@@ -58,13 +58,11 @@ void HostMemoryWorker::run(int device) noexcept {
         lock.unlock();
         job(); // a packaged task: its exception lands in its future
         lock.lock();
-        running_                         = false;
-        const std::function<void()> wake = wake_;
-        if (wake) {
-            lock.unlock();
-            wake(); // the engine's waker takes its own lock
-            lock.lock();
-        }
+        running_ = false;
+        // Under mutex_, so set_waker returns only once no call is in flight: an engine that clears its waker
+        // before it goes away is never called afterwards. The waker takes the engine's queue lock, which nothing
+        // holds while it posts a job or sets the waker.
+        if (wake_) { wake_(); }
     }
 }
 

@@ -37,6 +37,8 @@ concept EngineProgramContract = requires(typename Types::Program& program, const
     { program.hybrid_poll_storage() } -> std::same_as<bool>;
     { view.hybrid_source_pending() } -> std::same_as<bool>;
     { view.hybrid_storage_due() } -> std::same_as<bool>;
+    // When a refused SSD write-back is tried again (the idle Engine's wait ends then); empty when none is waiting.
+    { view.hybrid_storage_retry_at() } -> std::same_as<std::optional<std::chrono::steady_clock::time_point>>;
     { view.hybrid_resume_grid() } -> std::convertible_to<std::uint32_t>;
     // The periodic prefix-cache save (empty when there was nothing to save).
     program.save_prefix_cache_now(CancellationView{});

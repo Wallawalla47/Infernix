@@ -260,13 +260,26 @@ DeviceSpan ProgramOffload::wide_workspace(std::uint64_t bytes, cudaStream_t comp
     if (wide_lease_.valid()) { return {wide_lease_.memory.data, bytes}; }
     // The cache cannot lend it now (it shrank under VRAM pressure, or a vision window holds frames):
     // the prompt allocates it; a failed allocation fails this prompt's requests, not the Engine.
+    // Under the Windows sysmem fallback the allocation succeeds on a full card by landing in shared system
+    // memory, where the whole pass would read and write its activations over the link: the guard's readings
+    // (two queries of the engine's source, on this path only) refuse that as they refuse a failed allocation.
     wide_fallback_ = DeviceBuffer();
+    SpillGuard guard(engine_.vram());
+    guard.begin();
     try {
         wide_fallback_ = DeviceBuffer(static_cast<std::size_t>(bytes));
     } catch (const std::exception& error) {
         throw runtime::RecoverableExecutionError("the prefill workspace (" + std::to_string(bytes >> 20) +
                                                  " MiB) could not be lent from the expert cache or allocated: " +
                                                  error.what());
+    }
+    if (const std::uint64_t spilled = guard.end(bytes, 0); spilled != 0) {
+        wide_fallback_ = DeviceBuffer();
+        throw runtime::RecoverableExecutionError(
+            "the prefill workspace (" + std::to_string(bytes >> 20) +
+            " MiB) could not be lent from the expert cache, and " + std::to_string(spilled >> 20) +
+            " MiB of its allocation were placed in shared system memory by the driver's sysmem fallback (" +
+            guard.readings(bytes) + "): free VRAM or lower --prefill-chunk");
     }
     return {wide_fallback_.p, bytes};
 }

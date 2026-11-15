@@ -57,6 +57,12 @@ VmmArena::~VmmArena() {
 
 bool VmmArena::supported(int device) { return vmm::supported(device); }
 
+namespace testing {
+void set_vmm_supported(std::optional<bool> supported) noexcept {
+    vmm::forced_support().store(supported ? (*supported ? 1 : 0) : -1, std::memory_order_relaxed);
+}
+} // namespace testing
+
 bool VmmArena::map_chunk() {
     if (mapped_bytes() + chunk_ > reserved_) { return false; }
     CUmemGenericAllocationHandle handle{};

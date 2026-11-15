@@ -5,6 +5,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace infernix {
@@ -35,6 +36,13 @@ struct HostMemorySnapshot {
 };
 
 [[nodiscard]] HostMemorySnapshot host_memory_snapshot();
+
+// Whether this process runs inside a WSL2 virtual machine (Linux: the kernel release names Microsoft; false
+// elsewhere). Every reading above is then the VM's memory, not the Windows host's: the VM grows into the host's
+// RAM as the process page-locks it, and the host cannot take page-locked guest memory back.
+[[nodiscard]] bool host_is_wsl() noexcept;
+// The test of host_is_wsl on a kernel release string (/proc/sys/kernel/osrelease).
+[[nodiscard]] bool kernel_release_is_wsl(std::string_view release) noexcept;
 
 // Keeps at least `bytes` of this process resident (Windows: a hard minimum working set), so a small
 // RAM reserve trims other programs before Infernix's own pageable memory. Empty on success and where
@@ -124,6 +132,9 @@ private:
     std::byte* data_  = nullptr;
     std::size_t size_ = 0;
     std::size_t raised_ = 0; // Windows: what the minimum working set grew by
+    // Windows: of raised_, what decommitted pages left in the minimum because it could not be lowered for them; their
+    // recommit raises by that much less.
+    std::size_t not_lowered_ = 0;
     std::string lock_failure_;
 };
 

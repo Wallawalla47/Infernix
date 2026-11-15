@@ -548,6 +548,25 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
         if (options.ram_resize) { prefix_growth = auto_host_context_ceiling_bytes(snapshot, demand, prefix_bytes); }
         demand.prefix_cache = prefix_bytes;
+        // The exclusive layout's cap was tested before the automatic tier took its share, which is at least
+        // kMinAutoHostContextBytes however little the cap leaves: in the band where the cap fitted with less than
+        // that to spare, the plan with the tier no longer holds the cap, and the start was refused as if the user
+        // had asked for --expert-ram-mib. The layout is the plan's own choice, so it gives way as it does on a
+        // machine too small for it: the plain SSD tier, whose experts take what the tier leaves.
+        if (exclusive && expert_offload::plan_host_memory(snapshot, demand).cap_too_large) {
+            demand.expert_cap.reset();
+            exclusive                            = false;
+            program_options.expert_ram_exclusive = false;
+            program_options.expert_shadow_share  = 0.0;
+            program_options.expert_seed_share    = models::qwen4_exp::ProgramOptions{}.expert_seed_share;
+            demand.prefix_cache                  = 0;
+            prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+            if (options.ram_resize) { prefix_growth = auto_host_context_ceiling_bytes(snapshot, demand, prefix_bytes); }
+            demand.prefix_cache = prefix_bytes;
+            report(options, DiagnosticLevel::Debug,
+                   "RAM plan: the exclusive expert layout does not fit beside the automatic prefix cache; using the "
+                   "SSD tier's layout");
+        }
     }
     if (cache.enabled) {
         program_options.prefix_host_bytes    = prefix_bytes;
@@ -839,6 +858,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         if (table.fp8_scale) { signature += ";scale=" + std::to_string(*table.fp8_scale); }
         if (table.nvfp4_scale) { signature += ";multiplier=" + std::to_string(*table.nvfp4_scale); }
         signature += instance->model->config().text.moe.a16_experts ? ";experts=a16" : ";experts=a4";
+        // The grid this Program's resumes sit on: 1 with free cache resume, else the prefill chunk it fitted to its
+        // expert cache at this launch (EngineOptions::prefill_chunk is only the request). A file saved under another
+        // grid holds taps whose state came from calls of another width, which this launch's cold prefill would not
+        // compute, so on the reproducible route a resume from them would make the output depend on the file.
+        signature += ";grid=" + std::to_string(instance->program->hybrid_resume_grid());
         // A DFlash2 drafter's ring rides in every snapshot: it belongs to that companion artifact.
         if (const auto& draft = instance->model->info().draft_artifact_id) {
             signature += ";draft=";

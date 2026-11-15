@@ -16,6 +16,9 @@ struct ResolvedExecutionOptions {
     ThinkingControlOptions thinking;
     std::vector<TokenId> readout_tokens;
     TokenConstraint constraint;
+    // The Engine's idle-time pass over a finished turn (hybrid-prefix-cache-spec §7.9), which no client
+    // waits for: it yields to a request at its next unit boundary, so a Program keeps its units short.
+    bool background = false;
 };
 
 // A row whose thinking is open at a call's first position: its end-of-turn tokens, and the tool-call opener when it

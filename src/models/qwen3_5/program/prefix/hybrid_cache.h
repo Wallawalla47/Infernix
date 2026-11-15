@@ -172,6 +172,10 @@ public:
 
     // Waits for every Host write and landing restore and publishes them.
     void drain();
+    // Room-making's wait: waits for the oldest Host write, or without one the oldest landing prefetch, and
+    // publishes what landed. False (and no wait) when neither is in flight: a lane's own restore is never waited
+    // for, since the blocks it lands stay mapped. Call it only while the index reports transfer-held blocks.
+    [[nodiscard]] bool settle_oldest_transfer();
 
     // ---- SSD tier (§5.7) -------------------------------------------------------------------------
     [[nodiscard]] runtime::prefix_cache::SsdTier* ssd() noexcept { return ssd_.get(); }
@@ -183,6 +187,9 @@ public:
     void service_ssd();
     // Whether service_ssd would start a write-back now.
     [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> ssd_retry_at() const noexcept {
+        return ssd_ ? ssd_->write_back_retry_at() : std::nullopt;
+    }
     // Starts reading the parts of `snapshot` only on the SSD into the Host tier (Ready without an
     // SSD tier or when nothing is only there).
     [[nodiscard]] runtime::prefix_cache::SsdTier::Promotion promote(runtime::prefix_cache::SnapshotRef snapshot);

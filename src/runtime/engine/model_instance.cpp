@@ -230,6 +230,23 @@ std::size_t free_device_bytes(const VramSnapshot& s) {
     return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
 }
 
+// What a start resolves its KV capacity in (kv_available_bytes): an automatic capacity leaves `headroom` of
+// free device memory and, of the OS budget, the expert frames' margin (size_expert_frames) with the retry's
+// extra headroom, so a budget below free memory is not stacked on the display headroom (it cost up to 960 MiB
+// of KV with a display: 24.10 GiB free against 21.88 the budget left planned 20.88, now 21.82). Past the
+// budget (--vram-past-budget) the source's free memory is already the widened budget less usage, whose
+// allowance kept its own margin (kPastBudgetMargin): the headroom alone comes off it, as before.
+std::size_t kv_sizing_bytes(const VramSnapshot& s, bool automatic, std::size_t headroom, std::size_t retry_headroom) {
+    std::optional<std::uint64_t> budget_left;
+    if (s.has_budget && s.budget_allowance == 0) {
+        budget_left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
+    } else if (s.has_budget) {
+        return free_device_bytes(s);
+    }
+    return kv_available_bytes(automatic, s.device_free, budget_left, headroom,
+                              static_cast<std::size_t>(expert_offload::kVramBudgetMarginBytes) + retry_headroom);
+}
+
 std::size_t current_free_device_bytes(int device, bool past_budget) {
     return free_device_bytes(open_vram_budget_source(device, past_budget)->query());
 }
@@ -905,6 +922,10 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             options.context_cache.host_capacity_bytes =
                 auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
             set_growth(snapshot, demand);
+            // The tier page-locks RAM down to the reserve, so the process's own pageable memory (its heap, the
+            // driver's pages, the kernel images) is what Windows would trim first under pressure: the growth the
+            // plan counted stays resident, as beside offloaded experts.
+            if (!plan_only) { reserve_expert_working_set(options, demand); }
         }
     }
     // Engine::plan: the pinned block's check (materialize's), the RAM report, and the weights; then the
@@ -1017,21 +1038,34 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             planned->vram.planned_bytes  = dense_bytes;
             return {};
         }
-        if (!plan_only) {
-            spill.emplace(*spill_source);
-            spill->begin();
-        }
+    }
+    // Every start checks that its weights landed in device memory: a resident model's arena is as exposed to
+    // the sysmem fallback as an offloaded one's dense weights, and without the check its spill surfaced only as
+    // a KV sizing failure that did not name the weights. The load page-locks the pinned block and the ladder's
+    // tail mirror meanwhile (its staging slots are released again), which the guard takes off the shared system
+    // memory use it reads.
+    std::uint64_t pinned_in_load = 0;
+    if (!plan_only) {
+        if (!spill_source) { spill_source = open_vram_budget_source(device.device, options.vram_past_budget); }
+        dense_bytes    = plan.materialization().device_capacity_bytes;
+        pinned_in_load = plan.materialization().pinned_capacity_bytes + tail_mirror;
+        spill.emplace(*spill_source);
+        spill->begin();
     }
     if (plan_only && !pinned_refusal.empty()) { plan_refuse(*planned, std::move(pinned_refusal)); }
     auto model = plan_only ? models::qwen3_5::plan_model(std::move(plan))
                           : models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
     if (spill) {
-        if (const std::uint64_t spilled = spill->end(dense_bytes); spilled != 0) {
-            throw std::runtime_error(std::to_string(spilled >> 20) +
-                                     " MiB of the dense weights were placed in shared system memory by the driver's "
-                                     "sysmem fallback: free VRAM and start again (" + spill->readings(dense_bytes) +
-                                     ")");
+        // The upload's staging slots count as page-locked too: they are released before this reading, but a
+        // release the OS has not yet taken off the process's use must not read as a spill.
+        pinned_in_load += model->storage_stats().peak_staging_bytes;
+        if (const std::uint64_t spilled = spill->end(dense_bytes, pinned_in_load); spilled != 0) {
+            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of the model's " +
+                                     (expert_ram ? "dense weights" : "weights") + " (" +
+                                     std::to_string(dense_bytes >> 20) +
+                                     " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
+                                     "VRAM and start again (" + spill->readings(dense_bytes) + ")");
         }
     }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
@@ -1108,10 +1142,18 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         // parameters' derived buffers it did not allocate (the DFlash2 drafter's head screen).
         const VramSnapshot vram_now  = open_vram_budget_source(device.device, options.vram_past_budget)->query();
         const std::size_t free_now   = free_device_bytes(vram_now);
+        // What the capacity resolves in: with a resident model's automatic capacity the display headroom comes
+        // off free device memory and the margin off the OS budget (kv_sizing_bytes); otherwise free_now.
+        const std::size_t sizing_headroom =
+            static_cast<std::size_t>(runtime::expert_offload::display_headroom(vram_now.display, false,
+                                                                              options.vram_headroom_bytes)) +
+            retry_headroom;
+        const std::size_t sizing_now = kv_sizing_bytes(
+            vram_now, !expert_ram && kv_policy.mode == KvCapacityMode::Automatic, sizing_headroom, retry_headroom);
         const std::size_t free_bytes =
-            plan_only ? planned_free_after_weights(free_now, planned_weights,
+            plan_only ? planned_free_after_weights(sizing_now, planned_weights,
                                                    planned_beside_weights + instance->parameters.planned_device_bytes)
-                      : free_now;
+                      : sizing_now;
         if (vram_now.has_budget) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
                                "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used)",
@@ -1123,10 +1165,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         // the GPU, 1 GiB with one or when unknown). Measured headless on the 27B and 35B at 4 x 65,536 (RTX
         // 5090, 2026-11-03): the earlier fixed 1 GiB stayed free, and long prefills, decode at four lanes
         // and a constrained tool call took 2 MiB more after startup.
-        const std::size_t headroom =
-            static_cast<std::size_t>(runtime::expert_offload::display_headroom(vram_now.display, false,
-                                                                              options.vram_headroom_bytes)) +
-            retry_headroom;
+        const std::size_t headroom = sizing_headroom;
         // The sequence plan of `trial` (these options at another prefill chunk, for the fit below) with its
         // KV capacity resolved; none when Engine::plan finds no capacity that fits.
         const auto plan_sequence = [&](const EngineOptions& trial)

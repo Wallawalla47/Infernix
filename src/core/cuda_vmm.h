@@ -6,6 +6,7 @@
 
 #include <cuda.h>
 
+#include <atomic>
 #include <cstddef>
 #include <mutex>
 #include <stdexcept>
@@ -25,7 +26,14 @@ inline void ensure_driver_initialized() {
     std::call_once(once, [] { check(cuInit(0), "cuInit(0)"); });
 }
 
+// testing::set_vmm_supported (vmm_arena.h): -1 asks the device, 0 and 1 answer for it.
+inline std::atomic<int>& forced_support() {
+    static std::atomic<int> forced{-1};
+    return forced;
+}
+
 inline bool supported(int device) {
+    if (const int forced = forced_support().load(std::memory_order_relaxed); forced >= 0) { return forced != 0; }
     ensure_driver_initialized();
     CUdevice handle = 0;
     if (cuDeviceGet(&handle, device) != CUDA_SUCCESS) { return false; }

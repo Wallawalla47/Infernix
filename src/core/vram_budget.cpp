@@ -317,6 +317,23 @@ std::uint64_t SpillGuard::end(std::uint64_t bytes) {
     return spill_shortfall(before_.device_free, after_.device_free, bytes);
 }
 
+std::uint64_t spill_rise(std::uint64_t nonlocal_before, std::uint64_t nonlocal_after, std::uint64_t bytes,
+                         std::uint64_t pinned_bytes, std::uint64_t tolerance) noexcept {
+    const std::uint64_t rise    = nonlocal_after > nonlocal_before ? nonlocal_after - nonlocal_before : 0;
+    const std::uint64_t spilled = rise > pinned_bytes ? rise - pinned_bytes : 0;
+    return spilled > tolerance ? (spilled < bytes ? spilled : bytes) : 0;
+}
+
+std::uint64_t SpillGuard::end(std::uint64_t bytes, std::uint64_t pinned_bytes) {
+    after_ = source_.query();
+    if (before_.shared_system != 0 && after_.shared_system != 0) {
+        return spill_rise(before_.nonlocal_usage, after_.nonlocal_usage, bytes, pinned_bytes);
+    }
+    if (spill_shortfall(before_.device_free, after_.device_free, bytes) == 0) { return 0; }
+    after_ = source_.query();
+    return spill_shortfall(before_.device_free, after_.device_free, bytes);
+}
+
 std::string SpillGuard::readings(std::uint64_t bytes) const {
     const auto mib = [](std::uint64_t value) { return std::to_string(value >> 20) + " MiB"; };
     std::string out = "free device memory " + mib(before_.device_free) + " before and " + mib(after_.device_free) +

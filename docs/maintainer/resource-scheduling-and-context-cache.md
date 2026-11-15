@@ -111,7 +111,9 @@ error instead of waiting for a releaser that does not exist. The error names the
 kind and the KV pages still short. No part of the unit has run, so it is a
 `RecoverableExecutionError` (engine architecture, failure handling): the residents and paused
 requests fail with it and the Engine keeps serving, unless a binding or materialization is in flight
-or the Program cannot recover, when everything fails.
+or the Program cannot recover, when everything fails. A resident that has finished and is settled at
+the next cycle boundary is a releaser: a unit short of capacity waits that cycle for its pages rather
+than pausing another resident or reporting the error.
 
 <a id="sources"></a>
 ## 4. Admission sources and binding
@@ -143,7 +145,9 @@ Each cycle first processes context transactions, terminal states and cancellatio
 turn that has served its slice (§5.2), and while a turn is held tries a complete resume of its owner
 if it is paused. It then requests resident unit permits row by row, the turn's owner first and then
 original ticket order, keeps the runnable subset, and, while no turn is held and nothing is paused or
-recovering, uses the remaining headroom to try fresh admission.
+recovering, uses the remaining headroom to try fresh admission: every request the scan can bind is
+bound in that cycle (a binding the Program completes over several cycles ends the pass), so requests
+that arrive together share the cycle's prefill turn by its order.
 It executes the permitted compact Control/Decode set and one Prefill/Replay chunk; rows committed by
 Control reacquire Decode permits in the next cycle. Graphs use the actual member count and execution
 profile. With the `idle-wide-prefill` fast path a Prefill permit reserved while no other lane is
@@ -202,6 +206,9 @@ whose DFlash2 ring YE-01 left incomplete recomputes from its deepest snapshot, s
 resident is paused before it; adopted 2026-11-14 under the owner's fastest-overall rule), it is resumed
 first when it is the one paused, and while it is paused or binding no other resident reserves a unit,
 so no one borrows capacity released for it. Once it holds its permit, the others use what is left.
+An owner the Program blocks (on Qwen3.8-Flash-Next a prefilling lane behind another lane's layer
+walk) leaves the cycle's prefill permit to the lanes that can run, so the walk it waits behind ends;
+its turn is not charged meanwhile (`Scheduler::prefill_turn`).
 During a turn only the owner may take capacity from a resident; another blocked request only records
 that it contends.
 

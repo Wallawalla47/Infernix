@@ -14,6 +14,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #    include <immintrin.h>
@@ -394,6 +395,7 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
     }
     if (!deferred.empty()) { tier_.defer_free(deferred); }
     queue_ = std::make_unique<DirectReadQueue>(options_.io);
+    queue_->set_faults(options_.io_faults);
     for (const auto& path : store_.files()) { files_.push_back(queue_->open(path)); }
     // A layer call reads each of its experts once, so a round demands at most its layer calls'
     // experts (every key once when a round calls each layer once), and each layer call's request
@@ -602,19 +604,49 @@ void HostExpertTier::submit_run(std::span<const std::pair<std::uint32_t, std::ui
 }
 
 void HostExpertTier::read_records(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs) {
+    // The fill is all or nothing. Its keys were placed before their reads were issued, so a failed read would
+    // leave a resident key over bytes never read, which the next round's pointer table hands to the kernels and
+    // the CPU arms. A scatter run fails as one read, so the keys of the whole call go back: resident slots to
+    // their class's free list, unpinned records to the free records (the lowest taken first, as before).
+    const auto undo = [&] {
+        for (const auto& [key, destination] : jobs) {
+            (void)destination;
+            if (unpinned_of_[key] >= 0) {
+                (void)tier_.unhold(key);
+                unpinned_free_.push_back(static_cast<std::uint32_t>(unpinned_of_[key]));
+                unpinned_of_[key] = -1;
+            } else {
+                tier_.undo_prefill(key);
+            }
+        }
+        std::sort(unpinned_free_.begin(), unpinned_free_.end(), std::greater<>());
+        ++stats_.fills_undone;
+    };
+    std::string stopped;
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (!agent_failure_.empty()) { throw std::runtime_error("SSD tier: the read agent stopped: " + agent_failure_); }
-        prefill_jobs_.insert(prefill_jobs_.end(), jobs.begin(), jobs.end());
-        prefill_pending_ += static_cast<std::uint32_t>(jobs.size());
-        wake_.notify_all();
-        prefill_done_.wait(lock, [&] { return prefill_pending_ == 0; });
+        stopped = agent_failure_;
+        if (stopped.empty()) {
+            prefill_jobs_.insert(prefill_jobs_.end(), jobs.begin(), jobs.end());
+            prefill_pending_ += static_cast<std::uint32_t>(jobs.size());
+            wake_.notify_all();
+            prefill_done_.wait(lock, [&] { return prefill_pending_ == 0; });
+        }
+    }
+    if (!stopped.empty()) { // nothing reads them: the keys go back as after a failed read
+        undo();
+        throw std::runtime_error("SSD tier: the read agent stopped: " + stopped);
     }
     if (prefill_failures_ != 0) {
-        throw std::runtime_error("SSD tier: " + std::to_string(prefill_failures_) +
+        // The count is this call's alone (an agent that stopped meanwhile added the reads still pending): left
+        // standing, it failed every later fill, the successful ones included.
+        const std::uint32_t failed = std::exchange(prefill_failures_, 0U);
+        undo();
+        throw std::runtime_error("SSD tier: " + std::to_string(failed) +
                                  " expert records could not be read from the artifact into RAM");
     }
     stats_.prefill_reads += jobs.size();
+    stats_.fill_retries   = agent_fill_retries_.load(std::memory_order_relaxed);
     stats_.run_reads      = agent_run_reads_.load(std::memory_order_relaxed);
     stats_.run_records    = agent_run_records_.load(std::memory_order_relaxed);
     stats_.csf_compressed = csf_compressed_.load(std::memory_order_relaxed);
@@ -776,6 +808,8 @@ std::uint64_t HostExpertTier::shrink(std::uint64_t bytes, HostMemoryWorker& work
     forget_kept();
     settle_fills(); // their records and ring slots are settled before any is given back
     if (bytes == 0) { return 0; }
+    // A stopped agent's reads may still land in a slot or a record (nothing tracks them any more): none is given back.
+    if (!failure().empty()) { return 0; }
     // The last round's demands, fetches and their copies land first (a fetch's copy is a ticket in flight); then no
     // read or copy into a slot or a record is left but the stream's (into lent slots) and the refills' (shrink_order).
     drain();
@@ -810,7 +844,9 @@ std::uint64_t HostExpertTier::shrink_unpinned(std::uint64_t bytes, HostMemoryWor
         });
         for (const std::uint32_t key : held) {
             if (released >= bytes) { break; }
-            (void)tier_.unhold(key);
+            // A key the VRAM policy has queued for a frame, or whose promotion's copy has not been published, keeps
+            // its record (HostTier::held_pinned): the load reads it, and no slot pin stands for a record.
+            if (!tier_.unhold(key)) { continue; }
             given.push_back(static_cast<std::uint32_t>(unpinned_of_[key]));
             unpinned_of_[key] = -1;
             released += record;
@@ -982,18 +1018,43 @@ std::uint64_t HostExpertTier::link_growth() {
     return linked;
 }
 
-std::uint32_t HostExpertTier::fill_room(const std::function<bool(std::uint32_t)>& skip) {
+std::uint32_t HostExpertTier::fill_room(const std::function<bool(std::uint32_t)>& skip, std::uint64_t max_bytes) {
     if (!room_unfilled_) { return 0; }
     if (round_open()) { throw std::logic_error("SSD tier: a RAM fill with a round open"); }
     settle_fills();
-    room_unfilled_                          = false;
+    // This call's piece: the best-ranked keys the free slots of their size, then the free records, can take (what
+    // slot_jobs and fill_unpinned place from the whole ranking), at most max_bytes of records and at least one.
     const std::vector<std::uint32_t> ranked = ranked_without_copy();
-    std::uint32_t filled                    = 0;
-    if (const auto jobs = slot_jobs(ranked, skip); !jobs.empty()) {
-        read_records(jobs);
-        filled += static_cast<std::uint32_t>(jobs.size());
+    const std::uint64_t most = std::max<std::uint64_t>(1, max_bytes / store_.record_bytes());
+    std::vector<std::size_t> room(tier_.class_count());
+    for (std::uint32_t c = 0; c < room.size(); ++c) { room[c] = tier_.free_resident(static_cast<std::uint8_t>(c)); }
+    std::size_t records = unpinned_free_.size();
+    std::vector<std::uint32_t> piece;
+    bool more = false;
+    for (const std::uint32_t key : ranked) {
+        if (skip && skip(key)) { continue; }
+        std::size_t& slots = room[tier_.class_of(key)];
+        if (slots == 0 && records == 0) { continue; }
+        if (piece.size() >= most) {
+            more = true;
+            break;
+        }
+        --(slots != 0 ? slots : records);
+        piece.push_back(key);
     }
-    return filled + fill_unpinned(ranked, skip);
+    std::uint32_t filled = 0;
+    try {
+        if (const auto jobs = slot_jobs(piece, skip); !jobs.empty()) {
+            read_records(jobs);
+            filled += static_cast<std::uint32_t>(jobs.size());
+        }
+        filled += fill_unpinned(piece, skip);
+    } catch (...) {
+        room_unfilled_ = true; // the failed piece went back whole (read_records): a later call reads it again
+        throw;
+    }
+    room_unfilled_ = more;
+    return filled;
 }
 
 std::uint64_t HostExpertTier::shrinkable_bytes() const {
@@ -1361,6 +1422,14 @@ void HostExpertTier::fail_ticket(std::uint32_t t) noexcept {
     in_flight_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
+void HostExpertTier::stop_agent_for_test(std::string why) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        agent_abort_ = std::move(why);
+    }
+    wake_.notify_all();
+}
+
 std::string HostExpertTier::failure() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return agent_failure_;
@@ -1477,7 +1546,13 @@ void HostExpertTier::agent_failed(std::string what) noexcept {
         new_demands_.clear();
         prefill_jobs_.clear();
         stream_jobs_.clear();
-        for (const RefillJob& job : refill_jobs_) { refill_state_[job.id].store(2, std::memory_order_release); }
+        // Every refill not landed fails: the queued ones and those the agent had taken or submitted, which nothing
+        // completes any more (a demotion waiting for one, ExpertResidency::finish_demotions, would wait for ever).
+        // An id no refill holds stays failed until refill() takes it, which a stopped agent refuses.
+        for (std::uint32_t id = 0; id < kRefills; ++id) {
+            std::uint32_t pending = 0;
+            refill_state_[id].compare_exchange_strong(pending, 2, std::memory_order_acq_rel);
+        }
         refill_jobs_.clear();
         for (std::uint32_t s = 0; s < options_.stream; ++s) { // pending stream reads fail
             std::uint32_t pending = 0;
@@ -1553,6 +1628,7 @@ void HostExpertTier::agent_loop() {
         std::uint32_t key, remaining;
         bool failed;
         std::uint8_t* destination;
+        std::uint8_t retried = 0; // per segment (bit): read again after it timed out (retry_fill)
     };
     std::vector<std::uint32_t> demands;
     std::vector<std::pair<std::uint32_t, std::uint8_t*>> prefills;
@@ -1649,10 +1725,11 @@ void HostExpertTier::agent_loop() {
             if (outstanding == 0 && waiting.empty() && !open_) {
                 wake_.wait(lock, [&] {
                     return stop_ || open_ || !new_demands_.empty() || !prefill_jobs_.empty() || !stream_jobs_.empty() ||
-                           !refill_jobs_.empty();
+                           !refill_jobs_.empty() || !agent_abort_.empty();
                 });
                 last_work = Clock::now();
             }
+            if (!agent_abort_.empty()) { throw std::runtime_error(agent_abort_); } // stop_agent_for_test
             // Stopping abandons demands still waiting for a slot (their readers are gone).
             if (stop_ && outstanding == 0) { return; }
             demands.swap(new_demands_);
@@ -1731,7 +1808,11 @@ void HostExpertTier::agent_loop() {
                 if (!fetch_failed && options_.ahead > 0 && request.experts.size() >= options_.ahead_min &&
                     static_cast<std::uint32_t>(request.layer) + 1 < store_.layers()) {
                     const auto next = static_cast<std::uint32_t>(request.layer) + 1;
-                    for (std::uint32_t e = 0; e < store_.experts() && ahead.size() < options_.ahead; ++e) {
+                    // Under the lock, and only while the round is still open: a ticket made after end_round could
+                    // start a copy from an unpinned record once a RAM shrink's drain had found nothing in flight.
+                    // One made before it counts in flight before the engine thread can close the round.
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    for (std::uint32_t e = 0; open_ && e < store_.experts() && ahead.size() < options_.ahead; ++e) {
                         const std::uint32_t k = key(next, e);
                         if (round_ticket_of_key_[k].load(std::memory_order_acquire) != 0 || tier_.slot_of(k) >= 0) {
                             continue;
@@ -1979,20 +2060,41 @@ void HostExpertTier::agent_loop() {
                 prefill_read(index, ok);
             }
         };
+        // A fill's read (prefill, fill_unpinned, fill_room: nothing waits for it but the fill) that timed out is read
+        // once more, each record on its own: the queue's timeout bounds one read in flight whatever its size, so a
+        // run of records at the queue's depth on a slow or briefly stalled drive (below about 170 MB/s for 32 MiB
+        // runs) timed out twice and failed the start, where a record's own read lands. Whether it was resubmitted.
+        const auto retry_fill = [&](std::uint32_t index, std::uint32_t segment) {
+            if ((index & (kStreamEntry | kRefillEntry)) != 0) { return false; }
+            PrefillEntry& entry     = prefill_entries[index];
+            const std::uint8_t bit = static_cast<std::uint8_t>(1U << (segment & 7U));
+            if ((entry.retried & bit) != 0) { return false; }
+            const auto segments = store_.segments(entry.key / store_.experts(), entry.key % store_.experts());
+            if (segment >= segments.size()) { return false; }
+            entry.retried |= bit;
+            const auto& s = segments[segment];
+            queue_->submit({files_[s.file], s.offset, s.bytes, entry.destination + s.at, DirectReadQueue::Priority::Demand,
+                            tag_of(kPrefillTag, index, segment)});
+            ++outstanding;
+            agent_fill_retries_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        };
         for (const auto& c : done) {
             --outstanding;
             const std::uint64_t kind = c.tag >> 62U;
             const auto index         = static_cast<std::uint32_t>((c.tag >> 8U) & ((1ULL << 54U) - 1U));
             const bool ok            = c.status == DirectReadQueue::Status::Ok;
+            const bool timed_out     = c.status == DirectReadQueue::Status::TimedOut;
             if (kind == kDemandTag) {
                 ticket_read(index, ok);
             } else if (kind == kPrefillTag) {
+                if (timed_out && retry_fill(index, static_cast<std::uint32_t>(c.tag & 0xFFU))) { continue; }
                 fill_read(index, ok);
             } else {
                 for (const std::uint32_t member : runs[index]) {
                     if (kind == kDemandRunTag) {
                         ticket_read(member, ok);
-                    } else {
+                    } else if (!(timed_out && retry_fill(member, 0))) {
                         fill_read(member, ok);
                     }
                 }

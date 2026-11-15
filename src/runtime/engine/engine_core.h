@@ -728,7 +728,9 @@ private:
     }
 
     // Coalesces admission-visible queue/resource changes. Ordinary prefill/decode progress does not
-    // re-arm a temporarily blocked inspection.
+    // re-arm a temporarily blocked inspection; a prefill unit that published a snapshot or returned
+    // capacity does, and so does every prefill unit while a queued request waits for a sibling's
+    // snapshot (resolve_prefill_progress).
     void request_admission_check() noexcept {
         admission_check_pending_.store(true, std::memory_order_release);
     }
@@ -1603,7 +1605,12 @@ private:
         // Between a long prompt's calls (Qwen4Exp: after each layer-walk span) the frames it borrows
         // can be returned, so a request waiting for KV growth need not wait for the whole prompt
         // (GitHub #24: admitted after the first 65,536-token span instead of expiring in the queue).
-        if (progress.capacity_released) { request_admission_check(); }
+        // A snapshot this unit published may be the one a queued request waits for (a sibling's tap where
+        // their prompts diverge, hybrid-prefix-cache-spec §12.2): it is quoted again now, not when this
+        // prompt completes. While a request waits for a sibling every prefill boundary re-arms admission,
+        // so one whose sibling passed the target without publishing (a tap skipped for lack of room)
+        // stops waiting there too.
+        if (progress.capacity_released || progress.snapshot_published || sibling_wait_) { request_admission_check(); }
         if (!progress.complete) { return; }
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
@@ -1876,6 +1883,24 @@ private:
                                          head->publication_order);
     }
 
+    // The next batch for the head the last attempt served, each cycle while that attempt left more to copy
+    // (HybridResourceManager::prefetch_continues): admission scans alone gave a head waiting behind long
+    // decodes one batch per queue or capacity event, and the rest of its path was restored at its binding.
+    // Under the same conditions as fresh admission, whose scan makes the first attempt.
+    void continue_head_prefetch() {
+        std::shared_ptr<Request> head;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (!pending_.empty()) { head = pending_.front(); }
+        }
+        if (!head || !head->base_plan || head->publication_order != resources_.prefetch_head() ||
+            head->cancelled.load(std::memory_order_acquire)) {
+            resources_.prefetch_forget();
+            return;
+        }
+        resources_.prefetch_blocked_head(*instance_.program, *head->base_plan, head->publication_order);
+    }
+
     // Hybrid prefix cache: the sources of the requests waiting for admission are evicted last, the
     // request furthest back first (hybrid-prefix-cache-spec §9.6). Paused requests restore before
     // fresh ones, so they come first. A request no admission pass has planned yet is skipped.
@@ -1979,6 +2004,16 @@ private:
         publish_diagnostic(diagnostics_, DiagnosticLevel::Debug, "%s", line.c_str());
     }
 
+    // The trace of a request that was not quoted (every lane is taken), logged once as trace_admission's lines.
+    void trace_waiting(Request& request, const char* outcome) {
+        std::string line = "admission req " + std::to_string(request.id) + " fresh, prompt " +
+                           std::to_string(request.base_plan ? request.base_plan->summary().prompt_tokens : 0U) + ": " +
+                           outcome;
+        if (line == request.admission_trace) { return; }
+        request.admission_trace = line;
+        publish_diagnostic(diagnostics_, DiagnosticLevel::Debug, "%s", line.c_str());
+    }
+
     [[nodiscard]] static std::string shortage_text(const ContextResourceUsage& shortage) {
         return "short state " + std::to_string(shortage.state_slots) + ", main KV " +
                std::to_string(shortage.main_kv_pages) + ", backend KV " + std::to_string(shortage.backend_kv_pages) +
@@ -1996,17 +2031,16 @@ private:
                                      [&](const auto& request) { return request->id == owner; })
                       : paused_.end();
         if (restoring && suspended == paused_.end()) { return false; }
-        if (!lane && !restoring) { prefetch_blocked_head(); }
-        if (!lane && restoring) {
-            if (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, {}, pause_cost())) {
-                return pause_resident(*victim);
-            }
-            return false;
-        }
+        // The owner needs a lane: the resident whose pause recomputes least, the next one when it cannot
+        // pause now (while the owner is paused no resident reserves a unit, so a victim that refused would
+        // never reach a boundary where it can).
+        if (!lane && restoring) { return pause_reclaim_victim(); }
         if (admission_decision_ && (admission_decision_->restoring != restoring ||
                                     (restoring && *suspended != admission_decision_->request))) {
             admission_decision_.reset();
         }
+        // A decision is only ever kept across a pause it started, which frees a lane.
+        if (!lane) { admission_decision_.reset(); }
         std::vector<std::shared_ptr<Request>> candidates;
         if (admission_decision_) {
             candidates.push_back(admission_decision_->request);
@@ -2024,6 +2058,15 @@ private:
                     request->admission_generation = admission_generation_;
                 }
                 if (!plan_or_fail(request, restoring)) { return true; }
+                if (!lane) {
+                    // Every lane is taken, so no source can bind: the request is planned (its queue hold
+                    // and the head's prefetch read the plan) and not quoted. A quote walks the prompt's
+                    // path and waits for a prefetch landing on it (the head's own, started for this very
+                    // wait), which held the residents' decode for a request that could not start. It is
+                    // quoted when a lane frees (remove_completed_slot starts a new scan).
+                    trace_waiting(*request, "waits for a lane");
+                    continue;
+                }
                 std::vector<SourceCandidate> sources = resources_.candidates(
                     *instance_.program, *request->base_plan, restoring ? &*request->suspended : nullptr);
                 if (sources.empty() && source_pending()) {
@@ -2032,6 +2075,9 @@ private:
                     if (restoring) { return false; }
                     continue;
                 }
+                // No source and no read: it waits for a prefilling sibling's snapshot (§12.2). Each of the
+                // sibling's prefill boundaries quotes it again (resolve_prefill_progress).
+                if (sources.empty() && !restoring) { sibling_wait_ = true; }
                 // An idle-time pass whose history the cache already holds ends before any binding
                 // (an agent turn that echoed the reply resumes from its endpoint anyway, §7.9).
                 if (request->background && !restoring && next_turn_covered(*request, sources)) {
@@ -2057,13 +2103,7 @@ private:
             bool deferred = false;
             while (decision.current < decision.sources.size()) {
                 const SourceCandidate& source = decision.sources[decision.current];
-                if (!lane) {
-                    trace_admission(*request, decision, "waits for a lane");
-                    note_source_wait(request, source, restoring);
-                    deferred = true;
-                    break;
-                }
-                const auto binding_started = Clock::now();
+                const auto binding_started    = Clock::now();
                 auto reservation           = instance_.program->start_binding(
                     *request->base_plan, LaneId{*lane}, source,
                     restoring ? &*request->suspended : nullptr,
@@ -2312,10 +2352,9 @@ private:
                 }
             }
         }
-        const auto prefill = priority && (slots_[*priority]->is_prefilling() ||
-                                          slots_[*priority]->is_replaying())
-                                 ? priority
-                                 : scheduler_.next_prefill(prefill_view, max_concurrency_);
+        // The owner's (or the recovering lane's) while it can run; a blocked one leaves the permit to the
+        // lane it waits behind (Scheduler::prefill_turn).
+        const auto prefill = scheduler_.prefill_turn(prefill_view, max_concurrency_, priority);
         std::vector<std::uint32_t> candidates;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -2376,6 +2415,11 @@ private:
                     handed_over = priority == lane;
                     break;
                 }
+                // A resident that finished in this cycle returns its lane and pages at the next boundary
+                // (settle_terminal_requests): the unit waits for that release rather than pausing another
+                // resident for it, or failing every resident with a capacity error one cycle before the
+                // pages come back.
+                if (scheduler_.release_pending(slots_, max_concurrency_)) { break; }
                 // The cache cannot cover the unit. During a turn only its owner may take
                 // capacity from a resident; another row records contention and waits.
                 if (const auto turn = scheduler_.progress_owner(); turn && *turn != request->id) {
@@ -2705,6 +2749,7 @@ private:
         ResolvedRequestOptions options;
         options.execution.requested_output_tokens = 1;
         options.execution.allow_prefix_reuse      = true;
+        options.execution.background              = true;
         options.tool_choice.constraints           = ToolConstraintMode::Automatic;
         return options;
     }
@@ -2974,9 +3019,16 @@ private:
                         return stopping_ || !pending_.empty() || maintenance_requested_ ||
                                next_turn_serial_ != seen;
                     };
+                    // The idle wait's deadline: the earliest of the timed events below.
                     std::optional<Clock::time_point> wake;
                     if (prefix_save_interval_.count() != 0) { wake = next_prefix_save_; }
                     if (const auto due = next_turn_due()) { wake = wake ? std::min(*wake, *due) : *due; }
+                    // A refused SSD write-back is tried again at a set time (a capture still landing when the last
+                    // request ended): nothing else wakes an idle Engine for it. The timeout branch's `continue`
+                    // returns to the loop top, where hybrid_storage_due() is then true.
+                    if (const auto retry = instance_.program->hybrid_storage_retry_at()) {
+                        wake = wake ? std::min(*wake, *retry) : *retry;
+                    }
                     if (!wake) {
                         queue_cv_.wait(lock, woken);
                     } else if (!queue_cv_.wait_until(lock, *wake, woken)) {
@@ -3089,21 +3141,39 @@ private:
                     executed |= progress_context_transaction(boundary);
                 }
                 reserve_resident_units();
+                bool admitted = false;
                 // Fresh requests wait while admitted ones contend (they keep their queue deadline);
                 // they enter once no turn is held, nothing is paused and no recovery is pending.
                 if (!scheduler_.progress_owner() && paused_.empty() && !context_owner_ && !recovering) {
                     if (!admission_decision_ && consume_admission_check()) {
                         ++admission_generation_;
                         scheduler_.begin_admission_scan();
+                        sibling_wait_ = false; // set again by a request this scan finds still waiting
                     }
-                    if (admission_decision_ || scheduler_.admission_scan_pending()) {
-                        (void)try_admit_one(false);
+                    // Every request the scan can bind is bound in this cycle, before its units are chosen:
+                    // requests that arrive together then share the cycle's prefill turn by its order (the
+                    // shortest prompt first) instead of each waiting out a unit of the one bound before it,
+                    // and a later one's Host restore runs under that unit. A binding the Program completes
+                    // over several cycles (a media prompt's encode on Qwen3.8-Flash-Next) ends the pass: the
+                    // Program holds one context transaction at a time.
+                    while ((admission_decision_ || scheduler_.admission_scan_pending()) && try_admit_one(false) &&
+                           materializing_) {
+                        executed |= progress_context_transaction(boundary);
+                        if (instance_.program->has_context_transaction()) { break; }
+                        admitted = true;
+                    }
+                    // The blocked head's Host-only path goes on being copied while it waits (§6.6).
+                    if (resources_.prefetch_continues() && !instance_.program->has_context_transaction()) {
+                        continue_head_prefetch();
                     }
                 }
                 hold_queued_sources();
                 if (instance_.program->has_context_transaction()) {
                     executed |= progress_context_transaction(boundary);
                     if (!instance_.program->has_context_transaction()) { reserve_resident_units(); }
+                } else if (admitted) {
+                    // The lanes bound above reserve their first units.
+                    reserve_resident_units();
                 }
                 if (testing::units_held().load(std::memory_order_relaxed)) {
                     // A test's stall (testing::hold_units): requests are admitted and bound, no unit runs.
@@ -3303,6 +3373,9 @@ private:
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
     std::atomic<bool> admission_check_pending_{false};
+    // worker: a queued request's last quote had no source because it waits for a prefilling sibling's
+    // snapshot; every prefill boundary then re-arms admission (hybrid-prefix-cache-spec §12.2).
+    bool sibling_wait_ = false;
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;
     std::array<std::uint32_t, kMaximumConcurrency> current_decode_lanes_{};

@@ -96,6 +96,8 @@ public:
         // classes by their layers (HostTier::Class::shadow_floor; the exclusive layout). 0: none kept.
         std::uint32_t shadow_floor = 0;
         DirectReadQueue::Options io;
+        // Test seam: the read queue's injected faults (DirectReadQueue::set_faults), set before the agent starts.
+        DirectReadQueue::Faults io_faults;
         // Pinned memory the device can read (default: cudaHostAlloc portable | mapped), null when the
         // OS refuses, and its release.
         std::function<void*(std::size_t)> allocate;
@@ -137,6 +139,8 @@ public:
 
     struct Stats {
         std::uint64_t demand_reads = 0, demand_failures = 0, prefill_reads = 0, admitted = 0, discarded = 0;
+        std::uint64_t fills_undone = 0; // fills taken back whole because a read of theirs failed (read_records)
+        std::uint64_t fill_retries = 0; // a fill's records read again, one by one, after their read timed out
         // Records the startup fill kept in a reused slot (Options::pool) instead of reading them.
         std::uint64_t kept = 0;
         std::uint64_t copied_admissions = 0; // admissions copied into a class of smaller records
@@ -313,7 +317,9 @@ public:
     // completed every kernel that may read a slot.) The memory work (releasing, page-locking, decommitting and
     // committing) runs on `worker`, off the engine thread.
     // Gives back at least `bytes` if it can (fewer when pins, loans, refills or Options::min_slots stop it): first the
-    // unpinned records, unused ones and then the lowest-ranked held keys' (HostTier::unhold; their pages decommitted),
+    // unpinned records, unused ones and then the lowest-ranked held keys' (HostTier::unhold; their pages decommitted;
+    // a key a VRAM promotion still needs, queued for a frame or being copied, keeps its record whatever the caller
+    // checked: HostTier::held_pinned),
     // then whole pinned chunks, those holding the least valuable residents first (decayed LFU): their slots are
     // retired (HostTier::retire) and the chunks released (Options::release). The transit region (records of several
     // sizes) and a chunk holding a bounce slot stay; a chunk with a pinned or lent slot, or a slot an issued refill
@@ -335,8 +341,12 @@ public:
     std::uint64_t link_growth();
     // Fills what is still free of the room a growth took back from the artifact with the keys without a host copy
     // that `skip` (when given) rejects, the best first by the decayed LFU (prefill, fill_unpinned): once the Engine
-    // is idle, since the reads wait. Returns how many keys it read; they are dirty.
-    std::uint32_t fill_room(const std::function<bool(std::uint32_t)>& skip = {});
+    // is idle, since the reads wait. At most `max_bytes` of records a call (at least one record), so the caller's
+    // thread is held for one piece at a time: room_unfilled() stays set while more is left, and the caller calls
+    // again. A piece whose read fails goes back whole (the keys keep no host copy), the room stays unfilled and the
+    // failure is thrown. Returns how many keys it read; they are dirty.
+    std::uint32_t fill_room(const std::function<bool(std::uint32_t)>& skip = {},
+                            std::uint64_t max_bytes = ~std::uint64_t{0});
     [[nodiscard]] bool room_unfilled() const noexcept { return room_unfilled_; }
     // What shrink could give back now (every unpinned record and the chunks it would retire) and what a growth could
     // take back (the retired chunks and the decommitted records).
@@ -379,6 +389,9 @@ public:
     // while it runs. Its pending and later demands then fail at once instead of waiting, and the
     // caller treats the tier as failed.
     [[nodiscard]] std::string failure() const;
+    // Test seam: the agent thread stops as on an error of its read queue, with `why` as failure() (non-empty), the
+    // reads it has issued left in flight.
+    void stop_agent_for_test(std::string why);
 
 private:
     struct Ticket {
@@ -606,6 +619,7 @@ private:
     std::condition_variable wake_;
     bool stop_ = false;
     std::string agent_failure_; // non-empty once the agent thread has stopped on an error
+    std::string agent_abort_;   // stop_agent_for_test: the agent throws it at its next turn
     std::vector<std::uint32_t> new_demands_; // ticket indices
     std::vector<RingSlot> ring_;             // free ring slots of this round, taken from the back
     std::deque<std::uint32_t> holding_;      // tickets holding a ring slot, oldest first
@@ -651,7 +665,7 @@ private:
     // Written by the agent; read at boundaries.
     std::atomic<std::uint64_t> agent_reads_{0}, agent_failures_{0}, agent_read_ns_{0};
     std::atomic<std::uint64_t> agent_fetch_requests_{0}, agent_fetch_records_{0}, agent_fetch_from_ram_{0};
-    std::atomic<std::uint64_t> agent_run_reads_{0}, agent_run_records_{0};
+    std::atomic<std::uint64_t> agent_run_reads_{0}, agent_run_records_{0}, agent_fill_retries_{0};
     std::atomic<std::uint64_t> unpinned_served_{0}, unpinned_copies_{0};
     std::uint32_t prefill_failures_ = 0; // published to prefill() by prefill_done_
     std::thread agent_;

@@ -56,6 +56,9 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                          = 0;
     std::int32_t dflash_kv_table_row                           = 0;
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+    // Positional initializers end at dflash_prefill_host_ingress. Every member below is set by name: a member
+    // inserted here once shifted a trailing positional rope_delta into dflash_context_floor (text passes of image
+    // requests then ran at delta 0), which compiled silently.
     // YE-01 (text prefill with a DFlash2 drafter whose layers are all local): the first prompt position
     // the drafter's context needs from this pass; the pass's columns below it (positions text_kv_base
     // onwards) are not projected, since every later read of the ring is overwritten past them. -1: all.

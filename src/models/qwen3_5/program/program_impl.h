@@ -88,6 +88,8 @@ struct RequestBasePlanImpl {
     RequestConstraintPlan constraint;
     std::shared_ptr<const VisionControlPlan> vision_control_plan;
     bool allow_prefix_reuse = false;
+    // runtime::ResolvedExecutionOptions::background: the idle-time pass, whose prefill steps stay one chunk.
+    bool background = false;
     // The prepared ngram index moves out of the immutable prompt into this one-shot slot; the
     // request's single fresh binding takes it (a resumed binding keeps its saved proposer).
     std::shared_ptr<PreparedNgramIndex> ngram_index;
@@ -1018,6 +1020,8 @@ public:
     // once the batch has landed. The view is valid only until the cache's next poll(), which every
     // KV commit runs, so only PrefillContext::take_layer_ready calls it, inside the chunk function.
     [[nodiscard]] std::span<const cudaEvent_t> hybrid_take_restore_layers(std::uint32_t lane);
+    // Empties the prefix cache and every Program-side reference into it (a failed round, a full failure).
+    void hybrid_reset_cache() noexcept;
     // True when a sibling lane still prefilling a prompt that shares more with this one than the
     // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
     // snapshot as an exact tap of the sibling when none is planned near the divergence.

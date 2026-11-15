@@ -747,8 +747,10 @@ bool ProgramImpl::hybrid_make_room(std::uint32_t text_pages, std::uint32_t backe
            (backend_pool != nullptr && backend_pool->available_pages() < backend_pages)) {
         if (!hybrid_) { return false; }
         if (hybrid_->index().evict_device_blocks(1) != 0) { continue; }
-        if (!hybrid_->transfers_pending()) { return false; }
-        hybrid_->drain();
+        // Waiting helps only while a transfer alone holds a block (a landed Host write or prefetch leaves it
+        // evictable), and then only for the oldest such transfer: another lane's restore lands blocks that lane
+        // maps, and waiting for its gigabytes stalled every lane for nothing.
+        if (!hybrid_->settle_oldest_transfer()) { return false; }
     }
     return true;
 }
@@ -833,14 +835,22 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     binding.quote                = candidate.hybrid;
     binding.path_hash            = path_hash;
     plan_binding_units(transaction, base, resume, resume_kind, resume_tokens);
-    // The Begin summary names the hybrid path the Engine admitted (initialize_prefill knows only
-    // the legacy Checkpoint/Root pair).
-    if (reuse != 0) { requests[lane].prefill->reuse = candidate.reuse_path; }
     const UnitDemand& demand = transaction.reservation_demand;
 
     std::vector<pc::NodeRef> host_only;
     for (const pc::NodeRef node : path) {
         if (cache->node(node).device == pc::CopyState::Absent) { host_only.push_back(node); }
+    }
+    // Restored in slab order: the destinations below are consecutive Device pages, and a run of them copies as
+    // one strided transfer per plane only while its Host records ascend at one pitch. Path order is slab order
+    // only for blocks one release wrote; a path written by several lanes then broke into a copy per block.
+    if (host_only.size() > 1) {
+        std::vector<std::pair<std::uint32_t, pc::NodeRef>> by_slab;
+        by_slab.reserve(host_only.size());
+        for (const pc::NodeRef node : host_only) { by_slab.emplace_back(cache->node(node).host_slab, node); }
+        std::sort(by_slab.begin(), by_slab.end(),
+                  [](const auto& left, const auto& right) { return left.first < right.first; });
+        for (std::size_t i = 0; i < by_slab.size(); ++i) { host_only[i] = by_slab[i].second; }
     }
     const bool tail_restore  = tail != 0 && snapshot.tail_device_copy != pc::CopyState::Resident;
     const bool image_restore = reuse != 0 && snapshot.device_slot == pc::kNoId;
@@ -913,6 +923,18 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
         if (!transaction.reserved_state) {
             unwind();
             return {.shortage = {.state_slots = 1}};
+        }
+        // The request's prefill state is staged only now that the binding has its room: an attempt that reports
+        // a shortage, which the Engine repeats on later admission passes, copies no prompt and encodes no image.
+        // A resumed request brings its own (install_binding), so it stages none.
+        if (!resume) {
+            initialize_prefill(lane, reuse);
+            // The Begin summary names the hybrid path the Engine admitted (initialize_prefill knows only
+            // the legacy Checkpoint/Root pair).
+            if (reuse != 0) { requests[lane].prefill->reuse = candidate.reuse_path; }
+        } else if (offload) {
+            // Offloaded experts: the replay's routes credit the cache from zero, as a prompt's do.
+            offload->engine().clear_prompt_uses(lane);
         }
     } catch (...) {
         unwind();
@@ -1322,10 +1344,13 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         const std::span<const TokenId> tail_tokens(
             sequence.ledger.data() + static_cast<std::size_t>(full) * kBlock, tail);
         // publish_snapshot consumes the staging slot and the tail id on every outcome.
+        const std::uint64_t evicted       = counters.evicted_blocks;
         const pc::PublishResult published = index.publish_snapshot(
             anchor, tap.frontier, tail_tokens, tail_id, tap.slot,
             tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap);
         if (!published.created) {
+            // The tail copy came back through release_device_block, which counts evictions: it was none.
+            counters.evicted_blocks = evicted;
             (void)state_store->release(tap.image);
             // An identical snapshot serves the lineage; without one (a full snapshot table) the
             // superseded snapshots stay its resume point.
@@ -1739,12 +1764,23 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                         const pc::NodeRef anchor = anchor_blocks == 0
                                                        ? pc::NodeRef{}
                                                        : lane_state.path[anchor_blocks - 1U];
+                        const std::uint64_t evicted = hybrid_->counters().evicted_blocks;
                         const pc::PublishResult published =
                             index.publish_snapshot(anchor, frontier, tail_tokens, tail_id, *slot, kind);
-                        if (published.snapshot.valid()) {
+                        if (published.created) {
                             endpoint_published = true;
                             lane_state.deepest_snapshot =
                                 std::max(lane_state.deepest_snapshot, frontier);
+                            out = published.snapshot;
+                        } else if (published.snapshot.valid()) {
+                            // An identical snapshot exists already (another lane of the same conversation, or
+                            // an earlier run of this one): it is the lineage's resume point and is returned as
+                            // such, but this lane published nothing, so its source is not superseded for it
+                            // and its deepest snapshot stays (the supersession below then leaves the source).
+                            // The lane's tail came back through release_device_block: no eviction.
+                            hybrid_->counters().evicted_blocks = evicted;
+                            endpoint_published                 = true;
+                            hybrid_undo_supersession(lane_state, superseded);
                             out = published.snapshot;
                         } else {
                             skipped(); // a full snapshot table
@@ -1802,9 +1838,12 @@ bool ProgramImpl::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
                (backend_pool != nullptr && backend_pool->available_pages() < backend_target)) {
             const std::uint32_t count = hybrid_->index().evict_device_blocks(1);
             if (count == 0) {
-                // Blocks pinned only by their in-flight Host writes become evictable once those land.
-                if (!hybrid_->transfers_pending()) { break; }
-                hybrid_->drain();
+                // Blocks held only by an in-flight Host write or prefetch become evictable once it lands: the
+                // oldest one is waited for, and only while such blocks exist. Another lane's restore is never
+                // waited for (its blocks stay mapped); that wait stalled every lane's decode for its whole copy.
+                if (hybrid_->index().device_transfer_held_blocks() == 0 || !hybrid_->settle_oldest_transfer()) {
+                    break;
+                }
                 continue;
             }
             released += count;

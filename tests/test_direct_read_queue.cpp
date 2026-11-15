@@ -198,6 +198,21 @@ void test_faults(const std::filesystem::path& path) {
         check(queue.stats().timeouts == 3, "timeouts counted");
     }
     {
+        // A larger device read has the timeout for each 4 MiB of it: a stalled 12 MiB demand read is cancelled
+        // after three of them, not one.
+        DirectReadQueue::Options o;
+        o.timeout = std::chrono::milliseconds(300);
+        DirectReadQueue queue(o);
+        const auto file = queue.open(path);
+        Aligned large(12 << 20);
+        queue.set_faults({.stall_read = 1});
+        queue.submit({file, 0, 12 << 20, large.p, DirectReadQueue::Priority::Demand, 43});
+        const auto done = drain(queue, 1);
+        check(done.size() == 1 && done[0].status == DirectReadQueue::Status::Ok && done[0].attempts == 2 &&
+                  done[0].latency_ns >= 900'000'000 && queue.stats().timeouts == 1 && matches(large.p, 0, 12 << 20),
+              "a 12 MiB read's timeout is three times a 4 MiB read's");
+    }
+    {
         DirectReadQueue queue;
         const auto file = queue.open(path);
         const std::uint64_t last = (kFileBytes / kBlock) * kBlock; // the partial block

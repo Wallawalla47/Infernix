@@ -1502,11 +1502,9 @@ void test_host_tier_resize() {
         return std::any_of(slabs.begin(), slabs.end(), [](std::uint32_t slab) { return slab >= 8; });
     });
     require(!second.empty() && moving != snapshots.end(), "a snapshot past the second ceiling is planned to move");
-    (void)index.supersede(*moving);
-    auto pressure = index.reserve_host_image(false, kAny); // evicts the superseded snapshot first
-    require(pressure.has_value() && !index.valid(*moving), "the moving snapshot was evicted");
+    Withdrawal leaving{{}, {*moving}};
+    require(index.withdraw(leaving) == 1 && !index.valid(*moving), "the moving snapshot left");
     index.check_invariants();
-    index.release_host_image(std::move(*pressure));
     (void)index.commit_host_moves();
     index.check_invariants();
     while (!index.finish_host_shrink()) {
@@ -2105,6 +2103,7 @@ void test_ssd_write_back_and_demotion() {
     require(candidate.snapshot == end && candidate.image_on_ssd_only && candidate.ssd_only_blocks == 1 &&
                 candidate.ssd_bytes == (1U << 20U) + (4U << 20U),
             "the candidate reads one block and the image from the SSD");
+    require(candidate.ssd_unread_bytes == candidate.ssd_bytes, "nothing of it is being read yet");
     index.release_host_image(std::move(*image));
     index.release_host_image(std::move(*more));
     index.check_invariants();
@@ -2117,6 +2116,12 @@ void test_ssd_write_back_and_demotion() {
     require(index.begin_ssd_promotion(end).status == SsdPromotionStatus::Waiting,
             "a second request waits for the promotion in flight");
     index.check_invariants();
+    // While the read is in flight the source still needs it (ssd_bytes: the request waits for the
+    // promotion), but the cost model charges no second read: a source whose read is under way must not
+    // look as far away as an unread one.
+    const MatchCandidate reading = match_one(index, a);
+    require(reading.ssd_bytes == (1U << 20U) + (4U << 20U) && reading.ssd_unread_bytes == 0,
+            "a promotion in flight is not charged as an SSD read again");
     index.complete_ssd_promotion(*start.job);
     index.check_invariants();
     const MatchCandidate back = match_one(index, a);
@@ -2758,6 +2763,331 @@ void test_restore_plan() {
                    "a block that is its own parent must be rejected");
 }
 
+// A Host allocation during a shrink (2026-11-15): a slab at or past the ceiling retires when freed and a planned
+// move keeps its destination until it commits, so a snapshot whose slabs all lie past the ceiling frees nothing an
+// allocation can take. The feasibility check counted such slabs as room and the eviction took those snapshots first
+// (the GDSF minimum): they were lost for nothing, one after another.
+void test_allocation_during_host_shrink() {
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(24, 0), backend);
+    std::vector<std::vector<NodeRef>> paths;
+    std::vector<SnapshotRef> snapshots; // image i on slabs [4i, 4i + 4)
+    for (std::uint32_t s = 0; s < 5; ++s) {
+        paths.push_back(insert_sequence(index, backend, make_tokens(64, 800 + s)));
+        auto image = index.reserve_host_image(false, kAny);
+        require(image.has_value() && image->slabs.front() == 4 * s, "images take the lowest slabs in order");
+        snapshots.push_back(
+            index.publish_host_snapshot(paths.back()[0], 64, {}, std::nullopt, std::move(*image), SnapshotKind::Tap)
+                .snapshot);
+    }
+    // Twelve slabs stay: the two oldest images go, and the two past the ceiling are planned onto the freed slabs.
+    require(index.begin_host_shrink(12, 4) == 12, "the shrink keeps twelve slabs");
+    require(!index.valid(snapshots[0]) && !index.valid(snapshots[1]) && index.valid(snapshots[2]) &&
+                index.valid(snapshots[3]) && index.valid(snapshots[4]),
+            "the shrink evicted the two oldest images");
+    require(index.plan_host_moves().size() == 8 && index.stats().host_free_slabs == 0,
+            "both images past the ceiling are planned to move and no slab is free below it");
+    // The image below the ceiling is worth the most; the two being moved are the GDSF minimum.
+    index.note_hit(snapshots[2]);
+    const double moving_value = index.snapshot(snapshots[3]).priority;
+    require(index.snapshot(snapshots[2]).priority > moving_value, "the image below the ceiling is worth more");
+    index.check_invariants();
+
+    const std::uint64_t evictions = index.stats().host_snapshot_evictions;
+    // A claim only the moving images are within: their slabs are no room, so nothing is evicted.
+    require(!index.reserve_host_image(false, moving_value).has_value(), "no slab below the ceiling can be had");
+    require(index.stats().host_snapshot_evictions == evictions && index.valid(snapshots[2]) &&
+                index.valid(snapshots[3]) && index.valid(snapshots[4]),
+            "an allocation that only snapshots past the ceiling could serve must evict nothing");
+    // Any claim: exactly the one image below the ceiling yields, and the moving ones stay.
+    auto image = index.reserve_host_image(false, kAny);
+    require(image.has_value() && std::all_of(image->slabs.begin(), image->slabs.end(),
+                                             [](std::uint32_t slab) { return slab >= 8 && slab < 12; }),
+            "the allocation takes the slabs of the image below the ceiling");
+    require(index.stats().host_snapshot_evictions == evictions + 1 && !index.valid(snapshots[2]) &&
+                index.valid(snapshots[3]) && index.valid(snapshots[4]),
+            "exactly one snapshot is evicted for a four-slab allocation during a shrink");
+    index.check_invariants();
+    index.release_host_image(std::move(*image));
+    require(index.commit_host_moves() && index.finish_host_shrink() && index.stats().host_slab_limit == 12,
+            "the moves commit and the shrink ends");
+    for (const SnapshotRef moved : {snapshots[3], snapshots[4]}) {
+        const auto slabs = index.snapshot(moved).host_slabs;
+        require(std::all_of(slabs.begin(), slabs.end(), [](std::uint32_t slab) { return slab < 8; }),
+                "a moved image lies below the ceiling");
+    }
+    for (const auto& path : paths) { index.release_path(path); }
+    index.check_invariants();
+}
+
+// A shrink evicts nothing when what its eviction can free retires no granule (2026-11-15): the blocks a queue-held
+// snapshot keeps alive are no room, but only the held image itself was counted as kept, so the one unheld snapshot
+// was evicted and the ceiling then rounded back up to the limit.
+void test_shrink_counts_held_paths() {
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(16, 0), backend);
+    const auto held_path = insert_sequence(index, backend, make_tokens(64 * 6, 805));
+    for (const NodeRef node : held_path) { backup_node(index, node); }
+    auto held_image = index.reserve_host_image(false, kAny);
+    require(held_image.has_value(), "the held conversation's image fits");
+    const SnapshotRef held =
+        index.publish_host_snapshot(held_path[5], 64 * 6, {}, std::nullopt, std::move(*held_image), SnapshotKind::Tap)
+            .snapshot;
+    index.release_path(held_path);
+    const auto other_path = insert_sequence(index, backend, make_tokens(64, 806));
+    auto other_image      = index.reserve_host_image(false, kAny);
+    require(other_image.has_value(), "the unheld image fits");
+    const SnapshotRef unheld =
+        index.publish_host_snapshot(other_path[0], 64, {}, std::nullopt, std::move(*other_image), SnapshotKind::Tap)
+            .snapshot;
+    index.release_path(other_path);
+    index.set_queue_holds(std::span<const SnapshotRef>(&held, 1));
+    require(index.stats().host_free_slabs == 2, "ten held slabs, four unheld, two free");
+
+    // Eight-slab granules: the held conversation's ten slabs leave no granule to retire, whatever is evicted.
+    require(index.begin_host_shrink(8, 8) == 16 && !index.host_shrinking(), "nothing can be retired");
+    require(index.valid(unheld) && index.snapshot(unheld).host == CopyState::Resident &&
+                index.stats().host_snapshot_evictions == 0,
+            "a shrink that retires nothing must evict nothing");
+    // Without the hold everything can go: the shrink happens.
+    index.set_queue_holds({});
+    require(index.begin_host_shrink(8, 8) == 8 && index.host_shrinking(), "an unheld tier shrinks");
+    (void)index.plan_host_moves();
+    (void)index.commit_host_moves();
+    require(index.finish_host_shrink() && index.stats().host_slab_limit == 8, "the shrink ends at its ceiling");
+    index.check_invariants();
+}
+
+// The claim is judged on the values an allocation begins with (2026-11-15). Evicting a snapshot revalues the
+// snapshots below it: they resume from further up without it, so their value can rise past the claim. The
+// feasibility check counted them, the eviction then refused them, and the allocation failed after its first
+// victims were gone. A snapshot above the claim from the start is still never taken, and then nothing is.
+void test_claim_survives_revaluation() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(8, 0), backend); // two tail-less images
+    const auto tokens = make_tokens(64 * 8, 810);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const auto host_tap = [&](std::uint32_t blocks) {
+        auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+        require(image.has_value(), "an image fits");
+        return index
+            .publish_host_snapshot(path[blocks - 1U], blocks * 64U, {}, std::nullopt, std::move(*image), SnapshotKind::Tap)
+            .snapshot;
+    };
+    const SnapshotRef above = host_tap(2);
+    const SnapshotRef below = host_tap(8); // valued against `above`: the prefill of blocks 2-7
+    const double above_value = index.snapshot(above).priority;
+    const double below_value = index.snapshot(below).priority;
+    require(above_value < below_value && index.stats().host_free_slabs == 0, "the Host tier is full, `above` its minimum");
+
+    // A tailed image needs five slabs: both images. Between their values only `above` is within the claim.
+    require(!index.reserve_host_image(true, (above_value + below_value) / 2.0).has_value(),
+            "one four-slab image within the claim cannot serve five slabs");
+    require(index.valid(above) && index.valid(below) && index.stats().host_snapshot_evictions == 0,
+            "a refused allocation evicts nothing");
+    // Just above `below`'s value both are within the claim. Without `above`, `below` is worth the prefill from
+    // the root (more than this claim): it must still yield, or `above` was evicted for a refusal.
+    auto image = index.reserve_host_image(true, below_value * 1.05);
+    require(image.has_value(), "an allocation found feasible must complete");
+    require(!index.valid(above) && !index.valid(below) && index.stats().host_snapshot_evictions == 2,
+            "both snapshots within the claim yield");
+    require(index.stats().gdsf_inflation <= below_value * 1.05, "GDSF time never rises past the claim");
+    index.release_host_image(std::move(*image));
+    index.release_path(path);
+    index.check_invariants();
+}
+
+// A duplicate publication (2026-11-15): the lineage that published the same state again resumes from the
+// existing snapshot next, so a superseded one is retained again, and it takes what it lacks: the tail's
+// Device copy, and the Device slot when the caller asks (it attaches the image).
+void test_duplicate_publication() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens      = make_tokens(64, 820);
+    const auto tail_tokens = make_tokens(10, 821);
+    const auto path        = insert_sequence(index, backend, tokens);
+    auto reservation       = index.reserve_host_image(true, std::numeric_limits<double>::infinity());
+    require(reservation.has_value(), "a tailed image fits");
+    const SnapshotRef endpoint =
+        index.publish_host_snapshot(path[0], 74, tail_tokens, std::nullopt, std::move(*reservation), SnapshotKind::Endpoint)
+            .snapshot;
+    require(index.supersede(endpoint), "another lineage moved past the endpoint");
+
+    // The endpoint published again from the Device: its tail's Device copy is taken, the slot is not asked for.
+    const auto slot           = index.acquire_device_slot();
+    const std::uint32_t tail1 = backend.allocate();
+    const PublishResult first =
+        index.publish_snapshot(path[0], 74, tail_tokens, tail1, *slot, SnapshotKind::Endpoint);
+    require(!first.created && first.snapshot == endpoint && first.tail_adopted && !first.device_adopted,
+            "a duplicate returns the existing snapshot and gives it the tail copy it lacked");
+    SnapshotView view = index.snapshot(endpoint);
+    require(!view.superseded, "a duplicate publication must retain a superseded snapshot again");
+    require(view.tail_device == tail1 && view.tail_device_copy == CopyState::Resident && backend.live.count(tail1) == 1,
+            "the tail's Device copy is the snapshot's");
+    require(view.device_slot == kNoId && index.stats().free_device_slots == 1,
+            "a slot the caller did not offer is freed");
+    index.check_invariants();
+
+    // Again, offering the slot: the snapshot owns it now; its tail copy is there already.
+    const auto slot2          = index.acquire_device_slot();
+    const std::uint32_t tail2 = backend.allocate();
+    const PublishResult second =
+        index.publish_snapshot(path[0], 74, tail_tokens, tail2, *slot2, SnapshotKind::Endpoint, std::nullopt, true);
+    require(!second.created && second.snapshot == endpoint && second.device_adopted && !second.tail_adopted,
+            "a duplicate gives the existing snapshot the Device slot it lacked");
+    view = index.snapshot(endpoint);
+    require(view.device_slot == *slot2 && index.slot_owner(*slot2) == endpoint && index.stats().free_device_slots == 0,
+            "the staging slot is the snapshot's");
+    require(view.tail_device == tail1 && backend.live.count(tail2) == 0, "a tail copy it does not need is released");
+    index.release_path(path);
+    index.check_invariants();
+}
+
+// Device eviction takes dead blocks first (2026-11-15): a block with no snapshot at or below it serves no request,
+// yet as an unbacked copy it used to go after every backed copy, held ones included, so live conversations lost their
+// Device KV (a Host restore at their next turn) while dead pages kept theirs. Found at the first lists looked at,
+// however many live blocks are cached.
+void test_dead_device_blocks_first() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 4), backend);
+    const auto conversation = [&](std::uint32_t seed, bool snapshot, bool backed) {
+        const auto path = insert_sequence(index, backend, make_tokens(128, seed));
+        if (backed) {
+            for (const NodeRef node : path) { backup_node(index, node); }
+        }
+        return std::pair{path, snapshot ? publish_tap(index, path[1]) : SnapshotRef{}};
+    };
+    const auto [live_backed, tap_backed]     = conversation(830, true, true);
+    const auto [held_backed, tap_held]       = conversation(831, true, true);
+    const auto [live_unbacked, tap_unbacked] = conversation(832, true, false);
+    const auto [dead_backed, none_a]         = conversation(833, false, true);
+    const auto [dead_unbacked, none_b]       = conversation(834, false, false);
+    // The dead paths are released last: plain recency would evict them last.
+    for (const auto* path : {&live_backed, &held_backed, &live_unbacked, &dead_backed, &dead_unbacked}) {
+        index.release_path(*path);
+    }
+    index.set_queue_holds(std::vector<SnapshotRef>{tap_held});
+    index.check_invariants();
+    require(index.device_evictable_blocks() == 10, "every block is evictable");
+    const auto resident = [&](const std::vector<NodeRef>& path) {
+        return std::all_of(path.begin(), path.end(), [&](NodeRef node) {
+            return index.valid(node) && index.node(node).device == CopyState::Resident;
+        });
+    };
+
+    std::uint64_t probes = index.operations().device_list_probes;
+    require(index.evict_device_blocks(1) == 1 && index.node(dead_backed[1]).device == CopyState::Absent,
+            "a dead backed block goes first, the deepest first");
+    require(index.operations().device_list_probes - probes == 1, "a dead backed block is found at the first list");
+    require(index.evict_backed_device_blocks(1) == 1 && index.node(dead_backed[0]).device == CopyState::Absent,
+            "a backed-only eviction takes dead blocks first too");
+    require(index.valid(dead_backed[0]) && index.node(dead_backed[0]).host == CopyState::Resident,
+            "a dead backed block keeps its Host copy for the Host tier's own sweep");
+    probes = index.operations().device_list_probes;
+    require(index.evict_device_blocks(1) == 1 && !index.valid(dead_unbacked[1]) && index.valid(dead_unbacked[0]),
+            "a dead unbacked block goes next, before any live copy");
+    require(index.operations().device_list_probes - probes == 2, "a dead unbacked block is found at the second list");
+    require(index.evict_device_blocks(1) == 1 && !index.valid(dead_unbacked[0]), "the last dead block");
+    require(resident(live_backed) && resident(held_backed) && resident(live_unbacked) &&
+                index.valid(tap_backed) && index.valid(tap_held) && index.valid(tap_unbacked) &&
+                index.stats().held_device_evictions == 0 && index.stats().unbacked_node_losses == 2,
+            "no live block, held or not, lost its Device copy to a dead one's eviction");
+    index.check_invariants();
+    // A backed-only eviction leaves a dead unbacked block alone: it is that block's last copy.
+    const auto again = insert_sequence(index, backend, make_tokens(128, 835));
+    index.release_path(again);
+    require(index.evict_backed_device_blocks(1) == 1 && resident(again) &&
+                index.node(live_backed[1]).device == CopyState::Absent,
+            "a backed-only eviction takes a live backed copy before a dead unbacked one");
+    // With the dead gone, the order is the one before: unheld backed, held backed, then unbacked.
+    require(index.evict_device_blocks(1) == 1 && !index.valid(again[1]), "the dead block goes before the rest");
+    index.set_queue_holds({});
+    index.check_invariants();
+}
+
+// A retained snapshot's value counts the path blocks it alone keeps (2026-11-15). A retained snapshot on another
+// branch that shares blocks with it (no snapshot where the two part) changes that count when it is published,
+// superseded, retained again or removed; it was revalued only at its own next hit.
+void test_sibling_revaluation() {
+    RecordingBackend backend;
+    const PrefixIndexConfig config = small_config(0, 4);
+    PrefixCacheIndex index(config, backend);
+    const auto value = [&](std::uint32_t exclusive_blocks) {
+        const double saved = config.cost.prefill_seconds(0, 512) - config.cost.restore_seconds(config.image_bytes);
+        return saved / (static_cast<double>(config.image_bytes) +
+                        static_cast<double>(exclusive_blocks) * static_cast<double>(config.block_bytes));
+    };
+    const auto same = [](double got, double want) { return std::abs(got - want) <= 1e-12 * want; };
+    const auto first = make_tokens(64 * 8, 840);
+    std::vector<TokenId> second(first.begin(), first.begin() + 64 * 4); // four shared blocks, four of its own
+    const auto suffix = make_tokens(64 * 4, 841);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    const auto first_path = insert_sequence(index, backend, first);
+    const SnapshotRef a   = publish_at(index, backend, first_path, first, 512, SnapshotKind::Tap);
+    require(same(index.snapshot(a).priority, value(8)), "alone, the snapshot keeps its eight blocks");
+    const auto second_path = insert_sequence(index, backend, second);
+    const SnapshotRef b    = publish_at(index, backend, second_path, second, 512, SnapshotKind::Tap);
+    require(same(index.snapshot(b).priority, value(4)), "the new snapshot keeps its own four blocks");
+    require(same(index.snapshot(a).priority, value(4)),
+            "a sibling's publication leaves the first snapshot only its own four blocks");
+    require(index.supersede(b) && same(index.snapshot(a).priority, value(8)),
+            "a superseded sibling keeps no block: the first snapshot has all eight again");
+    index.unsupersede(b);
+    require(same(index.snapshot(a).priority, value(4)), "retained again, the sibling shares them again");
+    Withdrawal gone{{}, {b}};
+    require(index.withdraw(gone) == 1 && same(index.snapshot(a).priority, value(8)),
+            "a removed sibling returns the shared blocks to the first snapshot");
+    index.release_path(first_path);
+    index.release_path(second_path);
+    index.check_invariants();
+}
+
+// GDSF time after slot rotations (2026-11-15). With Device-only owners in every slot the least valuable one
+// yields to any new snapshot (§9.2), though it is worth more than the claim. Raising GDSF time to its value on
+// every rotation aged the whole cache by a hot owner's value per new snapshot: time rises no further than the
+// least valuable retained snapshot's value.
+void test_rotation_keeps_gdsf_time() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 2), backend);
+    const auto long_tokens = make_tokens(64 * 20, 850);
+    const auto long_path   = insert_sequence(index, backend, long_tokens);
+    const SnapshotRef long_end = publish_at(index, backend, long_path, long_tokens, 64 * 20, SnapshotKind::Endpoint);
+    const auto short_tokens    = make_tokens(64 * 2, 851);
+    const auto short_path      = insert_sequence(index, backend, short_tokens);
+    const SnapshotRef short_end = publish_at(index, backend, short_path, short_tokens, 64 * 2, SnapshotKind::Endpoint);
+    // The cache's least valuable snapshot lives on the Host only.
+    const auto cheap_path = insert_sequence(index, backend, make_tokens(64, 852));
+    auto image            = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(image.has_value(), "a Host image fits");
+    const SnapshotRef cheap =
+        index.publish_host_snapshot(cheap_path[0], 64, {}, std::nullopt, std::move(*image), SnapshotKind::Tap).snapshot;
+    const double cheap_value = index.snapshot(cheap).priority;
+    const double short_value = index.snapshot(short_end).priority;
+    require(cheap_value < short_value && short_value < index.snapshot(long_end).priority &&
+                index.stats().gdsf_inflation == 0.0,
+            "the Host snapshot is the minimum, the long conversation's endpoint the maximum");
+
+    const auto rotated = index.acquire_device_slot(0.0);
+    require(rotated.has_value() && !index.valid(short_end) && index.valid(long_end), "the lesser owner's slot rotates");
+    require(index.stats().gdsf_inflation == cheap_value,
+            "a rotation must not raise GDSF time past the least valuable retained snapshot");
+    // The next conversation's endpoint takes the slot and rotates out in turn: time stays.
+    const auto next_tokens = make_tokens(64 * 2, 853);
+    const auto next_path   = insert_sequence(index, backend, next_tokens);
+    const SnapshotRef next =
+        index.publish_snapshot(next_path[1], 128, {}, std::nullopt, *rotated, SnapshotKind::Endpoint).snapshot;
+    require(index.valid(next) && index.snapshot(next).priority > cheap_value, "the new endpoint is worth more");
+    const auto again = index.acquire_device_slot(0.0);
+    require(again.has_value() && !index.valid(next) && index.valid(long_end) && index.valid(cheap),
+            "the new endpoint rotates out, the long conversation keeps its slot");
+    require(index.stats().gdsf_inflation == cheap_value, "GDSF time is unchanged by a second rotation");
+    index.release_device_slot(*again);
+    for (const auto* path : {&long_path, &short_path, &cheap_path, &next_path}) { index.release_path(*path); }
+    index.check_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -2805,6 +3135,13 @@ int main() {
         test_ssd_promotion_abort();
         test_ssd_device_slots();
         test_ssd_random_stress();
+        test_allocation_during_host_shrink();
+        test_shrink_counts_held_paths();
+        test_claim_survives_revaluation();
+        test_duplicate_publication();
+        test_dead_device_blocks_first();
+        test_sibling_revaluation();
+        test_rotation_keeps_gdsf_time();
         test_tap_planner();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

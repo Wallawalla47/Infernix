@@ -248,16 +248,18 @@ std::pair<HostKVAllocation, HostKVAllocation> HostKVArena::split(HostKVAllocatio
     if (page_offset == 0 || page_offset >= original.pages) {
         throw std::out_of_range("Host KV split must leave two non-empty allocations");
     }
-    const std::uint32_t right_index = take_descriptor();
-    if (right_index == std::numeric_limits<std::uint32_t>::max()) {
+    if (free_descriptors_.empty()) {
         throw std::logic_error("Host KV descriptor capacity invariant was violated");
     }
 
     const std::size_t stride        = layouts_[original.layout].page_stride;
     const std::uint32_t right_pages = original.pages - page_offset;
-    Descriptor& right               = descriptors_[right_index];
+    // The arena's split may throw: the right half's descriptor is taken only once it has not, so a failed split
+    // leaves the descriptor pool as it was.
     auto pieces =
         arena_->split(std::move(original.storage), static_cast<std::size_t>(page_offset) * stride);
+    const std::uint32_t right_index = take_descriptor();
+    Descriptor& right               = descriptors_[right_index];
     original.storage = std::move(pieces.first);
     right.storage    = std::move(pieces.second);
     right.layout     = original.layout;

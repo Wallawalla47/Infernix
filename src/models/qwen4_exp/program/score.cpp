@@ -49,7 +49,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
     execution.requested_output_tokens = 1;
     execution.allow_prefix_reuse      = false;
     RequestBasePlan base = plan_request(std::move(prompt), execution);
-    const std::vector<SourceCandidate> sources = hybrid_sources(base, UINT32_MAX);
+    const std::vector<SourceCandidate> sources = hybrid_sources(base, nullptr);
     if (sources.empty()) { throw std::logic_error("Qwen4Exp: causal scoring has no binding source"); }
     if (!start_binding(base, runtime::LaneId{0}, sources.back(), nullptr).reserved) {
         throw std::runtime_error("Qwen4Exp: the KV cache cannot hold the scored window");

@@ -125,10 +125,24 @@ public:
     // Starts reading the parts of `snapshot` only on the SSD into the Host tier.
     [[nodiscard]] Promotion promote(PrefixCacheIndex& index, SnapshotRef snapshot);
     [[nodiscard]] bool promoting() const noexcept { return promotions_in_flight_ != 0; }
-    // Whether poll would start a write-back (the idle Engine runs its maintenance for it): the Host
-    // tier's lossless room was below target with a write slot free and no recent refusal when the
-    // tier last applied transfers. Lock-free: the Engine reads it outside its execution lock.
-    [[nodiscard]] bool write_back_due() const noexcept { return due_.load(std::memory_order_relaxed); }
+    // Whether poll would start a write-back now (the idle Engine runs its maintenance for it): the Host
+    // tier's lossless room was below target with a write slot free when the tier last applied
+    // transfers, and the time of the next attempt has come. Lock-free: the Engine reads it outside its
+    // execution lock.
+    [[nodiscard]] bool write_back_due() const noexcept {
+        return wanted_.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now().time_since_epoch().count() >= retry_at_.load(std::memory_order_relaxed);
+    }
+    // While write-back is wanted (as above, whatever the time): when poll next tries, which is in the
+    // past when it is due now. Absent when nothing is wanted. A refused attempt (no candidate could be
+    // written yet: its Host copies were still landing, or the SSD had no room) is tried again 100 ms
+    // later, doubling up to 2 s while the index publishes nothing new, so the idle Engine waits until
+    // this time instead of for a wake that may never come. Lock-free, like write_back_due.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> write_back_retry_at() const noexcept {
+        if (!wanted_.load(std::memory_order_relaxed)) { return std::nullopt; }
+        return std::chrono::steady_clock::time_point{
+            std::chrono::steady_clock::duration{retry_at_.load(std::memory_order_relaxed)}};
+    }
     [[nodiscard]] bool busy() const noexcept { return !jobs_.empty(); }
     // Waits for every transfer and codec job in flight and applies it, starting nothing new (before a
     // Host tier resize, a save or the cache's teardown).
@@ -150,8 +164,12 @@ private:
         Phase phase              = Phase::Io;
         Staging staging;              // the codec stream (packed images)
         std::size_t stream_bytes = 0; // its encoded length
+        // Codec-thread tasks of a promotion still running: its decode parts and the zero fill of the image
+        // slabs its SSD copy leaves out. It lands once its reads are done (`read_done`) and none is left.
         std::atomic<std::uint32_t> parts{0};
         std::atomic<bool> failed{false};
+        bool read_done = false;   // Engine thread
+        bool zero_posted = false; // the zero fill runs on a codec thread (else land_promotion does it)
         // Kept file: each transferred SSD slab and its content hash (the I/O threads fill `hashes`).
         std::vector<std::uint32_t> hash_slabs;
         std::vector<std::uint64_t> hashes;
@@ -164,7 +182,11 @@ private:
     void start_decode(std::uint64_t tag, Job& job);
     void start_write_backs(PrefixCacheIndex& index);
     [[nodiscard]] std::uint64_t write_back_target(const PrefixCacheIndex& index) const noexcept;
-    [[nodiscard]] bool compute_due(const PrefixCacheIndex& index) const noexcept;
+    [[nodiscard]] bool compute_wanted(const PrefixCacheIndex& index) const noexcept;
+    // Publishes compute_wanted and the next attempt's time for write_back_due / write_back_retry_at.
+    void publish_due(const PrefixCacheIndex& index) noexcept;
+    // A promotion's reads have finished (`ok`): it lands now, or once its codec-thread tasks have.
+    void reads_finished(PrefixCacheIndex& index, std::uint64_t tag, Job& job, bool ok);
     [[nodiscard]] bool budget_still_blocked(const PrefixCacheIndex& index) const noexcept;
     [[nodiscard]] DirectScratchFile::Batch batch(std::uint64_t tag, DirectScratchFile::Op op, Job& job) const;
     // A promotion's reads against the hashes the previous run saved; false when a slab differs.
@@ -176,7 +198,8 @@ private:
     void give_staging(Staging staging) noexcept;
     void codec_done(std::uint64_t tag);
 
-    std::atomic<bool> due_{false};
+    std::atomic<bool> wanted_{false};
+    std::atomic<std::chrono::steady_clock::rep> retry_at_{0}; // next_write_attempt_, as its count since the epoch
     DirectScratchFile file_;
     std::size_t slab_bytes_ = 0;
     // Kept file: every slab's content hash, and the slabs of the previous run not read back since.
@@ -195,6 +218,11 @@ private:
     // landing for poll, so the waiting request is quoted again.
     bool room_wanted_                    = false;
     std::chrono::steady_clock::time_point next_write_attempt_{};
+    // The wait after a refused attempt, and the index's snapshot epoch at the last refusal (the wait doubles
+    // only while nothing new was published).
+    std::chrono::milliseconds write_retry_{0};
+    bool refused_               = false;
+    std::uint64_t refused_epoch_ = 0;
     std::vector<DirectScratchFile::Completion> completions_;
     Counters counters_;
     std::string last_error_;
@@ -214,6 +242,7 @@ private:
     bool packed_write_busy_ = false;
     std::mutex codec_mutex_;
     std::vector<std::uint64_t> codec_finished_;
+    std::mutex waker_mutex_; // waker_ and its calls (codec threads)
     std::function<void()> waker_;
 };
 

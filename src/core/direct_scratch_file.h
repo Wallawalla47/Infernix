@@ -41,6 +41,10 @@ public:
         // Empty: a uniquely named scratch file in the directory, removed at the end. Otherwise this file,
         // kept and reused (above).
         std::filesystem::path kept_file;
+        // With kept_file: the file must exist with exactly `bytes` and is opened for reading only (shared
+        // with other readers, never created, resized or locked); a write batch is refused. For reading a
+        // finished file with this class's queued, hashed transfers (the prefix cache file's load).
+        bool read_only = false;
     };
 
     enum class Op : std::uint8_t { Read, Write };
@@ -91,8 +95,8 @@ public:
     // std::system_error when the drive refuses.
     void flush();
 
-    // Queues a batch; throws std::invalid_argument for an empty batch, a misaligned or empty I/O, or
-    // one past the end of the file.
+    // Queues a batch; throws std::invalid_argument for an empty batch, a misaligned or empty I/O, one
+    // past the end of the file, or a write to a read-only file.
     void submit(Batch batch);
     // Appends every batch finished since the last call; never blocks. Returns the number appended.
     std::size_t poll(std::vector<Completion>& out);
@@ -100,7 +104,9 @@ public:
     void wait_idle();
     // Batches submitted and not yet returned by poll.
     [[nodiscard]] std::size_t outstanding() const noexcept;
-    // Called on an I/O thread after each batch finishes (no lock held); empty to clear.
+    // Called on an I/O thread after each batch finishes, under a lock of its own that set_waker takes too:
+    // when set_waker returns, the waker it replaced is not running and will not run. Empty to clear. The
+    // waker must not call set_waker.
     void set_waker(std::function<void()> waker);
 
 private:

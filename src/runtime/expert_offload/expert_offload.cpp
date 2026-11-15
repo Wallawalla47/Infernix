@@ -345,7 +345,11 @@ void ExpertOffload::create_tier() {
 void ExpertOffload::plan_exclusive(const ExpertStore& store, HostExpertTier::Options& tier) {
     const std::uint64_t keys   = static_cast<std::uint64_t>(store.layers()) * store.experts();
     const std::uint64_t frame  = residency_->frame_bytes();
-    const std::uint64_t frames = size_expert_frames(vram_->query(), frame_demand(frame)).frames;
+    // The frames size_frames will back: less the chunk of slack each pool keeps off the count, so the seeds and the
+    // shadows are planned for the cache that starts, not one a chunk a pool larger.
+    const std::uint64_t sized  = size_expert_frames(vram_->query(), frame_demand(frame)).frames;
+    const std::uint64_t slack  = pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, frame);
+    const std::uint64_t frames = sized > slack ? sized - slack : 0;
     const auto in_frames       = [frame](std::uint64_t bytes) { return (bytes + frame - 1) / frame; };
     const std::uint64_t loan   = 2ULL * setup_.layout.experts + 1 + in_frames(setup_.loan_bytes);
     // The warm start seeds half the frames, as the full layout's: seeding every frame the shadows leave kept 5.8 GiB

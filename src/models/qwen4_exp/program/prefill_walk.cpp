@@ -432,7 +432,10 @@ void ProgramImpl::walk_plan_taps(Lane& lane) {
         }
         const bool tail   = B % kBlock != 0;
         const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail));
-        if (!staged) { continue; }
+        if (!staged) {
+            prefix_retry_tap(lane, B, forward); // no Host room now: due again at the next chunk's end
+            continue;
+        }
         walk_.taps[c] = {B, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, *staged};
         deepest       = B;
     }
@@ -526,6 +529,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;
         out.complete                = false;
+        out.snapshot_published      = prefix_publications_observed(); // a tap of the span before this one landed
         out.timing.submit_host_ns   = elapsed_ns(start);
         lane.prefill_ns += out.timing.submit_host_ns;
         return out;

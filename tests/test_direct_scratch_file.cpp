@@ -176,6 +176,69 @@ int main() {
         DirectScratchFile odd(directory, 1000);
         check(false, "a size not a multiple of 4 KiB is refused");
     } catch (const std::invalid_argument&) {}
+    // A kept file: reopened with another size it starts over at that size on the drive (a smaller one is
+    // cut, on every platform), and a finished one opens for reading only, shared and unchanged.
+    try {
+        const std::filesystem::path kept = directory / "kept.bin";
+        Aligned memory(4 * kSlab);
+        std::uint64_t hashes[4] = {};
+        {
+            DirectScratchFile file(directory, 8 * kSlab, DirectScratchFile::Options{.kept_file = kept});
+            check(!file.kept_content(), "a new kept file holds nothing");
+        }
+        check(std::filesystem::file_size(kept) == 8 * kSlab, "a kept file stays, at its size");
+        {
+            DirectScratchFile file(directory, 4 * kSlab, DirectScratchFile::Options{.kept_file = kept});
+            check(!file.kept_content(), "a kept file of another size is not the previous run's");
+            for (std::uint64_t slab = 0; slab < 4; ++slab) { fill(memory.p + slab * kSlab, slab, 5); }
+            file.submit(DirectScratchFile::Batch{
+                .tag = 1,
+                .op  = DirectScratchFile::Op::Write,
+                .ios = {{.offset = 0, .bytes = 4 * kSlab, .memory = memory.p, .hashes = hashes, .hash_stride = kSlab}}});
+            const auto written = collect(file, 1);
+            check(written.size() == 1 && written.front().ok, "the kept file is written");
+            file.flush();
+        }
+        check(std::filesystem::file_size(kept) == 4 * kSlab, "a kept file reopened smaller is cut to the new size");
+        std::fill(memory.p, memory.p + memory.bytes, std::byte{0});
+        {
+            DirectScratchFile reader(directory, 4 * kSlab, DirectScratchFile::Options{.kept_file = kept, .read_only = true});
+            DirectScratchFile second(directory, 4 * kSlab, DirectScratchFile::Options{.kept_file = kept, .read_only = true});
+            check(reader.kept_content() && second.kept_content(), "a finished file opens for reading, twice at once");
+            std::uint64_t read_hashes[4] = {};
+            reader.submit(DirectScratchFile::Batch{
+                .tag = 2,
+                .op  = DirectScratchFile::Op::Read,
+                .ios = {{.offset = 0, .bytes = 4 * kSlab, .memory = memory.p, .hashes = read_hashes, .hash_stride = kSlab}}});
+            const auto got = collect(reader, 1);
+            bool exact     = got.size() == 1 && got.front().ok;
+            for (std::uint64_t slab = 0; slab < 4; ++slab) {
+                exact = exact && holds(memory.p + slab * kSlab, slab, 5) && read_hashes[slab] == hashes[slab] && hashes[slab] != 0;
+            }
+            check(exact, "it returns what was written, each slab with the hash taken when it was written");
+            try {
+                reader.submit(DirectScratchFile::Batch{.tag = 3,
+                                                       .op  = DirectScratchFile::Op::Write,
+                                                       .ios = {{.offset = 0, .bytes = kSlab, .memory = memory.p}}});
+                check(false, "a write to a read-only file is refused");
+            } catch (const std::invalid_argument&) {}
+        }
+        check(std::filesystem::file_size(kept) == 4 * kSlab, "reading leaves the file as it was");
+        try {
+            DirectScratchFile wrong(directory, 8 * kSlab, DirectScratchFile::Options{.kept_file = kept, .read_only = true});
+            check(false, "a read-only file of another size is refused");
+        } catch (const std::system_error&) {}
+        check(std::filesystem::file_size(kept) == 4 * kSlab, "and is not resized");
+        try {
+            DirectScratchFile absent(directory, 4 * kSlab,
+                                     DirectScratchFile::Options{.kept_file = directory / "absent.bin", .read_only = true});
+            check(false, "a missing read-only file is refused");
+        } catch (const std::system_error&) {}
+        check(!std::filesystem::exists(directory / "absent.bin"), "and is not created");
+    } catch (const std::exception& error) {
+        ++failures;
+        std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
+    }
     std::error_code ec;
     std::filesystem::remove_all(directory, ec);
     if (failures != 0) {

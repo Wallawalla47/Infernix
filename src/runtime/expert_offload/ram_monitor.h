@@ -18,8 +18,10 @@
 // engine thread asks decide() in the Program's maintenance with the tiers' room, starts it and reports the room left
 // (resized) once it completed, which asks for the next growth piece at once.
 
+#include "core/host_memory.h"
 #include "core/host_memory_worker.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +31,15 @@
 #include <thread>
 
 namespace infernix::runtime::expert_offload {
+
+// The memory the resize law reads: what the OS can still hand out, in physical pages and in commit, whichever is
+// less. The tiers are committed as well as resident (page-locked), so a system that runs out of commit (a small page
+// file, another program committing memory it has not touched yet) refuses other programs' allocations while physical
+// memory still looks free: the tiers give back then too, and a growth never takes commit the system lacks. Linux
+// commits lazily (the snapshot's commit is its physical memory plus free swap), so there this is the physical reading.
+[[nodiscard]] constexpr std::uint64_t resize_available(const HostMemorySnapshot& snapshot) noexcept {
+    return std::min(snapshot.available_physical, snapshot.available_commit);
+}
 
 struct RamDecision {
     std::uint64_t release = 0; // bytes the tiers should give back now
@@ -41,6 +52,9 @@ public:
     static constexpr std::uint64_t kPressureFloorBytes = 2ULL << 30U;
     static constexpr std::uint64_t kStepBytes          = 1ULL << 30U;
     static constexpr double kGrowHoldSeconds           = 10.0;
+    // A growth that took nothing doubles the hold before the next attempt, up to this; one that took memory, or a
+    // release, returns it to kGrowHoldSeconds.
+    static constexpr double kGrowHoldMaximumSeconds = 640.0;
     // Under pressure with no room known, the tiers are asked again this often (pins of the last round may have gone).
     static constexpr double kRecheckSeconds = 30.0;
 
@@ -53,6 +67,11 @@ public:
     [[nodiscard]] std::uint64_t relieve_point() const noexcept { return relieve_; }
     // What growth leaves available: the relieve point plus a step (a growth into it would soon be given back).
     [[nodiscard]] std::uint64_t growth_floor() const noexcept { return relieve_ + kStepBytes; }
+    // Less than twice the pressure point is available: a release may be due within one ordinary period, so the
+    // monitor reads more often (RamMonitor::poll_period).
+    [[nodiscard]] bool near_pressure(std::uint64_t available) const noexcept { return available < 2U * pressure_; }
+    // How long growth waits now (kGrowHoldSeconds, longer after refused growths).
+    [[nodiscard]] double grow_hold_seconds() const noexcept { return grow_hold_; }
 
     // One reading of the available physical memory at `now` (seconds, any epoch); whether the engine should look:
     // a resize is due given the tiers' room (set_room), or, under pressure with no room, kRecheckSeconds have passed
@@ -64,10 +83,13 @@ public:
     // steps), else a growth of at most what stays above the growth floor (whole steps), once more than it has held
     // for kGrowHoldSeconds since the last hold.
     [[nodiscard]] RamDecision decide(std::uint64_t available, double now) const noexcept;
-    // The tiers were resized at `now`; `hold`: growth waits kGrowHoldSeconds again (after a release, or a growth
-    // that took nothing), else its next piece is due at once.
-    void resized(double now, bool hold) noexcept {
+    // The tiers were resized at `now`; `hold`: growth waits again (after a release, or a growth that took nothing),
+    // else its next piece is due at once. `refused`: the resize was a growth that took nothing, so the wait doubles
+    // (to kGrowHoldMaximumSeconds at most): every attempt commits, zeroes and tries to page-lock a chunk beside
+    // running requests, and what refused it (the page-lock limit, the commit limit) rarely changes within seconds.
+    void resized(double now, bool hold, bool refused = false) noexcept {
         if (hold) { last_hold_ = now; }
+        grow_hold_ = refused ? std::min(2.0 * grow_hold_, kGrowHoldMaximumSeconds) : kGrowHoldSeconds;
     }
     // What the tiers can still release and take back.
     void set_room(std::uint64_t shrinkable, std::uint64_t growable) noexcept {
@@ -78,6 +100,7 @@ public:
 private:
     std::uint64_t pressure_, relieve_;
     std::uint64_t shrinkable_ = 0, growable_ = 0;
+    double grow_hold_   = kGrowHoldSeconds;
     double above_since_ = -1.0; // since when the growth floor has been exceeded (-1: not now)
     double last_hold_   = -1.0e30;
     double last_check_  = -1.0e30;
@@ -113,6 +136,10 @@ public:
     [[nodiscard]] std::uint64_t available() const noexcept { return available_.load(std::memory_order_relaxed); }
     std::uint64_t measure();
     [[nodiscard]] const RamControl& control() const noexcept { return control_; }
+    // The wait before the next reading after one of `available`: the period, a tenth of it (at least 1 ms) while
+    // less than twice the pressure point is available. A reading costs microseconds.
+    static constexpr int kNearPressurePollDivisor = 10;
+    [[nodiscard]] std::chrono::milliseconds poll_period(std::uint64_t available) const noexcept;
     // The thread the tiers' memory work runs on.
     [[nodiscard]] HostMemoryWorker& worker() noexcept { return worker_; }
 
@@ -127,7 +154,8 @@ private:
     std::condition_variable stop_cv_;
     bool stopping_ = false;
     RamControl control_;
-    std::function<void()> wake_;
+    bool growing_ = false; // mutex_: the last decide() asked for a growth (resized() then knows a refused one)
+    std::function<void()> wake_; // called under mutex_ only (poke)
     std::atomic<std::uint64_t> available_{0};
     std::atomic<bool> due_{false};
     std::atomic<bool> busy_{false};

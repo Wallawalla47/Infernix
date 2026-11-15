@@ -144,6 +144,7 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     if (!constraint.empty()) { constraint.serial = next_constraint_serial_++; }
     base->constraint = std::move(constraint);
     base->allow_prefix_reuse             = options.allow_prefix_reuse && prompt.identity.reusable;
+    base->background                     = options.background;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     if (prompt.has_media()) {
@@ -289,9 +290,12 @@ std::uint32_t ProgramImpl::prefill_step_tokens(const SequenceState& sequence,
     // idle-wide-prefill: a step beside a lane that waits to decode stays one chunk, which bounds
     // that lane's stall; with none waiting it may take the idle width. A Vision prompt keeps the
     // chunk (its media is staged per chunk), and so does a recovering request, whose resume
-    // coverage was planned in chunks.
+    // coverage was planned in chunks. The Engine's idle-time pass keeps the chunk too: it yields to
+    // an arriving request at its next unit boundary, which a wide step would put up to the idle
+    // width away.
     if (idle_prefill_width <= prefill_chunk || !request.prefill || request.prefill->vision ||
-        request.recovery || !sequence.kv || other_lane_generating(sequence.lane)) {
+        request.recovery || !sequence.kv || other_lane_generating(sequence.lane) ||
+        (request.base && request.base->background)) {
         return prefill_chunk;
     }
     const RequestControl::Prefill& staged = *request.prefill;

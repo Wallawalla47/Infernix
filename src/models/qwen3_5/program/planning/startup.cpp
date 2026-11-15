@@ -16,6 +16,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
+#include "core/vmm_arena.h"
 #include "infernix/ops/argmax.h"
 #include "core/temporary_switches.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -301,7 +302,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // Offloaded experts take the VRAM the Program leaves, so a generation Program's text KV pages grow
     // from them on demand (elastic KV): planned in their own region, backed beyond kElasticKvBaseTokens
     // as requests need. (Every capacity plans the region the same way, so the plan stays affine in it.)
-    const bool elastic_kv = parameters.model.offloaded_experts() && !plan.causal_scoring;
+    // Without CUDA virtual memory management there is no region to reserve: the planes are planned in the
+    // persistent arena, whole, as the expert frames fall back to one allocation (ExpertResidency).
+    const bool elastic_kv =
+        parameters.model.offloaded_experts() && !plan.causal_scoring && VmmArena::supported(plan.device);
     LayoutBuilder text_pages;
     out.decoder = qwen3_5::plan_decoder_state(
         builder, qwen3_5::DecoderStateSpec{

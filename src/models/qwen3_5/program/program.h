@@ -305,6 +305,9 @@ struct PrefillProgress {
     // Qwen3.5 lends nothing to a prefill, so no capacity comes back between its calls (the Engine
     // re-runs admission when a Qwen4Exp prompt returns lent frames, GitHub #24).
     bool capacity_released = false;
+    // This unit published a snapshot to the prefix cache (a tap; hybrid spec §12.2): a queued request coalesced
+    // onto this lane's prefill may now resume from it, so the Engine re-runs admission.
+    bool snapshot_published = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;
@@ -504,6 +507,7 @@ public:
     [[nodiscard]] bool hybrid_source_pending() const noexcept;
     // Whether the SSD tier would start a write-back now: the idle Engine runs maintain() for it.
     [[nodiscard]] bool hybrid_storage_due() const noexcept;
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> hybrid_storage_retry_at() const noexcept;
     // The positions a request can resume from: every position with free-cache-resume, else the
     // prefill chunk grid (the reproducible route).
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;

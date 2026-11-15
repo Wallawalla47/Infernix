@@ -13,7 +13,9 @@ namespace infernix::runtime::prefix_cache {
 // Its level is kept across restarts in `state_file` (so restarting the server does not refill it).
 // While the bucket is at least half full every candidate is written; below that, a candidate is
 // written only when its expected value is among the best (2 x fill) share, by bytes, of the recent
-// candidates, so the bytes left go to what is most likely to save the most prefill. (Spending at the
+// candidates, so the bytes left go to what is most likely to save the most prefill. A candidate larger
+// than what is left is passed over, unless the bucket is full: one larger than an hour's bytes is then
+// written and empties it (it could never be written otherwise). (Spending at the
 // budget's sustained rate on the most valuable candidates from the start wrote less and kept fewer
 // cache hits: the value ranking favours early taps, which are rarely read back; §16.9.)
 class SsdWriteBudget {

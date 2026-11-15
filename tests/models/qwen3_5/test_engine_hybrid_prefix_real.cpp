@@ -605,11 +605,15 @@ int exercise_persist(const char* artifact) {
 //   token so the follower never shares a decode round: the follower's output must equal an
 //   uncached run's.
 // - Inside a block, the snapshot goes on the block boundary below, where it publishes at once.
-int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool compare_output) {
+// - A leader with a long prompt past the shared prefix (`leader_suffix` of several chunks): the follower is
+//   admitted when the leader's snapshot at the divergence publishes, not when the leader's whole prefill ends
+//   (2026-11-15: admission was re-run only at the end of the leader's prompt, so the follower queued for all of it).
+int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool compare_output,
+                      std::uint32_t leader_suffix = 40) {
     const std::vector<infernix::TokenId> shared        = synthetic_tokens(shared_tokens, 6);
     std::vector<infernix::TokenId> first               = shared;
     std::vector<infernix::TokenId> second              = shared;
-    const std::vector<infernix::TokenId> first_suffix  = synthetic_tokens(40, 7);
+    const std::vector<infernix::TokenId> first_suffix  = synthetic_tokens(leader_suffix, 7);
     const std::vector<infernix::TokenId> second_suffix = synthetic_tokens(40, 8);
     first.insert(first.end(), first_suffix.begin(), first_suffix.end());
     second.insert(second.end(), second_suffix.begin(), second_suffix.end());
@@ -618,6 +622,7 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
     infernix::EngineOptions options =
         hybrid_options(artifact, infernix::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
     options.max_concurrency = 2;
+    if (shared_tokens + leader_suffix + 64U > options.max_context) { options.max_context = 8192; }
     std::vector<infernix::TokenId> reference;
     if (compare_output) {
         infernix::Engine engine(options);
@@ -639,6 +644,19 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
         std::cerr << "coalesce " << shared_tokens
                   << ": the follower generated different tokens than an uncached run\n";
         ++failures;
+    }
+    if (leader_suffix >= kPrefillChunk) {
+        // The follower waits for the leader's prefill of the shared prefix only: under half of the leader's
+        // prompt here, and later chunks cost more. Three quarters of the leader's prefill time bounds it with room.
+        const double waited  = followed.engine_timing.queue_wait_seconds;
+        const double prefill = led.timings.prefill_seconds;
+        std::cout << "coalesce " << shared_tokens << "+" << leader_suffix << ": the follower queued " << waited
+                  << " s of the leader's " << prefill << " s prefill\n";
+        if (!(waited < 0.75 * prefill)) {
+            std::cerr << "coalesce " << shared_tokens << "+" << leader_suffix
+                      << ": the follower was admitted only once the leader's whole prefill had run\n";
+            ++failures;
+        }
     }
     return failures;
 }
@@ -971,6 +989,80 @@ int exercise_vision(const char* artifact) {
     }
     if (first.generated_token_ids.size() != 4 || other.generated_token_ids.size() != 4) {
         std::cerr << "vision: generation did not complete\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// A turn resumed past an image against the same prompt run cold, on the reproducible route (bit for bit). A
+// multi-row image advances the rotary position by less than its token count, so every token after it sits at
+// position + rope_delta. Turn 1 leaves a snapshot on the chunk grid past the image; turn 2 resumes there and
+// prefills only text, through the text pass, which must carry the prompt's rope delta (2026-11-15: it ran at delta
+// 0 since the pass's context gained a member, so a resumed image conversation computed its suffix at the wrong
+// positions and published it, while a cold run of the same prompt, a multimodal pass throughout, did not).
+int exercise_vision_resume(const char* artifact) {
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 8192, 1ULL << 30, 0);
+    options.context_cache.hybrid.device_snapshot_slots.reset();
+    options.enable_vision = true;
+    options.fast_paths    = false;
+    options.fast_path_candidates.clear();
+
+    const std::string system = "You describe images for an accessibility service.";
+    // Long enough that a chunk boundary past the image lies before the generation opener.
+    std::string question = "Describe the image.";
+    for (int sentence = 0; sentence < 150; ++sentence) {
+        question += " Detail " + std::to_string(sentence) + ": name the colours, shapes and layout plainly.";
+    }
+    const std::vector<std::uint8_t> image = gradient_ppm(512, 23);
+    const auto first_turn                 = [&] {
+        infernix::ChatMessage user;
+        user.role = infernix::ChatRole::User;
+        infernix::MessagePart media;
+        media.kind              = infernix::MessagePartKind::Media;
+        media.media.kind        = infernix::MediaKind::Image;
+        media.media.bytes       = image;
+        media.media.media_type  = "image/x-portable-pixmap";
+        media.media.source_name = "image.ppm";
+        user.parts.push_back(std::move(media));
+        user.parts.push_back(
+            infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = question, .media = {}});
+        return std::vector<infernix::ChatMessage>{text_message(infernix::ChatRole::System, system), std::move(user)};
+    };
+    const auto second_turn = [&] {
+        std::vector<infernix::ChatMessage> messages = first_turn();
+        messages.push_back(text_message(infernix::ChatRole::Assistant, "A diagonal colour gradient."));
+        messages.push_back(text_message(infernix::ChatRole::User, "Which colour dominates the top left corner?"));
+        return messages;
+    };
+
+    std::vector<infernix::TokenId> cold;
+    std::uint32_t prompt_tokens = 0;
+    {
+        infernix::Engine engine(options);
+        const infernix::GenerationResult result = engine.generate(engine.prepare(conversation(second_turn())), greedy(24));
+        cold          = result.generated_token_ids;
+        prompt_tokens = result.prompt.prompt_tokens;
+        if (result.reused_prompt_tokens != 0) {
+            std::cerr << "vision-resume: the cold run reused " << result.reused_prompt_tokens << " tokens\n";
+            return 1;
+        }
+    }
+    infernix::Engine engine(options);
+    (void)engine.generate(engine.prepare(conversation(first_turn())), greedy(4));
+    const infernix::GenerationResult resumed = engine.generate(engine.prepare(conversation(second_turn())), greedy(24));
+    std::cout << "vision-resume: turn 2 reused " << resumed.reused_prompt_tokens << " of " << prompt_tokens
+              << " prompt tokens\n";
+    int failures = 0;
+    // The system text is under a chunk and a 512x512 image is 256 merged tokens: a resume from the second chunk
+    // boundary on lies past the image.
+    if (resumed.reused_prompt_tokens < 2U * kPrefillChunk || resumed.reused_prompt_tokens % kPrefillChunk != 0) {
+        std::cerr << "vision-resume: turn 2 resumed from " << resumed.reused_prompt_tokens
+                  << ", not from a chunk boundary past the image\n";
+        ++failures;
+    }
+    if (resumed.generated_token_ids != cold) {
+        std::cerr << "vision-resume: the turn resumed past the image differs from the same prompt run cold\n";
         ++failures;
     }
     return failures;
@@ -1419,7 +1511,8 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 22> kScenarios{"all",
+    constexpr std::array<std::string_view, 23> kScenarios{"all",
+                                                          "vision-resume",
                                                           "ssd-restore",
                                                           "ssd-restore-mtp",
                                                           "next-turn",
@@ -1466,6 +1559,7 @@ int main() {
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
+        if (all || scenario == "vision-resume") { failures += exercise_vision_resume(artifact); }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
         if (all || scenario == "identical-burst") { failures += exercise_identical_burst(artifact); }
@@ -1478,6 +1572,7 @@ int main() {
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);
             failures += exercise_coalesce(artifact, 3000, false);
+            failures += exercise_coalesce(artifact, 6 * kPrefillChunk, false, 8 * kPrefillChunk);
         }
         if (all || scenario == "coalesce-vision") {
             failures += exercise_coalesce_vision(artifact);

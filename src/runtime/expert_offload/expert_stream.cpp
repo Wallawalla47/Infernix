@@ -3,6 +3,7 @@
 #include "core/copy_batch.h"
 #include "core/device.h"
 #include "ops/offloaded_sparse_moe/csf_expand.h"
+#include "runtime/contract/execution.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -364,7 +365,13 @@ void ExpertStream::enqueue(std::uint32_t layer, std::uint32_t first) {
         if (next_ssd < ssd_planned_[layer].size() && ssd_planned_[layer][next_ssd].first == e) {
             // A stream read: its record once landed (the host waits for the drive here).
             const std::uint8_t* source = ssd_.wait(ssd_slots_[layer][next_ssd]);
-            if (source == nullptr) { throw std::runtime_error("expert stream: an SSD-only expert's record could not be read"); }
+            // As a failed read of a decode round (ExpertOffload::check_error): the unit's requests fail and the Engine
+            // keeps serving. The record is not copied and its layer's experts are not enqueued, so no kernel reads
+            // it; the caller ends the stream (end) on the way out.
+            if (source == nullptr) {
+                throw RecoverableExecutionError("expert stream: layer " + std::to_string(layer) +
+                                                ": an SSD-only expert's record could not be read");
+            }
             const std::size_t bytes = host_strides_.empty() ? stride_ : host_strides_[layer];
             copies.add(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes);
             stats_.streamed += 1;

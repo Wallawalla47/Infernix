@@ -387,7 +387,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // The fixed allocations: the persistent and workspace arenas and the elastic text KV's base pages
         // (the rest of its region is reserved, not backed).
         const std::uint64_t fixed = plan.persistent.bytes + plan.workspace.capacity + (kv_vmm ? kv_vmm->mapped_bytes() : 0U);
-        if (const std::uint64_t spilled = spill_guard->end(fixed); spilled != 0) {
+        // What the constructor page-locked since the guard began (the grammar masks' mirror is the only buffer of
+        // megabytes; the round frames, flags and table shadows are within the guard's tolerance), which the
+        // guard takes off the shared system memory use it reads.
+        const std::uint64_t pinned = grammar_masks_host ? grammar_masks_host->size() : 0U;
+        if (const std::uint64_t spilled = spill_guard->end(fixed, pinned); spilled != 0) {
             throw std::runtime_error(
                 std::to_string(spilled >> 20) +
                 " MiB of the Program's VRAM allocations were placed in shared system memory by the driver's sysmem "
@@ -440,16 +444,45 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // Past the OS budget (--vram-past-budget) cudaMemGetInfo stops at the budget: the budget source reads both
         // sides of the graphs' allocations.
         const auto graph_vram         = open_vram_budget_source(device.device, plan.vram_past_budget);
-        const std::size_t free_before = graph_vram->query().device_free;
+        const VramSnapshot before     = graph_vram->query();
+        const std::size_t free_before = before.device_free;
         // Offloaded experts: each executable's warm launch runs the MoE (its CPU-served misses and
         // landings included), so a round is open; an expert the warm launches could not serve fails
         // the startup.
         if (offload) { offload->begin_round(device.stream); }
-        prepare_graphs();
-        device.synchronize();
+        try {
+            prepare_graphs();
+            device.synchronize();
+        } catch (const GraphMemoryExhausted&) {
+            throw;
+        } catch (const DeviceMemoryExhausted& error) {
+            // A warm launch (a kernel's first launch loads its module) or the work it enqueued found no device
+            // memory, as an instantiation does: the same answer, so the start's retry with a smaller automatic KV
+            // capacity takes it too. The device is usable once the enqueued work has drained.
+            (void)settle_after_memory_exhausted();
+            throw GraphMemoryExhausted(std::string("CUDA Graph preparation: ") + error.what());
+        }
         if (offload) { offload->engine().check_error(parameters.model.info().name + " (graph preparation)"); }
-        const std::size_t free_after = graph_vram->query().device_free;
+        const VramSnapshot after     = graph_vram->query();
+        const std::size_t free_after = after.device_free;
         graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
+        // Under the Windows sysmem fallback the driver never reports the shortage: executables past the free
+        // device memory land in shared system memory, where every replay reads them over the link, and the drop
+        // in free memory misses them. This process's shared system memory use shows them (nothing here
+        // page-locks host memory without offloaded experts, whose tiers and promotions do): they fail the attempt
+        // as an exhausted instantiation does, so an automatic KV capacity retries smaller and an explicit one
+        // fails the start by name instead of running slowly.
+        if (!offload && before.shared_system != 0 && after.shared_system != 0) {
+            const std::uint64_t ceiling = std::numeric_limits<std::uint64_t>::max();
+            if (const std::uint64_t spilled = spill_rise(before.nonlocal_usage, after.nonlocal_usage, ceiling, 0);
+                spilled != 0) {
+                throw GraphMemoryExhausted("CUDA Graph preparation: " + std::to_string(spilled >> 20) +
+                                           " MiB of the executables were placed in shared system memory by the "
+                                           "driver's sysmem fallback (free device memory " +
+                                           std::to_string(free_before >> 20) + " MiB before, " +
+                                           std::to_string(free_after >> 20) + " MiB after)");
+            }
+        }
         graph_phase.complete();
     }
     work.reset();
@@ -812,6 +845,19 @@ MemoryUsage ProgramImpl::memory_usage() const noexcept {
         out.device.prefix  = page * cached;
         out.device.kv     -= out.device.prefix;
         out.device.kv_used = page * (allocated - cached);
+        // A cached block's bundle holds a page of the DFlash drafter's full-attention pool too: the cache's
+        // part, not the drafter's.
+        if (dflash && dflash->full) {
+            const DeviceKVPagePool& full = dflash->full->page_pool();
+            std::uint64_t planes         = 0;
+            for (std::size_t i = 0; i < full.plane_count(); ++i) {
+                const Tensor& plane = full.plane(i);
+                planes += static_cast<std::uint64_t>(plane.nb[3]) * static_cast<std::uint64_t>(plane.ne[3]);
+            }
+            const std::uint64_t held = planes / full.capacity_pages() * std::min(cached, full.allocated_pages());
+            out.device.prefix  += held;
+            out.device.drafter -= std::min(out.device.drafter, held);
+        }
     }
     // The StateImage pool: a slot per lane (state), then the prefix cache's Device snapshot slots (its part).
     const std::uint64_t snapshot_slots = context_cache.hybrid.device_snapshot_slots.value_or(0);

@@ -211,6 +211,9 @@ public:
     void make_lossless_room(std::uint64_t slabs);
     // Whether service_ssd would start a write-back now.
     [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> ssd_retry_at() const noexcept {
+        return ssd_ ? ssd_->write_back_retry_at() : std::nullopt;
+    }
     // Starts reading the parts of `snapshot` only on the SSD into the Host tier.
     [[nodiscard]] runtime::prefix_cache::SsdTier::Promotion promote(runtime::prefix_cache::SnapshotRef snapshot);
     [[nodiscard]] bool transfers_pending() const noexcept {
@@ -221,6 +224,11 @@ public:
     // copy is first in the transfer stream, at most an image's copy time. Returns whether it waited.
     [[nodiscard]] bool await_extended_endpoint(std::span<const runtime::prefix_cache::NodeRef> path,
                                                std::span<const TokenId> tokens);
+    // Waits for capture `id` alone (and what the transfer stream holds before it) and publishes it; false when it
+    // is not in flight (landed, skipped or unknown): nothing is waited for.
+    bool await_capture(std::uint64_t id);
+    // Whether capture `id` is still copying (not yet published). A forgotten result is not pending.
+    [[nodiscard]] bool capture_pending(std::uint64_t id) const noexcept { return !capture_events(id).empty(); }
     // The publication of a landed capture (absent while it is in flight); forget it when done.
     [[nodiscard]] std::optional<runtime::prefix_cache::PublishResult> capture_result(std::uint64_t id) const;
     void forget_capture(std::uint64_t id) noexcept;
@@ -247,6 +255,9 @@ public:
     // Waits on the host for a landing batch (and every batch before it) and retires what landed.
     void await_restore(RestoreTicket ticket);
     void abort_restore() noexcept;
+    // An activation failed with the batch open, possibly part enqueued: waits for the restore stream, then aborts
+    // the batch, so no later restore finds one open and no page returns under a copy.
+    void fail_restore() noexcept;
 
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;

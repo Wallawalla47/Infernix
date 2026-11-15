@@ -481,10 +481,18 @@ struct DirectReadQueue::Impl {
         platform_read(io);
     }
 
+    // A device read's timeout: Options::timeout for each 4 MiB of it or part of one, so a 32 MiB fill run on
+    // a slow drive is not failed by the bound a single record's read is given.
+    [[nodiscard]] Clock::duration timeout_of(const Io& io) const noexcept {
+        constexpr std::size_t kTimeoutUnitBytes = std::size_t{4} << 20;
+        const std::size_t units = std::max<std::size_t>(1, (io.bytes + kTimeoutUnitBytes - 1) / kTimeoutUnitBytes);
+        return options.timeout * static_cast<std::int64_t>(units);
+    }
+
     void check_timeouts(Clock::time_point now) {
         for (const std::size_t i : flight) {
             Io& io = ios[i];
-            if (!io.timed_out && now - io.issued >= options.timeout && platform_cancel(io)) {
+            if (!io.timed_out && now - io.issued >= timeout_of(io) && platform_cancel(io)) {
                 io.timed_out = true;
                 ++io.timeouts;
                 ++stats.timeouts;
@@ -589,7 +597,7 @@ struct DirectReadQueue::Impl {
         for (const auto& f : held) { due = std::min(due, f.release); }
         for (const std::size_t i : backoff) { due = std::min(due, ios[i].not_before); }
         for (const std::size_t i : flight) {
-            if (!ios[i].timed_out) { due = std::min(due, ios[i].issued + options.timeout); }
+            if (!ios[i].timed_out) { due = std::min(due, ios[i].issued + timeout_of(ios[i])); }
         }
         return due;
     }

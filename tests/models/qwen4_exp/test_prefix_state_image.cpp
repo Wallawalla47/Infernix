@@ -165,6 +165,17 @@ void test_layout(const TextConfig& c) {
     require(plain.group_begin[plain.drafter_group()] == plain.group_begin[plain.drafter_group() + 1] &&
                 plain.fingerprint != layout.fingerprint && plain.image_bytes < layout.image_bytes,
             "without MTP the MTP group is empty and the layout differs");
+    // fp16-gdn-state: the Program passes its state pool's recurrent dtype, FP16 (the spec once accepted only FP32 or
+    // BF16, so that fast path could not start with the prefix cache). Each GDN layer's recurrent part halves.
+    const StateImageLayout half =
+        plan_state_image(state_image_spec(c, true, KvCacheStorage::Int8Group64, {}, DType::FP16));
+    const std::size_t recurrent = static_cast<std::size_t>(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads;
+    require(half.spec.gdn_recurrent_bytes == recurrent * 2U && layout.spec.gdn_recurrent_bytes == recurrent * 4U,
+            "the FP16 state image holds two bytes an element");
+    require(half.fingerprint != layout.fingerprint && half.image_bytes < layout.image_bytes,
+            "an FP16 state image is smaller and never read as an FP32 one");
+    require_throws([&] { (void)state_image_spec(c, true, KvCacheStorage::Int8Group64, {}, DType::BF16); },
+                   "a recurrent dtype the state pool never has");
 }
 
 void test_round_trips(const TextConfig& c) {

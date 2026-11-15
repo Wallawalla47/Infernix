@@ -534,6 +534,16 @@ void prepare_process(const EngineOptions& options) {
                                         io->before);
         }
     }
+    // Under WSL2 every RAM reading is the virtual machine's: --ram-free-mib, an automatic --host-context-mib and
+    // --ram-resize cannot see the Windows host's memory, and the host cannot take back what the engine page-locks.
+    if (host_is_wsl()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                    "running under WSL2: --ram-free-mib (%llu MiB) and --ram-resize are measured inside "
+                                    "the Linux VM, not on the Windows host, which cannot reclaim the RAM the engine "
+                                    "page-locks; bound the VM with `memory=` in .wslconfig, or set --host-context-mib "
+                                    "to leave Windows the RAM it needs",
+                                    static_cast<unsigned long long>(options.ram_free_bytes >> 20));
+    }
 }
 
 } // namespace

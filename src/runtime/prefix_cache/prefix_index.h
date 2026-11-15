@@ -121,7 +121,9 @@ struct MatchCandidate {
     bool image_on_ssd_only         = false;
     bool tail_on_ssd_only          = false;
     std::uint64_t restore_bytes    = 0; // Host-to-Device bytes
-    std::uint64_t ssd_bytes        = 0; // SSD-to-Host bytes before them
+    std::uint64_t ssd_bytes        = 0; // SSD-to-Host bytes before them (nonzero: a promotion comes first)
+    // Of ssd_bytes, what no promotion is reading yet: the read the cost model charges (choose).
+    std::uint64_t ssd_unread_bytes = 0;
 };
 
 struct MatchResult {
@@ -149,6 +151,12 @@ struct InsertResult {
 struct PublishResult {
     SnapshotRef snapshot;
     bool created = false;
+    // A duplicate publication (`created` false, `snapshot` the existing one) that gave the existing
+    // snapshot what it lacked: the publication's Device slot (only when the caller asked for it with
+    // `adopt`: the slot is the snapshot's now, and the caller attaches its image to `snapshot`), or its
+    // tail's Device copy (the tail device id is the snapshot's now).
+    bool device_adopted = false;
+    bool tail_adopted   = false;
 };
 
 // Free-list slabs a caller holds for a snapshot image it is copying to the Host before the
@@ -194,6 +202,7 @@ struct SnapshotView {
     SnapshotKind kind  = SnapshotKind::Tap;
     std::uint32_t hits = 0;
     bool superseded    = false;
+    double priority    = 0.0; // GDSF H (§9.3)
     std::span<const TokenId> tail;
 };
 
@@ -301,12 +310,14 @@ struct PrefixIndexStats {
 
 // The work of Host victim selection (operation-count tests guard its complexity): snapshot-table
 // scans for a victim, Host-room feasibility checks, the snapshot entries both examined, and the
-// nodes a feasibility check walked.
+// nodes a feasibility check walked. And of Device victim selection: the LRU lists it looked at (a dead
+// block is found at the first or second, however many live blocks are cached).
 struct PrefixIndexOperations {
-    std::uint64_t victim_scans     = 0;
-    std::uint64_t room_scans       = 0;
-    std::uint64_t snapshot_visits  = 0;
-    std::uint64_t room_node_visits = 0;
+    std::uint64_t victim_scans       = 0;
+    std::uint64_t room_scans         = 0;
+    std::uint64_t snapshot_visits    = 0;
+    std::uint64_t room_node_visits   = 0;
+    std::uint64_t device_list_probes = 0;
 };
 
 class PrefixCacheIndex {
@@ -421,10 +432,12 @@ public:
     void complete_device_fill(NodeRef node);
     // Returns the device id to the backend.
     void abort_device_fill(NodeRef node);
-    // Releases up to `blocks` unpinned device copies, host-backed ones first. Returns the number
-    // released. An unbacked release loses the node and its subtree (§9.4).
+    // Releases up to `blocks` unpinned device copies. Dead blocks go first (no snapshot at or below them
+    // and no holder: no request can resume through them), backed ones before unbacked ones, before any
+    // block a snapshot still needs, held or not; then host-backed copies, then unbacked ones. Returns the
+    // number released. An unbacked release loses the node and its subtree (§9.4).
     std::uint32_t evict_device_blocks(std::uint32_t blocks);
-    // The same, releasing only host-backed copies: nothing loses its last copy.
+    // The same, releasing only host-backed copies (dead ones first): nothing loses its last copy.
     std::uint32_t evict_backed_device_blocks(std::uint32_t blocks);
     [[nodiscard]] std::uint32_t device_evictable_blocks() const noexcept;
     [[nodiscard]] std::uint32_t device_backed_evictable_blocks() const noexcept;
@@ -471,12 +484,19 @@ public:
     void release_device_slot(std::uint32_t slot);
     // Publishes a snapshot whose image is in staging slot `device_slot`. frontier must equal
     // 64 * (anchor depth + 1) + tail.size() (tail.size() for the root anchor). A tail requires
-    // `tail_device_id`. For a duplicate (same anchor and tail) the staging slot is freed, the tail
-    // device id is released and the existing snapshot is returned with created=false.
+    // `tail_device_id`. A duplicate (same anchor and tail) returns the existing snapshot with
+    // created=false: the lineage that published it resumes from it next, so its recency is refreshed and
+    // a superseded one is retained again; it takes the tail device id when its own tail has no Device
+    // copy, and with `adopt` the staging slot when it owns none (PublishResult::tail_adopted,
+    // device_adopted: the caller then attaches its image); what it does not take is freed or released.
+    // A full snapshot table evicts a superseded snapshot, or the least valuable retained one when the new
+    // snapshot is worth at least as much (`claim`; its own estimated priority when absent), and otherwise
+    // publishes nothing (an invalid reference; the slot is freed and the tail device id released).
     [[nodiscard]] PublishResult publish_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
-                                                 std::uint32_t device_slot, SnapshotKind kind);
+                                                 std::uint32_t device_slot, SnapshotKind kind,
+                                                 std::optional<double> claim = std::nullopt, bool adopt = false);
     // Host-born snapshots: the image (and tail) is copied straight to Host slabs, with no Device
     // slot. Reserves the image's slabs, plus one tail slab when `tail` (which needs host_blocks),
     // evicting like begin_snapshot_host_fill but no retained snapshot valued above `claim` (the
@@ -487,13 +507,15 @@ public:
     // Publishes a snapshot whose image and tail already landed in `image`'s slabs: Host Resident,
     // no Device slot. A tail requires a reservation made with `tail`; its Device copy
     // (`tail_device_id`) is optional. Frontier rules as publish_snapshot. A duplicate (same anchor
-    // and tail), or no snapshot entry to be had, releases the slabs and the tail device id; a
-    // duplicate returns the existing snapshot with created=false. `image` is consumed either way.
+    // and tail), or no snapshot entry to be had (publish_snapshot's rule and `claim`), releases the slabs
+    // and the tail device id; a duplicate returns the existing snapshot with created=false, refreshed,
+    // retained and given the tail device id as publish_snapshot does. `image` is consumed either way.
     [[nodiscard]] PublishResult publish_host_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                       std::span<const TokenId> tail,
                                                       std::optional<std::uint32_t> tail_device_id,
                                                       HostImageReservation&& image,
-                                                      SnapshotKind kind);
+                                                      SnapshotKind kind,
+                                                      std::optional<double> claim = std::nullopt);
 
     // ---- withdrawal (§7.8) ---------------------------------------------------------------------
     // Removes what a sequence published from state that may be wrong (its logits went non-finite):
@@ -538,7 +560,8 @@ public:
     // A shrink retires the slabs from a ceiling on while requests run and transfers fly:
     // - begin_host_shrink evicts as an allocation would (dead KV, superseded snapshots, then the GDSF minimum of the
     //   unheld entries, whatever its priority) until what is in use (owned and reserved) fits below `limit`, and sets
-    //   the ceiling there, or where what held entries keep in use fits, and above every slab a transfer reads or
+    //   the ceiling there, or where what no eviction frees fits (held entries, and the blocks only a held or
+    //   Device-only snapshot keeps alive: the eviction order's own count), and above every slab a transfer reads or
     //   writes now (reservations, filling copies, I/O-pinned entries), rounded up to a multiple of `granule` (the
     //   caller's chunk); it evicts nothing when that leaves nothing to retire. From then on no slab at or past the
     //   ceiling is taken: the free ones leave the free list and freed ones are retired. Returns the ceiling;
@@ -548,9 +571,13 @@ public:
     //   (an SSD job reads or writes them), pinned ones included (a sequence's mapped path; a restore batch that reads
     //   one makes the caller wait before committing). Dead KV past the ceiling is dropped instead (allocation evicts
     //   it first anyway). An entry an SSD job I/O-pins after begin waits until the job ends. Each is planned once; the
-    //   caller copies the bytes of `from` into `to`. Only begin_host_shrink scans every node; the rest stays
-    //   proportional to what lies past the ceiling (and the snapshots). Its bookkeeping is reserved first, so a throw
-    //   (an allocation) leaves no move half-planned.
+    //   caller copies the bytes of `from` into `to`. Nothing scans every node: begin_host_shrink visits the slabs from
+    //   its limit on (each names its node) and the snapshots, and the rest stays proportional to what lies past the
+    //   ceiling (and the snapshots). Its bookkeeping is reserved first, so a throw (an allocation) leaves no move
+    //   half-planned.
+    // - while the shrink is under way an allocation counts and evicts only what frees a slab below the ceiling: a
+    //   snapshot whose slabs all lie past it is no victim (its slabs retire when freed, and its planned moves keep
+    //   their destinations until they commit).
     // - cancel_host_moves undoes the last plan_host_moves, whose copies were never started (posting them threw): each
     //   `to` is free again and each `from` movable, for a later plan. Nothing else may run in between.
     // - commit_host_moves, once the copies have landed and no restore reads a Host slab: each entry still holding a
@@ -712,14 +739,19 @@ private:
         std::uint32_t ancestor = kNoId;
         std::vector<std::uint32_t> dependents;
         std::uint8_t hold = kNoHold; // queue rank while held (§9.6)
+        // claim_epoch_ of the Host allocation that found it worth at most its claim (allocate_slabs).
+        std::uint64_t claim_stamp = 0;
     };
 
     enum class SlotState : std::uint8_t { Free, Staging, Owned };
 
     static constexpr std::uint8_t kNoHold = 0xff;
     // Device LRU lists: 0 backed, 1 unbacked, then for each queue rank r a backed (2 + 2r) and an
-    // unbacked (3 + 2r) list of held entries. Even lists are backed.
-    static constexpr std::size_t kLruLists = 2 + 2 * static_cast<std::size_t>(kMaxQueueHolds);
+    // unbacked (3 + 2r) list of held entries, then the dead blocks' backed and unbacked lists (a block
+    // with no snapshot at or below it and no holder, whatever its hold). Even lists are backed.
+    static constexpr std::uint8_t kLruDeadBacked   = static_cast<std::uint8_t>(2U + 2U * kMaxQueueHolds);
+    static constexpr std::uint8_t kLruDeadUnbacked = static_cast<std::uint8_t>(kLruDeadBacked + 1U);
+    static constexpr std::size_t kLruLists         = static_cast<std::size_t>(kLruDeadUnbacked) + 1U;
 
     // Device LRU entries: node i is entry i, snapshot tail j is entry max_nodes + j.
     struct LruLink {
@@ -761,6 +793,14 @@ private:
                (node_backed(node) || (node.pins == 0 && node.io_pins == 0));
     }
     [[nodiscard]] static bool held(const Snapshot& snapshot) noexcept { return snapshot.pins != 0 || snapshot.io_pins != 0; }
+    // The Device LRU list of a node (0xff: none). A dead block (no snapshot at or below it, no holder)
+    // can serve no request, so it has lists of its own that eviction empties first.
+    [[nodiscard]] static std::uint8_t node_lru_list(const Node& node) noexcept {
+        if (!device_evictable(node)) { return 0xff; }
+        const bool backed = node_backed(node);
+        if (node.live_below == 0 && !held(node)) { return backed ? kLruDeadBacked : kLruDeadUnbacked; }
+        return lru_list(backed, node.hold);
+    }
     void unpin_path_from(std::uint32_t node, bool deepest_first_order);
     void refresh_node(std::uint32_t node);
     void refresh_tail(std::uint32_t snapshot);
@@ -822,19 +862,32 @@ private:
     [[nodiscard]] bool take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out);
     // Restore: marks SSD slabs held by restored copies; false when one is out of range or held already.
     [[nodiscard]] bool claim_ssd_slabs(std::span<const std::uint32_t> slabs);
-    // Whether allocate_slabs' eviction order, at `claim`, may free `count` slabs (counting the slabs
-    // of every entry it may take, and the blocks that die with a snapshot it removes).
-    [[nodiscard]] bool host_room_possible(std::uint32_t count, std::uint32_t protect_snapshot, double claim) const;
+    // The slabs allocate_slabs' eviction order, at `claim`, can make free, free ones included: the slabs
+    // of every entry it may take and the blocks that die with a snapshot it removes; counting stops once
+    // `count` is reached. During a shrink only slabs below the ceiling count (the others retire when
+    // freed), and a snapshot holding none there is no victim. A lower bound: a claimed snapshot stays
+    // claimed while the allocation evicts (allocate_slabs), so what is counted can be freed.
+    [[nodiscard]] std::uint64_t host_room(std::uint64_t count, std::uint32_t protect_snapshot, double claim) const;
+    [[nodiscard]] bool host_room_possible(std::uint32_t count, std::uint32_t protect_snapshot, double claim) const {
+        return host_room(count, protect_snapshot, claim) >= count;
+    }
+    // Whether evicting the snapshot's Host copy frees a slab an allocation can take (always, outside a shrink).
+    [[nodiscard]] bool yields_host_room(const Snapshot& snapshot) const noexcept;
     // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`
-    // slabs are free, but no retained snapshot with a priority above `claim`; evicts nothing when
-    // those cannot free enough (host_room_possible).
+    // slabs are free, but no retained snapshot with a priority above `claim` when the allocation began
+    // (an eviction revalues the victim's dependents, and one that was claimable stays so: taken before
+    // its ancestor it would have been within the claim); evicts nothing when those cannot free enough
+    // (host_room_possible).
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot,
                                       double claim = std::numeric_limits<double>::infinity());
     // One eviction of allocate_slabs's order that frees Host slabs; false when nothing (or nothing worth at most
-    // `claim`) can yield.
-    [[nodiscard]] bool evict_for_slabs(std::uint32_t protect_snapshot, double claim);
+    // `claim`) can yield. `for_moves` (a shrink making room for its moves) also takes a snapshot whose slabs all
+    // lie past the ceiling: its eviction is one move less.
+    [[nodiscard]] bool evict_for_slabs(std::uint32_t protect_snapshot, double claim, bool for_moves = false);
     void free_slab(std::uint32_t slab);
+    // A node's Host slab, recorded in node_of_slab_ (kNoId clears it).
+    void set_node_slab(std::uint32_t node, std::uint32_t slab) noexcept;
 
     // The publication shared by publish_snapshot and publish_host_snapshot: exactly one of
     // `device_slot` (a staging slot) and `host_slabs` (reserved slabs, already unmarked) holds the
@@ -844,8 +897,22 @@ private:
                                               std::optional<std::uint32_t> tail_device_id,
                                               std::uint32_t device_slot,
                                               std::vector<std::uint32_t>&& host_slabs,
-                                              SnapshotKind kind);
+                                              SnapshotKind kind, std::optional<double> claim, bool adopt);
     void remove_snapshot(std::uint32_t snapshot);
+    // A superseded snapshot is its lineage's resume point again (a hit, an undone supersession, a
+    // duplicate publication).
+    void retain_again(std::uint32_t snapshot);
+    // The frontier of the nearest retained snapshot above a snapshot that would be published at
+    // `frontier` with `tail` on `anchor` (0: none).
+    [[nodiscard]] std::uint32_t retained_frontier_above(std::uint32_t anchor, std::uint32_t frontier,
+                                                        std::span<const TokenId> tail) const noexcept;
+    // The lowest priority of a retained snapshot (infinity when there is none).
+    [[nodiscard]] double lowest_retained_priority() const noexcept;
+    // `anchor`'s path gained or lost a retained snapshot (`own`: 1 when that snapshot, `skip`, is
+    // retained on it now, 0 when it no longer is). Where the path then holds exactly one other retained
+    // snapshot, that one's exclusive blocks changed (they end, or begin again, where the two paths
+    // part), so it is revalued: one walk up to the fork and one down to it.
+    void revalue_sibling(std::uint32_t anchor, std::uint32_t skip, std::uint32_t own);
     // Snapshot ancestry: `above` lies on `below`'s path at a smaller frontier.
     [[nodiscard]] bool on_path(const Snapshot& above, const Snapshot& below) const noexcept;
     // Whether the tree branches below the snapshot's frontier (another conversation continued
@@ -869,13 +936,16 @@ private:
     // superseded one, otherwise the GDSF minimum. kNoId when every candidate is protected.
     [[nodiscard]] std::uint32_t pick_victim(bool host_resident, std::uint32_t protect) const;
     // Host-resident, unpinned, unheld snapshots: the oldest superseded one, and the lowest-priority
-    // retained ones whose image the SSD tier holds (clean) and does not hold (unclean).
+    // retained ones whose image the SSD tier holds (clean) and does not hold (unclean); `claimed` is the
+    // lowest-priority unclean one the allocation under way stamped as within its claim. With `yielding`
+    // only snapshots whose eviction frees a slab an allocation can take (yields_host_room).
     struct HostVictims {
         std::uint32_t superseded = kNoId;
         std::uint32_t clean      = kNoId;
         std::uint32_t unclean    = kNoId;
+        std::uint32_t claimed    = kNoId;
     };
-    [[nodiscard]] HostVictims pick_host_victims(std::uint32_t protect) const;
+    [[nodiscard]] HostVictims pick_host_victims(std::uint32_t protect, bool yielding) const;
     void remove_subtree(std::uint32_t node);
     void release_node_storage(std::uint32_t node);
     void drop_node_device_copy(std::uint32_t node);
@@ -940,7 +1010,14 @@ private:
     // commit_host_moves count them down), and the nodes begin_host_shrink found holding one (plan_host_moves revisits
     // only these: no node takes a slab past the ceiling later; snapshots, far fewer, are scanned).
     std::uint32_t past_in_use_ = 0;
+    // Of the planned moves, those whose entry still holds its `from`.
+    std::uint32_t moves_live_ = 0;
     std::vector<std::uint32_t> shrink_nodes_;
+    // The node holding each Host slab (kNoId: a snapshot's, reserved, free or retired), so a shrink finds
+    // the nodes past its ceiling without visiting every node.
+    std::vector<std::uint32_t> node_of_slab_;
+    // Counts the Host allocations that evicted under a finite claim (Snapshot::claim_stamp).
+    std::uint64_t claim_epoch_ = 0;
     // A planned shrink move: the entry (a node, or a snapshot and the position in its host_slabs) holding `from`.
     struct PendingHostMove {
         bool snapshot          = false;

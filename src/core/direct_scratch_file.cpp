@@ -97,6 +97,7 @@ struct DirectScratchFile::Impl {
     std::uint32_t writes_in_flight = 0;
     std::size_t live               = 0; // batches submitted and not finished
     bool stopping                  = false;
+    std::mutex waker_mutex; // `waker` and its calls
     std::function<void()> waker;
     std::vector<std::thread> threads;
 
@@ -113,6 +114,9 @@ struct DirectScratchFile::Impl {
                                     "DirectScratchFile: " + directory.string() + " is not a directory");
         }
         keep_file = !options.kept_file.empty();
+        if (options.read_only && !keep_file) {
+            throw std::invalid_argument("DirectScratchFile: a read-only file must be named");
+        }
         file_path = keep_file ? std::filesystem::absolute(options.kept_file)
                               : unique_name(std::filesystem::absolute(directory));
         open_file();
@@ -149,7 +153,11 @@ struct DirectScratchFile::Impl {
         // No sharing. A scratch file is removed when the last handle closes (also at a crash: the OS
         // closes it); a kept file stays.
         bool existed = false;
-        if (keep_file) {
+        if (options.read_only) {
+            handle  = ::CreateFileW(file_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+            existed = handle != INVALID_HANDLE_VALUE;
+        } else if (keep_file) {
             handle  = ::CreateFileW(file_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
                                     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
                                     nullptr);
@@ -169,6 +177,11 @@ struct DirectScratchFile::Impl {
                 if (::GetFileSizeEx(handle, &size) && static_cast<std::uint64_t>(size.QuadPart) == file_bytes) {
                     kept = true;
                 }
+            }
+            if (options.read_only && !kept) {
+                throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                        "DirectScratchFile: " + file_path.string() + " does not hold " +
+                                            std::to_string(file_bytes) + " bytes");
             }
             // Unbuffered transfers must be whole sectors; every I/O here is a multiple of 4 KiB.
             FILE_STORAGE_INFO storage{};
@@ -198,7 +211,9 @@ struct DirectScratchFile::Impl {
             throw;
         }
 #else
-        int flags = O_RDWR | O_CREAT | O_CLOEXEC | (keep_file ? 0 : O_EXCL);
+        const int buffered = options.read_only ? O_RDONLY | O_CLOEXEC
+                                               : O_RDWR | O_CREAT | O_CLOEXEC | (keep_file ? 0 : O_EXCL);
+        int flags          = buffered;
 #    ifdef O_DIRECT
         flags |= O_DIRECT;
 #    endif
@@ -206,11 +221,20 @@ struct DirectScratchFile::Impl {
 #    ifdef O_DIRECT
         // A filesystem without direct I/O (tmpfs, some FUSE mounts) refuses O_DIRECT: the file then
         // goes through the page cache with the same alignment rules.
-        if (fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) {
-            fd = ::open(file_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | (keep_file ? 0 : O_EXCL), 0600);
-        }
+        if (fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) { fd = ::open(file_path.c_str(), buffered, 0600); }
 #    endif
         if (fd < 0) { throw_errno(errno, "DirectScratchFile: open " + file_path.string()); }
+        if (options.read_only) {
+            struct stat status{};
+            if (::fstat(fd, &status) != 0 || static_cast<std::uint64_t>(status.st_size) != file_bytes) {
+                close_file();
+                throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                        "DirectScratchFile: " + file_path.string() + " does not hold " +
+                                            std::to_string(file_bytes) + " bytes");
+            }
+            kept = true;
+            return;
+        }
         if (keep_file) {
             // For this process alone: another server on the same prefix cache file must not share it.
             if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
@@ -222,6 +246,14 @@ struct DirectScratchFile::Impl {
             if (::fstat(fd, &status) == 0 && static_cast<std::uint64_t>(status.st_size) == file_bytes) {
                 kept = true;
                 return;
+            }
+            // A kept file of another size (the tier was resized) starts over at this one: a larger one is cut,
+            // or its space past the new size would stay allocated for as long as the file exists.
+            if (static_cast<std::uint64_t>(status.st_size) > file_bytes &&
+                ::ftruncate(fd, static_cast<off_t>(file_bytes)) != 0) {
+                const int error = errno;
+                close_file();
+                throw_errno(error, "DirectScratchFile: sizing " + file_path.string());
             }
         } else {
             // Unlinked at once: the space returns when the descriptor closes, whatever ends the process.
@@ -365,7 +397,7 @@ struct DirectScratchFile::Impl {
     }
 
     void finish(const Pending& pending, Op op, const std::error_code& error) {
-        std::function<void()> wake;
+        bool completed = false;
         {
             std::lock_guard lock(mutex);
             --(op == Op::Read ? reads_in_flight : writes_in_flight);
@@ -386,17 +418,25 @@ struct DirectScratchFile::Impl {
                 });
                 free_batches.push_back(pending.batch);
                 --live;
-                wake = waker;
+                completed = true;
                 if (live == 0) { idle.notify_all(); }
             }
         }
         // Another thread may take the next I/O now (a finished read can release a waiting write).
         work_ready.notify_all();
-        if (wake) { wake(); }
+        if (completed) {
+            // Called under the lock set_waker takes (not the queue's): once set_waker returns, the waker it
+            // replaced is neither running nor about to run, so its owner may go.
+            std::lock_guard lock(waker_mutex);
+            if (waker) { waker(); }
+        }
     }
 
     void submit(Batch batch) {
         if (batch.ios.empty()) { throw std::invalid_argument("DirectScratchFile: an empty batch"); }
+        if (options.read_only && batch.op == Op::Write) {
+            throw std::invalid_argument("DirectScratchFile: a write to a read-only file");
+        }
         std::uint64_t bytes = 0;
         for (const Io& io : batch.ios) {
             if (io.bytes == 0 || io.bytes > kMaxIoBytes || io.bytes % kAlignment != 0 || io.offset % kAlignment != 0 ||
@@ -477,7 +517,7 @@ std::size_t DirectScratchFile::outstanding() const noexcept {
 }
 
 void DirectScratchFile::set_waker(std::function<void()> waker) {
-    std::lock_guard lock(impl_->mutex);
+    std::lock_guard lock(impl_->waker_mutex);
     impl_->waker = std::move(waker);
 }
 

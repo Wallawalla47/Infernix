@@ -425,6 +425,65 @@ void test_prefill_order() {
     }
 }
 
+// The cycle's prefill permit under a service turn (resource-scheduling §5.2). The turn's owner takes it while it
+// can run. An owner the Program blocks (on Qwen3.8-Flash-Next a prefilling lane behind another lane's layer walk) is
+// absent from the runnable view: the permit then goes to the lane it waits behind, which would otherwise never
+// advance, and neither would the owner; its turn is not spent meanwhile.
+void test_blocked_owner_leaves_the_prefill_permit() {
+    Scheduler scheduler;
+    Slots slots{};
+    auto decoder = slots[0] = request(10, Request::Phase::Decode);
+    auto owner = slots[1] = request(20, Request::Phase::Prefill);
+    auto walker = slots[2] = request(30, Request::Phase::Prefill);
+    owner->remaining  = 50000;
+    walker->remaining = 60000;
+    for (const auto& value : {decoder, owner, walker}) { admit(scheduler, value); }
+    scheduler.require_progress(decoder->id);
+    scheduler.require_progress(walker->id); // contention: the turn rotates instead of ending
+    scheduler.served(decoder->id, Scheduler::service_quantum_ns);
+    require(scheduler.advance_service(false, false) && scheduler.progress_owner() == owner->id,
+            "the turn did not pass to the next admitted request");
+
+    require(scheduler.prefill_turn(slots, 3, 1U) == 1, "a runnable owner lost the prefill permit");
+    Slots runnable = slots;
+    runnable[1].reset(); // the walker's layer walk blocks the owner's context
+    require(scheduler.prefill_turn(runnable, 3, 1U) == 2,
+            "a blocked owner kept the prefill permit from the lane it waits behind");
+    // The walker's units are not the owner's service: the turn stays with it until it has run its own slice.
+    scheduler.served(walker->id, 10 * Scheduler::service_quantum_ns);
+    require(!scheduler.advance_service(false, false) && scheduler.progress_owner() == owner->id,
+            "the blocked owner's turn was spent by the lane it waited behind");
+    require(scheduler.prefill_turn(slots, 3, 1U) == 1, "the owner did not take the permit once it could run");
+    scheduler.served(owner->id, Scheduler::service_quantum_ns);
+    require(scheduler.advance_service(false, false), "the owner's turn did not end after its own slice");
+
+    // An owner that decodes holds no prefill permit, and without a turn the order is next_prefill's.
+    require(scheduler.prefill_turn(slots, 3, 0U) == 1 && scheduler.prefill_turn(slots, 3, std::nullopt) == 1,
+            "a decoding owner or no owner changed the prefill order");
+    // A blocked owner with nothing else to prefill: no permit, rather than one it cannot use.
+    runnable[2].reset();
+    require(!scheduler.prefill_turn(runnable, 3, 1U), "a permit went to a lane that cannot run");
+}
+
+// A unit short of capacity waits for a resident that has finished (its lane and pages come back at the next cycle
+// boundary) instead of pausing another resident or failing with a capacity error: no victim is not no releaser.
+void test_finished_resident_is_a_pending_release() {
+    Scheduler scheduler;
+    Slots slots{};
+    auto owner = slots[0] = request(10, Request::Phase::Prefill);
+    auto finishing = slots[1] = request(20, Request::Phase::Decode);
+    for (const auto& value : {owner, finishing}) { admit(scheduler, value); }
+    require(!scheduler.release_pending(slots, 2), "a decoding resident was taken for a pending release");
+    scheduler.require_progress(owner->id);
+    finishing->phase = Request::Phase::Finished; // its last round ended it; it is settled at the next boundary
+    require(!scheduler.preemption_victim(slots, 2), "a finished resident was offered as a pause victim");
+    require(scheduler.release_pending(slots, 2), "a finished resident's release was not seen: the owner would fail");
+    slots[1].reset();
+    scheduler.finished(finishing->id);
+    require(!scheduler.release_pending(slots, 2) && scheduler.progress_owner() == owner->id,
+            "the settled resident left a pending release or took the turn");
+}
+
 void test_decode_and_control_membership() {
     Scheduler scheduler;
     Slots slots{};
@@ -463,6 +522,8 @@ int main() {
         test_recovery_cost_has_a_bounded_service_allowance();
         test_bounded_service_under_continuous_contention();
         test_prefill_order();
+        test_blocked_owner_leaves_the_prefill_permit();
+        test_finished_resident_is_a_pending_release();
         test_decode_and_control_membership();
         std::cout << "ok\n";
         return 0;

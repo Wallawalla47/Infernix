@@ -129,7 +129,16 @@ M_{max}=C\,L
 \(M_{min}\) satisfies, respectively, reaching \(S\) when one request is exclusive and the geometric lower
 bound of C requests each needing one minimum page.
 \(M_{max}\) is the physical upper bound when all active requests reach the per-sequence ceiling at the
-same time.
+same time. That bound holds without the prefix cache, where only the C active address spaces hold pages.
+With the prefix cache every Device page no active lease holds is a cached block, so more pages than
+\(C\,L\) are useful and only the int32 token representation bounds the pool:
+
+\[
+M_{max}=\max\left(C\,L,\ \left\lfloor (2^{31}-1)/P\right\rfloor\right)
+\]
+
+(`maximum_main_page_groups`, `planning/startup.cpp`), and the automatic policy spends the free Device
+memory on cache.
 
 The explicit `kv_capacity` policy resolves to:
 
@@ -203,7 +212,13 @@ draft config with no full layer does not allocate this pool.
 
 The pools are physically separate. A free page of one pool cannot become payload of another pool. The
 Program establishes the complete typed capacity vector once at startup and does not grow or
-redistribute the pool geometry at runtime.
+redistribute the pool geometry at runtime. What may change at runtime is how much of the Main Text
+pool's fixed geometry has memory behind it: with offloaded experts (Qwen3.5-122B-A10B) on a device with
+CUDA virtual memory management, its planes lie in a reserved virtual region whose pages
+\([0, backed)\) are mapped (`DeviceKVPagePool::backed_pages`), starting at 4,096 tokens; a request that
+needs more takes memory from the expert frames and an idle pool gives it back
+(`program/elastic_kv.cpp`). Page IDs, plane addresses and the capacity \(M\) never move. Without virtual
+memory management the planes are planned in the persistent arena and backed whole.
 
 ### 3.5 Host capacity
 

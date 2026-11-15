@@ -544,6 +544,98 @@ void test_held() {
     tier.check();
 }
 
+// ---- a held key a VRAM promotion still needs keeps its hold: queued for a frame, then being copied, its record has
+// no slot whose pin could keep it, so unhold (a RAM shrink) refuses it until the promotion is done or dropped.
+void test_held_promotion() {
+    HostTier tier(small_config());
+    check(tier.hold(60) && tier.hold(61) && !tier.held_pinned(60), "held keys start unpinned");
+    tier.queued(60);
+    check(tier.held_pinned(60) && !tier.unhold(60) && tier.held(60) && tier.held_count() == 2,
+          "a held key queued for VRAM is not unheld");
+    tier.check();
+    tier.promotion_issued(60);
+    check(tier.held_pinned(60) && !tier.unhold(60) && tier.held(60), "nor while its promotion's copy is in flight");
+    tier.promotion_completed(60, true);
+    check(!tier.held_pinned(60) && tier.unhold(60) && !tier.held(60), "once the promotion completed it may go");
+    // A queued key the VRAM policy drops again (T9) may go too; the other key was never pinned.
+    tier.queued(61);
+    check(!tier.unhold(61), "queued");
+    tier.unqueued(61);
+    check(!tier.held_pinned(61) && tier.unhold(61) && tier.held_count() == 0, "a key dropped from the queue may go");
+    tier.check();
+}
+
+// ---- a pre-fill whose read failed is taken back: the key has no host copy, its slot is free in its class again,
+// nothing counts as lost, and the slot serves the next pre-fill.
+void test_undo_prefill() {
+    HostTier tier(small_config());
+    std::int32_t slot = -1, shadow = -1;
+    for (std::uint32_t k = 0; k < 6; ++k) { check(tier.prefill(k, slot), "prefill"); }
+    check(tier.prefill_shadow(6, shadow) && tier.shadow_count() == 1 && tier.free_resident(0) == 1, "a shadow pre-fill");
+    {
+        const std::uint32_t used[] = {5, 6};
+        tier.record_uses(1, used, 3.0); // their victim heap entries carry values
+    }
+    (void)dirty(tier);
+    tier.undo_prefill(5);
+    check(!tier.host_copy(5) && tier.slot_of(5) < 0 && tier.resident_count() == 6 && tier.free_resident(0) == 2 &&
+              tier.state(static_cast<std::uint32_t>(slot)) == SlotState::kFree,
+          "an undone resident pre-fill frees its slot");
+    tier.undo_prefill(6);
+    check(!tier.host_copy(6) && tier.shadow_count() == 0 && tier.resident_count() == 5 && tier.free_resident(0) == 3 &&
+              tier.state(static_cast<std::uint32_t>(shadow)) == SlotState::kFree,
+          "an undone shadow pre-fill frees its slot and its shadow count");
+    check(dirty(tier) == std::vector<std::uint32_t>{5, 6}, "the undone keys are dirty");
+    const HostTier::Losses& lost = tier.losses();
+    check(lost.residents_evicted == 0 && lost.retired == 0 && lost.unpublished == 0 && lost.no_slot == 0 && lost.unworthy == 0,
+          "an undone pre-fill is no loss");
+    tier.undo_prefill(70); // a key without a slot: nothing to undo
+    tier.check();
+    std::int32_t again = -1;
+    check(tier.prefill(70, again) && tier.prefill(71, again) && tier.prefill(5, again) && !tier.prefill(72, again),
+          "the freed slots take the next pre-fills");
+    tier.check();
+}
+
+// ---- the eviction gate promises each victim it passes a demotion or free slot of its class: with an unlimited
+// allowance (a prefill boundary) it passes as many demotion-worthy victims as there are slots, so none it passed is
+// dropped for want of one, whether the evictions follow each gate or every gate comes first (a round's policy steps
+// run before its evictions).
+void test_gate_reserves() {
+    for (const bool gates_first : {false, true}) {
+        HostTier tier(small_config());
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            std::int32_t slot = -1;
+            check(tier.prefill(k, slot), "prefill");
+        }
+        const std::uint32_t hot[] = {60, 61, 62, 63, 64, 65};
+        tier.record_uses(1, hot, 1000.0); // every one outranks the residents: demotion-worthy
+        tier.begin_round(kUnlimited);
+        std::vector<std::uint32_t> passed;
+        std::uint32_t demoted = 0, target = 0;
+        for (const std::uint32_t key : hot) {
+            if (!tier.allow_evict(key)) { continue; }
+            passed.push_back(key);
+            if (!gates_first) { demoted += tier.vram_evicted(key, true, target) == VramEviction::kDemote ? 1U : 0U; }
+        }
+        if (gates_first) {
+            for (const std::uint32_t key : passed) {
+                demoted += tier.vram_evicted(key, true, target) == VramEviction::kDemote ? 1U : 0U;
+            }
+        }
+        check(passed.size() == 3 && demoted == 3, "the gate passes one victim per demotion slot, and each is demoted");
+        check(tier.losses().no_slot == 0, "no victim the gate passed is dropped for want of a slot");
+        check(!tier.allow_evict(65), "T6 with every slot taken the next demotion-worthy victim waits");
+        tier.check();
+        // The next boundary refills the list and its promises start over.
+        tier.replenish_demotion_list();
+        tier.begin_round(kUnlimited);
+        check(tier.allow_evict(63) && tier.allow_evict(64) && tier.allow_evict(65) && !tier.allow_evict(62),
+              "the next boundary's gate promises the refilled list once");
+        tier.check();
+    }
+}
+
 // ---- retirement (a RAM shrink takes slots out of service, a growth restores them): residents and shadows leave RAM
 // and are dirty, a list's slots are replaced by the lowest-ranked residents outside the set (the lists keep their
 // sizes), a pinned slot refuses the whole set, a class keeps more slots than its demotion list, and restored slots
@@ -1006,6 +1098,9 @@ int main() {
         test_transitions();
         test_warm_fill();
         test_held();
+        test_held_promotion();
+        test_undo_prefill();
+        test_gate_reserves();
         test_stream_pins();
         test_retire();
         test_random();

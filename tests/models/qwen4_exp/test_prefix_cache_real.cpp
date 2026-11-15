@@ -21,6 +21,9 @@
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //                Between the turns, Engine 1's periodic save writes the file once and, with the Host
 //                tier unchanged, not again.
+//   restore fault (plain mode, own Engines) An activation fails with its Host restore staged
+//                (testing::set_restore_fault): later resumes restore from the Host tier again, the stop saves
+//                the Host tier and a restart restores it.
 //   one context  (MTP mode, own Engine with kv_capacity = max_context) A recomputed cached prefix
 //                replaces the cached copies instead of pinning them beside its pages: the request
 //                completes, equals its cold run, and the Engine keeps serving.
@@ -46,6 +49,7 @@
 #include "kv_cache_storage.h"
 #include "engine_host.h"
 #include "infernix/engine.h"
+#include "models/qwen4_exp/program/prefix/test_taps.h"
 
 #include <algorithm>
 #include <chrono>
@@ -385,6 +389,61 @@ int run_persistence(const char* artifact, const char* ngram) {
         failures += check(after.generated_token_ids == before.generated_token_ids,
                           "the restored resume equals Engine 1's turn 2 (" +
                               first_difference(after.generated_token_ids, before.generated_token_ids) + ")");
+    }
+    std::filesystem::remove(file, ignored);
+    return failures;
+}
+
+// A failed activation (review 2026-11-14, D1): a device error while a resume's Host restore is staged left the
+// restore batch open, so every later resume that needed a restore failed ("a restore is already open") and the stop's
+// save refused, until a restart. testing::set_restore_fault fails the next activation at that point. Afterwards the
+// Engine must serve the same resume from a Host restore again, and the stop must save a file a restart restores.
+int run_restore_fault(const char* artifact, const char* ngram) {
+    std::printf("== restore fault (a failed activation)\n");
+    namespace hooks = infernix::models::qwen4_exp::testing;
+    const std::filesystem::path file = infernix::test::unique_temp_path("infernix_qwen4_exp_fault.cache");
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    infernix::EngineOptions options             = base_options(artifact, ngram);
+    options.context_cache.hybrid.persistent_file     = file;
+    options.context_cache.hybrid.persistent_identity = "fault";
+    const std::vector<infernix::TokenId> a = synthetic_tokens(1500, 71);
+    std::vector<infernix::TokenId> b(a.begin(), a.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 72);
+    b.insert(b.end(), suffix.begin(), suffix.end());
+    const std::vector<infernix::TokenId> pressure = synthetic_tokens(3900, 73);
+    int failures = 0;
+    {
+        infernix::Engine engine(options, infernix::test::engine_host());
+        // A leaves its taps and blocks; the pressure prompt takes the lane's slot and the Device pages, so B's
+        // resume restores its image (and blocks) from the Host tier.
+        (void)generate(engine, a, 8, true);
+        (void)generate(engine, pressure, 1, true);
+        hooks::set_restore_fault();
+        try {
+            const Run failed = generate(engine, b, 16, true);
+            std::printf("        the faulted request was served from %u reused tokens\n", failed.reused);
+        } catch (const std::exception& error) {
+            std::printf("        the faulted request failed: %s\n", error.what());
+        }
+        failures += check(!hooks::take_restore_fault(), "the resume staged a Host restore and met the fault");
+        // The cache was emptied with the failed binding: the same sequence fills it and resumes again.
+        (void)generate(engine, a, 8, true);
+        (void)generate(engine, pressure, 1, true);
+        const infernix::RuntimeStats before = engine.runtime_stats();
+        const Run resumed                   = generate(engine, b, 16, true);
+        const infernix::RuntimeStats after  = engine.runtime_stats();
+        failures += check(resumed.reused > 0 && resumed.tokens.size() == 16,
+                          "after the fault a resume is served (reused " + std::to_string(resumed.reused) + ")");
+        failures += check(after.hybrid_host_image_restores > before.hybrid_host_image_restores,
+                          "after the fault a Host restore is staged and lands");
+    } // the stop saves the Host tier: it refuses while a restore batch is open
+    failures += check(std::filesystem::exists(file), "the stop saved the Host tier after the fault");
+    {
+        infernix::Engine engine(options, infernix::test::engine_host());
+        const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
+        failures += check(restore.restored && restore.snapshots > 0,
+                          "a restart restores the saved snapshots (" + restore.message + ")");
     }
     std::filesystem::remove(file, ignored);
     return failures;
@@ -855,6 +914,7 @@ int main(int argc, char** argv) {
         if (mtp) { failures += run_one_context(artifact, ngram); }
         if (mtp) { failures += run_identical_burst(artifact, ngram); }
         if (plain) { failures += run_persistence(artifact, ngram); }
+        if (plain) { failures += run_restore_fault(artifact, ngram); }
         if (next_turn) {
             failures += run_next_turn(artifact, ngram, false);
             failures += run_next_turn(artifact, ngram, true);

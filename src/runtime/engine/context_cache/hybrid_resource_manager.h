@@ -58,6 +58,15 @@ public:
         prefetch_room_  = program.hybrid_prefetch_room();
     }
 
+    // Whether the last attempt left more to copy (a batch in flight, or one that copied blocks): the Engine
+    // then asks again each cycle while the same request heads the queue, so a head that waits through long
+    // decodes has its whole Host-only path copied, not one batch per admission event. One flag read a cycle
+    // otherwise.
+    [[nodiscard]] bool prefetch_continues() const noexcept { return prefetch_retry_; }
+    [[nodiscard]] std::uint64_t prefetch_head() const noexcept { return prefetch_order_; }
+    // The head it served left the queue's front (admitted, cancelled, expired): nothing more to copy for it.
+    void prefetch_forget() noexcept { prefetch_retry_ = false; }
+
     void populate_runtime_stats(Program& program, RuntimeStats& out) const noexcept {
         const auto hybrid              = program.hybrid_stats();
         out.hybrid_cached_blocks       = hybrid.device_resident_blocks;

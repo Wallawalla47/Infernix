@@ -263,6 +263,36 @@ void test_growth_past_start(int device) {
     index.check_invariants();
 }
 
+// A tier of many small chunks, more than one batch of the startup's page-touching threads (each batch is
+// registered while the next is touched): every chunk is page-locked, the progress reaches the whole tier
+// in rising steps, and every slab is zeroed memory of its own that holds what is written to it.
+void test_startup_batches() {
+    constexpr std::uint32_t kSmallChunkSlabs = 2;
+    std::vector<std::uint64_t> steps;
+    std::uint64_t total_seen = 0;
+    pc::HostSlabStore store(kSlab, kSlabs, kSlabs, kSmallChunkSlabs * kSlab, "test Host tier",
+                            [&](std::uint64_t pinned, std::uint64_t total) {
+                                steps.push_back(pinned);
+                                total_seen = total;
+                            });
+    const std::uint64_t bytes = static_cast<std::uint64_t>(kSlabs) * kSlab;
+    require(store.pinned_slabs() == kSlabs && store.pinned_bytes() == bytes && store.slabs_per_chunk() == kSmallChunkSlabs,
+            "every chunk of the tier is page-locked");
+    require(steps.size() == kSlabs / kSmallChunkSlabs && total_seen == bytes && steps.back() == bytes &&
+                std::is_sorted(steps.begin(), steps.end()) && std::adjacent_find(steps.begin(), steps.end()) == steps.end(),
+            "the progress reports each chunk once, up to the whole tier");
+    for (std::uint32_t slab = 0; slab < kSlabs; ++slab) {
+        const std::byte* p = store.slab(slab);
+        require(std::all_of(p, p + kSlab, [](std::byte b) { return b == std::byte{0}; }), "a fresh slab is zeroed");
+    }
+    for (std::uint32_t slab = 0; slab < kSlabs; ++slab) { std::memset(store.slab(slab), static_cast<int>(slab + 1U), kSlab); }
+    for (std::uint32_t slab = 0; slab < kSlabs; ++slab) {
+        const std::byte* p = store.slab(slab);
+        require(p[0] == static_cast<std::byte>(slab + 1U) && p[kSlab - 1] == static_cast<std::byte>(slab + 1U),
+                "every slab is memory of its own");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -274,6 +304,7 @@ int main() {
     try {
         test_release_and_growth(0);
         test_growth_past_start(0);
+        test_startup_batches();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

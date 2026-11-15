@@ -147,6 +147,36 @@ public:
         return best;
     }
 
+    // The lane this cycle's prefill permit goes to. `runnable` is the residents less the lanes that cannot
+    // run a prefill unit now (the Program blocks their context, or they wait for their grammar while
+    // another lane has work). `priority`, the service turn's owner or a protected recovery, takes the
+    // permit while it prefills or replays and can run; otherwise next_prefill chooses among the lanes that
+    // can. A priority lane that cannot run must not keep the permit: the lane it waits behind (another
+    // lane's layer walk on Qwen3.8-Flash-Next) would never advance, and neither would it. Its turn is not
+    // charged meanwhile (served counts only its own committed progress), so it still gets its whole slice
+    // once it can run.
+    template <class Slots>
+    [[nodiscard]] std::optional<std::uint32_t>
+    prefill_turn(const Slots& runnable, std::uint32_t concurrency,
+                 std::optional<std::uint32_t> priority) const noexcept {
+        if (priority && *priority < concurrency && runnable[*priority] &&
+            (runnable[*priority]->is_prefilling() || runnable[*priority]->is_replaying())) {
+            return priority;
+        }
+        return next_prefill(runnable, concurrency);
+    }
+
+    // Whether a resident has finished and gives its lane and pages back at the next cycle boundary (the
+    // Engine settles terminal requests there). A unit short of capacity waits for that release instead of
+    // pausing a resident for it or reporting a capacity contract error: the releaser exists.
+    template <class Slots>
+    [[nodiscard]] bool release_pending(const Slots& slots, std::uint32_t concurrency) const noexcept {
+        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+            if (slots[lane] && slots[lane]->is_model_finished()) { return true; }
+        }
+        return false;
+    }
+
     // After lane `lane`'s unit prefilled or replayed `tokens`: every other lane still prefilling or
     // replaying waited that long.
     template <class Slots>

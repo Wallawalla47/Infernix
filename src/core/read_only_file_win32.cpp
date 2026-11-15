@@ -209,8 +209,25 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
     constexpr std::size_t kDepth = 16;
     const std::size_t blocks     = (destination.size() + kBlock - 1) / kBlock;
     const std::size_t slots      = std::min(kDepth, blocks);
-    // One OVERLAPPED per slot and no event objects: completion is polled (HasOverlappedIoCompleted),
-    // since a wait on the handle would return for any of the slots' reads.
+    // One OVERLAPPED and one event per slot: a pass finds the finished reads (HasOverlappedIoCompleted, a
+    // memory read), and when none has finished the thread sleeps until one does. These reads take
+    // milliseconds each, so the wake costs nothing against them, where a spin held a core for the whole
+    // read (seconds for the expert banks, while other threads zero and upload). read_direct_blocks keeps
+    // its spin: its 4 KiB reads complete in tens of microseconds.
+    struct Events {
+        std::vector<HANDLE> handles;
+        ~Events() {
+            for (const HANDLE handle : handles) { ::CloseHandle(handle); }
+        }
+    } events;
+    events.handles.reserve(slots);
+    for (std::size_t s = 0; s < slots; ++s) {
+        const HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (event == nullptr) {
+            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "direct file read: CreateEventW");
+        }
+        events.handles.push_back(event);
+    }
     std::vector<OVERLAPPED> operations(slots);
     std::vector<std::size_t> reading(slots, blocks);
     std::vector<DWORD> landed(blocks, 0);
@@ -247,6 +264,7 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
                 operation                    = OVERLAPPED{};
                 operation.Offset             = static_cast<DWORD>(absolute & 0xffffffffULL);
                 operation.OffsetHigh         = static_cast<DWORD>(absolute >> 32U);
+                operation.hEvent             = events.handles[s]; // ReadFile resets it, the completion sets it
                 if (!::ReadFile(impl_->direct_file, destination.data() + at, amount, nullptr, &operation)) {
                     const DWORD error = ::GetLastError();
                     if (error == ERROR_HANDLE_EOF) {
@@ -263,7 +281,15 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
                 progressed = true;
             }
         }
-        if (!progressed && in_flight > 0) { YieldProcessor(); }
+        if (!progressed && in_flight > 0) {
+            HANDLE waiting[kDepth];
+            DWORD count = 0;
+            for (std::size_t s = 0; s < slots; ++s) {
+                if (reading[s] != blocks) { waiting[count++] = events.handles[s]; }
+            }
+            // A failed wait (it cannot time out) falls back to the next pass's poll.
+            if (::WaitForMultipleObjects(count, waiting, FALSE, INFINITE) == WAIT_FAILED) { YieldProcessor(); }
+        }
     }
     if (failure != ERROR_SUCCESS) {
         throw std::system_error(static_cast<int>(failure), std::system_category(), "direct file read");

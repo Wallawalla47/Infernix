@@ -42,7 +42,7 @@ public:
         std::uint32_t total_depth    = 13;
         std::size_t restore_split    = 1024 * 1024;
         std::size_t prefetch_split   = 256 * 1024;
-        std::chrono::milliseconds timeout{1500};
+        std::chrono::milliseconds timeout{1500}; // of a device read of up to 4 MiB; a larger one has it per 4 MiB
         std::chrono::milliseconds transient_bound{1500};
         std::uint32_t posix_workers = 4;
     };

@@ -23,4 +23,15 @@ void set_forced_tap(std::optional<std::uint32_t> position) noexcept;
 void set_restore_delay(std::uint32_t microseconds) noexcept;
 [[nodiscard]] std::uint32_t restore_delay() noexcept;
 
+// The next activation that stages a Host restore fails once its batch is open and staged, as a device error in a
+// restore copy would (infernix_qwen4_exp_prefix_cache_real_test: the batch is aborted, and later restores and the
+// shutdown save work). take_restore_fault reads and clears the request. For tests only.
+void set_restore_fault() noexcept;
+[[nodiscard]] bool take_restore_fault() noexcept;
+
+// Whole drains of the prefix cache's transfer and restore streams (PrefixCache::drain) since the process started: a
+// test reads the count around an operation that must not wait for every transfer. count_drain is the cache's.
+void count_drain() noexcept;
+[[nodiscard]] std::uint64_t drains() noexcept;
+
 } // namespace infernix::models::qwen4_exp::testing

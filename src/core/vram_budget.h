@@ -77,6 +77,11 @@ inline constexpr std::uint64_t kSpillToleranceBytes = 32ULL << 20;
 [[nodiscard]] std::uint64_t spill_shortfall(std::uint64_t free_before, std::uint64_t free_after,
                                             std::uint64_t bytes,
                                             std::uint64_t tolerance = kSpillToleranceBytes) noexcept;
+// The same from this process's shared system memory use before and after the step: its rise beyond
+// the `pinned_bytes` the step page-locked and `tolerance`, at most `bytes`; 0: resident.
+[[nodiscard]] std::uint64_t spill_rise(std::uint64_t nonlocal_before, std::uint64_t nonlocal_after,
+                                       std::uint64_t bytes, std::uint64_t pinned_bytes,
+                                       std::uint64_t tolerance = kSpillToleranceBytes) noexcept;
 
 // Checks device allocation steps against a source's free memory. A shortfall is confirmed by a
 // second reading, since another program can change free memory during the step.
@@ -85,8 +90,16 @@ public:
     explicit SpillGuard(VramBudgetSource& source) : source_(source) {}
     // Records free memory before a step.
     void begin() { before_ = source_.query(); }
-    // After a step that allocated `bytes`: the bytes not placed in device memory (0: resident).
+    // After a step that allocated `bytes`: the bytes not placed in device memory (0: resident), from
+    // the drop in free device memory. Another program that frees or takes device memory during the
+    // step changes that drop, so a caller that knows what it page-locked uses the form below.
     [[nodiscard]] std::uint64_t end(std::uint64_t bytes);
+    // The same for a step that also page-locked `pinned_bytes` of host memory for the device (net of
+    // what it released again). Where the source reads this process's shared system memory use
+    // (Windows, WSL2) that use is the evidence: a sysmem fallback raises it by the bytes it placed
+    // there, page-locked memory by its size, and no other program's allocations move it. Without
+    // that reading the free-memory drop decides, as above.
+    [[nodiscard]] std::uint64_t end(std::uint64_t bytes, std::uint64_t pinned_bytes);
     // The last step's readings, for its failure: free device memory before and after a step of
     // `bytes`, and where the source reads it (Windows, WSL2) this process's shared system memory use,
     // which a real sysmem fallback raises and a misread free-memory figure does not.

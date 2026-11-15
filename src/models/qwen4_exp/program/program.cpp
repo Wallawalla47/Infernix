@@ -61,7 +61,7 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
 }
 
 std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, const ResumeState* resume) {
-    return impl_->hybrid_sources(base, resume ? resume->frontier() : UINT32_MAX);
+    return impl_->hybrid_sources(base, resume);
 }
 
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
@@ -100,6 +100,9 @@ bool Program::hybrid_poll_storage() { return impl_->hybrid_poll_storage(); }
 bool Program::hybrid_source_pending() const noexcept { return impl_->hybrid_source_pending(); }
 
 bool Program::hybrid_storage_due() const noexcept { return impl_->hybrid_storage_due(); }
+std::optional<std::chrono::steady_clock::time_point> Program::hybrid_storage_retry_at() const noexcept {
+    return impl_->hybrid_storage_retry_at();
+}
 std::uint32_t Program::hybrid_resume_grid() const noexcept { return impl_->hybrid_resume_grid(); }
 
 runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {

@@ -4,12 +4,14 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen3_5/program/program_impl.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -731,6 +733,164 @@ void cached_pause_lifecycle(DeviceContext& device, const qwen::execution::Parame
     }
 }
 
+// A paused generation resumed from a tap whose blocks and image went to the Host tier, with the restore's copies
+// held 200 ms (testing::set_restore_delay), against the same request with the copies not held:
+// - the Replay passes wait for each layer's copies, so both runs generate the same tokens (2026-11-15: only a
+//   prefill pass waited; a Replay pass read restored KV pages and recurrent state before they landed);
+// - a reclaim that cannot evict returns while that restore is still landing, having waited for no transfer (it
+//   drained every transfer, another lane's restore included);
+// - a lane's release writes to the Host tier only the blocks a snapshot can resume through;
+// - the prefill unit that publishes a tap reports it (PrefillProgress::snapshot_published), and no other does;
+// - emptying the cache drops every entry and the tool-call holds that named them.
+void host_restore_lifecycle(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                            EngineOptions options) {
+    constexpr std::uint32_t kHostPrompt = 2048;
+    constexpr std::uint32_t kTap        = kHostPrompt - kChunk; // the prompt-tail tap: the final chunk's start
+    const qwen::Frontend frontend =
+        qwen::make_frontend(parameters.model.resources(), {.vision_enabled = false, .max_context = kLongContext});
+    options.max_context                                = kLongContext;
+    options.kv_capacity                                = KvCapacityPolicy::explicit_capacity(2 * kLongContext);
+    options.context_cache.enabled                      = true;
+    options.context_cache.host_capacity_bytes          = 2ULL << 30;
+    options.context_cache.hybrid.device_snapshot_slots = 4;
+    options.context_cache.hybrid.max_new_taps          = 2;
+    options.context_cache.hybrid.tap_ladder_tokens     = 4096;
+    options.context_cache.hybrid.tap_min_gap_tokens    = 1024;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 3 * kLongContext / 64U);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    require(program.hybrid_ != nullptr && program.hybrid_->host_tier(), "the Host-tier fixture built no Host tier");
+
+    const auto settle = [&] {
+        for (unsigned step = 0; step < 8; ++step) {
+            device.synchronize();
+            auto progress = program.poll_context({});
+            if (progress.complete) { return progress; }
+        }
+        throw std::runtime_error("Host-tier fixture transaction did not complete");
+    };
+    const auto reserve = [&](qwen::SequenceHandle sequence, qwen::ExecutionUnitKind kind, std::uint32_t tokens = 0) {
+        const std::array<qwen::ExecutionUnit, 1> units{{{sequence, kind, tokens}}};
+        require(static_cast<bool>(program.reserve_units(units)), "the Host-tier fixture could not reserve a unit");
+    };
+    const auto decode = [&](qwen::SequenceHandle sequence, bool terminal) {
+        reserve(sequence, qwen::ExecutionUnitKind::Decode, 1);
+        const std::array<qwen::SequenceHandle, 1> members{sequence};
+        const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 1}}};
+        auto pending = program.decode(members, budgets, nullptr, nullptr);
+        const std::array<runtime::CommitDecision, 1> decision{{{.accepted_tokens = 1, .terminal = terminal}}};
+        (void)program.commit(std::move(pending), decision, runtime::CommitObservation::AllRows, nullptr);
+    };
+    struct RestoreDelay {
+        explicit RestoreDelay(std::uint32_t microseconds) { qwen::testing::set_restore_delay(microseconds); }
+        ~RestoreDelay() { qwen::testing::set_restore_delay(0); }
+    };
+
+    // One request from an empty cache: prefilled, three tokens generated, paused with no Device snapshot slot to
+    // take (so the pause publishes nothing), its blocks evicted to the Host tier, resumed from the tap and replayed,
+    // then six more tokens. Returns the tokens it generated.
+    const auto run = [&](bool delayed) {
+        const std::string label = delayed ? "held restore" : "restore";
+        std::vector<TokenId> ids(kHostPrompt, 198);
+        for (std::size_t at = 0; at < ids.size(); at += 5) { ids[at] = 4000 + static_cast<TokenId>(at % 89); }
+        runtime::ResolvedExecutionOptions execution;
+        execution.requested_output_tokens = 16;
+        execution.allow_prefix_reuse      = true;
+        const auto base = program.plan_request(
+            qwen::PreparedPromptAccess::take(frontend.prepare_tokens(std::move(ids))), execution);
+
+        auto sources = program.hybrid_sources(base, nullptr);
+        require(!sources.empty() && sources.front().reused_tokens == 0, label + ": the empty cache quoted a source");
+        require(static_cast<bool>(program.start_binding(base, {0}, sources.front(), nullptr,
+                                                        qwen::ExecutionUnitKind::Prefill, 0U)),
+                label + ": the request could not bind");
+        const qwen::SequenceHandle original = *settle().sequence;
+        bool reported = false;
+        for (std::uint32_t processed = 0; processed < kHostPrompt;) {
+            reserve(original, qwen::ExecutionUnitKind::Prefill);
+            const std::uint64_t taps = program.hybrid_stats().taps_created;
+            auto step                = program.advance_prefill(original, nullptr, nullptr);
+            const bool published     = program.hybrid_stats().taps_created != taps;
+            require(step.snapshot_published == published,
+                    label + ": a prefill unit's snapshot_published disagrees with the taps it published");
+            reported = reported || step.snapshot_published;
+            processed += step.processed_prompt_tokens;
+            if (step.complete) {
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accepted, runtime::CommitObservation::AllRows, nullptr);
+            }
+        }
+        require(reported, label + ": no prefill unit reported the tap it published");
+        for (int round = 0; round < 3; ++round) { decode(original, false); }
+
+        // The tap's Host write lands, so holding every Device slot takes its slot and leaves its image on the Host.
+        device.synchronize();
+        program.hybrid_->drain();
+        std::vector<std::uint32_t> held;
+        while (const auto slot = program.hybrid_->index().acquire_device_slot()) { held.push_back(*slot); }
+        const auto before_pause = program.hybrid_stats();
+        require(program.start_pause(original, nullptr), label + ": pause refused");
+        auto paused = settle();
+        require(paused.paused.has_value(), label + ": pause lost its request");
+        device.synchronize();
+        program.hybrid_->drain();
+        for (const std::uint32_t slot : held) { program.hybrid_->index().release_device_slot(slot); }
+        // Only the blocks at or above the tap can serve a resume; the ones past it would be recomputed.
+        const std::uint64_t written = program.hybrid_stats().host_block_writes - before_pause.host_block_writes;
+        require(written == kTap / 64U, label + ": the release wrote " + std::to_string(written) +
+                                           " blocks to the Host tier, not the " + std::to_string(kTap / 64U) +
+                                           " a snapshot can resume through");
+        (void)program.hybrid_->index().evict_backed_device_blocks(kLongContext);
+
+        const RestoreDelay delay(delayed ? 200'000U : 0U);
+        const auto before_resume = program.hybrid_stats();
+        sources                  = program.hybrid_sources(base, &*paused.paused);
+        require(!sources.empty() && sources.front().reused_tokens == kTap,
+                label + ": the paused request was not quoted its tap");
+        require(static_cast<bool>(program.start_binding(base, {1}, sources.front(), &*paused.paused,
+                                                        qwen::ExecutionUnitKind::Decode, 1U)),
+                label + ": the resume could not bind");
+        auto bound = settle();
+        require(bound.published && bound.sequence && bound.replaying, label + ": the resume did not enter replay");
+        paused.paused.reset();
+        const qwen::SequenceHandle resumed = *bound.sequence;
+        require(program.hybrid_stats().host_block_restores - before_resume.host_block_restores == kTap / 64U,
+                label + ": the resume did not restore its blocks from the Host tier");
+        if (delayed) {
+            // Nothing a wait could free: the only transfer in flight lands blocks the resumed lane maps.
+            const std::uint64_t waits = qwen::testing::transfer_waits();
+            runtime::ContextResourceUsage shortage;
+            shortage.main_kv_pages = 4U * kLongContext;
+            (void)program.hybrid_reclaim(shortage);
+            require(qwen::testing::transfer_waits() == waits && program.hybrid_->transfers_pending(),
+                    "a reclaim that could evict nothing waited for another lane's restore");
+        }
+        bool complete = false;
+        for (unsigned step = 0; !complete && step < kHostPrompt / kChunk + 4; ++step) {
+            reserve(resumed, qwen::ExecutionUnitKind::Replay);
+            complete = program.advance_replay(resumed, nullptr).complete;
+        }
+        require(complete, label + ": the replay did not complete");
+        for (int round = 0; round < 6; ++round) { decode(resumed, round == 5); }
+        const std::vector<TokenId>& ledger = program.sequences[1].ledger;
+        std::vector<TokenId> generated(ledger.begin() + kHostPrompt, ledger.end());
+        require(program.finish(resumed).status == runtime::ConsumeStatus::Consumed, label + ": the request did not finish");
+        return generated;
+    };
+
+    const std::vector<TokenId> plain = run(false);
+    // Emptying the cache between the runs: no entry and no tool-call hold survives it.
+    program.hybrid_hold_continuation(std::chrono::steady_clock::now() + std::chrono::seconds(30));
+    require(!program.hybrid_tool_holds_.empty(), "the finished request left nothing for a tool-call hold");
+    program.hybrid_reset_cache();
+    require(program.hybrid_tool_holds_.empty() && program.hybrid_->index().stats().nodes == 0 &&
+                program.hybrid_->index().stats().snapshots == 0,
+            "emptying the prefix cache left entries or tool-call holds behind");
+    const std::vector<TokenId> held = run(true);
+    require(plain.size() == 10 && held == plain,
+            "a resume whose Host restore was held generated other tokens than one whose restore had landed");
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -772,8 +932,10 @@ int main(int argc, char** argv) {
         replay_sampling_counts(device, parameters, frontend, options);
         std::cout << "replay sampling counts: OK\n";
         cached_pause_lifecycle(device, parameters, options);
-        std::cout << "OK native pause, a pause before the first chunk, replay recovery, row failure and the cached "
-                     "pause lifecycle\n";
+        std::cout << "cached pause lifecycle: OK\n";
+        host_restore_lifecycle(device, parameters, options);
+        std::cout << "OK native pause, a pause before the first chunk, replay recovery, row failure, the cached "
+                     "pause lifecycle and the Host-restored resume\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL native transactions: " << error.what() << '\n';

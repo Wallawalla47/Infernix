@@ -364,8 +364,12 @@ struct Snapshot {
 - A snapshot is **valid** iff every node on `path(anchor)`, the tail bundle (if any) and the image
   each have at least one resident copy (device or host). Validity is maintained eagerly:
   removing the last copy of a node deletes its subtree's snapshots (§9.4).
-- There is at most one snapshot per `(anchor, tail tokens)`. Publishing a duplicate is a no-op
-  that refreshes recency.
+- There is at most one snapshot per `(anchor, tail tokens)`. Publishing a duplicate creates nothing:
+  the existing snapshot is returned, its recency refreshed and, when superseded, retained again (the
+  lineage that published the same state again resumes from it next; left superseded it was the first
+  victim, with the snapshot that lineage came from superseded behind it). It takes what it lacks from
+  the publication: the tail's Device copy, and the Device slot when the caller offers it and attaches
+  the image (`PublishResult::tail_adopted`, `device_adopted`); the rest is released.
 
 ### 5.4 Memory pools
 
@@ -389,9 +393,11 @@ struct Snapshot {
   free list is a min-heap of slab ids (the lowest goes first, so batches come out consecutive).
   There is no fragmentation and no geometry check: capacity is `free_slabs`. A nonzero budget
   smaller than one snapshot plus one block is rejected at startup. Both Programs' caches keep the
-  pool in `runtime::prefix_cache::HostSlabStore`: chunks of at most 1 GiB of whole slabs (one very
-  large page-locked allocation can fail or stall under WDDM), each committed, zeroed and then
-  registered with the driver (a short driver call), which are also its resize step; a slab never
+  pool in `runtime::prefix_cache::HostSlabStore`: chunks of at most 64 MiB of whole slabs
+  (`HostSlabStore::kChunkBytes`: one very large page-locked allocation can fail or stall under WDDM, and
+  registering a range stalls the device's work for a time that grows with it), each committed, zeroed and
+  then registered with the driver (a short driver call; at startup a batch of chunks is registered while
+  the next batch's pages are zeroed), which are also its resize step; a slab never
   crosses chunks. Under RAM pressure (`--ram-resize auto`, idle or between rounds while requests
   run) a release retires the slabs from a ceiling on without stopping anything:
   `PrefixCacheIndex::begin_host_shrink` places the ceiling above every slab a transfer reads or
@@ -441,6 +447,11 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   lands, then every Host-resident snapshot whose anchor path is Host-resident, and exactly those
   paths, are written parents first with their slab bytes (a temporary file flushed to the drive,
   then renamed into place, so a power loss leaves the old file or the new one, never a torn one).
+  The slabs go from the Host tier's page-locked memory to the drive unbuffered
+  (`core::DirectScratchFile`: no page cache and no copy; consecutive slabs of one chunk as one write
+  of up to 8 MiB, two in flight), each hashed on its way (`core::content_hash`, xxHash64, as the SSD
+  tier's slabs: the only pass over the bytes besides the device's); the head with the tables and
+  those hashes is written last.
   Superseded snapshots (§9.3) are saved too, with their flag, after the retained ones and oldest
   supersession first: a retry, a regenerate or a re-sent prompt resumes from the tap its first
   request resumed from, which that request's endpoint superseded, so leaving them out lost exactly
@@ -455,12 +466,18 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   and expert tail skip settings, the product binary's identity — build id plus executable size
   and time, so any rebuild invalidates it — and the GPU's name, compute capability and SM count)
   and its Host geometry equal the running Engine's, and
-  its size matches its tables. The file (format 5, one layout and one implementation for every
+  its size matches its tables. The file (format 6, one layout and one implementation for every
   binding, `runtime/prefix_cache/persist_file.h`; each family supplies its file kind, its Host
   geometry, a word per block — Qwen3.8-Flash-Next's `mtp_next` — and fixed-size meta per snapshot —
   its state image header) holds the header, the block table, the snapshot table (each snapshot's
-  kind, hits and superseded flag) and only then the slab bytes, so the loader chooses before it
-  reads any slab. A Host tier
+  kind, hits and superseded flag, and the content hash of every Host slab the file holds) and the
+  end mark, padded to 4 KiB, and only then the slab bytes, each slab on a 4 KiB boundary, so the
+  loader chooses before it reads any slab and reads them unbuffered straight into the Host tier's
+  memory (eight reads of up to 8 MiB in flight, consecutive slabs of one chunk as one read, each
+  slab hashed on its read's thread). An entry with a slab whose bytes are not the saved ones is
+  dropped — a block with what resumes through it, a snapshot alone — and the rest of the file
+  stays; the load reports how many. A file of an earlier format is ignored and replaced by the
+  next save. A Host tier
   that holds the whole file restores all of it, superseded snapshots coming back superseded (they
   are evicted first again, and a hit retains one as it does in a running cache). A smaller one
   restores whole snapshots, retained ones before superseded ones and each group greedily by the
@@ -472,7 +489,10 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   only the blocks its snapshots resume through; the log then warns `prefix cache not restored`
   with the tier the file needs, and that the save at shutdown replaces the file. Entries are rebuilt Host-only, parents before children, without evicting
   anything, and their first requests restore blocks and images through the ordinary Host restore
-  path. A damaged file loads nothing.
+  path. A file with damaged tables, or one a read of fails, loads nothing. A file saved with SSD
+  copies and loaded without them (no kept SSD tier at this start, or another size) restores what the
+  Host bytes alone can: a snapshot below a block only the SSD held cannot come back and takes none
+  of the Host tier.
 - **With an SSD tier (§5.7) the SSD content is kept too** (2026-11-08, candidates YK-02). The tier's
   file is then `infernix-context-kept-<hash of the file's absolute path>.bin` in `--ssd-context-dir`,
   opened for this process alone and kept when it ends. The tier records each slab's content hash as
@@ -589,7 +609,10 @@ most once while the SSD keeps it (blocks are immutable):
   writes nothing; superseded snapshots, dead blocks and Device-only content are never written. Each
   Engine cycle first publishes landed captures and Host writes, then decides, so a request's
   snapshots are written before the next request's prefill displaces them; while the Engine is idle
-  the maintenance waker runs it (`hybrid_storage_due`). That order alone still lost races: on
+  the maintenance waker runs it (`hybrid_storage_due`). An attempt that finds nothing it can write
+  yet (a just-finished request's endpoint whose Host copies are still landing, which wakes nobody)
+  is tried again 100 ms later, the wait doubling up to 2 s while the index publishes nothing new:
+  the tier names that time (`SsdTier::write_back_retry_at`) for the idle Engine's wait. That order alone still lost races: on
   Qwen3.8-Flash-Next a capture whose image the Host tier cannot hold without losing unwritten content
   (`capture`, and a layer walk's staged capture when the walk is planned) first starts the
   write-backs it can, lowest value first, and waits for them to land until it can displace copies
@@ -603,9 +626,10 @@ most once while the SSD keeps it (blocks are immutable):
   evictable (a path pin takes a block out of the Device LRU, and one did make an idle Engine refuse a
   prompt that needed those pages). A Device copy that is an entry's only copy stays out of the LRU
   while I/O-pinned, and a Device slot owner under a promotion is never removed for its slot.
-- Unbuffered I/O needs sector-aligned memory: Host chunks are allocated 4 KiB-aligned
-  (`PinnedHostBuffer(bytes, 4096)`), since `cudaMallocHost` returned a 1 GiB chunk only 512-byte
-  aligned. A transfer the file refuses or the drive fails counts as a failure, never an Engine error.
+- Unbuffered I/O needs sector-aligned memory: Host chunks are page-aligned allocations of their own
+  (`RegisteredHostBuffer`: committed, then registered with the driver), since `cudaMallocHost`
+  returned a 1 GiB chunk only 512-byte aligned. A transfer the file refuses or the drive fails counts
+  as a failure, never an Engine error; three of either stop the write-back.
 - SSD room for a write-back worth `H` (its snapshot's priority) comes from, in order: the SSD copies
   of dead blocks; superseded SSD-only snapshots, oldest first; SSD copies of images still on the
   Host or the Device whose priority exceeds `H` (the Host keeps those longer; most valuable first);
@@ -653,7 +677,8 @@ Write policy (2026-11-06/07, the owner's request to cut SSD writes; measurements
   `--ssd-context-dir` (`infernix-ssd-write-budget.txt`, saved every minute and at exit), so model
   switches do not refill it. While the bucket is at least half full every candidate is written; below
   that, a candidate is written when its expected value is within the best (2 x fill) share, by bytes,
-  of the last 256 offered, and never when it is larger than what is left. Its expected value is its
+  of the last 256 offered, and never when it is larger than what is left, unless the bucket is full (a candidate larger than
+  an hour's bytes is then written and empties it; it could never be written otherwise). Its expected value is its
   GDSF value density (`(1 + hits) x seconds saved per byte`) times the share of its kind's written
   images read back so far (one in two before any). A rule that spent at the budget's sustained rate on
   the most valuable candidates from the start wrote less but kept fewer cache hits (the value density
@@ -935,7 +960,10 @@ so its restore can happen during the wait instead.
   the prefetched blocks like any cache.
 - One batch is about 550 MB for 27B INT8 KV (about 20 ms of PCIe). The Engine retries for the same
   head only while the last attempt copied blocks or the spare room grew, because matching walks
-  the whole prompt path.
+  the whole prompt path; while it did, the next batch follows in the next cycle (not at the next
+  admission event: a head waiting behind long decodes used to get one or two batches in all).
+- A request waiting for a lane is planned but not quoted: a quote would wait for the head's own
+  landing prefetch (below) on the Engine thread for a request that cannot bind yet.
 - A quote whose candidates cross a landing prefetch waits for it (`settle_prefetch`) instead of
   skipping those candidates for a shallower source. A lane's own restore batches are never waited
   for synchronously (§6.5).
@@ -1137,6 +1165,11 @@ After any commit that advances every enabled pool's committed frontier across a 
 - D2H write-through of the lane's Device-only nodes is enqueued in one batch when the lane releases
   its path (finish, abort or cancel), before the nodes become evictable. Batching coalesces runs of
   consecutive pages and slabs into one strided copy per plane, and pinned nodes need no backup yet.
+  A block with no snapshot at or below it is not written (2026-11-15): no resume can pass through it, so
+  its Host copy would only hold a slab until the dead-KV sweep (a prefill cancelled past its last tap, a
+  generation that left no endpoint). When such a write lands, its blocks join the Device LRU deepest first.
+  Room-making (a binding's, a unit's reclaim) waits for a transfer only while one alone holds a Device block,
+  and then for the oldest Host write or prefetch, never for another lane's restore, whose blocks stay mapped.
 
 The block-table row is unchanged, so no GPU work is needed.
 
@@ -1365,6 +1398,15 @@ policy lives:
 
 Two lists are kept, *backed* and *unbacked*, and backed entries are always consumed first.
 
+**Dead blocks first (2026-11-15).** A block with no snapshot at or below it and no holder can serve
+no request (a resume needs a state image). Host eviction leaves such blocks behind on the Device when
+it removes a snapshot and drops its path's Host copies, and as unbacked entries they used to go after
+every backed copy, queue-held ones included: live conversations lost their Device KV, a Host restore
+at their next turn, while dead pages kept theirs. Dead blocks have two lists of their own (backed,
+unbacked), which every eviction empties before it takes a block a snapshot still needs, held or not; a
+backed-only eviction takes the dead backed ones. A block moves between its lists as its snapshot count
+changes, so a pop stays O(1) (`PrefixIndexOperations::device_list_probes`).
+
 ### 9.2 Device snapshot slots
 
 Slots hold at most `D` images. A sequence about to snapshot past its previous snapshot (the one
@@ -1393,7 +1435,10 @@ owners that Host eviction had made Device-only in their slots for good (§16.5).
 Device-only owners hold at most `D − 1` slots, though: `L` rises only on an eviction, so owners worth more than every
 new claim (a long prompt's hot snapshots after Host write-back stripped their Host copies) kept all
 `D` slots for the rest of the session, and no new conversation could publish a snapshot (issue
-#29). The most valuable keep their slots; the last one rotates.
+#29). The most valuable keep their slots; the last one rotates. A rotation takes an owner worth more
+than the claim, so `L` then rises no further than the least valuable retained snapshot's priority
+(2026-11-15): raised to the rotated owner's priority, every new snapshot lifted `L` by a hot owner's
+value and the Host tier's snapshots aged as fast as slots turned over.
 
 ### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
 
@@ -1440,7 +1485,15 @@ even when the rest could not free enough: a pause's resume point against a Host 
 snapshots evicted every unheld one and then failed. An allocation now first checks that the order
 above, at its claim, can free all `k` slabs (`host_room_possible`: the free and dead slabs, the
 superseded, SSD-backed and claimable retained snapshots, and the blocks their removal leaves dead),
-and evicts nothing when it cannot. The check passes a removal up to a node's parent only once every
+and evicts nothing when it cannot. The claim is judged on the priorities the allocation begins with
+(2026-11-15): removing a snapshot revalues the retained snapshots below it, which resume from further
+up without it and can rise past the claim, and the eviction then stopped with its first victims gone.
+A snapshot the check counted stays a victim (taken before its ancestor it would have been within the
+claim), `L` rising no further than the claim. During a Host shrink (§5.4) only slabs below the ceiling
+are room: a slab past it retires when freed and a planned move keeps its destination until it commits,
+so a snapshot whose slabs all lie past the ceiling is neither counted nor evicted for an allocation.
+A full snapshot table follows the same rule: it evicts a superseded snapshot, or the minimum for a
+new snapshot worth at least as much, and otherwise publishes nothing. The check passes a removal up to a node's parent only once every
 snapshot at or below the node is counted, so it visits each node at most once per snapshot anchored on
 it and once per child that empties: O(snapshots + nodes) however deep the lineages, not the depth of
 every lineage per snapshot. Operation counters (`PrefixIndexOperations`) guard this: a test drains
@@ -1466,7 +1519,11 @@ F(s)  = 1 + hits(s)                             // admissions resumed from s sin
   that record it (`dependents`); a new snapshot between them takes over the dependents below it,
   and a removed one hands its dependents to its ancestor. `C` and `Z` are recomputed for the
   snapshot and for those whose nearest retained ancestor or exclusive path it changes, when it is
-  published, hit, superseded, retained again or removed.
+  published, hit, superseded, retained again or removed. That includes one retained snapshot on
+  another branch (2026-11-15): where two branches share path blocks with no snapshot at the fork, the
+  blocks are exclusive to one branch's snapshot only while the other branch has none retained, so
+  that snapshot is revalued too (one walk up to the fork and one down to it); before, it kept a
+  stale `Z` until its own next hit.
 - Valuing against the nearest *retained* ancestor makes a conversation's newest endpoint carry the
   whole conversation-specific prefill (its superseded predecessors go first), and a shared
   boundary its own prefix. Valuing only against aligned (`tail_len == 0`) ancestors, as before,
@@ -1664,8 +1721,11 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
      first media item the two prompts do not carry identically (content digest, grid, timing,
      token placement). A request whose shared prefix covers a sibling's image waits for the
      snapshot past it and encodes nothing for that image (ignis ADR 0035's fan-out case).
-   - Every sibling prefill boundary re-arms admission, and the head stops waiting once the sibling
-     passes the target, finishes or is cancelled. So a missing snapshot never blocks it for long.
+   - Every sibling prefill boundary re-arms admission while a queued request waits for a sibling
+     (as does any prefill unit that published a snapshot, `PrefillProgress::snapshot_published`), and
+     the head stops waiting once the sibling passes the target, finishes or is cancelled. So a missing
+     snapshot never blocks it for long. (Until 2026-11-15 only the sibling's completion re-armed it: a
+     follower waited out the leader's whole prompt.)
    - Gate: total prefill tokens reduced on the concurrent-shared-prefix trace, with no TTFT
      regression for other requests.
 3. **Output-boundary snapshots** (not implemented). The Frontend's output parser signals structural boundaries
@@ -2577,6 +2637,51 @@ between the builds is shown either way at this sample size. The resumed share is
 in the change's greedy runs (87.0-87.3 % against 87.7-87.9 %), also within the sampled runs' range
 (87.3-88.9 % against 87.9-88.0 %).
 
+### 16.12 Review of memory handling and the cache, and its fixes (2026-11-15)
+
+A line-by-line review of every source that sizes or resizes memory or manages the cache (seven subsystem reads, each
+finding checked against the code) found defects in three groups. The fixes are described in the sections they
+concern; this entry is the record.
+
+- **Wrong output.** A member inserted into `PrefillContext` on 2026-11-08 shifted a positional `rope_delta` into
+  another field, so text passes after the first of a request with an image ran at rotary delta 0 (a resumed later
+  turn, Replay, forced tokens) on every route; the members past the positional ones are now set by name. Replay
+  passes did not wait for a Host restore's per-layer events and ran with a default execution schedule; they now wait
+  as a first prefill pass does and run the Program's schedule, which changes the default route's bits for a paused and
+  replayed request (the reproducible and lossless routes never pause). An expert refill after a RAM growth left keys
+  resident over unread bytes when a read failed; a fill is now all or nothing. `recover_after_failure` emptied the
+  index before the lanes released their references. Flash-Next: `fp16-gdn-state` could not start with the cache; a
+  failed activation left its restore batch open; the cache file's signature now carries the fitted resume grid.
+- **Time to first token and stalls.** A request coalesced onto a sibling's snapshot (§12.2) was re-quoted only when
+  the sibling finished its whole prompt: a prefill unit now reports `snapshot_published` and the Engine re-arms
+  admission. Device eviction takes blocks no snapshot can reach before any live block, and blocks whose Host write
+  lands join the LRU deepest first (§9.1). Room-making waits only for the oldest pending Host write or prefetch, never
+  for another lane's restore (§7.6). The blocked head's prefetch continues every cycle (§6.6); admission binds every
+  free lane in one cycle; a service turn whose owner is context-blocked yields the prefill permit; the capacity error
+  waits for a finished resident's release; a refused SSD write-back is retried while the Engine is idle (§5.7); the
+  Host feasibility check respects the shrink ceiling and re-checks its claim after each eviction (§9.3).
+- **Memory.** A resident model's automatic KV applied the display headroom on top of the OS budget (up to 960 MiB
+  with the default headroom); it now follows the offloaded rule. Spill guards decide from the shared-system-memory
+  reading and cover resident weights, the 122B's wide-prefill fallback and the graph set. The RAM monitor reads commit
+  as well as physical memory, polls ten times faster near the pressure point and backs off a refused growth. The
+  prefix cache file (format 6) is read and written unbuffered with a hash per slab; a damaged slab drops its entry.
+
+Checks, RTX 5090, official 27B NVFP4 and Flash-Next Dense8, one build: 26 CPU tests (CTest); the native-transaction
+test on none, MTP and DFlash2 (with a new Host-restored resume scenario); the hybrid-prefix real test (new scenarios:
+`vision-resume`, a turn resumed past an image against the same prompt cold, token for token on the reproducible
+route; `coalesce` with a leader 4,096 tokens past the shared 3,072: the follower queued 0.21 s of the leader's 0.56 s
+prefill); the prefix real test; the preemption real test, all scenarios, on none (five runs), MTP and DFlash2 (three
+runs); reproducible request invariance on three backends; resume against cold; speculation invariance (five modes);
+Flash-Next's prefix-cache (with an injected activation fault: later resumes restore and the stop saves), preemption
+and resume-cold real tests. One regression was found and fixed on the way: with the narrowed wait, a pause's tail copy
+found no room beside its lane's own pending write and published no resume point (`cache-replay`, backend none, one
+resume of five replayed 410 tokens); any pending Host write is waited for again.
+
+Not measured: speed or TTFT on a served workload for any of these changes (the agentic and two-conversation A/Bs of
+§16.10 were not re-run), the 122B (no real test of it was run), Linux/WSL, and the SSD tier beyond its unit tests and
+the two real scenarios above. Not covered by a test: a paused image request, the full failed-round recovery (it needs
+offloaded experts), the Windows spill guards on a real spill.
+
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 
 `Qwen4ExpForCausalLM` keeps every routed expert in pinned Host RAM and streams them into a Device
@@ -2593,13 +2698,13 @@ rules, measurements and the build record are in the
 | Snapshots | Host-born only: a capture reserves Host slabs and copies the lane's state image (GDN recurrent and conv state, PLE state, QSA tails, the MTP drafter's saved residual) and its partial page, one decoder layer at a time on the transfer stream; the next call of the lane waits per layer, and a page that returns to the pool while a capture still reads it (the lane's release, a block's eviction) orders the compute stream after that copy. Restores are one batch per admission on the restore stream, waited on per layer by the first call; a resume whose cached state reaches its paused frontier decodes without a call, so its binding orders the compute stream after the whole restore |
 | MTP drafter | Cells and anchors follow rules MR1-MR6 (design §19.3.1): blocks record `mtp_next`, snapshots `mtp_written`/`mtp_next`; a resume whose continuation differs rewrites the anchor's last cell in a private copy |
 | Admission | Two sources per request: the affordable snapshot chosen without a lane, then the root. `start_binding` re-selects for the actual lane (crediting a lane-resident snapshot) and returns no reservation when the choice changed, so the Engine falls back to the root; otherwise it reserves the prompt's pages plus one round, and later rounds grow the lane (design §19.3.13). A prefetch landing over the prompt's path is waited for before matching, and pending Host writes are drained before a cached source is given up (as §6.6). A blocked FIFO head's Host-only blocks are prefetched into free and Host-backed Device pages, never growing the pool into the expert frames (`RuntimeStats::hybrid_prefetched_blocks`). A fresh request whose prompt shares a prefix (media agreeing, as §12.2) with a lane still prefilling waits for that lane's snapshot at the divergence when the predicted wait is within half the queue timeout: an exact tap is planned there (splitting the lane's pending call) and published as a Boundary. Shortages are reclaimed by evicting unpinned cached Device blocks |
-| Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`): boundary exact taps (Explicit, Structural) always split; the generation opener and Automatic taps split only when the split adds at most 0.1 s of call cost (a CPU-served opener tail costs ~35 ms), else become flexible. Taps planned as boundaries (Explicit, Structural, coalescing, branch) are published as `SnapshotKind::Boundary`. A branch tap is an exact boundary tap where the prompt leaves its cached path (the end of its matched blocks), planned when that point is at least 1,024 tokens past the resume frontier (`kBranchTapMinTokens`): a client re-sending a long transcript with new content inserted before its end then resumes at the branch instead of the last chunk boundary (measured 2026-10-17, Dense8, 40K-token transcript, chunk 16,384: re-sent queries reuse 40,128 against 32,768 tokens, time to first token 0.6-1.1 s against 2.1-2.2 s, the first diverging query +0.6 s for the split; the agentic replay, seeds 42/43 at scale 0.5, keeps its cache hits: 84.6 against 84.5 % and 84.9 against 85.2 %). Unlike Qwen3.5's removed branch-point taps (§16.8), a Flash-Next prefill call has a large fixed cost (the expert stream), so re-prefilling the shared tokens after a chunk boundary costs nearly a full call. The opener is kept after endpoint resumes; a resume from an opener snapshot whose capturing request had resumed from an endpoint counts `endpoint_mismatch_fallbacks` |
+| Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`): boundary exact taps (Explicit, Structural) always split; the generation opener and Automatic taps split only when the split adds at most 0.1 s of call cost (a CPU-served opener tail costs ~35 ms), else become flexible. Taps planned as boundaries (Explicit, Structural, coalescing, branch) are published as `SnapshotKind::Boundary`. A branch tap is an exact boundary tap where the prompt leaves its cached path (the end of its matched blocks), planned when that point is at least 1,024 tokens past the resume frontier (`kBranchTapMinTokens`): a client re-sending a long transcript with new content inserted before its end then resumes at the branch instead of the last chunk boundary (measured 2026-10-17, Dense8, 40K-token transcript, chunk 16,384: re-sent queries reuse 40,128 against 32,768 tokens, time to first token 0.6-1.1 s against 2.1-2.2 s, the first diverging query +0.6 s for the split; the agentic replay, seeds 42/43 at scale 0.5, keeps its cache hits: 84.6 against 84.5 % and 84.9 against 85.2 %). Unlike Qwen3.5's removed branch-point taps (§16.8), a Flash-Next prefill call has a large fixed cost (the expert stream), so re-prefilling the shared tokens after a chunk boundary costs nearly a full call. The opener is kept after endpoint resumes; a resume from an opener snapshot whose capturing request had resumed from an endpoint counts `endpoint_mismatch_fallbacks`. A tap whose capture the Host tier refuses for room is queued again as a flexible tap for the next call boundary (2026-11-15, as Qwen3.5's retry of §7.4); a resume from the request's own pause snapshot keeps the forward opener rule and starts no echo lineage |
 | Supersession | Unlike §9.3, a request's captures never supersede its own earlier ones: its first capture (tap or endpoint) supersedes the snapshot it resumed from and the endpoints it went past; its ladder taps, system-block boundary and the prompt's last tap stay retained and GDSF values them. In agentic replays the edits and loop-detection side calls diverge at exactly those taps: superseded first, a full Host tier evicted them before they were reused |
 | Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate. Without `free-cache-resume` (the reproducible route) every tap, coalescing point and resume frontier lies on the prefill-chunk grid (`ProgramImpl::resume_grid`), so a resumed prefill's calls are the cold prefill's: several prefill routes change their arithmetic with the call's width (model-quality.md §6.7) |
 | Vision | A resume frontier strictly inside an item, or past its start in the block it begins in (rule 3 of §6.1), is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `prefix_cache_hit_tokens` / `prefix_cache_block_tokens` as in Qwen3.5 |
-| Persistence | As §5.5, the shared file (`runtime/prefix_cache/persist_file.cpp`, version 5) under its own magic `NINFQ4PC` and geometry, bound in `prefix/persist.cpp`: the block table also stores each block's `mtp_next`, the snapshot table each snapshot's superseded flag; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
+| Persistence | As §5.5, the shared file (`runtime/prefix_cache/persist_file.cpp`, version 5) under its own magic `NINFQ4PC` and geometry, bound in `prefix/persist.cpp`: the block table also stores each block's `mtp_next`, the snapshot table each snapshot's superseded flag; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup. The file's signature carries the fitted resume grid (`;grid=`, 2026-11-15): the prefill chunk is fitted to free VRAM at each start, and a file saved under another grid held taps a reproducible start would otherwise resume from with other call widths than its own cold prefill |
 | SSD tier | As §5.7 (`prefix_select` promotes the source a quote chooses; a binding skips sources only on the SSD). Snapshot meta and `mtp_next` stay with their index entries, so an SSD copy is the Host slabs' bytes alone, and it leaves out the DFlash2 ring (`ssd_image_slabs`: 136 of 184 FP4-Local image slabs; a promotion zero-fills the rest) |
-| Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
+| Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier. The resume waits only for its own pause capture (not for every transfer in flight, which stalled the other lanes' decode), and a request paused after its first token is quoted over its ledger, so it never waits for an SSD promotion of a prompt snapshot it would not use (2026-11-15) |
 | Failure | A row with non-finite logits withdraws the request's entries (§7.8): its captures are Host-born, so the release first drains the transfer stream and reads each capture's publication (the lane keeps its capture ids until its release). A `RecoverableExecutionError` (an expert record that could not be read) still empties the whole cache, since the failed round's state is unknown for every lane |
 | Not built | Device snapshot slots, prefill CPU assist and C > 1 extras (design P7, P8) |

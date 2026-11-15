@@ -9,6 +9,7 @@
 #include <cuda.h>
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace infernix {
@@ -73,5 +74,12 @@ private:
     CUdeviceptr base_     = 0;
     std::vector<CUmemGenericAllocationHandle> handles_; // 0: unmapped
 };
+
+namespace testing {
+// Answers every later "does the device support virtual memory management" question (VmmArena::supported,
+// EvictableWeightPool::supported) with `supported`; empty asks the device again. For tests of the
+// plans and allocations that fall back without it.
+void set_vmm_supported(std::optional<bool> supported) noexcept;
+} // namespace testing
 
 } // namespace infernix

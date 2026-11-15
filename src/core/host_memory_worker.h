@@ -31,6 +31,8 @@ public:
     HostMemoryWorker(const HostMemoryWorker&)            = delete;
     HostMemoryWorker& operator=(const HostMemoryWorker&) = delete;
 
+    // The waker runs on the worker's thread under the worker's lock: once this returns, the previous waker is not
+    // running and never runs again. It must not post a job or set the waker.
     void set_waker(std::function<void()> wake);
 
     // Queues `work` (which may own move-only resources, such as the memory it releases); the future holds its result,

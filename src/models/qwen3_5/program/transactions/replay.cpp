@@ -196,7 +196,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         execution::PrefillContext context{
             {device, parameters, work, *state_images,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, execution_schedule},
             text_kv_view(sequence),
             skip_mtp_alignment ? PagedKVCacheView{} : mtp_kv_view(sequence),
             decoder->text_kv,
@@ -209,9 +209,12 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             selectors.destination,
             0,
             sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0,
-            dflash_prefill_host_ingress,
-            sequence.rope_delta};
+            dflash_prefill_host_ingress};
+        context.rope_delta        = sequence.rope_delta; // by name: see PrefillContext
         context.prefill_gpu_timer = &prefill_gpu_timer_;
+        // A resume from a tap restores Host blocks and state behind per-layer events (hybrid spec §6.5); the first
+        // Replay pass waits for each layer's copies as a first prefill pass does. A landed batch yields no events.
+        context.take_layer_ready = [this, lane] { return hybrid_take_restore_layers(lane); };
         mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                  ? workspace_plan.mtp_prefill
                                  : workspace_plan.text_prefill);
@@ -255,6 +258,13 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         }
 
         if (bridge_mtp) {
+            if (count == 0 && request.resume_lifecycle == Lifecycle::Active) {
+                // Only the bridge runs, and the lane decodes next: the bridge reads the restore's prelude, the decode
+                // rounds every layer's state, and neither waits per layer. Order the compute stream after the restore.
+                // (A paused prefill goes on to a prefill pass, which waits per layer and keeps the overlap.)
+                const std::span<const cudaEvent_t> layers = hybrid_take_restore_layers(lane);
+                if (!layers.empty()) { CUDA_CHECK(cudaStreamWaitEvent(device.stream, layers.back(), 0)); }
+            }
             if (!sequence.tail_hidden_valid || !io.mtp) {
                 throw std::logic_error("MTP replay source has no continuation hidden");
             }

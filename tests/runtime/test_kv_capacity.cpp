@@ -122,6 +122,45 @@ int main() {
                           "an explicit capacity that no longer fits rejects the grown plan");
     }
 
+    // What an automatic capacity may plan in under an OS budget: the headroom comes off free device
+    // memory and the margin off the budget, never both off the smaller of the two.
+    {
+        using infernix::runtime::kv_available_bytes;
+        constexpr std::size_t kHeadroom = 1024, kMargin = 64;
+        const auto planned = [&](std::size_t free_bytes, std::optional<std::uint64_t> budget) {
+            return kv_available_bytes(true, free_bytes, budget, kHeadroom, kMargin) - kHeadroom;
+        };
+        failures += check(planned(20000, std::nullopt) == 18976, "no budget: free memory less the headroom");
+        failures += check(planned(20000, 30000) == 18976, "free memory below the budget: the headroom alone");
+        failures += check(planned(20000, 19500) == 18976,
+                          "a budget below free memory by less than the headroom is not stacked on it");
+        failures += check(planned(20000, 19000) == 18936,
+                          "between them, the budget's margin binds once it is the smaller");
+        failures += check(planned(20000, 17000) == 16936,
+                          "a budget below free memory by more than the headroom leaves its margin only");
+        failures += check(kv_available_bytes(true, 20000, 40, kHeadroom, kMargin) == kHeadroom,
+                          "a budget inside its margin leaves nothing to plan");
+        // Past the budget the source reports free memory as the widened budget less usage and the caller
+        // names no budget: the headroom comes off it once, as before.
+        failures += check(planned(19500, std::nullopt) == 18476, "past the budget: the headroom off the widened budget");
+        // An explicit capacity has no headroom and must fit both.
+        failures += check(kv_available_bytes(false, 20000, 17000, kHeadroom, kMargin) == 17000 &&
+                              kv_available_bytes(false, 16000, 17000, kHeadroom, kMargin) == 16000 &&
+                              kv_available_bytes(false, 16000, std::nullopt, kHeadroom, kMargin) == 16000,
+                          "an explicit capacity fits free memory and the budget");
+        // Through the resolver: 2.2 units of budget shortfall no longer cost the headroom as well.
+        infernix::runtime::SequenceCapacityCurve wide = curve;
+        wide.maximum_main_page_groups                = 1000;
+        const auto stacked = infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::automatic(), wide,
+                                                                    17000, kHeadroom);
+        const auto fixed   = infernix::runtime::resolve_kv_capacity(
+            infernix::KvCapacityPolicy::automatic(), wide, kv_available_bytes(true, 20000, 17000, kHeadroom, kMargin),
+            kHeadroom);
+        failures += check(stacked.main_page_groups == 2 + (17000 - 1024 - 1000) / 128 &&
+                              fixed.main_page_groups == 2 + (17000 - 64 - 1000) / 128,
+                          "the resolved capacity takes the budget less its margin");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

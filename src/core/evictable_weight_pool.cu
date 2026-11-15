@@ -40,13 +40,51 @@ struct EvictableWeightPool::Impl {
     std::vector<std::size_t> sizes;
     std::size_t first_tail_piece = 0;
     std::size_t evicted_pieces   = 0;   // count of evicted pieces at the vector end
+    // Where each piece's handle is mapped, so that a constructor or transaction that fails part-way
+    // releases exactly what exists (the device memory behind a handle is held until it is released).
+    enum class Mapping : std::uint8_t { None, Home, Overlay };
+    std::vector<Mapping> mapping;
+    std::vector<std::uint8_t> created;      // the piece's handle exists
+    std::size_t overlay_first = 0;          // the piece mapped at the overlay's start (an open or failed eviction)
     std::unique_ptr<PinnedHostBuffer> mirror;
     double last_evict_seconds   = 0.0;
     double last_restore_seconds = 0.0;
 
+    Impl() = default;
+    Impl(const Impl&)            = delete;
+    Impl& operator=(const Impl&) = delete;
+
+    ~Impl() {
+        for (std::size_t piece = 0; piece < created.size(); ++piece) {
+            if (mapping[piece] == Mapping::Home) {
+                (void)cuMemUnmap(home + offsets[piece], sizes[piece]);
+            } else if (mapping[piece] == Mapping::Overlay) {
+                (void)cuMemUnmap(overlay + (piece - overlay_first) * kChunkBytes, sizes[piece]);
+            }
+            if (created[piece] != 0) { (void)cuMemRelease(handles[piece]); }
+        }
+        if (home != 0) { (void)cuMemAddressFree(home, arena_reserved); }
+        if (overlay != 0) { (void)cuMemAddressFree(overlay, overlay_reserved); }
+    }
+
     void map_home(std::size_t piece) {
         INFERNIX_CU_CHECK(cuMemMap(home + offsets[piece], sizes[piece], 0, handles[piece], 0));
+        mapping[piece] = Mapping::Home;
         set_access(home + offsets[piece], sizes[piece]);
+    }
+
+    void unmap(std::size_t piece) {
+        const CUdeviceptr at = mapping[piece] == Mapping::Home ? home + offsets[piece]
+                                                               : overlay + (piece - overlay_first) * kChunkBytes;
+        INFERNIX_CU_CHECK(cuMemUnmap(at, sizes[piece]));
+        mapping[piece] = Mapping::None;
+    }
+
+    void map_overlay(std::size_t piece) {
+        const CUdeviceptr at = overlay + (piece - overlay_first) * kChunkBytes;
+        INFERNIX_CU_CHECK(cuMemMap(at, sizes[piece], 0, handles[piece], 0));
+        mapping[piece] = Mapping::Overlay;
+        set_access(at, sizes[piece]);
     }
 
     void set_access(CUdeviceptr va, std::size_t bytes) { vmm::set_access(va, bytes, config.device); }
@@ -108,30 +146,20 @@ EvictableWeightPool::EvictableWeightPool(const Config& config) : impl_(std::make
         offset += kChunkBytes;
     }
 
+    // A step that fails (the device has no memory for a piece) throws out of this constructor; the Impl's
+    // destructor then releases the handles, mappings and address ranges made so far.
     impl.handles.resize(impl.offsets.size());
+    impl.mapping.assign(impl.offsets.size(), Impl::Mapping::None);
+    impl.created.assign(impl.offsets.size(), 0);
     for (std::size_t piece = 0; piece < impl.offsets.size(); ++piece) {
         INFERNIX_CU_CHECK(cuMemCreate(&impl.handles[piece], impl.sizes[piece], &prop, 0));
+        impl.created[piece] = 1;
         impl.map_home(piece);
     }
 }
 
-EvictableWeightPool::~EvictableWeightPool() {
-    if (impl_ == nullptr || impl_->home == 0) { return; }
-    Impl& impl = *impl_;
-    for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
-        const bool away = impl.evicted_pieces != 0 && piece >= impl.handles.size() -
-                                                                  impl.evicted_pieces;
-        if (away) {
-            const std::size_t rank = piece - (impl.handles.size() - impl.evicted_pieces);
-            (void)cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]);
-        } else {
-            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
-        }
-        (void)cuMemRelease(impl.handles[piece]);
-    }
-    (void)cuMemAddressFree(impl.home, impl.arena_reserved);
-    (void)cuMemAddressFree(impl.overlay, impl.overlay_reserved);
-}
+// The Impl releases its handles, mappings and address ranges.
+EvictableWeightPool::~EvictableWeightPool() = default;
 
 EvictableWeightPool::EvictableWeightPool(EvictableWeightPool&&) noexcept            = default;
 EvictableWeightPool& EvictableWeightPool::operator=(EvictableWeightPool&&) noexcept = default;
@@ -178,13 +206,22 @@ std::byte* EvictableWeightPool::evict(std::size_t bytes, std::size_t* mapped_byt
     }
     const auto start        = Clock::now();
     const std::size_t first = impl.handles.size() - chunks;
-    for (std::size_t rank = 0; rank < chunks; ++rank) {
-        const std::size_t piece = first + rank;
-        INFERNIX_CU_CHECK(cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]));
-        INFERNIX_CU_CHECK(
-            cuMemMap(impl.overlay + rank * kChunkBytes, impl.sizes[piece], 0,
-                     impl.handles[piece], 0));
-        impl.set_access(impl.overlay + rank * kChunkBytes, impl.sizes[piece]);
+    impl.overlay_first      = first;
+    try {
+        for (std::size_t piece = first; piece < impl.handles.size(); ++piece) {
+            impl.unmap(piece);
+            impl.map_overlay(piece);
+        }
+    } catch (...) {
+        // No transaction opened: every piece goes home again, its memory (and so the weights in it) untouched.
+        // A piece that cannot be mapped home stays unmapped for the destructor; the caller sees the first error.
+        for (std::size_t piece = first; piece < impl.handles.size(); ++piece) {
+            try {
+                if (impl.mapping[piece] == Impl::Mapping::Overlay) { impl.unmap(piece); }
+                if (impl.mapping[piece] == Impl::Mapping::None) { impl.map_home(piece); }
+            } catch (...) {}
+        }
+        throw;
     }
     impl.evicted_pieces     = chunks;
     impl.last_evict_seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -198,10 +235,10 @@ void EvictableWeightPool::restore(cudaStream_t stream) {
     const auto start         = Clock::now();
     const std::size_t chunks = impl.evicted_pieces;
     const std::size_t first  = impl.handles.size() - chunks;
-    for (std::size_t rank = 0; rank < chunks; ++rank) {
-        const std::size_t piece = first + rank;
-        INFERNIX_CU_CHECK(cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]));
-        impl.map_home(piece);
+    for (std::size_t piece = first; piece < impl.handles.size(); ++piece) {
+        // A restore that failed part-way and is called again finds some pieces home already.
+        if (impl.mapping[piece] == Impl::Mapping::Overlay) { impl.unmap(piece); }
+        if (impl.mapping[piece] == Impl::Mapping::None) { impl.map_home(piece); }
     }
     // Only bytes below arena_bytes ever hold weights; the aligned slack stays untouched.
     const std::size_t evicted_begin = impl.offsets[first];

@@ -66,7 +66,10 @@ bool SsdWriteBudget::admit(double value, std::uint64_t bytes, bool first, Clock:
         recent_next_          = (recent_next_ + 1U) % kRecent;
         recent_count_         = std::min(recent_count_ + 1U, kRecent);
     }
-    if (static_cast<double>(bytes) > level_) { return false; }
+    // Larger than what is left: passed over, except from a full bucket. A candidate larger than an hour's bytes
+    // (one long conversation's unwritten path against a small budget) could otherwise never be written; from a
+    // full bucket it takes the whole of it, so the hour's bytes still bound the rate.
+    if (static_cast<double>(bytes) > level_) { return level_ >= static_cast<double>(bytes_per_hour_); }
     const double fill = level_ / static_cast<double>(bytes_per_hour_);
     if (fill >= 0.5 || recent_count_ == 0) { return true; }
     return value >= threshold(2.0 * fill);

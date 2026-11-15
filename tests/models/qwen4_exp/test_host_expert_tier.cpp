@@ -1003,6 +1003,200 @@ void test_record_fills(const ExpertStore& store) {
     tier.controller().check();
 }
 
+// A fill is all or nothing: one unreadable record (key kKeys - 1) fails it, and every key the call placed goes back
+// (no host copy, not held, the free slots and records as before, the keys dirty), so no key is left over bytes that
+// were never read; the failure does not stand against the next fill.
+void test_failed_fill(const ExpertStore& store) {
+    const auto threw = [](const auto& fill) {
+        try {
+            (void)fill();
+        } catch (const std::runtime_error&) { return true; }
+        return false;
+    };
+    {
+        HostExpertTier tier(store, options());
+        auto& host = tier.controller();
+        const std::vector<std::uint32_t> good{10, 11, 12}, bad{0, 1, 2, kKeys - 1, 3};
+        check(tier.prefill(good) == 3, "failed fill: a first fill lands");
+        std::vector<std::uint32_t> dirty;
+        tier.take_dirty(dirty);
+        check(threw([&] { return tier.prefill(bad); }), "failed fill: a fill with an unreadable record throws");
+        bool gone = true;
+        for (const std::uint32_t k : bad) { gone = gone && tier.record(k) == nullptr && !host.host_copy(k) && !host.held(k); }
+        check(gone, "failed fill: none of its keys keeps a host copy");
+        check(matches(tier.record(10), 10) && matches(tier.record(11), 11) && matches(tier.record(12), 12),
+              "failed fill: an earlier fill's keys keep theirs");
+        check(host.resident_count() == 3 && host.free_resident(0) == 47 && tier.stats().fills_undone == 1,
+              "failed fill: the slots are free again");
+        dirty.clear();
+        tier.take_dirty(dirty);
+        std::sort(dirty.begin(), dirty.end());
+        check(dirty == std::vector<std::uint32_t>{0, 1, 2, 3, kKeys - 1}, "failed fill: its keys are dirty");
+        host.check();
+        const std::vector<std::uint32_t> next{0, 1, 2, 3};
+        std::uint32_t filled = 0;
+        check(!threw([&] { return filled = tier.prefill(next); }) && filled == 4,
+              "failed fill: the next fill of readable records succeeds");
+        bool exact = true;
+        for (const std::uint32_t k : next) { exact = exact && matches(tier.record(k), k); }
+        check(exact && tier.stats().fills_undone == 1, "failed fill: and its records equal the file bytes");
+        // The shadows' fill likewise.
+        check(threw([&] { return tier.prefill_shadows(std::vector<std::uint32_t>{20, kKeys - 1}); }) &&
+                  tier.record(20) == nullptr && host.shadow_count() == 0 && host.resident_count() == 7,
+              "failed fill: a failed shadow fill leaves no shadow");
+        host.check();
+    }
+    {
+        // Unpinned records: the keys are not held and the records are free again, the lowest first.
+        int chunks = 0;
+        HostExpertTier tier(store, refusing_options(chunks));
+        auto& host = tier.controller();
+        std::vector<std::uint32_t> ranked(kKeys);
+        for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+        check(tier.prefill(ranked) == 14, "failed fill: the slots fill");
+        const std::vector<std::uint32_t> bad{14, 15, kKeys - 1, 16};
+        check(threw([&] { return tier.fill_unpinned(bad, {}); }), "failed fill: an unpinned fill with an unreadable record throws");
+        bool gone = true;
+        for (const std::uint32_t k : bad) { gone = gone && tier.unpinned_record(k) == nullptr && !host.held(k); }
+        check(gone && host.held_count() == 0 && tier.unpinned_held() == 0, "failed fill: none of its keys is held");
+        host.check();
+        std::uint32_t filled = 0;
+        check(!threw([&] { return filled = tier.fill_unpinned(ranked, [](std::uint32_t key) { return key == kKeys - 1; }); }) &&
+                  filled == 46,
+              "failed fill: the next unpinned fill takes every record");
+        bool exact = true;
+        for (std::uint32_t k = 14; k < 60; ++k) { exact = exact && matches(tier.unpinned_record(k), k); }
+        check(exact, "failed fill: and the records equal the file bytes");
+        host.check();
+    }
+}
+
+// A fill's read that times out (a slow or stalled drive: here the queue's first eight issues, the four scatter runs
+// and their retries, never complete) is read again record by record instead of failing the start.
+void test_fill_timeout(const ExpertStore& store) {
+    auto o                   = options();
+    o.io.timeout             = std::chrono::milliseconds(250);
+    o.io_faults.stall_read   = 1;
+    o.io_faults.stall_count  = 8;
+    HostExpertTier tier(store, o);
+    std::vector<std::uint32_t> ranked(50);
+    for (std::uint32_t k = 0; k < 50; ++k) { ranked[k] = k; }
+    std::uint32_t filled = 0;
+    bool threw           = false;
+    try {
+        filled = tier.prefill(ranked);
+    } catch (const std::runtime_error&) { threw = true; }
+    bool exact = !threw;
+    for (std::uint32_t k = 0; k < 50 && exact; ++k) { exact = matches(tier.record(k), k); }
+    check(!threw && filled == 50 && exact, "fill timeout: a fill whose runs timed out lands record by record");
+    check(tier.stats().fill_retries == 50 && tier.stats().fills_undone == 0, "fill timeout: every record of the runs was read again");
+    tier.controller().check();
+}
+
+// The idle refill in pieces: a growth's room is filled at most max_bytes a call, best-ranked first, and stays
+// unfilled until the last piece.
+void test_fill_room_pieces(const ExpertStore& store) {
+    int chunks = 0;
+    HostExpertTier tier(store, refusing_options(chunks));
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    check(tier.prefill(ranked) == 14 && tier.fill_unpinned(ranked, {}) == 46, "fill pieces: slots hold 0-13, records 14-59");
+    check(shrink(tier, 5 * kRecord) == 5 * kRecord, "fill pieces: five records given back");
+    {
+        const std::vector<std::uint32_t> first{100, 101}, then{102, 103}, last{104};
+        tier.record_uses(0, first, 90.0);
+        tier.record_uses(0, then, 60.0);
+        tier.record_uses(0, last, 30.0);
+    }
+    check(tier.begin_growth(5 * kRecord, ram_worker()) == 5 * kRecord, "fill pieces: a growth of the five records");
+    while (!tier.growth_landed()) { std::this_thread::yield(); }
+    check(tier.link_growth() == 5 * kRecord && tier.room_unfilled(), "fill pieces: linked, not filled");
+    check(tier.fill_room({}, 2 * kRecord) == 2 && tier.room_unfilled() && matches(tier.unpinned_record(100), 100) &&
+              matches(tier.unpinned_record(101), 101) && tier.unpinned_record(102) == nullptr,
+          "fill pieces: the first call reads the two best-ranked keys only");
+    check(tier.fill_room({}, 2 * kRecord) == 2 && tier.room_unfilled() && matches(tier.unpinned_record(103), 103) &&
+              tier.unpinned_record(104) == nullptr,
+          "fill pieces: the second the next two");
+    check(tier.fill_room({}, 2 * kRecord) == 1 && !tier.room_unfilled() && matches(tier.unpinned_record(104), 104),
+          "fill pieces: the last piece ends the fill");
+    check(tier.fill_room({}, 2 * kRecord) == 0, "fill pieces: a filled room takes nothing");
+    tier.controller().check();
+}
+
+// A RAM shrink never takes the unpinned record of a key a VRAM promotion still needs (queued for a frame, or its
+// copy not yet published): the promotion reads the record, which no slot pin stands for. The key keeps its record
+// and its hold, the shrink takes the next ones, and once the promotion is done the record may go.
+void test_resize_queued_record(const ExpertStore& store) {
+    int chunks = 0;
+    HostExpertTier tier(store, refusing_options(chunks));
+    auto& host = tier.controller();
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    check(tier.prefill(ranked) == 14 && tier.fill_unpinned(ranked, {}) == 46, "queued record: keys 14-59 are held");
+    {
+        const std::vector<std::uint32_t> hot{59};
+        tier.record_uses(0, hot, 100.0); // the lowest ranked are then 58, 57, 56, 55, 54 and 53
+    }
+    host.queued(58); // the VRAM policy admitted it; it waits for a frame
+    check(shrink(tier, 5 * kRecord) == 5 * kRecord, "queued record: five records given back");
+    check(host.held(58) && matches(tier.unpinned_record(58), 58) && matches(tier.host_record(58), 58),
+          "queued record: the queued key keeps its record");
+    bool released = true;
+    for (std::uint32_t k = 53; k < 58; ++k) { released = released && tier.unpinned_record(k) == nullptr && !host.held(k); }
+    check(released && matches(tier.unpinned_record(52), 52), "queued record: the next lowest-ranked go instead");
+    // The promotion's copy reads the record (a bounce slot takes it), then completes.
+    host.promotion_issued(58);
+    check(shrink(tier, kRecord) == kRecord && host.held(58), "queued record: nor while its promotion's copy is in flight");
+    const std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> bounce{{tier.bounce_slot(0), tier.unpinned_record(58)}};
+    tier.copy_records(bounce);
+    check(matches(tier.bounce_slot(0), 58), "queued record: the promotion reads the record's bytes");
+    host.promotion_completed(58, true);
+    check(shrink(tier, kRecord) == kRecord && !host.held(58) && tier.unpinned_record(58) == nullptr,
+          "queued record: once the promotion completed the record may go");
+    host.check();
+}
+
+// The read agent stops with a refill in flight (its read issued and stalled): the refill fails, so a demotion
+// waiting for it ends its wait, and nothing more is refilled or given back.
+void test_agent_stop(const ExpertStore& store) {
+    auto o                  = options();
+    o.io.timeout            = std::chrono::seconds(30);
+    o.io_faults.stall_read  = 1; // the refill's read and its retry never complete
+    o.io_faults.stall_count = 2;
+    HostExpertTier tier(store, o);
+    auto& host = tier.controller();
+    {
+        const std::vector<std::uint32_t> hot{60, 61};
+        tier.record_uses(1, hot, 1000.0);
+    }
+    std::uint32_t target = 0;
+    check(host.vram_evicted(60, true, target) == expert_cache::VramEviction::kDemote, "agent stop: a demotion");
+    const std::uint32_t id = tier.refill(60, target);
+    check(id != HostExpertTier::kNoRefill, "agent stop: its refill is queued");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // the agent has taken the refill and issued its read
+    check(tier.refill_state(id) == 0, "agent stop: the refill is in flight");
+    tier.stop_agent_for_test("stopped by the test");
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (tier.failure().empty() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+    check(tier.failure() == "stopped by the test", "agent stop: the tier reports why its agent stopped");
+    check(tier.refill_state(id) == 2, "agent stop: the refill in flight fails, so nothing waits for it");
+    tier.refill_release(id);
+    host.demotion_failed(60, target);
+    std::uint32_t other = 0;
+    check(host.vram_evicted(61, true, other) == expert_cache::VramEviction::kDemote &&
+              tier.refill(61, other) == HostExpertTier::kNoRefill,
+          "agent stop: a stopped agent takes no refill");
+    host.demotion_failed(61, other);
+    check(shrink(tier, ~0ULL) == 0, "agent stop: nothing is given back with reads unaccounted for");
+    bool threw = false;
+    try {
+        (void)tier.prefill(std::vector<std::uint32_t>{0, 1});
+    } catch (const std::runtime_error&) { threw = true; }
+    check(threw && tier.record(0) == nullptr && tier.record(1) == nullptr && host.resident_count() == 0,
+          "agent stop: a fill throws and leaves no key placed");
+    host.check();
+}
+
 // An EngineHost's reused slots (HostSlotPool): tiers one after another take the chunks the last gave back and keep the
 // records their slots still hold, reading only the others; every record equals the file's bytes, and the fill places
 // the keys a fill without the pool places. Another artifact's chunks are reused as memory only, a chunk of another
@@ -1477,6 +1671,11 @@ int main(int argc, char** argv) {
         test_resize(store);
         test_resize_unpinned(store);
         test_record_fills(store);
+        test_failed_fill(store);
+        test_fill_timeout(store);
+        test_fill_room_pieces(store);
+        test_resize_queued_record(store);
+        test_agent_stop(store);
         test_slot_pool(store);
         if (argc > 1 && std::string_view(argv[1]) == "--fetch") {
             test_fetch(store);

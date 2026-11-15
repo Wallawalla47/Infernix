@@ -17,9 +17,13 @@ namespace {
 // Two write-backs at once keep the drive busy without a long queue a promotion could find ahead of
 // it (the file issues no write while a read waits, but the writes already issued finish first).
 constexpr std::uint32_t kWriteJobs = 2;
-// After a refused write-back (nothing qualified, or no room) the idle Engine is not woken for another
-// for this long (polls between rounds try every time; a landed promotion resets it).
+// After a refused write-back (nothing qualified, or no room) the idle Engine tries another this much later
+// (write_back_retry_at; polls between rounds try every time; a landed transfer resets it): a candidate is
+// often refused only because its Host copies are still landing, which wakes nobody. While the index
+// publishes nothing new the wait doubles up to kWriteRetryMax, so an idle Engine whose candidates stay
+// refused scans once in two seconds, not ten times a second.
 constexpr std::chrono::milliseconds kWriteRetry{100};
+constexpr std::chrono::milliseconds kWriteRetryMax{2000};
 // After this many failed writes the tier stops writing (reads go on).
 constexpr std::uint64_t kWriteFailureLimit = 3;
 // Consecutive slabs join one I/O up to this size: several in flight reach a drive's sequential rate.
@@ -165,7 +169,12 @@ SsdTier::~SsdTier() {
 }
 
 void SsdTier::set_waker(std::function<void()> waker) {
-    waker_ = waker;
+    {
+        // The codec threads call it (codec_done) under this lock while the Engine's owner replaces it: once
+        // this returns, the replaced waker is not running and will not run.
+        std::lock_guard lock(waker_mutex_);
+        waker_ = waker;
+    }
     file_.set_waker(std::move(waker));
 }
 
@@ -188,6 +197,7 @@ void SsdTier::codec_done(std::uint64_t tag) {
         std::lock_guard lock(codec_mutex_);
         codec_finished_.push_back(tag);
     }
+    std::lock_guard lock(waker_mutex_);
     if (waker_) { waker_(); }
 }
 
@@ -289,8 +299,11 @@ void SsdTier::land_promotion(PrefixCacheIndex& index, Job& job, bool ok) {
     --promotions_in_flight_;
     promotion_landed_ = true;
     if (ok) {
-        // Image slabs the SSD copy leaves out hold zeros, never another slab's bytes.
-        for (const std::uint32_t slab : job.job.zero_host_slabs) { std::memset(host_slab_(slab), 0, slab_bytes_); }
+        // Image slabs the SSD copy leaves out hold zeros, never another slab's bytes: filled on a codec thread
+        // while the reads ran (promote), or here without one.
+        if (!job.zero_posted) {
+            for (const std::uint32_t slab : job.job.zero_host_slabs) { std::memset(host_slab_(slab), 0, slab_bytes_); }
+        }
         counters_.block_reads += job.job.nodes.size();
         counters_.image_reads += job.job.image ? 1U : 0U;
         ++counters_.promotions;
@@ -316,17 +329,18 @@ void SsdTier::start_decode(std::uint64_t tag, Job& job) {
         offsets.push_back(offset);
         offset += payload_size(job.staging.get() + offset);
     }
-    if (job.failed || offset > available) {
-        job.failed = true;
-        codec_done(tag);
-        return;
-    }
     std::vector<std::byte*> targets;
     targets.reserve(job.job.image_host_slabs.size());
     for (const std::uint32_t slab : job.job.image_host_slabs) { targets.push_back(host_slab_(slab)); }
+    if (job.failed || offset > available || targets.empty()) {
+        // A damaged stream: nothing decodes; the promotion fails once its zero fill (if any) has finished.
+        job.failed = true;
+        return;
+    }
     job.phase           = Phase::Decoding;
     const unsigned parts = std::min<unsigned>(workers_->count(), static_cast<unsigned>(targets.size()));
-    job.parts            = parts;
+    // Added to the zero fill's part, which may still run: the last task to finish reports the job.
+    job.parts.fetch_add(parts);
     for (unsigned part = 0; part < parts; ++part) {
         const std::size_t begin = targets.size() * part / parts, end = targets.size() * (part + 1U) / parts;
         workers_->post([this, tag, &job, begin, end, offsets, targets, available] {
@@ -386,6 +400,9 @@ void SsdTier::apply_codec(PrefixCacheIndex& index) {
         if (found == jobs_.end()) { continue; } // abandoned
         Job& job = *found->second;
         if (job.promotion) {
+            // A zero fill that finished before the reads, or decode parts added since it reported: a later
+            // report (or reads_finished) lands it.
+            if (!job.read_done || job.parts.load() != 0) { continue; }
             land_promotion(index, job, !job.failed);
             jobs_.erase(found);
         } else {
@@ -405,9 +422,26 @@ void SsdTier::apply_codec(PrefixCacheIndex& index) {
     }
 }
 
+void SsdTier::reads_finished(PrefixCacheIndex& index, std::uint64_t tag, Job& job, bool ok) {
+    job.read_done = true;
+    if (!ok) {
+        job.failed = true;
+    } else if (job.job.packed) {
+        start_decode(tag, job);
+    }
+    // Codec-thread tasks (the zero fill, decode parts) still write its Host slabs: the last one reports the job
+    // and apply_codec lands it, a failed one included (its slabs are freed only then).
+    if (job.parts.load() != 0) { return; }
+    land_promotion(index, job, !job.failed);
+    jobs_.erase(tag);
+}
+
 void SsdTier::write_finished(const Job& job) noexcept {
     --writes_in_flight_;
     write_slabs_in_flight_ -= job.host_slabs;
+    // What it made clean, or left unwritten, changes what the next attempt finds.
+    refused_            = false;
+    next_write_attempt_ = {};
     if (room_wanted_) {
         // A promotion waits for room (promote): whatever this write's outcome, it quotes again.
         room_wanted_      = false;
@@ -433,12 +467,8 @@ void SsdTier::apply(PrefixCacheIndex& index) {
                 }
             }
             // A slab of the previous run whose bytes changed fails the promotion as a failed read does.
-            const bool ok = done.ok && verify_kept(job);
-            if (ok && job.job.packed) {
-                start_decode(done.tag, job); // lands through apply_codec
-                continue;
-            }
-            land_promotion(index, job, ok);
+            reads_finished(index, done.tag, job, done.ok && verify_kept(job));
+            continue; // landed and erased, or it lands through apply_codec
         } else {
             write_finished(job);
             if (done.ok) {
@@ -462,7 +492,7 @@ void SsdTier::apply(PrefixCacheIndex& index) {
         jobs_.erase(found);
     }
     if (workers_) { apply_codec(index); } // decodes that finished meanwhile land in this pass
-    due_.store(compute_due(index), std::memory_order_relaxed);
+    publish_due(index);
 }
 
 std::uint64_t SsdTier::write_back_target(const PrefixCacheIndex& index) const noexcept {
@@ -479,12 +509,17 @@ bool SsdTier::budget_still_blocked(const PrefixCacheIndex& index) const noexcept
            budget_->available_bytes() < blocked_available_ + blocked_retry_bytes_;
 }
 
-bool SsdTier::compute_due(const PrefixCacheIndex& index) const noexcept {
+bool SsdTier::compute_wanted(const PrefixCacheIndex& index) const noexcept {
     const std::uint64_t room   = index.host_lossless_slabs() + write_slabs_in_flight_;
     const std::uint64_t target = write_back_target(index);
     return counters_.write_failures < kWriteFailureLimit && writes_in_flight_ < kWriteJobs &&
-           !(packed_write_busy_ && 2U * room >= target) && !budget_still_blocked(index) &&
-           std::chrono::steady_clock::now() >= next_write_attempt_ && room < target;
+           !(packed_write_busy_ && 2U * room >= target) && !budget_still_blocked(index) && room < target;
+}
+
+void SsdTier::publish_due(const PrefixCacheIndex& index) noexcept {
+    // The time first: a reader that sees `wanted` then reads the attempt it belongs to, or a later one.
+    retry_at_.store(next_write_attempt_.time_since_epoch().count(), std::memory_order_relaxed);
+    wanted_.store(compute_wanted(index), std::memory_order_relaxed);
 }
 
 void SsdTier::start_write_backs(PrefixCacheIndex& index) {
@@ -501,7 +536,7 @@ void SsdTier::start_write_backs(PrefixCacheIndex& index) {
     } timed{counters_, began};
     // Tried at every poll: a candidate is often blocked only for a moment (the last blocks of a request
     // that just ended still landing in the Host tier), and the next request's prefill must not find it
-    // unwritten. A refusal only keeps the idle Engine from waking for it (compute_due) for a while.
+    // unwritten. A refusal only sets when the idle Engine next wakes for it (write_back_retry_at).
     const auto now             = std::chrono::steady_clock::now();
     const std::uint64_t target = write_back_target(index);
     // With a write budget, a candidate's expected value is its GDSF value density times the share of
@@ -529,13 +564,27 @@ void SsdTier::start_write_backs(PrefixCacheIndex& index) {
     // write at a time fell behind a small Host tier's captures). Raw writes beside a packed one while
     // there is slack made more content clean early and demoted it, losing a snapshot a later resume
     // needed: with slack the tier waits for the packed write.
-    while (writes_in_flight_ < kWriteJobs && index.host_lossless_slabs() + write_slabs_in_flight_ < target) {
+    // The failure limit is tested at every start: a write the file refuses at once (issue_write) fails here,
+    // inside the loop, and its candidate is offered again.
+    while (counters_.write_failures < kWriteFailureLimit && writes_in_flight_ < kWriteJobs &&
+           index.host_lossless_slabs() + write_slabs_in_flight_ < target) {
         const bool slack = 2U * (index.host_lossless_slabs() + write_slabs_in_flight_) >= target;
         if (packed_write_busy_ && slack) { break; }
         declined = 0;
         std::optional<SsdJob> job = index.begin_ssd_write(admit);
         if (!job) {
-            next_write_attempt_ = now + kWriteRetry;
+            // The next attempt of an idle Engine (polls between rounds try every time). A refusal inside the
+            // wait leaves it; one at or after it doubles the wait while the index published nothing since.
+            const std::uint64_t epoch = index.snapshot_epoch();
+            if (!refused_ || epoch != refused_epoch_) {
+                write_retry_        = kWriteRetry;
+                next_write_attempt_ = now + write_retry_;
+            } else if (now >= next_write_attempt_) {
+                write_retry_        = std::min(2 * write_retry_, kWriteRetryMax);
+                next_write_attempt_ = now + write_retry_;
+            }
+            refused_       = true;
+            refused_epoch_ = epoch;
             if (budget_ && declined != 0) {
                 // Every candidate the budget saw was passed over: nothing changes until a snapshot is
                 // published or the budget allows another image.
@@ -547,6 +596,7 @@ void SsdTier::start_write_backs(PrefixCacheIndex& index) {
             return;
         }
         budget_blocked_ = false;
+        refused_        = false;
         const std::uint64_t tag = next_tag_++;
         auto entry              = std::make_unique<Job>();
         entry->job              = std::move(*job);
@@ -585,9 +635,12 @@ bool SsdTier::poll(PrefixCacheIndex& index) {
         last_budget_save_ = std::chrono::steady_clock::now();
     }
     const bool landed = std::exchange(promotion_landed_, false);
-    if (landed) { next_write_attempt_ = {}; }
+    if (landed) {
+        next_write_attempt_ = {};
+        refused_            = false;
+    }
     start_write_backs(index);
-    due_.store(compute_due(index), std::memory_order_relaxed);
+    publish_due(index);
     return landed;
 }
 
@@ -628,7 +681,27 @@ SsdTier::Promotion SsdTier::promote(PrefixCacheIndex& index, SnapshotRef snapsho
             return Promotion::Unavailable;
         }
         ++promotions_in_flight_;
-        jobs_.emplace(tag, std::move(entry));
+        Job& added = *jobs_.emplace(tag, std::move(entry)).first->second;
+        if (workers_ && !added.job.zero_host_slabs.empty()) {
+            // The image slabs the SSD copy leaves out are zeroed on a codec thread while the reads run (tens of
+            // megabytes for a DFlash2 ring), not on the Engine thread at the landing. They are Filling: nothing
+            // else touches them, and the promotion lands only once this has finished (reads_finished).
+            try {
+                std::vector<std::byte*> zero;
+                zero.reserve(added.job.zero_host_slabs.size());
+                for (const std::uint32_t slab : added.job.zero_host_slabs) { zero.push_back(host_slab_(slab)); }
+                added.zero_posted = true;
+                added.parts.fetch_add(1);
+                workers_->post([this, tag, &added, zero = std::move(zero), bytes = slab_bytes_] {
+                    for (std::byte* slab : zero) { std::memset(slab, 0, bytes); }
+                    if (added.parts.fetch_sub(1) == 1U) { codec_done(tag); }
+                });
+            } catch (const std::exception&) {
+                // Not posted: land_promotion fills them.
+                if (added.zero_posted) { added.parts.fetch_sub(1); }
+                added.zero_posted = false;
+            }
+        }
     }
     return Promotion::Pending;
 }
@@ -660,7 +733,9 @@ void SsdTier::abandon() noexcept {
     packed_write_busy_     = false;
     room_wanted_           = false;
     promotion_landed_      = true; // waiting requests quote the empty cache again
-    due_.store(false, std::memory_order_relaxed);
+    refused_               = false;
+    next_write_attempt_    = {};
+    wanted_.store(false, std::memory_order_relaxed);
 }
 
 } // namespace infernix::runtime::prefix_cache

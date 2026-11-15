@@ -30,7 +30,7 @@ RamDecision RamControl::decide(std::uint64_t available, double now) const noexce
     }
     const std::uint64_t floor = growth_floor();
     if (growable_ != 0 && available > floor && above_since_ >= 0.0 &&
-        now - std::max(above_since_, last_hold_) >= kGrowHoldSeconds) {
+        now - std::max(above_since_, last_hold_) >= grow_hold_) {
         out.grow = std::min(growable_, (available - floor) / kStepBytes * kStepBytes);
     }
     return out;
@@ -39,7 +39,7 @@ RamDecision RamControl::decide(std::uint64_t available, double now) const noexce
 RamMonitor::RamMonitor(std::uint64_t reserve_bytes, int device, std::function<std::uint64_t()> available,
                        std::chrono::milliseconds period)
     : read_(available ? std::move(available) : std::function<std::uint64_t()>([] {
-          return host_memory_snapshot().available_physical;
+          return resize_available(host_memory_snapshot());
       })),
       period_(period), control_(reserve_bytes), worker_(device) {
     available_.store(read_(), std::memory_order_relaxed);
@@ -73,7 +73,9 @@ RamDecision RamMonitor::decide(std::uint64_t shrinkable, std::uint64_t growable)
     control_.set_room(shrinkable, growable);
     control_.checked(now());
     (void)control_.observe(available, now());
-    return control_.decide(available, now());
+    const RamDecision decision = control_.decide(available, now());
+    growing_                   = decision.grow != 0;
+    return decision;
 }
 
 std::uint64_t RamMonitor::measure() {
@@ -82,13 +84,17 @@ std::uint64_t RamMonitor::measure() {
     return available;
 }
 
+// The waker runs under mutex_, here and wherever else it is called: set_waker then returns only once no call is in
+// flight, so an engine that clears its waker before it goes away is never called afterwards. The waker takes the
+// engine's queue lock, which nothing holds while it calls into the monitor.
 void RamMonitor::poke() {
-    std::function<void()> wake;
-    {
-        std::lock_guard lock(mutex_);
-        wake = wake_;
-    }
-    if (wake) { wake(); } // the engine's waker takes its own lock
+    std::lock_guard lock(mutex_);
+    if (wake_) { wake_(); }
+}
+
+std::chrono::milliseconds RamMonitor::poll_period(std::uint64_t available) const noexcept {
+    if (!control_.near_pressure(available)) { return period_; }
+    return std::max(period_ / kNearPressurePollDivisor, std::chrono::milliseconds(1));
 }
 
 void RamMonitor::set_room(std::uint64_t shrinkable, std::uint64_t growable) {
@@ -99,20 +105,20 @@ void RamMonitor::set_room(std::uint64_t shrinkable, std::uint64_t growable) {
 bool RamMonitor::resized(bool hold, std::uint64_t shrinkable, std::uint64_t growable) {
     const std::uint64_t available = read_();
     available_.store(available, std::memory_order_relaxed);
-    std::function<void()> wake;
-    bool more = false;
-    {
-        std::lock_guard lock(mutex_);
-        control_.resized(now(), hold);
-        control_.set_room(shrinkable, growable);
-        (void)control_.observe(available, now());
-        more = !hold && control_.decide(available, now()).grow != 0;
-        if (more) {
-            due_.store(true, std::memory_order_relaxed);
-            wake = wake_;
-        }
+    std::lock_guard lock(mutex_);
+    // A growth that was due and took nothing was refused (the OS page-locks no more now, or the tier could not start
+    // it): the next attempt waits twice as long, since each one commits, zeroes and tries to lock a chunk while
+    // requests run.
+    const bool refused = hold && growing_;
+    growing_           = false;
+    control_.resized(now(), hold, refused);
+    control_.set_room(shrinkable, growable);
+    (void)control_.observe(available, now());
+    const bool more = !hold && control_.decide(available, now()).grow != 0;
+    if (more) {
+        due_.store(true, std::memory_order_relaxed);
+        if (wake_) { wake_(); }
     }
-    if (wake) { wake(); } // the engine's waker takes its own lock
     return more;
 }
 
@@ -126,13 +132,10 @@ void RamMonitor::run() {
         if (stopping_) { break; }
         const bool due = control_.observe(available, now());
         if (due) { due_.store(true, std::memory_order_relaxed); }
-        if ((due || busy_.load(std::memory_order_relaxed)) && wake_) {
-            const std::function<void()> wake = wake_;
-            lock.unlock();
-            wake(); // the engine's waker takes its own lock
-            lock.lock();
-        }
-        stop_cv_.wait_for(lock, period_, [this] { return stopping_; });
+        if ((due || busy_.load(std::memory_order_relaxed)) && wake_) { wake_(); } // under mutex_ (poke)
+        // Close to the pressure point the next reading comes sooner: another program can take the last GiB in
+        // well under a second.
+        stop_cv_.wait_for(lock, poll_period(available), [this] { return stopping_; });
     }
 }
 

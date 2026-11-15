@@ -432,9 +432,12 @@ void PrefixCache::poll() {
         const cudaError_t status = cudaEventQuery(w.done);
         if (status == cudaErrorNotReady) { break; }
         CUDA_CHECK(status);
-        for (const pc::NodeRef node : w.nodes) {
-            index_->complete_host_fill(node);
-            index_->unpin_node(node);
+        // Deepest first (the nodes are a lane's path, root first): each joins the Device LRU as its pin drops, and
+        // the LRU's oldest entry goes first, so the deeper blocks are evicted before the ones every continuation
+        // of the path maps.
+        for (auto node = w.nodes.rbegin(); node != w.nodes.rend(); ++node) {
+            index_->complete_host_fill(*node);
+            index_->unpin_node(*node);
         }
         recycle(w.done);
         writes_.pop_front();
@@ -452,7 +455,19 @@ void PrefixCache::poll() {
     if (ssd_) { ssd_->settle(*index_); }
 }
 
+bool PrefixCache::await_capture(std::uint64_t id) {
+    for (const PendingCapture& c : captures_) {
+        if (c.capture.id != id) { continue; }
+        // One transfer stream: every capture queued before it has landed by then, so poll publishes up to it.
+        CUDA_CHECK(cudaEventSynchronize(c.events.back()));
+        poll();
+        return true;
+    }
+    return false;
+}
+
 void PrefixCache::drain() {
+    testing::count_drain();
     CUDA_CHECK(cudaStreamSynchronize(transfer_));
     CUDA_CHECK(cudaStreamSynchronize(restore_stream_));
     poll();
@@ -674,7 +689,18 @@ void PrefixCache::abort_restore() noexcept {
     restore_ = RestoreBatch{};
 }
 
+void PrefixCache::fail_restore() noexcept {
+    if (!restore_.open) { return; }
+    // Part of the batch may be enqueued (a failure inside submit_restore): those copies land, or fail, before their
+    // destination pages return to the pool.
+    (void)cudaStreamSynchronize(restore_stream_);
+    for (cudaEvent_t event : restore_.events) { recycle(event); }
+    restore_.events.clear();
+    abort_restore();
+}
+
 void PrefixCache::clear() noexcept {
+    fail_restore(); // a batch a failed activation left open names this index's entries
     try {
         drain();
     } catch (...) {}
@@ -683,6 +709,12 @@ void PrefixCache::clear() noexcept {
     }
     landing_.clear();
     while (!staged_.empty()) { abandon_staged_capture(staged_.begin()->first); }
+    // What a failed drain left unpublished: the streams were waited for as far as they answer, so the events go
+    // back to the spares (the index these captures and writes name is rebuilt below).
+    for (PendingCapture& c : captures_) {
+        for (cudaEvent_t event : c.events) { recycle(event); }
+    }
+    for (PendingWrite& w : writes_) { recycle(w.done); }
     captures_.clear();
     writes_.clear();
     published_.clear();

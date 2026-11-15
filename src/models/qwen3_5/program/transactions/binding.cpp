@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -31,6 +32,7 @@ void ProgramImpl::preencode_overlay_vision(execution::VisionPrefillSession& sess
     execution::VisionOverlayWindowStats window_stats;
     std::vector<execution::PinnedVisionResult> preencoded;
     if (first_needed < item_end) {
+        testing::count_binding_vision_encode();
         // With offloaded experts the window runs in lent expert frames.
         preencoded = execution::encode_items_overlay(device, parameters, prompt, plan, first_needed, &window_stats,
                                                      offload ? &offload->vision_window() : nullptr);
@@ -80,8 +82,9 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     }
 }
 
-// Stages a binding's request state and unit demands before its capacity check. A failed check
-// resets requests[lane].
+// Plans a binding's unit demands before its capacity check, which needs nothing of the prompt but its lengths:
+// the request's prefill state (a copy of the prompt, its Vision session and overlay encode) is staged by the
+// binding once the check has passed (initialize_prefill). A failed check resets requests[lane].
 void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePlan& base,
                                      ResumeState* resume, ExecutionUnitKind resume_kind,
                                      std::uint32_t resume_tokens) {
@@ -91,7 +94,6 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
     state.lane        = lane;
     request.base      = base.impl_;
     request.lifecycle = Lifecycle::Prefilling;
-    initialize_prefill(lane, tx.reuse_frontier);
     UnitDemand first;
     if (!resume) {
         // A binding's first step is one chunk: admission and source choice size it so
@@ -102,7 +104,7 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
         // pp1024 +19.3 %, pp2048 +11.5 %, pp3072 +5.2 %, pp4096 +0.5 %, pp8192 +1.8 % (ABBA).
         std::uint32_t step = prefill_chunk;
         const std::uint32_t prompt = base.summary().prompt_tokens;
-        if (idle_prefill_width > prefill_chunk && !request.prefill->vision_plan &&
+        if (idle_prefill_width > prefill_chunk && !base.impl_->vision_control_plan &&
             prompt - tx.reuse_frontier > prefill_chunk && !other_lane_generating(lane)) {
             const std::uint32_t tokens =
                 hybrid_wide_step_limit(lane, tx.reuse_frontier, prompt, idle_prefill_width);

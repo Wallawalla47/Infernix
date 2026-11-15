@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <new>
@@ -88,11 +89,14 @@ struct Conversation {
     std::vector<TokenId> tokens;
     std::vector<NodeRef> path;
     SnapshotRef endpoint;
+    SnapshotRef tap; // with tap_blocks
 };
 
 // Blocks written through to the Host (each slab's bytes keyed by its node index), then a Host-born
-// endpoint whose image slabs are keyed by 1000 + snapshot index + slab position.
-Conversation publish(PrefixCacheIndex& index, Backend& backend, std::uint32_t seed, std::uint32_t blocks) {
+// endpoint whose image slabs are keyed by 1000 + snapshot index + slab position. With `tap_blocks`, a
+// Host-born tap after that many blocks first.
+Conversation publish(PrefixCacheIndex& index, Backend& backend, std::uint32_t seed, std::uint32_t blocks,
+                     std::uint32_t tap_blocks = 0) {
     Conversation c;
     std::mt19937 rng(seed);
     c.tokens.resize(blocks * kBlockTokens);
@@ -109,6 +113,18 @@ Conversation publish(PrefixCacheIndex& index, Backend& backend, std::uint32_t se
         index.complete_host_fill(inserted.node);
         c.path.push_back(inserted.node);
         parent = inserted.node;
+    }
+    if (tap_blocks != 0) {
+        auto tap_image = index.reserve_host_image(false, kAny);
+        require(tap_image.has_value(), "a tap image fits");
+        const std::vector<std::uint32_t> tap_slabs = tap_image->slabs;
+        const PublishResult tap = index.publish_host_snapshot(c.path[tap_blocks - 1], tap_blocks * kBlockTokens, {}, std::nullopt,
+                                                              std::move(*tap_image), SnapshotKind::Tap);
+        require(tap.created, "tap published");
+        for (std::size_t k = 0; k < tap_slabs.size(); ++k) {
+            fill(backend, tap_slabs[k], 1000U + tap.snapshot.index * 8U + static_cast<std::uint32_t>(k));
+        }
+        c.tap = tap.snapshot;
     }
     auto image = index.reserve_host_image(false, kAny);
     require(image.has_value(), "an endpoint image fits");
@@ -522,6 +538,15 @@ void test_write_budget(const std::filesystem::path& directory) {
     selective.charge(300); // 100 left: fill 0.1, the best 20 %
     require(!selective.admit(8.0, 50, false, start) && selective.admit(9.0, 50, false, start), "the best 20 % only");
     require(!selective.admit(100.0, 150, false, start), "nothing larger than what is left");
+    // A candidate larger than an hour's bytes is written from a full bucket (it could never be written
+    // otherwise) and empties it; from anything less it waits.
+    SsdWriteBudget oversized(1000, directory / "oversized.txt", start);
+    require(oversized.admit(1.0, 1500, true, start), "an oversized candidate is written from a full bucket");
+    oversized.charge(1500);
+    require(oversized.available_bytes() == 0, "it takes the whole bucket");
+    require(!oversized.admit(1.0, 1500, false, start + std::chrono::minutes(59)),
+            "an oversized candidate waits for a full bucket");
+    require(oversized.admit(1.0, 1500, false, start + std::chrono::minutes(61)), "and is written once it is full again");
     // It refills at an hour's bytes per hour, and a restart keeps the level.
     const auto state = directory / "budget.txt";
     SsdWriteBudget budget(1000, state, start);
@@ -551,6 +576,308 @@ void test_write_budget(const std::filesystem::path& directory) {
     require(refused, "a budget needs a positive hourly size");
 }
 
+// A refused write-back is tried again without anything else waking the caller (§5.7): the candidates are
+// refused while pinned (as a snapshot whose Host copies are still landing is), the tier names a near time
+// for the next attempt, and once that time has come it reports the write-back due with no poll in between
+// (an idle Engine waits until then) and the next poll writes.
+void test_idle_retry(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    Backend backend;
+    PrefixCacheIndex index(config(), backend);
+    SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); });
+    const Conversation a = publish(index, backend, 71, 2);
+    (void)tier.poll(index);
+    require(!tier.write_back_retry_at().has_value() && !tier.write_back_due(), "a Host tier with room wants no write-back");
+    const Conversation b = publish(index, backend, 72, 3);
+    index.pin_snapshot(a.endpoint);
+    index.pin_snapshot(b.endpoint);
+    (void)tier.poll(index);
+    require(!tier.busy() && tier.counters().image_writes == 0, "pinned candidates are refused");
+    const auto retry = tier.write_back_retry_at();
+    require(retry.has_value(), "a refused write-back names its next attempt");
+    require(*retry - std::chrono::steady_clock::now() < std::chrono::seconds(1), "the next attempt is near");
+    if (std::chrono::steady_clock::now() < *retry) { require(!tier.write_back_due(), "not due before its time"); }
+    index.unpin_snapshot(a.endpoint);
+    index.unpin_snapshot(b.endpoint);
+    std::this_thread::sleep_until(*retry + std::chrono::milliseconds(1));
+    require(tier.write_back_due(), "due once its time has come, with no poll in between");
+    (void)tier.poll(index);
+    require(tier.busy(), "the retried write-back starts");
+    settle(tier, index);
+    require(tier.counters().image_writes >= 1, "and lands");
+    // Refusals with nothing new published back off, so an idle caller is not woken ten times a second.
+    index.pin_snapshot(a.endpoint);
+    index.pin_snapshot(b.endpoint);
+    std::chrono::steady_clock::duration longest{};
+    for (int attempt = 0; attempt < 4 && tier.write_back_retry_at().has_value(); ++attempt) {
+        (void)tier.poll(index);
+        const auto next = tier.write_back_retry_at();
+        if (!next) { break; }
+        longest = std::max(longest, *next - std::chrono::steady_clock::now());
+        std::this_thread::sleep_until(*next + std::chrono::milliseconds(1));
+    }
+    if (tier.write_back_retry_at().has_value()) {
+        require(longest > std::chrono::milliseconds(150), "repeated refusals wait longer than the first");
+    }
+    index.unpin_snapshot(a.endpoint);
+    index.unpin_snapshot(b.endpoint);
+    tier.drain(index);
+    index.check_invariants();
+}
+
+// A write the file refuses at once (here: Host memory that is not 4 KiB-aligned) fails like a write the
+// drive fails: after three the tier stops writing, and the poll that met them returns.
+void test_refused_submit(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    Backend backend;
+    PrefixCacheIndex index(config(), backend);
+    SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab) + 512; });
+    const Conversation a = publish(index, backend, 81, 2);
+    const Conversation b = publish(index, backend, 82, 3);
+    (void)tier.poll(index); // spun forever before the failure limit was tested inside the loop
+    require(!tier.busy() && tier.counters().write_failures == 3 && !tier.last_error().empty(),
+            "three refused writes stop the write-back (" + std::to_string(tier.counters().write_failures) + ")");
+    require(index.snapshot(a.endpoint).ssd == CopyState::Absent && index.snapshot(b.endpoint).ssd == CopyState::Absent,
+            "the entries stay as they were");
+    (void)tier.poll(index);
+    require(tier.counters().write_failures == 3 && !tier.write_back_due(), "and nothing is tried again");
+    index.check_invariants();
+}
+
+// The prefix cache file's binding for a Host tier alone; `slab` maps a slab id to its memory.
+PersistBinding host_binding(std::function<std::byte*(std::uint32_t)> slab, std::uint32_t image_slabs,
+                            std::uint32_t host_slabs = kHostSlabs) {
+    PersistBinding binding;
+    binding.magic       = {'T', 'E', 'S', 'T', 'P', 'C', '0', '1'};
+    binding.geometry    = {std::byte{1}, std::byte{2}, std::byte{3}};
+    binding.slab_bytes  = kSlabBytes;
+    binding.image_slabs = image_slabs;
+    binding.host_slabs  = host_slabs;
+    binding.slab        = std::move(slab);
+    return binding;
+}
+
+// The size of a prefix cache file's head (its tables, padded to 4 KiB): the 64-bit field after the magic
+// and the version.
+std::uint64_t head_bytes_of(const std::filesystem::path& file) {
+    std::ifstream in(file, std::ios::binary);
+    in.seekg(12);
+    std::uint64_t bytes = 0;
+    in.read(reinterpret_cast<char*>(&bytes), sizeof(bytes));
+    require(static_cast<bool>(in), "the file's head size reads");
+    return bytes;
+}
+
+void flip_byte(const std::filesystem::path& file, std::uint64_t offset) {
+    std::fstream damage(file, std::ios::in | std::ios::out | std::ios::binary);
+    damage.seekg(static_cast<std::streamoff>(offset));
+    char byte = 0;
+    damage.read(&byte, 1);
+    byte = static_cast<char>(byte ^ 0x5A);
+    damage.seekp(static_cast<std::streamoff>(offset));
+    damage.write(&byte, 1);
+    require(static_cast<bool>(damage), "the file is damaged for the test");
+}
+
+// The Host slabs of an image, in order.
+std::vector<std::byte> image_bytes(const PrefixCacheIndex& index, SnapshotRef snapshot,
+                                   const std::function<std::byte*(std::uint32_t)>& slab) {
+    std::vector<std::byte> out;
+    for (const std::uint32_t id : index.snapshot(snapshot).host_slabs) { out.insert(out.end(), slab(id), slab(id) + kSlabBytes); }
+    return out;
+}
+
+// The prefix cache file through its unbuffered writer and reader (§5.5): the slabs go to and from the Host
+// tier's own memory, here in chunks of three slabs laid out in reverse (so runs join inside a chunk and
+// break between chunks), behind tables whose size is no multiple of 4 KiB; every block and image comes
+// back with its bytes, and the file is whole 4 KiB blocks.
+void test_file_round_trip(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path file = directory / "cache.bin";
+    const std::string fingerprint    = "a fingerprint of odd length";
+    const auto chunked = [](Backend& backend) {
+        return [&backend](std::uint32_t id) { return id < 30U ? backend.slab((9U - id / 3U) * 3U + id % 3U) : backend.slab(id); };
+    };
+    std::vector<std::byte> image_a, image_b;
+    std::uint32_t frontier_a = 0;
+    {
+        Backend backend;
+        PrefixCacheIndex index(config(), backend);
+        const Conversation a = publish(index, backend, 21, 2);
+        const Conversation b = publish(index, backend, 22, 3);
+        // The bytes as this layout holds them: every slab in use keyed by its id.
+        std::vector<NodeRef> nodes;
+        std::vector<SnapshotRef> snapshots;
+        index.collect_persistable(nodes, snapshots, false);
+        const auto slab = chunked(backend);
+        const auto write = [&](std::uint32_t id) {
+            std::byte* p = slab(id);
+            for (std::size_t i = 0; i < kSlabBytes; ++i) { p[i] = pattern(5000U + id, i); }
+        };
+        for (const NodeRef node : nodes) { write(index.node(node).host_slab); }
+        for (const SnapshotRef snapshot : snapshots) {
+            for (const std::uint32_t id : index.snapshot(snapshot).host_slabs) { write(id); }
+        }
+        image_a    = image_bytes(index, a.endpoint, slab);
+        image_b    = image_bytes(index, b.endpoint, slab);
+        frontier_a = index.snapshot(a.endpoint).frontier;
+        const PersistResult saved = save_prefix_cache(index, host_binding(slab, 4), file, fingerprint, {});
+        require(saved.ok && saved.blocks == 5 && saved.snapshots == 2, "the Host tier is saved (" + saved.message + ")");
+        const std::uint64_t head = head_bytes_of(file);
+        require(head % 4096 == 0 && std::filesystem::file_size(file) == head + 13 * kSlabBytes && saved.bytes == head + 13 * kSlabBytes,
+                "the file is its padded tables and its 13 slabs");
+        require(!std::filesystem::exists(file.string() + ".tmp"), "the temporary file was renamed");
+    }
+    {
+        Backend backend;
+        PrefixCacheIndex index(config(), backend);
+        const auto slab            = chunked(backend);
+        const PersistResult loaded = load_prefix_cache(index, host_binding(slab, 4), file, fingerprint, {});
+        require(loaded.ok && loaded.message.empty() && loaded.blocks == 5 && loaded.snapshots == 2,
+                "everything comes back, every slab matching its hash (" + loaded.message + ")");
+        index.check_invariants();
+        std::vector<NodeRef> nodes;
+        std::vector<SnapshotRef> snapshots;
+        index.collect_persistable(nodes, snapshots, false);
+        require(snapshots.size() == 2, "both snapshots are restored");
+        for (const SnapshotRef snapshot : snapshots) {
+            const std::vector<std::byte>& expected = index.snapshot(snapshot).frontier == frontier_a ? image_a : image_b;
+            require(image_bytes(index, snapshot, slab) == expected, "a restored image holds its bytes");
+        }
+        // Saved again from the restored tier, the file is the same size (the same entries).
+        const PersistResult again = save_prefix_cache(index, host_binding(slab, 4), file, fingerprint, {});
+        require(again.ok && again.bytes == loaded.bytes, "a restored tier saves the same file size");
+        Backend other;
+        PrefixCacheIndex fresh(config(), other);
+        const PersistResult foreign =
+            load_prefix_cache(fresh, host_binding([&](std::uint32_t id) { return other.slab(id); }, 4), file, "another", {});
+        require(!foreign.ok && fresh.stats().nodes == 0, "a file of another fingerprint loads nothing");
+    }
+}
+
+// A Host slab whose bytes changed on the drive (§5.5): its content hash no longer matches, and the entry
+// it belongs to is dropped while the rest of the file loads; damage to the tables refuses the whole file.
+void test_file_damage(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path file = directory / "cache.bin";
+    std::vector<std::byte> image_a, image_b;
+    std::uint32_t frontier_a = 0;
+    {
+        Backend backend;
+        PrefixCacheIndex index(config(), backend);
+        const auto slab      = [&](std::uint32_t id) { return backend.slab(id); };
+        const Conversation a = publish(index, backend, 31, 2);
+        const Conversation b = publish(index, backend, 32, 3);
+        image_a              = image_bytes(index, a.endpoint, slab);
+        image_b              = image_bytes(index, b.endpoint, slab);
+        frontier_a           = index.snapshot(a.endpoint).frontier;
+        const PersistResult saved = save_prefix_cache(index, host_binding(slab, 4), file, "fp", {});
+        require(saved.ok && saved.snapshots == 2, "two conversations are saved (" + saved.message + ")");
+    }
+    const std::uint64_t head = head_bytes_of(file);
+    const auto load = [&](const char* what, bool ok, std::uint64_t snapshots) {
+        Backend backend;
+        PrefixCacheIndex index(config(), backend);
+        const auto slab            = [&](std::uint32_t id) { return backend.slab(id); };
+        const PersistResult loaded = load_prefix_cache(index, host_binding(slab, 4), file, "fp", {});
+        require(loaded.ok == ok, std::string(what) + ": " + (ok ? "the file still loads (" : "the file is refused (") + loaded.message + ")");
+        if (!ok) { return; }
+        require(loaded.snapshots == snapshots && loaded.saved_snapshots == 2 && !loaded.message.empty(),
+                std::string(what) + ": the damaged entry is dropped and reported, the other kept (" +
+                    std::to_string(loaded.snapshots) + " snapshots)");
+        index.check_invariants();
+        std::vector<NodeRef> nodes;
+        std::vector<SnapshotRef> kept;
+        index.collect_persistable(nodes, kept, false);
+        require(kept.size() == snapshots, std::string(what) + ": the index holds what the result counts");
+        for (const SnapshotRef snapshot : kept) {
+            const std::vector<std::byte>& expected = index.snapshot(snapshot).frontier == frontier_a ? image_a : image_b;
+            require(image_bytes(index, snapshot, slab) == expected, std::string(what) + ": a kept image holds its bytes");
+        }
+    };
+    // The file's last slab is the last snapshot's last image slab: that snapshot goes, alone.
+    flip_byte(file, std::filesystem::file_size(file) - 100);
+    load("a damaged image slab", true, 1);
+    flip_byte(file, std::filesystem::file_size(file) - 100); // restored
+    // The first slab is a root block's: it goes with what resumed through it, the other conversation stays.
+    flip_byte(file, head + 100);
+    load("a damaged block slab", true, 1);
+    flip_byte(file, head + 100);
+    // A damaged end mark (the last bytes of the tables, before their padding) refuses the file.
+    {
+        std::ifstream in(file, std::ios::binary);
+        std::vector<char> tables(static_cast<std::size_t>(head));
+        in.read(tables.data(), static_cast<std::streamsize>(tables.size()));
+        std::size_t end = tables.size();
+        while (end > 0 && tables[end - 1] == 0) { --end; }
+        require(end > 16, "the tables end in their end mark");
+        in.close();
+        flip_byte(file, end - 10);
+        load("damaged tables", false, 0);
+        flip_byte(file, end - 10);
+    }
+    // A truncated file is refused before anything is read.
+    std::filesystem::resize_file(file, std::filesystem::file_size(file) - kSlabBytes);
+    load("a truncated file", false, 0);
+}
+
+// A file saved with SSD copies, loaded by a start without the SSD tier into a Host tier smaller than the
+// file (§5.5): a snapshot whose path has a block only the SSD held cannot come back, so it takes none of
+// the Host tier, and every snapshot that can come back and fits does.
+void test_restore_without_ssd(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path kept = directory / "kept.bin";
+    const std::filesystem::path file = directory / "cache.bin";
+    std::uint32_t frontier_c = 0;
+    {
+        Backend backend;
+        PrefixCacheIndex index(config(), backend);
+        SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); }, 0, false, kept);
+        // x: four blocks, a tap after two and an endpoint; c: two blocks and an endpoint. Only the tap is
+        // written back (the endpoints are pinned meanwhile), with x's first two blocks.
+        const Conversation x = publish(index, backend, 51, 4, 2);
+        const Conversation c = publish(index, backend, 52, 2);
+        frontier_c           = index.snapshot(c.endpoint).frontier;
+        index.pin_snapshot(x.endpoint);
+        index.pin_snapshot(c.endpoint);
+        for (int i = 0; i < 20 && tier.counters().image_writes == 0; ++i) {
+            (void)tier.poll(index);
+            settle(tier, index);
+        }
+        index.unpin_snapshot(x.endpoint);
+        index.unpin_snapshot(c.endpoint);
+        require(tier.counters().image_writes == 1 && index.snapshot(x.tap).ssd == CopyState::Resident,
+                "the tap and its two blocks were written back");
+        // Captures displace what the SSD holds: the tap's Host image, then x's first two blocks' Host copies.
+        std::vector<HostImageReservation> reservations;
+        while (index.node(x.path[0]).host == CopyState::Resident) {
+            auto image = index.reserve_host_image(false, kAny);
+            require(image.has_value(), "a capture displaces clean Host copies");
+            reservations.push_back(std::move(*image));
+        }
+        require(index.snapshot(x.endpoint).host == CopyState::Resident && index.node(x.path[2]).host == CopyState::Resident &&
+                    index.snapshot(c.endpoint).host == CopyState::Resident,
+                "the unwritten endpoints and x's last blocks are still on the Host");
+        for (HostImageReservation& reservation : reservations) { index.release_host_image(std::move(reservation)); }
+        tier.drain(index);
+        const PersistResult saved = save_prefix_cache(index, test_binding(backend, tier, 4), file, "fp", {});
+        require(saved.ok && saved.snapshots == 3 && saved.ssd_snapshots == 1 && saved.ssd_blocks == 2,
+                "x's endpoint is saved over two blocks only the SSD holds (" + saved.message + ")");
+    }
+    for (const std::uint32_t host_slabs : {8U, kHostSlabs}) {
+        Backend backend;
+        PrefixCacheIndex index(config(), backend);
+        const PersistResult loaded = load_prefix_cache(
+            index, host_binding([&](std::uint32_t id) { return backend.slab(id); }, 4, host_slabs), file, "fp", {});
+        require(loaded.ok && !loaded.ssd_message.empty(), "the file loads without its SSD copies (" + loaded.message + ")");
+        require(loaded.snapshots == 1 && loaded.blocks == 2,
+                "the snapshot that can come back does, in a Host tier of " + std::to_string(host_slabs) + " slabs (" +
+                    std::to_string(loaded.snapshots) + " snapshots, " + std::to_string(loaded.blocks) + " blocks)");
+        require(index.snapshot(only_snapshot(index)).frontier == frontier_c, "it is the conversation the Host tier held whole");
+        index.check_invariants();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -565,6 +892,11 @@ int main() {
         test_packed_partial(directory / "partial");
         test_kept_restart(directory / "kept");
         test_room_wait(directory / "room");
+        test_idle_retry(directory / "retry");
+        test_refused_submit(directory / "refused");
+        test_file_round_trip(directory / "file");
+        test_file_damage(directory / "damage");
+        test_restore_without_ssd(directory / "no-ssd");
         Backend backend;
         PrefixCacheIndex index(config(), backend);
         SsdTier tier(directory, 64, kSlabBytes, [&](std::uint32_t slab) { return backend.slab(slab); });

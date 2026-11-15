@@ -73,7 +73,7 @@ int DecayedLfu::advance(double dt) {
 HostTier::HostTier(const Config& config)
     : config_(config), lfu_(config.num_keys, config.half_life), slots_(config.slots), slot_class_(config.slots, kTransit),
       key_class_(config.num_keys, 0), slot_of_(config.num_keys, -1), held_(config.num_keys, 0),
-      copying_(config.num_keys, 0), dirty_mark_(config.num_keys, 0) {
+      held_pins_(config.num_keys, 0), copying_(config.num_keys, 0), dirty_mark_(config.num_keys, 0) {
     if (config.num_keys == 0) { throw std::invalid_argument("HostTier: no keys"); }
     for (auto& pos : heap_pos_) { pos.assign(config.slots, -1); }
     for (auto& cls : heap_class_) { cls.assign(config.slots, 0); }
@@ -351,6 +351,23 @@ void HostTier::defer_free(std::span<const std::uint32_t> slots) {
     }
 }
 
+void HostTier::undo_prefill(std::uint32_t key) {
+    const std::int32_t at = slot_of_[key];
+    if (at < 0) { return; }
+    const auto slot = static_cast<std::uint32_t>(at);
+    Slot& s         = slots_[slot];
+    if (s.pins != 0 || (s.state != SlotState::kResident && s.state != SlotState::kShadow)) {
+        throw std::logic_error("HostTier: undoing a pre-fill of a pinned or empty slot");
+    }
+    slot_of_[key] = -1;
+    mark_dirty(key);
+    --resident_count_;
+    if (s.state == SlotState::kShadow) { count_shadow(slot, -1); }
+    s.state = SlotState::kFree; // no loss counted: the record never arrived
+    push_victim(slot);          // invalidates its heap entries
+    classes_[slot_class_[slot]].free.push_back(slot);
+}
+
 bool HostTier::prefill_shadow(std::uint32_t key, std::int32_t& slot) {
     if (host_copy(key) || held(key) || copying_[key]) { return false; }
     const std::int32_t s = take_free(key_class_[key]);
@@ -369,7 +386,8 @@ bool HostTier::hold(std::uint32_t key) {
 }
 
 bool HostTier::unhold(std::uint32_t key) {
-    if (!held(key)) { return false; }
+    // A promotion queued for a frame or being copied reads the record: it has no slot to pin, so the hold stays.
+    if (!held(key) || held_pins_[key] != 0) { return false; }
     held_[key] = 0;
     --held_count_;
     mark_dirty(key);
@@ -594,6 +612,7 @@ void HostTier::mark_used(std::uint32_t slot) {
 void HostTier::begin_round(std::uint32_t allowance) {
     if (!copies_.empty()) { throw std::logic_error("HostTier: admissions are still waiting for their copies"); }
     allowance_ = allowance;
+    for (ClassState& cs : classes_) { cs.promised = 0; } // the last boundary's evictions have taken their slots
     for (const auto s : used_) {
         slots_[s].pins &= static_cast<std::uint8_t>(~kPinUse);
         push_victim(s);
@@ -713,7 +732,10 @@ void HostTier::replenish_demotion_list() {
 
 void HostTier::queued(std::uint32_t key) {
     const std::int32_t s = slot_of_[key];
-    if (s < 0 && held(key)) { return; } // its record never moves
+    if (s < 0 && held(key)) { // its record never moves, but must not be given back (unhold)
+        held_pins_[key] |= kPinQueue;
+        return;
+    }
     if (s < 0) { throw std::logic_error("HostTier: a key queued for VRAM has no host copy"); }
     slots_[static_cast<std::uint32_t>(s)].pins |= kPinQueue;
     push_victim(static_cast<std::uint32_t>(s));
@@ -721,14 +743,20 @@ void HostTier::queued(std::uint32_t key) {
 
 void HostTier::unqueued(std::uint32_t key) {
     const std::int32_t s = slot_of_[key];
-    if (s < 0) { return; }
+    if (s < 0) {
+        held_pins_[key] &= static_cast<std::uint8_t>(~kPinQueue);
+        return;
+    }
     slots_[static_cast<std::uint32_t>(s)].pins &= static_cast<std::uint8_t>(~kPinQueue);
     push_victim(static_cast<std::uint32_t>(s));
 }
 
 void HostTier::promotion_issued(std::uint32_t key) {
     const std::int32_t s = slot_of_[key];
-    if (s < 0 && held(key)) { return; }
+    if (s < 0 && held(key)) {
+        held_pins_[key] = static_cast<std::uint8_t>((held_pins_[key] & ~kPinQueue) | kPinH2D);
+        return;
+    }
     if (s < 0) { throw std::logic_error("HostTier: a promotion without a host copy"); }
     Slot& slot = slots_[static_cast<std::uint32_t>(s)];
     slot.pins  = static_cast<std::uint8_t>((slot.pins & ~kPinQueue) | kPinH2D);
@@ -737,7 +765,10 @@ void HostTier::promotion_issued(std::uint32_t key) {
 
 void HostTier::promotion_completed(std::uint32_t key, bool published) {
     const std::int32_t s = slot_of_[key];
-    if (s < 0 && held(key)) { return; }
+    if (s < 0 && held(key)) {
+        held_pins_[key] &= static_cast<std::uint8_t>(~kPinH2D);
+        return;
+    }
     if (s < 0) { throw std::logic_error("HostTier: a completed promotion without a host copy"); }
     Slot& slot = slots_[static_cast<std::uint32_t>(s)];
     slot.pins &= static_cast<std::uint8_t>(~kPinH2D);
@@ -758,8 +789,12 @@ bool HostTier::demotion_worthy(std::uint32_t key) {
 
 bool HostTier::allow_evict(std::uint32_t key) {
     if (host_copy(key) || held(key) || !demotion_worthy(key)) { return true; }
-    const ClassState& cs = classes_[key_class_[key]];
-    if (allowance_ == 0 || (cs.demotion.empty() && cs.free.empty())) { return false; } // T6: the admission waits
+    ClassState& cs = classes_[key_class_[key]];
+    // T6: the admission waits. The slots promised to this boundary's earlier victims are not there for this one:
+    // vram_evicted takes them only after every gate, so the lists' sizes alone passed more victims than they hold
+    // (an unlimited allowance at a prefill boundary, a record size's few slots) and the rest were dropped.
+    if (allowance_ == 0 || cs.promised >= cs.demotion.size() + cs.free.size()) { return false; }
+    ++cs.promised;
     if (allowance_ != std::numeric_limits<std::uint32_t>::max()) { --allowance_; }
     return true;
 }
@@ -796,6 +831,7 @@ VramEviction HostTier::vram_evicted(std::uint32_t key, bool published, std::uint
     } else {
         slot = static_cast<std::uint32_t>(take_free(key_class_[key]));
     }
+    if (cs.promised != 0) { --cs.promised; } // the slot the gate promised is taken
     Slot& target = slots_[slot];
     target.list  = SlotList::kNone;
     target.state = SlotState::kLanding;
@@ -983,6 +1019,7 @@ void HostTier::check() const {
         const std::int32_t s = slot_of_[k];
         if (s >= 0 && slots_[static_cast<std::uint32_t>(s)].key != k) { fail("key map"); }
         if (held_[k] != 0 && s >= 0) { fail("a held key also has a slot"); }
+        if (held_pins_[k] != 0 && held_[k] == 0) { fail("a promotion's pin on a key that is not held"); }
         held_keys += held_[k] != 0 ? 1 : 0;
     }
     if (held_keys != held_count_) { fail("held count"); }

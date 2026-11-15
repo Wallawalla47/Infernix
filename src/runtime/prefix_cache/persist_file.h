@@ -42,9 +42,12 @@ struct PersistBinding {
 
 // Every Host-backed (and with a kept SSD tier, SSD-backed) snapshot and the block path it anchors on,
 // written to a temporary file renamed into place: the header, the block table (parents first), the
-// snapshot table (retained snapshots first, then superseded ones oldest first), the Host slab bytes of
-// the entries that have them, the footer. The SSD tier must be drained (no transfer in flight); its
-// file is made durable before the tables name its slabs. An abandoned save keeps the previous file.
+// snapshot table (retained snapshots first, then superseded ones oldest first) and the end mark, padded
+// to 4 KiB, then the Host slab bytes of the entries that have them. The slabs go from the Host tier's
+// memory (binding.slab: 4 KiB-aligned) to the drive unbuffered, consecutive ones in one chunk as one
+// write, each hashed on its way (the tables carry the hashes and are written last). The SSD tier must be
+// drained (no transfer in flight); its file is made durable before the tables name its slabs. An
+// abandoned save keeps the previous file.
 [[nodiscard]] PersistResult save_prefix_cache(const PrefixCacheIndex& index, const PersistBinding& binding,
                                               const std::filesystem::path& path, std::string_view fingerprint,
                                               const CancellationView& abandoned);
@@ -52,10 +55,24 @@ struct PersistBinding {
 // Rebuilds a saved cache into the empty `index`: when the fingerprint and the geometry match, the Host
 // tier gets what plan_host_restore chooses (its slab bytes read), and the entries with SSD copies in a
 // reopened kept SSD tier come back SSD-resident (each slab checked against its hash at its first
-// promotion). A damaged file throws nothing: the result says why, and the caller clears the index.
+// promotion). The slabs are read unbuffered straight into the Host tier's memory, several reads in
+// flight, and each is checked against its saved hash: an entry with a slab whose bytes changed is
+// dropped (a block with what resumes through it) and the rest stays; the result is then ok with a
+// message that counts them. Damaged tables or a failed read throw nothing: the result says why, and the
+// caller clears the index.
 [[nodiscard]] PersistResult load_prefix_cache(PrefixCacheIndex& index, const PersistBinding& binding,
                                               const std::filesystem::path& path, std::string_view fingerprint,
                                               const StartupObserver& observer);
+
+// The kept SSD tier files in `ssd_directory` other than `current` (this start's, from kept_ssd_file),
+// with their sizes: a prefix cache file that is no longer used leaves its own behind, which nothing
+// removes. For the startup log; another running server's file is listed too, so none is deleted here.
+struct KeptSsdFile {
+    std::filesystem::path path;
+    std::uint64_t bytes = 0;
+};
+[[nodiscard]] std::vector<KeptSsdFile> other_kept_ssd_files(const std::filesystem::path& ssd_directory,
+                                                            const std::filesystem::path& current) noexcept;
 
 // The kept SSD tier's file for a prefix cache file: in the SSD tier's directory, named after the
 // prefix cache file's absolute path, so each prefix cache file keeps its own.
