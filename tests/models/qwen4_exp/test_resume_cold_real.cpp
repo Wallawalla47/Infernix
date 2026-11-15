@@ -107,17 +107,31 @@ int main(int argc, char** argv) {
         std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT\n");
         return 77;
     }
+    if (argc < 2) {
+        // No case named: report it instead of passing with nothing checked.
+        std::fprintf(stderr, "FAIL: usage: infernix_qwen4_exp_resume_cold_real_test mtp|dflash2...\n");
+        return 2;
+    }
     try {
         int failures = 0;
+        int cases    = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string_view drafter = argv[i];
             if (drafter == "dflash2" && (setup.drafter == nullptr || *setup.drafter == '\0')) {
                 std::printf("skip dflash2: INFERNIX_QWEN4_DFLASH2 is not set\n");
                 continue;
             }
-            for (const bool fast_paths : {false, true}) { failures += run(setup, drafter, fast_paths); }
+            for (const bool fast_paths : {false, true}) {
+                failures += run(setup, drafter, fast_paths);
+                ++cases;
+            }
         }
-        std::printf(failures == 0 ? "resume against cold passed\n" : "FAIL: %d checks failed\n", failures);
+        if (cases == 0) {
+            std::printf("SKIP: every named case was skipped\n");
+            return 77;
+        }
+        std::printf(failures == 0 ? "resume against cold passed (%d cases)\n" : "FAIL: %d checks failed\n",
+                    failures == 0 ? cases : failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
