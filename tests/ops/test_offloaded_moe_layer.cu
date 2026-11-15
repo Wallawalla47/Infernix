@@ -533,7 +533,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         Responder::Mode fetch = Responder::Mode::kAnswer;
         bool fetched  = false; // the fetch channel serves SSD-only experts no CPU job takes
         bool overlap  = false; // passes staged on the overlap stream
-        int idle      = 0;     // calls after the service idles 60 ms; 2: wake() before each
+        // Calls after the service idles: 1: 60 ms (its short waits); 2: 60 ms with wake() before each; 3: 1.2 s (past
+        // one second of quiet: its long waits); 4: 1.2 s with wake() before each.
+        int idle      = 0;
         bool split    = false; // a forked call's misses staged in two launches (MoeExpertSource::split_stream)
         bool csf      = false; // the bank's CSF records (MoeExpertSource::host_csf), expanded as they are staged
         bool tier_csf = false; // with table: the tier's CSF slots (tagged entries, MoeExpertSource::host_csf_pitch)
@@ -691,7 +693,12 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 // The first call, without the service, measures the GPU's own idle cost.
                                 Config{.slots = 64, .service = nullptr, .idle = 1},
                                 Config{.slots = 64, .service = &service_eight, .idle = 1},
-                                Config{.slots = 64, .service = &service_eight, .idle = 2}}) {
+                                Config{.slots = 64, .service = &service_eight, .idle = 2},
+                                // The same after more than a second of quiet (the service's long waits, PR #69),
+                                // against the GPU's own cost after that long (its clocks fall too).
+                                Config{.slots = 64, .service = nullptr, .idle = 3},
+                                Config{.slots = 64, .service = &service_eight, .idle = 3},
+                                Config{.slots = 64, .service = &service_eight, .idle = 4}}) {
         if ((g_idle_checks == IdleChecks::kSkip && config.idle > 0) ||
             (g_idle_checks == IdleChecks::kOnly && config.idle == 0)) {
             continue;
@@ -836,17 +843,18 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 double busy = timed();
                 for (int i = 0; i < 2; ++i) { busy = std::min(busy, timed()); }
                 std::array<double, 5> extra{};
+                const auto quiet = std::chrono::milliseconds(config.idle >= 3 ? 1200 : 60);
                 for (double& e : extra) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(60));
-                    if (config.idle == 2) { config.service->wake(); }
+                    std::this_thread::sleep_for(quiet);
+                    if (config.idle == 2 || config.idle == 4) { config.service->wake(); }
                     e = timed() - busy;
                 }
                 std::sort(extra.begin(), extra.end());
-                std::printf("E=%d T=%d k=%d idle %s: call %.2f ms busy, +%.2f ms idle (median of 5, max +%.2f)\n",
-                            experts, columns, top_k,
-                            config.service == nullptr ? "GPU only"
-                            : config.idle == 2        ? "service after wake()"
-                                                      : "service",
+                std::printf("E=%d T=%d k=%d idle %lld ms %s: call %.2f ms busy, +%.2f ms idle (median of 5, max +%.2f)\n",
+                            experts, columns, top_k, static_cast<long long>(quiet.count()),
+                            config.service == nullptr                  ? "GPU only"
+                            : (config.idle == 2 || config.idle == 4) ? "service after wake()"
+                                                                       : "service",
                             busy, extra[2], extra[4]);
                 if (config.service == nullptr) {
                     // Idle cannot make a call faster than the busy one: a negative median is a slow busy call.

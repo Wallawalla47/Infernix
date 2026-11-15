@@ -28,12 +28,6 @@
 
 namespace infernix::ops::offloaded_moe {
 
-// The idle waits' tiers (CpuMissService::idle_wait): a fresh-quiet spin decays to the short wait,
-// deepening to the long one after a full second without a request. Both are latencies the GPU pays
-// when it publishes to a sleeping service — keep the deep tier far below a decode step's budget.
-inline constexpr std::uint32_t kIdleSleepUs    = 50;
-inline constexpr std::uint32_t kIdleSleepDeepUs = 1000;
-
 class CpuMissService {
 public:
     struct Layer {
@@ -105,11 +99,10 @@ public:
     [[nodiscard]] std::string failure() const;
     // A round that may hand the service requests is about to be enqueued: an idle service thread
     // wakes now and spins again. Requests are served without it too, only later: after 20 ms
-    // without a request the thread idles in waits of about 50 us, deepening to 1 ms once the
-    // quiet stretch passes 1 s (the arrival's own round calls wake() before its first request,
-    // so the deep tier costs at most one 1 ms wait even when a caller forgets to). On Windows the
-    // wait is a high-resolution timer; the 15.6 ms tick inflates a 1 ms request to one tick —
-    // accepted where the event handle already ends it early.
+    // without a request or a wake() the thread idles in timed waits (kIdleWaitUs; kIdleDeepWaitUs
+    // once the quiet stretch passes 1 s) that this ends at once (Windows: an event beside a
+    // high-resolution timer; Linux: a futex on the wake count). A spinning thread is not signalled:
+    // it sees the count at its next check, so this costs no system call while the service is busy.
     void wake() const noexcept;
     // The team's speed against the caller's reference rates (CpuSpeed): each request's experts with their records in
     // memory are timed as the team computes them (tier reads excluded). Before set_reference_rates, 1.
@@ -117,8 +110,14 @@ public:
     [[nodiscard]] double speed_ratio() const noexcept { return speed_.ratio(); }
 
 private:
+    // The idle waits (idle_wait): the latency a request pays when it arrives at a waiting service without a
+    // wake() first, so both stay far below a decode step.
+    static constexpr std::uint32_t kIdleWaitUs     = 50;
+    static constexpr std::uint32_t kIdleDeepWaitUs = 1000;
+
     void serve();
-    void idle_wait() noexcept;
+    // One timed wait, ended early by wake(); none when a wake() is already pending.
+    void idle_wait(std::uint32_t microseconds) noexcept;
     void record_failure(std::string what) noexcept;
 
     std::vector<Layer> layers_;
@@ -132,11 +131,11 @@ private:
     std::uint32_t* heartbeat_ = nullptr; // mapped, beside status_: advanced while the service thread lives
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};
-    mutable std::atomic<std::uint32_t> wakes_{0};   // wake() calls the service thread has not seen yet
-    // The idle_wait()'s current tier: the serve loop deepens it after 1 s quiet and restores it on
-    // a served request or a wake(); a round's pre-enqueue wake() races the restore harmlessly (the
-    // next check restores again — the worst cost is one stale short wait).
-    std::atomic<std::uint32_t> idle_sleep_us_{kIdleSleepUs};
+    // wake() calls the service thread has not seen yet; on Linux also the futex word idle_wait sleeps on.
+    mutable std::atomic<std::uint32_t> wakes_{0};
+    static_assert(sizeof(std::atomic<std::uint32_t>) == sizeof(std::uint32_t) &&
+                  std::atomic<std::uint32_t>::is_always_lock_free);
+    std::atomic<bool> sleeping_{false};      // the service thread is in (or entering) an idle_wait
     void* wake_event_ = nullptr;             // Windows: auto-reset event wake() signals
     void* idle_timer_ = nullptr;             // Windows: the idle wait's high-resolution timer
     std::atomic<std::uint64_t> served_{0}, experts_{0};
