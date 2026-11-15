@@ -151,9 +151,13 @@ void CpuMissService::idle_wait() noexcept {
 #if defined(_WIN32)
     // A wait's timeout and sleep_for both round up to the 15.6 ms timer tick; the high-resolution
     // timer measured 0.51 ms for a 50 us request (2026-10-09, Windows 11, i9-13900K).
+    // The period is kIdleSleepUs (not a literal 50 us): the deep tier sleeps 20x longer than the
+    // fresh-idle one, so the 15.6 ms tick inflates it to ~1 tick — accepted for the same reason
+    // sleep_for's tick rounding was: a missed wake costs at most one wait, and the host's wake()
+    // ends it early where an event handle exists.
     if (wake_event_ != nullptr && idle_timer_ != nullptr) {
         LARGE_INTEGER due{};
-        due.QuadPart = -500; // 50 us, relative, in 100 ns units
+        due.QuadPart = -10LL * static_cast<long long>(idle_sleep_us_.load(std::memory_order_relaxed)); // relative, in 100 ns units
         if (::SetWaitableTimerEx(idle_timer_, &due, 0, nullptr, nullptr, nullptr, 0)) {
             const HANDLE handles[2] = {wake_event_, idle_timer_};
             ::WaitForMultipleObjects(2, handles, FALSE, INFINITE);
@@ -161,7 +165,7 @@ void CpuMissService::idle_wait() noexcept {
         }
     }
 #endif
-    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    std::this_thread::sleep_for(std::chrono::microseconds(idle_sleep_us_.load(std::memory_order_relaxed)));
 }
 
 MoeCpuChannel CpuMissService::channel(int layer) const {
@@ -248,17 +252,54 @@ void CpuMissService::serve() {
         std::uint32_t seen      = 0;
         auto last               = std::chrono::steady_clock::now();
         std::uint32_t polls     = 0;
+        // The idle tiers. The old loop checked the clock only every 4096 pause-iterations: on a
+        // loaded box the thread is preempted long enough that 4096 iterations can take far more
+        // than 20 ms of wall time, so a server whose requests arrive every few seconds re-arms the
+        // timer before the check is ever reached and the idle wait never runs. Measured on a
+        // 24-core desktop under normal load: 40% of a core burned forever at a 30% request duty
+        // cycle. The check now runs every kIdleCheckPolls spins and after every idle_wait (a
+        // preempted thread may sleep past its whole check budget, so the post-wait pass is the
+        // guaranteed one), and a quiet stretch deepens the wait after kIdleDeepMs: the GPU
+        // publishes a request by writing the mapped word (no interrupt can reach this thread),
+        // so the sleep length IS the idle miss latency — 1 ms deep-idle adds <=1 ms to the first
+        // miss after a >1 s silence (the arrival re-arms the spin; later misses pay nothing) and
+        // cuts idle CPU ~20x. The heartbeat liveness word is safe: its timeout is
+        // kHeartbeatTimeoutNs (10 s), orders above even the deep wait.
+        constexpr auto kIdleCheckPolls = 64U;
+        constexpr auto kIdleQuietMs    = std::chrono::milliseconds(20);
+        constexpr auto kIdleDeepMs     = std::chrono::milliseconds(1000);
+        bool deep = false;
         while (!stop_.load(std::memory_order_acquire)) {
             const std::uint32_t sequence = *volatile_sequence;
             *volatile_beat = ++beat;
             if (sequence == seen) {
                 relax();
                 // Spin while decoding; after 20 ms without a request or a wake(), idle in short
-                // waits that wake() ends at once.
-                if (++polls % 4096 == 0) {
+                // waits; after 1 s, in one longer wait per pass (the request path resets both).
+                if (++polls % kIdleCheckPolls == 0) {
+                    const auto now = std::chrono::steady_clock::now();
                     if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) {
-                        last = std::chrono::steady_clock::now();
-                    } else if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(20)) {
+                        last = now;
+                    } else if (now - last > kIdleQuietMs) {
+                        if (now - last > kIdleDeepMs) {
+                            if (!deep) { deep = true; idle_sleep_us_.store(kIdleSleepDeepUs, std::memory_order_relaxed); }
+                        } else if (deep) {
+                            deep = false; idle_sleep_us_.store(kIdleSleepUs, std::memory_order_relaxed);
+                        }
+                        idle_wait();
+                        if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) { last = std::chrono::steady_clock::now(); }
+                    }
+                } else if (polls < kIdleCheckPolls) {
+                    // Right after waking (a request served, or an idle_wait that found nothing):
+                    // re-judge the clock now instead of after 64 more spins, so one preemption
+                    // cannot defer the idle check past the timer's re-arming.
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last > kIdleQuietMs) {
+                        if (now - last > kIdleDeepMs) {
+                            if (!deep) { deep = true; idle_sleep_us_.store(kIdleSleepDeepUs, std::memory_order_relaxed); }
+                        } else if (deep) {
+                            deep = false; idle_sleep_us_.store(kIdleSleepUs, std::memory_order_relaxed);
+                        }
                         idle_wait();
                         if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) { last = std::chrono::steady_clock::now(); }
                     }
@@ -359,6 +400,7 @@ void CpuMissService::serve() {
             serving_layer = -1;
             last          = std::chrono::steady_clock::now();
             polls         = 0;
+            if (deep) { deep = false; idle_sleep_us_.store(kIdleSleepUs, std::memory_order_relaxed); }
         }
     } catch (const std::exception& error) {
         // A failed service never answers: the device wait ends after its timeout instead of hanging,
