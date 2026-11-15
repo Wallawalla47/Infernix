@@ -1952,8 +1952,7 @@ int test_mid_conversation_tool_changes() {
     failures += check(request.messages.size() == 3 && request.reasoning_effort == RequestedReasoningEffort::Low,
                       "an effort-only system message was refused, rendered or ignored");
     body["messages"][3]["content"] = "an instruction";
-    failures += check(api_code([&] { (void)parse(body); }) == "invalid_message_order" ||
-                          !api_code([&] { (void)parse(body); }).empty(),
+    failures += check(api_param([&] { (void)parse(body); }) == "messages",
                       "output_config on a system message with content was accepted");
     return failures;
 }

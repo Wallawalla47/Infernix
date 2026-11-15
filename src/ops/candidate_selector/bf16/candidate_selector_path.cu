@@ -47,7 +47,6 @@ struct alignas(16) SelectorShared {
 // Ties go to the lower rank (the higher-probability one).
 __device__ __forceinline__ int coupled_rank(float probability, bool available, int token, unsigned long long seed,
                                             int position) {
-    const int lane    = threadIdx.x & 31;
     const float score = available && probability > 0.0F ? sampling_gumbel_score(probability, seed, position, token)
                                                          : -CUDART_INF_F;
     const float best  = warp_max(score);

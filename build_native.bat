@@ -37,7 +37,6 @@ if exist build-windows\CMakeCache.txt if not exist build-windows\build.ninja (
 )
 cmake -S . -B build-windows -G "Ninja Multi-Config" -DCMAKE_CONFIGURATION_TYPES=Release ^
   -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" ^
-  -DVCPKG_TARGET_TRIPLET=x64-windows ^
   -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows" ^
   -DCMAKE_CUDA_ARCHITECTURES=120a ^
   -DINFERNIX_BUILD_APPS=ON ^
