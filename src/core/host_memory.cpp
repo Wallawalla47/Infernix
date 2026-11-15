@@ -170,11 +170,35 @@ SIZE_T current_working_set() noexcept {
     return ::GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters)) ? counters.WorkingSetSize : 0;
 }
 
+// SetProcessWorkingSetSizeEx documents that raising the minimum needs SE_INC_WORKING_SET_NAME. Standard accounts
+// hold that right with the privilege disabled in the token; a raise succeeds so on Windows 11 here, but the
+// documented contract is the enabled privilege (issue #68), so it is enabled once, before the first raise. A token
+// without the right is left as it is: the raise then reports its own error.
+void enable_increase_working_set_privilege() noexcept {
+    static const bool enabled = [] {
+        HANDLE token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) { return false; }
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        // SE_INC_WORKING_SET_NAME is TEXT()-wrapped, so the wide name is spelled out for the W call.
+        bool ok = ::LookupPrivilegeValueW(nullptr, L"SeIncreaseWorkingSetPrivilege", &privileges.Privileges[0].Luid);
+        if (ok) {
+            privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            // AdjustTokenPrivileges succeeds without enabling an unheld privilege; GetLastError tells.
+            ok = ::AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) && ::GetLastError() == ERROR_SUCCESS;
+        }
+        ::CloseHandle(token);
+        return ok;
+    }();
+    (void)enabled;
+}
+
 } // namespace
 #endif
 
 std::string reserve_process_working_set(std::uint64_t bytes) {
 #ifdef _WIN32
+    enable_increase_working_set_privilege();
     SIZE_T minimum = 0, maximum = 0;
     DWORD flags    = 0;
     if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
@@ -313,6 +337,7 @@ constexpr SIZE_T kWorkingSetSlack = SIZE_T{64} << 20;
 // by what the minimum grew. `covered` is what the minimum still holds for pages decommitted without lowering it
 // (ResidentHostBuffer::decommit): that much of `bytes` needs no raise, and leaves `covered` once the minimum is set.
 std::string lock_resident(std::byte* at, std::size_t bytes, std::size_t& raised, std::size_t& covered) {
+    enable_increase_working_set_privilege();
     SIZE_T minimum = 0, maximum = 0;
     DWORD flags    = 0;
     if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {

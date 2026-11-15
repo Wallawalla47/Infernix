@@ -4,6 +4,8 @@
 #include "core/nvtx.h"
 #include "core/temporary_switches.h"
 
+#include <cuda.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <fstream>
@@ -62,14 +64,25 @@ void dump_graph_edges(cudaGraph_t graph) {
     };
     const auto name = [&](cudaGraphNode_t node) -> std::string {
         if (!kernel(node)) { return "-"; }
-        cudaKernelNodeParams params{};
-        CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &params));
+        // The generic node query (CUDA 13.5 marks the per-type cudaGraphKernelNodeGetParams for deprecation).
+        cudaGraphNodeParams params{};
+        CUDA_CHECK(cudaGraphNodeGetParams(node, &params));
+        const cudaKernelNodeParamsV2& kernel_params = params.kernel;
         const char* symbol = nullptr;
-        if (cudaFuncGetName(&symbol, params.func) != cudaSuccess || symbol == nullptr) {
-            (void)cudaGetLastError();
-            return "?";
+        bool named = false;
+        switch (kernel_params.functionType) {
+        case cudaKernelFunctionTypeKernel:
+            named = cuKernelGetName(&symbol, reinterpret_cast<CUkernel>(kernel_params.kern)) == CUDA_SUCCESS;
+            break;
+        case cudaKernelFunctionTypeFunction:
+            named = cuFuncGetName(&symbol, reinterpret_cast<CUfunction>(kernel_params.cuFunc)) == CUDA_SUCCESS;
+            break;
+        default: // a device entry (a __global__ function pointer), or unspecified
+            named = cudaFuncGetName(&symbol, kernel_params.func) == cudaSuccess;
+            if (!named) { (void)cudaGetLastError(); }
+            break;
         }
-        return symbol;
+        return named && symbol != nullptr ? std::string(symbol) : std::string("?");
     };
     std::size_t kernels = 0;
     for (cudaGraphNode_t node : nodes) { kernels += kernel(node) ? 1 : 0; }

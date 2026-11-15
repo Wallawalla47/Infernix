@@ -549,7 +549,8 @@ void launch_sliced_k_pipelined_shape(const SlicedKOperands& operands, int stages
     if (stages < 1 || stages > Schedule::kMaxStages || shared > Schedule::kOptInBytes) {
         throw std::invalid_argument("sliced-K pipelined: ring depth out of range");
     }
-    for_each_token_slice(operands.tokens, Schedule::kTokenCapacity, [&](int offset, int count) {
+    // `kernel` is captured by copy: MSVC 14.44 rejects a by-reference capture of the local constexpr pointer (C2326).
+    for_each_token_slice(operands.tokens, Schedule::kTokenCapacity, [&, kernel](int offset, int count) {
         const dim3 grid(div_up(row_policy.output_rows(operands.rows), RowPolicy::kOutputRowsPerCta),
                         div_up(count, Schedule::kTokenCapacity));
         SlicedKOperands slice = operands;
