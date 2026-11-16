@@ -511,7 +511,8 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
                                    std::span<const std::optional<std::uint32_t>> cache_boundaries,
                                    std::optional<std::size_t> engine_tool_marker_index,
                                    std::optional<std::uint32_t> leading_boundary,
-                                   const std::optional<RewriteCheckpointSpec>& rewrite_checkpoint) {
+                                   const std::optional<RewriteCheckpointSpec>& rewrite_checkpoint,
+                                   std::optional<std::uint32_t> media_end) {
     using runtime::prefix_cache::TapHint;
     using runtime::prefix_cache::TapHintKind;
     // Taps are cheap and content-deduplicated, so explicit markers only add taps. A protocol
@@ -546,6 +547,10 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
         add(message_boundaries[*leading_boundary], TapHintKind::Structural);
     }
     if (rewrite_checkpoint) { add(rewrite_checkpoint->frontier, TapHintKind::GenerationOpener); }
+    // Where the prompt's last media item ends (candidates QC-01): a new conversation that asks about the same
+    // pictures or clip shares the prompt up to there, and resumes past them (encoding none of them) instead of at
+    // the last message boundary before them.
+    add(media_end, TapHintKind::Structural);
     for (const std::optional<std::uint32_t> boundary : message_boundaries) {
         add(boundary, TapHintKind::MessageBoundary);
     }
@@ -1109,9 +1114,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         }
     }
     result.identity.reusable = true;
-    result.tap_hints         = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
-                                                 engine_tool_marker_index, leading_boundary,
-                                                 result.identity.rewrite_checkpoint);
+    std::optional<std::uint32_t> media_end;
+    for (const detail::VisionTokenRange& range : detail::vision_ranges(result)) {
+        media_end = std::max(media_end.value_or(0U), range.end);
+    }
+    result.tap_hints = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries, engine_tool_marker_index,
+                                         leading_boundary, result.identity.rewrite_checkpoint, media_end);
     validate_context_cache_hints(cache_hints, message_count, rendered_markers, cache_boundaries);
     detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     if (impl_->ngram_sources_enabled) {

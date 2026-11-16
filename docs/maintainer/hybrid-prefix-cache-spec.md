@@ -1071,7 +1071,9 @@ Candidates, in priority order:
   client from the endpoint, a re-rendering one from the opener), so each keeps one image a turn; a first turn
   keeps both.
 - Hints are the Frontend's existing `message_boundaries` plus the structural boundaries it already
-  computes.
+  computes, among them the end of the prompt's last media item (candidates QC-01): a new conversation asking about
+  the same pictures or clip resumes past them, and the Vision pass encodes no item that ends inside the reused
+  prefix. (Flash-Next measured by Basalt before it: the same 30 s clip in a new chat 2.2 s against 0.37 s.)
 - At most `max_new_taps` (default 8 with a Host tier, 2 without) taps are kept per request.
 
 Tap placement is a function of the prompt, so it is deterministic. Endpoint snapshots are exact

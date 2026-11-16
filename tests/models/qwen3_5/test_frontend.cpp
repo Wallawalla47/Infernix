@@ -1773,6 +1773,12 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                                   explicit_marker->position &&
                               explicit_marker->position < prepared_data.token_ids.size(),
                           "media expansion did not remap the following message cache boundary");
+        // A new conversation asking about the same image shares the prompt up to its last placeholder: a
+        // structural tap there lets it resume past the image (candidates QC-01).
+        const bool media_end_tap = std::any_of(hints.begin(), hints.end(), [&](const auto& hint) {
+            return hint.kind == TapHintKind::Structural && hint.position == span.begin + span.count;
+        });
+        failures += check(media_end_tap, "no structural tap where the prompt's last media item ends");
     }
     if (image_patches.size() == 16 * 1536) {
         failures += check(image_patches[0] == bf16_bits(-1.0F) &&
