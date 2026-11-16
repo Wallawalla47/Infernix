@@ -1,8 +1,10 @@
 #pragma once
 
 // PDF documents through PDFium (bblanchon/pdfium-binaries, the build without V8 and XFA): each page's text, and
-// the pages a caller asks for rendered. PDFium's state is process-wide and not thread-safe, so every call holds
-// one process-wide lock; a build without PDFium (INFERNIX_HAVE_PDFIUM unset) refuses every document.
+// the pages a caller asks for rendered. PDFium's state is process-wide and not thread-safe, so its calls hold one
+// process-wide lock, taken per page and served in arrival order (concurrent documents interleave by page, and a
+// caller's checkpoint runs between pages, unlocked); a build without PDFium (INFERNIX_HAVE_PDFIUM unset) refuses
+// every document.
 
 #include <cstddef>
 #include <cstdint>

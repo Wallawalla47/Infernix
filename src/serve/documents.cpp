@@ -68,6 +68,7 @@ struct PartWriter {
         part.source.kind       = product::media_acquire::SourceKind::Bytes;
         part.source.media_type = std::string(kPdfPageImageMediaType);
         part.source.bytes      = bytes;
+        part.derived           = true;
         parts.push_back(std::move(part));
     }
 
@@ -293,6 +294,7 @@ DocumentResolution resolve_documents(const GenerationRequest& request, const Doc
     // The PDFs in request order: their bytes and text, then their page images from the budget as it stands there.
     std::unordered_map<const DocumentSource*, PdfInput> pdfs;
     PageImageBudget budget(options);
+    std::uint64_t total_pages = 0;
     for (const ChatTurn& turn : request.messages) {
         for (const ContentPart& part : turn.content) {
             if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) { budget.other_media(); }
@@ -308,6 +310,12 @@ DocumentResolution resolve_documents(const GenerationRequest& request, const Doc
             input.bytes = options.acquire(part.document->pdf);
             try {
                 input.text = cache.text(input.bytes, options.checkpoint);
+                total_pages += input.text->size();
+                if (total_pages > kPdfMaximumPages) {
+                    document_error("the request's PDFs hold more than " + std::to_string(kPdfMaximumPages) +
+                                       " pages together (" + std::to_string(total_pages) + " so far)",
+                                   "pdf_too_many_pages");
+                }
                 const std::vector<media::pdf::RenderSize> sizes = budget.allocate(*input.text);
                 std::vector<media::pdf::RenderRequest> requests;
                 for (std::size_t page = 0; page < sizes.size(); ++page) {
@@ -396,7 +404,13 @@ DocumentResolution resolve_documents(const GenerationRequest& request, const Doc
                 for (std::size_t page = 0; page < pdf.text->size(); ++page) {
                     const media::pdf::PageText& text = (*pdf.text)[page];
                     writer.text += "<page number=\"" + std::to_string(text.number) + "\">\n";
-                    if (pdf.images[page] != nullptr) { writer.image(*pdf.images[page]); }
+                    if (pdf.images[page] != nullptr) {
+                        writer.image(*pdf.images[page]);
+                    } else if (is_blank(text.text)) {
+                        // The model would otherwise see an empty page and not know it went unread.
+                        writer.text += options.vision.prompt_tokens == 0 ? kPdfPageUnreadWithoutVision
+                                                                         : kPdfPageUnreadOverBudget;
+                    }
                     append_sentences(writer.text, text.text, chunks, position, text.number);
                     if (!writer.text.empty() && writer.text.back() != '\n') { writer.text += '\n'; }
                     writer.text += "</page>\n";

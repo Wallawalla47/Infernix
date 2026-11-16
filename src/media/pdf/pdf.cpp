@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
 #include <mutex>
 
 #ifdef INFERNIX_HAVE_PDFIUM
@@ -23,28 +25,76 @@ RenderSize render_size(double width_points, double height_points, const RenderPo
     const auto fit = [&](double points) {
         return std::max(multiple, std::floor(points * scale / multiple) * multiple);
     };
-    double width  = fit(width_points);
-    double height = fit(height_points);
-    // Rounding down can leave the page below the minimum: grow the shorter side while the maximum allows.
-    while (width * height < static_cast<double>(policy.min_pixels)) {
-        double& side = width <= height ? width : height;
-        if ((side + multiple) * (width <= height ? height : width) > static_cast<double>(policy.max_pixels)) { break; }
-        side += multiple;
+    const auto max_pixels = static_cast<double>(policy.max_pixels);
+    const auto min_pixels = static_cast<double>(policy.min_pixels);
+    double width          = fit(width_points);
+    double height         = fit(height_points);
+    if (width * height < min_pixels) {
+        // Rounding down left the page below the minimum (a page budget near it): the grid size within the bounds
+        // whose aspect ratio is nearest the page's, the larger on a tie.
+        const double aspect = width_points / height_points;
+        double best         = -1.0;
+        for (double w = multiple; w * multiple <= max_pixels; w += multiple) {
+            const double h = std::floor(max_pixels / w / multiple) * multiple;
+            if (h < multiple || w * h < min_pixels) { continue; }
+            const double error = std::abs(std::log((w / h) / aspect));
+            if (best < 0.0 || error < best - 1e-12 || (std::abs(error - best) <= 1e-12 && w * h > width * height)) {
+                best   = error;
+                width  = w;
+                height = h;
+            }
+        }
+        if (best < 0.0) { return {}; }
     }
     // Outside the bounds (the processor would resize it, and the budget would count the wrong size): no image.
-    if (width * height > static_cast<double>(policy.max_pixels) ||
-        width * height < static_cast<double>(policy.min_pixels)) {
-        return {};
-    }
+    if (width * height > max_pixels || width * height < min_pixels) { return {}; }
     return RenderSize{.width = static_cast<int>(width), .height = static_cast<int>(height)};
 }
 
 #ifdef INFERNIX_HAVE_PDFIUM
 namespace {
 
-std::mutex& library_mutex() {
-    static std::mutex mutex;
-    return mutex;
+// PDFium allows one call at a time from any thread. Its lock is taken per page and served in arrival order, so a
+// long document's pages interleave with other requests' instead of holding them for the whole document, and each
+// request's checkpoint (deadline, cancellation) runs between its pages, unlocked.
+class LibraryLock {
+public:
+    void lock() {
+        std::unique_lock guard(mutex_);
+        const std::uint64_t ticket = next_++;
+        turn_.wait(guard, [&] { return serving_ == ticket; });
+    }
+    void unlock() {
+        {
+            const std::lock_guard guard(mutex_);
+            ++serving_;
+        }
+        turn_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable turn_;
+    std::uint64_t next_    = 0;
+    std::uint64_t serving_ = 0;
+};
+
+LibraryLock& library_mutex() {
+    static LibraryLock lock;
+    return lock;
+}
+
+// Runs the checkpoint between pages with the library unlocked; the lock is held again when it returns or throws, so
+// the document handles still close under it.
+void between_pages(std::unique_lock<LibraryLock>& lock, const std::function<void()>& checkpoint) {
+    lock.unlock();
+    try {
+        if (checkpoint) { checkpoint(); }
+    } catch (...) {
+        lock.lock();
+        throw;
+    }
+    lock.lock();
 }
 
 // Under library_mutex(). PDFium stays initialized for the process's life.
@@ -202,13 +252,13 @@ bool available() noexcept { return true; }
 
 std::vector<PageText> read_text(std::span<const std::uint8_t> bytes, std::uint32_t max_pages,
                                 const std::function<void()>& checkpoint) {
-    const std::lock_guard lock(library_mutex());
+    std::unique_lock lock(library_mutex());
     DocumentHandle document;
     open(document, bytes);
     const int count = checked_page_count(document, max_pages);
     std::vector<PageText> pages(static_cast<std::size_t>(count));
     for (int index = 0; index < count; ++index) {
-        if (checkpoint) { checkpoint(); }
+        between_pages(lock, checkpoint);
         const PageHandle handle(FPDF_LoadPage(document.document, index));
         if (handle.page == nullptr) {
             throw Error(ErrorKind::Invalid, "page " + std::to_string(index + 1) + " of the PDF could not be read");
@@ -226,13 +276,13 @@ std::vector<RenderedPage> render(std::span<const std::uint8_t> bytes, std::span<
                                  const std::function<void()>& checkpoint) {
     std::vector<RenderedPage> out;
     if (pages.empty()) { return out; }
-    const std::lock_guard lock(library_mutex());
+    std::unique_lock lock(library_mutex());
     DocumentHandle document;
     open(document, bytes);
     const int count = FPDF_GetPageCount(document.document);
     out.reserve(pages.size());
     for (const RenderRequest& request : pages) {
-        if (checkpoint) { checkpoint(); }
+        between_pages(lock, checkpoint);
         if (request.number == 0 || request.number > static_cast<std::uint32_t>(std::max(count, 0)) ||
             request.size.width <= 0 || request.size.height <= 0) {
             throw std::invalid_argument("PDF render request names no page of the document");

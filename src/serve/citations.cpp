@@ -84,6 +84,53 @@ Cursor skip_spaces(std::string_view text, Cursor cursor) noexcept {
 
 bool is_tag_space(char c) noexcept { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 
+bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
+
+// Abbreviations a number follows ("Fig. 3", "p. 12"), compared without case.
+constexpr std::array<std::string_view, 16> kNumberAbbreviations{
+    "fig", "figs", "eq", "eqs", "no", "nos", "sec", "secs", "ch", "vol", "p", "pp", "ref", "refs", "tab", "art"};
+
+// Whether the ASCII terminal at `mark`, followed by whitespace and then `following`, ends no sentence:
+// - before a lowercase word ("e.g. the", "approx. ten");
+// - inside or after a contents line's dot leader ("Intro . . . . 174": a mark after whitespace or after a mark,
+//   and a mark before a mark), so a contents page is not cut at every dot;
+// - after an abbreviation a number follows ("Fig. 3");
+// - after a line's leading enumerator ("1. Install", "6.1.1. Compilation"), which numbers what follows it.
+bool no_sentence_end(std::string_view text, std::size_t mark, bool full_stop, char following) noexcept {
+    if (following == '.' || following == '!' || following == '?') { return true; }
+    if (!full_stop) { return false; }
+    if (following >= 'a' && following <= 'z') { return true; }
+    const char before = mark == 0 ? '\n' : text[mark - 1];
+    const bool leader = before == ' ' || before == '\t' || before == '.';
+    if (leader && is_digit(following)) { return true; }
+    // The word the stop ends, back to the whitespace before it.
+    std::size_t start = mark;
+    while (start > 0 && text[start - 1] != ' ' && text[start - 1] != '\t' && text[start - 1] != '\n' &&
+           text[start - 1] != '\r') {
+        --start;
+    }
+    const std::string_view word = text.substr(start, mark - start);
+    if (word.empty()) { return false; }
+    if (is_digit(following) && word.size() <= 4) {
+        for (const std::string_view abbreviation : kNumberAbbreviations) {
+            if (abbreviation.size() == word.size() &&
+                std::equal(word.begin(), word.end(), abbreviation.begin(), [](char a, char b) {
+                    return (a >= 'A' && a <= 'Z' ? static_cast<char>(a - 'A' + 'a') : a) == b;
+                })) {
+                return true;
+            }
+        }
+    }
+    // A leading enumerator: digits with inner dots, first on its line.
+    if (!is_digit(word.front()) || word.back() == '.') { return false; }
+    for (const char c : word) {
+        if (!is_digit(c) && c != '.') { return false; }
+    }
+    std::size_t line = start;
+    while (line > 0 && (text[line - 1] == ' ' || text[line - 1] == '\t')) { --line; }
+    return line == 0 || text[line - 1] == '\n';
+}
+
 } // namespace
 
 std::uint64_t code_point_count(std::string_view text) noexcept {
@@ -125,9 +172,9 @@ std::vector<SentenceSpan> split_sentences(std::string_view text) {
             const Cursor next = skip_spaces(text, after);
             content           = true;
             bool boundary     = wide || next.byte == text.size() || next.byte > after.byte;
-            if (boundary && !wide && full_stop && next.byte < text.size() && text[next.byte] >= 'a' &&
-                text[next.byte] <= 'z') {
-                boundary = false; // "e.g. the", "approx. ten"
+            if (boundary && !wide && next.byte < text.size() &&
+                no_sentence_end(text, cursor.byte, full_stop, text[next.byte])) {
+                boundary = false;
             }
             if (boundary) {
                 close_at(next);

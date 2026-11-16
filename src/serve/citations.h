@@ -31,8 +31,10 @@ struct SentenceSpan {
 
 // Cuts `text` into sentences that partition it. A sentence ends after terminal punctuation (. ! ? and the
 // full-width 。！？, with any closing quotes or brackets after it) followed by whitespace, or the full-width marks
-// alone, or after a blank line; the whitespace that follows belongs to it. A full stop followed by whitespace and
-// a lowercase ASCII letter ("e.g. the") does not end one. A sentence that has run past
+// alone, or after a blank line; the whitespace that follows belongs to it. These do not end one: a full stop before
+// a lowercase ASCII letter ("e.g. the"), after an abbreviation a number follows ("Fig. 3"), or after a line's
+// leading enumerator ("1. Install", "6.1.1. Compilation"); and a contents line's dot leader with its page number
+// (". . . 174"). A sentence that has run past
 // kMaximumSentenceCodePoints ends at its next whitespace, so a table or a list without punctuation still gives
 // citable pieces. Whitespace before the first sentence belongs to it, and whitespace after the last one too.
 inline constexpr std::uint64_t kMaximumSentenceCodePoints = 1'000;

@@ -250,8 +250,10 @@ infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point de
                                    const std::function<bool()>& is_cancelled,
                                    std::size_t& remaining_bytes,
                                    std::uint32_t retry_after_seconds) {
-    std::vector<std::uint8_t> source_bytes =
-        acquire_source_bytes(part.source, deadline, is_cancelled, remaining_bytes, retry_after_seconds);
+    // A rendered PDF page is bounded by the vision budget; the PDF's own bytes were charged already.
+    std::size_t derived_budget = infernix::kMaximumPromptMediaBytes;
+    std::vector<std::uint8_t> source_bytes = acquire_source_bytes(
+        part.source, deadline, is_cancelled, part.derived ? derived_budget : remaining_bytes, retry_after_seconds);
     infernix::OwnedMedia media;
     media.kind =
         part.kind == ContentKind::Image ? infernix::MediaKind::Image : infernix::MediaKind::Video;

@@ -131,6 +131,9 @@ struct ContentPart {
     infernix::ImageResizePolicy image_resize_policy = infernix::ImageResizePolicy::Downsize;
     std::shared_ptr<const DocumentSource> document; // populated for Document
     std::vector<CitationLocation> citations;        // an assistant text block's citations
+    // A PDF page image resolve_documents rendered: the vision budget bounds it, so the request's media byte budget,
+    // already charged with the PDF, does not count it again.
+    bool derived = false;
     std::optional<CacheBoundary> cache_boundary_after;
 };
 

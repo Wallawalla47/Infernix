@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -67,6 +68,27 @@ int test_sentences() {
                       "a closing quote did not stay with its sentence");
     failures += check(pieces("Title\n\nBody text here.") == std::vector<std::string>{"Title\n\n", "Body text here."},
                       "a blank line did not end a chunk");
+    // A contents page (as PDFium extracts the CUDA guide's): dot leaders and page numbers end no chunk.
+    const std::string contents = "10.8.1.11 tex2DLod() . . . . . . . . . . . . . . 174\n"
+                                 "10.8.1.12 tex2DLod() for sparse CUDA arrays . . . . . . 174\n"
+                                 "10.8.1.13 tex3D() . . . . . . . . . . . . . . . . . 175\n";
+    failures += check(split_sentences(contents).size() == 1, "a contents page's dot leaders were cut into " +
+                                                                  std::to_string(split_sentences(contents).size()) +
+                                                                  " chunks");
+    failures += check(pieces("See Fig. 3 below. Then stop.") ==
+                          std::vector<std::string>{"See Fig. 3 below. ", "Then stop."},
+                      "an abbreviation before a number ended a sentence");
+    // A numbered list and a numbered heading (the CUDA guide's page 40): an item's number starts its chunk.
+    failures += check(pieces("Steps:\n1. Install it.\n2. Configure it.") ==
+                          std::vector<std::string>{"Steps:\n1. Install it.\n", "2. Configure it."},
+                      "a numbered list's chunks begin at the wrong place");
+    failures += check(pieces("See the nvcc user manual.\n6.1.1. Compilation Workflow\nSource files compile.") ==
+                          std::vector<std::string>{"See the nvcc user manual.\n",
+                                                   "6.1.1. Compilation Workflow\nSource files compile."},
+                      "a numbered heading's chunk begins at the wrong place");
+    failures += check(pieces("It opened in 2019. 2020 was better.") ==
+                          std::vector<std::string>{"It opened in 2019. ", "2020 was better."},
+                      "a sentence ending in a number did not end");
     failures += check(pieces("  \n\nHello. World.") == std::vector<std::string>{"  \n\nHello. ", "World."},
                       "leading whitespace made a chunk of its own");
     const std::string wide = "\xE4\xBB\x8A\xE6\x97\xA5\xE3\x80\x82\xE6\x98\x8E\xE6\x97\xA5\xE3\x80\x82"; // 今日。明日。
@@ -529,6 +551,17 @@ int test_pdf() {
     const infernix::media::pdf::RenderSize size = infernix::media::pdf::render_size(
         612, 792, {.max_pixels = 1'048'576, .min_pixels = 65'536, .edge_multiple = 32, .max_points_scale = 2.0});
     failures += check(size.width == 896 && size.height == 1152, "a Letter page at 1M pixels did not size to 896 x 1152");
+    // At the processor's minimum the grid sizes round below it; the nearest size within the bounds is kept.
+    const infernix::media::pdf::RenderSize smallest = infernix::media::pdf::render_size(
+        612, 792, {.max_pixels = 65'536, .min_pixels = 65'536, .edge_multiple = 32, .max_points_scale = 2.0});
+    failures += check(smallest.width == 256 && smallest.height == 256,
+                      "a Letter page at the minimum sized to " + std::to_string(smallest.width) + " x " +
+                          std::to_string(smallest.height));
+    const infernix::media::pdf::RenderSize near_min = infernix::media::pdf::render_size(
+        612, 792, {.max_pixels = 90'000, .min_pixels = 65'536, .edge_multiple = 32, .max_points_scale = 2.0});
+    failures += check(near_min.width % 32 == 0 && near_min.height % 32 == 0 &&
+                          near_min.width * near_min.height >= 65'536 && near_min.width * near_min.height <= 90'000,
+                      "a page just above the minimum left the bounds");
     const infernix::media::pdf::RenderRequest render_request{.number = 1, .size = size};
     const std::vector<infernix::media::pdf::RenderedPage> rendered =
         infernix::media::pdf::render(pdf, std::span(&render_request, 1));
@@ -560,6 +593,42 @@ int test_pdf() {
     failures += check(decoded.width == 896 && decoded.height == 1152 && decoded.rgb == rendered[0].rgb,
                       "raw RGB did not round-trip through decode_image");
 
+    // Two requests read and render two PDFs at once: PDFium's lock is taken per page, and each result equals its
+    // read alone.
+    {
+        std::vector<std::string> first_pages;
+        std::vector<std::string> second_pages;
+        for (int page = 0; page < 60; ++page) {
+            first_pages.push_back("First document page " + std::to_string(page) + ".");
+            second_pages.push_back(page % 7 == 0 ? std::string() : "Second document page " + std::to_string(page) + ".");
+        }
+        const std::vector<std::uint8_t> first  = make_pdf(first_pages);
+        const std::vector<std::uint8_t> second = make_pdf(second_pages);
+        const auto read = [](const std::vector<std::uint8_t>& bytes) {
+            std::string text;
+            for (const auto& page : infernix::media::pdf::read_text(bytes, 100)) { text += page.text + "\f"; }
+            std::vector<infernix::media::pdf::RenderRequest> requests;
+            for (std::uint32_t page = 1; page <= 60; page += 6) { requests.push_back({.number = page, .size = {256, 320}}); }
+            for (const auto& image : infernix::media::pdf::render(bytes, requests)) {
+                text.append(image.rgb.begin(), image.rgb.end());
+            }
+            return text;
+        };
+        const std::string alone_first  = read(first);
+        const std::string alone_second = read(second);
+        bool same = true;
+        for (int round = 0; round < 4 && same; ++round) {
+            std::string together_first;
+            std::string together_second;
+            std::thread a([&] { together_first = read(first); });
+            std::thread b([&] { together_second = read(second); });
+            a.join();
+            b.join();
+            same = together_first == alone_first && together_second == alone_second;
+        }
+        failures += check(same, "PDFs read at once differ from their reads alone");
+    }
+
     // Text only without vision; with vision every page also as an image, from the budget.
     const GenerationRequest text_only = *resolve_documents(pdf_request({pdf}, false), pdf_options(0, 0)).request;
     failures += check(images_of(text_only).empty() && turn_text(text_only.messages[0]).find("<page number=\"2\">\nSecond page here.") != std::string::npos,
@@ -584,6 +653,38 @@ int test_pdf() {
     failures += check(api_code([] { (void)resolve_documents(pdf_request({make_pdf({""})}, false), pdf_options(0, 0)); }) ==
                           "pdf_no_text",
                       "a PDF without a text layer was accepted without vision");
+    // A 300-page scan at --max-context 65536: the budget (16,384 tokens) gives the smallest image (64 tokens) to
+    // its first 256 pages; the other 44 say they were not read.
+    {
+        const GenerationRequest scan =
+            *resolve_documents(pdf_request({make_pdf(std::vector<std::string>(300))}, false), pdf_options(32'768, 65'536))
+                 .request;
+        const std::string text = turn_text(scan.messages[0]);
+        std::size_t notes      = 0;
+        for (std::size_t at = text.find(kPdfPageUnreadOverBudget); at != std::string::npos;
+             at = text.find(kPdfPageUnreadOverBudget, at + 1)) {
+            ++notes;
+        }
+        failures += check(images_of(scan).size() == 256 && notes == 44 &&
+                              text.find(std::string("<page number=\"300\">\n") + std::string(kPdfPageUnreadOverBudget)) !=
+                                  std::string::npos,
+                          "a 300-page scan gave " + std::to_string(images_of(scan).size()) + " images and " +
+                              std::to_string(notes) + " notes");
+    }
+    // 1,000 pages a request: one PDF over it, and two that only together are.
+    failures += check(api_code([] {
+                          (void)resolve_documents(pdf_request({make_pdf(std::vector<std::string>(1'001, "Page."))}, false),
+                                                  pdf_options(0, 0));
+                      }) == "pdf_too_many_pages",
+                      "a 1,001-page PDF was accepted");
+    {
+        const std::vector<std::uint8_t> half = make_pdf(std::vector<std::string>(600, "Page."));
+        failures += check(api_code([&] { (void)resolve_documents(pdf_request({half, half}, false), pdf_options(0, 0)); }) ==
+                              "pdf_too_many_pages",
+                          "two PDFs of 1,200 pages together were accepted");
+        failures += check(resolve_documents(pdf_request({half}, false), pdf_options(0, 0)).request.has_value(),
+                          "a 600-page PDF was refused");
+    }
     failures += check(api_code([] {
                           (void)resolve_documents(pdf_request({std::vector<std::uint8_t>{'n', 'o', 't'}}, false),
                                                   pdf_options(0, 0));

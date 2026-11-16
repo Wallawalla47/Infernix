@@ -16,7 +16,12 @@
 // Page images (with vision) spend a budget in request order, so a page's size depends only on what precedes it:
 // min(the prompt's vision tokens, a quarter of the context), less kPdfPageVisionTokens for each image or video
 // before it. A PDF's pages each get min(kPdfPageVisionTokens, what remains / its pages); when that falls below the
-// processor's smallest image, its pages without a text layer get the remainder first and the others none.
+// processor's smallest image, its pages without a text layer get the remainder first and the others none. A page
+// left with neither text nor an image says so in a fixed note, so the model knows the page is there unread.
+//
+// What bounds a PDF is the context: its pages' text (and IDs, and images) must fit the prompt, which the Engine
+// checks exactly. Bytes are bounded by the request body and media budgets. kPdfMaximumPages bounds only the PDFium
+// work a request can ask for before that check (about 1 ms a page for text).
 
 #include "infernix/types.h"
 #include "media/pdf/pdf.h"
@@ -40,12 +45,17 @@ namespace infernix::serve {
 
 // A PDF page's image tokens at most (about a million pixels: 10-point text stays legible).
 inline constexpr std::uint64_t kPdfPageVisionTokens = 1'024;
-// The pages one PDF may hold, as on the Anthropic API.
-inline constexpr std::uint32_t kPdfMaximumPages = 100;
+// The pages a request's PDFs may hold together.
+inline constexpr std::uint32_t kPdfMaximumPages = 1'000;
 // The server's cache of read PDFs (their bytes, page text and page images).
 inline constexpr std::size_t kPdfCacheBytes = 256ULL << 20;
 // The media type of a rendered page image (media::decode's raw RGB container).
 inline constexpr std::string_view kPdfPageImageMediaType = "image/x-infernix-rgb";
+// The note a page with neither text nor an image carries in the prompt.
+inline constexpr std::string_view kPdfPageUnreadWithoutVision =
+    "[This page has no text layer, and this server has no vision input to read it as an image.]\n";
+inline constexpr std::string_view kPdfPageUnreadOverBudget =
+    "[This page has no text layer, and the request's vision budget left no room for its image.]\n";
 
 using PdfPageImage = std::shared_ptr<const std::vector<std::uint8_t>>;
 

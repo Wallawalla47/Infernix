@@ -1656,24 +1656,41 @@ by blank lines); `<search_result>` with its `<source>` and `<title>`, then its b
 
 **PDFs** are read with PDFium, which the build needs (`tools/deps/fetch_pdfium.py` downloads the
 pinned release; `build_native.bat` and the Dockerfile use it). A build without it refuses PDF
-documents (`documents_not_supported`). A PDF holds at most 100 pages (`pdf_too_many_pages`); one that
-needs a password or an unsupported security handler is refused (`pdf_encrypted`), and bytes PDFium
-cannot open are `invalid_pdf`. Each page's text comes from its text layer. With `--vision`, each page
-is also rendered and enters the prompt as an image, sized to the processor's 32-pixel grid so it is
-not resized again: at most 1,024 vision tokens a page (about a million pixels), out of a budget of
-`min(32768, --max-context / 4)` tokens that the request's PDFs spend in request order, less 1,024
-for each image or video before them, so a page's size depends only on what precedes it. A PDF whose
-pages cannot all get the processor's smallest image gives its remaining budget to its pages without a
-text layer, and the others stay text only. Without `--vision` a PDF is text only, and one with no
-text layer at all (a scanned document) is refused with `pdf_no_text`. Read PDFs (text and page images)
-stay in a 256 MiB server cache by their bytes, so an agent that resends a PDF on every turn reads it
-once. A PDF's bytes count toward the request's media byte budget.
+documents (`documents_not_supported`). One that needs a password or an unsupported security handler
+is refused (`pdf_encrypted`), and bytes PDFium cannot open are `invalid_pdf`. Each page's text comes
+from its text layer. With `--vision`, each page is also rendered and enters the prompt as an image,
+sized to the processor's 32-pixel grid so it is not resized again: at most 1,024 vision tokens a page
+(about a million pixels), out of a budget of `min(32768, --max-context / 4)` tokens that the
+request's PDFs spend in request order, less 1,024 for each image or video before them, so a page's
+size depends only on what precedes it. A PDF whose pages cannot all get the processor's smallest
+image (64 tokens, 256 x 256 pixels; about 256 pages at `--max-context 65536`) gives its remaining
+budget to its pages without a text layer, and the others stay text only. A page left with neither
+text nor an image carries a fixed note saying so, so the model knows it was not read. Without
+`--vision` a PDF is text only, and one with no text layer at all (a scanned document) is refused with
+`pdf_no_text`. Read PDFs (text and page images) stay in a 256 MiB server cache by their bytes, so an
+agent that resends a PDF on every turn reads it once (a PDF over 128 MiB is read again each time).
+
+What limits a PDF is the context: its pages' text, chunk IDs and images must fit `--max-context`,
+and a prompt that does not fit is answered like any other (`context_length_exceeded`, "prompt is too
+long"). Neither pages nor bytes say how many tokens a PDF holds: of four NVIDIA manuals of 598-884
+pages, the 19.2 MiB PTX ISA holds the same 1.2 MiB of text as the 2.3 MiB Runtime API, and each is
+315,590-412,095 tokens on the Qwen3.8 tokenizer (a 120-page excerpt 89,185), past a 262,144-token
+context. Bytes are already bounded by the request
+body (`--max-request-mib`) and the request's media byte budget (256 MiB at most), which counts a PDF's
+bytes but not its rendered pages (the vision budget bounds those). A request's PDFs may hold at most
+1,000 pages together (`pdf_too_many_pages`), which bounds only the reading before the context check:
+about 1 ms a page for the text (0.65-0.98 ms measured on those manuals), 1-2 ms a page for the
+smallest images and 3-6 ms for the largest. PDFium serves one page at a time across the server, in
+arrival order, so concurrent PDF requests take turns by page.
 
 **Citations.** `citations: {"enabled": true}` is accepted on all of a request's documents or on none,
 and separately on all of its search results or none (HTTP 400 otherwise), and not together with
 `output_config.format`. A citable source is cut into chunks: the sentences of plain text and of each
-PDF page (a sentence keeps the whitespace after it, so the chunks concatenate to the text), or each
-block of custom content and of a search result. The model reads each chunk after its ID `[S.C]` (S
+PDF page (a sentence keeps the whitespace after it, so the chunks concatenate to the text; a full stop
+before a lowercase word, after an abbreviation a number follows ("Fig. 3") or after a line's leading
+number ("1. Install"), and a contents line's dot leader, end none), or each block of
+custom content and of a search result. Each chunk's ID costs about 5-8 prompt tokens: those manuals
+give 9-13 chunks a page, so citations add 74-100 tokens a page (10-20 % of their prompt). The model reads each chunk after its ID `[S.C]` (S
 counts the request's citable sources from 0, C the source's chunks from 0) and, once, right after the
 first citable source, an instruction to put the words of its answer that a passage supports in
 `<cite ids="S.C,...">...</cite>`. The response turns each tag into a text block of its own, whose
