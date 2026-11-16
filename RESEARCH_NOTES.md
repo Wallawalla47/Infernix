@@ -225,8 +225,10 @@ and slower above, while the A16 down projection was far slower from 5 columns:
 | LinearAdd down 5120x17408, T=4 / 6 / 8 | 36.2 / 58.1 (A16 route) / 37.5 | 36.1 / 58.1 / 58.1 |
 
 Only the gate/up projection was therefore tried with A16 at up to 8 columns (every C=1 neural
-round). In the decode graph it was slower, not faster: the A4 MMA kernel stages its weights before
-its PDL wait and was charged 60.3 us per call, the A16 kernel 63.6 us (Nsight, 16K context). Greedy
+round). In the decode graph it was slower, not faster: the A4 MMA kernel was charged 60.3 us per call,
+the A16 kernel 63.6 us (Nsight, 16K context). (The A4 kernel waits for its producer before staging
+anything; staging its weights before the wait measured level, 2026-11-16: NVFP4 27B DFlash2
+`-pg 512,512` 225.19 tok/s against 225.28 waiting first, ABBA x2.) Greedy
 `infernix_bench -pg 16384,512`, three interleaved passes: 14.957 against 14.764 ms per round (+1.3 %).
 Sampled acceptance (`acc_ab.py`: 24 prompts x 2 seed sets x 1536 tokens, temperature 1.0, top_p
 0.95, top_k 20, thinking on, about 66K tokens per arm): 3.468 against 3.443 tokens per round
