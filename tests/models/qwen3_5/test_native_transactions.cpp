@@ -912,6 +912,168 @@ void host_restore_lifecycle(DeviceContext& device, const qwen::execution::Parame
             "a resume whose Host restore was held generated other tokens than one whose restore had landed");
 }
 
+// A queued turn's prefetch (Program::hybrid_prefetch, hybrid-prefix-cache-spec §6.6). A conversation's history is
+// only on the Host tier; after another conversation's request, its next turn's history is prefetched, as the
+// Engine does for a queued request between rounds. Against the same two requests without the prefetch (the turn
+// restores its history at its binding):
+// - the turn's binding then restores no block, and every block the plain run restored at the binding was prefetched;
+// - the turn generates the tokens of the plain run;
+// - a restore's copies are batched: fewer copy calls than restored blocks, and than KV planes.
+void prefetched_resume(DeviceContext& device, const qwen::execution::Parameters& parameters, EngineOptions options) {
+    constexpr std::uint32_t kHistory = 2048;
+    constexpr std::uint32_t kTurn    = kHistory + 384;
+    const qwen::Frontend frontend =
+        qwen::make_frontend(parameters.model.resources(), {.vision_enabled = false, .max_context = kLongContext});
+    options.max_context                                = kLongContext;
+    options.kv_capacity                                = KvCapacityPolicy::explicit_capacity(2 * kLongContext);
+    options.context_cache.enabled                      = true;
+    options.context_cache.host_capacity_bytes          = 2ULL << 30;
+    options.context_cache.hybrid.device_snapshot_slots = 4;
+    options.context_cache.hybrid.max_new_taps          = 2;
+    options.context_cache.hybrid.tap_ladder_tokens     = 4096;
+    options.context_cache.hybrid.tap_min_gap_tokens    = 1024;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 3 * kLongContext / 64U);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    require(program.hybrid_ != nullptr && program.hybrid_->host_tier(), "the wait-service fixture built no Host tier");
+
+    const auto settle = [&] {
+        for (unsigned step = 0; step < 8; ++step) {
+            device.synchronize();
+            auto progress = program.poll_context({});
+            if (progress.complete) { return progress; }
+        }
+        throw std::runtime_error("wait-service fixture transaction did not complete");
+    };
+    const auto reserve = [&](qwen::SequenceHandle sequence, qwen::ExecutionUnitKind kind, std::uint32_t tokens = 0) {
+        const std::array<qwen::ExecutionUnit, 1> units{{{sequence, kind, tokens}}};
+        require(static_cast<bool>(program.reserve_units(units)), "the wait-service fixture could not reserve a unit");
+    };
+    const auto decode = [&](qwen::SequenceHandle sequence, bool terminal) {
+        reserve(sequence, qwen::ExecutionUnitKind::Decode, 1);
+        const std::array<qwen::SequenceHandle, 1> members{sequence};
+        const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 1}}};
+        auto pending = program.decode(members, budgets, nullptr, nullptr);
+        const std::array<runtime::CommitDecision, 1> decision{{{.accepted_tokens = 1, .terminal = terminal}}};
+        (void)program.commit(std::move(pending), decision, runtime::CommitObservation::AllRows, nullptr);
+    };
+    const auto tokens = [](std::uint32_t count, TokenId salt) {
+        std::vector<TokenId> ids(count, 198);
+        for (std::size_t at = 0; at < ids.size(); at += 5) { ids[at] = salt + static_cast<TokenId>(at % 89); }
+        return ids;
+    };
+    const auto plan_request = [&](std::vector<TokenId> ids) {
+        runtime::ResolvedExecutionOptions execution;
+        execution.requested_output_tokens = 16;
+        execution.allow_prefix_reuse      = true;
+        return program.plan_request(qwen::PreparedPromptAccess::take(frontend.prepare_tokens(std::move(ids))), execution);
+    };
+    // Binds `base` on `lane` from the cache's first source, prefills it, generates `rounds` tokens and finishes.
+    // Returns the generated tokens; `restored` receives the blocks its binding restored from the Host tier.
+    const auto run_request = [&](const qwen::RequestBasePlan& base, std::uint32_t lane, std::uint32_t prompt_tokens,
+                                 std::uint32_t expected_reuse, int rounds, const std::string& label,
+                                 std::uint64_t* restored = nullptr) {
+        auto sources = program.hybrid_sources(base, nullptr);
+        require(!sources.empty() && sources.front().reused_tokens == expected_reuse,
+                label + ": quoted " + std::to_string(sources.empty() ? 0U : sources.front().reused_tokens) +
+                    " reused tokens, not " + std::to_string(expected_reuse));
+        const std::uint64_t before = program.hybrid_stats().host_block_restores;
+        require(static_cast<bool>(program.start_binding(base, {lane}, sources.front(), nullptr,
+                                                        qwen::ExecutionUnitKind::Prefill, 0U)),
+                label + ": the request could not bind");
+        const qwen::SequenceHandle sequence = *settle().sequence;
+        if (restored != nullptr) { *restored = program.hybrid_stats().host_block_restores - before; }
+        for (bool complete = false; !complete;) {
+            reserve(sequence, qwen::ExecutionUnitKind::Prefill);
+            auto step = program.advance_prefill(sequence, nullptr, nullptr);
+            complete  = step.complete;
+            if (complete) {
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accepted, runtime::CommitObservation::AllRows, nullptr);
+            }
+        }
+        for (int round = 0; round < rounds; ++round) { decode(sequence, round + 1 == rounds); }
+        const std::vector<TokenId>& ledger = program.sequences[lane].ledger;
+        std::vector<TokenId> generated(ledger.begin() + prompt_tokens, ledger.end());
+        require(program.finish(sequence).status == runtime::ConsumeStatus::Consumed, label + ": the request did not finish");
+        return generated;
+    };
+
+    struct Outcome {
+        std::vector<TokenId> other;
+        std::vector<TokenId> turn;
+        std::uint64_t binding_restores = 0;
+        std::uint64_t restore_copies   = 0;
+        std::uint64_t restored_blocks  = 0;
+        std::uint64_t prefetched       = 0;
+    };
+    const auto run = [&](bool prefetch) {
+        const std::string label = prefetch ? "prefetched" : "plain";
+        Outcome out;
+        // The conversation's first turn, then its history leaves the Device.
+        const auto first = plan_request(tokens(kHistory, 4000));
+        (void)run_request(first, 0, kHistory, 0, 2, label + " first turn");
+        device.synchronize();
+        program.hybrid_->drain();
+        (void)program.hybrid_->index().evict_backed_device_blocks(kLongContext);
+
+        // Its next turn waits (planned, not bound) while another conversation's request runs.
+        std::vector<TokenId> next = tokens(kTurn, 4000);
+        for (std::uint32_t at = kHistory; at < kTurn; ++at) { next[at] = 5000 + static_cast<TokenId>(at % 61); }
+        const auto turn  = plan_request(std::move(next));
+        const auto other = plan_request(tokens(kHistory, 7000));
+        const auto before = program.hybrid_stats();
+        out.other = run_request(other, 1, kHistory, 0, 4, label + " other conversation");
+        if (prefetch) {
+            // As the Engine asks for a queued request between rounds: again while a batch lands, until none is left.
+            for (unsigned attempt = 0; attempt < 64; ++attempt) {
+                const std::optional<std::uint32_t> blocks = program.hybrid_prefetch(turn, false);
+                if (blocks && *blocks == 0) { break; }
+                if (!blocks) { device.synchronize(); }
+            }
+        }
+        const std::uint64_t prefetched = program.hybrid_stats().prefetched_blocks - before.prefetched_blocks;
+        require(prefetch ? prefetched != 0 : prefetched == 0,
+                label + ": prefetched " + std::to_string(prefetched) + " blocks");
+        // The turn binds: from its history's deepest snapshot.
+        const std::uint32_t reuse = program.hybrid_sources(turn, nullptr).front().reused_tokens;
+        require(reuse != 0 && reuse <= kHistory + 2U, label + ": the turn was not quoted its history");
+        out.turn = run_request(turn, 0, kTurn, reuse, 4, label + " next turn", &out.binding_restores);
+        const auto after       = program.hybrid_stats();
+        out.restore_copies     = after.host_restore_copies - before.host_restore_copies;
+        out.restored_blocks    = after.host_block_restores - before.host_block_restores;
+        out.prefetched         = prefetched;
+        return out;
+    };
+
+    const Outcome plain = run(false);
+    program.hybrid_reset_cache();
+    const Outcome prefetched = run(true);
+    require(plain.binding_restores != 0, "the plain turn restored nothing at its binding: the fixture tests nothing");
+    require(prefetched.binding_restores == 0 && prefetched.prefetched == plain.binding_restores,
+            "the turn's binding still restored " + std::to_string(prefetched.binding_restores) + " blocks after " +
+                std::to_string(prefetched.prefetched) + " were prefetched (the plain binding restored " +
+                std::to_string(plain.binding_restores) + ")");
+    require(prefetched.restored_blocks == plain.restored_blocks,
+            "the prefetched run restored " + std::to_string(prefetched.restored_blocks) + " blocks, the plain run " +
+                std::to_string(plain.restored_blocks));
+    require(prefetched.other == plain.other, "the other conversation generated other tokens in the two runs");
+    require(prefetched.turn == plain.turn && plain.turn.size() == 5,
+            "a turn bound over prefetched history generated other tokens than one that restored it at its binding");
+    // A restore's copies are batched, one driver call a layer's planes and one for the prelude (DeviceKVPagePool::
+    // copy_from_host_records): a copy call per strided transfer took at least one a plane, and blocked the
+    // Engine thread on the full copy queue for about the copies' link time (2026-11-15).
+    const std::uint64_t planes = program.text_kv_pages->physical_pool().plane_count();
+    require(plain.restore_copies < plain.restored_blocks && plain.restore_copies < planes,
+            "restoring " + std::to_string(plain.restored_blocks) + " blocks took " +
+                std::to_string(plain.restore_copies) + " copy calls (" + std::to_string(planes) +
+                " planes): the copies were not batched");
+    std::cout << "prefetched resume: " << prefetched.prefetched << " blocks prefetched; binding restores "
+              << plain.binding_restores << " plain, " << prefetched.binding_restores << " prefetched; "
+              << plain.restored_blocks << " blocks restored in " << plain.restore_copies << " copy calls (" << planes
+              << " planes)\n";
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -955,8 +1117,9 @@ int main(int argc, char** argv) {
         cached_pause_lifecycle(device, parameters, options);
         std::cout << "cached pause lifecycle: OK\n";
         host_restore_lifecycle(device, parameters, options);
+        prefetched_resume(device, parameters, options);
         std::cout << "OK native pause, a pause before the first chunk, replay recovery, row failure, the cached "
-                     "pause lifecycle and the Host-restored resume\n";
+                     "pause lifecycle, the Host-restored resume and the prefetched resume\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL native transactions: " << error.what() << '\n';

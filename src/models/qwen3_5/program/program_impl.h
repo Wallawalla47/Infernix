@@ -448,7 +448,7 @@ public:
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
                                                               const ResumeState* resume);
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base, bool spare_only);
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     // The one answer to how many Device pages the prefix cache can give up for a binding (source
     // choice, the binding's own check and the drain decision all ask it): its evictable blocks now,

@@ -10944,7 +10944,7 @@ compile on their own, because the new contract changed the Program surface under
 |---|---|
 | `plan_request(PreparedPrompt&&)` | Keeps the prepared prompt on the plan; compiles a token constraint and checks readout tokens against the public token domain. |
 | `hybrid_sources` | Offers two sources: the prefix cache's affordable snapshot, chosen without a lane, then the root. Returns none while the request should wait for a prefilling sibling's snapshot (coalescing, below). |
-| `hybrid_prefetch` | Copies a blocked FIFO head's Host-only blocks into free and Host-backed Device pages while it waits. |
+| `hybrid_prefetch` | Copies a queued request's Host-only blocks (the FIFO head's or the request's behind it) into free and Host-backed Device pages while it waits; a request that is not the next to bind takes room only from free pages and blocks no queue hold names. |
 | `start_binding` | Re-selects the source for the actual lane, crediting a lane-resident snapshot. A changed choice returns no reservation and no shortage, so the Engine falls back to the root. Otherwise it makes room and reserves the pages of the prompt plus one round (§19.3.13); a shortage is reported as `main_kv_pages`. Vision is reserved after the KV. A resumed request binds its ledger (§19.3.13). |
 | Begin summary | `{prompt_tokens, reused_tokens, reuse_path}`. The reuse path is `HybridSnapshot`, `HybridEndpoint` or `Root`. |
 | `poll_context` | Runs Vision steps, then publishes the bound sequence. On cancellation it releases the binding. |

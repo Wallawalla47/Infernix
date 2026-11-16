@@ -439,8 +439,12 @@ public:
     std::uint32_t evict_device_blocks(std::uint32_t blocks);
     // The same, releasing only host-backed copies (dead ones first): nothing loses its last copy.
     std::uint32_t evict_backed_device_blocks(std::uint32_t blocks);
+    // The same, leaving every copy a queue hold names (set_queue_holds): room made for a request that is not next
+    // to bind never takes a block another waiting request resumes over.
+    std::uint32_t evict_unheld_backed_device_blocks(std::uint32_t blocks);
     [[nodiscard]] std::uint32_t device_evictable_blocks() const noexcept;
     [[nodiscard]] std::uint32_t device_backed_evictable_blocks() const noexcept;
+    [[nodiscard]] std::uint32_t device_unheld_backed_evictable_blocks() const noexcept;
     // Device copies that only in-flight transfers hold now: evictable once those land (each is backed
     // then). With device_evictable_blocks, the Device room the cache can give up after a drain.
     [[nodiscard]] std::uint32_t device_transfer_held_blocks() const noexcept { return transfer_releasable_; }
@@ -805,15 +809,15 @@ private:
     void refresh_node(std::uint32_t node);
     void refresh_tail(std::uint32_t snapshot);
 
-    std::uint32_t evict_device_entries(std::uint32_t blocks, bool unbacked);
+    std::uint32_t evict_device_entries(std::uint32_t blocks, bool unbacked, bool unheld_only = false);
     void lru_remove(std::uint32_t entry);
     void lru_append(std::uint32_t entry, std::uint8_t list);
     [[nodiscard]] std::uint32_t lru_pop(std::uint8_t list);
     // The list of an evictable entry: its residency kind and queue hold.
     [[nodiscard]] static std::uint8_t lru_list(bool backed, std::uint8_t hold) noexcept;
     // The next Device entry to evict: unheld backed, held backed (highest rank first), then with
-    // `unbacked` unheld unbacked and held unbacked. kNoId when none.
-    [[nodiscard]] std::uint32_t lru_pop_victim(bool unbacked);
+    // `unbacked` unheld unbacked and held unbacked; with `unheld_only` no held entry. kNoId when none.
+    [[nodiscard]] std::uint32_t lru_pop_victim(bool unbacked, bool unheld_only = false);
     // Recomputes every node's hold from holds_ and moves the affected LRU entries.
     void refresh_holds();
 

@@ -84,9 +84,9 @@ bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
     impl_->settle_deferred();
     return impl_->hybrid_reclaim(shortage);
 }
-std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base, bool spare_only) {
     impl_->settle_deferred();
-    return impl_->hybrid_prefetch(base);
+    return impl_->hybrid_prefetch(base, spare_only);
 }
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
 void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,

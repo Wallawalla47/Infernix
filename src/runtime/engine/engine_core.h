@@ -1870,35 +1870,31 @@ private:
         }
     }
 
-    // Hybrid prefix cache: copies the waiting FIFO head's Host-only blocks into spare Device cache
-    // (hybrid-prefix-cache-spec §6.6).
-    void prefetch_blocked_head() {
-        std::shared_ptr<Request> head;
+    // Hybrid prefix cache: copies the queued requests' Host-only blocks into spare Device cache
+    // (hybrid-prefix-cache-spec §6.6): the FIFO head's, then the request's behind it. Paused requests are not
+    // targets: a paused request's history copied back while the lanes that paused it still run took the pages
+    // they grow into, and two such requests then paused each other in turn (§16.14). A target is prefetched for
+    // once an admission scan has planned it.
+    void prefetch_waiting() {
+        if (instance_.program->has_context_transaction()) { return; }
+        std::array<std::shared_ptr<Request>, kPrefetchTargets> waiting;
+        std::size_t count = 0;
         {
             std::lock_guard lock(queue_mutex_);
-            if (!pending_.empty()) { head = pending_.front(); }
+            for (const auto& request : pending_) {
+                if (count == kPrefetchTargets) { break; }
+                if (request->cancelled.load(std::memory_order_acquire)) { continue; }
+                waiting[count++] = request;
+            }
         }
-        if (!head || !head->base_plan) { return; }
-        resources_.prefetch_blocked_head(*instance_.program, *head->base_plan,
-                                         head->publication_order);
-    }
-
-    // The next batch for the head the last attempt served, each cycle while that attempt left more to copy
-    // (HybridResourceManager::prefetch_continues): admission scans alone gave a head waiting behind long
-    // decodes one batch per queue or capacity event, and the rest of its path was restored at its binding.
-    // Under the same conditions as fresh admission, whose scan makes the first attempt.
-    void continue_head_prefetch() {
-        std::shared_ptr<Request> head;
-        {
-            std::lock_guard lock(queue_mutex_);
-            if (!pending_.empty()) { head = pending_.front(); }
+        std::array<typename ResourceManagement::PrefetchTarget, kPrefetchTargets> targets;
+        std::size_t planned = 0;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& request = waiting[index];
+            if (!request->base_plan) { continue; }
+            targets[planned++] = {.id = request->id, .base = &*request->base_plan};
         }
-        if (!head || !head->base_plan || head->publication_order != resources_.prefetch_head() ||
-            head->cancelled.load(std::memory_order_acquire)) {
-            resources_.prefetch_forget();
-            return;
-        }
-        resources_.prefetch_blocked_head(*instance_.program, *head->base_plan, head->publication_order);
+        resources_.prefetch_waiting(*instance_.program, std::span(targets.data(), planned));
     }
 
     // Hybrid prefix cache: the sources of the requests waiting for admission are evicted last, the
@@ -2222,7 +2218,7 @@ private:
             }
             if (restoring) { return false; }
         }
-        if (!restoring) { prefetch_blocked_head(); }
+        if (!restoring) { prefetch_waiting(); }
         return false;
     }
 
@@ -3162,10 +3158,11 @@ private:
                         if (instance_.program->has_context_transaction()) { break; }
                         admitted = true;
                     }
-                    // The blocked head's Host-only path goes on being copied while it waits (§6.6).
-                    if (resources_.prefetch_continues() && !instance_.program->has_context_transaction()) {
-                        continue_head_prefetch();
-                    }
+                }
+                // The queued requests' Host-only paths go on being copied while they wait (§6.6), each cycle
+                // while the last pass left more to copy.
+                if (resources_.prefetch_continues() && !instance_.program->has_context_transaction()) {
+                    prefetch_waiting();
                 }
                 hold_queued_sources();
                 if (instance_.program->has_context_transaction()) {
@@ -3376,6 +3373,8 @@ private:
     // worker: a queued request's last quote had no source because it waits for a prefilling sibling's
     // snapshot; every prefill boundary then re-arms admission (hybrid-prefix-cache-spec §12.2).
     bool sibling_wait_ = false;
+    // The requests prefetch_waiting copies for: the FIFO head and the request behind it.
+    static constexpr std::size_t kPrefetchTargets = 2;
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;
     std::array<std::uint32_t, kMaximumConcurrency> current_decode_lanes_{};

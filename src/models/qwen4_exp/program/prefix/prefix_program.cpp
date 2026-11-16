@@ -388,11 +388,12 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
     return std::nullopt;
 }
 
-// The blocked FIFO head's Host-only blocks are copied into spare Device cache while it waits
+// A waiting request's Host-only blocks are copied into spare Device cache while it waits
 // (hybrid-prefix-cache-spec §6.6): its matched path is pinned while room is made from free pages and
 // Host-backed cached blocks, least recently used first, so a prefetch never waits for a transfer,
-// never grows the pool into the expert frames, and never drops a block's last copy.
-std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan& base) {
+// never grows the pool into the expert frames, and never drops a block's last copy. With `spare_only` (a
+// request that is not the next to bind) room never comes from a block a queue hold names.
+std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan& base, bool spare_only) {
     if (!prefix_ || !prefix_->host_tier() || base.impl_ == nullptr || !base.impl_->reuse || !base.impl_->prompt) {
         return 0U;
     }
@@ -412,41 +413,43 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
     if (!choice.candidate) { return 0U; }
-    if (match.candidates[*choice.candidate].ssd_bytes != 0) {
-        // The head's source is read from the SSD tier into the Host tier while it waits
+    const pc::MatchCandidate& chosen = match.candidates[*choice.candidate];
+    if (chosen.ssd_bytes != 0) {
+        // The request's source is read from the SSD tier into the Host tier while it waits
         // (hybrid-prefix-cache-spec §5.7); its Device prefetch follows once that lands.
-        const pc::SsdTier::Promotion promotion = prefix_->promote(match.candidates[*choice.candidate].snapshot);
+        const pc::SsdTier::Promotion promotion = prefix_->promote(chosen.snapshot);
         if (promotion == pc::SsdTier::Promotion::Pending) { return std::nullopt; }
         if (promotion == pc::SsdTier::Promotion::Unavailable) { return 0U; }
     }
-    if (match.candidates[*choice.candidate].host_only_blocks == 0) { return 0U; }
-    const std::span<const pc::NodeRef> path(match.path.data(), match.candidates[*choice.candidate].path_blocks);
+    if (chosen.host_only_blocks == 0) { return 0U; }
+    const std::span<const pc::NodeRef> path(match.path.data(), chosen.path_blocks);
     index.acquire_path(path);
     std::uint32_t started = 0;
     try {
-        std::uint32_t wanted = std::min(match.candidates[*choice.candidate].host_only_blocks, kPrefetchBatchBlocks);
-        while (pool_->available_pages() < wanted && index.evict_backed_device_blocks(1) != 0) {}
+        std::uint32_t wanted = std::min(chosen.host_only_blocks, kPrefetchBatchBlocks);
+        while (pool_->available_pages() < wanted && (spare_only ? index.evict_unheld_backed_device_blocks(1)
+                                                                : index.evict_backed_device_blocks(1)) != 0) {}
         wanted = std::min(wanted, pool_->available_pages());
+        std::vector<pc::NodeRef> host_only;
+        host_only.reserve(wanted);
+        for (const pc::NodeRef node : path) {
+            if (host_only.size() == wanted) { break; }
+            const pc::NodeView view = index.node(node);
+            if (view.device == pc::CopyState::Absent && view.host == pc::CopyState::Resident) { host_only.push_back(node); }
+        }
         std::optional<DeviceKVPageReservation> reservation;
-        if (wanted != 0) { reservation = pool_->reserve(wanted); }
+        if (!host_only.empty()) { reservation = pool_->reserve(static_cast<std::uint32_t>(host_only.size())); }
         if (reservation) {
             std::vector<DeviceKVPageLease> pages;
-            pages.reserve(wanted);
-            pool_->materialize(*reservation, wanted, pages);
+            pages.reserve(host_only.size());
+            pool_->materialize(*reservation, static_cast<std::uint32_t>(host_only.size()), pages);
             prefix_->open_restore(device_.stream);
-            for (const pc::NodeRef node : path) {
-                if (started == wanted) { break; }
-                const pc::NodeView view = index.node(node);
-                if (view.device != pc::CopyState::Absent || view.host != pc::CopyState::Resident) { continue; }
-                prefix_->restore_block(node, std::move(pages[started]));
+            for (std::size_t i = 0; i < host_only.size(); ++i) {
+                prefix_->restore_block(host_only[i], std::move(pages[i]));
                 ++started;
             }
-            if (started != 0) {
-                prefetch_ticket_ = prefix_->submit_restore();
-                prefix_->counters().prefetched_blocks += started;
-            } else {
-                prefix_->abort_restore();
-            }
+            prefetch_ticket_ = prefix_->submit_restore();
+            prefix_->counters().prefetched_blocks += started;
         }
     } catch (...) {
         prefix_->abort_restore();

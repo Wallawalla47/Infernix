@@ -729,13 +729,32 @@ TransferWork DeviceKVPagePool::copy_pages(std::span<const std::pair<DeviceKVPage
     return device_copy_work(static_cast<std::uint32_t>(pairs.size()));
 }
 
+namespace {
+
+// Where the device reaches registered, mapped host memory at `host` (null for memory the driver does not
+// map): a batched copy names a host operand by that address (core/copy_batch.h).
+std::byte* mapped_device_address(std::byte* host) noexcept {
+    cudaPointerAttributes attributes{};
+    if (cudaPointerGetAttributes(&attributes, host) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    return attributes.type == cudaMemoryTypeHost ? static_cast<std::byte*>(attributes.devicePointer) : nullptr;
+}
+
+} // namespace
+
 std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin,
                                               std::size_t plane_end, std::int32_t first, std::size_t count,
                                               std::byte* host_base, std::size_t host_pitch,
                                               std::size_t max_pitch, const HostKVPageLayout& host,
-                                              cudaStream_t stream) const {
+                                              cudaStream_t stream, CopyBatch* batch) const {
     const bool to_host = kind == cudaMemcpyDeviceToHost;
-    std::uint32_t copies = 0;
+    // A run lies in one pinned allocation (host_record_run_end), which the device maps contiguously: one lookup
+    // gives every copy's host operand. Without a batch (the legacy default stream, which a batch refuses), and for
+    // memory the driver does not map, each strided transfer is one cudaMemcpy2DAsync.
+    std::byte* const host_device = batch != nullptr ? mapped_device_address(host_base) : nullptr;
+    std::uint32_t calls = 0;
     for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
         const Tensor& plane                 = planes_[plane_index];
         const HostKVPlaneLayout& host_plane = host.planes[plane_index];
@@ -743,13 +762,30 @@ std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t p
         auto* device_base                   = static_cast<unsigned char*>(plane.data);
         const auto copy = [&](std::byte* host_ptr, std::size_t pitch_on_host, unsigned char* device_ptr,
                               std::size_t device_pitch, std::size_t width, std::size_t height) {
-            ++copies;
-            if (to_host) {
-                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, pitch_on_host, device_ptr, device_pitch, width,
-                                             height, cudaMemcpyDeviceToHost, stream));
-            } else {
-                CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, pitch_on_host, width,
-                                             height, cudaMemcpyHostToDevice, stream));
+            if (host_device == nullptr) {
+                ++calls;
+                if (to_host) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, pitch_on_host, device_ptr, device_pitch, width,
+                                                 height, cudaMemcpyDeviceToHost, stream));
+                } else {
+                    CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, pitch_on_host, width,
+                                                 height, cudaMemcpyHostToDevice, stream));
+                }
+                return;
+            }
+            // One copy a row (a page's plane, or a page's head): a batch of strided copies still blocks the
+            // thread on a full copy queue, one of plain copies does not and runs at a higher link rate
+            // (2026-11-15: 750 scattered 27B blocks issued in 36 ms, not 103 ms, landing at 23.8 GB/s, not 14.7).
+            std::byte* host_row       = host_device + (host_ptr - host_base);
+            unsigned char* device_row = device_ptr;
+            for (std::size_t row = 0; row < height; ++row) {
+                if (to_host) {
+                    batch->add(host_row, device_row, width);
+                } else {
+                    batch->add(device_row, host_row, width);
+                }
+                host_row += pitch_on_host;
+                device_row += device_pitch;
             }
         };
         if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
@@ -773,7 +809,7 @@ std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t p
             }
         }
     }
-    return copies;
+    return calls;
 }
 
 template <bool ToHost>
@@ -966,17 +1002,21 @@ std::uint32_t DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPag
     }
     const std::span<const std::byte* const> addresses(
         reinterpret_cast<const std::byte* const*>(records.data()), records.size());
-    std::size_t begin    = 0;
-    std::uint32_t copies = 0;
+    // Write-through stays one strided transfer a call: batched as a copy a page and plane (as restores are), the
+    // 27B's 4,400 written blocks of a cold 182K prompt became 283,000 copies, half of them 1 KiB scale rows, and
+    // the prompt's first token came 0.6 s later (2026-11-15). Its copies trickle out tap by tap, so the queue it
+    // fills is short.
+    std::size_t begin   = 0;
+    std::uint32_t calls = 0;
     while (begin < source.size()) {
         std::size_t pitch     = 0;
         const std::size_t end = host_record_run_end(source, addresses, record_groups, begin,
                                                     layout.page_stride, max_pitch, pitch);
-        copies += copy_host_run(cudaMemcpyDeviceToHost, plane_begin, plane_end, source[begin].index_,
-                                end - begin, records[begin], pitch, max_pitch, layout, stream);
+        calls += copy_host_run(cudaMemcpyDeviceToHost, plane_begin, plane_end, source[begin].index_,
+                               end - begin, records[begin], pitch, max_pitch, layout, stream, nullptr);
         begin = end;
     }
-    return copies;
+    return calls;
 }
 
 std::uint32_t DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> records,
@@ -1005,19 +1045,26 @@ std::uint32_t DeviceKVPagePool::copy_from_host_records(std::span<const std::byte
         if (record == nullptr) { throw std::invalid_argument("Paged KV H2D record is null"); }
     }
     const std::size_t max_pitch = device_max_copy_pitch();
+    // The destinations are distinct pages (validated above), so the batch tracks no overlap.
+    std::optional<CopyBatch> batch;
+    if (stream != nullptr) { batch.emplace(stream, CopyBatch::Destinations::Distinct); }
     std::size_t begin           = 0;
-    std::uint32_t copies        = 0;
+    std::uint32_t calls         = 0;
     while (begin < destination.size()) {
         std::size_t pitch     = 0;
         const std::size_t end = host_record_run_end(destination, records, record_groups, begin,
                                                     layout.page_stride, max_pitch, pitch);
         // The H2D direction only reads the host run.
-        copies += copy_host_run(cudaMemcpyHostToDevice, plane_begin, plane_end, destination[begin].index_,
-                                end - begin, const_cast<std::byte*>(records[begin]), pitch, max_pitch, layout,
-                                stream);
+        calls += copy_host_run(cudaMemcpyHostToDevice, plane_begin, plane_end, destination[begin].index_,
+                               end - begin, const_cast<std::byte*>(records[begin]), pitch, max_pitch, layout,
+                               stream, batch ? &*batch : nullptr);
         begin = end;
     }
-    return copies;
+    if (batch) {
+        batch->flush();
+        calls += batch->calls();
+    }
+    return calls;
 }
 
 std::vector<DeviceKVPageReservation>

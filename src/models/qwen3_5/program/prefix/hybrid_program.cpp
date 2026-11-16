@@ -457,7 +457,7 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
     return out;
 }
 
-std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan& base) {
+std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan& base, bool spare_only) {
     if (!hybrid_ || !hybrid_->host_tier() || base.impl_ == nullptr || !base.impl_->prompt ||
         !base.impl_->allow_prefix_reuse || !base.impl_->prompt->identity.reusable) {
         return 0U;
@@ -481,20 +481,22 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
     if (!choice.candidate) { return 0U; }
-    if (match.candidates[*choice.candidate].ssd_bytes != 0) {
-        // The head's source is read from the SSD tier into the Host tier while it waits (§5.7); its
+    const pc::MatchCandidate& chosen = match.candidates[*choice.candidate];
+    if (chosen.ssd_bytes != 0) {
+        // The request's source is read from the SSD tier into the Host tier while it waits (§5.7); its
         // Device prefetch follows once that lands.
-        const pc::SsdTier::Promotion promotion = hybrid_->promote(match.candidates[*choice.candidate].snapshot);
+        const pc::SsdTier::Promotion promotion = hybrid_->promote(chosen.snapshot);
         if (promotion == pc::SsdTier::Promotion::Pending) { return std::nullopt; }
         if (promotion == pc::SsdTier::Promotion::Unavailable) { return 0U; }
     }
-    if (match.candidates[*choice.candidate].host_only_blocks == 0) { return 0U; }
-    const std::span<const pc::NodeRef> path(match.path.data(),
-                                            match.candidates[*choice.candidate].path_blocks);
+    if (chosen.host_only_blocks == 0) { return 0U; }
+    const std::span<const pc::NodeRef> path(match.path.data(), chosen.path_blocks);
 
     // Pinned while room is made, so no block of this path is evicted to hold another of them.
     // Room comes from free pages and host-backed cache, least recently used first: a prefetch
-    // never waits for a transfer and never drops a block's last copy.
+    // never waits for a transfer and never drops a block's last copy. For a request that is not the
+    // next to bind (`spare_only`) it never takes a block a queue hold names either: those are what the
+    // requests ahead of it, and it, resume over.
     index.acquire_path(path);
     std::uint32_t started = 0;
     try {
@@ -505,22 +507,29 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
             const std::uint32_t text = text_pool.available_pages();
             return backend_pool != nullptr ? std::min(text, backend_pool->available_pages()) : text;
         };
-        std::uint32_t wanted =
-            std::min(match.candidates[*choice.candidate].host_only_blocks, kPrefetchBatchBlocks);
-        while (available() < wanted && index.evict_backed_device_blocks(1) != 0) {}
+        std::uint32_t wanted = std::min(chosen.host_only_blocks, kPrefetchBatchBlocks);
+        while (available() < wanted && (spare_only ? index.evict_unheld_backed_device_blocks(1)
+                                                   : index.evict_backed_device_blocks(1)) != 0) {}
         wanted = std::min(wanted, available());
+        std::vector<pc::NodeRef> host_only;
+        host_only.reserve(wanted);
+        for (const pc::NodeRef node : path) {
+            if (host_only.size() == wanted) { break; }
+            const pc::NodeView view = index.node(node);
+            if (view.device == pc::CopyState::Absent && view.host == pc::CopyState::Resident) {
+                host_only.push_back(node);
+            }
+        }
+        const auto blocks = static_cast<std::uint32_t>(host_only.size());
         std::optional<DeviceKVPageReservation> text_pages;
         std::optional<DeviceKVPageReservation> backend_pages;
-        if (wanted != 0) {
-            text_pages = text_pool.reserve(wanted);
-            if (backend_pool != nullptr) { backend_pages = backend_pool->reserve(wanted); }
+        if (blocks != 0) {
+            text_pages = text_pool.reserve(blocks);
+            if (backend_pool != nullptr) { backend_pages = backend_pool->reserve(blocks); }
         }
         if (text_pages && (backend_pool == nullptr || backend_pages)) {
             hybrid_->open_restore(device.stream);
-            for (const pc::NodeRef node : path) {
-                if (started == wanted) { break; }
-                const pc::NodeView view = index.node(node);
-                if (view.device != pc::CopyState::Absent || view.host != pc::CopyState::Resident) { continue; }
+            for (const pc::NodeRef node : host_only) {
                 HybridBlockPages pages{
                     .text = text_kv_pages->materialize_transfer_destination(*text_pages, kBlock)};
                 if (backend_pool != nullptr) {
@@ -823,7 +832,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
                                [&](pc::NodeRef node) { return cache->node(node).device == pc::CopyState::Filling; });
         };
         if (hybrid_->prefetch_landing() && filling()) {
-            // The blocked head's prefetch (§6.6) is copying blocks this source stands on while it
+            // A waiting request's prefetch (§6.6) is copying blocks this source stands on while it
             // waited for room: they land within a batch's copy time, and a stale source here would
             // send the request to a root start.
             hybrid_->settle_prefetch();
@@ -868,17 +877,6 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     std::vector<pc::NodeRef> host_only;
     for (const pc::NodeRef node : path) {
         if (cache->node(node).device == pc::CopyState::Absent) { host_only.push_back(node); }
-    }
-    // Restored in slab order: the destinations below are consecutive Device pages, and a run of them copies as
-    // one strided transfer per plane only while its Host records ascend at one pitch. Path order is slab order
-    // only for blocks one release wrote; a path written by several lanes then broke into a copy per block.
-    if (host_only.size() > 1) {
-        std::vector<std::pair<std::uint32_t, pc::NodeRef>> by_slab;
-        by_slab.reserve(host_only.size());
-        for (const pc::NodeRef node : host_only) { by_slab.emplace_back(cache->node(node).host_slab, node); }
-        std::sort(by_slab.begin(), by_slab.end(),
-                  [](const auto& left, const auto& right) { return left.first < right.first; });
-        for (std::size_t i = 0; i < by_slab.size(); ++i) { host_only[i] = by_slab[i].second; }
     }
     const bool tail_restore  = tail != 0 && snapshot.tail_device_copy != pc::CopyState::Resident;
     const bool image_restore = reuse != 0 && snapshot.device_slot == pc::kNoId;

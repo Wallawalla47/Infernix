@@ -481,10 +481,13 @@ public:
     // Evicts unpinned cached Device blocks, and the Device copies of cached snapshot images, until
     // the shortage is covered or nothing evictable remains. Returns whether anything was freed.
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
-    // Copies Host-only blocks a waiting request resumes from into Device pages the pools can
+    // Copies Host-only blocks a queued request resumes from into Device pages the pools can
     // spare as cache (hybrid-prefix-cache-spec §6.6), so its admission restores less. Returns the
-    // blocks whose copy started; absent while a prefetch or an admission is still in flight.
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    // blocks whose copy started; absent while a prefetch or an admission is still in flight. With
+    // `spare_only` (a request that is not the next to bind) room is made only from free pages and
+    // cached blocks no queue hold names.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base,
+                                                               bool spare_only = false);
     // Device pages a prefetch could fill now: free ones and host-backed cached ones.
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     // Holds the snapshot each queued request would resume from now, in admission order

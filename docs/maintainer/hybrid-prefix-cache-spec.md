@@ -47,7 +47,7 @@ be positive, §17); every other value is derived from the rest of the configurat
 | §5.4 automatic Device sizing | implemented: with the cache enabled the Main pool is not clamped to `C·L`, and `infernix-serve` defaults `--kv-capacity` to `auto`, so free VRAM becomes Device block cache |
 | §5.4 unified Host slab pool | implemented: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's binding transaction | implemented: staging reserves the first unit's Device pages and the state slot, Host restores run on a dedicated restore stream, and completion forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1). Later units reserve incrementally; preemption recovers by Replay (§9.5) |
-| §6.6 prefetching the blocked head | implemented: Host-only path blocks are copied into spare Device cache while the FIFO head waits |
+| §6.6 prefetching for waiting requests | implemented: the first two queued requests' Host-only path blocks are copied into spare Device cache while they wait; paused requests are not prefetched for (measured to thrash, §16.14) |
 | §9.6 queue holds | implemented (default on, `--no-queue-holds`): waiting requests' resume snapshots and paths are evicted last, the back of the queue first; host-only unit tests. End-to-end effect not yet measured |
 | §7.1 taps | implemented: exact taps (explicit, generation opener, structural) split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
 | §7.4 tap publication | implemented: deferred until the anchoring blocks commit (a frontier inside a block, or an MTP backend one token behind); exact-frontier tails are copied into cache-owned pages |
@@ -909,6 +909,17 @@ the order a forward pass reads it, recording an event after each part:
 2. then, for each model layer in forward order, that layer's state: a full-attention layer's KV
    planes of every restored block, or a linear-attention layer's conv and recurrent state.
 
+Each part's copies, one per block and plane, are enqueued with one driver call
+(`DeviceKVPagePool::copy_from_host_records`, `core/copy_batch.h`), the Host records named at the
+address the device maps them at. Copies
+issued one strided transfer per run of consecutive pages and slabs blocked the Engine thread
+whenever the restore stream's copy queue was full, so a binding of 750 scattered 27B blocks
+(1.6 GB) held the thread for about the copies' own link time, 100-140 ms, and the strided copies
+ran at about 15 GB/s against 24 GB/s for the batch; neither restoring in Host slab order nor
+taking a run's Device pages together changed that under KV pressure (2026-11-15, §16.14). Host
+write-through keeps one strided transfer a call: batched the same way, a cold 182K-token prompt's
+4,400 written blocks became 283,000 copies and its first token came 0.6 s later (§16.14).
+
 `land_restore` makes the compute stream wait for the prelude (activation copies the tail and the
 MTP bridge reads the backend pages and hidden) and hands the lane a ticket for the per-layer
 events. The lane's first prefill pass waits for each layer's event just before that layer
@@ -942,28 +953,46 @@ Failure: a CUDA error in a restore job is Engine-wide, as today. A request cance
 (before activation) waits for the restore stream, returns every destination and reservation, and
 releases its pins.
 
-### 6.6 Prefetching the blocked head
+### 6.6 Prefetching for waiting requests
 
 When the Device pool cannot hold every conversation, each admission restores most of its path
 from the Host tier (the production agent log of 2026-09-26: 2.59 TB, a median 2.7 GB per turn).
 For a short turn the first prefill pass waits for those copies, and other lanes' decode queues
-behind it. The FIFO head usually waited seconds to minutes for a lane or for pages before that,
+behind it. A waiting request usually waited seconds to minutes for a lane or for pages before that,
 so its restore can happen during the wait instead.
 
-- When the head stays blocked (hybrid mode does not backfill, §6.3), the Engine asks the Program to
-  prefetch for it. The Program matches the prompt as a quote would, takes the source admission
-  would choose, and copies up to 256 of its Host-only path blocks into Device pages. They are
-  ordinary cached blocks: `Filling` until the batch lands, then unpinned at the MRU end of the
-  device LRU. Admission later finds them Device-resident and restores only the rest.
+- While requests wait, the Engine asks the Program to prefetch for them
+  (`HybridResourceManager::prefetch_waiting`), in the order they bind: the FIFO head, then the
+  request behind it (hybrid mode does not backfill, §6.3). The Program matches as a quote would,
+  takes the source admission would choose, and copies up to 256 of its Host-only path blocks into
+  Device pages. They are ordinary cached blocks: `Filling` until the batch lands, then unpinned at
+  the MRU end of the device LRU. Admission later finds them Device-resident and restores only the
+  rest. One batch is in flight at a time, so the first target with blocks left to copy takes it.
+  Until 2026-11-15 only the FIFO head was a target.
+- A paused request is not a target. Prefetching its history (over its ledger, up to its paused
+  frontier) was built and measured on 2026-11-15: under KV pressure the copies took the pages the
+  lanes that had paused it grow into, it then resumed cheaply and paused one of them, and two
+  requests paused each other in turn (the agentic replay of §16.10: 31 preemptions in a run against
+  1-2 for the control, two requests paused 12 and 15 times; §16.14). Its history is restored at its
+  resume, as before.
 - Pages come from the free pool and from host-backed cached blocks, least recently used first.
-  The head's path is pinned meanwhile. A prefetch never drops a block's last copy, never waits for
+  The target's path is pinned meanwhile. A prefetch never drops a block's last copy, never waits for
   a transfer, and never runs beside an open admission or another prefetch. Active leases may evict
-  the prefetched blocks like any cache.
+  the prefetched blocks like any cache. For a target that is not the first, room never comes from a
+  block a queue hold names (§9.6, `evict_unheld_backed_device_blocks`): those are what the requests
+  ahead of it, and it, resume over, and two waiting requests would otherwise take each other's
+  prefetched blocks in turn.
+- Not during a prefill unit: the worker waits in the driver for a whole unit (a 1,024-token pass on
+  the 27B is about 0.27 s), and a request that arrives meanwhile is planned and prefetched for once it
+  ends. A prefill wait service that polled the stream instead, planning arrivals and prefetching
+  between polls with the copies ordered after a mark taken before each pass, was built and measured on
+  2026-11-15/16 and removed: it cost 0.7 % of a cold 27B prompt's prefill in Engine device waits and
+  showed no gain in any workload measured (§16.14).
 - One batch is about 550 MB for 27B INT8 KV (about 20 ms of PCIe). The Engine retries for the same
-  head only while the last attempt copied blocks or the spare room grew, because matching walks
-  the whole prompt path; while it did, the next batch follows in the next cycle (not at the next
-  admission event: a head waiting behind long decodes used to get one or two batches in all).
-- A request waiting for a lane is planned but not quoted: a quote would wait for the head's own
+  target only while its last attempt copied blocks or the spare room grew, because matching walks
+  the whole prompt path; while a target did, the next batch follows in the next cycle (not at the
+  next admission event: a head waiting behind long decodes used to get one or two batches in all).
+- A request waiting for a lane is planned but not quoted: a quote would wait for the request's own
   landing prefetch (below) on the Engine thread for a request that cannot bind yet.
 - A quote whose candidates cross a landing prefetch waits for it (`settle_prefetch`) instead of
   skipping those candidates for a shallower source. A lane's own restore batches are never waited
@@ -1311,7 +1340,9 @@ struct SourceCandidate {                    // the binding source shared with ch
 [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan&,
                                                           const ResumeState* resume);      // §6.1-6.3
 [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);                // §9.5
-[[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&);       // §6.6
+[[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&,
+                                                           const ResumeState* resume,
+                                                           bool spare_only);               // §6.6
 [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
 void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
                        std::span<const ResumeState* const> resumes);                     // §9.6
@@ -2740,6 +2771,103 @@ Flash-Next's guards and the draft screen; Device-slot adoption on a duplicate sn
 its place in a full snapshot table. Checks: 27 CPU tests, the real tests of 16.12 again, the 122B offloaded real
 test, the 35B MoE real test, and a WSL GCC build with 13 CPU tests.
 
+### 16.14 Batched Host restores, more prefetch targets, and a prefill wait service measured and removed (2026-11-15/16)
+
+**What changed.** Restores enqueue their copies, one per block and plane, as one driver call per
+`copy_from_host_records` call (§6.5). The request behind the FIFO head is a prefetch target too, its room only from
+blocks no queue hold names (§6.6). A prefill wait service, which let a unit's device wait plan arriving requests and
+prefetch for them beside the unit (the binding still followed the unit), was measured below and removed: it cost
+0.7 % of a cold prompt's prefill and gained nothing measurable. The measurements below up to its on/off A/B ran
+with it.
+
+**Agentic replay** (§16.10's `bench/agentic_ab` press launch, 132 requests, greedy; RTX 5090, official 27B NVFP4;
+control `2aca67f7`, order base, new, new, base). The treatment was the build before the final one: its write-through
+was batched too (removed afterwards, below). The binding figures are restores and carry over; its TTFT, wall and
+preemption figures belong to that build and were not measured again:
+
+| run | TTFT mean / median / p90 / max | wall | bindings: total / over 10 ms / slowest | copy calls a restored block | preemptions (replayed tokens) |
+|---|---|---|---|---|---|
+| base | 1.61 / 0.42 / 5.64 / 19.18 s | 12.3 min | 1.82 s / 26 / 125 ms | 9.71 | 8 (25,088) |
+| new | 1.25 / 0.34 / 2.54 / 14.95 s | 10.8 min | 0.36 s / 9 / 37 ms | 0.96 | 18 (3,626) |
+| new | 1.07 / 0.34 / 2.20 / 11.66 s | 8.4 min | 0.51 s / 8 / 97 ms | 1.44 | 2 (18) |
+| base | 1.11 / 0.32 / 2.51 / 13.50 s | 9.5 min | 1.41 s / 22 / 128 ms | 12.79 | 6 (3,584) |
+
+The Engine thread's binding time falls by two thirds to four fifths; prefetched blocks rise from 2,020-2,922 to
+5,290-11,054. TTFT is not shown to change: the first run of a session is the slowest in both of today's replays
+(13.8 and 12.3 min), and against the later control run the means differ by +0.14 and -0.04 s. The preemptions come
+in pairs between two long requests in every run, the control's included; this workload's control runs have shown
+0 to 10 (§16.13 and today), so the treatment's 18 is beyond that range once, unexplained; no preempting interval of
+these runs prefetched anything.
+
+**Why bindings took 40-140 ms.** A loop of strided copies blocks the issuing thread whenever the stream's copy queue
+is full, so a binding of 750 scattered blocks (1.6 GB) held the Engine thread for about the copies' own link time.
+On a copy pattern built from these runs (750 blocks in runs of 4 pages, 64 planes; every byte checked):
+
+| copies | issue time | transfer time | link rate |
+|---|---|---|---|
+| one `cudaMemcpy2DAsync` a run and plane (before) | 103-110 ms | 108-111 ms | 14.4-14.7 GB/s (8.3 GB/s in runs of 1.5) |
+| one `cudaMemcpy3DBatchAsync` a layer, same transfers | 102-109 ms | 109-112 ms | 14.2-14.6 GB/s |
+| one `cudaMemcpyBatchAsync` a layer, a copy a page and plane (now) | 36-38 ms | 67 ms | 23.8 GB/s |
+| Device to Host, strided against batched | 94 / 34 ms | 98 / 58 ms | 16.2 / 27.4 GB/s |
+
+750 blocks still hold the thread about 35 ms (the queue fills); 250 take 6 ms (32 before). Restores of the models
+that stream experts over the link (Qwen3.8-Flash-Next, the 122B) take the same batch; their speed under restore
+pressure was not measured (their two-conversation runs restore nothing).
+
+**Built and removed.** Restoring in Host slab order with each run's Device pages taken together (and the binding's
+slab sort of `96201dc1`): copy calls a block 13.3-17.5 against 10.5-13.9 for the control, slowest binding 118-143 ms
+against 122-142 ms; the batch makes the order irrelevant. Prefetching for paused requests (over the ledger, up to
+the paused frontier): 8 and 31 preemptions against 1 and 2, two requests paused 12 and 15 times, every preempting
+interval carrying a 169-1,010-block prefetch (the control's: none); §6.6. Batching write-through as restores are
+(on the copy pattern above 34 ms of issue against 94, 27.4 GB/s against 16.2): on the 27B's two conversations the
+cold 182K prompt's first token came 0.6 s later in both runs (48.96 s against 48.27-48.34 s) with its GPU prefill
+time unchanged (32.46 s), the Engine's post-processing 0.15 s longer and its device waits 0.5 s longer; its 4,400
+written blocks had become 283,000 copies, half of them 1 KiB scale rows. Write-through issues one strided transfer
+a call again.
+
+**Two conversations** (§16.10's driver, ten continuing turns a run): on the 27B at the default flags every arm gave
+0.51 / 0.51-0.52 / 0.68-0.70 s with no Host restore at all (KV pool 268,416 tokens); on Qwen3.8-Flash-Next Dense8
+1.86-2.02 / 1.98-2.00 / 2.05-3.86 s in both arms. Their queue wait (about 1.5 s on Flash-Next) is the other lane's
+call, which the binding still waits for. On the final build the 27B gave 0.50-0.51 / 0.52 / 0.68-0.70 s in all four
+runs; its cold 182K prompt took 48.24 and 48.73 s against 48.13 and 48.36 s for the control (48.53 and 48.36 s
+against 48.40 and 48.28 s on the earlier build), the GPU prefill time unchanged and the difference in device waits
+outside the prompt's own passes: a mean of +0.18 s (0.4 %) over the four treatment runs, overlapping the control's
+spread. The 96K prompt took 12.25-12.29 s in every run.
+
+**The prefill wait service on and off** (the final build, `INFERNIX_TMP_NO_PREFILL_WAIT_SERVICE=1` detaching it, the
+same two conversations, order off, on, on, off, off, on, on, off; the switch confirmed in each arm's startup log): the
+cold 182K prompt's first token came after 47.81, 48.37, 48.32 and 48.39 s without it and 48.60, 48.77, 48.37 and
+48.47 s with it, a mean of +0.33 s (0.7 %), three of the four above every run without it; its GPU prefill time was
+the same (32.20-32.44 s against 32.32-32.45 s) and the difference lay in the Engine's device waits (46.19-46.73 s
+against 46.79-47.12 s). The 96K prompt: 12.23 s against 12.25 s on average; continuing turns 0.50-0.53 s either way.
+So the service costs about 0.7 % of a cold prompt's prefill. Under KV pressure (the agentic replay, the switch passed
+through `AB_TREATMENT_ENV` and confirmed in each arm's log, order off, on, on, off): TTFT mean 1.26 and 1.28 s
+without it against 1.28 and 1.18 s with it; p90 3.16 and 4.50 s against 4.14 and 4.96 s; max 15.9 and 14.3 s
+against 14.4 and 16.8 s; wall 10.1 and 9.9 min against 12.3 and 11.5 min (the middle runs, but the middle runs of the
+replay below were the slowest with one configuration too, so the wall is not attributed); bindings 0.67 and 0.85 s
+in all against 0.52 and 0.45 s; prefetched blocks 3,038 and 3,099 against 9,807 and 8,107; preemptions 14 and 2
+against 1 and 0. It copied three times as much ahead of admission without a faster first token, so it was removed.
+
+**The agentic replay on the final build** (the same launch, order base, final, final, final, final, base; the two
+middle runs were meant to detach the service, but the replay runner passes a server only the `INFERNIX_TMP_*`
+switches its `AB_*_ENV` names, so all four ran with it): TTFT mean 1.38 and 1.28 s for the control against 1.20, 1.42,
+1.16 and 1.16 s; p90 4.32 and 3.78 s against 4.47, 5.40, 3.27 and 2.43 s; max 32.1 and 15.2 s against 12.2-20.3 s;
+wall 10.5 and 9.7 min against 9.8-12.3 min; preemptions 13 and 8 against 2, 16, 20 and 8. Bindings took 1.38 and
+1.22 s in all (22-23 over 10 ms, slowest 117-120 ms) against 0.40-0.56 s (7-12, 82-100 ms), and restores 10.1-12.4
+copy calls a block against 1.0-1.2. The binding gain holds; TTFT, wall and preemptions overlap the control's.
+
+**`--embedding-host` on the 35B-A3B** (two runs an arm): KV pool 852,928 → 899,456 tokens, continuing TTFT 0.30 s
+either way, cold prefill 0.5-0.8 % slower (96K tokens 7.22-7.24 s against 7.27-7.29 s; 182K 26.57-26.63 s
+against 26.72-26.73 s); on the 27B 0.3 % (§16.13's runs). It stays off by default.
+
+Checks on the committed build (the wait service removed): 27 CPU tests; the device test in every sync mode; the
+KV-cache test (a restore's record copy is one call); the native transaction test on three backends (a queued turn's
+history prefetched, its binding then restoring none of the 30 blocks the plain binding restored, tokens equal; the
+restore in 16-17 calls); the 27B hybrid-prefix, prefix, preemption (three backends), resume-against-cold and
+invariance tests; Flash-Next prefix-cache, preemption, resume-against-cold (MTP and DFlash2) and decide tests; the
+122B offloaded and 35B MoE tests. Flash-Next's resume-against-cold test had been run without its drafter arguments
+in the checks of 16.12 and 16.13, so it checked nothing there.
+
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 
 `Qwen4ExpForCausalLM` keeps every routed expert in pinned Host RAM and streams them into a Device
@@ -2755,7 +2883,7 @@ rules, measurements and the build record are in the
 | Configuration | `normalize_engine_options` resolves the Host tier per architecture (default the common 8 GiB, `kDefaultHybridHostCacheBytes`; 0 is refused), no Device snapshot slots (`--device-snapshot-slots` is refused), the common tap budget (8, ladder max(4096, 2 x chunk), gap max(1024, chunk)). A Qwen4Exp Engine runs with the cache or with the context cache disabled |
 | Snapshots | Host-born only: a capture reserves Host slabs and copies the lane's state image (GDN recurrent and conv state, PLE state, QSA tails, the MTP drafter's saved residual) and its partial page, one decoder layer at a time on the transfer stream; the next call of the lane waits per layer, and a page that returns to the pool while a capture still reads it (the lane's release, a block's eviction) orders the compute stream after that copy. Restores are one batch per admission on the restore stream, waited on per layer by the first call; a resume whose cached state reaches its paused frontier decodes without a call, so its binding orders the compute stream after the whole restore |
 | MTP drafter | Cells and anchors follow rules MR1-MR6 (design §19.3.1): blocks record `mtp_next`, snapshots `mtp_written`/`mtp_next`; a resume whose continuation differs rewrites the anchor's last cell in a private copy |
-| Admission | Two sources per request: the affordable snapshot chosen without a lane, then the root. `start_binding` re-selects for the actual lane (crediting a lane-resident snapshot) and returns no reservation when the choice changed, so the Engine falls back to the root; otherwise it reserves the prompt's pages plus one round, and later rounds grow the lane (design §19.3.13). A prefetch landing over the prompt's path is waited for before matching, and pending Host writes are drained before a cached source is given up (as §6.6). A blocked FIFO head's Host-only blocks are prefetched into free and Host-backed Device pages, never growing the pool into the expert frames (`RuntimeStats::hybrid_prefetched_blocks`). A fresh request whose prompt shares a prefix (media agreeing, as §12.2) with a lane still prefilling waits for that lane's snapshot at the divergence when the predicted wait is within half the queue timeout: an exact tap is planned there (splitting the lane's pending call) and published as a Boundary. Shortages are reclaimed by evicting unpinned cached Device blocks |
+| Admission | Two sources per request: the affordable snapshot chosen without a lane, then the root. `start_binding` re-selects for the actual lane (crediting a lane-resident snapshot) and returns no reservation when the choice changed, so the Engine falls back to the root; otherwise it reserves the prompt's pages plus one round, and later rounds grow the lane (design §19.3.13). A prefetch landing over the prompt's path is waited for before matching, and pending Host writes are drained before a cached source is given up (as §6.6). The FIFO head's and the next queued request's Host-only blocks are prefetched into free and Host-backed Device pages (the second only from blocks no queue hold names), never growing the pool into the expert frames (`RuntimeStats::hybrid_prefetched_blocks`). A fresh request whose prompt shares a prefix (media agreeing, as §12.2) with a lane still prefilling waits for that lane's snapshot at the divergence when the predicted wait is within half the queue timeout: an exact tap is planned there (splitting the lane's pending call) and published as a Boundary. Shortages are reclaimed by evicting unpinned cached Device blocks |
 | Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`): boundary exact taps (Explicit, Structural) always split; the generation opener and Automatic taps split only when the split adds at most 0.1 s of call cost (a CPU-served opener tail costs ~35 ms), else become flexible. Taps planned as boundaries (Explicit, Structural, coalescing, branch) are published as `SnapshotKind::Boundary`. A branch tap is an exact boundary tap where the prompt leaves its cached path (the end of its matched blocks), planned when that point is at least 1,024 tokens past the resume frontier (`kBranchTapMinTokens`): a client re-sending a long transcript with new content inserted before its end then resumes at the branch instead of the last chunk boundary (measured 2026-10-17, Dense8, 40K-token transcript, chunk 16,384: re-sent queries reuse 40,128 against 32,768 tokens, time to first token 0.6-1.1 s against 2.1-2.2 s, the first diverging query +0.6 s for the split; the agentic replay, seeds 42/43 at scale 0.5, keeps its cache hits: 84.6 against 84.5 % and 84.9 against 85.2 %). Unlike Qwen3.5's removed branch-point taps (§16.8), a Flash-Next prefill call has a large fixed cost (the expert stream), so re-prefilling the shared tokens after a chunk boundary costs nearly a full call. The opener is kept after endpoint resumes; a resume from an opener snapshot whose capturing request had resumed from an endpoint counts `endpoint_mismatch_fallbacks`. A tap whose capture the Host tier refuses for room is queued again as a flexible tap for the next call boundary (2026-11-15, as Qwen3.5's retry of §7.4); a resume from the request's own pause snapshot keeps the forward opener rule and starts no echo lineage |
 | Supersession | Unlike §9.3, a request's captures never supersede its own earlier ones: its first capture (tap or endpoint) supersedes the snapshot it resumed from and the endpoints it went past; its ladder taps, system-block boundary and the prompt's last tap stay retained and GDSF values them. In agentic replays the edits and loop-detection side calls diverge at exactly those taps: superseded first, a full Host tier evicted them before they were reused |
 | Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate. Without `free-cache-resume` (the reproducible route) every tap, coalescing point and resume frontier lies on the prefill-chunk grid (`ProgramImpl::resume_grid`), so a resumed prefill's calls are the cold prefill's: several prefill routes change their arithmetic with the call's width (model-quality.md §6.7) |

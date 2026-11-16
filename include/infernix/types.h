@@ -2375,11 +2375,12 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_block_writes       = 0;
     std::uint64_t hybrid_host_image_restores     = 0;
     std::uint64_t hybrid_host_block_restores     = 0;
-    // Of those, blocks copied for a waiting FIFO head before its admission.
+    // Of those, blocks copied for a queued request (the FIFO head or the one behind it) before its admission.
     std::uint64_t hybrid_prefetched_blocks       = 0;
     std::uint64_t hybrid_host_write_bytes        = 0;
     std::uint64_t hybrid_host_restore_bytes      = 0;
-    // The copy calls behind those bytes (Qwen3.5's Host tier; zero for other caches).
+    // The copy calls behind those bytes, a restore's each a batch of copies (Qwen3.5's Host tier; zero for other
+    // caches).
     std::uint64_t hybrid_host_write_copies       = 0;
     std::uint64_t hybrid_host_restore_copies     = 0;
     std::uint64_t hybrid_evicted_blocks          = 0;

@@ -635,9 +635,12 @@ public:
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // Evicts unpinned cached Device blocks until the shortage is covered; whether anything was freed.
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
-    // Copies the blocked FIFO head's Host-only blocks into spare Device cache while it waits: the
-    // blocks started (nullopt while a transaction or an earlier prefetch is in flight).
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    // Copies a queued request's Host-only blocks into spare Device cache while it waits: the
+    // blocks started (nullopt while a transaction or an earlier prefetch is in flight). With `spare_only` (a
+    // request that is not the next to bind) room is made only from free pages and cached blocks no queue hold
+    // names.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base,
+                                                               bool spare_only = false);
     // The Device pages a prefetch could fill now (free plus Host-backed cached).
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     // Holds the snapshot each queued request would resume from now, in admission order

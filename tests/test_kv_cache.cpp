@@ -569,8 +569,12 @@ int exercise_layout_and_transfer(infernix::DeviceContext& context, infernix::KVP
         const std::vector<infernix::DeviceKVPageHandle> record_handles = handles(from_records);
         destination.zero_pages(record_handles, context.stream);
         std::vector<const std::byte*> const_records(records.begin(), records.end());
-        destination.copy_from_host_records(const_records, {}, record_handles, host_layout,
-                                           context.stream);
+        // On a created stream a restore's copies, whatever its runs, are one batched driver call (pinned
+        // records are mapped for the device); the round trips below check what they wrote.
+        const std::uint32_t restore_calls = destination.copy_from_host_records(const_records, {}, record_handles,
+                                                                               host_layout, context.stream);
+        failures += expect(restore_calls == 1, label + " H2D record copies were " + std::to_string(restore_calls) +
+                                                   " calls, not one batch");
         std::optional<infernix::HostKVAllocation> record_roundtrip =
             host_arena.allocate(host_layout, 5);
         infernix::HostKVAllocationView record_view = host_arena.writable_view(*record_roundtrip);

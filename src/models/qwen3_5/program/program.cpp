@@ -418,8 +418,8 @@ bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
     return impl_->hybrid_reclaim(shortage);
 }
 
-std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
-    return impl_->hybrid_prefetch(base);
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base, bool spare_only) {
+    return impl_->hybrid_prefetch(base, spare_only);
 }
 
 std::uint32_t Program::hybrid_prefetch_room() const noexcept {

@@ -18,6 +18,8 @@
 
 namespace infernix {
 
+class CopyBatch;
+
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
 /**
@@ -293,7 +295,12 @@ public:
     // pinned allocation and within the device's maximum copy pitch: `record_groups` (empty, or
     // one id per record) names the allocation each record lies in, and records of different
     // groups, or further apart than the maximum pitch, are never joined into one run. Each returns
-    // the copy calls it issued.
+    // the copy calls it issued. copy_to_host_records issues one call a strided transfer;
+    // copy_from_host_records, on a stream other than the legacy default stream, enqueues its copies,
+    // one a page and plane (a page and head for a HeadMajor plane), as one batch (core/copy_batch.h),
+    // the host operands at the addresses the device maps them at: a loop of strided copies blocked
+    // the thread whenever the stream's copy queue was full, so a restore of 750 scattered 27B blocks
+    // held the Engine thread about the copies' own link time (100 ms), and ran at 15 GB/s against 24.
     std::uint32_t copy_to_host_records(std::span<const DeviceKVPageHandle> source,
                                        std::span<std::byte* const> records,
                                        std::span<const std::uint32_t> record_groups,
@@ -328,11 +335,14 @@ private:
     // One run of `count` consecutive physical pages from `first` whose host records advance by
     // host_pitch: a HeadMajor plane copies head by head (one strided transfer of the run per head)
     // or, when the run has fewer pages than the plane has heads and the head stride is within
-    // max_pitch, page by page (one strided transfer of the page's heads). Returns the copies issued.
+    // max_pitch, page by page (one strided transfer of the page's heads). Adds the transfers' rows to
+    // `batch` as plain copies, or, without a batch or for memory the driver does not map, issues each
+    // strided transfer as one call. Returns the calls it issued itself.
     std::uint32_t copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
                                 std::int32_t first, std::size_t count, std::byte* host_base,
                                 std::size_t host_pitch, std::size_t max_pitch,
-                                const HostKVPageLayout& host, cudaStream_t stream) const;
+                                const HostKVPageLayout& host, cudaStream_t stream,
+                                CopyBatch* batch) const;
     [[nodiscard]] static std::size_t host_record_run_end(std::span<const DeviceKVPageHandle> pages,
                                                          std::span<const std::byte* const> records,
                                                          std::span<const std::uint32_t> groups,

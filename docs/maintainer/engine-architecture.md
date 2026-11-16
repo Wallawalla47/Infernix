@@ -118,8 +118,8 @@ to compile instead of silently losing SSD polling, resizes or a periodic save.
 ### 2.3 HybridResourceManager
 
 The `HybridResourceManager` connects the Engine to the Program's prefix index: it asks for an admitted
-request's candidate sources, reclaims by evicting cached Device blocks, prefetches the blocked FIFO
-head's Host-only path, passes the queue for queue holds and publishes the cache statistics. Retention
+request's candidate sources, reclaims by evicting cached Device blocks, prefetches the queued requests'
+Host-only paths (the FIFO head's and the request's behind it), passes the queue for queue holds and publishes the cache statistics. Retention
 policy (the block tree, snapshots, taps and eviction) lives in the Program's index
 ([hybrid prefix cache](hybrid-prefix-cache-spec.md)).
 

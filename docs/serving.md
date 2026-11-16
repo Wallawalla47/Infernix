@@ -2563,9 +2563,10 @@ slots taken from another snapshot) and `device_slot_refusals` (slot requests ref
 `free_device_snapshot_slots` is an end-of-interval gauge. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
 Host-tier write-through and restores, and `host_write_copies` and `host_restore_copies` the copy
-calls that moved those bytes (many small copies queue behind other work on the copy engine; the
-Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts the restored blocks copied for a
-waiting FIFO head before its admission. `evicted_blocks` counts Device block evictions,
+calls that moved those bytes (a restore enqueues its copies in batches, one call a model layer's KV
+planes; the Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts
+the restored blocks copied for a queued request (the FIFO head or the request behind it) before its
+admission. `evicted_blocks` counts Device block evictions,
 `host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
 reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
 with no Host copy, which remove them and the blocks after them from the cache. With queue holds

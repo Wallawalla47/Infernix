@@ -741,7 +741,7 @@ std::uint32_t PrefixCacheIndex::lru_pop(std::uint8_t list_id) {
     return entry;
 }
 
-std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked) {
+std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked, bool unheld_only) {
     // Dead blocks first: no request can resume through them, so their pages are free room, while every
     // other copy is one a waiting or later request restores or recomputes.
     ++operations_.device_list_probes;
@@ -755,6 +755,7 @@ std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked) {
         const std::uint8_t unheld = lru_list(backed, kNoHold);
         ++operations_.device_list_probes;
         if (lru_[unheld].count != 0) { return lru_pop(unheld); }
+        if (unheld_only) { continue; }
         for (std::uint32_t rank = kMaxQueueHolds; rank-- > 0;) {
             const std::uint8_t list = lru_list(backed, static_cast<std::uint8_t>(rank));
             ++operations_.device_list_probes;
@@ -1043,10 +1044,18 @@ std::uint32_t PrefixCacheIndex::evict_backed_device_blocks(std::uint32_t blocks)
     return evict_device_entries(blocks, false);
 }
 
-std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool unbacked) {
+std::uint32_t PrefixCacheIndex::evict_unheld_backed_device_blocks(std::uint32_t blocks) {
+    return evict_device_entries(blocks, false, true);
+}
+
+std::uint32_t PrefixCacheIndex::device_unheld_backed_evictable_blocks() const noexcept {
+    return lru_[kLruDeadBacked].count + lru_[lru_list(true, kNoHold)].count;
+}
+
+std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool unbacked, bool unheld_only) {
     std::uint32_t released = 0;
     while (released < blocks) {
-        const std::uint32_t entry = lru_pop_victim(unbacked);
+        const std::uint32_t entry = lru_pop_victim(unbacked, unheld_only);
         if (entry == kNoId) { break; }
         if (entry < config_.max_nodes) {
             Node& node = nodes_[entry];

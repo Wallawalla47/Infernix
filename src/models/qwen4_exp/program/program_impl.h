@@ -7016,14 +7016,14 @@ private:
     // Whether a fresh prompt reusing `reuse` tokens should wait for a prefilling sibling's snapshot
     // inside their shared prefix; plans that snapshot as a boundary tap of the sibling when so.
     bool prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse);
-    // A restore batch prefetching a blocked head's blocks (none once it has landed).
+    // A restore batch prefetching a waiting request's blocks (none once it has landed).
     std::optional<prefix::RestoreTicket> prefetch_ticket_;
     [[nodiscard]] bool prefetch_landing() const noexcept {
         return prefetch_ticket_ && !prefix_->restore_events(*prefetch_ticket_).empty();
     }
 
 public:
-    std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base, bool spare_only);
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
                            std::span<const ResumeState* const> resumes);

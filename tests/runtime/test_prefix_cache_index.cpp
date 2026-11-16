@@ -1793,6 +1793,30 @@ void test_queue_holds() {
                 "backed-only eviction may take held copies but never an unbacked block");
         index.check_invariants();
     }
+    {
+        // Room for a request that is not the next to bind (a prefetch behind the queue head): only host-backed
+        // copies no queue hold names. Both conversations are backed; the held one keeps every Device copy.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64, 4), backend);
+        std::vector<std::vector<NodeRef>> paths;
+        const auto snaps = device_scenario(backend, index, paths);
+        for (const auto& path : paths) {
+            for (const NodeRef node : path) { backup_node(index, node); }
+        }
+        index.set_queue_holds(std::vector<SnapshotRef>{snaps[1]});
+        index.check_invariants();
+        const std::uint32_t unheld = index.device_unheld_backed_evictable_blocks();
+        require(unheld != 0 && unheld < index.device_backed_evictable_blocks(),
+                "the unheld count leaves out the held conversation's copies");
+        require(index.evict_unheld_backed_device_blocks(8) == unheld &&
+                    index.node(paths[0][0]).device == CopyState::Absent &&
+                    index.node(paths[1][0]).device == CopyState::Resident &&
+                    index.node(paths[1][1]).device == CopyState::Resident &&
+                    index.stats().held_device_evictions == 0 && index.device_unheld_backed_evictable_blocks() == 0,
+                "unheld-only eviction never takes a held copy");
+        require(index.evict_unheld_backed_device_blocks(8) == 0, "and stops there");
+        index.check_invariants();
+    }
 }
 
 // insert_block without attach pins an identical Host-only child but leaves its Device copy absent:

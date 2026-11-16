@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <vector>
@@ -41,31 +42,50 @@ public:
                                                 : ReclaimProgress::Blocked;
     }
 
-    // A blocked FIFO head's Host-only blocks are copied into spare Device cache while it waits
-    // (hybrid-prefix-cache-spec §6.6). Matching a long prompt walks its path, so a new attempt
-    // needs a new head, progress on the last attempt, or more room.
-    void prefetch_blocked_head(Program& program, const Base& base,
-                               std::uint64_t publication_order) {
+    // A queued request waiting to bind.
+    struct PrefetchTarget {
+        std::uint64_t id = 0;
+        const Base* base = nullptr;
+    };
+
+    // The queued requests' Host-only blocks are copied into spare Device cache while they wait
+    // (hybrid-prefix-cache-spec §6.6), in `targets` order: the FIFO head first, and a later one only from room
+    // no waiting request's blocks hold. One batch is in flight at a time, so the first target with blocks
+    // left to copy takes it. Matching a long prompt walks its path, so a target is tried again only after
+    // progress on its last attempt or with more room.
+    void prefetch_waiting(Program& program, std::span<const PrefetchTarget> targets) {
         if (program.has_context_transaction()) { return; }
-        if (publication_order == prefetch_order_ && !prefetch_retry_ &&
-            program.hybrid_prefetch_room() <= prefetch_room_) {
-            return;
+        std::erase_if(prefetch_, [&](const PrefetchState& state) {
+            return std::none_of(targets.begin(), targets.end(),
+                                [&](const PrefetchTarget& target) { return target.id == state.id; });
+        });
+        prefetch_retry_ = false;
+        for (std::size_t rank = 0; rank < targets.size(); ++rank) {
+            const PrefetchTarget& target = targets[rank];
+            auto state = std::find_if(prefetch_.begin(), prefetch_.end(),
+                                      [&](const PrefetchState& entry) { return entry.id == target.id; });
+            if (state == prefetch_.end()) {
+                prefetch_.push_back(PrefetchState{.id = target.id});
+                state = std::prev(prefetch_.end());
+            } else if (!state->retry && program.hybrid_prefetch_room() <= state->room) {
+                continue;
+            }
+            const std::optional<std::uint32_t> started =
+                program.hybrid_prefetch(*target.base, rank != 0);
+            // A prefetch still in flight, or one that copied blocks, may leave more to copy.
+            state->retry = !started || *started != 0;
+            state->room  = program.hybrid_prefetch_room();
+            if (state->retry) {
+                prefetch_retry_ = true;
+                break;
+            }
         }
-        const std::optional<std::uint32_t> started = program.hybrid_prefetch(base);
-        prefetch_order_                            = publication_order;
-        // A prefetch still in flight, or one that copied blocks, may leave more to copy.
-        prefetch_retry_ = !started || *started != 0;
-        prefetch_room_  = program.hybrid_prefetch_room();
     }
 
-    // Whether the last attempt left more to copy (a batch in flight, or one that copied blocks): the Engine
-    // then asks again each cycle while the same request heads the queue, so a head that waits through long
-    // decodes has its whole Host-only path copied, not one batch per admission event. One flag read a cycle
-    // otherwise.
+    // Whether the last pass left more to copy (a batch in flight, or one that copied blocks): the Engine then
+    // asks again each cycle, so a request that waits through long decodes has its whole Host-only path copied,
+    // not one batch per admission event. One flag read a cycle otherwise.
     [[nodiscard]] bool prefetch_continues() const noexcept { return prefetch_retry_; }
-    [[nodiscard]] std::uint64_t prefetch_head() const noexcept { return prefetch_order_; }
-    // The head it served left the queue's front (admitted, cancelled, expired): nothing more to copy for it.
-    void prefetch_forget() noexcept { prefetch_retry_ = false; }
 
     void populate_runtime_stats(Program& program, RuntimeStats& out) const noexcept {
         const auto hybrid              = program.hybrid_stats();
@@ -171,10 +191,14 @@ public:
     }
 
 private:
-    // The last prefetch attempt: the head it served, whether to try again and the room it left.
-    std::uint64_t prefetch_order_ = 0;
-    bool prefetch_retry_          = false;
-    std::uint32_t prefetch_room_  = 0;
+    // The last prefetch attempt for each current target: whether to try again and the room it left.
+    struct PrefetchState {
+        std::uint64_t id   = 0;
+        bool retry         = false;
+        std::uint32_t room = 0;
+    };
+    std::vector<PrefetchState> prefetch_;
+    bool prefetch_retry_ = false;
     // The queue and snapshot epoch the current holds were computed for.
     std::vector<std::uint64_t> hold_ids_;
     std::uint64_t hold_epoch_ = 0;
