@@ -154,7 +154,7 @@ int run(const Options& options) {
     execution.allow_prefix_reuse      = false;
     auto request_base                 = program->plan_request(std::move(prompt), execution);
     // Prefix reuse is off, so the only source is a root start.
-    const auto sources = program->hybrid_sources(request_base, UINT32_MAX);
+    const auto sources = program->hybrid_sources(request_base, nullptr);
     if (sources.empty() ||
         !program->start_binding(request_base, infernix::runtime::LaneId{0}, sources.front())) {
         throw std::runtime_error("benchmark root binding could not reserve its first unit");
