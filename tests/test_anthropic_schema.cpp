@@ -1731,6 +1731,183 @@ int test_client_tool_references() {
     return failures;
 }
 
+// Anthropic mid-conversation system messages that change tools (tool_addition / tool_removal): the shape Claude Code
+// 2.1.325 sends for claude.ai connector tools (Strata #5952: an inline tool_definition of a name not in `tools`,
+// cache_control on the block), references, removals, redefinitions, and their effect on the output contract.
+int test_mid_conversation_tool_changes() {
+    int failures         = 0;
+    const Json docs_tool = Json{{"name", "mcp__claude_ai_Docs__batch"},
+                                {"description", "Batch edits"},
+                                {"input_schema", Json{{"type", "object"}, {"properties", Json::object()}}}};
+    const auto conversation = [](Json system_content) {
+        return Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                            Json{{"role", "system"}, {"content", std::move(system_content)}},
+                            Json{{"role", "assistant"}, {"content", "Ready."}},
+                            Json{{"role", "user"}, {"content", "use the batch tool"}}});
+    };
+    const auto inline_addition = [&](Json definition) {
+        return Json{{"type", "tool_addition"},
+                    {"tool", Json{{"type", "tool_definition"}, {"definition", std::move(definition)}}},
+                    {"cache_control", Json{{"type", "ephemeral"}, {"ttl", "1h"}}}};
+    };
+    const auto reference = [](const char* type, std::string name) {
+        return Json{{"type", type}, {"tool", Json{{"type", "tool_reference"}, {"name", std::move(name)}}}};
+    };
+
+    // 1. An inline definition of a new name: shown where the message stands, contract-only, cached after it.
+    Json body        = base_request();
+    body["tools"]    = Json::array({ordinary_tool()});
+    body["messages"] = conversation(Json::array({inline_addition(docs_tool)}));
+    const std::string docs_name = "mcp__claude_ai_Docs__batch";
+    GenerationRequest request   = parse(body).generation;
+    const auto added = std::find_if(request.tools.begin(), request.tools.end(),
+                                    [&](const ToolDefinition& tool) { return tool.name == docs_name; });
+    failures += check(added != request.tools.end() && added->deferred && added->shown_in_messages &&
+                          request.tool_contract_changes.empty(),
+                      "an inline tool_addition was not declared as a contract-only tool");
+    failures += check(request.messages.size() == 4 && request.messages[1].role == infernix::ChatRole::System &&
+                          request.messages[1].loaded_tools.size() == 1 &&
+                          request.messages[1].loaded_tools[0].name == docs_name &&
+                          request.messages[1].cache_boundary_after.has_value(),
+                      "an inline tool_addition was not shown where its system message stands");
+    infernix::PromptInput translated = prompt(request);
+    failures += check(translated.options.tool_jsons.size() == 1 && translated.options.deferred_tool_jsons.size() == 1 &&
+                          translated.options.deferred_tool_jsons[0].find("mcp__claude_ai_Docs__batch") !=
+                              std::string::npos &&
+                          translated.options.withdrawn_tool_names.empty(),
+                      "an inline tool changed the tool section or missed the output contract");
+    const auto counted = parse_anthropic_count_tokens_request(body, limits()).generation;
+    failures += check(counted.messages.size() == request.messages.size() && counted.tools.size() == request.tools.size(),
+                      "count_tokens lowered a tool_addition differently");
+    // Every top-level tool may be deferred when the messages add tools. The templates give the call format only in
+    // the tool section, so with no tool listed the shown tools are listed there instead of in their message.
+    Json all_deferred     = body;
+    all_deferred["tools"] = Json::array({deferred_tool("get_forecast", "Weather forecast")});
+    const GenerationRequest promoted = parse(all_deferred).generation;
+    const infernix::PromptInput promoted_prompt = prompt(promoted);
+    failures += check(promoted_prompt.options.tool_jsons.size() == 1 &&
+                          promoted_prompt.options.tool_jsons[0].find(docs_name) != std::string::npos &&
+                          promoted_prompt.options.deferred_tool_jsons.size() == 1 && promoted.messages.size() == 3 &&
+                          std::none_of(promoted.messages.begin(), promoted.messages.end(),
+                                       [](const ChatTurn& turn) { return !turn.loaded_tools.empty(); }),
+                      "with no listed tool, an added tool was not listed in the tool section");
+    // ... and a declared deferred tool the history redefines is listed as its newer definition.
+    Json redefined_deferred = all_deferred;
+    Json newer              = deferred_tool("get_forecast", "Weather forecast");
+    newer.erase("defer_loading");
+    newer["input_schema"]["properties"]["units"] = Json{{"type", "string"}};
+    redefined_deferred["messages"] = conversation(Json::array({inline_addition(newer)}));
+    const GenerationRequest redefined_request    = parse(redefined_deferred).generation;
+    const infernix::PromptInput redefined_prompt = prompt(redefined_request);
+    failures += check(redefined_prompt.options.tool_jsons.size() == 1 &&
+                          redefined_prompt.options.tool_jsons[0].find("units") != std::string::npos &&
+                          redefined_prompt.options.deferred_tool_jsons.empty() &&
+                          redefined_prompt.options.withdrawn_tool_names.empty() &&
+                          redefined_request.tool_contract_changes.empty(),
+                      "a promoted redefinition listed the older definition");
+    Json no_tools = body;
+    no_tools.erase("tools");
+    failures += check(prompt(parse(no_tools).generation).options.tool_jsons.size() == 1,
+                      "a request whose only tool is added in the messages has no tool section");
+    // The added tool called later in the history, and the conversation going on.
+    Json called        = body;
+    called["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"role", "system"}, {"content", Json::array({inline_addition(docs_tool)})}},
+         Json{{"role", "assistant"},
+              {"content", Json::array({Json{{"type", "tool_use"}, {"id", "toolu_docs"}, {"name", docs_name},
+                                            {"input", Json::object()}}})}},
+         Json{{"role", "user"},
+              {"content", Json::array({Json{{"type", "tool_result"}, {"tool_use_id", "toolu_docs"}, {"content", "done"}}})}}});
+    called["tool_choice"] = Json{{"type", "tool"}, {"name", docs_name}};
+    const GenerationRequest called_request = parse(called).generation;
+    failures += check(called_request.messages.size() == 4 && called_request.has_tool_history() &&
+                          prompt(called_request).options.deferred_tool_jsons.size() == 1,
+                      "a call to an added tool in the history, or tool_choice naming it, was refused");
+
+    // 2. Errors: an unresolved reference, an MCP reference, cache_control on the block and its definition.
+    body["messages"] = conversation(Json::array({reference("tool_addition", "missing")}));
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_reference_unresolved",
+                      "a tool_addition reference to an undeclared tool was accepted");
+    body["messages"] = conversation(
+        Json::array({Json{{"type", "tool_addition"},
+                          {"tool", Json{{"type", "mcp_tool_reference"}, {"server_name", "s"}, {"name", "t"}}}}}));
+    failures += check(api_code([&] { (void)parse(body); }) == "mcp_servers_not_supported",
+                      "an MCP tool reference was accepted without an MCP client");
+    Json cached_definition           = docs_tool;
+    cached_definition["cache_control"] = Json{{"type", "ephemeral"}};
+    body["messages"]                 = conversation(Json::array({inline_addition(cached_definition)}));
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_cache_control",
+                      "cache_control on both a tool_addition block and its definition was accepted");
+
+    // 3. Removing a listed tool: the prompt keeps listing it, the contract drops it, a line says so; tool_choice may
+    //    no longer force it.
+    body["messages"] = conversation(Json::array({reference("tool_removal", "weather")}));
+    request          = parse(body).generation;
+    translated       = prompt(request);
+    failures += check(request.tool_contract_changes.size() == 1 && request.tool_contract_changes[0].name == "weather" &&
+                          !request.tool_contract_changes[0].definition && translated.options.tool_jsons.size() == 1 &&
+                          translated.options.withdrawn_tool_names == std::vector<std::string>{"weather"} &&
+                          request.messages[1].content.size() == 1 &&
+                          request.messages[1].content[0].text ==
+                              "The following functions are no longer available: weather.",
+                      "a tool_removal of a listed tool was not withdrawn from the contract only");
+    Json forced           = body;
+    forced["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
+    failures += check(api_param([&] { (void)parse(forced); }) == "tool_choice",
+                      "tool_choice could force a tool the conversation removed");
+    forced["tool_choice"] = Json{{"type", "any"}};
+    failures += check(api_param([&] { (void)parse(forced); }) == "tool_choice",
+                      "tool_choice any was accepted with every tool removed");
+
+    // 4. Removed, then offered again by reference: no change at the end; a removal and re-addition in one message
+    //    cancel out and render nothing.
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                                    Json{{"role", "system"}, {"content", Json::array({reference("tool_removal", "weather")})}},
+                                    Json{{"role", "assistant"}, {"content", "Ok."}},
+                                    Json{{"role", "user"}, {"content", "and now?"}},
+                                    Json{{"role", "system"}, {"content", Json::array({reference("tool_addition", "weather")})}}});
+    request = parse(body).generation;
+    failures += check(request.tool_contract_changes.empty() && request.messages.back().role == infernix::ChatRole::System &&
+                          request.messages.back().loaded_tools.size() == 1,
+                      "a removed tool offered again was not restored");
+    body["messages"] = conversation(
+        Json::array({reference("tool_removal", "weather"), reference("tool_addition", "weather")}));
+    request = parse(body).generation;
+    failures += check(request.messages.size() == 3 && request.tool_contract_changes.empty(),
+                      "a system message whose tool changes cancel out rendered a turn");
+
+    // 5. Another definition under a listed tool's name: shown, and the contract takes it in the listed one's place.
+    Json redefined                  = ordinary_tool();
+    redefined["input_schema"]["properties"]["units"] = Json{{"type", "string"}};
+    redefined.erase("strict");
+    body["messages"] = conversation(Json::array(
+        {Json{{"type", "tool_addition"}, {"tool", Json{{"type", "tool_definition"}, {"definition", redefined}}}}}));
+    request    = parse(body).generation;
+    translated = prompt(request);
+    failures += check(request.tool_contract_changes.size() == 1 && request.tool_contract_changes[0].definition &&
+                          translated.options.withdrawn_tool_names == std::vector<std::string>{"weather"} &&
+                          translated.options.deferred_tool_jsons.size() == 1 &&
+                          translated.options.deferred_tool_jsons[0].find("units") != std::string::npos &&
+                          request.messages[1].loaded_tools.size() == 1,
+                      "a redefined listed tool did not replace its declaration in the output contract");
+
+    // 6. An effort-only system message may follow an assistant turn; it sets the reply's effort and renders nothing.
+    body             = base_request();
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                                    Json{{"role", "assistant"}, {"content", "Hello."}},
+                                    Json{{"role", "user"}, {"content", "think harder"}},
+                                    Json{{"role", "system"}, {"content", ""}, {"output_config", Json{{"effort", "low"}}}}});
+    request = parse(body).generation;
+    failures += check(request.messages.size() == 3 && request.reasoning_effort == RequestedReasoningEffort::Low,
+                      "an effort-only system message was refused, rendered or ignored");
+    body["messages"][3]["content"] = "an instruction";
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_message_order" ||
+                          !api_code([&] { (void)parse(body); }).empty(),
+                      "output_config on a system message with content was accepted");
+    return failures;
+}
+
 GenerationOutcome search_round_outcome() {
     GenerationOutcome outcome;
     outcome.reasoning         = "I need a forecast tool.";
@@ -2291,6 +2468,7 @@ int main() {
     failures += test_auto_mode_server_review_safeguards_body();
     failures += test_deferred_tool_declarations();
     failures += test_client_tool_references();
+    failures += test_mid_conversation_tool_changes();
     failures += test_tool_search_execution();
     failures += test_tool_search_round_trip();
     failures += test_multi_round_cache_creation();

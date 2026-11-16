@@ -419,7 +419,8 @@ void prepare_strict_parameters(Contract::Tool& tool) {
 std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons,
                                 std::span<const std::string> deferred_tool_jsons, bool open_names,
-                                bool declared_parameter_names) {
+                                bool declared_parameter_names,
+                                std::span<const std::string> withdrawn_tool_names) {
     const std::size_t count = tool_jsons.size() + deferred_tool_jsons.size();
     if (count == 0) return {};
     auto result                      = std::make_shared<Contract>();
@@ -435,6 +436,12 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons,
             const auto& function    = declaration.at("function");
             Contract::Tool tool;
             tool.name = function.at("name").get<std::string>();
+            // A listed declaration the conversation withdrew or redefined leaves the contract (its index still
+            // counts, so error paths keep naming the request's own declaration).
+            if (i < tool_jsons.size() &&
+                std::find(withdrawn_tool_names.begin(), withdrawn_tool_names.end(), tool.name) !=
+                    withdrawn_tool_names.end())
+                continue;
             if (tool.name.empty() || !names.insert(tool.name).second)
                 fail("tool names must be nonempty and unique", "/" + std::to_string(i));
             tool.strict = function.value("strict", false);
@@ -462,6 +469,7 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons,
             fail(std::string("invalid tool declaration: ") + error.what(), "/" + std::to_string(i));
         }
     }
+    if (result->tools.empty()) return {}; // every declaration was withdrawn
     return result;
 }
 

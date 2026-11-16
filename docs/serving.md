@@ -1443,7 +1443,29 @@ blocks, Thinking history, tool-use history, tool results, user-defined tools, ag
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
 Mid-conversation System messages retain their text and input position; where the active chat
 template rejects them there, Infernix instead renders them under the User role (role only, never
-text or position). A final Assistant message
+text or position). As in the Anthropic API, a System message with content follows a User message
+(or an Assistant message ending in a server tool's result) and ends `messages` or precedes an
+Assistant message; an empty one that only sets `output_config.effort` may follow any turn, renders
+nothing and sets the reply's effort (the latest one wins over the top-level value).
+
+Mid-conversation tool changes: a System message may also carry `tool_addition` and `tool_removal`
+blocks (Anthropic's `mid-conversation-tool-changes` / `inline-tools` betas; the headers are not
+required). `tool_addition` takes a `tool_reference` to a tool in `tools` (a deferred one is shown
+from there on, a removed one offered again) or a `tool_definition` holding a custom tool entry,
+which declares or redefines that tool from there on; `tool_removal` takes a `tool_reference` and
+withdraws the tool from there on. Each message shows its net change where it stands: added or
+redefined definitions as the loaded-tools block that tool search results use, withdrawn tools as one
+line naming them. The tool section and every earlier turn keep their tokens, so the prefix cache
+still hits. The output contract takes the tools as at the end of the history: a tool defined by
+value joins it as a deferred declaration, a withdrawn one leaves it (the tool section still lists a
+withdrawn listed tool, as the conversation saw it), and a redefined one is constrained by its newer
+definition. `tool_choice` may name a tool the history defines and may not force one it withdrew.
+With a `tool_addition` in the messages, every top-level tool may be deferred. `cache_control` on a
+tool block (or its definition, not both) is a breakpoint after the System message. Refused:
+`tool_reference_unresolved` for a name in neither `tools` nor an earlier definition,
+`tool_name_conflict` for a definition under a server tool's name, `mcp_servers_not_supported` for
+MCP references and toolsets, `invalid_cache_control` for a deferred definition with a breakpoint.
+Turn-scoped messages (`clear_at`) are not interpreted. A final Assistant message
 is an Assistant prefill: generation continues its existing text instead of opening another turn.
 Assistant prefill cannot contain media and cannot start with Thinking enabled; a turn cut by the
 output limit may carry reasoning content. It cannot carry `tool_use` blocks: every `tool_use`

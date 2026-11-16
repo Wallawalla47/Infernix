@@ -603,8 +603,35 @@ void undeclared_parameters() {
             "a streamed call's undeclared parameter was not counted as a schema mismatch");
 }
 
+// PromptOptions::withdrawn_tool_names (Anthropic mid-conversation tool changes): a withdrawn listed declaration
+// leaves the contract, a deferred declaration may then take its name (a redefinition), and a contract every
+// declaration of which is withdrawn is none at all.
+void withdrawn_declarations() {
+    const auto declaration = [](const char* name, Json parameters) {
+        return Json{{"type", "function"}, {"function", {{"name", name}, {"parameters", std::move(parameters)}}}}.dump();
+    };
+    const std::vector<std::string> listed{declaration("weather", schema({{"type", "string"}})),
+                                          declaration("docs", schema({{"type", "string"}}))};
+    const std::vector<std::string> redefinition{declaration("weather", schema({{"type", "integer"}}))};
+    const std::vector<std::string> withdrawn{"weather"};
+    const auto contract = frontend::build_tool_call_output_contract(listed, redefinition, false, false, withdrawn);
+    require(contract && contract->tools.size() == 2 && contract->tools[0].name == "docs" &&
+                contract->tools[1].name == "weather" && contract->tools[1].declaration_index == 2 &&
+                contract->tools[1].schema_json.find("integer") != std::string::npos,
+            "a withdrawn listed declaration stayed in the contract or its redefinition was lost");
+    bool duplicate = false;
+    try {
+        (void)frontend::build_tool_call_output_contract(listed, redefinition);
+    } catch (const std::exception&) { duplicate = true; }
+    require(duplicate, "a deferred declaration took a listed name that was not withdrawn");
+    const std::vector<std::string> both{"weather", "docs"};
+    require(!frontend::build_tool_call_output_contract(listed, {}, false, false, both),
+            "a contract whose declarations were all withdrawn was not empty");
+}
+
 void run() {
     auto compiled = compiler();
+    withdrawn_declarations();
     undeclared_parameters();
     basic_contracts(compiled);
     selected_contracts(compiled);

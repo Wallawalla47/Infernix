@@ -78,7 +78,8 @@ struct ToolCallOutputContract {
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons,
                                 std::span<const std::string> deferred_tool_jsons = {},
-                                bool open_names = false, bool declared_parameter_names = false);
+                                bool open_names = false, bool declared_parameter_names = false,
+                                std::span<const std::string> withdrawn_tool_names = {});
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,

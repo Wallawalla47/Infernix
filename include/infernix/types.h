@@ -1334,6 +1334,11 @@ struct PromptOptions {
     // constraints cover them after tool_jsons, in this order, while the template's tool section
     // omits them; a message that loads one carries its definition in its own content.
     std::vector<std::string> deferred_tool_jsons;
+    // Names of listed declarations (tool_jsons) the output contract leaves out: tools the conversation withdrew or
+    // redefined after the tool section listed them (Anthropic tool_removal / tool_addition in a mid-conversation
+    // system message). The tool section still lists them as the conversation first saw them; a redefinition's newer
+    // declaration is in deferred_tool_jsons under the same name.
+    std::vector<std::string> withdrawn_tool_names;
     // The client knows tools the request does not declare (it defers tools behind its own search, as
     // Claude Code does with its MCP tools): a well-formed call to an undeclared name stays a call for
     // the client to judge instead of turning into text. The prompt does not change.

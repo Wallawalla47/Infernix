@@ -97,8 +97,19 @@ struct ToolDefinition {
     // A deferred tool is declared for parsing and constraints but left out of the prompt's tool
     // list; the model sees its definition only where a later turn loads it (ChatTurn::loaded_tools).
     bool deferred = false;
+    // Declared by an Anthropic mid-conversation tool_addition without defer_loading: the model saw it where it was
+    // added (`deferred` is set as well, so the tool section never lists it), so a server tool search does not offer
+    // it again.
+    bool shown_in_messages = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
+};
+
+// A declared tool an Anthropic conversation withdrew (tool_removal) or redefined (a tool_addition of another
+// definition), as at the end of its history: `definition` is the newer one, nullopt a withdrawal.
+struct ToolContractChange {
+    std::string name;
+    std::optional<ToolDefinition> definition;
 };
 
 struct ToolCall {
@@ -198,6 +209,10 @@ struct GenerationRequest {
     NgramSessionHints ngram_session;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
+    // Declared tools the conversation withdrew or redefined after declaring them (Anthropic mid-conversation
+    // system messages). The prompt keeps every declaration where the conversation saw it; the output contract
+    // follows these (translate.cpp contract_declarations).
+    std::vector<ToolContractChange> tool_contract_changes;
     // The client knows tools it does not declare (Anthropic Messages with a deferred tool and no
     // server tool search: Claude Code's MCP tools, listed by name only): infernix::PromptOptions::open_tool_names.
     bool open_tool_names = false;

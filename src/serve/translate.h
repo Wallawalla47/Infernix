@@ -51,8 +51,19 @@ std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest&
 // replayed by a later request renders the same tokens.
 std::string render_loaded_tools(std::span<const ToolDefinition> tools);
 
-// Each declaration's protocol schema path in Engine declaration order (listed tools, then deferred
-// ones), for mapping an Engine tool-schema error back to the request.
+// The output contract's declarations in Engine declaration order: the listed tools in request order (each also
+// renders in the prompt's tool section; `withdrawn` names those the conversation withdrew or redefined, which the
+// contract leaves out), then the contract-only ones: deferred declarations in request order (a withdrawn one left
+// out, a redefined one as its newer definition), then the newer definitions of redefined listed tools.
+struct ContractDeclarations {
+    std::vector<const ToolDefinition*> listed;
+    std::vector<std::string> withdrawn;
+    std::vector<const ToolDefinition*> deferred;
+};
+ContractDeclarations contract_declarations(const GenerationRequest& req);
+
+// Each declaration's protocol schema path in Engine declaration order (contract_declarations), for mapping an
+// Engine tool-schema error back to the request.
 std::vector<std::string> tool_declaration_params(const GenerationRequest& req);
 
 // Build public request options (output budget, thinking, stop policy, sampler). The

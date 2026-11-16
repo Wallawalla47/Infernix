@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
@@ -229,10 +230,50 @@ struct ParsedMessage {
     std::vector<AssistantRound> rounds; // Assistant messages: at least one
 };
 
-// The request state history lowering resolves against: declared tools and search tools.
+// Anthropic mid-conversation tool changes: tool_addition and tool_removal blocks in role "system" messages
+// (platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages), applied in message order.
+// The prompt shows each message's net change where the message stands (added or redefined tools as the loaded-
+// tools block, withdrawn ones as one line), so every earlier turn keeps its tokens and the tool section never
+// changes; the output contract takes the state at the end of the history (finalize).
+class ToolTimeline {
+public:
+    ToolTimeline(const GenerationRequest& request, const std::vector<AnthropicToolSearch>& searches)
+        : request_(request), searches_(searches) {}
+
+    // A content system message: its text blocks, then its net tool change. `index` is its position in messages.
+    [[nodiscard]] ChatTurn system_message(const Json& content, std::size_t index);
+    // The definition `name` has at this point when a tool_addition defined or redefined it; nullptr otherwise.
+    [[nodiscard]] const ToolDefinition* current(const std::string& name) const;
+    // The contract changes of declared tools and the declarations of tools the history added by value.
+    void finalize(GenerationRequest& request) const;
+
+private:
+    struct State {
+        const ToolDefinition* declared = nullptr; // its `tools` entry; null: added by value in the history
+        ToolDefinition definition;                // the definition from here on (kept while withdrawn)
+        bool withdrawn = false;
+        bool shown     = false; // the model has it at this point (listed, or shown by a message)
+        bool redefined = false; // definition differs from the declaration
+        bool shown_when_added = false; // added by value without defer_loading
+    };
+    State* find(const std::string& name);
+    State& reference(const Json& tool, const char* block);
+
+    const GenerationRequest& request_;
+    const std::vector<AnthropicToolSearch>& searches_;
+    std::deque<std::pair<std::string, State>> states_; // first-touch order; a deque keeps State addresses
+};
+
+const ToolDefinition* timeline_definition(const ToolTimeline* timeline, const std::string& name) {
+    return timeline != nullptr ? timeline->current(name) : nullptr;
+}
+
+// The request state history lowering resolves against: declared tools, search tools, and the tool changes of
+// mid-conversation system messages seen so far.
 struct LoweringContext {
     const GenerationRequest& request;
     const std::vector<AnthropicToolSearch>& searches;
+    ToolTimeline* timeline = nullptr;
 
     [[nodiscard]] bool is_search_tool(std::string_view name) const {
         return std::any_of(searches.begin(), searches.end(),
@@ -240,8 +281,9 @@ struct LoweringContext {
     }
 };
 
-const ToolDefinition& referenced_tool(const GenerationRequest& request, const std::string& name) {
-    for (const ToolDefinition& tool : request.tools) {
+const ToolDefinition& referenced_tool(const LoweringContext& context, const std::string& name) {
+    if (const ToolDefinition* current = timeline_definition(context.timeline, name)) { return *current; }
+    for (const ToolDefinition& tool : context.request.tools) {
         if (tool.name == name) { return tool; }
     }
     bad_request("Tool reference '" + name + "' not found in available tools", "messages",
@@ -279,7 +321,7 @@ std::string require_tool_history_id(const Json& object, const char* key,
 // tool_reference blocks (a client-side tool search) load the referenced definitions after the
 // result's text and images instead of standing at their own position.
 std::vector<ContentPart> parse_tool_result_content(const Json& block,
-                                                   const GenerationRequest& request,
+                                                   const LoweringContext& context,
                                                    std::vector<ToolDefinition>& loaded) {
     if (!block.contains("content") || block.at("content").is_null()) { return {text_part({})}; }
     const Json& content = block.at("content");
@@ -296,7 +338,7 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block,
         } else if (type == "image") {
             result.push_back(parse_image(part));
         } else if (type == "tool_reference") {
-            load_tool(loaded, referenced_tool(request, require_tool_reference_name(part)));
+            load_tool(loaded, referenced_tool(context, require_tool_reference_name(part)));
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
@@ -317,10 +359,10 @@ ToolCall parse_tool_use(const Json& block) {
     return call;
 }
 
-ParsedToolResult parse_tool_result(const Json& block, const GenerationRequest& request) {
+ParsedToolResult parse_tool_result(const Json& block, const LoweringContext& context) {
     ParsedToolResult result;
     result.tool_use_id = require_tool_history_id(block, "tool_use_id", "tool_result block");
-    result.content     = parse_tool_result_content(block, request, result.loaded_tools);
+    result.content     = parse_tool_result_content(block, context, result.loaded_tools);
     if (block.contains("is_error") && !block.at("is_error").is_null()) {
         if (!block.at("is_error").is_boolean()) {
             bad_request("tool_result.is_error must be a boolean", "messages");
@@ -343,7 +385,7 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content,
         } else if (type == "image") {
             result.emplace_back(parse_image(block));
         } else if (type == "tool_result") {
-            result.emplace_back(parse_tool_result(block, context.request));
+            result.emplace_back(parse_tool_result(block, context));
         } else if (type == "tool_reference") {
             bad_request("tool_reference blocks are valid only inside a tool_result", "messages",
                         "content_block_not_supported");
@@ -975,6 +1017,14 @@ void lower_tool_result(GenerationRequest& request, ParsedToolResult result) {
 void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& request) {
     for (ParsedMessage& message : messages) {
         if (message.role == ChatRole::System) {
+            // A message whose tool changes cancel out renders nothing; its cache breakpoint moves to the turn before.
+            if (message.turn.content.empty() && message.turn.loaded_tools.empty()) {
+                if (message.turn.cache_boundary_after && !request.messages.empty() &&
+                    !request.messages.back().cache_boundary_after) {
+                    request.messages.back().cache_boundary_after = message.turn.cache_boundary_after;
+                }
+                continue;
+            }
             merge_turn(request, std::move(message.turn));
             continue;
         }
@@ -1006,7 +1056,28 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
     }
 }
 
-void parse_messages(const Json& body, GenerationRequest& request, const LoweringContext& context) {
+// An empty system message that only sets output_config.effort from that point (Anthropic's per-message effort): it
+// may follow any turn and renders nothing.
+bool is_effort_only_system_message(const Json& item) {
+    if (!item.contains("output_config") || item.at("output_config").is_null()) { return false; }
+    const Json& content = item.at("content");
+    return (content.is_string() && content.get_ref<const std::string&>().empty()) ||
+           (content.is_array() && content.empty());
+}
+
+// An assistant message whose last block is a server tool's result (a system message may follow it).
+bool ends_in_server_tool_result(const Json& item) {
+    const Json& content = item.at("content");
+    if (!content.is_array() || content.empty() || !content.back().is_object() || !content.back().contains("type") ||
+        !content.back().at("type").is_string()) {
+        return false;
+    }
+    const std::string& type = content.back().at("type").get_ref<const std::string&>();
+    return type != "tool_result" && type.ends_with("_tool_result");
+}
+
+void parse_messages(const Json& body, GenerationRequest& request, const LoweringContext& context,
+                    std::optional<RequestedReasoningEffort>& message_effort) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -1015,6 +1086,7 @@ void parse_messages(const Json& body, GenerationRequest& request, const Lowering
 
     std::vector<ChatRole> roles;
     roles.reserve(messages.size());
+    std::vector<bool> effort_only(messages.size(), false);
     for (std::size_t index = 0; index < messages.size(); ++index) {
         const Json& item = messages[index];
         if (!item.is_object() || !item.contains("role") || !item.at("role").is_string()) {
@@ -1034,19 +1106,35 @@ void parse_messages(const Json& body, GenerationRequest& request, const Lowering
         if (!item.contains("content") || item.at("content").is_null()) {
             bad_request("each message must contain content", "messages");
         }
+        if (item.contains("output_config") && !item.at("output_config").is_null()) {
+            if (roles.back() != ChatRole::System || !is_effort_only_system_message(item)) {
+                bad_request("output_config is valid only on a system message with empty content", "messages");
+            }
+            effort_only[index] = true;
+        }
     }
 
+    // Content system messages (text, tool_addition, tool_removal) follow a user message or an assistant message
+    // that ends in a server tool result, and end the messages or precede an assistant message; a run of system
+    // messages is judged together, and effort-only ones may stand anywhere.
     for (std::size_t index = 0; index < roles.size();) {
         if (roles[index] != ChatRole::System) {
             ++index;
             continue;
         }
         const std::size_t begin = index;
-        while (index < roles.size() && roles[index] == ChatRole::System) { ++index; }
-        if (begin == 0 || roles[begin - 1U] != ChatRole::User ||
-            (index < roles.size() && roles[index] != ChatRole::Assistant)) {
-            bad_request("system messages must follow a user message and be final or precede an "
-                        "assistant message",
+        bool content_message    = false;
+        while (index < roles.size() && roles[index] == ChatRole::System) {
+            content_message = content_message || !effort_only[index];
+            ++index;
+        }
+        if (!content_message) { continue; }
+        const bool after_user_or_server_result =
+            begin != 0 && (roles[begin - 1U] == ChatRole::User ||
+                           (roles[begin - 1U] == ChatRole::Assistant && ends_in_server_tool_result(messages[begin - 1U])));
+        if (!after_user_or_server_result || (index < roles.size() && roles[index] != ChatRole::Assistant)) {
+            bad_request("system messages must follow a user message (or an assistant message ending in a server "
+                        "tool result) and be final or precede an assistant message",
                         "messages", "invalid_message_order");
         }
     }
@@ -1060,7 +1148,21 @@ void parse_messages(const Json& body, GenerationRequest& request, const Lowering
         message.role      = role;
         message.turn.role = role;
         if (role == ChatRole::System) {
-            message.turn = parse_system_value(content, "messages");
+            if (effort_only[index]) {
+                const Json& config = messages[index].at("output_config");
+                if (!config.is_object()) { bad_request("output_config must be an object", "messages"); }
+                if (config.contains("effort") && !config.at("effort").is_null()) {
+                    if (!config.at("effort").is_string()) {
+                        bad_request("output_config.effort must be a string", "messages");
+                    }
+                    const auto effort = parse_requested_reasoning_effort(config.at("effort").get<std::string>());
+                    if (!effort) { bad_request("output_config.effort is not a recognized effort value", "messages"); }
+                    message_effort = *effort; // the latest one sets the reply's effort
+                }
+                continue;
+            }
+            message.turn = context.timeline != nullptr ? context.timeline->system_message(content, index)
+                                                       : parse_system_value(content, "messages");
             parsed.push_back(std::move(message));
             continue;
         }
@@ -1197,6 +1299,316 @@ void define_tool_search(ParsedTool& parsed, const ToolSearchType& type, const Js
     }
 }
 
+// A user-defined tool's own fields (name, description, input schema, examples, cache_control), from a `tools`
+// entry or a mid-conversation tool_definition; `param` names where it came from in errors.
+void parse_custom_tool_fields(const Json& item, ParsedTool& parsed, const char* param) {
+    parsed.definition.name = require_tool_name(item, param);
+    if (item.contains("description") && !item.at("description").is_null()) {
+        if (!item.at("description").is_string()) { bad_request("tool description must be a string", param); }
+        parsed.definition.description = item.at("description").get<std::string>();
+    }
+    if (!item.contains("input_schema") || !item.at("input_schema").is_object()) {
+        bad_request("tool input_schema must be a JSON object", param);
+    }
+    parsed.definition.input_schema_json = item.at("input_schema").dump();
+    if (item.contains("input_examples") && !item.at("input_examples").is_null()) {
+        if (!item.at("input_examples").is_array()) { bad_request("tool input_examples must be an array", param); }
+        parsed.definition.input_examples_json = item.at("input_examples").dump();
+    }
+    if (const auto ttl = cache_boundary(item, param)) {
+        parsed.definition.cache_boundary_after = explicit_cache_boundary(*ttl);
+    }
+}
+
+// The fields every tool type may carry: strict, defer_loading, eager_input_streaming, allowed_callers.
+void parse_common_tool_fields(const Json& item, ParsedTool& parsed, const char* param) {
+    if (item.contains("strict") && !item.at("strict").is_null()) {
+        if (!item.at("strict").is_boolean()) { bad_request("tool strict must be a boolean", param); }
+        parsed.definition.strict = item.at("strict").get<bool>();
+    }
+    if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
+        if (!item.at("defer_loading").is_boolean()) { bad_request("tool defer_loading must be a boolean", param); }
+        parsed.defer_loading = item.at("defer_loading").get<bool>();
+    }
+    if (item.contains("eager_input_streaming") && !item.at("eager_input_streaming").is_null() &&
+        !item.at("eager_input_streaming").is_boolean()) {
+        bad_request("tool eager_input_streaming must be a boolean", param);
+    }
+    if (item.contains("allowed_callers") && !item.at("allowed_callers").is_null()) {
+        if (!item.at("allowed_callers").is_array()) { bad_request("tool allowed_callers must be an array", param); }
+        parsed.allowed_callers.emplace();
+        for (const Json& caller : item.at("allowed_callers")) {
+            if (!caller.is_string()) { bad_request("tool allowed_callers entries must be strings", param); }
+            parsed.allowed_callers->push_back(caller.get<std::string>());
+        }
+    }
+}
+
+bool same_tool_definition(const ToolDefinition& a, const ToolDefinition& b) {
+    return a.name == b.name && a.description == b.description && a.input_schema_json == b.input_schema_json &&
+           a.strict == b.strict && a.input_examples_json == b.input_examples_json;
+}
+
+ToolTimeline::State* ToolTimeline::find(const std::string& name) {
+    for (auto& [key, state] : states_) {
+        if (key == name) { return &state; }
+    }
+    for (const ToolDefinition& tool : request_.tools) {
+        if (tool.name != name) { continue; }
+        State state;
+        state.declared   = &tool;
+        state.definition = tool;
+        state.definition.cache_boundary_after.reset();
+        state.shown = !tool.deferred;
+        return &states_.emplace_back(name, std::move(state)).second;
+    }
+    return nullptr;
+}
+
+ToolTimeline::State& ToolTimeline::reference(const Json& tool, const char* block) {
+    const std::string type = require_block_type(tool, "messages");
+    if (type == "mcp_tool_reference" || type == "mcp_toolset_reference" || type == "mcp_toolset") {
+        bad_request(std::string(block) + " of an MCP connector tool needs an MCP client, which Infernix does not provide",
+                    "messages", "mcp_servers_not_supported");
+    }
+    if (type != "tool_reference") {
+        bad_request(std::string(block) + " tool must be a tool_reference" +
+                        (std::string_view(block) == "tool_addition" ? " or a tool_definition" : ""),
+                    "messages", "content_block_not_supported");
+    }
+    const char* key = tool.contains("name") ? "name" : "tool_name";
+    if (!tool.contains(key) || !tool.at(key).is_string() || tool.at(key).get_ref<const std::string&>().empty()) {
+        bad_request("tool_reference blocks must contain a non-empty string name", "messages");
+    }
+    const std::string name = tool.at(key).get<std::string>();
+    State* state           = find(name);
+    if (state == nullptr) {
+        bad_request("Tool reference '" + name + "' not found in available tools", "messages",
+                    "tool_reference_unresolved");
+    }
+    return *state;
+}
+
+ChatTurn ToolTimeline::system_message(const Json& content, std::size_t index) {
+    ChatTurn turn;
+    turn.role = ChatRole::System;
+    if (content.is_string()) {
+        turn.content.push_back(text_part(content.get<std::string>()));
+        return turn;
+    }
+    if (!content.is_array()) { bad_request("system content must be a string or an array of blocks", "messages"); }
+    // Each tool's availability and definition before the message, to render its net change.
+    struct Before {
+        const State* state = nullptr;
+        bool available     = false;
+        ToolDefinition definition;
+    };
+    std::vector<Before> touched;
+    const auto touch = [&](const State& state) {
+        if (std::none_of(touched.begin(), touched.end(), [&](const Before& item) { return item.state == &state; })) {
+            touched.push_back(Before{&state, !state.withdrawn && state.shown, state.definition});
+        }
+    };
+    std::optional<CacheBoundary> boundary;
+    for (std::size_t block_index = 0; block_index < content.size(); ++block_index) {
+        const Json& block      = content[block_index];
+        const std::string type = require_block_type(block, "messages");
+        if (type == "text") {
+            turn.content.push_back(text_part(require_string(block, "text", "messages", "system text block"),
+                                             cache_boundary(block, "messages")));
+            continue;
+        }
+        if (type != "tool_addition" && type != "tool_removal") {
+            bad_request("system messages support text, tool_addition and tool_removal blocks", "messages",
+                        "content_block_not_supported");
+        }
+        if (!block.contains("tool") || !block.at("tool").is_object()) {
+            bad_request(type + " blocks must contain a tool object", "messages");
+        }
+        const Json& tool      = block.at("tool");
+        const auto block_ttl  = cache_boundary(block, "messages");
+        if (block_ttl) { boundary = explicit_cache_boundary(*block_ttl); }
+        if (type == "tool_removal") {
+            State& state = reference(tool, "tool_removal");
+            touch(state);
+            state.withdrawn = true;
+            state.shown     = false;
+            continue;
+        }
+        if (require_block_type(tool, "messages") != "tool_definition") {
+            // Offers a declared (or earlier defined) tool from here on: a deferred one is shown, a withdrawn one
+            // re-offered with the definition it had.
+            State& state = reference(tool, "tool_addition");
+            touch(state);
+            state.withdrawn = false;
+            state.shown     = true;
+            continue;
+        }
+        if (!tool.contains("definition") || !tool.at("definition").is_object()) {
+            bad_request("tool_definition must contain a definition object", "messages");
+        }
+        const Json& item = tool.at("definition");
+        if (item.contains("type") && !item.at("type").is_null() &&
+            !(item.at("type").is_string() && item.at("type").get_ref<const std::string&>() == "custom")) {
+            bad_request("a tool_definition may define only a custom tool; declare other tool types in tools", "messages",
+                        "tool_definition_not_supported");
+        }
+        ParsedTool parsed;
+        parsed.definition.schema_param = "messages/" + std::to_string(index) + "/content/" +
+                                         std::to_string(block_index) + "/tool/definition/input_schema";
+        parse_custom_tool_fields(item, parsed, "messages");
+        parse_common_tool_fields(item, parsed, "messages");
+        const bool definition_cache = parsed.definition.cache_boundary_after.has_value();
+        if (definition_cache) {
+            if (block_ttl) {
+                bad_request("cache_control may be set on a tool_addition block or on its definition, not both",
+                            "messages", "invalid_cache_control");
+            }
+            boundary = parsed.definition.cache_boundary_after;
+            parsed.definition.cache_boundary_after.reset();
+        }
+        if (parsed.defer_loading && (definition_cache || block_ttl)) {
+            bad_request("a tool with defer_loading=true cannot carry cache_control", "messages", "invalid_cache_control");
+        }
+        if (parsed.allowed_callers && std::find(parsed.allowed_callers->begin(), parsed.allowed_callers->end(),
+                                                "direct") == parsed.allowed_callers->end()) {
+            bad_request("tool allowed_callers excludes direct model calls, and Infernix provides no alternate caller",
+                        "messages", "tool_caller_not_supported");
+        }
+        const std::string name = parsed.definition.name; // a copy: the definition moves into the state below
+        if (std::any_of(searches_.begin(), searches_.end(),
+                        [&](const AnthropicToolSearch& search) { return search.name == name; })) {
+            bad_request("tool '" + name + "' is already declared as another tool type", "messages",
+                        "tool_name_conflict");
+        }
+        State* state = find(name);
+        if (state == nullptr) {
+            State created;
+            created.definition          = std::move(parsed.definition);
+            created.shown               = !parsed.defer_loading;
+            created.shown_when_added    = created.shown;
+            state                       = &states_.emplace_back(name, std::move(created)).second;
+            touched.push_back(Before{state, false, {}});
+            continue;
+        }
+        touch(*state);
+        if (!same_tool_definition(state->definition, parsed.definition)) {
+            // Another definition under the same name replaces the earlier one from here on.
+            state->definition = std::move(parsed.definition);
+            state->redefined  = state->declared != nullptr;
+        }
+        state->withdrawn = false;
+        if (!parsed.defer_loading) {
+            state->shown            = true;
+            state->shown_when_added = true;
+        }
+    }
+    std::vector<std::string> removed;
+    for (const Before& before : touched) {
+        const State& state   = *before.state;
+        const bool available = !state.withdrawn && state.shown;
+        if (available && (!before.available || !same_tool_definition(before.definition, state.definition))) {
+            turn.loaded_tools.push_back(state.definition);
+        } else if (!available && before.available) {
+            removed.push_back(state.definition.name);
+        }
+    }
+    if (!removed.empty()) {
+        std::string line = "The following functions are no longer available:";
+        for (std::size_t i = 0; i < removed.size(); ++i) {
+            line += i == 0 ? " " : ", ";
+            line += removed[i];
+        }
+        line += '.';
+        turn.content.push_back(text_part(std::move(line)));
+    }
+    turn.cache_boundary_after = boundary;
+    return turn;
+}
+
+const ToolDefinition* ToolTimeline::current(const std::string& name) const {
+    for (const auto& [key, state] : states_) {
+        if (key == name) {
+            return !state.withdrawn && (state.declared == nullptr || state.redefined) ? &state.definition : nullptr;
+        }
+    }
+    return nullptr;
+}
+
+void ToolTimeline::finalize(GenerationRequest& request) const {
+    std::vector<ToolDefinition> added;
+    for (const auto& [name, state] : states_) {
+        if (state.declared != nullptr) {
+            if (state.withdrawn) {
+                request.tool_contract_changes.push_back(ToolContractChange{name, std::nullopt});
+            } else if (state.redefined) {
+                request.tool_contract_changes.push_back(ToolContractChange{name, state.definition});
+            }
+            continue;
+        }
+        if (state.withdrawn) { continue; }
+        // Contract-only (the tool section never lists it); one the model was shown is not a tool-search candidate.
+        ToolDefinition tool    = state.definition;
+        tool.deferred          = true;
+        tool.shown_in_messages = state.shown_when_added;
+        added.push_back(std::move(tool));
+    }
+    // With no tool listed in `tools` (all deferred, or none), the prompt would carry no tool section, and the Qwen
+    // templates give the call format only there: every tool the history shows at its end is listed instead, and its
+    // message keeps no copy. The prompt's start then changes when the first such tool appears (Anthropic: the first
+    // tool defined by value costs one full cache miss) and stays put while the shown set does.
+    const bool listed = std::any_of(request.tools.begin(), request.tools.end(),
+                                    [](const ToolDefinition& tool) { return !tool.deferred; });
+    std::vector<std::string> promoted;
+    if (!listed) {
+        for (const auto& [name, state] : states_) {
+            if (state.withdrawn || !state.shown) { continue; }
+            promoted.push_back(name);
+            if (state.declared == nullptr) { continue; }
+            for (ToolDefinition& tool : request.tools) {
+                if (tool.name != name) { continue; }
+                // Listed as the definition the history ends with: a redefinition's newer one (the contract change
+                // that carried it is no longer needed: the listed declaration itself is current).
+                if (state.redefined) {
+                    tool = state.definition;
+                    std::erase_if(request.tool_contract_changes,
+                                  [&](const ToolContractChange& change) { return change.name == name; });
+                }
+                tool.deferred = false;
+            }
+        }
+        for (ToolDefinition& tool : added) {
+            if (std::find(promoted.begin(), promoted.end(), tool.name) != promoted.end()) {
+                tool.deferred          = false;
+                tool.shown_in_messages = false;
+            }
+        }
+    }
+    // Appended after the walk: the states hold pointers into request.tools.
+    for (ToolDefinition& tool : added) { request.tools.push_back(std::move(tool)); }
+    if (promoted.empty()) { return; }
+    const auto is_promoted = [&](const ToolDefinition& tool) {
+        return std::find(promoted.begin(), promoted.end(), tool.name) != promoted.end();
+    };
+    for (std::size_t index = 0; index < request.messages.size();) {
+        ChatTurn& turn = request.messages[index];
+        if (turn.role != ChatRole::System || turn.loaded_tools.empty()) {
+            ++index;
+            continue;
+        }
+        std::erase_if(turn.loaded_tools, is_promoted);
+        if (!turn.content.empty() || !turn.loaded_tools.empty()) {
+            ++index;
+            continue;
+        }
+        // Nothing left to render: its cache breakpoint moves to the turn before, as lower_messages does.
+        if (turn.cache_boundary_after && index > 0 && !request.messages[index - 1].cache_boundary_after) {
+            request.messages[index - 1].cache_boundary_after = turn.cache_boundary_after;
+        }
+        request.messages.erase(request.messages.begin() + static_cast<std::ptrdiff_t>(index));
+    }
+}
+
 std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     std::vector<ParsedTool> result;
     if (!body.contains("tools") || body.at("tools").is_null()) { return result; }
@@ -1231,71 +1643,40 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
         }
 
         if (parsed.source == ToolSource::UserDefined) {
-            parsed.definition.name = require_tool_name(item, "tools");
+            parse_custom_tool_fields(item, parsed, "tools");
             if (!names.insert(parsed.definition.name).second) {
                 bad_request("duplicate tool name: " + parsed.definition.name, "tools");
-            }
-            if (item.contains("description") && !item.at("description").is_null()) {
-                if (!item.at("description").is_string()) {
-                    bad_request("tool description must be a string", "tools");
-                }
-                parsed.definition.description = item.at("description").get<std::string>();
-            }
-            if (!item.contains("input_schema") || !item.at("input_schema").is_object()) {
-                bad_request("tool input_schema must be a JSON object", "tools");
-            }
-            parsed.definition.input_schema_json = item.at("input_schema").dump();
-            if (item.contains("input_examples") && !item.at("input_examples").is_null()) {
-                if (!item.at("input_examples").is_array()) {
-                    bad_request("tool input_examples must be an array", "tools");
-                }
-                parsed.definition.input_examples_json = item.at("input_examples").dump();
-            }
-            if (const auto ttl = cache_boundary(item, "tools")) {
-                parsed.definition.cache_boundary_after = explicit_cache_boundary(*ttl);
             }
         } else if (parsed.source != ToolSource::ToolSearch && item.contains("name") &&
                    item.at("name").is_string()) {
             parsed.definition.name = item.at("name").get<std::string>();
         }
-
-        if (item.contains("strict") && !item.at("strict").is_null()) {
-            if (!item.at("strict").is_boolean()) {
-                bad_request("tool strict must be a boolean", "tools");
-            }
-            parsed.definition.strict = item.at("strict").get<bool>();
-        }
-        if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
-            if (!item.at("defer_loading").is_boolean()) {
-                bad_request("tool defer_loading must be a boolean", "tools");
-            }
-            parsed.defer_loading = item.at("defer_loading").get<bool>();
-        }
-        if (item.contains("eager_input_streaming") && !item.at("eager_input_streaming").is_null() &&
-            !item.at("eager_input_streaming").is_boolean()) {
-            bad_request("tool eager_input_streaming must be a boolean", "tools");
-        }
-        if (item.contains("allowed_callers") && !item.at("allowed_callers").is_null()) {
-            if (!item.at("allowed_callers").is_array()) {
-                bad_request("tool allowed_callers must be an array", "tools");
-            }
-            parsed.allowed_callers.emplace();
-            for (const Json& caller : item.at("allowed_callers")) {
-                if (!caller.is_string()) {
-                    bad_request("tool allowed_callers entries must be strings", "tools");
-                }
-                parsed.allowed_callers->push_back(caller.get<std::string>());
-            }
-        }
+        parse_common_tool_fields(item, parsed, "tools");
         result.push_back(std::move(parsed));
     }
     return result;
 }
 
+// Whether a mid-conversation system message adds a tool (ToolTimeline): Anthropic then accepts every top-level tool
+// deferred, and the tool tool_choice names may be one the history defines.
+bool messages_add_tools(const Json& body) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) { return false; }
+    for (const Json& item : body.at("messages")) {
+        if (!item.is_object() || item.value("role", std::string()) != "system" || !item.contains("content") ||
+            !item.at("content").is_array()) {
+            continue;
+        }
+        for (const Json& block : item.at("content")) {
+            if (block.is_object() && block.value("type", std::string()) == "tool_addition") { return true; }
+        }
+    }
+    return false;
+}
+
 // defer_loading keeps a user-defined tool out of the prompt until a search result or a
 // tool_reference loads it. Anthropic's rules: the search tool itself is never deferred, a deferred
-// tool carries no cache breakpoint, and at least one tool stays listed.
-void validate_deferral(std::vector<ParsedTool>& definitions) {
+// tool carries no cache breakpoint, and at least one tool stays listed unless the messages add tools.
+void validate_deferral(std::vector<ParsedTool>& definitions, bool tools_added_in_messages) {
     std::size_t deferred = 0;
     bool listed          = false;
     for (ParsedTool& tool : definitions) {
@@ -1316,7 +1697,7 @@ void validate_deferral(std::vector<ParsedTool>& definitions) {
         tool.definition.deferred = true;
         ++deferred;
     }
-    if (deferred != 0 && !listed) {
+    if (deferred != 0 && !listed && !tools_added_in_messages) {
         bad_request("At least one tool must have defer_loading=false. All tools cannot be deferred.",
                     "tools", "all_tools_deferred");
     }
@@ -1328,22 +1709,25 @@ void validate_deferral(std::vector<ParsedTool>& definitions) {
 }
 
 void lower_tools(const Json& body, GenerationRequest& request,
-                 std::vector<AnthropicToolSearch>& searches) {
+                 std::vector<AnthropicToolSearch>& searches, bool tools_added_in_messages) {
     const ToolSelection selection       = parse_tool_choice(body);
     std::vector<ParsedTool> definitions = parse_tool_definitions(body);
-    validate_deferral(definitions);
+    validate_deferral(definitions, tools_added_in_messages);
     const auto named                    = [&](const ParsedTool& tool) {
         return tool.definition.name == selection.name;
     };
 
+    // With tools added in the messages, these checks wait for the end of the history (validate_tool_choice).
     if (selection.kind == ToolSelectionKind::Named) {
-        if (std::none_of(definitions.begin(), definitions.end(), named)) {
+        if (!tools_added_in_messages && std::none_of(definitions.begin(), definitions.end(), named)) {
             bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
         }
         request.tool_choice.allowed_names = std::vector<std::string>{selection.name};
     }
     if (selection.kind == ToolSelectionKind::Any) {
-        if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
+        if (definitions.empty() && !tools_added_in_messages) {
+            bad_request("tool_choice requires tools", "tool_choice");
+        }
     }
 
     request.tool_choice.mode     = selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None
@@ -1594,15 +1978,52 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                       .ttl      = *automatic_ttl};
 }
 
+// tool_choice against the tools as at the end of the history: a tool the conversation withdrew cannot be forced,
+// and one the history added may be (lower_tools leaves these checks here when the messages add tools).
+void validate_tool_choice(const GenerationRequest& request) {
+    if (request.tool_choice.mode != ToolChoiceMode::Required) { return; }
+    const auto callable = [&](const ToolDefinition& tool) {
+        return std::none_of(request.tool_contract_changes.begin(), request.tool_contract_changes.end(),
+                            [&](const ToolContractChange& change) {
+                                return change.name == tool.name && !change.definition;
+                            });
+    };
+    if (request.tool_choice.allowed_names) {
+        for (const std::string& name : *request.tool_choice.allowed_names) {
+            const auto tool = std::find_if(request.tools.begin(), request.tools.end(),
+                                           [&](const ToolDefinition& item) { return item.name == name; });
+            if (tool == request.tools.end()) {
+                bad_request("tool_choice references unknown tool: " + name, "tool_choice");
+            }
+            if (!callable(*tool)) {
+                bad_request("tool_choice names tool '" + name + "', which the conversation removed", "tool_choice");
+            }
+        }
+        return;
+    }
+    if (std::none_of(request.tools.begin(), request.tools.end(), callable)) {
+        bad_request("tool_choice requires tools", "tool_choice");
+    }
+}
+
 std::vector<AnthropicToolSearch> parse_common_prompt(const Json& body, GenerationRequest& request,
                                                      ParsePurpose purpose,
                                                      ClaudeCodePrompt claude_code_prompt) {
     std::vector<AnthropicToolSearch> searches;
-    lower_tools(body, request, searches);
+    lower_tools(body, request, searches, messages_add_tools(body));
     parse_system(body, request, claude_code_prompt);
-    parse_messages(body, request, LoweringContext{.request = request, .searches = searches});
-    parse_thinking(body, request);
-    parse_effort(body, request, purpose);
+    {
+        ToolTimeline timeline(request, searches);
+        std::optional<RequestedReasoningEffort> message_effort;
+        parse_messages(body, request,
+                       LoweringContext{.request = request, .searches = searches, .timeline = &timeline},
+                       message_effort);
+        timeline.finalize(request);
+        validate_tool_choice(request);
+        parse_thinking(body, request);
+        parse_effort(body, request, purpose);
+        if (message_effort) { request.reasoning_effort = *message_effort; }
+    }
     // Anthropic's effort applies "with or without thinking": with thinking off (disabled, or between_tools on a user
     // turn) the turn stays without thinking, and the effort, which the Qwen templates read only while thinking, is
     // dropped instead of conflicting with it (NInfer #441).

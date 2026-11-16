@@ -118,8 +118,18 @@ AnthropicToolSearchExecutor::AnthropicToolSearchExecutor(const AnthropicMessages
     for (const AnthropicToolSearch& search : request.tool_searches) {
         names_.push_back(search.name);
     }
+    // The deferred tools as at the end of the history: one the conversation withdrew is not offered, a redefined
+    // one is offered as its newer definition, and one a tool_addition already showed is not offered again.
     for (const ToolDefinition& tool : request.generation.tools) {
-        if (tool.deferred) { deferred_.push_back(tool); }
+        if (!tool.deferred || tool.shown_in_messages) { continue; }
+        const auto change = std::find_if(request.generation.tool_contract_changes.begin(),
+                                         request.generation.tool_contract_changes.end(),
+                                         [&](const ToolContractChange& item) { return item.name == tool.name; });
+        if (change == request.generation.tool_contract_changes.end()) {
+            deferred_.push_back(tool);
+        } else if (change->definition) {
+            deferred_.push_back(*change->definition);
+        }
     }
 }
 
