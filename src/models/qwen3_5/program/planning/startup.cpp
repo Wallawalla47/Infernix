@@ -42,6 +42,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace infernix::models::qwen3_5::detail {
@@ -1612,6 +1613,9 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .lossless_design         = {.active = options.reference, .kv = options.kv_cache},
             .gumbel_sampling         = !options.fast_paths || options.lossless ||
                                        fast_paths.selected(FastPath::GumbelSampling),
+            .coupled_mtp_steps       = std::holds_alternative<MoeConfig>(parameters.model.config().text.ffn)
+                                           ? 1U
+                                           : std::numeric_limits<std::uint32_t>::max(),
             .logits                  = options.logits_dtype == LogitsDtype::BF16 ? DType::BF16 : DType::FP32};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV

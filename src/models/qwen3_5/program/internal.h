@@ -129,6 +129,12 @@ struct ExecutionSchedule {
     // The reproducible and lossless routes: sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
     bool gumbel_sampling = false;
+    // On those routes, the leading MTP steps whose argmax drafts are drawn under the verifying key instead (QK-04;
+    // each coupled step costs about 20 us, its gain sits at the leading positions). Timed on --reproducible,
+    // sampled at 0.7, against no coupling: NVFP4 27B one step +4.45 %, two +7.76 %, all five +8.9 %; 35B-A3B one
+    // +1.08 %, two +0.33 %, all three -0.13 %. So every step on a dense model, one on a mixture of experts (the
+    // 122B follows the 35B until it is timed).
+    std::uint32_t coupled_mtp_steps = 0;
     // Every main-head logits buffer's dtype (EngineOptions::logits_dtype): FP32, or BF16.
     DType logits = DType::FP32;
 
