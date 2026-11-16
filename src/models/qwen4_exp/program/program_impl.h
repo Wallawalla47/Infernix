@@ -2374,7 +2374,9 @@ public:
     }
 
     // Penalty counts over the request's output so far (the sampler counts output tokens only),
-    // counted on the host: a binding may overlap a round that still uses the workspace.
+    // counted on the host: a binding may overlap a round that still uses the workspace. upload_pinned copies the
+    // table at the call (its staging ring), so the next lane's binding rewrites penalty_host_ without waiting for
+    // the device: no stream synchronization holds the Engine thread behind the queued rounds.
     void rebuild_token_counts(const Lane& lane) {
         const cudaStream_t s = device_.stream;
         auto* counts         = lane.sampling.token_counts;
@@ -2392,7 +2394,6 @@ public:
             if (token >= 0 && token < token_domain_) { ++host[static_cast<std::size_t>(token)]; }
         }
         upload_pinned(counts, host, bytes, s);
-        CUDA_CHECK(cudaStreamSynchronize(s)); // the table is read before the next lane's rewrites it
     }
 
     // Pauses a resident at its committed boundary (design §19.3.13): the prefix cache receives the
@@ -2499,10 +2500,10 @@ public:
             kv_busy();
             if (prefix_) { pc_make_room(missing); }
             if (pool_->available_pages() < missing) { (void)grow_kv(missing); }
-            if (pool_->available_pages() < missing && prefix_ && prefix_->transfers_pending()) {
-                // Blocks pinned only by their in-flight Host writes (a lane just paused or finished)
-                // become evictable once those land: wait for them before reporting a shortage.
-                prefix_->drain();
+            // Blocks pinned only by their in-flight Host writes (a lane just paused or finished) become evictable once
+            // those land: wait for them one at a time, oldest first, until the pages are there, before reporting a
+            // shortage (never for every transfer at once: another lane's restore is not waited for).
+            while (pool_->available_pages() < missing && prefix_ && prefix_->settle_oldest_transfer()) {
                 pc_make_room(missing);
             }
             auto reservation = pool_->reserve(missing);
@@ -2583,11 +2584,9 @@ public:
         const std::uint32_t target = before + shortage.main_kv_pages;
         if (prefix_) {
             pc_make_room(target);
-            if (pool_->available_pages() == before && prefix_->transfers_pending()) {
-                // Blocks pinned only by in-flight Host writes become evictable once those land.
-                prefix_->drain();
-                pc_make_room(target);
-            }
+            // Blocks pinned only by in-flight Host writes become evictable once those land: the oldest first, one at a
+            // time, until the target is met.
+            while (pool_->available_pages() < target && prefix_->settle_oldest_transfer()) { pc_make_room(target); }
         }
         // A long prompt's stream ring and wide arena stay lent until its last call, and growth is
         // refused while frames are lent, so a request queued behind it waited out its prefill (issue

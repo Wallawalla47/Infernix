@@ -201,6 +201,13 @@ public:
     void poll();
     // Waits for every capture, write and restore in flight and publishes them.
     void drain();
+    // Room-making's wait: for the oldest transfer whose landing can free Device memory, and publishes what landed. A
+    // Host write unpins its blocks and a capture hands over its tail page as it lands, so the oldest of those goes
+    // first (one transfer stream: everything queued before it lands with it); without one, the oldest restore,
+    // while blocks are held only by transfers. False when nothing in flight could free anything. Unlike drain(), it
+    // never waits for every restore at once: another lane's restore lands blocks that lane maps, and waiting for
+    // all of them stalled every lane behind gigabytes of copies.
+    bool settle_oldest_transfer();
 
     // ---- SSD tier (hybrid-prefix-cache-spec §5.7) ----------------------------------------------
     [[nodiscard]] runtime::prefix_cache::SsdTier* ssd() noexcept { return ssd_.get(); }

@@ -484,6 +484,21 @@ void PrefixCache::drain() {
     poll();
 }
 
+bool PrefixCache::settle_oldest_transfer() {
+    // Each wait lands at least one transfer, so a caller that loops makes progress and ends.
+    if (!writes_.empty()) {
+        CUDA_CHECK(cudaEventSynchronize(writes_.front().done));
+    } else if (!captures_.empty()) {
+        CUDA_CHECK(cudaEventSynchronize(captures_.front().events.back()));
+    } else if (!landing_.empty() && index_->device_transfer_held_blocks() != 0) {
+        CUDA_CHECK(cudaEventSynchronize(landing_.front().events.back()));
+    } else {
+        return false;
+    }
+    poll();
+    return true;
+}
+
 bool PrefixCache::poll_ssd() {
     service_ssd();
     return std::exchange(ssd_landed_, false);
