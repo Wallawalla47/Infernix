@@ -280,15 +280,16 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return device_native_weight(embedding.view); });
-    // BF16 rows (packed or not), a GGUF import's IQ4_XS or IQ3_S rows (ops::ggml_embedding's two routes: GSQ-RCO
-    // IQ3_S stores the table in IQ4_XS, IQ3_XXS in IQ3_S), or q8_g32_fp16 rows (a GGUF's or a .basalt pack's Q8_0
-    // embedding, the same codes and scales; ops::embedding). Every route is exact.
+    // BF16 rows (packed or not), a GGUF import's IQ4_XS, IQ3_S or Q6_K rows (ops::ggml_embedding's three routes:
+    // GSQ-RCO IQ3_S stores the table in IQ4_XS, IQ3_XXS in IQ3_S, Unsloth's UD quants in Q6_K), or q8_g32_fp16 rows
+    // (a GGUF's or a .basalt pack's Q8_0 embedding, the same codes and scales; ops::embedding). Every route is exact.
     if (token_embedding.qtype != QType::BF16 && token_embedding.qtype != QType::BF16_P12 &&
         !(token_embedding.layout == QuantLayout::GgmlRows &&
-          (token_embedding.qtype == QType::GGML_IQ4_XS || token_embedding.qtype == QType::GGML_IQ3_S)) &&
+          (token_embedding.qtype == QType::GGML_IQ4_XS || token_embedding.qtype == QType::GGML_IQ3_S ||
+           token_embedding.qtype == QType::GGML_Q6_K)) &&
         !(token_embedding.layout == QuantLayout::RowSplit && token_embedding.qtype == QType::Q8_G32_FP16)) {
         throw std::invalid_argument(
-            embedding.name + ": the token embedding must be BF16 (packed or not), IQ4_XS, IQ3_S or q8_g32_fp16 rows");
+            embedding.name + ": the token embedding must be BF16 (packed or not), IQ4_XS, IQ3_S, Q6_K or q8_g32_fp16 rows");
     }
     const auto& head = source.weight(w.output_head);
     if (!head.view.parts.empty() && (head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16 ||

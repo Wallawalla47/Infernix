@@ -30,7 +30,8 @@ __device__ __forceinline__ float f16_value(std::uint16_t word) {
 }
 
 // The exact value of one chunk element, kappa * d * sub * code, for formats without a min term
-// whose |sub * code| < 2^13 (IQ4_XS, IQ4_NL, Q8_0; IQ3_S: |code| <= 15, sub <= 31): with d's 11 significant bits
+// whose |sub * code| < 2^13 (IQ4_XS, IQ4_NL, Q8_0; IQ3_S: |code| <= 15, sub <= 31; Q6_K: |sub| <= 128,
+// |code| <= 32, so at most 2^12): with d's 11 significant bits
 // it is exact in binary32.
 template <QType F>
 __device__ __forceinline__ void chunk_values(const std::uint8_t* row, int index, float (&v)[8]) {
@@ -130,11 +131,20 @@ void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStr
                 id, data, vocab, hidden, row_bytes, o, fault);
         }
         break;
+    case QType::GGML_Q6_K: // Unsloth's UD quants' table: 210-byte blocks; |sub * code| <= 128 * 32, so exact too
+        require(reinterpret_cast<std::uintptr_t>(data) % 2 == 0, "table rows must be 2-byte aligned");
+        if (row_bytes % 4 == 0 && reinterpret_cast<std::uintptr_t>(data) % 4 == 0) {
+            embedding_kernel<QType::GGML_Q6_K, unsigned int><<<columns, kThreads, smem, stream>>>(
+                id, data, vocab, hidden, row_bytes, o, fault);
+        } else {
+            embedding_kernel<QType::GGML_Q6_K, unsigned short><<<columns, kThreads, smem, stream>>>(
+                id, data, vocab, hidden, row_bytes, o, fault);
+        }
+        break;
     default:
-        // Other formats' products can exceed 24 significant bits (Q6_K), so they would need the
-        // int128 path; only IQ4_XS and IQ3_S tables are registered (a GGUF's Q8_0 embedding is imported as
-        // q8_g32_fp16, which ops::embedding gathers).
-        throw std::invalid_argument("ggml_embedding: table format has no embedding route (IQ4_XS, IQ3_S)");
+        // Formats with a min term (Q4_K/Q5_K) would need the int128 path; only IQ4_XS, IQ3_S and Q6_K tables are
+        // registered (a GGUF's Q8_0 embedding is imported as q8_g32_fp16, which ops::embedding gathers).
+        throw std::invalid_argument("ggml_embedding: table format has no embedding route (IQ4_XS, IQ3_S, Q6_K)");
     }
     check_launch("embedding");
 }
