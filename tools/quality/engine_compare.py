@@ -91,6 +91,7 @@ NOT_EXERCISED = {
     "sampled-mtp-drafts": "acts on sampled requests; the measurement decodes greedily",
     "block-verification": "acts on sampled requests; the measurement decodes greedily",
     "univer-trees": "acts on sampled requests; the measurement decodes greedily",
+    "gumbel-sampling": "acts on sampled requests; the measurement decodes greedily",
 }
 MINUTES = {"reference": 120, "twin": 120, "P": 45, "D": 240, "E": 180}
 

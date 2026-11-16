@@ -271,9 +271,15 @@ enum class FastPath : std::uint8_t {
     // 2608.20961), instead of walking the tree column by column. FP32 in another order: outputs
     // within rounding of the walk, not bit-identical; records unchanged.
     GdnTreeClosedForm,
+    // Qwen3.5 with speculation: positive-temperature requests draw by Gumbel-max (ops::SamplingConfig::gumbel_max)
+    // as the reproducible route does, so speculation verifies each sampled draft by equality with the target's own
+    // draw, and the drafters draw their drafts under the same keys (candidates ZH-01: candidate selectors, coupled
+    // MTP argmax drafts). The output distribution stays the sampler's; a seeded sampled request's text
+    // changes, greedy requests are unchanged. Without it sampled drafts are verified by rejection sampling.
+    GumbelSampling,
 };
 
-inline constexpr std::array<FastPath, 38> kFastPaths{
+inline constexpr std::array<FastPath, 39> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -294,7 +300,7 @@ inline constexpr std::array<FastPath, 38> kFastPaths{
     FastPath::Bf16PromptSplit,     FastPath::RouterMma,
     FastPath::ScreenedLmHead,      FastPath::Fp16GdnState,
     FastPath::BlockVerification,   FastPath::UniverTrees,
-    FastPath::GdnTreeClosedForm};
+    FastPath::GdnTreeClosedForm,   FastPath::GumbelSampling};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -336,6 +342,7 @@ inline constexpr std::array<FastPath, 38> kFastPaths{
     case FastPath::BlockVerification: return "block-verification";
     case FastPath::UniverTrees: return "univer-trees";
     case FastPath::GdnTreeClosedForm: return "gdn-tree-closed-form";
+    case FastPath::GumbelSampling: return "gumbel-sampling";
     }
     return "unknown";
 }

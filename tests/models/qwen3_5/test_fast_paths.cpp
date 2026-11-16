@@ -461,6 +461,16 @@ int main() {
                       "and is qualified nowhere");
     failures += check(infernix::parse_fast_path("block-verification") == FastPath::BlockVerification,
                       "block-verification parses");
+    // gumbel-sampling (candidates ZH-01): every drafted engine, a row's draw reads only that row, a candidate only.
+    failures += check(q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash2) &&
+                          q::fast_path_applies(FastPath::GumbelSampling, int8_24, mtp) &&
+                          q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash) &&
+                          !q::fast_path_applies(FastPath::GumbelSampling, int8_24, options) &&
+                          !q::couples_requests(FastPath::GumbelSampling) &&
+                          !q::fast_path_qualified(FastPath::GumbelSampling, int8_24) &&
+                          infernix::parse_fast_path("gumbel-sampling") == FastPath::GumbelSampling,
+                      "gumbel-sampling applies to drafted engines, keeps a request invariant, is qualified nowhere "
+                      "and parses");
     // univer-trees: fixed-table tree rounds of the drafters that build their trees (DFlash2, DFlash);
     // not automatic widths, not MTP's leaf trees, not chains.
     infernix::EngineOptions dflash2_trees = dflash2, dflash_trees = dflash, mtp_trees = mtp,

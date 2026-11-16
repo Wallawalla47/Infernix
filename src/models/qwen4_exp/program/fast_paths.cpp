@@ -685,6 +685,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
                options.speculative.backend == SpeculativeBackend::Mtp;
     case FastPath::UniverTrees: return false; // Qwen3.5's tree rounds only
     case FastPath::GdnTreeClosedForm: return false; // Qwen3.5's tree rounds only
+    case FastPath::GumbelSampling: return false;    // Qwen3.5's drafters only (candidates ZH-01)
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16 and bf16p, int8, fp8, nvfp4, k8v4); VQ2 and K4V2
         // append inside qsa_attention and keep the composed prepare.

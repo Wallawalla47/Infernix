@@ -548,6 +548,9 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
         return options.speculative.draft_tree_auto ||
                std::any_of(options.speculative.draft_tree_nodes.begin(),
                            options.speculative.draft_tree_nodes.end(), [](std::uint32_t n) { return n != 0; });
+    // Every drafted engine: sampled drafts verified by equality with the target's Gumbel-max draw, drawn
+    // under the same keys. Qualified nowhere yet: a candidate only.
+    case FastPath::GumbelSampling: return options.speculative.backend != SpeculativeBackend::None;
     }
     return false;
 }

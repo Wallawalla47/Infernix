@@ -60,7 +60,8 @@ struct FastPathConfiguration {
     case FastPath::Fp16GdnState:
     case FastPath::BlockVerification:
     case FastPath::UniverTrees:
-    case FastPath::GdnTreeClosedForm: return false;
+    case FastPath::GdnTreeClosedForm:
+    case FastPath::GumbelSampling: return false;
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3:
     case FastPath::ExpertA4ResidualDecode:
