@@ -86,6 +86,86 @@ void check_finite_language_masks() {
     }
 }
 
+// xgrammar #1003 (backported from NInfer 8e46481296): a token may finish a byte literal and enter a token-level
+// free-text region (ExcludeToken), which takes the whole token from there; Token still requires a boundary. Every
+// case is also compared with a compiler that compiled every other case first (a check that its masks match a cold
+// compile's; it does not show the cache-adapted lookahead path ran).
+void check_mid_token_exclusion() {
+    const std::vector<std::string> vocabulary{"\n\n",  "\n\n\n", "\n\n\n\n", "<",  "<hi",
+                                              "<end>", "<tool>", "x",        "hi", ""};
+    struct Case {
+        std::string source;
+        std::vector<std::int32_t> prefix;
+        int token;
+        bool accepted;
+    };
+    const std::vector<Case> cases{
+        {"root ::= \"\\n\\n\" ExcludeToken(5)* Token(5)", {}, 1, true},
+        {"root ::= prefix ExcludeToken(5)*\nprefix ::= \"\\n\\n\" | \"x\"", {}, 1, true},
+        {"root ::= \"<\" ExcludeToken(5)*", {}, 5, false},
+        {"root ::= \"<\" ExcludeToken(5)*", {}, 4, true},
+        {"root ::= \"\\n\\n\" ExcludeToken(1)* Token(5)", {}, 2, true},
+        {"root ::= prefix ExcludeToken(1)*\nprefix ::= \"\\n\\n\" | \"x\"", {}, 2, true},
+        {"root ::= Token(6) prefix ExcludeToken(5)\nprefix ::= \"<\"", {6}, 4, true},
+        {"root ::= \"<\" Token(4)", {}, 4, false},
+        {"root ::= Token(6) prefix Token(5)\nprefix ::= \"<\"", {6}, 5, false},
+    };
+    infernix::text::GrammarCompiler warm(vocabulary, {9}, 4 * 1024 * 1024);
+    for (const auto& item : cases) { (void)compile(warm, item.source, {}, {}); }
+    for (const auto& item : cases) {
+        infernix::text::GrammarCompiler compiler(vocabulary, {9}, 4 * 1024 * 1024);
+        auto session = compile(compiler, item.source, {}, {});
+        session->accept(item.prefix);
+        session->confirm();
+        const auto before = mask(*session);
+        require(allows(before, item.token) == item.accepted,
+                "mid-token exclusion mask differs from token-boundary semantics");
+        auto cached = compile(warm, item.source, {}, {});
+        cached->accept(item.prefix);
+        cached->confirm();
+        require(mask(*cached) == before, "a mask depends on the grammars compiled before it");
+        const std::array<std::int32_t, 1> draft{item.token};
+        std::vector<std::uint32_t> draft_masks(2 * session->mask_words());
+        require(session->masks(draft, draft_masks) == 0,
+                "mid-token exclusion lookahead reached an unexpected dead end");
+        require(mask(*session) == before, "mid-token lookahead changed the legal token set");
+        bool accepted = true;
+        try {
+            session->accept(item.token);
+        } catch (const std::logic_error&) { accepted = false; }
+        require(accepted == item.accepted, "mid-token matcher disagrees with its mask");
+        session->discard();
+        require(mask(*session) == before, "mid-token rollback changed the legal token set");
+        if (item.accepted) {
+            session->accept(item.token);
+            session->confirm();
+            require(mask(*session) ==
+                        std::vector<std::uint32_t>(draft_masks.begin() + session->mask_words(),
+                                                   draft_masks.end()),
+                    "committed mid-token state differs from speculative lookahead");
+        }
+    }
+
+    // The seam Infernix's own constrained requests form with thinking on (grammar.cpp compile_model): the
+    // reasoning prefix's Token(</think>) "\n\n", then a grammar opening in token-level free text (the Qwen tool
+    // grammar's TokenTagDispatch lowers to an ExcludeToken loop). An answer token that extends the separator
+    // ("\n\n\n") is legal there and must not be masked out.
+    const std::vector<std::string> reasoning_vocabulary{"\n\n", "\n\n\n", "</think>", "x", "<tool>", ""};
+    infernix::text::GrammarCompiler reasoning_compiler(reasoning_vocabulary, {5}, 4 * 1024 * 1024);
+    const infernix::text::ReasoningFraming framing{.close_token = 2, .separator = "\n\n"};
+    auto reasoning = compile(reasoning_compiler, "root ::= ExcludeToken(4)* Token(4)", framing, {});
+    reasoning->accept(3); // a thinking token
+    reasoning->confirm();
+    reasoning->accept(2); // </think>
+    reasoning->confirm();
+    const auto after_close = mask(*reasoning);
+    require(allows(after_close, 0), "the separator token after </think> was masked out");
+    require(allows(after_close, 1), "a token extending the separator into free text was masked out after </think>");
+    reasoning->accept(1);
+    reasoning->confirm();
+    require(allows(mask(*reasoning), 4), "free text after a mid-token separator lost its closing token");
+}
+
 void check_compiled_grammar_lifetime() {
     std::unique_ptr<infernix::text::GrammarSession> session;
     {
@@ -330,6 +410,7 @@ int main() {
         check_finite_language_masks();
         check_counted_units();
         check_compiled_grammar_lifetime();
+        check_mid_token_exclusion();
         check_draft_lookahead();
         check_deferred_compile();
         std::vector<std::string> vocab;
