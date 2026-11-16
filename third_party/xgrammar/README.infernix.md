@@ -6,8 +6,10 @@ under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Infernix owns the CMake target and maintains its adaptations here, adopting upstream changes
 selectively. Cold compilation is limited to two concurrent callers per compiler; the adapter
-uses one caller thread per compile (a submit thread, or one of its two compile workers), without a
-thread pool inside the library. Python/TVM bindings, GPU kernels,
+calls each compile from one thread (a submit thread, or one of its two compile workers), and the
+library computes that compile's adaptive token masks on its own thread pool (`max_threads`, a quarter
+of the hardware threads up to 8, from `text/grammar.cpp`; the rule-level cache is sharded under
+mutexes). Python/TVM bindings, GPU kernels,
 Web code, upstream tests and build machinery are excluded.
 
 Grammar string escaping preserves embedded NUL bytes, including in compilation cache keys.

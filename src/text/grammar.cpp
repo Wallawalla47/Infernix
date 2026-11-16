@@ -181,6 +181,13 @@ std::shared_ptr<const std::vector<std::int32_t>> tokens_containing(const std::ve
     }
     return ids;
 }
+
+// Threads one cold compile's token-mask pass runs on: a quarter of the hardware threads, at most 8, so a compile
+// beside an offloaded model's CPU expert team takes a minority of the cores. A 20-tool Qwen tool grammar on the
+// RTX 5090 machine (32 threads): 0.78 s on one thread, 0.14 s on 8, 0.11-0.13 s on 16 (QH-01, 2026-11-16).
+int grammar_compile_threads() {
+    return static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 4U, 1U, 8U));
+}
 } // namespace
 
 // A deferred compile's result, made on a compiler worker.
@@ -199,7 +206,7 @@ public:
         : vocab(std::make_shared<const std::vector<std::string>>(std::move(vocab_))),
           eos(std::move(eos_)), tag_ends(tokens_containing(*vocab, '>')),
           tokenizer(*vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab->size()), eos),
-          compiler(tokenizer, 1, true, static_cast<std::int64_t>(bytes)) {}
+          compiler(tokenizer, grammar_compile_threads(), true, static_cast<std::int64_t>(bytes)) {}
 
     ~Impl() {
         {
