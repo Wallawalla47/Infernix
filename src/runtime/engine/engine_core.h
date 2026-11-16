@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/temporary_switches.h"
+#include "core/timer_resolution.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/program.h"
@@ -3378,6 +3379,7 @@ private:
             }
             execution_lock.unlock();
             if (!executed) {
+                // About 1 ms with timer_resolution_ held (15.7 ms at Windows' default tick, candidates QN-27).
                 std::unique_lock lock(queue_mutex_);
                 queue_cv_.wait_for(lock, std::chrono::milliseconds(1));
             }
@@ -3486,6 +3488,9 @@ private:
     bool next_turn_stop_ = false;                          // next_turn_mutex_
     std::thread next_turn_thread_;
 
+    // The worker's 1 ms wait between cycles that ran nothing is about a millisecond while the Engine exists, not a
+    // 15.6 ms Windows timer tick (core/timer_resolution.h). Destroyed after the threads are joined.
+    TimerResolution timer_resolution_;
     std::thread worker_;
     std::thread constraint_warm_;
 };

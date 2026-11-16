@@ -20,6 +20,7 @@ add_library(infernix_core STATIC
   gpu_telemetry.cpp
   host_load.cpp
   host_memory.cpp
+  timer_resolution.cpp
   host_memory_worker.cpp
   host_worker_pool.cpp
   io_priority.cpp
@@ -46,8 +47,9 @@ infernix_internal_includes(infernix_core)
 infernix_cuda_archive(infernix_core)
 target_link_libraries(infernix_core PUBLIC infernix_cuda_runtime CUDA::nvtx3 CUDA::cuda_driver Threads::Threads)
 if(WIN32)
-  # DXGI: the OS video-memory budget and display outputs of the CUDA adapter (vram_budget.cpp).
-  target_link_libraries(infernix_core PRIVATE dxgi)
+  # DXGI: the OS video-memory budget and display outputs of the CUDA adapter (vram_budget.cpp); winmm: the timer
+  # resolution (timer_resolution.cpp).
+  target_link_libraries(infernix_core PRIVATE dxgi winmm)
 else()
   # DXCore under WSL2: the Windows adapter's shared system memory (vram_budget.cpp).
   target_sources(infernix_core PRIVATE dxcore_adapter.cpp)
