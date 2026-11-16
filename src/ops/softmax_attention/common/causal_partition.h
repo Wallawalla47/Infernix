@@ -4,6 +4,14 @@
 #include <algorithm>
 #include <cstdint>
 
+// Full unrolling of the proportional partitions' fixed-trip row loops in device code, so their arrays stay in
+// registers; host compilers see nothing.
+#if defined(__CUDA_ARCH__)
+#    define INFERNIX_CAUSAL_UNROLL _Pragma("unroll")
+#else
+#    define INFERNIX_CAUSAL_UNROLL
+#endif
+
 namespace infernix::ops::detail {
 
 // Capture reserves partials for the largest row window. Producer and merge use
@@ -98,33 +106,42 @@ __device__ inline int causal_proportional_counts(const CausalKvPartition& partit
                                                  int (&counts)[kCausalProportionalMaxRows]) {
     // 32-bit arithmetic throughout: a window is at most 2^20 keys (kCausalAttentionMaximumVisibleKeys), the spare
     // slots at most 8 x 256, so spare x window < 2^32 and the eight windows' sum < 2^24. Every CTA runs this before
-    // its key loop; 64-bit divisions cost about a timer tick (2 us) on 4K-key rounds.
+    // its key loop; 64-bit divisions cost about a timer tick (2 us) on 4K-key rounds. Every loop runs over the eight
+    // rows with constant indices and each row finds its share group's members by their group's first row, so the
+    // arrays stay in registers: loops stepping by the run-time group size put them in local memory (56d5726e: 64-128
+    // bytes of stack and up to 246 local loads in the INT8, FP8, NVFP4 and K8V4 decode kernels' prologues).
     unsigned windows[kCausalProportionalMaxRows];
+    int share[kCausalProportionalMaxRows]; // the first row of each row's share group
+    const int group = partition.proportional > 1 && partition.proportional < rows ? partition.proportional : rows;
+INFERNIX_CAUSAL_UNROLL
     for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
         const int first = r < rows ? positions[static_cast<std::int64_t>(r) * width] : -1;
         const int window = first >= 0 ? causal_row_window(first, width, visible_capacity) : 0;
         windows[r]       = window > 0 ? static_cast<unsigned>(window) : 0U;
-        counts[r]        = 0;
+        share[r]         = group > 0 ? r / group * group : 0;
     }
-    const int group       = partition.proportional > 1 && partition.proportional < rows ? partition.proportional : rows;
     const unsigned per_row = rows > 0 ? static_cast<unsigned>(slots / rows) : 0U;
-    int total             = 0;
-    for (int begin = 0; begin < kCausalProportionalMaxRows; begin += group > 0 ? group : kCausalProportionalMaxRows) {
-        const int end = begin + group < kCausalProportionalMaxRows ? begin + group : kCausalProportionalMaxRows;
+    int total              = 0;
+INFERNIX_CAUSAL_UNROLL
+    for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
         unsigned live = 0, keys = 0;
-        for (int r = begin; r < end; ++r) {
-            live += windows[r] != 0U ? 1U : 0U;
-            keys += windows[r];
+INFERNIX_CAUSAL_UNROLL
+        for (int s = 0; s < kCausalProportionalMaxRows; ++s) {
+            if (share[s] == share[r]) {
+                live += windows[s] != 0U ? 1U : 0U;
+                keys += windows[s];
+            }
         }
-        const int in_group     = (rows < end ? rows : end) - begin;
-        const unsigned owned   = in_group > 0 ? per_row * static_cast<unsigned>(in_group) : 0U;
-        const unsigned spare   = owned > live ? owned - live : 0U;
-        for (int r = begin; r < end; ++r) {
-            counts[r] = windows[r] != 0U ? partition.shared(static_cast<int>(windows[r]),
-                                                            1 + static_cast<int>(spare * windows[r] / keys))
-                                         : 0;
-            total += counts[r];
-        }
+        const int begin = share[r];
+        const int end   = group > 0 && begin + group < kCausalProportionalMaxRows ? begin + group
+                                                                                    : kCausalProportionalMaxRows;
+        const int in_group   = (rows < end ? rows : end) - begin;
+        const unsigned owned = in_group > 0 ? per_row * static_cast<unsigned>(in_group) : 0U;
+        const unsigned spare = owned > live ? owned - live : 0U;
+        counts[r]            = windows[r] != 0U ? partition.shared(static_cast<int>(windows[r]),
+                                                                   1 + static_cast<int>(spare * windows[r] / keys))
+                                                : 0;
+        total += counts[r];
     }
     return total;
 }

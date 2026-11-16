@@ -135,13 +135,18 @@ __device__ inline void bf16_kv_proportional_row(const Bf16KvPartition& partition
         const Bf16KvProportionalShares shares(partition, positions + static_cast<std::int64_t>(begin) * width,
                                               validity != nullptr ? validity + begin : nullptr, width, group,
                                               visible_capacity);
-        for (int r = 0; r < group; ++r) {
-            const int c = shares.count(r);
-            if (begin + r == last) {
-                count = c;
-                return;
+        // Constant row indices (the shares' arrays stay in registers; a loop bounded by `group` put them in
+        // local memory).
+INFERNIX_CAUSAL_UNROLL
+        for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
+            if (r < group) {
+                const int c = shares.count(r);
+                if (begin + r == last) {
+                    count = c;
+                    return;
+                }
+                base += c;
             }
-            base += c;
         }
     }
 }
@@ -157,13 +162,16 @@ __device__ inline bool bf16_kv_proportional_slot(const Bf16KvPartition& partitio
         const Bf16KvProportionalShares shares(partition, positions + static_cast<std::int64_t>(begin) * width,
                                               validity != nullptr ? validity + begin : nullptr, width, group,
                                               visible_capacity);
-        for (int r = 0; r < group; ++r) {
-            const int c = shares.count(r);
-            if (flat < base + c) {
-                out = {begin + r, flat - base, c, base};
-                return true;
+INFERNIX_CAUSAL_UNROLL
+        for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
+            if (r < group) {
+                const int c = shares.count(r);
+                if (flat < base + c) {
+                    out = {begin + r, flat - base, c, base};
+                    return true;
+                }
+                base += c;
             }
-            base += c;
         }
     }
     return false;
