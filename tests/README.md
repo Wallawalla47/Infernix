@@ -365,6 +365,8 @@ endpoint, the mean log-probability difference stays within max(0.5, 4 x) (Qwen3.
 (Qwen4Exp) that of a resume from a prefill-made state. A stale state measured 3.99; the NVFP4 27B's
 decode-computed states differ from prefill-made ones by up to 0.185 over ten texts, since its prompt path
 takes 4-bit activations and its decode path 16 (the test's comment has the measurements). The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
+Run directly, these entries and the startup-capture one need their arguments: with none they fail (exit 2), and
+when every named case is skipped they report a skip (77), never a pass with nothing checked.
 
 `infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; TEMPORARY with
 `INFERNIX_TMP_STARTUP_CAPTURE`, Flash-Next design §19.3.37) runs two prompts, alone and then together, through an
