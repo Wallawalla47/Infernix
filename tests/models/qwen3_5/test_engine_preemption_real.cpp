@@ -1,5 +1,6 @@
 #include "models/qwen3_5/proposal_head.h"
 #include "infernix/engine.h"
+#include "runtime/contract/execution.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -546,7 +547,9 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
 
 // NW-01, the shape of NInfer #434's fairness test (a754fcf3): two long generations that cannot stay
 // resident together. Bounded service turns (resource-scheduling §5.2) must give both repeated
-// service — at least two recoveries each, every one with new committed output — before either ends;
+// service — at least two recoveries each, every one with new committed output — before either ends
+// (with one-second turns set by the test seam: the product's 30-second turn, QN-01, lets a generation this
+// short finish within its turn, by design);
 // a short request submitted while one is paused keeps its queue deadline (fresh admission waits under
 // pressure); the cancelled cohort settles with no membership or physical state left.
 constexpr std::uint32_t kFairnessCapacity = 2048;
@@ -554,6 +557,11 @@ constexpr std::uint32_t kFairnessCapacity = 2048;
 void fairness(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
               std::string_view backend_name, bool prefix_cache) {
     using Clock  = std::chrono::steady_clock;
+    // The turn mechanics within the test's time: one-second turns (runtime::testing::service_quantum_ns).
+    infernix::runtime::testing::service_quantum_ns().store(1'000'000'000ULL);
+    struct ResetTurn {
+        ~ResetTurn() { infernix::runtime::testing::service_quantum_ns().store(0); }
+    } reset_turn;
     auto options = engine_options(artifact, selected, prefix_cache);
     // One context of KV for two: each request fits alone, together they pass it at about half.
     options.max_context = kFairnessCapacity;

@@ -293,7 +293,9 @@ void test_pressure_handoff_and_fair_service() {
     require(!scheduler.progress_owner(), "an empty service order kept a turn");
 }
 
-void test_recovery_cost_has_a_bounded_service_allowance() {
+// A turn is 30 seconds of service (candidates QN-01): Replay never counts as service, and an expensive one no
+// longer lengthens the turn past it.
+void test_recovery_cost_does_not_lengthen_a_turn() {
     Scheduler scheduler;
     auto a = request(1), b = request(2);
     admit(scheduler, a);
@@ -301,11 +303,11 @@ void test_recovery_cost_has_a_bounded_service_allowance() {
     scheduler.require_progress(a->id);
     scheduler.recovery_work(a->id, 10 * Scheduler::maximum_service_ns);
     require(!scheduler.advance_service(true, false), "Replay was counted as new progress");
-    scheduler.served(a->id, Scheduler::service_quantum_ns);
-    require(!scheduler.advance_service(true, false), "an expensive Replay earned no useful service");
-    scheduler.served(a->id, Scheduler::maximum_service_ns - Scheduler::service_quantum_ns);
+    scheduler.served(a->id, Scheduler::service_quantum_ns - 1);
+    require(!scheduler.advance_service(true, false), "a turn ended before its quantum of service");
+    scheduler.served(a->id, 1);
     require(scheduler.advance_service(true, false) && scheduler.progress_owner() == b->id,
-            "recovery cost allowed unbounded service");
+            "an expensive Replay lengthened the turn past its quantum");
     scheduler.served(b->id, Scheduler::service_quantum_ns);
     require(scheduler.advance_service(true, false), "recovery cost leaked into another turn");
 }
@@ -519,7 +521,7 @@ int main() {
         test_scan_progress_and_waiter_barrier();
         test_scan_keeps_unexamined_candidates();
         test_pressure_handoff_and_fair_service();
-        test_recovery_cost_has_a_bounded_service_allowance();
+        test_recovery_cost_does_not_lengthen_a_turn();
         test_bounded_service_under_continuous_contention();
         test_prefill_order();
         test_blocked_owner_leaves_the_prefill_permit();

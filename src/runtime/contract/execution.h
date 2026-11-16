@@ -86,6 +86,13 @@ inline std::atomic<bool>& units_held() noexcept {
     return held;
 }
 inline void hold_units(bool held) noexcept { units_held().store(held); }
+// A pressure turn's service in nanoseconds instead of Scheduler::service_quantum_ns (30 s), for engine-level tests
+// of the turn mechanics (rotation, recovery, the queue deadline under pressure) within a test's time; 0 keeps the
+// built-in turn. Read at every turn check. Process-wide.
+inline std::atomic<std::uint64_t>& service_quantum_ns() noexcept {
+    static std::atomic<std::uint64_t> ns{0};
+    return ns;
+}
 // The no-progress watch's warning and heal bounds in milliseconds (EngineCore::kNoProgressWarning,
 // kNoProgressRecovery); 0 keeps the built-in bound. Read on every check. Process-wide.
 inline std::atomic<std::uint32_t>& no_progress_warning_ms() noexcept {

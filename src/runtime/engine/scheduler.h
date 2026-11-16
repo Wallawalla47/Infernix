@@ -303,14 +303,14 @@ public:
     void served(std::uint64_t request, std::uint64_t elapsed_ns) noexcept {
         if (progress_owner() != request) { return; }
         served_ = true;
-        service_ns_ += std::min(elapsed_ns, maximum_service_ns - service_ns_);
+        service_ns_ += std::min(elapsed_ns, service_quantum() - std::min(service_ns_, service_quantum()));
     }
 
     // Replay toward the owner's paused frontier: lengthens its turn (up to maximum_service_ns),
     // never counts as service.
     void recovery_work(std::uint64_t request, std::uint64_t elapsed_ns) noexcept {
         if (progress_owner() == request) {
-            recovery_ns_ += std::min(elapsed_ns, maximum_service_ns - recovery_ns_);
+            recovery_ns_ += std::min(elapsed_ns, service_quantum() - std::min(recovery_ns_, service_quantum()));
         }
     }
 
@@ -320,7 +320,7 @@ public:
     // next admitted request takes the turn. Returns whether the turn ended.
     bool advance_service(bool have_paused, bool recovering) noexcept {
         if (!pressure_ || recovering || !served_) { return false; }
-        if (service_ns_ < std::max(service_quantum_ns, recovery_ns_) && service_order_.size() > 1) {
+        if (service_ns_ < std::max(service_quantum(), recovery_ns_) && service_order_.size() > 1) {
             return false;
         }
         if (!have_paused && (!contended_ || service_order_.size() <= 1)) {
@@ -380,10 +380,17 @@ public:
         return chosen;
     }
 
-    // A turn grants at least one second of useful execution; an expensive restore earns up to
-    // four seconds to amortize its Replay or transfer, a finite bound either way.
-    static constexpr std::uint64_t service_quantum_ns = 1'000'000'000;
-    static constexpr std::uint64_t maximum_service_ns = 4 * service_quantum_ns;
+    // A turn grants 30 seconds of useful execution before it passes (the owner's choice, 2026-11-16, candidates
+    // QN-01): every switch costs a pause and a resume, and with one-second turns (up to four after an expensive
+    // restore) two long requests that could not both fit paused each other in turn, 4 + 4 to 9 + 9 pauses a
+    // replay run. A restore's Replay no longer lengthens a turn past it.
+    static constexpr std::uint64_t service_quantum_ns = 30'000'000'000;
+    static constexpr std::uint64_t maximum_service_ns = service_quantum_ns;
+    // The turn in force: service_quantum_ns, or an engine-level test's (testing::service_quantum_ns).
+    [[nodiscard]] static std::uint64_t service_quantum() noexcept {
+        const std::uint64_t test = testing::service_quantum_ns().load(std::memory_order_relaxed);
+        return test != 0 ? test : service_quantum_ns;
+    }
 
 private:
     template <class R>

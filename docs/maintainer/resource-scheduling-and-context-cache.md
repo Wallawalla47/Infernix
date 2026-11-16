@@ -212,14 +212,16 @@ its turn is not charged meanwhile (`Scheduler::prefill_turn`).
 During a turn only the owner may take capacity from a resident; another blocked request only records
 that it contends.
 
-A turn ends at a cycle boundary once its owner has served one second of execution that committed new
-progress for it (prompt or output tokens), or as long as its restore took (Replay time) up to four
-seconds; waiting for a grant and Replay never count as service, and a turn never ends while a
-recovery is pending. The turn then passes to the next admitted request in the order (a paused one is
+A turn ends at a cycle boundary once its owner has served 30 seconds of execution that committed new
+progress for it (prompt or output tokens); waiting for a grant and Replay never count as service, and a
+turn never ends while a recovery is pending. (Until 2026-11-16 a turn was one second, or as long as its
+restore took up to four: two long requests that could not both fit then paused each other in turn, 4 + 4
+to 9 + 9 pauses a replay run and up to 25,088 replayed tokens, candidates QN-01. Each switch costs a pause
+and a resume; by the owner's choice a turn now runs 30 seconds before it passes.) The turn then passes to the next admitted request in the order (a paused one is
 resumed, pausing whoever its unit needs), and an unused permit of the previous turn is released.
 Pressure ends when a turn ends with nothing paused and no other request contending; a terminal owner
 passes its turn at once. Every admitted request therefore advances within a bounded number of turns
-of about a second each; the cost is Replay on the turns that pause (Qwen3.5 recomputes from the
+of at most 30 seconds of service each; the cost is Replay on the turns that pause (Qwen3.5 recomputes from the
 deepest cached state; Qwen3.8-Flash-Next restores the snapshot it published), so `--max-concurrency`
 and the KV capacity should still leave room for the contexts a workload runs together. While
 pressure holds, fresh requests wait in the queue under their queue deadline instead of entering idle
