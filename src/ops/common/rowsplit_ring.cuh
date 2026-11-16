@@ -49,6 +49,9 @@ struct RowSplitRing {
     static constexpr int kSharedBytes     = kBarrierOffset + Stages * 2 * static_cast<int>(sizeof(std::uint64_t));
     // Chunks (32 K values of one row) a producer thread decodes a K tile: chunk i is half (i & 1) of row i >> 1.
     static constexpr int kChunks = Tile::BM * 2 / kProducerThreads;
+    // Activation copies (eight K values of one token) a producer thread makes of a K tile, at most: a tile holds at
+    // most Tile::BN tokens.
+    static constexpr int kMaxCopies = (Tile::BN * (Tile::BK / 8) + kProducerThreads - 1) / kProducerThreads;
     static_assert(Tile::BK == 64, "a ring stage is one 64-value K tile");
     static_assert(Tile::BM * 2 % kProducerThreads == 0 && kChunks >= 1, "producer threads decode whole chunks");
     static_assert(Stages >= 2 && kThreads <= 1024 && kSharedBytes <= 99 * 1024);
@@ -151,9 +154,13 @@ struct RowSplitRing {
             __nv_bfloat16* As = weight_tile(stage);
             __nv_bfloat16* Bs = activation_tile(stage);
             const int k0      = kt * Tile::BK;
-            int ordinal       = 0;
-#pragma unroll 1
-            for (int c = p; c < tokens * (Tile::BK / 8); c += kProducerThreads, ++ordinal) {
+            // Unrolled over the most copies a thread can have, so each copy's ordinal is a constant: a gathering
+            // source's per-copy rows (an array indexed by it) stay in registers. With a run-time ordinal they were
+            // a local-memory array, reloaded at every copy of every K tile.
+#pragma unroll
+            for (int ordinal = 0; ordinal < kMaxCopies; ++ordinal) {
+                const int c = p + ordinal * kProducerThreads;
+                if (c >= tokens * (Tile::BK / 8)) { break; }
                 const int tl = c / (Tile::BK / 8), kl = (c - tl * (Tile::BK / 8)) * 8;
                 __nv_bfloat16* dst        = &Bs[tl * Tile::BK + gemm_swz64(tl, kl)];
                 const __nv_bfloat16* from = source(ordinal, tl, k0 + kl);
