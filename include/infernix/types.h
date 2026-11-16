@@ -1810,6 +1810,9 @@ struct GenerationWorkTiming {
 // paused time and the remaining resident interval partition this Engine wall time.
 struct GenerationFirstOutputTiming {
     double elapsed_seconds         = 0.0;
+    // From the binding's start, at the end of an Engine cycle, to its completion at the next cycle's start: it
+    // includes the round the other lanes run in between (about 0.1 s at 100K-token contexts beside it), not only
+    // the binding's own work.
     double initial_binding_seconds = 0.0;
     GenerationEngineTiming engine;
     GenerationWorkTiming prefill;
