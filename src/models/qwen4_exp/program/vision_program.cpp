@@ -110,9 +110,7 @@ std::optional<BindingReservation> ProgramImpl::vision_lend(Lane& lane, std::uint
     // span or a wide call. For a window that does not fit they go back only when they hold every lent
     // frame, so the window then fits: a window that waits leaves them alone.
     if (need > vision_lendable() && !walk_.active && !wide_active_ && need <= vision_lend_capacity()) {
-        const std::uint64_t returnable = static_cast<std::uint64_t>(stream_lease_.count) + stream_wide_lease_.count +
-                                         stream_walk_lease_.count + work_lease_.count;
-        if (residency_->stats().lent_frames == returnable) {
+        if (residency_->stats().lent_frames == returnable_frames()) {
             return_stream_lease();
             return_wide_work();
         }

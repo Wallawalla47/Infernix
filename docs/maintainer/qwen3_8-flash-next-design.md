@@ -9113,8 +9113,9 @@ elastic pool does the same job with no kernel change:
       unmapped), as many as the growth needs: a fixed pool at the capacity takes them all.
     - Growth is refused while frames are lent. The quote and the prefix selection count what one
       growth could add.
-    - When only a prefill's stream ring and wide arena are lent (no layer walk, no vision window),
-      the Engine's reclaim for a short binding returns them between calls and grows (the prompt's
+    - When only a prefill's loans are lent (the stream's ring, wide arena and walk area and the wide
+      workspace; no walk span running, no vision window; `returnable_frames`), the Engine's reclaim for
+      a short binding returns them between calls or walk spans and grows (the prompt's
       next streamed call lends again from the smaller cache, or stages: the same bytes), and the
       quote counts that growth. A completed prompt also re-runs admission, since its loans return
       then. Before 2026-10-15 a long prompt held its loans for its whole prefill, and a request
@@ -10865,6 +10866,16 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   queue), finished before A, and its output equals its solo run; A took 19.2 s instead of 15.4 s. The
   reclaim returns the leases only when the pool's capacity has room for the growth (at a full
   `--max-context 150000` it had returned 4,221 frames for nothing).
+  From 2026-10-17 (the wide arena and the walk area became leases of their own, 1bd307c5) to 2026-11-16 the
+  check counted only the ring and the wide workspace, so no streamed prompt's loans were ever returnable and
+  every such wait lasted the whole prompt: in the greedy two-conversation run (Dense8, C = 2) a cold 96K
+  prompt waited 17.5-19.0 s behind a cold 182K one (16 s of it short 1,471 KV pages). `returnable_frames`
+  counts all four leases; `test_queued_growth_real` (an 81,920-token two-span prompt, an 8,192-token request
+  1.5 s later) binds the second request 4.2 s before the first prompt's first output (the old count: at it).
+  Fixed work (Dense8, `--reproducible`, two closed-loop conversations, a 151K and an 80K cold prompt 2 s apart, then
+  ~1.9K-token turns, every reply its exact length; 4 runs an arm, alternated): makespan 46.73 s (46.7-46.8) before,
+  46.84 s (46.7-47.0) after; first outputs summed 55.7 -> 53.3 s (the 80K prompt's 23.1 -> 12.6 s, the 151K
+  prompt's 16.3 -> 25.3 s).
 - A built-in calibrated expert order seeds the warm start (S4b) when no saved state exists: NInfer's
   `kFlashNextExpertPriority` (f8a774f73; 48 layers × 512 experts ranked over 128 tasks in nine
   domains), copied into `expert_cache/calibrated_order.cpp` and applied to every model of its shape

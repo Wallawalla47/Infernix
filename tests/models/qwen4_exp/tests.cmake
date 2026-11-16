@@ -109,6 +109,14 @@ infernix_add_test(infernix_qwen4_exp_finish_beside_binding_real_test
 set_tests_properties(infernix_qwen4_exp_finish_beside_binding_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
 
+# A request waiting for the KV cache to grow is bound at a long prompt's walk-span boundary, when the prompt's
+# lent frames can go back, not after the whole prompt (GitHub #24); both requests keep their solo ids.
+infernix_add_test(infernix_qwen4_exp_queued_growth_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_queued_growth_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_queued_growth_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
 # Non-finite logits after a request published prefix-cache entries (a test hook): its entries are
 # withdrawn, a retry resumes from nothing and equals a cache-off run, and a saved cache file cannot
 # bring them back (hybrid-prefix-cache-spec §7.8, candidates SQ-01).

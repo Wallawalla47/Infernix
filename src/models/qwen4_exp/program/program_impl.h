@@ -2618,9 +2618,17 @@ public:
     [[nodiscard]] bool leases_returnable() const noexcept {
         if (!kv_vmm_ || !residency_ || walk_.active || wide_active_) { return false; }
         const std::uint64_t lent = residency_->stats().lent_frames;
-        const std::uint64_t returnable = (stream_lease_.valid() ? stream_lease_.count : 0U) +
-                                         (work_lease_.valid() ? work_lease_.count : 0U);
-        return lent != 0 && lent == returnable;
+        return lent != 0 && lent == returnable_frames();
+    }
+    // The frames return_stream_lease and return_wide_work give back: the stream's ring, wide arena and walk
+    // area, and the wide workspace. (Counting the ring alone, after the arena and the walk area became leases
+    // of their own, kept every streamed prompt's loans from going back, so a request short of KV waited out
+    // the whole prompt: 16 s behind a cold 182K one, 2026-11-16.)
+    [[nodiscard]] std::uint64_t returnable_frames() const noexcept {
+        const auto count = [](const ExpertResidency::FrameLease& lease) -> std::uint64_t {
+            return lease.valid() ? lease.count : 0U;
+        };
+        return count(stream_lease_) + count(stream_wide_lease_) + count(stream_walk_lease_) + count(work_lease_);
     }
 
     // ---------------------------------------------------------------- execution
