@@ -26,6 +26,11 @@ struct OpenAIPromptCachePolicy {
 
 [[nodiscard]] bool parse_openai_prompt_cache_breakpoint(const RequestJson& value,
                                                         std::string_view param);
+
+// An OpenAI file input (a Chat `file` part's `file` object, a Responses `input_file` part) as a PDF document:
+// `file_data` (a base64 PDF, as a data URL or bare) or, with `allow_url`, `file_url`; `filename` titles it.
+// `file_id` needs a Files API and is refused, as is a file that is not a PDF.
+[[nodiscard]] ContentPart parse_openai_file_input(const RequestJson& file, std::string_view param, bool allow_url);
 [[nodiscard]] OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body);
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
 

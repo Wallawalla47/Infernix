@@ -329,6 +329,13 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             }
             parsed.kind   = ContentKind::Video;
             parsed.source = parse_media_url(part, "video_url", false);
+        } else if (type == "file") {
+            // A PDF document (documents.h): its pages' text, and their images with vision.
+            if (turn.role != ChatRole::User && turn.role != ChatRole::Tool) {
+                bad_request("file is only supported on user or tool messages", "messages", "modality_not_supported");
+            }
+            if (!part.contains("file")) { bad_request("file content part must contain a file object", "messages"); }
+            parsed = parse_openai_file_input(part.at("file"), "messages", false);
         } else {
             bad_request("content type '" + type + "' is not supported", "messages",
                         "modality_not_supported");

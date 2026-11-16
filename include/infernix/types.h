@@ -1502,6 +1502,17 @@ struct MediaGeometry {
     [[nodiscard]] friend bool operator==(MediaGeometry, MediaGeometry) noexcept = default;
 };
 
+// How Vision sizes an image, for a caller that renders images itself (PDF pages): an image whose sides are
+// multiples of token_edge and whose area lies within [min_pixels, max_pixels] enters unresized, as
+// (width / token_edge) * (height / token_edge) vision tokens. One prompt's images and videos hold at most
+// prompt_tokens together. All zero without vision.
+struct VisionImageBudget {
+    std::uint64_t prompt_tokens = 0;
+    std::uint32_t token_edge    = 0;
+    std::uint64_t min_pixels    = 0;
+    std::uint64_t max_pixels    = 0;
+};
+
 struct PromptSummary {
     bool starts_in_reasoning    = false;
     std::uint32_t prompt_tokens = 0;

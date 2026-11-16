@@ -738,6 +738,8 @@ std::uint64_t merged_token_image_pixels() {
     return static_cast<std::uint64_t>(kFactor) * kFactor;
 }
 
+std::uint32_t merged_token_image_edge() { return static_cast<std::uint32_t>(kFactor); }
+
 std::uint64_t merged_token_video_pixels() {
     return static_cast<std::uint64_t>(kTemporal) * kFactor * kFactor;
 }

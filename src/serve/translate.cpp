@@ -287,6 +287,8 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
                 media.kind  = infernix::MessagePartKind::Media;
                 media.media = acquire_media(part);
                 message.parts.push_back(std::move(media));
+            } else if (part.kind == ContentKind::Document) {
+                throw std::logic_error("a document part reached translation unresolved (resolve_documents)");
             } else {
                 ApiError error;
                 error.message = "content type '" + part.type_raw + "' is not supported";
@@ -463,7 +465,7 @@ std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest&
         if (req.messages[m].role != ChatRole::Tool) { continue; }
         for (std::size_t p = 0; p < req.messages[m].content.size(); ++p) {
             const ContentKind kind = req.messages[m].content[p].kind;
-            if (kind == ContentKind::Text) { continue; }
+            if (kind != ContentKind::Image && kind != ContentKind::Video) { continue; }
             if (!out) { out = req; }
             ContentPart& part = out->messages[m].content[p];
             part.kind         = ContentKind::Text;

@@ -875,6 +875,11 @@ ChatTemplateRoleSupport Engine::chat_template_role_support() const {
     return impl_->frontend().chat_template_role_support();
 }
 
+VisionImageBudget Engine::vision_image_budget() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().vision_image_budget();
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

@@ -848,6 +848,15 @@ ChatTemplateRoleSupport Frontend::chat_template_role_support() const noexcept {
     return impl_->chat_template.role_support();
 }
 
+VisionImageBudget Frontend::vision_image_budget() const noexcept {
+    if (!impl_->vision_enabled) { return {}; }
+    const fi::ProcessorOptions& processor = impl_->processor;
+    return VisionImageBudget{.prompt_tokens = processor.max_vision_tokens,
+                             .token_edge    = fi::merged_token_image_edge(),
+                             .min_pixels    = processor.image_min_pixels,
+                             .max_pixels    = processor.image_max_pixels};
+}
+
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, options));
 }

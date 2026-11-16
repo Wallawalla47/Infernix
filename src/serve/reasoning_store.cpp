@@ -107,6 +107,23 @@ void ConversationDigest::add(const ChatTurn& turn) {
             absorb(part.text);
             continue;
         }
+        if (part.kind == ContentKind::Document) {
+            // A document's identity is its content, not the (empty) media source.
+            const DocumentSource& document = *part.document;
+            absorb(static_cast<std::uint64_t>(document.kind) << 8U | static_cast<std::uint64_t>(document.format));
+            absorb(static_cast<std::uint64_t>(document.citations));
+            absorb(document.title);
+            absorb(document.context);
+            absorb(document.source);
+            absorb(document.filename);
+            absorb(document.text);
+            absorb(static_cast<std::uint64_t>(document.blocks.size()));
+            for (const std::string& block : document.blocks) { absorb(block); }
+            absorb(static_cast<std::uint64_t>(document.pdf.kind));
+            absorb(document.pdf.value);
+            absorb(std::string_view(reinterpret_cast<const char*>(document.pdf.bytes.data()), document.pdf.bytes.size()));
+            continue;
+        }
         absorb(static_cast<std::uint64_t>(part.source.kind));
         absorb(part.source.value);
         absorb(part.source.media_type);

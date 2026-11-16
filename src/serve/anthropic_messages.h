@@ -8,6 +8,7 @@
 // itself, so request lowering restores it from the returned block. A signature without the Infernix
 // marker stays non-semantic transport metadata.
 
+#include "serve/citations.h"
 #include "serve/request.h"
 #include "serve/request_json.h"
 
@@ -139,9 +140,12 @@ ApiError normalize_anthropic_error(ApiError error);
 std::string make_anthropic_error_body(const ApiError& error, const std::string& request_id);
 std::string make_anthropic_sse_error(const ApiError& error, const std::string& request_id);
 
+// With `citations` (the request's citable sources, PreparedRequest::citations), the text's cite tags become text
+// blocks of their own carrying `citations` (CiteParser); without, the text is one block as generated.
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
                                              const GenerationOutcome& outcome,
-                                             bool hide_thinking = false);
+                                             bool hide_thinking = false,
+                                             const CitationRegistry* citations = nullptr);
 // A response of several generations. `totals` carries the summed usage and timings (see
 // combine_round_outcomes); `stop_reason` replaces the final generation's (`pause_turn`, or
 // `max_tokens` when the budget ran out after a search).
@@ -149,7 +153,8 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                                              std::span<const AnthropicResponseSegment> segments,
                                              const GenerationOutcome& totals,
                                              std::optional<std::string_view> stop_reason,
-                                             bool hide_thinking = false);
+                                             bool hide_thinking = false,
+                                             const CitationRegistry* citations = nullptr);
 // A cache pre-warm's response (`max_tokens:0`): no content, `stop_reason:"max_tokens"`, the prompt's usage with
 // its cache reads and writes, and no output tokens (the one token the Engine sampled is left out).
 std::string make_anthropic_prewarm_response(const AnthropicResponseIdentity& identity, const GenerationOutcome& totals);
@@ -161,9 +166,15 @@ public:
     // `claude_code_usage_compat` (--claude-code-usage-compat) reports the stream's one
     // `message_start` usage with a provisional 0 `input_tokens` (its cache-read split stays exact);
     // see ServeOptions. No other event changes, the terminal cumulative usage least of all.
+    // `citations` as for make_anthropic_messages_response: a cited span streams as its own text block, whose
+    // `citations_delta` events follow its content_block_start; text that may begin a tag is held until decided.
     AnthropicMessagesStream(AnthropicResponseIdentity identity, int input_tokens,
                             bool hide_thinking = false, std::vector<AnthropicToolSearch> searches = {},
-                            bool claude_code_usage_compat = false);
+                            bool claude_code_usage_compat = false,
+                            std::shared_ptr<const CitationRegistry> citations = {});
+    ~AnthropicMessagesStream();
+    AnthropicMessagesStream(AnthropicMessagesStream&&) noexcept;
+    AnthropicMessagesStream& operator=(AnthropicMessagesStream&&) noexcept;
 
     // The Engine start event is exact for normal streams; with the compat mode above, its
     // `input_tokens` is the provisional 0 there too, including on this no-argument form. The route
@@ -201,6 +212,10 @@ private:
     std::string start_with_cache(std::optional<int> cache_read_input_tokens);
     std::vector<std::string> close_thinking();
     std::vector<std::string> close_text();
+    std::vector<std::string> open_text(bool cited);
+    std::vector<std::string> cite_events(const std::vector<CiteParser::Event>& parsed);
+    // Releases the cite parser's held text and closes a cited span (the generation's end, a tool call).
+    std::vector<std::string> flush_citations();
     std::vector<std::string> close_generation(const GenerationOutcome& outcome);
     std::vector<std::string> call_blocks(const AnthropicResponseSegment& segment);
 
@@ -212,8 +227,10 @@ private:
 
     AnthropicResponseIdentity identity_;
     std::vector<AnthropicToolSearch> searches_;
+    std::shared_ptr<const CitationRegistry> citations_;
+    std::unique_ptr<CiteParser> cite_parser_; // the current generation's, with citations
     std::string reasoning_;
-    std::string content_;
+    std::string content_; // the generated text as the Engine gave it (cite tags included)
     std::vector<StreamedCall> calls_; // the current generation's streamed calls
     int input_tokens_   = 0;
     bool hide_thinking_ = false;

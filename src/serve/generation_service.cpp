@@ -2,6 +2,7 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
+#include "serve/documents.h"
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -219,10 +220,11 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
-infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
-                                   const std::function<bool()>& is_cancelled,
-                                   std::size_t& remaining_bytes,
-                                   std::uint32_t retry_after_seconds) {
+// A media or document source's bytes, charged to the request's aggregate media budget.
+std::vector<std::uint8_t> acquire_source_bytes(const infernix::product::media_acquire::Source& source,
+                                               Clock::time_point deadline,
+                                               const std::function<bool()>& is_cancelled,
+                                               std::size_t& remaining_bytes, std::uint32_t retry_after_seconds) {
     if (remaining_bytes == 0) {
         throw_media_error(infernix::product::media_acquire::Error(
             infernix::product::media_acquire::ErrorKind::BudgetExceeded,
@@ -234,14 +236,22 @@ infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point de
     policy.is_cancelled = is_cancelled;
     std::vector<std::uint8_t> source_bytes;
     try {
-        source_bytes = infernix::product::media_acquire::acquire_bytes(part.source, policy);
+        source_bytes = infernix::product::media_acquire::acquire_bytes(source, policy);
     } catch (const infernix::product::media_acquire::Error& exception) {
         throw_media_error(exception, retry_after_seconds);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_media");
     }
-
     remaining_bytes -= source_bytes.size();
+    return source_bytes;
+}
+
+infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
+                                   const std::function<bool()>& is_cancelled,
+                                   std::size_t& remaining_bytes,
+                                   std::uint32_t retry_after_seconds) {
+    std::vector<std::uint8_t> source_bytes =
+        acquire_source_bytes(part.source, deadline, is_cancelled, remaining_bytes, retry_after_seconds);
     infernix::OwnedMedia media;
     media.kind =
         part.kind == ContentKind::Image ? infernix::MediaKind::Image : infernix::MediaKind::Video;
@@ -281,6 +291,24 @@ void check_preparation_control(Clock::time_point deadline,
                                                    "inference request expired during preparation"),
                             "structured_outputs.grammar", {}, retry_after_seconds);
     }
+}
+
+// The request's documents resolved (documents.h): their bytes charged to the media budget, PDF pages read
+// under the deadline and cancellation.
+DocumentResolution resolve_request_documents(const GenerationRequest& request, const infernix::Engine& engine,
+                                             PdfCache& cache, Clock::time_point deadline,
+                                             const std::function<bool()>& is_cancelled,
+                                             std::size_t& remaining_media_bytes, std::uint32_t retry_after_seconds) {
+    if (!has_documents(request)) { return {}; }
+    DocumentResolveOptions options;
+    options.vision      = engine.vision_image_budget();
+    options.max_context = engine.options().max_context;
+    options.acquire = [&](const infernix::product::media_acquire::Source& source) {
+        return acquire_source_bytes(source, deadline, is_cancelled, remaining_media_bytes, retry_after_seconds);
+    };
+    options.checkpoint = [&] { check_preparation_control(deadline, is_cancelled, retry_after_seconds); };
+    options.cache      = &cache;
+    return resolve_documents(request, options);
 }
 
 class ServiceOutputSink final : public infernix::OutputSink {
@@ -424,6 +452,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    pdf_cache_ = std::make_shared<PdfCache>(kPdfCacheBytes);
 }
 
 std::shared_ptr<RequestLifetime>
@@ -515,8 +544,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         const auto acquisition_started = Clock::now();
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, infernix::kMaximumPromptMediaBytes);
+        DocumentResolution documents =
+            resolve_request_documents(request, *engine_, *pdf_cache_, prepared.lifetime->deadline, is_cancelled,
+                                      remaining_media_bytes, queue_retry_after_seconds());
+        prepared.citations             = std::move(documents.citations);
+        const GenerationRequest& lowered = documents.request ? *documents.request : request;
+        const bool lowered_has_media     = lowered.media_item_count() != 0;
         infernix::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(lowered, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes, queue_retry_after_seconds());
             });
@@ -530,7 +565,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         if (cache_participation == CacheParticipation::ReadWrite && cache.enabled &&
             cache.hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() > 0 &&
             request.continuation == infernix::PromptContinuationMode::NewAssistantTurn &&
-            !request_has_media && request.readout_tokens.empty() &&
+            !lowered_has_media && request.readout_tokens.empty() &&
             request.token_constraint.empty() && !request.ignore_eos && request.max_tokens > 0) {
             prepared.next_turn = input;
         }
@@ -617,8 +652,10 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     try {
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, infernix::kMaximumPromptMediaBytes);
+        const DocumentResolution documents = resolve_request_documents(
+            request, *engine_, *pdf_cache_, deadline, is_cancelled, remaining_media_bytes, queue_retry_after_seconds());
         infernix::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(documents.request ? *documents.request : request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes,
                                      queue_retry_after_seconds());
             });

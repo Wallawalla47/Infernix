@@ -112,6 +112,8 @@ public:
     // lower an instruction turn that arrived in an unsupported position to a role the template does
     // render, keeping text and position, instead of failing the request.
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const noexcept;
+    // The processor's image sizing (all zero without vision).
+    [[nodiscard]] VisionImageBudget vision_image_budget() const noexcept;
 
 private:
     class Impl;

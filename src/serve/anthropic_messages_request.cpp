@@ -318,74 +318,174 @@ std::string require_tool_history_id(const Json& object, const char* key,
     return object.at(key).get<std::string>();
 }
 
-// Whether a document or search_result block asks for citations, which Infernix does not produce.
+// A document or search_result block's `citations: {enabled}`.
 bool requests_citations(const Json& block) {
     if (!block.contains("citations") || block.at("citations").is_null()) { return false; }
     const Json& citations = block.at("citations");
     if (!citations.is_object()) { bad_request("citations must be an object", "messages"); }
-    return citations.value("enabled", false);
+    if (!citations.contains("enabled") || citations.at("enabled").is_null()) { return false; }
+    if (!citations.at("enabled").is_boolean()) { bad_request("citations.enabled must be a boolean", "messages"); }
+    return citations.at("enabled").get<bool>();
 }
 
-// The text blocks of a document's `content` source or a search_result's `content`, joined by blank lines.
-std::string text_blocks(const Json& content, const char* block) {
-    if (content.is_string()) { return content.get<std::string>(); }
+// The text blocks of a document's `content` source or a search_result's `content`: a chunk each with citations.
+std::vector<std::string> text_blocks(const Json& content, const char* block) {
+    if (content.is_string()) { return {content.get<std::string>()}; }
     if (!content.is_array()) { bad_request(std::string(block) + " content must be a string or an array", "messages"); }
-    std::string text;
+    std::vector<std::string> blocks;
+    blocks.reserve(content.size());
     for (const Json& part : content) {
         if (require_block_type(part, "messages") != "text") {
             bad_request(std::string(block) + " content supports text blocks only", "messages",
                         "content_block_not_supported");
         }
-        if (!text.empty()) { text += "\n\n"; }
-        text += require_string(part, "text", "messages", "text block");
+        blocks.push_back(require_string(part, "text", "messages", "text block"));
     }
-    return text;
+    return blocks;
 }
 
-// A text document or a search result, lowered to framed text in place (no citation blocks are produced, so one
-// that asks for citations, and a PDF, URL or file document, keep their refusal). The framing depends on the block
-// alone, so a replayed history renders the same tokens.
-ContentPart lower_document_block(const Json& block, const std::string& type) {
-    if (requests_citations(block)) {
-        bad_request(type + " blocks with citations enabled require citation semantics that Infernix does not provide",
-                    "messages", type == "document" ? "documents_not_supported" : "search_results_not_supported");
-    }
+// A document (text, custom content, a base64 or URL PDF) or a search result, kept whole: resolve_documents
+// (documents.h) reads, chunks and renders it after parsing.
+ContentPart parse_document_block(const Json& block, const std::string& type) {
     const auto optional_string = [&](const char* key) -> std::string {
         if (!block.contains(key) || block.at(key).is_null()) { return {}; }
         if (!block.at(key).is_string()) { bad_request(type + " " + key + " must be a string", "messages"); }
         return block.at(key).get<std::string>();
     };
-    std::string text = "<" + type + ">\n";
+    auto document       = std::make_shared<DocumentSource>();
+    document->citations = requests_citations(block);
     if (type == "document") {
+        document->kind = DocumentSource::Kind::Document;
         if (!block.contains("source") || !block.at("source").is_object()) {
             bad_request("document blocks must contain a source object", "messages");
         }
-        const Json& source        = block.at("source");
-        const std::string kind    = source.value("type", std::string());
-        std::string body;
+        const Json& source     = block.at("source");
+        const std::string kind = require_string(source, "type", "messages", "document source");
         if (kind == "text") {
-            body = require_string(source, "data", "messages", "document text source");
+            document->format = DocumentSource::Format::Text;
+            document->text   = require_string(source, "data", "messages", "document text source");
         } else if (kind == "content") {
             if (!source.contains("content")) { bad_request("a content document source must contain content", "messages"); }
-            body = text_blocks(source.at("content"), "document");
+            document->format = DocumentSource::Format::Content;
+            document->blocks = text_blocks(source.at("content"), "document");
+        } else if (kind == "base64") {
+            const std::string media_type = require_string(source, "media_type", "messages", "base64 document source");
+            if (media_type != "application/pdf") {
+                bad_request("base64 document sources must be PDFs (media_type 'application/pdf'); send plain text as "
+                            "a 'text' source",
+                            "messages", "documents_not_supported");
+            }
+            const std::string data = require_string(source, "data", "messages", "base64 document source");
+            if (data.empty()) { bad_request("base64 document data must not be empty", "messages"); }
+            document->format           = DocumentSource::Format::Pdf;
+            document->pdf.kind         = infernix::product::media_acquire::SourceKind::Data;
+            document->pdf.media_type   = media_type;
+            document->pdf.value        = "data:application/pdf;base64," + data;
+        } else if (kind == "url") {
+            std::string url = require_string(source, "url", "messages", "URL document source");
+            if (!url.starts_with("http://") && !url.starts_with("https://")) {
+                bad_request("document URL must use HTTP(S)", "messages");
+            }
+            document->format         = DocumentSource::Format::Pdf;
+            document->pdf.kind       = infernix::product::media_acquire::SourceKind::Url;
+            document->pdf.media_type = "application/pdf";
+            document->pdf.value      = std::move(url);
+        } else if (kind == "file") {
+            bad_request("document file sources require an Anthropic Files API, which Infernix does not provide",
+                        "messages", "files_not_supported");
         } else {
-            bad_request("document blocks with a '" + kind +
-                            "' source (PDF, URL or file) need a document reader that Infernix does not provide",
-                        "messages", "documents_not_supported");
+            bad_request("unsupported document source type: " + kind, "messages");
         }
-        if (const std::string title = optional_string("title"); !title.empty()) { text += "<title>" + title + "</title>\n"; }
-        if (const std::string context = optional_string("context"); !context.empty()) {
-            text += "<context>" + context + "</context>\n";
-        }
-        text += body;
+        document->title   = optional_string("title");
+        document->context = optional_string("context");
     } else {
-        text += "<source>" + require_string(block, "source", "messages", "search_result block") + "</source>\n";
-        text += "<title>" + require_string(block, "title", "messages", "search_result block") + "</title>\n";
+        document->kind   = DocumentSource::Kind::SearchResult;
+        document->format = DocumentSource::Format::Content;
+        document->source = require_string(block, "source", "messages", "search_result block");
+        document->title  = require_string(block, "title", "messages", "search_result block");
         if (!block.contains("content")) { bad_request("search_result blocks must contain content", "messages"); }
-        text += text_blocks(block.at("content"), "search_result");
+        document->blocks = text_blocks(block.at("content"), "search_result");
     }
-    text += "\n</" + type + ">";
-    return text_part(std::move(text), cache_boundary(block, "messages"));
+    ContentPart part;
+    part.kind     = ContentKind::Document;
+    part.type_raw = type;
+    part.document = std::move(document);
+    if (const auto ttl = cache_boundary(block, "messages")) { part.cache_boundary_after = explicit_cache_boundary(*ttl); }
+    return part;
+}
+
+// The citations of an assistant text block, as the response gave them: the block renders back as its cite tag.
+// Citations of kinds Infernix never produces, and malformed ones, are left out.
+std::vector<CitationLocation> parse_text_citations(const Json& block) {
+    std::vector<CitationLocation> locations;
+    if (!block.contains("citations") || !block.at("citations").is_array()) { return locations; }
+    for (const Json& citation : block.at("citations")) {
+        if (!citation.is_object() || !citation.contains("type") || !citation.at("type").is_string()) { continue; }
+        const std::string& type = citation.at("type").get_ref<const std::string&>();
+        const auto number       = [&](const char* key) -> std::optional<std::uint64_t> {
+            if (!citation.contains(key) || !citation.at(key).is_number_unsigned()) { return std::nullopt; }
+            return citation.at(key).get<std::uint64_t>();
+        };
+        CitationLocation location;
+        std::optional<std::uint64_t> index;
+        std::optional<std::uint64_t> start;
+        std::optional<std::uint64_t> end;
+        if (type == "char_location") {
+            location.kind = CitationLocation::Kind::Char;
+            index         = number("document_index");
+            start         = number("start_char_index");
+            end           = number("end_char_index");
+        } else if (type == "page_location") {
+            location.kind = CitationLocation::Kind::Page;
+            index         = number("document_index");
+            start         = number("start_page_number");
+            end           = number("end_page_number");
+        } else if (type == "content_block_location") {
+            location.kind = CitationLocation::Kind::ContentBlock;
+            index         = number("document_index");
+            start         = number("start_block_index");
+            end           = number("end_block_index");
+        } else if (type == "search_result_location") {
+            location.kind = CitationLocation::Kind::SearchResult;
+            index         = number("search_result_index");
+            start         = number("start_block_index");
+            end           = number("end_block_index");
+        } else {
+            continue;
+        }
+        if (!index || !start || !end) { continue; }
+        location.source_index = static_cast<std::size_t>(*index);
+        location.start        = *start;
+        location.end          = *end;
+        if (citation.contains("cited_text") && citation.at("cited_text").is_string()) {
+            location.cited_text = citation.at("cited_text").get<std::string>();
+        }
+        locations.push_back(std::move(location));
+    }
+    return locations;
+}
+
+// Citations are enabled on all of a request's documents or on none, and separately on all of its search results
+// or none, as on the Anthropic API; and they cannot combine with a structured output format.
+void validate_citations(const GenerationRequest& request) {
+    std::optional<bool> documents;
+    std::optional<bool> search_results;
+    for (const ChatTurn& turn : request.messages) {
+        for (const ContentPart& part : turn.content) {
+            if (part.kind != ContentKind::Document) { continue; }
+            std::optional<bool>& seen =
+                part.document->kind == DocumentSource::Kind::SearchResult ? search_results : documents;
+            if (seen && *seen != part.document->citations) {
+                bad_request(std::string("citations must be enabled on all or none of the request's ") +
+                                (&seen == &documents ? "documents" : "search results"),
+                            "messages");
+            }
+            seen = part.document->citations;
+        }
+    }
+    if ((documents.value_or(false) || search_results.value_or(false)) && request.constraint) {
+        bad_request("citations cannot be combined with output_config.format", "output_config.format");
+    }
 }
 
 // tool_reference blocks (a client-side tool search) load the referenced definitions after the
@@ -410,7 +510,7 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block,
         } else if (type == "tool_reference") {
             load_tool(loaded, referenced_tool(context, require_tool_reference_name(part)));
         } else if (type == "document" || type == "search_result") {
-            result.push_back(lower_document_block(part, type));
+            result.push_back(parse_document_block(part, type));
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
@@ -462,7 +562,7 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content,
             bad_request("tool_reference blocks are valid only inside a tool_result", "messages",
                         "content_block_not_supported");
         } else if (type == "document" || type == "search_result") {
-            result.emplace_back(lower_document_block(block, type));
+            result.emplace_back(parse_document_block(block, type));
         } else if (is_server_tool_block(type)) {
             bad_request("server tool result blocks require an executor that Infernix does not "
                         "provide",
@@ -516,9 +616,10 @@ std::vector<AssistantRound> parse_assistant_blocks(const Json& content,
         AssistantRound& round = rounds.back();
         ChatTurn& assistant   = round.turn;
         if (type == "text") {
-            assistant.content.push_back(
-                text_part(require_string(block, "text", "messages", "text block"),
-                          cache_boundary(block, "messages")));
+            ContentPart text = text_part(require_string(block, "text", "messages", "text block"),
+                                         cache_boundary(block, "messages"));
+            text.citations   = parse_text_citations(block);
+            assistant.content.push_back(std::move(text));
         } else if (type == "thinking") {
             if (cache_boundary(block, "messages")) {
                 bad_request("cache_control is not valid on thinking blocks", "messages",
@@ -2162,6 +2263,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
         }
     }
     parse_structured_outputs(body, result.generation);
+    validate_citations(result.generation);
     return result;
 }
 
@@ -2173,6 +2275,7 @@ AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& bod
     result.generation.tool_name_max_length = kMaxToolNameLength;
     (void)parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
                               limits.claude_code_prompt);
+    validate_citations(result.generation);
     return result;
 }
 

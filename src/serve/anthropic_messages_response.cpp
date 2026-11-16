@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 #include "product/constraint_observation.h"
 
+#include "serve/citations.h"
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
 
@@ -193,6 +194,104 @@ std::string anthropic_call_id(std::span<const AnthropicToolSearch> searches, std
     return random_identifier(is_search_tool(searches, name) ? "srvtoolu_" : "toolu_");
 }
 
+// One citation as the Anthropic API gives it: a document's char_location (plain text), page_location (PDF) or
+// content_block_location (custom content), or a search result's search_result_location.
+OrderedJson citation_json(const ResolvedCitation& citation) {
+    const CitableSource& source = *citation.source;
+    const CitationChunk& first  = source.chunks[citation.first];
+    const CitationChunk& last   = source.chunks[citation.last];
+    const OrderedJson title     = source.title ? OrderedJson(*source.title) : OrderedJson(nullptr);
+    if (source.kind == DocumentSource::Kind::SearchResult) {
+        return OrderedJson{{"type", "search_result_location"},
+                           {"cited_text", citation.cited_text()},
+                           {"source", source.source},
+                           {"title", title},
+                           {"search_result_index", source.index},
+                           {"start_block_index", first.start},
+                           {"end_block_index", last.end}};
+    }
+    OrderedJson json;
+    switch (source.format) {
+    case DocumentSource::Format::Text:
+        json = OrderedJson{{"type", "char_location"},
+                           {"cited_text", citation.cited_text()},
+                           {"document_index", source.index},
+                           {"document_title", title},
+                           {"start_char_index", first.start},
+                           {"end_char_index", last.end}};
+        break;
+    case DocumentSource::Format::Pdf:
+        json = OrderedJson{{"type", "page_location"},
+                           {"cited_text", citation.cited_text()},
+                           {"document_index", source.index},
+                           {"document_title", title},
+                           {"start_page_number", first.page},
+                           {"end_page_number", last.page + 1U}};
+        break;
+    case DocumentSource::Format::Content:
+        json = OrderedJson{{"type", "content_block_location"},
+                           {"cited_text", citation.cited_text()},
+                           {"document_index", source.index},
+                           {"document_title", title},
+                           {"start_block_index", first.start},
+                           {"end_block_index", last.end}};
+        break;
+    }
+    return json;
+}
+
+OrderedJson citations_json(const std::vector<ResolvedCitation>& citations) {
+    OrderedJson array = OrderedJson::array();
+    for (const ResolvedCitation& citation : citations) { array.push_back(citation_json(citation)); }
+    return array;
+}
+
+// A generation's text as response blocks: one block, or with citations the plain and cited spans of its cite tags
+// (an empty span gives no block).
+void append_text_blocks(OrderedJson& content, const std::string& text, const CitationRegistry* citations) {
+    if (text.empty()) { return; }
+    if (citations == nullptr) {
+        content.push_back(OrderedJson{{"type", "text"}, {"text", text}});
+        return;
+    }
+    CiteParser parser(*citations);
+    std::vector<CiteParser::Event> events = parser.feed(text);
+    for (CiteParser::Event& event : parser.finish()) { events.push_back(std::move(event)); }
+    std::string span;
+    const std::vector<ResolvedCitation>* cited = nullptr;
+    const auto flush = [&] {
+        if (!span.empty()) {
+            OrderedJson block{{"type", "text"}, {"text", span}};
+            if (cited != nullptr) { block["citations"] = citations_json(*cited); }
+            content.push_back(std::move(block));
+        }
+        span.clear();
+    };
+    for (const CiteParser::Event& event : events) {
+        switch (event.kind) {
+        case CiteParser::Event::Kind::Text:
+            span += event.text;
+            break;
+        case CiteParser::Event::Kind::Open:
+            flush();
+            cited = &event.citations;
+            break;
+        case CiteParser::Event::Kind::Close:
+            flush();
+            cited = nullptr;
+            break;
+        case CiteParser::Event::Kind::Attach:
+            // A tag around punctuation alone cites the text before it (in its own block when there is none).
+            span += event.text;
+            cited = &event.citations;
+            flush();
+            cited = nullptr;
+            break;
+        }
+    }
+    flush();
+}
+
 } // namespace
 
 std::string new_anthropic_request_id() { return random_identifier("req_"); }
@@ -328,17 +427,18 @@ std::vector<ToolCall> identify_anthropic_tool_calls(const GenerationOutcome& out
 }
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome, bool hide_thinking) {
+                                             const GenerationOutcome& outcome, bool hide_thinking,
+                                             const CitationRegistry* citations) {
     const AnthropicResponseSegment segment = client_segment(outcome);
     return make_anthropic_messages_response(identity, std::span(&segment, 1), outcome,
-                                            std::nullopt, hide_thinking);
+                                            std::nullopt, hide_thinking, citations);
 }
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
                                              std::span<const AnthropicResponseSegment> segments,
                                              const GenerationOutcome& totals,
                                              std::optional<std::string_view> stop_reason,
-                                             bool hide_thinking) {
+                                             bool hide_thinking, const CitationRegistry* citations) {
     if (segments.empty()) { throw std::logic_error("Anthropic response has no generation"); }
     OrderedJson content = OrderedJson::array();
     for (const AnthropicResponseSegment& segment : segments) {
@@ -355,9 +455,7 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                 {"signature", hide_thinking ? encode_thinking_signature(outcome.reasoning)
                                             : identity.message_id}});
         }
-        if (!outcome.text.empty()) {
-            content.push_back(OrderedJson{{"type", "text"}, {"text", outcome.text}});
-        }
+        append_text_blocks(content, outcome.text, citations);
         for (OrderedJson& block : call_blocks_json(segment)) { content.push_back(std::move(block)); }
     }
     const GenerationOutcome& final_outcome = *segments.back().outcome;
@@ -400,9 +498,15 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
                                                  int input_tokens, bool hide_thinking,
                                                  std::vector<AnthropicToolSearch> searches,
-                                                 bool claude_code_usage_compat)
-    : identity_(std::move(identity)), searches_(std::move(searches)), input_tokens_(input_tokens),
-      hide_thinking_(hide_thinking), claude_code_usage_compat_(claude_code_usage_compat) {}
+                                                 bool claude_code_usage_compat,
+                                                 std::shared_ptr<const CitationRegistry> citations)
+    : identity_(std::move(identity)), searches_(std::move(searches)), citations_(std::move(citations)),
+      input_tokens_(input_tokens), hide_thinking_(hide_thinking),
+      claude_code_usage_compat_(claude_code_usage_compat) {}
+
+AnthropicMessagesStream::~AnthropicMessagesStream()                                             = default;
+AnthropicMessagesStream::AnthropicMessagesStream(AnthropicMessagesStream&&) noexcept            = default;
+AnthropicMessagesStream& AnthropicMessagesStream::operator=(AnthropicMessagesStream&&) noexcept = default;
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -475,25 +579,81 @@ std::vector<std::string> AnthropicMessagesStream::close_thinking() {
     return events;
 }
 
+std::vector<std::string> AnthropicMessagesStream::open_text(bool cited) {
+    text_index_ = next_index_++;
+    text_open_  = true;
+    Json block{{"type", "text"}, {"text", ""}};
+    if (cited) { block["citations"] = Json::array(); }
+    return {event("content_block_start",
+                  Json{{"type", "content_block_start"}, {"index", text_index_}, {"content_block", std::move(block)}})};
+}
+
+namespace {
+
+std::string text_delta_event(int index, const std::string& text) {
+    return event("content_block_delta", Json{{"type", "content_block_delta"},
+                                             {"index", index},
+                                             {"delta", Json{{"type", "text_delta"}, {"text", text}}}});
+}
+
+} // namespace
+
 std::vector<std::string> AnthropicMessagesStream::content_delta(const std::string& text) {
     if (!started_ || finished_) { throw std::logic_error("invalid Anthropic text delta state"); }
     std::vector<std::string> events = close_thinking();
-    if (!text_open_) {
-        text_index_ = next_index_++;
-        text_open_  = true;
-        events.push_back(event("content_block_start",
-                               Json{{"type", "content_block_start"},
-                                    {"index", text_index_},
-                                    {"content_block", Json{{"type", "text"}, {"text", ""}}}}));
-    }
     content_ += text;
-    if (!text.empty()) {
-        events.push_back(event("content_block_delta",
-                               Json{{"type", "content_block_delta"},
-                                    {"index", text_index_},
-                                    {"delta", Json{{"type", "text_delta"}, {"text", text}}}}));
+    if (!citations_) {
+        if (!text_open_) { append(events, open_text(false)); }
+        if (!text.empty()) { events.push_back(text_delta_event(text_index_, text)); }
+        return events;
+    }
+    // Cited spans: each is a text block of its own, its citations right after its start.
+    if (!cite_parser_) { cite_parser_ = std::make_unique<CiteParser>(*citations_); }
+    append(events, cite_events(cite_parser_->feed(text)));
+    return events;
+}
+
+std::vector<std::string> AnthropicMessagesStream::cite_events(const std::vector<CiteParser::Event>& parsed) {
+    std::vector<std::string> events;
+    const auto citations = [&](const std::vector<ResolvedCitation>& cited) {
+        for (const ResolvedCitation& citation : cited) {
+            events.push_back(event("content_block_delta",
+                                   Json{{"type", "content_block_delta"},
+                                        {"index", text_index_},
+                                        {"delta", Json{{"type", "citations_delta"},
+                                                       {"citation", Json::parse(citation_json(citation).dump())}}}}));
+        }
+    };
+    for (const CiteParser::Event& item : parsed) {
+        switch (item.kind) {
+        case CiteParser::Event::Kind::Text:
+            if (!text_open_) { append(events, open_text(false)); }
+            events.push_back(text_delta_event(text_index_, item.text));
+            break;
+        case CiteParser::Event::Kind::Open:
+            append(events, close_text());
+            append(events, open_text(true));
+            citations(item.citations);
+            break;
+        case CiteParser::Event::Kind::Close:
+            append(events, close_text());
+            break;
+        case CiteParser::Event::Kind::Attach:
+            // A tag around punctuation alone cites the block before it, which the punctuation then ends.
+            if (!text_open_) { append(events, open_text(true)); }
+            citations(item.citations);
+            events.push_back(text_delta_event(text_index_, item.text));
+            append(events, close_text());
+            break;
+        }
     }
     return events;
+}
+
+std::vector<std::string> AnthropicMessagesStream::flush_citations() {
+    if (!cite_parser_) { return {}; }
+    const std::unique_ptr<CiteParser> parser = std::move(cite_parser_);
+    return cite_events(parser->finish());
 }
 
 std::vector<std::string> AnthropicMessagesStream::close_text() {
@@ -519,6 +679,7 @@ std::vector<std::string> AnthropicMessagesStream::close_generation(const Generat
     }
     const std::string content_suffix = outcome.text.substr(content_.size());
     if (!content_suffix.empty()) { append(events, content_delta(content_suffix)); }
+    append(events, flush_citations());
     append(events, close_thinking());
     append(events, close_text());
     reasoning_.clear();
@@ -535,6 +696,7 @@ std::vector<std::string> AnthropicMessagesStream::tool_call_delta(const infernix
     std::vector<std::string> events;
     if (opens) {
         append(events, close_thinking());
+        append(events, flush_citations());
         append(events, close_text());
         calls_.push_back(StreamedCall{
             .call  = ToolCall{.id = anthropic_call_id(searches_, delta.name), .name = delta.name},

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -63,6 +64,7 @@ enum class ContentKind {
     Text,
     Image,
     Video,
+    Document, // a document or search result, resolved before translation (documents.h)
 };
 
 struct CacheBoundary {
@@ -79,12 +81,56 @@ struct CacheBoundary {
     [[nodiscard]] friend constexpr bool operator==(CacheBoundary, CacheBoundary) noexcept = default;
 };
 
+// A document or search result as the client sent it. resolve_documents (documents.h) decodes, chunks and renders
+// it after parsing, so parsing stays free of I/O and Count Tokens resolves exactly what Messages runs.
+struct DocumentSource {
+    enum class Kind : std::uint8_t {
+        Document,     // Anthropic `document`; OpenAI file inputs
+        SearchResult, // Anthropic `search_result`
+    };
+    enum class Format : std::uint8_t {
+        Text,    // `text`: plain text, chunked into sentences
+        Content, // `blocks`: custom content (a document's content source, a search result's content), a chunk each
+        Pdf,     // `pdf`: a PDF file, each page's text chunked into sentences
+    };
+    Kind kind     = Kind::Document;
+    Format format = Format::Text;
+    std::string title;   // optional for a document, required for a search result
+    std::string context; // a document's context: shown to the model, never cited
+    std::string source;  // a search result's source (its URL or name)
+    std::string text;
+    std::vector<std::string> blocks;
+    infernix::product::media_acquire::Source pdf;
+    std::string filename; // an OpenAI file input's name, the title when it has none
+    bool citations = false;
+};
+
+// A citation an assistant history text block carries (the location fields of an Anthropic citation), so the
+// block renders back as the cite tag the model wrote (documents.h).
+struct CitationLocation {
+    enum class Kind : std::uint8_t {
+        Char,         // char_location: [start, end) in code points
+        Page,         // page_location: [start, end) page numbers, 1-based
+        ContentBlock, // content_block_location: [start, end) content blocks
+        SearchResult, // search_result_location: [start, end) content blocks of a search result
+    };
+    Kind kind                = Kind::Char;
+    std::size_t source_index = 0; // document_index, or search_result_index
+    std::uint64_t start      = 0;
+    std::uint64_t end        = 0;
+    std::string cited_text;
+
+    [[nodiscard]] friend bool operator==(const CitationLocation&, const CitationLocation&) = default;
+};
+
 struct ContentPart {
     ContentKind kind = ContentKind::Text;
     std::string text;     // populated for Text
     std::string type_raw; // original wire "type" string for diagnostics
     infernix::product::media_acquire::Source source;
     infernix::ImageResizePolicy image_resize_policy = infernix::ImageResizePolicy::Downsize;
+    std::shared_ptr<const DocumentSource> document; // populated for Document
+    std::vector<CitationLocation> citations;        // an assistant text block's citations
     std::optional<CacheBoundary> cache_boundary_after;
 };
 

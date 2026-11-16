@@ -228,6 +228,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         make_anthropic_response_identity(request_id, request.model);
     metadata.response_id   = identity.message_id;
     const int input_tokens = prepared.prompt_tokens;
+    // Continuations after a search resolve the same documents; the first generation's sources serve them all.
+    const std::shared_ptr<const CitationRegistry> citations = prepared.citations;
 
     auto lifecycle = begin_request(make_request_log_context(
         req_id, "anthropic_messages", request.generation, metadata, prepared));
@@ -280,7 +282,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                        ? make_anthropic_prewarm_response(identity, totals)
                                        : make_anthropic_messages_response(identity, segments, totals,
                                                                           state->stop_reason,
-                                                                          request.hide_thinking),
+                                                                          request.hide_thinking, citations.get()),
                                    prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
@@ -329,7 +331,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // the error event.
         auto encoder = std::make_shared<AnthropicMessagesStream>(
             identity, input_tokens, request.hide_thinking, request.tool_searches,
-            options_.claude_code_usage_compat);
+            options_.claude_code_usage_compat, citations);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(

@@ -25,6 +25,8 @@ namespace infernix::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+class CitationRegistry;
+class PdfCache;
 
 struct GenerationOutcome {
     std::string text;
@@ -138,6 +140,8 @@ struct PreparedRequest {
     // Engine::prefill_next_turn. Unset for requests the next turn cannot follow (media, assistant
     // continuation, readouts, token constraints, no prefix reuse).
     std::optional<infernix::PromptInput> next_turn;
+    // The request's citable sources (documents.h), for the response's cite tags; null without one.
+    std::shared_ptr<const CitationRegistry> citations;
 };
 
 // The Engine's options for serving with `options`: the one mapping a start (GenerationService) and
@@ -329,6 +333,8 @@ private:
     // Token counting runs the whole preparation path on handler threads, so it has its own bound:
     // a flood of counts is rejected before it can occupy the threads generation prepares on.
     std::shared_ptr<RequestCapacity> count_capacity_;
+    // Recently read PDF documents (documents.h).
+    std::shared_ptr<PdfCache> pdf_cache_;
 };
 
 } // namespace infernix::serve

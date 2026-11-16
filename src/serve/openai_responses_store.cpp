@@ -15,6 +15,13 @@ std::size_t estimate_turn_bytes(const ChatTurn& turn) {
         bytes += sizeof(ContentPart) + part.text.size() + part.type_raw.size() +
                  part.source.value.size() + part.source.media_type.size() +
                  part.source.bytes.size();
+        if (const DocumentSource* document = part.document.get()) {
+            // A stored input_file keeps its PDF (base64 or URL) for the chain's later turns.
+            bytes += sizeof(DocumentSource) + document->title.size() + document->context.size() +
+                     document->source.size() + document->filename.size() + document->text.size() +
+                     document->pdf.value.size() + document->pdf.bytes.size();
+            for (const std::string& block : document->blocks) { bytes += block.size(); }
+        }
     }
     for (const ToolCall& call : turn.tool_calls) {
         bytes += sizeof(ToolCall) + call.id.size() + call.name.size() + call.arguments_json.size();

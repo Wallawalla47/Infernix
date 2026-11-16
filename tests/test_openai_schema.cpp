@@ -762,10 +762,29 @@ int test_messages_and_media() {
         Json::array({Json{{"type", "input_audio"}, {"input_audio", Json::object()}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
                       "input audio rejected");
+    // A file part is a PDF document (serve/documents.h); a Files API id is refused.
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "file"}, {"file", Json::object()}}});
-    failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
-                      "file input rejected");
+    failures += check(api_error([&] { (void)parse(body); }).param == "messages", "an empty file input was accepted");
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "file"}, {"file", Json{{"file_id", "file-1"}}}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "file_inputs_not_supported",
+                      "a Files API file input was accepted");
+    body["messages"][0]["content"] = Json::array(
+        {Json{{"type", "file"}, {"file", Json{{"file_data", "data:application/pdf;base64,JVBERi0="},
+                                              {"filename", "report.pdf"}}}}});
+    {
+        const auto parsed = parse(body);
+        const ContentPart& file = parsed.generation.messages[0].content[0];
+        failures += check(file.kind == ContentKind::Document && file.document->format == DocumentSource::Format::Pdf &&
+                              file.document->filename == "report.pdf" &&
+                              file.document->pdf.value == "data:application/pdf;base64,JVBERi0=",
+                          "a file part was not read as a PDF document");
+    }
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "file"}, {"file", Json{{"file_data", "data:text/plain;base64,SGk="}}}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "file_inputs_not_supported",
+                      "a file input that is not a PDF was accepted");
 
     // GitHub #33: an agent framework's first tool round names the system, assistant and tool
     // messages. Every string name is accepted and ignored: the request parses to the same history

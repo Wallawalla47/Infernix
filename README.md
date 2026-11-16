@@ -147,6 +147,9 @@ Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer
   default with the drafter measured fastest for each model (`--spec auto`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video; the vision encoder can stay in system RAM.
+- **Documents**: PDFs (page text, and page images with vision, read with PDFium), plain-text documents and
+  search results, with Anthropic citations
+  ([serving](docs/serving.md#documents-pdfs-and-citations)).
 - **Conversion**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources; Q4-Q8, FP8, NVFP4 and
   mixed recipes.
 - **Windows and Linux**: native MSVC and GCC builds, WSL2 included.
@@ -529,12 +532,17 @@ the top of `build_native.bat`. It builds with Ninja Multi-Config (about 30 % fas
 Studio generator); a `build-windows` tree from the Visual Studio generator is configured afresh on its
 next build.
 
+PDF documents need PDFium: `tools\deps\fetch_pdfium.py` downloads the pinned prebuilt release, checks
+its SHA-256 and unpacks it where `build_native.bat` finds it (without it the build succeeds and PDFs
+are refused).
+
 ```bat
+py -3.11 -I tools\deps\fetch_pdfium.py
 build_native.bat configure
 build_native.bat build
 ```
 
-The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs beside it.
+The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs (`pdfium.dll` among them) beside it.
 
 **The easy way: the launcher.** Run `infernix-launcher.exe`, beside the server: see
 [Infernix Launcher](#infernix-launcher-beta).
@@ -632,7 +640,8 @@ compiler, Ninja, `pkg-config`, and the FFmpeg, libjpeg-turbo and curl developmen
 
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libjpeg-turbo8-dev libcurl4-openssl-dev
-cmake --preset release
+python3.11 -I tools/deps/fetch_pdfium.py   # PDF documents (PDFium); prints the tree for PDFIUM_ROOT
+cmake --preset release -DPDFIUM_ROOT="$PWD/build-deps/pdfium/chromium-8152/linux-x64"
 cmake --build build -j
 ```
 

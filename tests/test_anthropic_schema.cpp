@@ -1,5 +1,6 @@
 #include "serve/anthropic_messages.h"
 
+#include "serve/documents.h"
 #include "serve/generation_service.h"
 #include "serve/server_tools.h"
 #include "serve/translate.h"
@@ -879,35 +880,48 @@ int test_content_and_cache_hints() {
                       "Files image source was flattened or ignored");
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "document"}, {"source", Json::object()}}});
-    failures += check(api_code([&] { (void)parse(body); }) == "documents_not_supported",
-                      "document citation semantics were silently discarded");
+    failures += check(api_param([&] { (void)parse(body); }) == "messages",
+                      "a document without a source type was accepted");
 
-    // Text documents and search results without citations are lowered to framed text in place (a conversation
-    // that attached one no longer fails every later turn); citations, and PDF / URL / file sources, stay refused.
+    // Documents and search results stay whole through parsing; resolve_documents renders them as framed text
+    // (documents.h), the same for every turn that sends them again.
+    const auto resolved = [](const GenerationRequest& request) {
+        DocumentResolution resolution = resolve_documents(request, {});
+        return resolution.request ? std::move(*resolution.request) : request;
+    };
     body["messages"][0]["content"] = Json::array(
         {Json{{"type", "document"},
               {"source", Json{{"type", "text"}, {"media_type", "text/plain"}, {"data", "Line one."}}},
               {"title", "Notes"}},
          Json{{"type", "text"}, {"text", "Summarize it."}}});
     GenerationRequest lowered = parse(body).generation;
+    failures += check(lowered.messages[0].content[0].kind == ContentKind::Document,
+                      "a document was rendered while parsing instead of resolved");
+    lowered = resolved(lowered);
     failures += check(lowered.messages.size() == 1 && lowered.messages[0].content.size() == 2 &&
                           lowered.messages[0].content[0].text ==
-                              "<document>\n<title>Notes</title>\nLine one.\n</document>",
-                      "a text document was not lowered to framed text in place");
+                              "<document>\n<title>Notes</title>\nLine one.\n</document>\n",
+                      "a text document was not rendered as framed text");
     body["messages"][0]["content"][0]["source"] =
         Json{{"type", "content"}, {"content", Json::array({Json{{"type", "text"}, {"text", "A"}},
                                                            Json{{"type", "text"}, {"text", "B"}}})}};
-    lowered = parse(body).generation;
-    failures += check(lowered.messages[0].content[0].text == "<document>\n<title>Notes</title>\nA\n\nB\n</document>",
-                      "a content-source document was not lowered");
-    body["messages"][0]["content"][0]["citations"] = Json{{"enabled", true}};
-    failures += check(api_code([&] { (void)parse(body); }) == "documents_not_supported",
-                      "a document asking for citations was accepted without them");
-    body["messages"][0]["content"][0].erase("citations");
+    lowered = resolved(parse(body).generation);
+    failures += check(lowered.messages[0].content[0].text == "<document>\n<title>Notes</title>\nA\n\nB\n</document>\n",
+                      "a content-source document was not rendered");
     body["messages"][0]["content"][0]["source"] =
         Json{{"type", "base64"}, {"media_type", "application/pdf"}, {"data", "JVBERi0="}};
+    lowered = parse(body).generation;
+    failures += check(lowered.messages[0].content[0].kind == ContentKind::Document &&
+                          lowered.messages[0].content[0].document->format == DocumentSource::Format::Pdf &&
+                          lowered.messages[0].content[0].document->pdf.value == "data:application/pdf;base64,JVBERi0=",
+                      "a base64 PDF document was not kept for the PDF reader");
+    body["messages"][0]["content"][0]["source"] =
+        Json{{"type", "base64"}, {"media_type", "text/plain"}, {"data", "SGk="}};
     failures += check(api_code([&] { (void)parse(body); }) == "documents_not_supported",
-                      "a PDF document was accepted without a reader");
+                      "a base64 document that is not a PDF was accepted");
+    body["messages"][0]["content"][0]["source"] = Json{{"type", "file"}, {"file_id", "file_1"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "files_not_supported",
+                      "a Files API document was accepted");
     body             = base_request();
     body["messages"] = Json::array(
         {Json{{"role", "user"}, {"content", "Search."}},
@@ -924,13 +938,13 @@ int test_content_and_cache_hints() {
                                                             {"content", Json::array({Json{{"type", "text"},
                                                                                           {"text", "Body."}}})}}})}}})}}});
     body["tools"] = Json::array({Json{{"name", "search"}, {"input_schema", Json{{"type", "object"}}}}});
-    lowered       = parse(body).generation;
+    lowered       = resolved(parse(body).generation);
     failures += check(lowered.messages.size() == 3 && lowered.messages[2].role == infernix::ChatRole::Tool &&
                           lowered.messages[2].content.size() == 1 &&
                           lowered.messages[2].content[0].text ==
                               "<search_result>\n<source>https://example.com/a</source>\n<title>A</title>\nBody.\n"
-                              "</search_result>",
-                      "a search_result inside a tool_result was not lowered to framed text");
+                              "</search_result>\n",
+                      "a search_result inside a tool_result was not rendered as framed text");
     return failures;
 }
 

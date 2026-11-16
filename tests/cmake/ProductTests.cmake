@@ -65,6 +65,12 @@ infernix_add_test(infernix_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES infernix_serve)
 
+# Citations and PDF documents: chunking, the cite-tag parser at every split, rendering, history identity, the
+# response blocks, and PDFs through PDFium (skipped in a build without it).
+infernix_add_test(infernix_citations_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_citations.cpp"
+  LIBRARIES infernix_serve infernix_media_pdf infernix_media_decode)
+
 infernix_add_test(infernix_tool_search_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_search.cpp"
   LIBRARIES infernix_serve)

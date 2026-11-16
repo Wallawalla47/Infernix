@@ -4,6 +4,8 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <memory>
+#include <optional>
 #include <chrono>
 #include <cstdio>
 #include <random>
@@ -37,6 +39,58 @@ std::string responses_identifier(std::string_view prefix) {
 } // namespace
 
 using Json = nlohmann::json;
+
+ContentPart parse_openai_file_input(const RequestJson& file, std::string_view param, bool allow_url) {
+    const std::string where(param);
+    if (!file.is_object()) { bad_request("a file input must be an object", where); }
+    const auto string_field = [&](const char* key) -> std::optional<std::string> {
+        if (!file.contains(key) || file.at(key).is_null()) { return std::nullopt; }
+        if (!file.at(key).is_string()) { bad_request(std::string("file ") + key + " must be a string", where); }
+        return file.at(key).get<std::string>();
+    };
+    if (string_field("file_id")) {
+        bad_request("file_id requires a Files API, which Infernix does not provide; send file_data", where,
+                    "file_inputs_not_supported");
+    }
+    auto document      = std::make_shared<DocumentSource>();
+    document->kind     = DocumentSource::Kind::Document;
+    document->format   = DocumentSource::Format::Pdf;
+    document->filename = string_field("filename").value_or(std::string());
+    if (const std::optional<std::string> data = string_field("file_data")) {
+        std::string value = *data;
+        if (value.starts_with("data:")) {
+            const std::size_t comma = value.find(',');
+            const std::string_view header =
+                comma == std::string::npos ? std::string_view{} : std::string_view(value).substr(5, comma - 5);
+            if (!header.starts_with("application/pdf") || header.find(";base64") == std::string_view::npos) {
+                bad_request("file_data must be a base64 PDF (data:application/pdf;base64,...)", where,
+                            "file_inputs_not_supported");
+            }
+        } else {
+            value = "data:application/pdf;base64," + value;
+        }
+        if (value.size() <= std::string_view("data:application/pdf;base64,").size()) {
+            bad_request("file_data must not be empty", where);
+        }
+        document->pdf.kind       = product::media_acquire::SourceKind::Data;
+        document->pdf.media_type = "application/pdf";
+        document->pdf.value      = std::move(value);
+    } else if (std::optional<std::string> url = allow_url ? string_field("file_url") : std::nullopt) {
+        if (!url->starts_with("http://") && !url->starts_with("https://")) {
+            bad_request("file_url must use HTTP(S)", where);
+        }
+        document->pdf.kind       = product::media_acquire::SourceKind::Url;
+        document->pdf.media_type = "application/pdf";
+        document->pdf.value      = std::move(*url);
+    } else {
+        bad_request(allow_url ? "a file input needs file_data or file_url" : "a file input needs file_data", where);
+    }
+    ContentPart part;
+    part.kind     = ContentKind::Document;
+    part.type_raw = "file";
+    part.document = std::move(document);
+    return part;
+}
 
 bool parse_openai_prompt_cache_breakpoint(const RequestJson& value, std::string_view param) {
     if (!value.contains("prompt_cache_breakpoint") ||

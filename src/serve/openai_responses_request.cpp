@@ -290,8 +290,17 @@ void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage&
         return;
     }
     if (type == "input_file") {
-        bad_request("input_file requires a Files API, which Infernix does not provide", "input",
-                    "file_inputs_not_supported");
+        // A PDF document (documents.h): its pages' text, and their images with vision.
+        if (role != ChatRole::User) { bad_request("input_file is only supported on user messages", "input"); }
+        ContentPart part = parse_openai_file_input(value, "input", true);
+        part.type_raw    = type;
+        parsed.turn.content.push_back(std::move(part));
+        Json canonical{{"type", "input_file"}};
+        for (const char* key : {"filename", "file_data", "file_url"}) {
+            if (value.contains(key) && !value.at(key).is_null()) { canonical[key] = value.at(key); }
+        }
+        content.push_back(std::move(canonical));
+        return;
     }
     if (type == "input_audio") {
         bad_request("input_audio is not supported by the Engine", "input",
@@ -561,8 +570,9 @@ ChatTurn parse_function_call_output_item(
                 apply_shared_breakpoint(part, value, breakpoint_count);
                 turn.content.push_back(std::move(part));
             } else if (type == "input_file") {
-                bad_request("tool result input_file requires a Files API", "input",
-                            "file_inputs_not_supported");
+                ContentPart part = parse_openai_file_input(value, "input", true);
+                part.type_raw    = type;
+                turn.content.push_back(std::move(part));
             } else {
                 bad_request("unsupported " + kind + " content type: " + type, "input",
                             "modality_not_supported");

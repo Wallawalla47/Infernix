@@ -1077,6 +1077,61 @@ int test_custom_tools() {
     return failures;
 }
 
+// An input_file part is a PDF document (serve/documents.h): parsed whole, carried by a stored chain to the
+// previous_response_id continuation, counted in the store's bytes; a Files API id and other roles are refused.
+int test_input_file_documents() {
+    int failures = 0;
+    const std::string data = "data:application/pdf;base64,JVBERi0xLjQK";
+    const Json body{{"model", "m"},
+                    {"input", Json::array({Json{{"role", "user"},
+                                                {"content", Json::array({Json{{"type", "input_file"},
+                                                                              {"file_data", data},
+                                                                              {"filename", "r.pdf"}},
+                                                                         Json{{"type", "input_text"},
+                                                                              {"text", "Summarize."}}})}}})}};
+    const auto initial = parse_openai_responses_create_request(body, limits());
+    const ContentPart& file = initial.prompt.input_turns.at(0).content.at(0);
+    failures += check(file.kind == ContentKind::Document && file.document->format == DocumentSource::Format::Pdf &&
+                          file.document->filename == "r.pdf" && file.document->pdf.value == data,
+                      "an input_file part was not read as a PDF document");
+
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    auto stored_turns = initial.prompt.input_turns;
+    stored_turns.push_back(text_turn(infernix::ChatRole::Assistant, "first answer"));
+    const OpenAIResponseContext context = append_openai_response_context({}, std::move(stored_turns));
+    const std::size_t with_document     = context->owned_bytes;
+    store.put(stored_parent(context));
+    const Json followup{{"model", "m"}, {"previous_response_id", "resp_parent"}, {"input", "And page two?"}};
+    const auto second =
+        resolve_openai_responses_prompt(parse_openai_responses_create_request(followup, limits()).prompt, store);
+    const ContentPart& carried = second.generation.messages.at(0).content.at(0);
+    failures += check(carried.kind == ContentKind::Document && carried.document->pdf.value == data,
+                      "a previous_response_id continuation lost the stored PDF document");
+    const OpenAIResponseContext text_only =
+        append_openai_response_context({}, {text_turn(infernix::ChatRole::User, "Summarize."),
+                                            text_turn(infernix::ChatRole::Assistant, "first answer")});
+    failures += check(with_document > text_only->owned_bytes + data.size(),
+                      "the store did not count a stored document's bytes");
+
+    Json files_api = body;
+    files_api["input"][0]["content"][0] = Json{{"type", "input_file"}, {"file_id", "file-1"}};
+    failures += check(api_code([&] { (void)parse_openai_responses_create_request(files_api, limits()); }) ==
+                          "file_inputs_not_supported",
+                      "a Files API input_file was accepted");
+    Json url = body;
+    url["input"][0]["content"][0] = Json{{"type", "input_file"}, {"file_url", "https://example.com/r.pdf"}};
+    const auto from_url = parse_openai_responses_create_request(url, limits());
+    failures += check(from_url.prompt.input_turns.at(0).content.at(0).document->pdf.kind ==
+                          infernix::product::media_acquire::SourceKind::Url,
+                      "a file_url input_file was not kept as a URL source");
+    Json assistant = body;
+    assistant["input"][0]["role"] = "assistant";
+    assistant["input"][0]["content"] = Json::array({Json{{"type", "input_file"}, {"file_data", data}}});
+    failures += check(api_error([&] { (void)parse_openai_responses_create_request(assistant, limits()); }).status == 400,
+                      "an assistant input_file was accepted");
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -2031,6 +2086,7 @@ int main() try {
     failures += test_custom_tools();
     failures += test_hosted_web_search_declaration();
     failures += test_explicit_rejections();
+    failures += test_input_file_documents();
     failures += test_deferred_tools_and_hosted_search();
     failures += test_client_tool_search_and_additional_tools();
     failures += test_previous_response_call_graph();

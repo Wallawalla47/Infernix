@@ -193,6 +193,8 @@ public:
     // Which instruction positions the active chat template renders; prompt preparation lowers an
     // instruction turn that arrived in an unsupported position to a role the template does render.
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const;
+    // How Vision sizes an image (all zero without vision), for a caller that renders images itself.
+    [[nodiscard]] VisionImageBudget vision_image_budget() const;
     [[nodiscard]] bool is_available() const;
     // True once an execution failure has ended every request: the Engine refuses new work until
     // the process starts a new one. An orderly stop() is not a failure.
