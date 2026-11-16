@@ -51,7 +51,7 @@ be positive, §17); every other value is derived from the rest of the configurat
 | §9.6 queue holds | implemented (default on, `--no-queue-holds`): waiting requests' resume snapshots and paths are evicted last, the back of the queue first; host-only unit tests. End-to-end effect not yet measured |
 | §7.1 taps | implemented: exact taps (explicit, generation opener, structural) split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
 | §7.4 tap publication | implemented: deferred until the anchoring blocks commit (a frontier inside a block, or an MTP backend one token behind); exact-frontier tails are copied into cache-owned pages |
-| §7.6 block publication, write-through | implemented: blocks join the tree at every commit; a lane's blocks are written to Host in one batch when it releases them |
+| §7.6 block publication, write-through | implemented: blocks join the tree at every commit; a lane's blocks are written to Host when a tap covering them publishes (Qwen3.5) or is taken (Qwen3.8-Flash-Next), and its release writes only the blocks past its last tap (§16.13) |
 | §7.7 endpoint snapshots at finish and consistent abort | implemented |
 | §7.9 next-turn prefill | implemented 2026-10-27 (`--cache-next-turn-ms`; default on for Qwen3.5, off for Qwen3.8-Flash-Next and refused on its reproducible route): host tests pass; real scenarios `next-turn` / `next-turn-reproducible` (27B) pass; Flash-Next's reproducible resume from the pass was not exact, and its reproducible route keeps no tap where a lane ends (§7.9); the agentic replay A/B is outstanding |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
@@ -59,7 +59,7 @@ be positive, §17); every other value is derived from the rest of the configurat
 | §5.7 SSD tier | implemented 2026-11-06 (opt-in `--ssd-context-gib` with `--ssd-context-dir`), both bindings; the write policy 2026-11-07 (fate counters, Qwen4Exp's ring left out, the image codec, `--ssd-context-gib-per-hour`): host-only unit tests (index write-back, demotion, promotion, SSD eviction order, partial and packed copies, a randomized stress with invariant checks), `infernix_ssd_tier_test` (bytes through a real scratch file, the codec's exactness, packed and partial copies, the write budget), `infernix_direct_scratch_file_test`, real scenarios `ssd-restore`/`ssd-restore-mtp` (27B) and `--ssd` (Flash-Next, also with DFlash2), timing `--ssd-scale` (§16.9) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1). The Qwen4Exp binding takes the opener's tap without the split another way, its pair call (Flash-Next design §19.3.56) |
-| §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
+| §11.2 KV transfer Op | copy-engine path only: a restore enqueues one copy per block and plane as one `cudaMemcpyBatchAsync` per model layer; write-through moves runs of consecutive pages and slabs as one `cudaMemcpy2DAsync` per plane |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
 | §5.6 Host state precision, §9.7 tool-call holds | implemented 2026-10-12 with branch-point taps and pause snapshots, measured by agentic A/B (§16.8); tool-call holds on by default (30 s) since 2026-10-13, packed Host state an option (default `fp32`), branch-point taps and pause snapshots removed; pause snapshots back since 2026-11-14 with ledger resumes (§16.10). An Op test for the state codec, a state-image test, option tests and a `cache-replay` preemption real scenario |
@@ -76,7 +76,7 @@ be positive, §17); every other value is derived from the rest of the configurat
 | Admission | bounded heuristic search over complete targets; up to 250 ms planning allowance per admission boundary | O(prompt blocks) lookup + arithmetic capacity check, no search |
 | Pressure | monotone degradation graph, joint post-state projection, ordered stage peaks, one global transaction | independent eviction per tier: device LRU and host GDSF (GreedyDual-Size-Frequency) |
 | Host tier | variable-extent arena with allocator geometry and a separate StateImage slot count | one pinned slab pool; KV blocks and snapshots share it with no fixed split between them |
-| Device ↔ host | demote on pressure (copy before release) | asynchronous write-through when a lane releases its blocks; device eviction never copies |
+| Device ↔ host | demote on pressure (copy before release) | asynchronous write-through as a lane's taps publish, and of the rest when it releases its blocks; device eviction never copies |
 | Code | ≈25 k lines in `runtime/engine/context_cache`, `program/{planning,transactions,storage}`, host arena, resource contracts | ≈6.1 k lines in `runtime/prefix_cache`, `program/prefix` and the Engine's `HybridResourceManager`, plus ≈1.8 k lines of integration |
 
 What the design changes for users:
@@ -248,7 +248,8 @@ Consequences:
 Ownership against AGENTS.md boundaries:
 
 - **Core** owns physical primitives: the paged KV cache's record-addressed Host copies, which
-  copy runs of consecutive pages and slabs as one strided transfer per plane.
+  restore as one batched call of per-block, per-plane copies and write through runs of consecutive
+  pages and slabs as one strided transfer per plane.
 - **Ops** gain nothing: the zero-split GDN tap (§7.2–§7.3) and a KV page transfer kernel (§11.2)
   are not implemented. Taps are Device copies of the committed StateImage.
 - **Program** owns the whole cache: exact identity, physical residency, refs, eviction, taps.
@@ -1192,9 +1193,13 @@ After any commit that advances every enabled pool's committed frontier across a 
   (`Duplicate`). If it exists host-only, or with an unpinned Device copy, it adopts the sequence's
   page as its Device copy (the unpinned copy is released). Otherwise **insert** a node owning the
   sequence's page. The node stays pinned for this sequence.
-- D2H write-through of the lane's Device-only nodes is enqueued in one batch when the lane releases
-  its path (finish, abort or cancel), before the nodes become evictable. Batching coalesces runs of
-  consecutive pages and slabs into one strided copy per plane, and pinned nodes need no backup yet.
+- D2H write-through of the lane's Device-only nodes is enqueued as soon as a snapshot covers them:
+  when a tap covering them publishes (Qwen3.5) or is taken (Qwen3.8-Flash-Next), and, for the blocks
+  past its last tap, when the lane releases its path (finish, abort or cancel), before the nodes
+  become evictable (continuous write-through since 2026-11-15, §16.13; one batch at release before).
+  Each write coalesces runs of consecutive pages and slabs into one strided copy per plane (batched
+  as one copy per block and plane, as restores are, it cost a cold prompt's first token 0.6 s,
+  §16.14), and pinned nodes need no backup yet.
   A block with no snapshot at or below it is not written (2026-11-15): no resume can pass through it, so
   its Host copy would only hold a slab until the dead-KV sweep (a prefill cancelled past its last tap, a
   generation that left no endpoint). When such a write lands, its blocks join the Device LRU deepest first.
@@ -1510,7 +1515,7 @@ Allocation of `k` slabs:
 
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
-Device-only (§9.2). KV block writes (write-through at release) are not bounded this way.
+Device-only (§9.2). KV block writes (write-through) are not bounded this way.
 
 **Jointly feasible eviction (2026-11-14, after NInfer).** Evicting one victim at a time lost victims
 even when the rest could not free enough: a pause's resume point against a Host tier of held
@@ -1699,9 +1704,12 @@ plus MTP. The Host slab layout packs a block's Main page with its Host page layo
 page at the next 4 KiB boundary, so a transfer is a pure copy with no requantisation, and restore is
 bit-exact for every KV profile.
 
-Implemented: the copy engines. Runs of consecutive device pages whose slab records advance by one
-constant pitch (within one pinned chunk and the device's maximum copy pitch) move as one
-`cudaMemcpy2DAsync` per plane; a restore orders the planes by model layer.
+Implemented: the copy engines. A restore enqueues one copy per block and plane, each Host record
+named at the address the device maps it at, as one `cudaMemcpyBatchAsync` per model layer's planes
+(and one for the prelude), in model-layer order (§6.5). Write-through moves runs of consecutive
+device pages whose slab records advance by one constant pitch (within one pinned chunk and the
+device's maximum copy pitch) as one `cudaMemcpy2DAsync` per plane, and so does a restore of memory
+the driver does not map or on the legacy default stream (§16.14).
 
 Not implemented, kept as options if restore bandwidth or SM interference ever matters: an SM copy
 kernel reading pinned slabs through mapped pointers (16 B vector accesses, a capped grid so other
@@ -1957,7 +1965,7 @@ With the cache disabled, `host_capacity_bytes`, `device_snapshot_slots` and
 |---|---|
 | Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one split per chat request, and none after an endpoint resume. The zero-split GDN tap (§7.2–§7.3) removes the rest if measurement shows it matters. |
 | Snapshots crowd KV out of host memory | GDSF weighs bytes against recompute seconds on the same scale for both. Dead-KV sweep runs first. |
-| Write-through competes with decode | Copy engines only, batched when a lane releases its blocks; decode rounds/s were unchanged with prefetch and write-through active (§16.3). Write-through can be throttled when decode is active without changing correctness. |
+| Write-through competes with decode | Copy engines only, written as taps publish since 2026-11-15 (one batch at release before); decode rounds/s were unchanged with prefetch and write-through active (§16.3), and the continuous form showed no difference (§16.13). Write-through can be throttled when decode is active without changing correctness. |
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
 | Large pinned allocations on Windows | Chunked allocation; the startup ledger reports the resolved size. |
 | No session keys | Content addressing reproduces chain reuse; the protocol surface is unchanged. |
