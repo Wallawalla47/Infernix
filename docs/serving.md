@@ -2580,7 +2580,9 @@ be added to `workspace.capacity_bytes`. The field is `null` when Vision is disab
 `cuda_graph_allowance_bytes` is the CUDA Graph memory
 the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph preparation
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
-the first. When the graphs find no Device memory at all, a Qwen3.5-family engine with
+the first, unless `cuda_graph_excess_absorbed` is true: on Qwen3.8-Flash-Next the allowance is the expert
+frames' fixed 128 MiB reserve, and graphs past it take memory back from the elastic frames by design. When
+the graphs find no Device memory at all, a Qwen3.5-family engine with
 `--kv-capacity auto` warns and starts once more with 1 GiB more headroom (a smaller KV capacity);
 an explicit `--kv-capacity` fails startup instead.
 

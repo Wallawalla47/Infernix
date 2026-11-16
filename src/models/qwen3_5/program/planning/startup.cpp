@@ -252,9 +252,14 @@ std::uint64_t maximum_main_page_groups(std::uint32_t concurrency, std::uint32_t 
 // 4). The 2026-09-26 calibration measured 2.2-4.1 MiB on the graphs of then, and the 4 MiB and
 // 64 MiB it kept left 66-426 MiB of these configurations free above the headroom, KV capacity
 // automatic sizing never used. The allowance keeps 2 MiB per executable (a third above the largest
-// measured) plus 16 MiB; serve warns at startup when the graphs took more.
-constexpr std::size_t kGraphExecutableAllowance = 2ULL * kMiB;
-constexpr std::size_t kGraphDriverAllowance     = 16ULL * kMiB;
+// measured) plus 16 MiB; serve warns at startup when the graphs took more. Column-invariant decode (the
+// reproducible route, without batched-decode) launches each column's kernels apart, so its executables carry
+// more nodes: 2026-11-16, the same 27B with DFlash2 and n-gram drafting at max concurrency 4 took 76 MiB for 28
+// executables on --reproducible (2.1 MiB each past the 16 MiB, past the 72 MiB allowed: serve warned), against
+// 212 MiB for 112 on the default route (1.75 MiB each). It keeps 3 MiB per executable.
+constexpr std::size_t kGraphExecutableAllowance                = 2ULL * kMiB;
+constexpr std::size_t kGraphExecutableAllowanceColumnInvariant = 3ULL * kMiB;
+constexpr std::size_t kGraphDriverAllowance                    = 16ULL * kMiB;
 
 // Number of executables one family instantiates for one batch size: one per topology class.
 std::uint32_t graph_topology_classes(const std::vector<GraphExecutionProfile>& profiles) {
@@ -1485,9 +1490,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                (split_batches ? impl->max_concurrency : 1U);
             }
         }
+        const std::size_t per_executable = impl->execution_schedule.column_invariant_decode
+                                               ? kGraphExecutableAllowanceColumnInvariant
+                                               : kGraphExecutableAllowance;
         impl->graph_allowance_bytes = checked_add(
-            kGraphDriverAllowance,
-            checked_mul(kGraphExecutableAllowance, executables, "CUDA Graph executable allowance"),
+            kGraphDriverAllowance, checked_mul(per_executable, executables, "CUDA Graph executable allowance"),
             "CUDA Graph allowance");
     }
 

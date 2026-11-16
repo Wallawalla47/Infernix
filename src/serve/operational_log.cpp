@@ -678,9 +678,10 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    product::format_pretty_bytes(memory.planned_slack_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_measured_bytes));
-    if (memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+    if (memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes && !memory.cuda_graph_excess_absorbed) {
         // The KV pool was sized against the allowance, so the excess came out of the slack left
-        // beside it; with no headroom the next allocation can fail.
+        // beside it; with no headroom the next allocation can fail. (An elastic expert-frame pool gives the
+        // excess back from its frames by design: no warning, the debug ledger above shows both figures.)
         logger_->warn("CUDA graphs used {} but the KV sizing allowed {}; leave more room with "
                       "--vram-headroom-mib or a smaller --kv-capacity",
                       product::format_pretty_bytes(memory.cuda_graph_measured_bytes),

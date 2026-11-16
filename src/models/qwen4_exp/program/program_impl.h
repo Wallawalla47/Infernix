@@ -3420,6 +3420,8 @@ public:
         // took more).
         out.cuda_graph_allowance_bytes = sizing_.reserve;
         out.cuda_graph_measured_bytes  = graph_set_.bytes > 0 ? static_cast<std::size_t>(graph_set_.bytes) : 0;
+        // An elastic pool keeps a fixed reserve and takes the rest back by chunks (internal_reserve, VM-04).
+        out.cuda_graph_excess_absorbed = residency_ && residency_->elastic();
         if (residency_) {
             // As the 122B's ExpertOffload::memory_summary reports its cache; the cache only resizes
             // under the VRAM monitor, so without it the startup frames are today's.

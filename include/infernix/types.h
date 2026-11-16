@@ -2154,6 +2154,10 @@ struct MemorySummary {
     // granularity: 0 without CUDA Graphs, and also when the graphs fit in memory the driver already
     // held (StartupPhase::CudaGraphPrepare reports the preparation itself).
     std::size_t cuda_graph_measured_bytes         = 0;
+    // The graphs past cuda_graph_allowance_bytes take device memory back from an elastic expert-frame pool (Qwen3.8-
+    // Flash-Next: a fixed 128 MiB reserve, the frames shrinking by chunks for the rest, by design), so a measured
+    // figure above the allowance is not a shortfall.
+    bool cuda_graph_excess_absorbed               = false;
     std::size_t kv_payload_bytes                  = 0;
     // With offloaded experts (beside runtime_reservation_bytes, which excludes them).
     std::optional<ExpertCacheMemorySummary> expert_cache;
