@@ -233,7 +233,8 @@ void validate_compatibility_hints(const Json& body) {
 }
 
 infernix::product::media_acquire::Source parse_media_url(const Json& part, const char* field,
-                                                       bool image) {
+                                                       bool image,
+                                                       std::uint32_t* max_long_side = nullptr) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
@@ -251,16 +252,11 @@ infernix::product::media_acquire::Source parse_media_url(const Json& part, const
             if (!value.at("detail").is_string()) {
                 bad_request("image_url.detail must be a string", "messages");
             }
-            // 'high' (sent by native OpenAI clients such as Codex) asks for full-quality
-            // preprocessing, which the model's native frontend already is; 'low' and other profiles
-            // it cannot apply.
-            const std::string detail = value.at("detail").get<std::string>();
-            if (detail != "auto" && detail != "high") {
-                bad_request(
-                    "image_url.detail='" + detail +
-                        "' requests an explicit preprocessing profile that Infernix's fixed Vision "
-                        "frontend cannot apply; use 'auto' or 'high'",
-                    "messages", "image_detail_not_supported");
+            // 'low' (Frigate's camera descriptions) caps the picture's longest side; 'high' (native
+            // OpenAI clients such as Codex), 'auto' and unknown values take the native geometry.
+            if (max_long_side != nullptr) {
+                *max_long_side =
+                    image_detail_long_side(value.at("detail").get_ref<const std::string&>());
             }
         }
     } else {
@@ -319,7 +315,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Image;
-            parsed.source = parse_media_url(part, "image_url", true);
+            parsed.source = parse_media_url(part, "image_url", true, &parsed.image_max_long_side);
         } else if (type == "video_url") {
             // Qwen, vLLM, and SGLang use video_url as a Chat Completions extension for
             // multimodal models. Infernix maps it to the Engine's native Video input.

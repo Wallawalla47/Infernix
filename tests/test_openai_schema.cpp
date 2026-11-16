@@ -707,15 +707,23 @@ int test_messages_and_media() {
                           media.messages[0].content[1].kind == ContentKind::Video,
                       "image and video compatibility inputs normalize to Engine media");
 
-    body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
-    failures += check(parse(body).generation.media_item_count() == 2,
-                      "image detail 'high' takes the native preprocessing, as 'auto'");
-    for (const char* detail : {"low", "original", "medium"}) {
+    failures += check(media.messages[0].content[0].image_max_long_side == 0,
+                      "image detail 'auto' takes the native geometry");
+    // Frigate's camera descriptions send 'low': the picture's longest side is capped at 512 px.
+    // 'high' and values Infernix does not know take the native geometry instead of a refusal.
+    for (const auto& [detail, long_side] :
+         std::vector<std::pair<const char*, std::uint32_t>>{
+             {"low", 512U}, {"high", 0U}, {"auto", 0U}, {"original", 0U}, {"medium", 0U}}) {
         body["messages"][0]["content"][0]["image_url"]["detail"] = detail;
-        failures +=
-            check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                  std::string("image preprocessing detail '") + detail + "' rejected");
+        const GenerationRequest parsed = parse(body).generation;
+        failures += check(parsed.media_item_count() == 2 &&
+                              parsed.messages[0].content[0].image_max_long_side == long_side,
+                          std::string("image detail '") + detail + "' is accepted with long side " +
+                              std::to_string(long_side));
     }
+    body["messages"][0]["content"][0]["image_url"]["detail"] = 5;
+    failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                      "a non-string image detail is still a bad request");
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();
