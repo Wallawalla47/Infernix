@@ -519,10 +519,11 @@ struct RecordConvShared {
     float beta[kRecordConvMaxWidth];
 };
 
-// run_recurrent_sequence's view of the CTA's evaluated inputs; outputs and records go where RecordAccess puts them.
-template <class State>
+// run_recurrent_sequence's view of the CTA's inputs in shared memory (evaluated by the record_conv kernel, or
+// staged by the record kernel); outputs and records go where the Record access puts them.
+template <class Record>
 struct RecordConvSharedAccess {
-    const RecordAccess<false, State>& record;
+    const Record& record;
     const RecordConvShared& shared;
     float scale;
 
@@ -842,7 +843,60 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
+// The record kernel's inputs for its CTA in shared memory (candidates QJ-01): q and k of its qk head, its state
+// tile's value rows and its value head's gates, over the row's `valid` columns (at most kRecordConvMaxWidth). Every
+// load is issued before the first store, so the recurrence that follows meets no global latency per column.
 template <bool Masked, class State>
+__device__ __forceinline__ void stage_record_inputs(const RecordAccess<Masked, State>& access,
+                                                    const RecurrentCoordinates& coord, std::int32_t valid,
+                                                    RecordConvShared& shared) {
+    constexpr int kThreads     = kWarpSize * kNumWarps;
+    constexpr int kPieces      = kStateDim / 4; // 8-byte pieces of a q or k row (8-byte aligned)
+    constexpr int kQkPasses    = kRecordConvMaxWidth * kPieces / kThreads;
+    constexpr int kValuePasses = kRecordConvMaxWidth * kBlockDv / kThreads;
+    static_assert(kQkPasses * kThreads == kRecordConvMaxWidth * kPieces);
+    static_assert(kValuePasses * kThreads == kRecordConvMaxWidth * kBlockDv && kRecordConvMaxWidth <= kThreads);
+    const int thread = coord.warp * kWarpSize + coord.lane;
+    const int row0   = static_cast<int>(coord.state_tile) * kBlockDv;
+    uint2 query[kQkPasses], key[kQkPasses];
+    __nv_bfloat16 value[kValuePasses];
+#pragma unroll
+    for (int p = 0; p < kQkPasses; ++p) {
+        const int i = thread + p * kThreads, token = i / kPieces, piece = i % kPieces;
+        if (token < valid) {
+            query[p] = *reinterpret_cast<const uint2*>(access.query_ptr(coord, token) + 4 * piece);
+            key[p]   = *reinterpret_cast<const uint2*>(access.key_ptr(coord, token) + 4 * piece);
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < kValuePasses; ++p) {
+        const int i = thread + p * kThreads, token = i / kBlockDv;
+        if (token < valid) { value[p] = access.value_ptr(coord, token)[row0 + i % kBlockDv]; }
+    }
+    RawGatePair gate{};
+    if (thread < valid) { gate = access.load_gate(coord, thread); }
+#pragma unroll
+    for (int p = 0; p < kQkPasses; ++p) {
+        const int i = thread + p * kThreads, token = i / kPieces, piece = i % kPieces;
+        if (token < valid) {
+            *reinterpret_cast<uint2*>(&shared.query[token][4 * piece]) = query[p];
+            *reinterpret_cast<uint2*>(&shared.key[token][4 * piece])   = key[p];
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < kValuePasses; ++p) {
+        const int i = thread + p * kThreads, token = i / kBlockDv;
+        if (token < valid) { shared.value[token][row0 + i % kBlockDv] = value[p]; }
+    }
+    if (thread < valid) {
+        shared.g[thread]    = gate.g;
+        shared.beta[thread] = gate.beta;
+    }
+}
+
+// `Staged` (widths up to kRecordConvMaxWidth): the inputs are staged in shared memory first; the recurrence then
+// reads the same bits from there, so the outputs and records are unchanged.
+template <bool Masked, bool Staged, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
@@ -853,7 +907,15 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     load_state_tile(state, access.state_read_base(coord), coord);
     pdl::enter_streaming();
     const std::int32_t valid = access.active_columns(coord);
-    run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
+    if constexpr (Staged) {
+        __shared__ __align__(16) RecordConvShared shared;
+        stage_record_inputs(access, coord, valid, shared);
+        __syncthreads();
+        const RecordConvSharedAccess<RecordAccess<Masked, State>> inputs{access, shared, access.scale};
+        run_recurrent_sequence<true, RecordEffects>(state, inputs, coord, valid);
+    } else {
+        run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
+    }
     zero_output_suffix(access, coord, valid, access.width);
 }
 
@@ -928,7 +990,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  shared.g[gate_column], shared.beta[gate_column]);
     }
     __syncthreads();
-    const RecordConvSharedAccess<State> inputs{record, shared, record.scale};
+    const RecordConvSharedAccess<RecordAccess<false, State>> inputs{record, shared, record.scale};
     run_recurrent_sequence<true, RecordEffects>(state, inputs, coord, width);
 }
 

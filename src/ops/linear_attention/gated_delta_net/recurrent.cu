@@ -123,8 +123,17 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    CUDA_CHECK(
-        pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_kernel<Masked, State>, access));
+    // One row's verification (up to 16 columns) stages its inputs in shared memory (candidates QJ-01): served on the
+    // reproducible route at one lane, 27B DFlash2 +0.22 % and 35B MTP +0.31 % decode (4 of 4 ABBA pairs each); at
+    // four lanes unresolved (27B 3 of 4 pairs faster, 35B 3 of 4 slower), and the op bench's L2-warm B = 4 and 8
+    // points 3-12 % slower, so wider calls keep the per-column loads. Both give the same bits.
+    if (q.ne[2] <= kRecordConvMaxWidth && q.ne[3] == 1) {
+        CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_kernel<Masked, true, State>,
+                                        access));
+    } else {
+        CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_kernel<Masked, false, State>,
+                                        access));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
