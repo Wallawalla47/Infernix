@@ -25,6 +25,7 @@
 #include "models/qwen4_exp/execution/dflash2.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/ngram_tree_testing.h"
+#include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "runtime/speculative/draft_length.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -508,7 +509,9 @@ struct PairHead {
 
 class ProgramImpl {
 public:
-    enum class Phase : std::uint8_t { Free, Prefill, Decode, Finishable };
+    // Published: finished beside an open context transaction (finish_held). Its report and its prefix publication
+    // are done; the lane keeps its pages, state slot and pins until release_finished, after the transaction.
+    enum class Phase : std::uint8_t { Free, Prefill, Decode, Finishable, Published };
 
     struct Lane {
         Phase phase          = Phase::Free;
@@ -2555,6 +2558,10 @@ public:
             out.advanced = true;
             if (!vision_encoded(admitted)) { return out; }
         }
+        if (testing::binding_held()) { // a test's longer binding (testing::set_binding_hold)
+            out.advanced = true;
+            return out;
+        }
         out.advanced  = true;
         out.complete  = true;
         out.published = true;
@@ -3247,7 +3254,34 @@ public:
         return out;
     }
 
-    FinishResult finish(SequenceHandle sequence) noexcept {
+    FinishResult finish(SequenceHandle sequence) noexcept { return finish_lane(sequence, true); }
+
+    // A finish beside an open context transaction (a vision binding's encode, which runs over several Engine
+    // cycles): everything finish() reports and publishes, the same prefix publication (a terminal lane runs no
+    // more units, and its endpoint capture and block writes are the Host-born snapshot and D2H copies a prefill
+    // tap of another lane takes during the transaction too), but the lane is not released: a release returns pages
+    // and frames the transaction's reservation was planned beside. The lane is Published until release_finished.
+    // Only a Finishable lane the transaction does not hold back (can_finish_held).
+    [[nodiscard]] bool can_finish_held(SequenceHandle sequence) const noexcept {
+        const std::uint32_t index = ContractAccess::lane(sequence);
+        return index < lanes_.size() && lanes_[index].phase == Phase::Finishable &&
+               lanes_[index].epoch == ContractAccess::epoch(sequence) && !context_blocks(sequence);
+    }
+    FinishResult finish_held(SequenceHandle sequence) noexcept { return finish_lane(sequence, false); }
+    void release_finished(SequenceHandle sequence) noexcept {
+        try {
+            const auto index = lane_of(sequence);
+            if (lanes_[index].phase != Phase::Published) {
+                diagnostic("Qwen4Exp: release of a lane that is not published", DiagnosticLevel::Error);
+                return;
+            }
+            release(index);
+        } catch (...) {
+            diagnostic("Qwen4Exp: release of a published lane failed", DiagnosticLevel::Error);
+        }
+    }
+
+    FinishResult finish_lane(SequenceHandle sequence, bool release_lane) noexcept {
         FinishResult out;
         try {
             const auto index = lane_of(sequence);
@@ -3278,7 +3312,12 @@ public:
                 const std::uint32_t deepest     = std::min(lane.prefix.deepest, lane.prompt_tokens);
                 out.cache_created_prompt_tokens = deepest > lane.prefix.reused ? deepest - lane.prefix.reused : 0U;
             }
-            release(index);
+            if (release_lane) {
+                release(index);
+            } else {
+                lanes_[index].phase = Phase::Published;
+                testing::count_held_finish();
+            }
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (const std::exception& error) {
             // The Engine fails a terminal sequence that does not finish; say why.
@@ -3296,8 +3335,10 @@ public:
             out.timings      = timings(lanes_[index]);
             out.speculative  = lanes_[index].speculative;
             // A consistent abort (no unit in flight) leaves an endpoint a resend resumes from; inside
-            // a layer walk the layers are at different positions, so it leaves none.
-            if (pending_transaction_ == 0 && lanes_[index].phase != Phase::Free && !(walk_.active && walk_.lane == index)) {
+            // a layer walk the layers are at different positions, so it leaves none. A published lane
+            // has already published its endpoint.
+            if (pending_transaction_ == 0 && lanes_[index].phase != Phase::Free &&
+                lanes_[index].phase != Phase::Published && !(walk_.active && walk_.lane == index)) {
                 prefix_finish(lanes_[index], index);
             }
             release(index);

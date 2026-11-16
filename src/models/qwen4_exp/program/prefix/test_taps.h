@@ -8,6 +8,7 @@
 //   before they land every time rather than now and then (infernix_qwen4_exp_preemption_real_test: a resume without
 //   replay decodes from a restored state).
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 
@@ -38,5 +39,14 @@ void count_tap_block_writes(std::uint64_t blocks) noexcept;
 
 void count_drain() noexcept;
 [[nodiscard]] std::uint64_t drains() noexcept;
+
+// For `hold` after the call (zero: none), a binding's context transaction whose own work is done is reported
+// unfinished: the binding spans more Engine cycles, as a Vision encode lent its window does (a layer group a cycle).
+// And the finishes completed beside an open transaction (finish_held) since the process started; count_held_finish
+// is the Program's (infernix_qwen4_exp_finish_beside_binding_real_test). For tests only.
+void set_binding_hold(std::chrono::milliseconds hold) noexcept;
+[[nodiscard]] bool binding_held() noexcept;
+void count_held_finish() noexcept;
+[[nodiscard]] std::uint64_t held_finishes() noexcept;
 
 } // namespace infernix::models::qwen4_exp::testing

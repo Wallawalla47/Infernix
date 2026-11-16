@@ -207,6 +207,10 @@ struct RequestRecord {
     bool background = false;
     EngineRequestState model_state = EngineRequestState::Waiting;
     std::optional<FinishReason> terminal_reason;
+    // Completed (its final event sent) beside an open context transaction while the Program still holds its
+    // lane: that sequence, which completion no longer names in `sequence`. The Engine releases it and the slot
+    // once the transaction ends (settle_terminal_requests).
+    std::optional<SequenceHandle> held_sequence;
 
     std::optional<BasePlan> base_plan;
     std::optional<ResumeState> suspended;

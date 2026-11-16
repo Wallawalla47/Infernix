@@ -345,6 +345,14 @@ state. The source remains valid until the required data has been copied and veri
 up reservations and transfers and does not publish an incomplete destination. Evictions that
 completed safely are kept, and the result must match the final actual occupancy.
 
+No lane is released while a transaction is open. Qwen3.5's bindings and pauses complete in their first poll,
+before terminal requests settle, so its finished requests never wait for one. A Flash-Next vision binding encodes
+over several cycles; a request that finishes meanwhile is completed at once (`finish_held`: its usage fields and
+its prefix publication, which are a terminal lane's endpoint capture and block writes, as a prefill tap of another
+lane makes during the transaction) and its lane is released at the first cycle after the transaction
+(`release_finished`). The publication follows the cache's rules at that moment: the binding's pinned source is not
+evictable room, so under Host-tier pressure an endpoint can be refused that a later finish would have kept.
+
 ### 5.2 Model unit transactions
 
 Prefill finalization, decode and control can produce a move-only `PendingBatch` containing the frozen

@@ -21,7 +21,23 @@ std::atomic<std::uint32_t> restore_delay_us{0};
 std::atomic<bool> restore_fault{false};
 std::atomic<std::uint64_t> drain_count{0};
 std::atomic<std::uint64_t> tap_block_write_count{0};
+std::atomic<std::int64_t> binding_hold_until{0}; // steady_clock ticks; 0: none
+std::atomic<std::uint64_t> held_finish_count{0};
 } // namespace
+
+void set_binding_hold(std::chrono::milliseconds hold) noexcept {
+    binding_hold_until.store(hold.count() == 0 ? 0
+                                               : (std::chrono::steady_clock::now() + hold).time_since_epoch().count());
+}
+
+bool binding_held() noexcept {
+    const std::int64_t until = binding_hold_until.load();
+    return until != 0 && std::chrono::steady_clock::now().time_since_epoch().count() < until;
+}
+
+void count_held_finish() noexcept { held_finish_count.fetch_add(1, std::memory_order_relaxed); }
+
+std::uint64_t held_finishes() noexcept { return held_finish_count.load(std::memory_order_relaxed); }
 
 void set_restore_fault() noexcept { restore_fault.store(true); }
 

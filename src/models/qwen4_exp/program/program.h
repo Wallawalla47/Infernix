@@ -708,6 +708,13 @@ public:
                                       runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
+    // A terminal sequence finished while a context transaction is open (a vision binding encodes over several
+    // Engine cycles): finish_held reports and publishes as finish() does but keeps the lane until
+    // release_finished, which the Engine calls once the transaction has ended. can_finish_held is false when the
+    // transaction holds the sequence back; the Engine then waits for it, as for every finish before.
+    [[nodiscard]] bool can_finish_held(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] FinishResult finish_held(SequenceHandle sequence) noexcept;
+    void release_finished(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
 
     void fail_all_cleanup() noexcept;

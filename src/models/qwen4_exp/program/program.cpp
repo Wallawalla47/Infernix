@@ -155,6 +155,15 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept {
     return impl_->finish(sequence);
 }
 
+bool Program::can_finish_held(SequenceHandle sequence) const noexcept { return impl_->can_finish_held(sequence); }
+
+FinishResult Program::finish_held(SequenceHandle sequence) noexcept {
+    impl_->settle_deferred_or_drop();
+    return impl_->finish_held(sequence);
+}
+
+void Program::release_finished(SequenceHandle sequence) noexcept { impl_->release_finished(sequence); }
+
 AbortResult Program::abort(SequenceHandle sequence) noexcept {
     impl_->settle_deferred_or_drop();
     return impl_->abort(sequence);

@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -1161,10 +1162,35 @@ private:
         return cancelled;
     }
 
+    // Completes the terminal requests in publication order: the Program finishes each sequence (its usage
+    // fields: timings, speculative and expert-cache counts, the prompt tokens its snapshots made reusable) and
+    // releases its lane. No lane is released while a context transaction is open. One that spans Engine cycles
+    // (a Flash-Next vision binding's encode) would otherwise hold a finished request's final event (a
+    // non-streaming client's whole response) for the encode, so a Program with finish_held completes the request
+    // now and keeps the lane, and the Engine releases it here once the transaction has ended (QN-04). A sequence
+    // the transaction holds back (can_finish_held false) waits, and so do the requests after it.
     bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
-        if (instance_.program->has_context_transaction()) { return false; }
+        constexpr bool kFinishHeld = requires(typename ModelContract::Program& program, const SequenceHandle& s) {
+            { program.can_finish_held(s) } -> std::same_as<bool>;
+            program.finish_held(s);
+            program.release_finished(s);
+        };
+        const bool transaction = instance_.program->has_context_transaction();
+        if (transaction && !kFinishHeld) { return false; }
 
         bool changed = false;
+        if constexpr (kFinishHeld) {
+            if (!transaction) {
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    const auto& request = slots_[lane];
+                    if (request == nullptr || !request->held_sequence) { continue; }
+                    instance_.program->release_finished(*request->held_sequence);
+                    request->held_sequence.reset();
+                    remove_completed_slot(lane);
+                    changed = true;
+                }
+            }
+        }
         for (;;) {
             std::optional<std::uint32_t> selected;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1184,7 +1210,17 @@ private:
                 throw std::logic_error("terminal-pending request has invalid ownership");
             }
             const FinishReason reason = *request->terminal_reason;
-            auto finished             = instance_.program->finish(*request->sequence);
+            typename ModelContract::FinishResult finished;
+            if constexpr (kFinishHeld) {
+                if (transaction) {
+                    if (!instance_.program->can_finish_held(*request->sequence)) { break; }
+                    finished = instance_.program->finish_held(*request->sequence);
+                } else {
+                    finished = instance_.program->finish(*request->sequence);
+                }
+            } else {
+                finished = instance_.program->finish(*request->sequence);
+            }
             if (finished.status != ConsumeStatus::Consumed) {
                 throw std::logic_error("terminal native sequence could not finish");
             }
@@ -1206,8 +1242,15 @@ private:
             }
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            // Completion clears the request's sequence: a held lane's is kept for its release.
+            std::optional<SequenceHandle> held;
+            if (transaction) { held = request->sequence; }
             complete_success(request, reason);
-            remove_completed_slot(lane);
+            if (transaction) {
+                request->held_sequence = held; // the slot and lane follow once the transaction ends
+            } else {
+                remove_completed_slot(lane);
+            }
             boundary = begin_host_phase();
             changed  = true;
         }
@@ -1221,7 +1264,8 @@ private:
         bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
-            if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
+            // A held finished request is complete: settle_terminal_requests releases it.
+            if (request == nullptr || request->held_sequence || !cancelled_at_boundary[lane]) { continue; }
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
             }
@@ -2609,6 +2653,10 @@ private:
             context_owner_.reset(); // a pausing owner holds its lane: it fails with the others below
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (slots_[lane] == nullptr) { continue; }
+                if (slots_[lane]->held_sequence) { // already answered; the Program released its lane above
+                    remove_completed_slot(lane);
+                    continue;
+                }
                 complete_error(slots_[lane], error);
                 remove_completed_slot(lane);
                 ++failed;
