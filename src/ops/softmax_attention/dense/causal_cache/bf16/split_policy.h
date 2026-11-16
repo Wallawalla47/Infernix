@@ -53,67 +53,26 @@ struct Bf16KvPartition {
 // The most splits one row of a proportional launch takes: the merge's reduction block (Bf16KvMergeSchedule<256>).
 inline constexpr int kBf16KvProportionalMaxSplits = 256;
 
-// A share group's shares: every row's window and the group's split budget, for `rows` rows (at most
-// kCausalProportionalMaxRows) of `width` columns (row r's positions at positions[r * width]; `validity` null, or
-// each row's live columns). A row with no live column or a negative first position has window 0 and takes no
-// split. The budget is the sum of the live rows' plain bounds, min(target of the window, one split per 64 keys,
+// A proportional launch's shares, in share groups of partition.proportional consecutive rows (at most
+// kCausalProportionalMaxRows rows of `width` columns; row r's positions at positions[r * width]; `validity` null, or
+// each row's live columns). A row with no live column or a negative first position has window 0 and takes no split.
+// A group's budget is the sum of its live rows' plain bounds, min(target of the window, one split per 64 keys,
 // capacity): what live() runs at most, so the group runs about as many CTAs as the plain partition and never more
-// than its capacity x rows slots. Each live row takes one split and the rest go to the rows in proportion to their
-// windows (rounded down), a row never more than one split per 64 keys or the merge's block: that is its count, the
-// slots it owns. It runs them as layout(window, count): equal splits of whole key tiles, the last slots left empty
-// where the tile rounding needs fewer. Rows of equal windows have their plain bound as count and so live()'s
-// splits, key for key (when the envelope's capacity is below the target, the capacity's). Every CTA of a launch
-// (producer and merge alike) computes the same shares from the same positions, in integers. The rows' positions
-// load together, without a branch between them, and the shares divide by the same sum of windows through its
-// reciprocal: one load round trip and one division before a CTA's first key load. 32-bit arithmetic: a window is
-// at most 2^20 keys and the spare slots at most 8 x 256, so spare x window < 2^32.
+// than its capacity x rows slots. Each live row takes one split and the rest go to the group's rows in proportion to
+// their windows (rounded down), a row never more than one split per 64 keys or the merge's block: that is its count,
+// the slots it owns, and its partials start at its first slot (the prefix of the earlier rows' counts). It runs them
+// as layout(window, count): equal splits of whole key tiles, the last slots left empty where the tile rounding needs
+// fewer. Rows of equal windows have their plain bound as count and so live()'s splits, key for key (when the
+// envelope's capacity is below the target, the capacity's). Every CTA of a launch (producer and merge alike) computes
+// the same shares from the same positions, in integers.
+//
+// It runs warp-wide: lane r < kCausalProportionalMaxRows holds row r (its window and bound, its group's sums by
+// shuffles, its count, and its first slot by a warp scan), so no array is kept (the eight rows' arrays, read by row
+// indices a group-bounded loop chose, spilled into local memory). The rows' positions load together, and a group's
+// shares divide by its sum of windows through one reciprocal. Every lane of the calling warp calls it with the same
+// arguments. 32-bit arithmetic: a window is at most 2^20 keys and the spare slots at most 8 x 256, so
+// spare x window < 2^32.
 struct Bf16KvProportionalShares {
-    unsigned windows[kCausalProportionalMaxRows];
-    unsigned keys       = 0;
-    unsigned spare      = 0;
-    unsigned reciprocal = 0; // floor((2^32 - 1) / keys)
-
-    __device__ Bf16KvProportionalShares(const Bf16KvPartition& partition, const std::int32_t* positions,
-                                        const std::int32_t* validity, int width, int rows, int visible_capacity) {
-        int first[kCausalProportionalMaxRows], valid[kCausalProportionalMaxRows];
-        for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
-            const int row = r < rows ? r : 0; // a row past the group reads row 0 (and is given no window below)
-            first[r]      = positions[static_cast<std::int64_t>(row) * width];
-            valid[r]      = validity != nullptr ? validity[row] : 1;
-        }
-        unsigned live = 0, budget = 0;
-        for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
-            const bool works = r < rows && valid[r] > 0 && first[r] >= 0;
-            const int window = works ? causal_row_window(first[r], width, visible_capacity) : 0;
-            windows[r]       = window > 0 ? static_cast<unsigned>(window) : 0U;
-            int bound        = window >= 32768 ? partition.long_target : partition.normal_target;
-            const int by_64  = (window + 63) >> 6;
-            bound            = bound < by_64 ? bound : by_64;
-            bound            = bound < partition.capacity ? bound : partition.capacity;
-            live += windows[r] != 0U ? 1U : 0U;
-            keys += windows[r];
-            budget += windows[r] != 0U ? static_cast<unsigned>(bound) : 0U;
-        }
-        spare      = budget > live ? budget - live : 0U;
-        reciprocal = keys != 0U ? 0xffffffffU / keys : 0U;
-    }
-
-    // Row r's count: the split slots it owns (0 for a row without work).
-    __device__ int count(int r) const {
-        const unsigned window = windows[r];
-        if (window == 0U) return 0;
-        // floor(spare x window / keys): the reciprocal's quotient is at most one short.
-        const unsigned product = spare * window;
-        unsigned quotient      = static_cast<unsigned>((static_cast<unsigned long long>(product) * reciprocal) >> 32);
-        if (product - quotient * keys >= keys) ++quotient;
-        unsigned share       = 1U + quotient;
-        const unsigned by_64 = (window + 63U) >> 6;
-        share                = share < by_64 ? share : by_64;
-        return static_cast<int>(share < static_cast<unsigned>(kBf16KvProportionalMaxSplits)
-                                    ? share
-                                    : static_cast<unsigned>(kBf16KvProportionalMaxSplits));
-    }
-
     // A row's splits within its `count` slots: live_with(window, count), the fewest whole key tiles a split (at
     // least 64 keys) that cover the window in `count` splits, and the splits that then hold keys (the tile rounding
     // can leave the last slots empty: their CTAs return, and the merge reads only the live ones). Only a CTA's own
@@ -123,32 +82,74 @@ struct Bf16KvProportionalShares {
     }
 };
 
-// A proportional launch of `rows` rows, in share groups of partition.proportional consecutive rows: the count and
-// first slot of every row up to `last` (base: the slots of the rows before `last`; count: its own).
+#if defined(__CUDACC__)
+// The calling lane's row's count and first slot, and every row's count.
+__device__ inline CausalProportionalRow bf16_kv_proportional_lane(const Bf16KvPartition& partition,
+                                                                  const std::int32_t* positions,
+                                                                  const std::int32_t* validity, int width, int rows,
+                                                                  int visible_capacity) {
+    constexpr unsigned kFull = 0xffffffffU;
+    const int r              = static_cast<int>(threadIdx.x & 31U);
+    const int row            = r < rows ? r : 0; // a lane past the rows reads row 0 (and is given no window below)
+    const int first          = positions[static_cast<std::int64_t>(row) * width];
+    const int valid          = validity != nullptr ? validity[row] : 1;
+    const bool works         = r < rows && r < kCausalProportionalMaxRows && valid > 0 && first >= 0;
+    const int value          = works ? causal_row_window(first, width, visible_capacity) : 0;
+    const unsigned window    = value > 0 ? static_cast<unsigned>(value) : 0U;
+    int bound                = value >= 32768 ? partition.long_target : partition.normal_target;
+    const int by_64          = (value + 63) >> 6;
+    bound                    = bound < by_64 ? bound : by_64;
+    bound                    = bound < partition.capacity ? bound : partition.capacity;
+    const int share          = r / partition.proportional * partition.proportional; // its group's first row
+    unsigned live = 0, keys = 0, budget = 0;
+INFERNIX_CAUSAL_UNROLL
+    for (int s = 0; s < kCausalProportionalMaxRows; ++s) {
+        const unsigned other_window = __shfl_sync(kFull, window, s);
+        const int other_bound       = __shfl_sync(kFull, bound, s);
+        if (__shfl_sync(kFull, share, s) == share) {
+            live += other_window != 0U ? 1U : 0U;
+            keys += other_window;
+            budget += other_window != 0U ? static_cast<unsigned>(other_bound) : 0U;
+        }
+    }
+    const unsigned spare      = budget > live ? budget - live : 0U;
+    const unsigned reciprocal = keys != 0U ? 0xffffffffU / keys : 0U; // floor((2^32 - 1) / keys)
+    int count                 = 0;
+    if (window != 0U) {
+        // floor(spare x window / keys): the reciprocal's quotient is at most one short.
+        const unsigned product = spare * window;
+        unsigned quotient = static_cast<unsigned>((static_cast<unsigned long long>(product) * reciprocal) >> 32);
+        if (product - quotient * keys >= keys) ++quotient;
+        unsigned split_share = 1U + quotient;
+        const unsigned per64 = (window + 63U) >> 6;
+        split_share          = split_share < per64 ? split_share : per64;
+        count                = static_cast<int>(split_share < static_cast<unsigned>(kBf16KvProportionalMaxSplits)
+                                                    ? split_share
+                                                    : static_cast<unsigned>(kBf16KvProportionalMaxSplits));
+    }
+    int inclusive = count;
+INFERNIX_CAUSAL_UNROLL
+    for (int offset = 1; offset < kCausalProportionalMaxRows; offset <<= 1) {
+        const int lower = __shfl_up_sync(kFull, inclusive, offset);
+        if (r >= offset) { inclusive += lower; }
+    }
+    return {count, inclusive - count, __shfl_sync(kFull, inclusive, kCausalProportionalMaxRows - 1)};
+}
+
+// Row `last`'s first slot (base: the slots of the rows before it) and count (a row past the launch's: every row's
+// count, and none).
 __device__ inline void bf16_kv_proportional_row(const Bf16KvPartition& partition, const std::int32_t* positions,
                                                 const std::int32_t* validity, int width, int rows,
                                                 int visible_capacity, int last, int& base, int& count) {
-    base  = 0;
-    count = 0;
-    for (int begin = 0; begin <= last && begin < rows; begin += partition.proportional) {
-        const int group = partition.proportional < rows - begin ? partition.proportional : rows - begin;
-        const Bf16KvProportionalShares shares(partition, positions + static_cast<std::int64_t>(begin) * width,
-                                              validity != nullptr ? validity + begin : nullptr, width, group,
-                                              visible_capacity);
-        // Constant row indices (the shares' arrays stay in registers; a loop bounded by `group` put them in
-        // local memory).
-INFERNIX_CAUSAL_UNROLL
-        for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
-            if (r < group) {
-                const int c = shares.count(r);
-                if (begin + r == last) {
-                    count = c;
-                    return;
-                }
-                base += c;
-            }
-        }
-    }
+    constexpr unsigned kFull       = 0xffffffffU;
+    const CausalProportionalRow me = bf16_kv_proportional_lane(partition, positions, validity, width, rows,
+                                                               visible_capacity);
+    const bool inside              = last >= 0 && last < kCausalProportionalMaxRows;
+    const int source               = inside ? last : 0;
+    const int row_base             = __shfl_sync(kFull, me.base, source);
+    const int row_count            = __shfl_sync(kFull, me.count, source);
+    base                           = inside ? row_base : me.total;
+    count                          = inside ? row_count : 0;
 }
 
 // The row and split the CTA at slot `flat` (row-major over grid z, then y) of such a launch serves, with that
@@ -156,25 +157,19 @@ INFERNIX_CAUSAL_UNROLL
 __device__ inline bool bf16_kv_proportional_slot(const Bf16KvPartition& partition, const std::int32_t* positions,
                                                  const std::int32_t* validity, int width, int rows,
                                                  int visible_capacity, int flat, CausalRowSplit& out) {
-    int base = 0;
-    for (int begin = 0; begin < rows; begin += partition.proportional) {
-        const int group = partition.proportional < rows - begin ? partition.proportional : rows - begin;
-        const Bf16KvProportionalShares shares(partition, positions + static_cast<std::int64_t>(begin) * width,
-                                              validity != nullptr ? validity + begin : nullptr, width, group,
-                                              visible_capacity);
-INFERNIX_CAUSAL_UNROLL
-        for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
-            if (r < group) {
-                const int c = shares.count(r);
-                if (flat < base + c) {
-                    out = {begin + r, flat - base, c, base};
-                    return true;
-                }
-                base += c;
-            }
-        }
-    }
-    return false;
+    constexpr unsigned kFull       = 0xffffffffU;
+    const CausalProportionalRow me = bf16_kv_proportional_lane(partition, positions, validity, width, rows,
+                                                               visible_capacity);
+    const int r                    = static_cast<int>(threadIdx.x & 31U);
+    const unsigned hit             = __ballot_sync(
+        kFull, r < kCausalProportionalMaxRows && flat >= me.base && flat < me.base + me.count);
+    if (hit == 0U) return false;
+    const int row   = __ffs(static_cast<int>(hit)) - 1;
+    const int count = __shfl_sync(kFull, me.count, row);
+    const int base  = __shfl_sync(kFull, me.base, row);
+    out             = {row, flat - base, count, base};
+    return true;
 }
+#endif
 
 } // namespace infernix::ops::detail
