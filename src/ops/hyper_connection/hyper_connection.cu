@@ -176,6 +176,14 @@ __global__ void stream_mean_kernel(const bf16* __restrict__ residual, int hidden
 // 16-byte load each), so the column is read once; the per-stream sums of squares reduce in warp then warp order.
 constexpr int kNormedMeanMaxStreams = 8;
 
+// Element i (a constant 0..7) of eight packed BF16 values, as FP32: a BF16 is the top half of its FP32, so this is
+// __bfloat162float's value. Reading the vector by shifts instead of through a pointer to it keeps the per-stream
+// vectors in registers (the pointer put all eight in local memory: 104 bytes of stack, 27 local loads).
+__device__ __forceinline__ float bf16_element(const uint4& v, int i) {
+    const unsigned word = i < 2 ? v.x : i < 4 ? v.y : i < 6 ? v.z : v.w;
+    return __uint_as_float((i & 1) != 0 ? word & 0xFFFF0000U : word << 16);
+}
+
 __device__ __forceinline__ void load8(const bf16* w, float (&out)[8]) {
     const uint4 v = *reinterpret_cast<const uint4*>(w);
     const bf16* e = reinterpret_cast<const bf16*>(&v);
@@ -206,11 +214,10 @@ __global__ void __launch_bounds__(1024) normed_stream_mean_kernel(const bf16* __
 #pragma unroll
     for (int s = 0; s < kNormedMeanMaxStreams; ++s) {
         if (s < streams) {
-            const bf16* e = reinterpret_cast<const bf16*>(&xs[s]);
-            float sum     = 0.0F;
+            float sum = 0.0F;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const float x = __bfloat162float(e[i]);
+                const float x = bf16_element(xs[s], i);
                 sum += x * x;
             }
             for (int offset = 16; offset > 0; offset >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset); }
@@ -231,10 +238,9 @@ __global__ void __launch_bounds__(1024) normed_stream_mean_kernel(const bf16* __
         if (s < streams) {
             float w[8];
             load8(weight + static_cast<std::size_t>(s) * hidden + static_cast<std::size_t>(v) * 8, w);
-            const bf16* e = reinterpret_cast<const bf16*>(&xs[s]);
             const float r = inv[s];
 #pragma unroll
-            for (int i = 0; i < 8; ++i) { acc[i] += __bfloat162float(e[i]) * r * (1.0F + w[i]); }
+            for (int i = 0; i < 8; ++i) { acc[i] += bf16_element(xs[s], i) * r * (1.0F + w[i]); }
         }
     }
     uint4 packed;
