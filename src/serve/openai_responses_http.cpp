@@ -382,6 +382,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         request.prompt.model = resolve_openai_model(request.prompt.model, public_model_id_, options_.any_model_name);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_);
         resolved.generation.ngram_session = resolve_ngram_session(req, body, options_);
+        if (request.store) {
+            openai_responses_store_.check_input_capacity(resolved.parent, request.prompt.input_turns,
+                                                         request.prompt.input_items);
+        }
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));
         return;

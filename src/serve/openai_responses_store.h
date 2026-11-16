@@ -55,6 +55,11 @@ public:
     // another request evicts or deletes their public store entry.
     std::shared_ptr<const StoredOpenAIResponse> get(const std::string& id);
     void put(StoredOpenAIResponse response);
+    // Before a stored request runs: throws the capacity error (400 response_store_capacity_exceeded) when its
+    // input alone (the context it extends, its input turns and items) exceeds the store's byte budget, so a
+    // request that could never be stored fails before its generation instead of after it.
+    void check_input_capacity(const OpenAIResponseContext& previous, const std::vector<ChatTurn>& input_turns,
+                              const std::vector<nlohmann::json>& input_items) const;
     bool erase(const std::string& id);
 
     [[nodiscard]] std::size_t size() const;

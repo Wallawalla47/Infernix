@@ -1129,6 +1129,21 @@ int test_input_file_documents() {
     assistant["input"][0]["content"] = Json::array({Json{{"type", "input_file"}, {"file_data", data}}});
     failures += check(api_error([&] { (void)parse_openai_responses_create_request(assistant, limits()); }).status == 400,
                       "an assistant input_file was accepted");
+
+    // A stored request whose input alone exceeds the store is refused before it runs; one that fits passes.
+    Json large = body;
+    large["input"][0]["content"][0]["file_data"] = "data:application/pdf;base64," + std::string(3U << 20, 'A');
+    const auto big = parse_openai_responses_create_request(large, limits());
+    OpenAIResponsesStore small(8, 4ULL << 20);
+    const ApiError refused = api_error(
+        [&] { small.check_input_capacity({}, big.prompt.input_turns, big.prompt.input_items); });
+    failures += check(refused.status == 400 && refused.code == "response_store_capacity_exceeded" &&
+                          refused.param == "store",
+                      "a stored request past the store's budget was not refused before it ran");
+    failures += check(api_error([&] {
+                          small.check_input_capacity({}, initial.prompt.input_turns, initial.prompt.input_items);
+                      }).status == 0,
+                      "a stored request within the store's budget was refused");
     return failures;
 }
 

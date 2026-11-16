@@ -1400,10 +1400,12 @@ Resource behavior:
 | `POST /v1/responses/compact` | explicitly fails with `compaction_not_supported` |
 
 `store:false` Responses cannot be retrieved or used as `previous_response_id`. LRU eviction and
-explicit deletion also make an ID unavailable. A single Response larger than the configured store
-capacity fails with `response_store_capacity_exceeded` rather than silently pretending it was
-stored. Generation has finished by then, but its output is not returned: an aggregate request gets
-only the error and a streamed one ends with `response.failed`. Repeat it with `store:false` or a
+explicit deletion also make an ID unavailable. A stored request whose input alone (the context it
+extends, its input Items and their files and images) exceeds the configured store capacity is refused
+before it runs, with HTTP 400 `response_store_capacity_exceeded` (`param: store`). One whose output
+then takes it past the capacity fails with the same code rather than silently pretending it was
+stored: generation has finished by then, but its output is not returned (an aggregate request gets
+only the error and a streamed one ends with `response.failed`). Repeat it with `store:false` or a
 larger `--response-store-max-mib`.
 
 ### Responses input token count
