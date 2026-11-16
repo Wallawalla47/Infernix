@@ -461,16 +461,21 @@ int main() {
                       "and is qualified nowhere");
     failures += check(infernix::parse_fast_path("block-verification") == FastPath::BlockVerification,
                       "block-verification parses");
-    // gumbel-sampling (candidates ZH-01): every drafted engine, a row's draw reads only that row, a candidate only.
-    failures += check(q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash2) &&
+    // gumbel-sampling (candidates ZH-01): MTP rounds only (DFlash2's equality acceptance timed slower), a row's draw
+    // reads only that row; registered on the NVFP4 27B's configuration with INT8 KV only (the owner, 2026-11-16).
+    failures += check(!q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash2) &&
                           q::fast_path_applies(FastPath::GumbelSampling, int8_24, mtp) &&
-                          q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash) &&
+                          !q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash) &&
                           !q::fast_path_applies(FastPath::GumbelSampling, int8_24, options) &&
                           !q::couples_requests(FastPath::GumbelSampling) &&
-                          !q::fast_path_qualified(FastPath::GumbelSampling, int8_24) &&
+                          q::fast_path_qualified(FastPath::GumbelSampling, int8_24) &&
+                          !q::fast_path_qualified(FastPath::GumbelSampling,
+                                                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}) &&
+                          !q::fast_path_qualified(FastPath::GumbelSampling,
+                                                  {16, ActivationClass::A16, KvCacheStorage::Int8Group64}) &&
                           infernix::parse_fast_path("gumbel-sampling") == FastPath::GumbelSampling,
-                      "gumbel-sampling applies to drafted engines, keeps a request invariant, is qualified nowhere "
-                      "and parses");
+                      "gumbel-sampling applies to MTP rounds, keeps a request invariant, is registered on the NVFP4 "
+                      "27B with INT8 KV only and parses");
     // univer-trees: fixed-table tree rounds of the drafters that build their trees (DFlash2, DFlash);
     // not automatic widths, not MTP's leaf trees, not chains.
     infernix::EngineOptions dflash2_trees = dflash2, dflash_trees = dflash, mtp_trees = mtp,

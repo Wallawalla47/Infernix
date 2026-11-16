@@ -366,6 +366,9 @@ constexpr std::array kQualified{
     Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
     Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
     Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    // Gumbel-max sampling on the NVFP4 27B's MTP rounds (2026-11-16, the owner's registration where it was timed
+    // faster: +8.5 %; model-quality.md 6.7 holds the timing and that its distribution test is still to run).
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -548,9 +551,10 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
         return options.speculative.draft_tree_auto ||
                std::any_of(options.speculative.draft_tree_nodes.begin(),
                            options.speculative.draft_tree_nodes.end(), [](std::uint32_t n) { return n != 0; });
-    // Every drafted engine: sampled drafts verified by equality with the target's Gumbel-max draw, drawn
-    // under the same keys. Qualified nowhere yet: a candidate only.
-    case FastPath::GumbelSampling: return options.speculative.backend != SpeculativeBackend::None;
+    // MTP rounds: sampled drafts verified by equality with the target's Gumbel-max draw, drawn under the same
+    // keys. Not DFlash2 or DFlash: on the NVFP4 27B equality accepted fewer DFlash2 drafts a round than
+    // rejection sampling at the same round time (-3.6 %), and the configuration key does not name the drafter.
+    case FastPath::GumbelSampling: return options.speculative.backend == SpeculativeBackend::Mtp;
     }
     return false;
 }
