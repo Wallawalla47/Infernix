@@ -348,7 +348,13 @@ may overwrite a stage that is still being read. On the RTX 5090 this never showe
 test, only when another shared-memory-heavy kernel shared the SMs: Flash-Next recipe C's FP8 shared
 expert beside the offloaded routed experts' staged pass returned wrong outputs in about half of the
 overlapped calls (`tests/ops/linear/test_fp8_moe_overlap.cu`; `test_tma_moe_overlap.cu` the FP8 A8
-route, which fails there unfenced). A producer of 16-byte `cp.async` copies writes through the generic proxy, which
+route, which fails there unfenced). compute-sanitizer's racecheck cannot check this rule on these kernels (2026.4
+from CUDA 13.5, `--racecheck-fence-proxy-async` with `--check-bulk-copy` and `--check-tensor-ops`, tried
+2026-11-16 on a one-CTA ring control): it reports no hazard for an unfenced `cp.async.bulk.tensor` refill, and for
+`cp.async.bulk` it tells fenced from unfenced only when every reading thread arrives on the empty barrier; a stage
+released the way the wide expert kernels release it (every lane fences, `__syncwarp`, lane 0 arrives for its warp)
+is reported as racing fenced or not. The overlap tests and `verify_repeatable` below stay the evidence. A producer
+of 16-byte `cp.async` copies writes through the generic proxy, which
 the barriers order, and needs no fence. A tensor map that the host writes into device memory with
 `cudaMemcpy` is acquired with `fence.proxy.tensormap::generic.acquire.sys` before its first use
 (`src/core/tma_descriptor_staging.cuh`).
