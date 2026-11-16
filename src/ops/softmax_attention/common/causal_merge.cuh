@@ -71,16 +71,10 @@ __launch_bounds__(256) __global__
     [[maybe_unused]] int proportional_count = 0;
     if constexpr (MultiBatch) {
         if (partition.proportional != 0) {
-            int counts[kCausalProportionalMaxRows];
-            causal_proportional_counts(partition, positions, tokens, batch_size, visible_capacity,
-                                       split_count * batch_size, counts);
-            // Constant indices only, so the counts stay in registers.
-            row_base = 0;
-#pragma unroll
-            for (int r = 0; r < kCausalProportionalMaxRows; ++r) {
-                if (r < batch) { row_base += counts[r]; }
-                if (r == batch) { proportional_count = counts[r]; }
-            }
+            int base = 0;
+            causal_proportional_row(partition, positions, tokens, batch_size, visible_capacity, split_count * batch_size,
+                                    batch, base, proportional_count);
+            row_base = base;
         }
     }
     if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * tokens;

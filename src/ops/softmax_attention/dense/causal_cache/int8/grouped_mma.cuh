@@ -90,10 +90,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     CausalRowSplit slot{MultiBatch ? static_cast<int>(blockIdx.z) : 0, static_cast<int>(blockIdx.y), 0,
                         (MultiBatch ? static_cast<int>(blockIdx.z) : 0) * static_cast<int>(gridDim.y)};
     if (MultiBatch && partition.proportional != 0) {
-        int counts[kCausalProportionalMaxRows];
-        causal_proportional_counts(partition, pos, full_width, static_cast<int>(gridDim.z), logical_capacity,
-                                   static_cast<int>(gridDim.y * gridDim.z), counts);
-        if (!causal_proportional_slot(counts, static_cast<int>(blockIdx.z * gridDim.y + blockIdx.y), slot)) return;
+        if (!causal_proportional_slot(partition, pos, full_width, static_cast<int>(gridDim.z), logical_capacity,
+                                      static_cast<int>(gridDim.y * gridDim.z),
+                                      static_cast<int>(blockIdx.z * gridDim.y + blockIdx.y), slot)) return;
     }
     const int split         = slot.split;
     const int batch         = slot.row;

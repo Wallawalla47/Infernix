@@ -84,9 +84,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     // A proportional launch (YD-02) maps its slots to (row, split) by the rows' windows.
     CausalRowSplit slot{(MultiBatch ? block.batch : 0), block.split, 0, (MultiBatch ? block.batch : 0) * block.split_count};
     if (MultiBatch && partition.proportional != 0) {
-        int counts[kCausalProportionalMaxRows];
-        causal_proportional_counts(partition, positions, full_width, static_cast<int>(MultiBatch ? gridDim.x : 1U), logical_capacity, block.split_count * static_cast<int>(MultiBatch ? gridDim.x : 1U), counts);
-        if (!causal_proportional_slot(counts, (MultiBatch ? block.batch : 0) * block.split_count + block.split, slot)) return;
+        if (!causal_proportional_slot(partition, positions, full_width, static_cast<int>(MultiBatch ? gridDim.x : 1U), logical_capacity, block.split_count * static_cast<int>(MultiBatch ? gridDim.x : 1U), (MultiBatch ? block.batch : 0) * block.split_count + block.split, slot)) return;
     }
     const int split       = slot.split;
     const int batch       = slot.row;
