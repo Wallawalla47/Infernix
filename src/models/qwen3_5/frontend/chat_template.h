@@ -60,6 +60,7 @@ struct MediaData {
     std::string media_type;
     std::string source_name;
     ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
+    std::uint32_t image_max_long_side = 0; // OwnedMedia::image_max_long_side
 };
 
 struct ChatPart {

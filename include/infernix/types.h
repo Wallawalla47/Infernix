@@ -1183,6 +1183,9 @@ struct OwnedMedia {
     std::string media_type;
     std::string source_name;
     ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
+    // An image's longest side is scaled to at most this many pixels, aspect kept, before the model's
+    // own resize (OpenAI's detail 'low' = 512); 0 = the model's native geometry.
+    std::uint32_t image_max_long_side = 0;
 };
 
 struct ToolCall {

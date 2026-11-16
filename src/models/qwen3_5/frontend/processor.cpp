@@ -94,6 +94,35 @@ Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::ui
     return {h, w};
 }
 
+// An image whose longest side is over max_long_side (OpenAI's detail 'low' = 512; 0 = no cap) is read as
+// if it were that size, aspect kept: the capped area becomes the smart resize's maximum, so the canvas's
+// sides stay at or under the cap on the model's own grid, and the image takes fewer vision tokens.
+Size image_canvas(int height, int width, const ProcessorOptions& options, std::uint32_t max_long_side) {
+    std::uint64_t max_pixels = options.image_max_pixels;
+    const int long_side      = std::max(height, width);
+    if (max_long_side != 0 && height > 0 && width > 0 &&
+        static_cast<std::uint64_t>(long_side) > max_long_side) {
+        const double scale = static_cast<double>(max_long_side) / long_side;
+        const std::uint64_t capped =
+            static_cast<std::uint64_t>(std::floor(height * scale)) *
+            static_cast<std::uint64_t>(std::floor(width * scale));
+        max_pixels = std::clamp(capped, options.image_min_pixels, max_pixels);
+    }
+    return smart_resize_image(height, width, options.image_min_pixels, max_pixels);
+}
+
+// The media and prefix caches know an item by its digest: a capped image is another canvas, so the cap
+// is part of its identity.
+Sha256Digest media_digest(const ChatPart& part, const PreparationControl& control) {
+    Sha256Digest digest = sha256(part.media.bytes, [&control] { check_preparation_control(control); });
+    if (part.kind == ChatPartKind::Image && part.media.image_max_long_side != 0) {
+        std::string keyed(reinterpret_cast<const char*>(digest.data()), digest.size());
+        keyed += "|image_max_long_side=" + std::to_string(part.media.image_max_long_side);
+        digest = sha256(std::string_view(keyed));
+    }
+    return digest;
+}
+
 Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pixels,
                         std::uint64_t max_pixels) {
     if (frames <= 0 || height < kFactor || width < kFactor || min_pixels == 0 ||
@@ -195,12 +224,12 @@ private:
     PreprocessStats stats_;
 };
 
-Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
-                       const media::decode::Policy& policy, MediaPreprocessCache& cache,
-                       ConcurrentMediaBudget& request_budget, const PreparationControl& control) {
+Prepared prepare_image(std::span<const std::uint8_t> bytes, std::uint32_t max_long_side,
+                       const ProcessorOptions& options, const media::decode::Policy& policy,
+                       MediaPreprocessCache& cache, ConcurrentMediaBudget& request_budget,
+                       const PreparationControl& control) {
     media::decode::Image image = media::decode::decode_image(bytes, policy);
-    const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
-                                         options.image_max_pixels);
+    const Size size            = image_canvas(image.height, image.width, options, max_long_side);
     const int gh    = size.h / kPatch;
     const int gw    = size.w / kPatch;
     Prepared out;
@@ -333,11 +362,10 @@ std::size_t validate_media_inputs(std::span<ChatPart* const> parts,
     return options.max_encoded_media_bytes - remaining;
 }
 
-VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
-                              const media::decode::Policy& policy) {
+VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, std::uint32_t max_long_side,
+                              const ProcessorOptions& options, const media::decode::Policy& policy) {
     const media::decode::ImageInfo image = media::decode::inspect_image(bytes, policy);
-    const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
-                                         options.image_max_pixels);
+    const Size size = image_canvas(image.height, image.width, options, max_long_side);
     VisionItem item;
     item.modality = Modality::Image;
     item.grid     = {1, size.h / kPatch, size.w / kPatch};
@@ -856,7 +884,9 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
             check_preparation_control(control);
             enforce_image_resize_policy(*part, options_, policy);
             VisionItem item = part->kind == ChatPartKind::Image
-                                  ? inspect_image_item(part->media.bytes, options_, policy)
+                                  ? inspect_image_item(part->media.bytes,
+                                                       part->media.image_max_long_side, options_,
+                                                       policy)
                                   : inspect_video_item(part->media.bytes, options_, policy);
             PreprocessStats item_stats;
             add_budget(item_stats, item);
@@ -951,8 +981,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         return [this, part = source.part, kind = source.kind, digest = source.key.digest, &policy, &request_budget,
                 &worker_control]() {
             Prepared built = kind == ChatPartKind::Image
-                                 ? prepare_image(part->media.bytes, options_, policy, *media_cache_, request_budget,
-                                                 worker_control)
+                                 ? prepare_image(part->media.bytes, part->media.image_max_long_side, options_, policy,
+                                                 *media_cache_, request_budget, worker_control)
                                  : prepare_video(part->media.bytes, options_, policy, *media_cache_, request_budget,
                                                  worker_control);
             built.item.content_digest = digest;
@@ -963,8 +993,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     for (ChatPart* part : parts) {
         try {
             check_preparation_control(control);
-            const auto digest =
-                sha256(part->media.bytes, [&control] { check_preparation_control(control); });
+            const auto digest       = media_digest(*part, control);
             const ChatPartKind kind = part->kind;
             const MediaSource source{
                 .part = part,

@@ -336,6 +336,7 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
                 media.media_type          = std::move(part.media.media_type);
                 media.bytes               = std::move(part.media.bytes);
                 media.image_resize_policy = part.media.image_resize_policy;
+                media.image_max_long_side = part.media.image_max_long_side;
                 switch (part.media.kind) {
                 case MediaKind::Image:
                     target.parts.push_back(fi::ChatPart::image(std::move(media)));
