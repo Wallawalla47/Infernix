@@ -19,3 +19,12 @@ if(WIN32)
   target_link_libraries(infernix_media_decode PRIVATE infernix_zlib)
   target_compile_definitions(infernix_media_decode PUBLIC INFERNIX_MEDIA_NATIVE_PNG)
 endif()
+
+# PDF documents (pdf/pdf.cpp) through PDFium when the configure found it (cmake/Dependencies.cmake); without it
+# the same interface refuses every document.
+add_library(infernix_media_pdf STATIC pdf/pdf.cpp)
+infernix_internal_includes(infernix_media_pdf)
+if(INFERNIX_HAVE_PDFIUM)
+  target_link_libraries(infernix_media_pdf PRIVATE pdfium)
+  target_compile_definitions(infernix_media_pdf PRIVATE INFERNIX_HAVE_PDFIUM)
+endif()

@@ -16,6 +16,11 @@ REM vcvars64 exports its own VCPKG_ROOT (the VS-bundled tree); re-assert ours.
 set "VCPKG_ROOT=C:\vcpkg"
 set "VCPKG_TARGET_TRIPLET=x64-windows"
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+REM PDFium reads PDF documents: tools\deps\fetch_pdfium.py unpacks the pinned release here (set PDFIUM_ROOT for
+REM another tree). Without it the build succeeds and PDF documents are refused; release packaging requires it.
+if not defined PDFIUM_ROOT if exist "%~dp0build-deps\pdfium\chromium-8152\win-x64\PDFiumConfig.cmake" (
+  set "PDFIUM_ROOT=%~dp0build-deps\pdfium\chromium-8152\win-x64"
+)
 cd /d "%~dp0"
 if "%1"=="configure" (
   call :configure
@@ -38,6 +43,7 @@ if exist build-windows\CMakeCache.txt if not exist build-windows\build.ninja (
 cmake -S . -B build-windows -G "Ninja Multi-Config" -DCMAKE_CONFIGURATION_TYPES=Release ^
   -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" ^
   -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows" ^
+  -DPDFIUM_ROOT="%PDFIUM_ROOT%" ^
   -DCMAKE_CUDA_ARCHITECTURES=120a ^
   -DINFERNIX_BUILD_APPS=ON ^
   -DBUILD_TESTING=ON

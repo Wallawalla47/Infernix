@@ -40,6 +40,24 @@ endif()
 # same vcpkg tree (`vcpkg install libjpeg-turbo:x64-windows`), elsewhere the system package.
 find_package(JPEG REQUIRED)
 
+# PDFium reads PDF documents (src/media/pdf): bblanchon/pdfium-binaries' prebuilt library, the build without V8 and
+# XFA, which tools/deps/fetch_pdfium.py downloads and checks against its pinned SHA-256. PDFIUM_ROOT (a cache
+# entry, or the environment) names the unpacked tree, whose PDFiumConfig.cmake defines the `pdfium` target.
+# Without it the build still succeeds and PDF documents are refused; Windows release packaging requires it.
+set(PDFIUM_ROOT "$ENV{PDFIUM_ROOT}" CACHE PATH "Unpacked pdfium-binaries tree (tools/deps/fetch_pdfium.py)")
+set(INFERNIX_HAVE_PDFIUM OFF)
+if(PDFIUM_ROOT)
+  find_package(PDFium CONFIG PATHS "${PDFIUM_ROOT}" NO_DEFAULT_PATH)
+  if(PDFium_FOUND AND TARGET pdfium)
+    set(INFERNIX_HAVE_PDFIUM ON)
+    message(STATUS "infernix: PDF documents through PDFium ${PDFium_VERSION} (${PDFIUM_ROOT})")
+  else()
+    message(WARNING "infernix: PDFIUM_ROOT=${PDFIUM_ROOT} holds no usable PDFium; PDF documents will be refused")
+  endif()
+else()
+  message(STATUS "infernix: no PDFIUM_ROOT; PDF documents will be refused (tools/deps/fetch_pdfium.py)")
+endif()
+
 # Repository-pinned header dependencies. No configure-time downloads.
 add_library(infernix::json INTERFACE IMPORTED GLOBAL)
 target_include_directories(infernix::json INTERFACE

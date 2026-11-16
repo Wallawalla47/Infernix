@@ -28,6 +28,7 @@ package, under the file name given here.
 | `libcurl.dll` | [curl](https://curl.se) (TLS through Windows Schannel) | curl licence (MIT-style) | `curl-LICENSE.txt` |
 | `z.dll` | [zlib](https://zlib.net) | zlib licence | `zlib-LICENSE.txt` |
 | `jpeg62.dll` | [libjpeg-turbo](https://libjpeg-turbo.org) (JPEG image decoding) | IJG licence, BSD-3-Clause and zlib licence | `libjpeg-turbo-LICENSE.txt` |
+| `pdfium.dll` | [PDFium](https://pdfium.googlesource.com/pdfium/) (PDF documents), the build of [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) without V8 and XFA; it contains FreeType, HarfBuzz, ICU, Little CMS, libjpeg-turbo, OpenJPEG, libpng, zlib, Abseil, Highway, simdutf, fast_float, Dragonbox, AGG and LLVM libc code | BSD-3-Clause (PDFium); MIT (the packaging); each contained component's own | `pdfium\` (one file per component, and `pdfium-binaries-LICENSE.txt`) |
 
 FFmpeg is used only through its DLLs, unmodified by Infernix, so it can be replaced by another build
 of the same FFmpeg major versions. Its corresponding source is published next to the Infernix

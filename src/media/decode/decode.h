@@ -77,6 +77,12 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
                         double target_fps, int min_frames, int max_frames);
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
+
+// Uncompressed RGB in Infernix's own container, for an image a caller renders itself (a PDF page): the 8 bytes
+// "IFXRGB24", the width and the height (32-bit little-endian), then width * height * 3 bytes, row-major.
+// inspect_image and decode_image read it as they read PNG or JPEG, without a codec.
+inline constexpr std::size_t kRawRgbHeaderBytes = 16;
+[[nodiscard]] std::vector<std::uint8_t> encode_raw_rgb(int width, int height, std::span<const std::uint8_t> rgb);
 // Whether this build's FFmpeg decodes animated WebP (FFmpeg 8: libavcodec 62+). Without it inspect_image and
 // decode_image refuse an animated WebP as InvalidInput with a message naming the version it needs.
 [[nodiscard]] bool animated_webp_supported() noexcept;

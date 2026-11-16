@@ -13,6 +13,7 @@ Python tools are independent of CMake; there is no `INFERNIX_BUILD_TOOLS` option
 
 | Task | Location |
 |---|---|
+| Fetch PDFium (PDF documents) at the pinned release, checked against its SHA-256, for `PDFIUM_ROOT` | `python -I tools/deps/fetch_pdfium.py [--platform win-x64\|linux-x64] [--dest DIR] [--archive FILE]`; [`deps/`](deps/fetch_pdfium.py) |
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |

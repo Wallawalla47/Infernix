@@ -69,8 +69,20 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force "$stage\licenses" | Out-Null
 
 foreach ($exe in $Executables) { Copy-Item "$BuildDir\$exe" $stage }
+# pdfium.dll (PDF documents) comes from the tree the build was configured with (PDFIUM_ROOT,
+# tools\deps\fetch_pdfium.py), with that tree's licences; a release must read PDFs.
+$cache = "$BuildDir\..\..\CMakeCache.txt"
+$pdfiumEntry = Select-String -Path $cache -Pattern '^PDFIUM_ROOT:PATH=(.+)$' | Select-Object -First 1
+$pdfiumRoot = if ($pdfiumEntry) { $pdfiumEntry.Matches[0].Groups[1].Value } else { '' }
+if (-not (Test-Path "$BuildDir\pdfium.dll") -or -not $pdfiumRoot -or -not (Test-Path "$pdfiumRoot\licenses")) {
+    throw "no PDFium in this build: run tools\deps\fetch_pdfium.py, configure with PDFIUM_ROOT and rebuild"
+}
+Copy-Item "$BuildDir\pdfium.dll" $stage
+New-Item -ItemType Directory -Force "$stage\licenses\pdfium" | Out-Null
+Copy-Item "$pdfiumRoot\LICENSE" "$stage\licenses\pdfium\pdfium-binaries-LICENSE.txt"
+Copy-Item "$pdfiumRoot\licenses\*" "$stage\licenses\pdfium"
 $needed = @{}
-foreach ($dll in Get-ChildItem "$BuildDir\*.dll") {
+foreach ($dll in Get-ChildItem "$BuildDir\*.dll" | Where-Object { $_.Name -ne 'pdfium.dll' }) {
     $package = $null
     foreach ($pattern in $dllPackages.Keys) { if ($dll.Name -match $pattern) { $package = $dllPackages[$pattern] } }
     if (-not $package) { throw "$($dll.Name) is not covered by THIRD_PARTY_NOTICES.md: add it before shipping" }

@@ -82,6 +82,31 @@ void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     }
 }
 
+constexpr std::string_view kRawRgbMagic = "IFXRGB24";
+
+bool is_raw_rgb(std::span<const std::uint8_t> bytes) noexcept {
+    return bytes.size() >= kRawRgbHeaderBytes &&
+           std::equal(kRawRgbMagic.begin(), kRawRgbMagic.end(), bytes.begin(),
+                      [](char expected, std::uint8_t actual) { return static_cast<std::uint8_t>(expected) == actual; });
+}
+
+std::uint32_t read_le32(std::span<const std::uint8_t> bytes, std::size_t offset) noexcept {
+    return static_cast<std::uint32_t>(bytes[offset]) | static_cast<std::uint32_t>(bytes[offset + 1]) << 8U |
+           static_cast<std::uint32_t>(bytes[offset + 2]) << 16U | static_cast<std::uint32_t>(bytes[offset + 3]) << 24U;
+}
+
+ImageInfo raw_rgb_info(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
+    const std::uint32_t width  = read_le32(bytes, 8);
+    const std::uint32_t height = read_le32(bytes, 12);
+    if (width == 0 || height == 0 || width > 65'536 || height > 65'536) {
+        throw_invalid_media("raw RGB image has invalid dimensions");
+    }
+    const std::uint64_t pixels = std::uint64_t{width} * height;
+    if (pixels > max_decoded_pixels) { throw Error(ErrorKind::BudgetExceeded, "raw RGB image exceeds pixel limit"); }
+    if (bytes.size() != kRawRgbHeaderBytes + pixels * 3U) { throw_invalid_media("raw RGB image has the wrong size"); }
+    return ImageInfo{.width = static_cast<int>(width), .height = static_cast<int>(height)};
+}
+
 int exif_orientation(std::span<const std::uint8_t> bytes) {
     constexpr std::size_t limit = 1ULL << 20;
     bytes                       = bytes.first(std::min(limit, bytes.size()));
@@ -776,6 +801,7 @@ bool animated_webp_supported() noexcept {
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    if (is_raw_rgb(bytes)) { return raw_rgb_info(bytes, policy.max_decoded_pixels); }
     refuse_unsupported_animated_webp(bytes);
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
     if (is_png(bytes)) {
@@ -825,6 +851,12 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    if (is_raw_rgb(bytes)) {
+        const ImageInfo info = raw_rgb_info(bytes, policy.max_decoded_pixels);
+        return Image{.width = info.width,
+                     .height = info.height,
+                     .rgb    = std::vector<std::uint8_t>(bytes.begin() + kRawRgbHeaderBytes, bytes.end())};
+    }
     refuse_unsupported_animated_webp(bytes);
     // Some FFmpeg builds (the Windows vcpkg tree) ship without the png decoder; the
     // native path decodes png directly so those builds accept png images too.
@@ -872,6 +904,21 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     out.height  = scan.first_frame.height;
     out.indices = std::move(plan.indices);
     return out;
+}
+
+std::vector<std::uint8_t> encode_raw_rgb(int width, int height, std::span<const std::uint8_t> rgb) {
+    if (width <= 0 || height <= 0 ||
+        rgb.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U) {
+        throw std::invalid_argument("raw RGB pixels do not match their dimensions");
+    }
+    std::vector<std::uint8_t> bytes(kRawRgbHeaderBytes + rgb.size());
+    std::copy(kRawRgbMagic.begin(), kRawRgbMagic.end(), bytes.begin());
+    for (int i = 0; i < 4; ++i) {
+        bytes[8 + i]  = static_cast<std::uint8_t>(static_cast<std::uint32_t>(width) >> (8 * i));
+        bytes[12 + i] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(height) >> (8 * i));
+    }
+    std::copy(rgb.begin(), rgb.end(), bytes.begin() + kRawRgbHeaderBytes);
+    return bytes;
 }
 
 LibraryLogHandler set_library_log_handler(LibraryLogHandler handler) {
