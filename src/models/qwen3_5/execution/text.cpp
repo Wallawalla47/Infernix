@@ -652,7 +652,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 }
 
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
-                                  Tensor* probabilities, const SampledDraftStep* sampled) {
+                                  Tensor* probabilities, const SampledDraftStep* sampled,
+                                  const CoupledDraftStep* coupled) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
@@ -702,6 +703,16 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         ops::argmax_with_probability(head_logits, proposal_tokens, *probabilities, valid_rows, work_, ctx_.stream);
     } else {
         ops::argmax(head_logits, proposal_tokens, valid_rows, ctx_.stream);
+    }
+    if (coupled != nullptr) {
+        // QK-04: a Gumbel-max row's draft is its law's Gumbel winner under the verifying column's key
+        // (head rows, before the remap below; the key takes the token id).
+        Tensor no_probability;
+        ops::speculative_couple_drafts(head_logits, valid_rows,
+                                       proposal_head_ != nullptr ? proposal_head_ids_ : nullptr, coupled->configs,
+                                       coupled->frontiers, coupled->column + 1, proposal_tokens,
+                                       probabilities != nullptr ? *probabilities : no_probability, work_,
+                                       ctx_.stream);
     }
     if (proposal_head_ != nullptr && proposal_head_ids_ != nullptr) {
         ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_, ctx_.stream);
@@ -977,7 +988,8 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
 }
 
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
-                                    Tensor* probabilities, const SampledDraftStep* sampled) {
+                                    Tensor* probabilities, const SampledDraftStep* sampled,
+                                    const CoupledDraftStep* coupled) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP proposal batch hidden");
@@ -986,7 +998,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
     ScopedValue<const LinearParameters*> head_binding(proposal_head_, batch_proposal_head());
-    proposal_argmax(hidden, logits, draft_tokens, probabilities, sampled);
+    proposal_argmax(hidden, logits, draft_tokens, probabilities, sampled, coupled);
 }
 
 const MtpParameters* TextContext::batch_mtp() const noexcept {

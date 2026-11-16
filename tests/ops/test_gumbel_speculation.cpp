@@ -8,6 +8,7 @@
 // name the produced token's position, so the same Gumbel noise decides both.
 
 #include "ops/op_family.h"
+#include "infernix/ops/argmax.h"
 #include "infernix/ops/candidate_selector.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_round.h"
@@ -305,6 +306,128 @@ int coupled_case(int k, int batch, std::mt19937& rng) {
     return failures;
 }
 
+// Coupled argmax drafts (speculative_couple_drafts, candidates QK-04): a Gumbel-max row's MTP draft of step `step`,
+// re-drawn under the key its verification column gives each token (L + step + 1), is plain sampling's own draw of
+// the drafter's logits at the input position L + step (the same support and noise: checked exactly, which pins the
+// key's offset), so verification by equality accepts it whenever the drafter's logits are the target's. A greedy row
+// and a sampled row without gumbel_max keep their argmax drafts; probability follows the re-drawn row
+// (argmax_with_probability's, then exp(l_new - lse)). `shortlist`: the drafter's rows are an increasing id map over
+// 65,536 of the tokens (the target's logits off the map are -30, so its support is on the map).
+int couple_drafts_case(int batch, int step, bool shortlist, std::mt19937& rng) {
+    constexpr int kRows = 248320, kVocab = 248077, kHead = 65536, per = 1;
+    const int head_rows = shortlist ? kHead : kRows, valid = shortlist ? kHead : kVocab;
+    const int cols = step + 2; // the target's verification columns
+    const int drafts_per_row = per, columns = per * batch;
+    std::vector<std::int32_t> map(kHead);
+    if (shortlist) {
+        std::vector<std::int32_t> all(kVocab);
+        for (int v = 0; v < kVocab; ++v) { all[static_cast<std::size_t>(v)] = v; }
+        std::shuffle(all.begin(), all.end(), rng);
+        std::copy_n(all.begin(), kHead, map.begin());
+        std::sort(map.begin(), map.end());
+    }
+    const auto token_of = [&](int row) { return shortlist ? map[static_cast<std::size_t>(row)] : row; };
+    std::normal_distribution<float> normal(0.0F, 3.0F);
+    std::vector<float> target(static_cast<std::size_t>(kRows) * cols * batch, shortlist ? -30.0F : 0.0F);
+    for (int b = 0; b < batch; ++b) {
+        for (int c = 0; c < cols; ++c) {
+            float* column = target.data() + (static_cast<std::size_t>(b) * cols + c) * kRows;
+            if (shortlist) {
+                for (int r = 0; r < kHead; ++r) { column[map[static_cast<std::size_t>(r)]] = bf16_round(normal(rng)); }
+            } else {
+                for (int v = 0; v < kRows; ++v) { column[v] = bf16_round(normal(rng)); }
+            }
+        }
+    }
+    // The drafter's column for row b's draft: the target's verifying column.
+    const auto verifying = [&](int) { return step; };
+    std::vector<float> drafter(static_cast<std::size_t>(head_rows) * columns);
+    for (int b = 0; b < batch; ++b) {
+        for (int j = 0; j < drafts_per_row; ++j) {
+            const float* column = target.data() + (static_cast<std::size_t>(b) * cols + verifying(j)) * kRows;
+            float* out          = drafter.data() + (static_cast<std::size_t>(b) * per + j) * head_rows;
+            for (int r = 0; r < head_rows; ++r) { out[r] = column[token_of(r)]; }
+        }
+    }
+    // Row 1 greedy, row 2 sampled without gumbel_max, the others coupled.
+    std::vector<ops::SamplingConfig> configs;
+    std::vector<std::int32_t> lengths(batch);
+    for (int b = 0; b < batch; ++b) {
+        ops::SamplingConfig c = gumbel_config(7000 + 31 * b);
+        if (b == 1) { c.temperature = 0.0F; }
+        if (b == 2) { c.gumbel_max = false; }
+        configs.push_back(c);
+        lengths[b] = 900 + 23 * b;
+    }
+    const auto coupled = [&](int b) { return b != 1 && b != 2; };
+
+    DeviceBuffer d_drafter = to_device_bf16(drafter), d_cfg = to_device(configs), d_lengths = to_device(lengths);
+    DeviceBuffer d_map = to_device(map), d_drafts(static_cast<std::size_t>(columns) * 4),
+                 d_probability(static_cast<std::size_t>(columns) * 4);
+    Tensor tdrafter(d_drafter.p, DType::BF16, {head_rows, columns}), tdrafts(d_drafts.p, DType::I32, {columns});
+    Tensor tprobability(d_probability.p, DType::FP32, {columns}), tlengths(d_lengths.p, DType::I32, {batch});
+    DeviceBuffer scratch(std::max(ops::argmax_with_probability_workspace_bytes(DType::BF16, head_rows, valid, columns),
+                                  ops::speculative_couple_drafts_workspace_bytes(valid, columns)));
+    WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
+    ops::argmax_with_probability(tdrafter, tdrafts, tprobability, valid, workspace, nullptr);
+    cuda_synchronize();
+    const auto argmax_drafts = from_device<std::int32_t>(d_drafts, static_cast<std::size_t>(columns));
+    ops::speculative_couple_drafts(tdrafter, valid, shortlist ? static_cast<const std::int32_t*>(d_map.p) : nullptr,
+                                   static_cast<const ops::SamplingConfig*>(d_cfg.p), tlengths, step + 1, tdrafts,
+                                   tprobability, workspace, nullptr);
+    cuda_synchronize();
+    const auto rows        = from_device<std::int32_t>(d_drafts, static_cast<std::size_t>(columns));
+    const auto probability = from_device<float>(d_probability, static_cast<std::size_t>(columns));
+
+    int failures = 0, redrawn = 0;
+    // Plain sampling of the drafter's logits at each draft's input position (token ids).
+    std::vector<std::vector<std::int32_t>> plain_tokens(static_cast<std::size_t>(batch));
+    for (int j = 0; j < drafts_per_row; ++j) {
+        std::vector<float> column(static_cast<std::size_t>(kRows) * batch);
+        std::vector<std::int32_t> positions(batch);
+        for (int b = 0; b < batch; ++b) {
+            std::copy_n(target.begin() + (static_cast<std::size_t>(b) * cols + verifying(j)) * kRows, kRows,
+                        column.begin() + static_cast<std::size_t>(b) * kRows);
+            positions[b] = lengths[b] + verifying(j);
+        }
+        const auto tokens = plain(column, kRows, kVocab, batch, configs, positions);
+        for (int b = 0; b < batch; ++b) { plain_tokens[static_cast<std::size_t>(b)].push_back(tokens[b]); }
+    }
+    for (int b = 0; b < batch; ++b) {
+        for (int j = 0; j < drafts_per_row; ++j) {
+            const std::size_t t = static_cast<std::size_t>(b) * per + j;
+            if (!coupled(b)) {
+                if (rows[t] != argmax_drafts[t]) {
+                    ++failures;
+                    std::cerr << "FAIL couple: uncoupled row " << b << " draft " << j << " changed\n";
+                }
+                continue;
+            }
+            redrawn += rows[t] != argmax_drafts[t] ? 1 : 0;
+            if (token_of(rows[t]) != plain_tokens[static_cast<std::size_t>(b)][static_cast<std::size_t>(j)]) {
+                ++failures;
+                std::cerr << "FAIL couple: row " << b << " draft " << j << " token " << token_of(rows[t])
+                          << ", plain sampling's " << plain_tokens[static_cast<std::size_t>(b)][static_cast<std::size_t>(j)]
+                          << "\n";
+            }
+            // The head's probability of the drawn row, in FP64 from the stored logits.
+            const float* column = drafter.data() + t * head_rows;
+            double sum          = 0.0;
+            for (int r = 0; r < valid; ++r) { sum += std::exp(static_cast<double>(column[r]) - column[rows[t]]); }
+            const double want = 1.0 / sum;
+            if (!(std::abs(probability[t] - want) <= 1e-4 * want)) {
+                ++failures;
+                std::cerr << "FAIL couple: row " << b << " draft " << j << " probability " << probability[t]
+                          << ", want " << want << "\n";
+            }
+        }
+    }
+    std::cout << "coupled MTP drafts step=" << step << " B=" << batch << (shortlist ? " shortlist" : "")
+              << ": " << (failures == 0 ? "plain sampling's draws" : "MISMATCH") << " (" << redrawn
+              << " re-drawn off the argmax)\n";
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(gumbel_speculation) {
@@ -322,6 +445,10 @@ INFERNIX_OP_TEST(gumbel_speculation) {
         failures += distribution_case(rng);
         failures += coupled_case(7, 6, rng);
         failures += coupled_case(15, 2, rng);
+        failures += couple_drafts_case(4, 0, false, rng);
+        failures += couple_drafts_case(5, 1, true, rng);
+        failures += couple_drafts_case(6, 2, false, rng);
+        failures += couple_drafts_case(8, 4, true, rng);
     } catch (const std::exception& e) {
         std::cerr << "FAIL exception: " << e.what() << "\n";
         return 1;

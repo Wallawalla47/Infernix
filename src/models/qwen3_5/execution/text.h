@@ -89,6 +89,15 @@ struct SampledDraftStep {
     Tensor scores;
 };
 
+// The Gumbel-max rows' coupling of one argmax MTP proposal step (ops::speculative_couple_drafts; the
+// reproducible and lossless routes): a sampled row's draft is re-drawn under the target's key for the
+// column that verifies it.
+struct CoupledDraftStep {
+    const ops::SamplingConfig* configs = nullptr; // device SamplingConfig[T]: the rows' samplers
+    Tensor frontiers;                             // I32 [T]: each row's length when the draft is verified
+    std::int32_t column = 0;                      // the draft's verification column (its step)
+};
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
@@ -221,9 +230,12 @@ public:
                                   Tensor& mtp_hidden);
     // `probabilities` (FP32 [batch], optional): each draft's drafter probability, from the argmax's
     // own pass (ops::argmax_with_probability). `sampled` (sampled-mtp-drafts): the drafts are drawn
-    // under each row's sampler instead, with their sparse proposals (no probabilities).
+    // under each row's sampler instead, with their sparse proposals (no probabilities). `coupled`
+    // (argmax drafts only): Gumbel-max rows re-draw their drafts under the target's keys, the
+    // probabilities following (CoupledDraftStep).
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
-                           Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr);
+                           Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr,
+                           const CoupledDraftStep* coupled = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -299,7 +311,8 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
-                         Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr);
+                         Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr,
+                         const CoupledDraftStep* coupled = nullptr);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;

@@ -108,6 +108,7 @@ public:
         }
         // The confidence policy's and the cut's input: each step's drafter probability.
         confidence_ = schedule.mtp_draft_confidence;
+        coupled_    = schedule.gumbel_sampling && !sampled_;
         // (An n-gram tree round's laws are its own planes.)
         if (sampled_ && (confidence_ || (frame_.current_candidates.data == nullptr && !ngram_tree_))) {
             throw std::logic_error("sampled MTP drafts need the MTP draft window's sparse planes, without probabilities");
@@ -346,17 +347,29 @@ private:
             return;
         }
         Tensor probability = confidence_ ? step_probability(step) : Tensor{};
-        card_->mtp_propose_batch(hidden, proposal_logits_, tokens, confidence_ ? &probability : nullptr);
+        // QK-04: on the Gumbel-max routes a sampled row's draft is verified by equality with the target's
+        // draw at (seed, frontier + step + 1, token), so it is drawn under that key (frontiers_ holds the
+        // lengths acceptance left: the next round's). Only the first kCoupledSteps steps are: the coupling's cost
+        // is fixed per step while its gain sits at the leading positions.
+        const CoupledDraftStep coupled{
+            .configs = frame_.sampling, .frontiers = frontiers_, .column = static_cast<std::int32_t>(step)};
+        card_->mtp_propose_batch(hidden, proposal_logits_, tokens, confidence_ ? &probability : nullptr, nullptr,
+                                 coupled_ && step < kCoupledSteps ? &coupled : nullptr);
     }
 
     MtpBatchContext& state_;
     std::int32_t batch_   = 0;
     std::uint32_t k_      = 0;
     std::uint32_t next_k_ = 0;
+    // The MTP steps whose drafts the Gumbel-max routes couple (--reproducible, sampled at 0.7, ABBA, decode against
+    // no coupling): NVFP4 27B one step +4.45 %, two +7.76 %, all five +8.9 %; 35B-A3B one +1.08 %, two +0.33 %,
+    // all three -0.13 % (accepted drafts gain at positions 0 and 1 only; each coupled step costs about 20 us).
+    static constexpr std::uint32_t kCoupledSteps = 2;
     MtpCausalAttentionEnvelopes envelopes_;
     qwen3_5::MtpDecodeState frame_;
     bool sampled_    = false;
     bool confidence_ = false;
+    bool coupled_    = false;
     bool tree_       = false;
     bool ngram_tree_ = false;
     std::optional<TextContext> card_;

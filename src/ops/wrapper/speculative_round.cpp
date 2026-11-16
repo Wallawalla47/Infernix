@@ -231,6 +231,37 @@ void speculative_sample_sparse_drafts(const Tensor& rows, const Tensor& logprobs
                                                     candidate_ids, proposal_q, confidence, stream);
 }
 
+std::size_t speculative_couple_drafts_workspace_bytes(std::int32_t valid_rows, std::int32_t columns) {
+    if (valid_rows <= kSamplerTileItems || columns < 1) {
+        throw std::invalid_argument("speculative_couple_drafts: more than 256 valid rows and T >= 1 required");
+    }
+    return detail::speculative_couple_drafts_workspace_exact_bytes(valid_rows, columns);
+}
+
+void speculative_couple_drafts(const Tensor& logits, std::int32_t valid_rows, const std::int32_t* token_ids,
+                               const SamplingConfig* configs, const Tensor& positions, std::int32_t offset,
+                               Tensor& drafts, Tensor& probability, WorkspaceArena& workspace,
+                               cudaStream_t stream) {
+    constexpr const char* op   = "speculative_couple_drafts";
+    const std::int32_t columns = logits.ne[1];
+    require_logits_dtype(logits, op);
+    require_contiguous_nonnull(logits, op, "logits");
+    if (logits.ne[2] != 1 || logits.ne[3] != 1 || columns < 1 || valid_rows <= kSamplerTileItems ||
+        valid_rows > logits.ne[0]) {
+        throw std::invalid_argument("speculative_couple_drafts: logits must be [physical_rows,T] with 256 < "
+                                    "valid_rows <= physical_rows");
+    }
+    const std::size_t bytes = speculative_couple_drafts_workspace_bytes(valid_rows, columns);
+    if (configs == nullptr) { throw std::invalid_argument("speculative_couple_drafts: configs must be non-null"); }
+    require_vector(positions, DType::I32, columns, op, "positions");
+    require_vector(drafts, DType::I32, columns, op, "drafts");
+    if (probability.data != nullptr) { require_vector(probability, DType::FP32, columns, op, "probability"); }
+    auto scratch_scope = workspace.scope();
+    const DeviceSpan scratch = workspace.alloc_bytes(bytes);
+    detail::speculative_couple_drafts_launch(logits, valid_rows, token_ids, configs, positions, offset, drafts,
+                                             probability, scratch, stream);
+}
+
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,

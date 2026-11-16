@@ -684,8 +684,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (plan.execution_schedule.sampled_mtp_drafts) {
             matrix(layout, DType::I32, kMtpSampledDraftRanks, columns);
             matrix(layout, DType::FP32, kMtpSampledDraftRanks, columns);
-        } else if (plan.execution_schedule.mtp_draft_confidence) {
-            scratch(layout, ops::argmax_with_probability_workspace_bytes(DType::BF16, head_rows, head_rows, columns));
+        } else {
+            if (plan.execution_schedule.mtp_draft_confidence) {
+                scratch(layout,
+                        ops::argmax_with_probability_workspace_bytes(DType::BF16, head_rows, head_rows, columns));
+            }
+            // QK-04: the Gumbel-max routes re-draw sampled rows' argmax drafts under the target's keys.
+            if (plan.execution_schedule.gumbel_sampling) {
+                scratch(layout, ops::speculative_couple_drafts_workspace_bytes(head_rows, columns));
+            }
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,

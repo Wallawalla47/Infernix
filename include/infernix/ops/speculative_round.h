@@ -275,6 +275,41 @@ void speculative_sample_sparse_drafts(const Tensor& rows, const Tensor& logprobs
                                       cudaStream_t stream);
 
 /**
+ * Op: speculative_couple_drafts
+ *
+ * Algorithm:
+ *   Re-draws the deterministic (argmax) drafts of the rows the target verifies by equality with its
+ *   own Gumbel-max draw (configs[r].gumbel_max with temperature > 0; sampling.h and the speculative
+ *   acceptance Ops), so each is the target's draw whenever the target's draw is the drafter's own
+ *   Gumbel winner (candidates ZH-01, QK-04). Column t is row t's draft. A coupled column builds
+ *   sample()'s truncated support over logits[0..valid_rows-1, t] under configs[t]'s temperature,
+ *   top_k, top_p and min_p, with no penalties, mask, open-reasoning exclusion or token counts (a
+ *   draft reads no counts), and takes the support row maximizing
+ *   sampling_gumbel_score(p, configs[t].seed, positions[t] + offset, id), id the row's token id
+ *   (token_ids[row], or the row itself when token_ids is null), ties to the higher-probability row:
+ *   the key the verification gives that token at the draft's column. A Gumbel-max pick is an exact
+ *   draw from the drafter's truncated law, so only which draw is taken changes. Other columns, and a
+ *   coupled column whose support has no finite value, keep drafts[t].
+ *   With probability non-empty, a re-drawn column's probability[t] is multiplied by
+ *   exp(l[new,t] - l[old,t]) (old: drafts[t] on entry): when it held the head's probability of the
+ *   old row (argmax_with_probability), it then holds the new row's.
+ *
+ * Logical shapes:
+ *   logits is contiguous BF16 or FP32 [physical_rows,T] with 256 < valid_rows <= physical_rows;
+ *   drafts I32 [T] holds head rows in [0,valid_rows) (before any token id remap); probability FP32
+ *   [T] or empty. configs is a device-resident SamplingConfig[T] and positions I32 [T]. token_ids,
+ *   when non-null, is a device I32 table of valid_rows token ids.
+ *
+ * Workspace:
+ *   speculative_couple_drafts_workspace_bytes(valid_rows, T) of caller-owned transient storage.
+ */
+[[nodiscard]] std::size_t speculative_couple_drafts_workspace_bytes(std::int32_t valid_rows, std::int32_t columns);
+void speculative_couple_drafts(const Tensor& logits, std::int32_t valid_rows, const std::int32_t* token_ids,
+                               const SamplingConfig* configs, const Tensor& positions, std::int32_t offset,
+                               Tensor& drafts, Tensor& probability, WorkspaceArena& workspace,
+                               cudaStream_t stream);
+
+/**
  * Op: speculative_select_accepted_hidden
  *
  * Math / indexing:
