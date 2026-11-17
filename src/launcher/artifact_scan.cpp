@@ -511,6 +511,11 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
                 model.path      = path;
                 model.locations = {path};
                 for (const auto& [part, expected] : facts.parts) {
+                    if (!safe_relative(part)) {
+                        // Never looked at, counted or deleted with the model's files.
+                        model.missing_files.push_back(part + " (outside the artifact's folder)");
+                        continue;
+                    }
                     const std::filesystem::path part_path = path.parent_path() / utf8_path(part);
                     const std::uint64_t actual             = file_size_or_zero(part_path);
                     if (actual != expected) {

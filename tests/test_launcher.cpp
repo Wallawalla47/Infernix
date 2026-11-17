@@ -399,6 +399,46 @@ void test_library() {
     check(contains(dense_args, {"--max-context", "auto"}), "the 27B context is the server's to size");
 }
 
+// A part file an artifact header names outside the artifact's folder (audit 2026-11-17 LN-10: an absolute path or
+// "..") is reported missing and is not one of the model's files, which "Delete model files" deletes.
+void test_library_part_paths() {
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "infernix-launcher-test-parts";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    const std::filesystem::path models = root / "models";
+    std::filesystem::create_directories(models);
+    const std::filesystem::path outside = root / "outside.bin";
+    { std::ofstream(outside, std::ios::binary) << std::string(4096 + 100, 'x'); }
+    { std::ofstream(models / "Next-00002-of-00002.infernix", std::ios::binary) << std::string(4096 + 2000, 'x'); }
+    Json directory     = flash_next_directory();
+    directory["files"] = Json::array({{{"path", nullptr}, {"payload_bytes", 1000}},
+                                      {{"path", "Next-00002-of-00002.infernix"}, {"payload_bytes", 2000}},
+                                      {{"path", "../outside.bin"}, {"payload_bytes", 100}},
+                                      {{"path", path_utf8(outside)}, {"payload_bytes", 100}}});
+    const std::string text = directory.dump();
+    std::string entry(32, '\0');
+    std::memcpy(entry.data(), "NINFER\0\x03", 8);
+    for (int i = 0; i < 8; ++i) { entry[8 + i] = static_cast<char>((text.size() >> (8 * i)) & 0xFF); }
+    for (int i = 0; i < 16; ++i) { entry[16 + i] = static_cast<char>(i + 1); }
+    entry += text;
+    entry.resize((entry.size() + 4095) / 4096 * 4096 + 1000, '\0');
+    { std::ofstream(models / "Next-00001-of-00002.infernix", std::ios::binary) << entry; }
+
+    const LibraryScan scan = scan_library({models}, 2);
+    const auto model = std::find_if(scan.models.begin(), scan.models.end(),
+                                    [](const ScannedModel& m) { return m.key == "0102030405060708090a0b0c0d0e0f10"; });
+    check(model != scan.models.end(), "the test artifact is scanned");
+    if (model != scan.models.end()) {
+        const bool kept_outside = std::any_of(model->part_files.begin(), model->part_files.end(),
+                                              [&](const std::filesystem::path& p) { return p.filename() == "outside.bin"; });
+        const auto outside_noted = std::count_if(model->missing_files.begin(), model->missing_files.end(),
+                                                 [](const std::string& f) { return f.find("outside") != std::string::npos; });
+        check(model->part_files.size() == 1 && !kept_outside, "only the part inside the folder is a model file");
+        check(outside_noted == 2, "both parts outside the folder are reported missing");
+    }
+    std::filesystem::remove_all(root, ignored);
+}
+
 void test_router() {
     std::mutex mutex;
     std::vector<std::string> events;
@@ -1149,6 +1189,7 @@ int main(int argc, char** argv) {
     test_help_cache();
     test_serve_log_files();
     test_library();
+    test_library_part_paths();
     test_scan_folder();
     test_router();
     test_router_cancel();

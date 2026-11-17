@@ -22,6 +22,9 @@ using Json = nlohmann::json;
 // Paths travel through JSON and the API as UTF-8 strings.
 [[nodiscard]] std::string path_utf8(const std::filesystem::path& path);
 [[nodiscard]] std::filesystem::path utf8_path(std::string_view text);
+// A path that stays inside the folder it is joined to: relative, no drive, no ".." part (a file a repository listing
+// or an artifact header names).
+[[nodiscard]] bool safe_relative(std::string_view path);
 
 [[nodiscard]] std::string lower(std::string_view text);
 [[nodiscard]] bool iequals(std::string_view a, std::string_view b);

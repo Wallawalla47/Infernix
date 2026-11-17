@@ -33,21 +33,6 @@ std::string new_id() {
     return hex_string(reinterpret_cast<const std::uint8_t*>(&value), sizeof(value));
 }
 
-bool safe_relative(const std::string& path) {
-    if (path.empty() || path.front() == '/' || path.front() == '\\' || path.find(':') != std::string::npos) {
-        return false;
-    }
-    std::size_t start = 0;
-    while (start <= path.size()) {
-        const std::size_t end = path.find_first_of("/\\", start);
-        const std::string part = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
-        if (part == "..") { return false; }
-        if (end == std::string::npos) { break; }
-        start = end + 1;
-    }
-    return true;
-}
-
 // A file written at positions by several connections at once.
 class PartFile {
 public:
