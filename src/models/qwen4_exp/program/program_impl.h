@@ -7539,7 +7539,16 @@ private:
         target = std::min(pool_->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
         if (target - backed < need - pool_->available_pages()) { return false; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
-        const std::size_t added    = kv_mapped_bytes(plan_, target) - kv_vmm_->mapped_bytes();
+        // The bytes map_kv(target) will map: the chunks the target needs that are not mapped yet. Chunks an earlier
+        // failed growth kept (below) can sit in some planes while another plane still lacks one, so the difference of
+        // the two totals is not that amount (and wrapped below zero when a smaller target followed).
+        std::size_t added = 0;
+        {
+            const auto chunks = kv_chunks(plan_, target);
+            for (std::size_t c = 0; c < chunks.size(); ++c) {
+                if (chunks[c] != 0 && !kv_vmm_->mapped(c)) { added += kKvChunkBytes; }
+            }
+        }
         const std::uint64_t stride = residency_->frame_bytes();
         const std::uint32_t frames = residency_->frames();
         // Memory the sizing function would give the frames anyway comes first; the rest is taken from
