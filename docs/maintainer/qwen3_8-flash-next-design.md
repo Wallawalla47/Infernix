@@ -11499,6 +11499,25 @@ startup line lists each reading's experts/s, and the busy warning stays only whe
 The full layout's reading moved from before the
 CPU service's creation to after the warm start, beside the tier's, and pays the 4 s pause.
 
+**A reference ends the readings early (2026-11-17).** The pause was spent waiting in most starts: in 15 of 17
+FP4-Local starts of 2026-11-16/17 the first reading lay within 7 % of the best. Now a start that settled in full on a
+quiet CPU records its rates beside the saved expert state (`<expert state>.cpu-rates`, one line a key: the CPU's brand,
+logical CPUs and RAM size, then the artifact, the team's workers and CPUs, its arithmetic, the record stride, banks or
+tier; `placement.h` `load_cpu_rate_reference` / `save_cpu_rate_reference`; the 122B's offload too). A later start of
+the same key takes two readings back to back (the first draws the CPU and memory out of their idle states, as the link
+probe's spinning SMs draw the link out of its); when their best lies within 10 % of the reference either way, the
+readings end there and the startup line says "confirmed against N from <date>". Below the band (memory still slow) or
+above it (a changed machine) they settle as before, and the full settle rewrites the reference; a confirmed start never
+writes it (it would ratchet down by up to 10 % a start). The session always takes this start's readings. Without an
+expert state file (`--expert-state off`, the bench) nothing changes. The PCIe link probe is not cached: it runs at every
+start (41dd1824's 200 ms of spinning SMs, then its best copy), about 0.2 s. FP4-Local, alternated starts (RTX 5090,
+i9-13900K): banks (`--host-context-mib 7500`) 19.0 / 18.8 / 19.1 s against 23.0 / 23.1 / 22.8 s; the SSD tier (16384)
+16.6 / 16.6 / 16.4 s against 24.7 / 25.1 / 27.2 s. There the first reading read 9,640-10,912 experts/s and the one
+taken right after it 19,383-19,922: the low first reading is the probe's own warm-up, gone 60 ms later, so the old rule
+paid two pauses for it. A reference doctored to 30,000 experts/s was met with 20,763 and settled in full (23.5 s), and
+rewritten. Residual risk: a change the key cannot see (DIMM speed, a BIOS power plan) could put a depressed pair of
+readings inside the band; the startup line names the reference so it can be seen.
+
 ### 19.3.29 IQ3_S prefill: BF16 tiles over the decoded planes, one-pass walk MoE calls (2026-10-19)
 
 **The gap.** At 128K tokens the GSQ-RCO IQ3_S import reached its first token in 29.4 s on

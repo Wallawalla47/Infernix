@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -94,6 +95,14 @@ struct CpuRateReading {
     double busy_share = -1.0; // other processes' CPU share when they kept the CPU busy through it, else < 0
     std::string note;         // how it was taken (the startup report's parenthesis)
 };
+// A settled reading an earlier start of the same machine and configuration took (load_cpu_rate_reference): it lets a
+// start whose own readings agree with it end without the settling pause. The session always takes its own readings.
+struct CpuRateReference {
+    double experts = 0.0;
+    double columns = 0.0;
+    std::string when; // its date (YYYY-MM-DD), for the startup report
+};
+
 // The rates the decode miss split and the prefill CPU split take for the session.
 struct SettledCpuRates {
     double experts = 0.0; // the best of the readings
@@ -102,6 +111,9 @@ struct SettledCpuRates {
                                   // reference rates stand)
     double busy_share = -1.0;     // the last reading's when every reading was busy (the startup warns), else < 0
     std::string note;             // the last reading's
+    // The readings ended early because their best agreed with this reference (settle_cpu_rates); a start that
+    // settled in full records its own rates as the next reference instead (never this one, which would ratchet).
+    std::optional<CpuRateReference> confirmed;
     // The startup report's account of the readings: "; the best of 2 readings (9377, 18942 experts/s)", or "".
     [[nodiscard]] std::string readings_text() const {
         if (readings.size() < 2) { return {}; }
@@ -109,7 +121,11 @@ struct SettledCpuRates {
         for (std::size_t i = 0; i < readings.size(); ++i) {
             text += (i > 0 ? ", " : "") + std::to_string(std::lround(readings[i]));
         }
-        return text + " experts/s)";
+        text += " experts/s)";
+        if (confirmed) {
+            text += ", confirmed against " + std::to_string(std::lround(confirmed->experts)) + " from " + confirmed->when;
+        }
+        return text;
     }
 };
 // Right after the expert banks' load or the SSD tier's fill (tens of GiB of direct reads), or while the OS clears
@@ -120,33 +136,73 @@ struct SettledCpuRates {
 // beats the best experts/s by more than kRateSettleGain, at most kRateSettleReadings readings; the best of each
 // rate stands. `read` takes one reading (nullopt without expert records in RAM); `pause` waits between readings
 // (empty: kRateSettle).
+//
+// With a `reference` (a settled reading of an earlier start of this machine and configuration), two readings are taken
+// back to back first: the first draws the CPU and memory out of their idle states, as the link probe's spinning SMs
+// draw the link out of its. When the better lies within kRateSettleGain of the reference either way, the rates have
+// settled and the pause is skipped (~4 s of a start; 15 of 17 Flash-Next starts of 2026-11-16/17 read within 7 % of
+// their best at once). Below it (memory still slow after the bulk reads: 10,707 and 11,249 against ~20,000 experts/s in
+// two of those starts) or above it (a changed machine), the readings settle as without a reference, the pause first.
+// The session takes this start's best readings either way, never the reference.
 inline constexpr std::chrono::seconds kRateSettle{4};
 inline constexpr int kRateSettleReadings = 3;
 inline constexpr double kRateSettleGain  = 0.10;
 [[nodiscard]] inline SettledCpuRates settle_cpu_rates(const std::function<std::optional<CpuRateReading>()>& read,
-                                                      const std::function<void()>& pause = {}) {
+                                                      const std::function<void()>& pause = {},
+                                                      const CpuRateReference* reference = nullptr) {
     SettledCpuRates out;
     bool quiet = false; // some reading was taken on a quiet CPU
-    while (out.readings.size() < static_cast<std::size_t>(kRateSettleReadings)) {
-        if (!out.readings.empty()) {
-            if (pause) {
-                pause();
-            } else {
-                std::this_thread::sleep_for(kRateSettle);
-            }
-        }
+    // One reading: false when there is none; `improved` when it beats the best experts/s by more than the gain.
+    const auto take = [&](bool& improved) {
         const std::optional<CpuRateReading> reading = read();
-        if (!reading) { break; }
-        const bool improved = reading->experts > out.experts * (1.0 + kRateSettleGain);
-        out.experts         = std::max(out.experts, reading->experts);
-        out.columns         = std::max(out.columns, reading->columns);
-        out.note            = reading->note;
-        quiet               = quiet || reading->busy_share < 0.0;
-        out.busy_share      = quiet ? -1.0 : reading->busy_share;
+        if (!reading) { return false; }
+        improved       = reading->experts > out.experts * (1.0 + kRateSettleGain);
+        out.experts    = std::max(out.experts, reading->experts);
+        out.columns    = std::max(out.columns, reading->columns);
+        out.note       = reading->note;
+        quiet          = quiet || reading->busy_share < 0.0;
+        out.busy_share = quiet ? -1.0 : reading->busy_share;
         out.readings.push_back(reading->experts);
-        if (!improved) { break; }
+        return true;
+    };
+    const auto wait = [&] {
+        if (pause) {
+            pause();
+        } else {
+            std::this_thread::sleep_for(kRateSettle);
+        }
+    };
+    std::size_t limit = kRateSettleReadings;
+    if (reference != nullptr && reference->experts > 0.0) {
+        bool improved = false;
+        if (!take(improved)) { return out; }
+        (void)take(improved);
+        const double low = reference->experts / (1.0 + kRateSettleGain), high = reference->experts * (1.0 + kRateSettleGain);
+        if (out.experts >= low && out.experts <= high) {
+            out.confirmed = *reference;
+            return out;
+        }
+        limit = out.readings.size() + kRateSettleReadings - 1; // the pair stands for the first reading
+    } else {
+        bool improved = false;
+        if (!take(improved)) { return out; }
+    }
+    while (out.readings.size() < limit) {
+        wait();
+        bool improved = false;
+        if (!take(improved) || !improved) { break; }
     }
     return out;
 }
+
+// The reference a settled start left for `key` (the machine and the configuration its rates depend on) in `path`
+// (beside the saved expert state); nothing when there is none, or for another key. Read errors read as none.
+[[nodiscard]] std::optional<CpuRateReference> load_cpu_rate_reference(const std::filesystem::path& path, const std::string& key);
+// Records `rates` as `key`'s reference in `path` (the other keys' lines kept), dated today. Only a full, quiet settle
+// may write one (SettledCpuRates::confirmed empty, busy_share < 0). Write errors are ignored: a start without a
+// reference settles in full.
+void save_cpu_rate_reference(const std::filesystem::path& path, const std::string& key, const SettledCpuRates& rates);
+// The machine part of a reference key: the CPU's brand string, its logical CPUs and the RAM's size in GiB.
+[[nodiscard]] std::string cpu_rate_machine_key();
 
 } // namespace infernix::runtime::expert_offload

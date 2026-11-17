@@ -24,9 +24,11 @@ target_sources(infernix_model_runtime PRIVATE
 # The host expert cache (Qwen3.8-Flash-Next design §9: LFRU, frame pool, saved state, the SSD tier's
 # RAM level) is a host-only library its conformance tests link directly.
 add_library(infernix_expert_offload_cache STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/cpu_rate_reference.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_state.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/host_tier.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/route_predictor.cpp")
 infernix_internal_includes(infernix_expert_offload_cache)
+target_link_libraries(infernix_expert_offload_cache PUBLIC infernix_core) # host_memory_snapshot (cpu_rate_reference.cpp)
 target_link_libraries(infernix_model_runtime PUBLIC infernix_expert_offload_cache)

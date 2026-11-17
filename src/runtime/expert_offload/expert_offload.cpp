@@ -625,7 +625,20 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
 
 // The CPU team's rates, settled (placement.h settle_cpu_rates), right after the banks' load or the tier's fill.
 void ExpertOffload::measure_cpu_rate_settled() {
-    const SettledCpuRates rates = settle_cpu_rates([this] { return measure_cpu_rate(); });
+    // An earlier start's settled reading of this machine and configuration, beside the saved expert state: this start's
+    // readings end without the settling pause when they agree with it (placement.h settle_cpu_rates).
+    std::filesystem::path reference_path;
+    if (!options_.expert_state.empty()) { (reference_path = options_.expert_state) += ".cpu-rates"; }
+    std::string reference_key = cpu_rate_machine_key() + " | " + options_.expert_state_identity + "|workers " +
+                                std::to_string(placement_.workers) + "|cpus";
+    for (const auto cpu : placement_.cpus) { reference_key += " " + std::to_string(cpu); }
+    reference_key += "|narrow " + std::to_string(static_cast<int>(options_.narrow_a16)) + "|stride " +
+                     std::to_string(setup_.banks.front()->planes.record_stride) + (tier_ ? "|tier" : "|banks");
+    std::optional<CpuRateReference> reference;
+    if (!reference_path.empty()) { reference = load_cpu_rate_reference(reference_path, reference_key); }
+    const SettledCpuRates rates =
+        settle_cpu_rates([this] { return measure_cpu_rate(); }, {}, reference ? &*reference : nullptr);
+    if (!reference_path.empty()) { save_cpu_rate_reference(reference_path, reference_key, rates); }
     const bool measured         = !rates.readings.empty();
     if (measured) {
         cpu_expert_rate_ = rates.experts;

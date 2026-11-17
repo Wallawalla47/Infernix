@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -87,6 +88,79 @@ int main() {
     check(rates.busy_share < 0.0, "a busy reading after a quiet one does not warn");
     rates = settle({{5'000.0, 1.0, 0.40, ""}, {9'000.0, 1.0, 0.50, ""}, {9'500.0, 1.0, 0.45, ""}}, &pauses);
     check(rates.busy_share == 0.45, "every reading busy: the warning gives the last one's share");
+
+    // With an earlier start's settled reading as the reference: two readings back to back; their best within 10 % of
+    // the reference either way ends the readings without a pause, else they settle as without one, the pause first.
+    using infernix::runtime::expert_offload::CpuRateReference;
+    const auto settle_ref = [](std::vector<CpuRateReading> readings, int* pauses, const CpuRateReference& reference) {
+        std::size_t next = 0;
+        *pauses          = 0;
+        return settle_cpu_rates(
+            [&]() -> std::optional<CpuRateReading> {
+                if (next == readings.size()) { return std::nullopt; }
+                return readings[next++];
+            },
+            [&] { ++*pauses; }, &reference);
+    };
+    const CpuRateReference reference{.experts = 20'000.0, .columns = 50'000.0, .when = "2026-11-16"};
+    rates = settle_ref({{19'000.0, 49'000.0, -1.0, ""}, {20'300.0, 50'500.0, -1.0, ""}, {30'000.0, 1.0, -1.0, ""}}, &pauses,
+                       reference);
+    check(rates.confirmed && pauses == 0 && rates.readings.size() == 2 && rates.experts == 20'300.0 &&
+              rates.columns == 50'500.0,
+          "readings that agree with the reference end at two, with no pause, and keep this start's rates");
+    check(rates.readings_text() == "; the best of 2 readings (19000, 20300 experts/s), confirmed against 20000 from 2026-11-16",
+          "the report names the reference a start was confirmed against");
+    // Memory still slow after the bulk reads (two of 2026-11-16/17's Flash-Next starts read about half at first).
+    rates = settle_ref({{10'700.0, 1.0, -1.0, ""}, {11'200.0, 1.0, -1.0, ""}, {19'900.0, 1.0, -1.0, ""}, {20'100.0, 1.0, -1.0, ""}},
+                       &pauses, reference);
+    check(!rates.confirmed && pauses == 2 && rates.readings.size() == 4 && rates.experts == 20'100.0,
+          "low readings settle as without a reference: a pause, then more while they rise");
+    // A faster machine than the reference was taken on: the readings settle in full and stand.
+    rates = settle_ref({{26'000.0, 1.0, -1.0, ""}, {26'500.0, 1.0, -1.0, ""}, {26'700.0, 1.0, -1.0, ""}}, &pauses, reference);
+    check(!rates.confirmed && pauses == 1 && rates.readings.size() == 3 && rates.experts == 26'700.0,
+          "readings above the reference's band settle in full");
+    rates = settle_ref({}, &pauses, reference);
+    check(rates.readings.empty() && pauses == 0, "a reference without expert records: no reading");
+
+    // The reference file: a full quiet settle is recorded under its key, other keys' lines kept; a confirmed start, a
+    // busy one and a reading-less one record nothing (a confirmed start rewriting its reference would ratchet it
+    // down by up to 10 % a start).
+    {
+        using infernix::runtime::expert_offload::load_cpu_rate_reference;
+        using infernix::runtime::expert_offload::save_cpu_rate_reference;
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "infernix_cpu_rates_test.cpu-rates";
+        std::filesystem::remove(file);
+        check(!load_cpu_rate_reference(file, "a"), "no file: no reference");
+        SettledCpuRates settled;
+        settled.experts  = 19'500.0;
+        settled.columns  = 48'000.0;
+        settled.readings = {19'000.0, 19'500.0};
+        save_cpu_rate_reference(file, "a", settled);
+        settled.experts = 9'000.0;
+        save_cpu_rate_reference(file, "b", settled);
+        auto loaded = load_cpu_rate_reference(file, "a");
+        check(loaded && loaded->experts == 19'500.0 && loaded->columns == 48'000.0 && loaded->when.size() == 10,
+              "a full quiet settle is recorded, dated");
+        SettledCpuRates confirmed = settled;
+        confirmed.experts         = 18'000.0;
+        confirmed.confirmed       = CpuRateReference{.experts = 19'500.0, .columns = 48'000.0, .when = "x"};
+        save_cpu_rate_reference(file, "a", confirmed);
+        SettledCpuRates busy = settled;
+        busy.experts         = 10'000.0;
+        busy.busy_share      = 0.5;
+        save_cpu_rate_reference(file, "a", busy);
+        save_cpu_rate_reference(file, "a", SettledCpuRates{});
+        loaded = load_cpu_rate_reference(file, "a");
+        check(loaded && loaded->experts == 19'500.0, "a confirmed, a busy or a reading-less start records nothing");
+        settled.experts = 21'000.0;
+        save_cpu_rate_reference(file, "a", settled);
+        loaded               = load_cpu_rate_reference(file, "a");
+        const auto other_key = load_cpu_rate_reference(file, "b");
+        check(loaded && loaded->experts == 21'000.0 && other_key && other_key->experts == 9'000.0,
+              "a later full settle replaces its key's reference and keeps the others");
+        std::filesystem::remove(file);
+    }
+    check(!infernix::runtime::expert_offload::cpu_rate_machine_key().empty(), "the machine key names the machine");
 
     const std::uint32_t process = infernix::process_logical_cpus();
     const unsigned machine      = std::thread::hardware_concurrency();

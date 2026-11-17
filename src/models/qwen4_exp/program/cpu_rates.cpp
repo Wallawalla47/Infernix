@@ -186,16 +186,15 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
 // cpu_rates): the same machine, artifact, team, CPUs, arithmetic and records.
 void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
     namespace moe = ops::offloaded_moe;
-    std::string pool_key;
+    // What the rates depend on besides the machine: the artifact, the team's workers and CPUs, its arithmetic and the
+    // records it reads.
+    std::string pool_key = pool_identity() + "|workers " + std::to_string(cpu_workers()) + "|cpus";
+    for (const auto cpu : placement_.cpus) { pool_key += " " + std::to_string(cpu); }
+    pool_key += "|narrow " + std::to_string(static_cast<int>(cpu_narrow_a16())) + "|ggml-a8 " +
+                std::to_string(cpu_ggml_a8() ? 1 : 0) + "|stride " + std::to_string(record_stride) +
+                (tier_ ? "|tier" : "|banks");
     std::optional<runtime::expert_offload::HostSlotPool::CpuRates> carried;
-    if (options_.expert_slot_pool) {
-        pool_key = pool_identity() + "|workers " + std::to_string(cpu_workers()) + "|cpus";
-        for (const auto cpu : placement_.cpus) { pool_key += " " + std::to_string(cpu); }
-        pool_key += "|narrow " + std::to_string(static_cast<int>(cpu_narrow_a16())) + "|ggml-a8 " +
-                    std::to_string(cpu_ggml_a8() ? 1 : 0) + "|stride " + std::to_string(record_stride) +
-                    (tier_ ? "|tier" : "|banks");
-        carried = options_.expert_slot_pool->cpu_rates(pool_key);
-    }
+    if (options_.expert_slot_pool) { carried = options_.expert_slot_pool->cpu_rates(pool_key); }
     SettledCpuRates rates;
     if (carried) {
         rates.experts = carried->experts;
@@ -203,7 +202,15 @@ void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
         rates.readings.push_back(carried->experts);
         rates.note = "kept from an earlier Engine of this EngineHost, " + carried->note;
     } else {
-        rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); });
+        // An earlier start's settled reading of this machine and configuration, beside the saved expert state: this
+        // start's readings, taken as ever, end without the settling pause when they agree with it (settle_cpu_rates).
+        std::filesystem::path reference_path;
+        if (!options_.expert_state.empty()) { (reference_path = options_.expert_state) += ".cpu-rates"; }
+        const std::string reference_key = runtime::expert_offload::cpu_rate_machine_key() + " | " + pool_key;
+        std::optional<runtime::expert_offload::CpuRateReference> reference;
+        if (!reference_path.empty()) { reference = runtime::expert_offload::load_cpu_rate_reference(reference_path, reference_key); }
+        rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); }, {}, reference ? &*reference : nullptr);
+        if (!reference_path.empty()) { runtime::expert_offload::save_cpu_rate_reference(reference_path, reference_key, rates); }
         if (options_.expert_slot_pool && !rates.readings.empty() && rates.busy_share < 0.0) {
             options_.expert_slot_pool->note_cpu_rates(pool_key, {.experts = rates.experts,
                                                                  .columns = rates.columns,
