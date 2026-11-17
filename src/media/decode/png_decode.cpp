@@ -12,6 +12,7 @@ extern "C" {
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace infernix::media::decode {
@@ -85,6 +86,24 @@ void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
             if (out.header.width <= 0 || out.header.height <= 0) {
                 throw std::invalid_argument("png dimensions are invalid");
             }
+            // The legal (colour type, bit depth) pairs (PNG specification, 11.2.2): every other depth would
+            // reach the sample reader's shifts and to8's divisor outside their domain.
+            const int depth   = out.header.bit_depth;
+            const bool legal  = [&] {
+                switch (out.header.color_type) {
+                case 0: return depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16;
+                case 3: return depth == 1 || depth == 2 || depth == 4 || depth == 8;
+                case 2:
+                case 4:
+                case 6: return depth == 8 || depth == 16;
+                default: return false;
+                }
+            }();
+            if (!legal) {
+                throw std::invalid_argument("png has an invalid colour type and bit depth (" +
+                                            std::to_string(out.header.color_type) + ", " + std::to_string(depth) +
+                                            ")");
+            }
         } else if (std::memcmp(tag, "PLTE", 4) == 0) {
             if (length % 3 != 0 || length == 0) {
                 throw std::invalid_argument("png has a malformed PLTE chunk");
@@ -101,89 +120,88 @@ void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
     if (!out.have_ihdr) { throw std::invalid_argument("png is missing its IHDR chunk"); }
 }
 
-[[nodiscard]] std::vector<std::uint8_t> inflate_zlib(std::span<const std::uint8_t> data,
-                                                     std::size_t expected) {
-    z_stream strm{};
-    if (inflateInit2(&strm, 15 + 32) != Z_OK) {
-        throw std::invalid_argument("png: failed to initialize decompressor");
-    }
-    if (data.size() > std::numeric_limits<uInt>::max()) {
-        throw std::invalid_argument("png IDAT stream exceeds the zlib input limit");
-    }
-    strm.next_in  = const_cast<std::uint8_t*>(data.data());
-    strm.avail_in = static_cast<uInt>(data.size());
-    std::vector<std::uint8_t> out;
-    out.reserve(std::min<std::size_t>(expected, 65536));
-    std::vector<std::uint8_t> chunk(65536);
-    // Decompress up to `expected + 1` bytes. Producing `expected + 1` proves the stream is
-    // longer than the image; reaching Z_STREAM_END at exactly `expected` proves it matches.
-    // This keeps the output bounded (DoS-safe) while distinguishing exact / too-short /
-    // too-long streams. (A stream that is exactly `expected` still has zlib's trailing
-    // end-marker block unprocessed, so the final inflate returns Z_OK, not Z_STREAM_END —
-    // comparing total produced bytes avoids misreading that as "longer".)
-    const std::size_t cap = expected + 1;
-    while (out.size() < cap) {
-        const std::size_t want = std::min(chunk.size(), cap - out.size());
-        strm.next_out = chunk.data();
-        strm.avail_out = static_cast<uInt>(want);
-        const int status = inflate(&strm, Z_NO_FLUSH);
-        const std::size_t produced = want - strm.avail_out;
-        out.insert(out.end(), chunk.data(), chunk.data() + produced);
-        if (status == Z_STREAM_END) { break; }
-        if (status != Z_OK) {
-            inflateEnd(&strm);
-            throw std::invalid_argument("png: IDAT stream failed to decompress");
+// The IDAT stream inflated a scanline at a time: the decode holds the compressed stream, two scanlines and the RGB
+// output, never the whole inflated image (an 8192 x 8192 RGBA-16 image inflates to 537 MB, and its unfiltered copy as
+// much again). The stream must hold exactly the image's scanlines: a shorter one, a longer one (more output after the
+// last scanline) and a failing one are refused, as when it was inflated whole.
+class ScanlineInflater {
+public:
+    explicit ScanlineInflater(std::span<const std::uint8_t> data) {
+        if (data.size() > std::numeric_limits<uInt>::max()) {
+            throw std::invalid_argument("png IDAT stream exceeds the zlib input limit");
         }
+        if (inflateInit2(&strm_, 15 + 32) != Z_OK) {
+            throw std::invalid_argument("png: failed to initialize decompressor");
+        }
+        strm_.next_in  = const_cast<std::uint8_t*>(data.data());
+        strm_.avail_in = static_cast<uInt>(data.size());
     }
-    inflateEnd(&strm);
-    if (out.size() > expected) {
-        throw std::invalid_argument("png: IDAT stream is longer than the image");
-    }
-    if (out.size() != expected) {
-        throw std::invalid_argument("png: IDAT stream length does not match the image");
-    }
-    return out;
-}
+    ~ScanlineInflater() { inflateEnd(&strm_); }
+    ScanlineInflater(const ScanlineInflater&)            = delete;
+    ScanlineInflater& operator=(const ScanlineInflater&) = delete;
 
-// Reconstruct the raw (unfiltered) scanlines from the compressed stream. The encoder
-// stores F = raw - predictor (mod 256), so reconstruction ADDS the predictor back:
-// raw = F + predictor (wrapping). Predictors are pixel-aligned (libpng applies the filter
-// at sample granularity): left = recon(x-bpp), up = prev(x), up-left = prev(x-bpp), where
-// bpp is the number of bytes per pixel (bytes_per_sample * samples_per_pixel).
-[[nodiscard]] std::vector<std::uint8_t> unfilter(const std::vector<std::uint8_t>& compressed,
-                                                 int height, int row_bytes, int bpp) {
-    std::vector<std::uint8_t> recon(static_cast<std::size_t>(height) * row_bytes);
-    for (int y = 0; y < height; ++y) {
-        const std::uint8_t* src      = compressed.data() + static_cast<std::size_t>(y) * (row_bytes + 1);
-        const std::uint8_t filter    = src[0];
-        const std::uint8_t* filtered = src + 1;
-        std::uint8_t* cur            = recon.data() + static_cast<std::size_t>(y) * row_bytes;
-        const std::uint8_t* up       = y > 0 ? cur - row_bytes : nullptr;
-        for (int x = 0; x < row_bytes; ++x) {
-            const std::uint8_t left   = x >= bpp ? cur[x - bpp] : 0;
-            const std::uint8_t upb    = up != nullptr ? up[x] : 0;
-            const std::uint8_t upleft = (up != nullptr && x >= bpp) ? up[x - bpp] : 0;
-            std::uint8_t v = filtered[x];
-            switch (filter) {
-                case 0: break;
-                case 1: v = static_cast<std::uint8_t>(v + left); break;
-                case 2: v = static_cast<std::uint8_t>(v + upb); break;
-                case 3: v = static_cast<std::uint8_t>(v + ((left + upb) >> 1)); break;
-                case 4: {
-                    const int pa = std::abs(static_cast<int>(upb) - static_cast<int>(upleft));
-                    const int pb = std::abs(static_cast<int>(left) - static_cast<int>(upleft));
-                    const int pc = std::abs(static_cast<int>(left) + static_cast<int>(upb) -
-                                            2 * static_cast<int>(upleft));
-                    const std::uint8_t c = (pa <= pb && pa <= pc) ? left : (pb <= pc ? upb : upleft);
-                    v = static_cast<std::uint8_t>(v + c);
-                    break;
-                }
-                default: throw std::invalid_argument("png: unknown scanline filter type");
+    // Fills `out` (one filter byte and a scanline; at most 4 MiB + 1 by the row-width guard).
+    void read(std::uint8_t* out, std::size_t bytes) {
+        strm_.next_out  = out;
+        strm_.avail_out = static_cast<uInt>(bytes);
+        while (strm_.avail_out > 0) {
+            const int status = inflate(&strm_, Z_NO_FLUSH);
+            if (status == Z_STREAM_END) {
+                ended_ = true;
+                if (strm_.avail_out > 0) { throw std::invalid_argument("png: IDAT stream length does not match the image"); }
+                return;
             }
-            cur[x] = v;
+            if (status != Z_OK) { throw std::invalid_argument("png: IDAT stream failed to decompress"); }
         }
     }
-    return recon;
+
+    // After the last scanline: nothing more may come out of the stream. (A stream that is exactly the image still
+    // has zlib's end marker to process, which produces no byte.)
+    void finish() {
+        while (!ended_) {
+            std::uint8_t extra = 0;
+            strm_.next_out     = &extra;
+            strm_.avail_out    = 1;
+            const int status   = inflate(&strm_, Z_NO_FLUSH);
+            if (strm_.avail_out == 0) { throw std::invalid_argument("png: IDAT stream is longer than the image"); }
+            if (status == Z_STREAM_END) { return; }
+            if (status != Z_OK) { throw std::invalid_argument("png: IDAT stream failed to decompress"); }
+        }
+    }
+
+private:
+    z_stream strm_{};
+    bool ended_ = false;
+};
+
+// Reconstructs one raw (unfiltered) scanline. The encoder stores F = raw - predictor (mod 256), so reconstruction ADDS
+// the predictor back: raw = F + predictor (wrapping). Predictors are pixel-aligned (libpng applies the filter at sample
+// granularity): left = recon(x-bpp), up = prev(x), up-left = prev(x-bpp), where bpp is the number of bytes per pixel
+// (bytes_per_sample * samples_per_pixel); the first scanline's `prev` is zeros.
+void unfilter_row(std::uint8_t filter, const std::uint8_t* filtered, const std::uint8_t* up, std::uint8_t* cur,
+                  int row_bytes, int bpp) {
+    for (int x = 0; x < row_bytes; ++x) {
+        const std::uint8_t left   = x >= bpp ? cur[x - bpp] : 0;
+        const std::uint8_t upb    = up[x];
+        const std::uint8_t upleft = x >= bpp ? up[x - bpp] : 0;
+        std::uint8_t v            = filtered[x];
+        switch (filter) {
+            case 0: break;
+            case 1: v = static_cast<std::uint8_t>(v + left); break;
+            case 2: v = static_cast<std::uint8_t>(v + upb); break;
+            case 3: v = static_cast<std::uint8_t>(v + ((left + upb) >> 1)); break;
+            case 4: {
+                const int pa = std::abs(static_cast<int>(upb) - static_cast<int>(upleft));
+                const int pb = std::abs(static_cast<int>(left) - static_cast<int>(upleft));
+                const int pc = std::abs(static_cast<int>(left) + static_cast<int>(upb) - 2 * static_cast<int>(upleft));
+                const std::uint8_t c = (pa <= pb && pa <= pc) ? left : (pb <= pc ? upb : upleft);
+                v = static_cast<std::uint8_t>(v + c);
+                break;
+            }
+            default: throw std::invalid_argument("png: unknown scanline filter type");
+        }
+        cur[x] = v;
+    }
 }
 
 // Reduce a full-precision sample to 8 bits.
@@ -241,30 +259,23 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
         throw Error(ErrorKind::BudgetExceeded, "png row width exceeds the decode buffer limit");
     }
     const int row_bytes = static_cast<int>((row_bits + 7) / 8);
-    const std::size_t raw_size = static_cast<std::size_t>(height) * static_cast<std::size_t>(row_bytes + 1);
-    const std::vector<std::uint8_t> compressed = inflate_zlib(parse.idat, raw_size);
-    // The Sub/Avg/Paeth filters reference the previous sample (pixel-aligned, x-bpp); the
-    // reconstruction adds the predictor back. This is correct for every bit depth.
-    const std::vector<std::uint8_t> recon =
-        unfilter(compressed, height, row_bytes, std::max(1, samples * bytes_per_sample));
+    const int bpp       = std::max(1, samples * bytes_per_sample);
 
-    // Full-precision sample (0 .. (1<<bit_depth)-1) at pixel (x,y), channel s.
-    auto raw_value = [&](int x, int y, int s) -> std::uint32_t {
+    // Full-precision sample (0 .. (1<<bit_depth)-1) of the reconstructed scanline `row` at pixel x, channel s.
+    auto raw_value = [&](const std::uint8_t* row, int x, int s) -> std::uint32_t {
         if (bit_depth >= 8) {
-            const std::uint8_t* base =
-                recon.data() + static_cast<std::size_t>(y) * row_bytes +
-                static_cast<std::size_t>(x) * static_cast<std::size_t>(samples) *
-                    bytes_per_sample +
-                static_cast<std::size_t>(s) * bytes_per_sample;
+            const std::uint8_t* base = row + static_cast<std::size_t>(x) * static_cast<std::size_t>(samples) *
+                                                 bytes_per_sample +
+                                       static_cast<std::size_t>(s) * bytes_per_sample;
             if (bit_depth == 16) {
                 return (static_cast<std::uint32_t>(base[0]) << 8) | static_cast<std::uint32_t>(base[1]);
             }
             return base[0];
         }
-        const int bitpos = (x * samples + s) * bit_depth;
-        const int byte   = bitpos >> 3;
-        const int shift  = 7 - (bitpos & 7) - (bit_depth - 1);
-        const std::uint8_t b = recon[static_cast<std::size_t>(y) * row_bytes + byte];
+        const int bitpos     = (x * samples + s) * bit_depth;
+        const int byte       = bitpos >> 3;
+        const int shift      = 7 - (bitpos & 7) - (bit_depth - 1);
+        const std::uint8_t b = row[byte];
         return (static_cast<int>(b) >> shift) & ((1 << bit_depth) - 1);
     };
 
@@ -273,22 +284,29 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
     out.height = height;
     out.rgb.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
     std::uint8_t* px = out.rgb.data();
+    // The previous scanline (zeros above the first) and this one, and this one's filter byte and filtered bytes.
+    std::vector<std::uint8_t> previous(static_cast<std::size_t>(row_bytes), 0), current(static_cast<std::size_t>(row_bytes));
+    std::vector<std::uint8_t> filtered(static_cast<std::size_t>(row_bytes) + 1);
+    ScanlineInflater stream(parse.idat);
     for (int y = 0; y < height; ++y) {
+        stream.read(filtered.data(), filtered.size());
+        unfilter_row(filtered[0], filtered.data() + 1, previous.data(), current.data(), row_bytes, bpp);
+        const std::uint8_t* row = current.data();
         for (int x = 0; x < width; ++x) {
             std::uint8_t r = 0, g = 0, b = 0;
             switch (color_type) {
                 case 0: {
-                    const std::uint8_t v = to8(raw_value(x, y, 0), bit_depth);
+                    const std::uint8_t v = to8(raw_value(row, x, 0), bit_depth);
                     r = g = b = v;
                     break;
                 }
                 case 2:
-                    r = to8(raw_value(x, y, 0), bit_depth);
-                    g = to8(raw_value(x, y, 1), bit_depth);
-                    b = to8(raw_value(x, y, 2), bit_depth);
+                    r = to8(raw_value(row, x, 0), bit_depth);
+                    g = to8(raw_value(row, x, 1), bit_depth);
+                    b = to8(raw_value(row, x, 2), bit_depth);
                     break;
                 case 3: {
-                    const std::uint32_t idx = raw_value(x, y, 0);
+                    const std::uint32_t idx = raw_value(row, x, 0);
                     if (idx >= parse.palette.rgb.size()) {
                         throw std::invalid_argument("png palette index is out of range");
                     }
@@ -298,14 +316,14 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
                     break;
                 }
                 case 4: { // gray + alpha: the gray sample
-                    const std::uint8_t v = to8(raw_value(x, y, 0), bit_depth);
+                    const std::uint8_t v = to8(raw_value(row, x, 0), bit_depth);
                     r = g = b = v;
                     break;
                 }
                 case 6: // RGBA: the color samples
-                    r = to8(raw_value(x, y, 0), bit_depth);
-                    g = to8(raw_value(x, y, 1), bit_depth);
-                    b = to8(raw_value(x, y, 2), bit_depth);
+                    r = to8(raw_value(row, x, 0), bit_depth);
+                    g = to8(raw_value(row, x, 1), bit_depth);
+                    b = to8(raw_value(row, x, 2), bit_depth);
                     break;
             }
             px[0] = r;
@@ -313,7 +331,9 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
             px[2] = b;
             px += 3;
         }
+        previous.swap(current);
     }
+    stream.finish();
     return out;
 }
 

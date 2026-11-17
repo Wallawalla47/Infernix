@@ -1925,24 +1925,13 @@ void PrefixCacheIndex::complete_ssd_promotion(SsdJob& job) {
     job = SsdJob{};
 }
 
+void PrefixCacheIndex::cancel_ssd_promotion(SsdJob& job) {
+    release_ssd_promotion(job);
+    job = SsdJob{};
+}
+
 void PrefixCacheIndex::abort_ssd_promotion(SsdJob& job) {
-    for (const NodeRef ref : job.nodes) {
-        Node& node = require(ref);
-        if (node.host != CopyState::Filling) { invariant("prefix cache SSD promotion not open"); }
-        free_slab(node.host_slab);
-        set_node_slab(ref.index, kNoId);
-        node.host = CopyState::Absent;
-        refresh_node(ref.index);
-    }
-    if (job.image) {
-        Snapshot& snapshot = require(job.snapshot);
-        if (snapshot.host != CopyState::Filling) { invariant("prefix cache SSD image promotion not open"); }
-        for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
-        snapshot.host_slabs.clear();
-        snapshot.host = CopyState::Absent;
-        refresh_tail(job.snapshot.index);
-    }
-    io_unpin_snapshot(job.snapshot.index);
+    release_ssd_promotion(job);
     // The SSD copies read may be damaged: they go, and an entry left with no copy goes with its
     // subtree (§9.4). The snapshot first, then the blocks deepest first. An entry another transfer
     // pins keeps its copy (its loss would leave that transfer's source without one).
@@ -1960,6 +1949,26 @@ void PrefixCacheIndex::abort_ssd_promotion(SsdJob& job) {
         if (node.device == CopyState::Absent && node.host == CopyState::Absent) { remove_subtree(it->index); }
     }
     job = SsdJob{};
+}
+
+void PrefixCacheIndex::release_ssd_promotion(SsdJob& job) {
+    for (const NodeRef ref : job.nodes) {
+        Node& node = require(ref);
+        if (node.host != CopyState::Filling) { invariant("prefix cache SSD promotion not open"); }
+        free_slab(node.host_slab);
+        set_node_slab(ref.index, kNoId);
+        node.host = CopyState::Absent;
+        refresh_node(ref.index);
+    }
+    if (job.image) {
+        Snapshot& snapshot = require(job.snapshot);
+        if (snapshot.host != CopyState::Filling) { invariant("prefix cache SSD image promotion not open"); }
+        for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
+        snapshot.host_slabs.clear();
+        snapshot.host = CopyState::Absent;
+        refresh_tail(job.snapshot.index);
+    }
+    io_unpin_snapshot(job.snapshot.index);
 }
 
 std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {
@@ -2180,11 +2189,14 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
                                                  std::optional<std::uint32_t> tail_device_id,
                                                  std::uint32_t device_slot, SnapshotKind kind,
                                                  std::optional<double> claim, bool adopt) {
+    // A refused call consumes what it was given, as every other outcome does (publish_image).
     if (device_slot >= slot_state_.size() || slot_state_[device_slot] != SlotState::Staging) {
+        if (tail_device_id && *tail_device_id != kNoId) { backend_->release_device_block(*tail_device_id); }
         invariant("prefix cache snapshot image is not in a staging slot");
     }
     // A Device image's tail lives on the Device until a Host fill backs the whole snapshot.
     if (!tail.empty() && !tail_device_id) {
+        set_slot(device_slot, SlotState::Free);
         throw std::invalid_argument("prefix cache snapshot tail is inconsistent");
     }
     return publish_image(anchor, frontier, tail, tail_device_id, device_slot, {}, kind, claim, adopt);
@@ -2222,7 +2234,14 @@ PublishResult PrefixCacheIndex::publish_host_snapshot(NodeRef anchor, std::uint3
                                                       std::optional<std::uint32_t> tail_device_id,
                                                       HostImageReservation&& image,
                                                       SnapshotKind kind, std::optional<double> claim) {
+    // A refused call consumes what it was given, as every other outcome does (publish_image); release_host_image
+    // frees only slabs still reserved.
+    const auto refuse = [&]() noexcept {
+        release_host_image(std::move(image));
+        if (tail_device_id && *tail_device_id != kNoId) { backend_->release_device_block(*tail_device_id); }
+    };
     if (image.tail != !tail.empty()) {
+        refuse();
         throw std::invalid_argument(
             "prefix cache Host-born snapshot tail does not match its reservation");
     }
@@ -2230,6 +2249,7 @@ PublishResult PrefixCacheIndex::publish_host_snapshot(NodeRef anchor, std::uint3
         !std::all_of(image.slabs.begin(), image.slabs.end(), [&](std::uint32_t slab) {
             return slab < slab_reserved_.size() && slab_reserved_[slab];
         })) {
+        refuse();
         invariant("prefix cache Host-born snapshot image is not a reservation");
     }
     const PublishResult result =
@@ -2245,13 +2265,31 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
                                               std::uint32_t device_slot,
                                               std::vector<std::uint32_t>&& host_slabs,
                                               SnapshotKind kind, std::optional<double> claim, bool adopt) {
+    // Every outcome consumes the image (its staging slot or its reserved slabs) and the tail id, a refusal here
+    // included: the caller cannot tell a refusal from a throw past the first change below (an allocation, after
+    // which the snapshot owns them), so it never gives them back itself.
+    const auto refuse = [&]() noexcept {
+        if (device_slot != kNoId) { set_slot(device_slot, SlotState::Free); }
+        for (const std::uint32_t slab : host_slabs) {
+            slab_reserved_[slab] = false;
+            free_slab(slab);
+        }
+        host_slabs.clear();
+        if (tail_device_id && *tail_device_id != kNoId) { backend_->release_device_block(*tail_device_id); }
+    };
     if (tail.size() >= kBlockTokens || (tail.empty() && tail_device_id) ||
         (tail_device_id && *tail_device_id == kNoId)) {
+        refuse();
         throw std::invalid_argument("prefix cache snapshot tail is inconsistent");
     }
+    if (anchor.valid() && !valid(anchor)) {
+        refuse();
+        invariant("stale prefix cache node reference");
+    }
     const std::uint32_t anchor_index = anchor.valid() ? anchor.index : kNoId;
-    const std::uint32_t base = anchor.valid() ? (require(anchor).depth + 1U) * kBlockTokens : 0U;
+    const std::uint32_t base = anchor.valid() ? (nodes_[anchor_index].depth + 1U) * kBlockTokens : 0U;
     if (frontier == 0 || frontier != base + static_cast<std::uint32_t>(tail.size())) {
+        refuse();
         throw std::invalid_argument("prefix cache snapshot frontier does not match its anchor");
     }
     // Validated: the reserved slabs now belong to this publication.

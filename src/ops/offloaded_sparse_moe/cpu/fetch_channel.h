@@ -45,6 +45,8 @@ public:
     void beat() noexcept;
 
 private:
+    void release() noexcept; // the words taken (the destructor's, and a constructor's that throws partway)
+
     FetchRequest* request_    = nullptr; // mapped
     FetchResponse* response_  = nullptr; // mapped
     std::uint64_t* consumed_  = nullptr; // mapped

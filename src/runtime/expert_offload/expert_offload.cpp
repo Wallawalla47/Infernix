@@ -538,7 +538,7 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
                              .nvfp4_a8   = options_.narrow_a16 == moe::NarrowA16::kA8, // the misses' route sets the rates
                              .shape      = shape,
                              .cpus       = placement_.cpus});
-    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    ScopedThreadCpus pinned(placement_.cpus.empty() ? 0 : placement_.cpus.front()); // restored on every way out
     const auto H = static_cast<std::size_t>(shape.hidden);
     std::vector<std::uint16_t> x(H * kNarrowColumns);
     std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
@@ -566,6 +566,12 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
     };
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    struct StreamGuard { // the probe's stream, destroyed on every way out
+        cudaStream_t& stream;
+        ~StreamGuard() {
+            if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+        }
+    } stream_guard{stream};
     const std::uint64_t source_stride = front.planes.record_stride; // at most the staging pitch
     const auto rate = [&](int columns, int first_round) {
         fill(first_round + kRateRepeats * kRateRounds, columns); // warm-up round
@@ -608,8 +614,8 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
         if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
         std::this_thread::sleep_for(kRetryPause);
     }
-    (void)set_current_thread_cpus(caller_cpus);
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    pinned.restore();
+    CUDA_CHECK(cudaStreamDestroy(std::exchange(stream, nullptr)));
     reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
     char share[160];
     if (attempts > 1) {
@@ -726,7 +732,7 @@ void ExpertOffload::cpu_probe_detail() {
                              .ggml       = ggml_format(front).valid(),
                              .shape      = shape,
                              .cpus       = placement_.cpus});
-    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    ScopedThreadCpus pinned(placement_.cpus.empty() ? 0 : placement_.cpus.front()); // restored on every way out
     const auto H = static_cast<std::size_t>(shape.hidden);
     std::vector<std::uint16_t> x(H * kNarrowColumns);
     std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
@@ -769,7 +775,7 @@ void ExpertOffload::cpu_probe_detail() {
                 std::max(narrow[static_cast<std::size_t>(memory)], timed(memory, kNarrowColumns));
         }
     }
-    (void)set_current_thread_cpus(caller_cpus);
+    pinned.restore();
     (void)cudaFreeHost(allocated);
     char text[512];
     std::snprintf(text, sizeof(text),
@@ -1564,25 +1570,27 @@ bool ExpertOffload::lend_stream(std::int32_t width, std::uint64_t wide_bytes, st
         const std::uint32_t layers = std::max(1U, residency_->lease_layers(lease));
         return (lease.count + layers - 1) / layers;
     };
-    ExpertResidency::FrameLease wide, walk;
+    // Leases taken here go back on every way out but the last: a lease left loaned would stop every later resize
+    // of the cache (ExpertResidency::resize refuses while frames are loaned).
+    ExpertResidency::LeaseHold wide, walk;
     if (wide_bytes > 0) {
         if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
-        wide = residency_->lend(wide_bytes, compute, writers);
+        wide = ExpertResidency::LeaseHold(*residency_, residency_->lend(wide_bytes, compute, writers), compute);
     }
     if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
-        walk = residency_->lend(walk_bytes, compute, writers);
+        walk = ExpertResidency::LeaseHold(*residency_, residency_->lend(walk_bytes, compute, writers), compute);
     }
-    const std::uint32_t widened    = std::min(E, most + std::max(per_layer(wide), per_layer(walk)));
-    const auto room_slots          = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
-    const std::uint32_t half       = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
+    const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide.get()), per_layer(walk.get())));
+    const auto room_slots       = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
+    const std::uint32_t half    = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
     if (half < kStreamHalfMin) {
-        if (walk.valid()) { residency_->give_back(walk, compute); }
-        if (wide.valid()) { residency_->give_back(wide, compute); }
+        walk.give_back();
+        wide.give_back();
         return false;
     }
-    leases_.ring = residency_->lend((2ULL * half + 1) * slot, compute, writers);
-    leases_.wide = wide;
-    leases_.walk = walk;
+    leases_.ring     = residency_->lend((2ULL * half + 1) * slot, compute, writers);
+    leases_.wide     = wide.release();
+    leases_.walk     = walk.release();
     stream_at_lease_ = stream_->stats();
     return true;
 }

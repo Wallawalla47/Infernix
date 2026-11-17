@@ -161,6 +161,7 @@ void ModelUpdates::shutdown() {
         if (stopping_) { return; }
         stopping_ = true;
     }
+    cancel_ = true;
     cv_.notify_all();
     if (worker_.joinable()) { worker_.join(); }
 }
@@ -226,8 +227,9 @@ void ModelUpdates::check_now() {
     std::optional<std::string> error;
     const std::string token = hooks_.token ? hooks_.token() : std::string();
     for (const auto& [place, job] : newest) {
+        if (cancel_) { return; } // the launcher is stopping: the result would not be shown
         try {
-            const HfListing listing = hf_list_files(place.first, token);
+            const HfListing listing = hf_list_files(place.first, token, &cancel_);
             if (listing.revision == job.value("revision", "")) { continue; }
             Json files          = Json::array();
             std::uint64_t bytes = 0;
@@ -280,19 +282,27 @@ void InfernixUpdate::shutdown() {
 }
 
 Json InfernixUpdate::state() const {
+#ifdef _WIN32
+    // The folder probe (a file made and removed) runs before the lock: the download's progress takes the same lock
+    // per chunk, and every publish asks for the state.
+    const bool install_dir_writable = writable(options_.install_dir);
+#else
+    const bool install_dir_writable = false;
+#endif
     std::lock_guard lock(mutex_);
-    return state_locked();
+    return state_locked(install_dir_writable);
 }
 
-Json InfernixUpdate::state_locked() const {
+Json InfernixUpdate::state_locked(bool install_dir_writable) const {
     const std::optional<std::string> current = release_version(options_.build_id);
     std::optional<std::string> blocked;
 #ifndef _WIN32
+    (void)install_dir_writable;
     blocked = "Infernix releases are Windows builds; on Linux, update from the source.";
 #else
     if (!latest_.is_null() && latest_["asset"].is_null()) {
         blocked = "The latest release has no Windows zip.";
-    } else if (!writable(options_.install_dir)) {
+    } else if (!install_dir_writable) {
         blocked = "The launcher's folder (" + path_utf8(options_.install_dir) + ") cannot be written.";
     }
 #endif
@@ -362,7 +372,7 @@ void InfernixUpdate::check_now() {
         if (phase_ != "ready") { phase_ = "checking"; }
     }
     publish();
-    const HttpResult result = http_get(kReleaseApi, "", 30);
+    const HttpResult result = http_get(kReleaseApi, "", 30, &cancel_);
     {
         std::lock_guard lock(mutex_);
         checked_at_ = now_ms();
@@ -383,6 +393,7 @@ void InfernixUpdate::check_now() {
 void InfernixUpdate::download_now() {
     std::string url, name;
     std::optional<std::string> sha;
+    std::uint64_t listed = 0; // the asset's size by the release
     {
         std::lock_guard lock(mutex_);
         const Json asset = latest_["asset"];
@@ -392,6 +403,7 @@ void InfernixUpdate::download_now() {
         phase_ = "downloading";
         done_  = 0;
         total_ = asset.value("bytes", std::uint64_t{0});
+        listed = total_;
         error_.reset();
     }
     publish();
@@ -436,6 +448,14 @@ void InfernixUpdate::download_now() {
         const std::atomic<bool> never{false};
         const std::optional<std::string> digest = sha256_file(part, nullptr, never);
         if (!digest || *digest != *sha) { failure = "the download does not match the release's SHA-256"; }
+    } else if (failure.empty() && listed != 0) {
+        // No digest (an older release): at least the size the release lists, so a transfer cut short is not installed.
+        std::error_code size_error;
+        const std::uintmax_t got = std::filesystem::file_size(part, size_error);
+        if (size_error || got != listed) {
+            failure = "the download has " + std::to_string(size_error ? 0 : got) + " bytes, the release lists " +
+                      std::to_string(listed);
+        }
     }
     if (failure.empty()) {
         std::filesystem::rename(part, zip, ignored);

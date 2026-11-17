@@ -183,7 +183,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * kv_table_rows[b]. The current k/v row is appended before it is observed, so the formula is the
  * shared oracle above over J=[0,p]. Each masked row has a live prefix [0,Vb); its live positions
  * are sequential and address populated histories. A nonempty row repeats its last live position
- * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
+ * through the inert tail; an empty row uses zero positions. These tail positions are required (some
+ * routes take a row's last visible key from its last column); the tail's q, k and v are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
  * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the

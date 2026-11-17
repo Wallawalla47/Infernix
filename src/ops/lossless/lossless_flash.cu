@@ -380,7 +380,8 @@ __global__ void __launch_bounds__(kSelectThreads)
     const int t = static_cast<int>(blockIdx.x), tid = static_cast<int>(threadIdx.x);
     for (int w = tid; w < words; w += kSelectThreads) { bits[w] = 0; }
     __syncthreads();
-    const int n = ((positions != nullptr ? positions[t] : t) + 1) / ratio;
+    // At most the scored blocks (positions are the caller's device data; the contract says they are covered).
+    const int n = min(((positions != nullptr ? positions[t] : t) + 1) / ratio, blocks);
     if (n <= budget) {
         for (int b = tid; b < n; b += kSelectThreads) { atomicOr(&bits[b / 32], 1U << (b % 32)); }
     } else {

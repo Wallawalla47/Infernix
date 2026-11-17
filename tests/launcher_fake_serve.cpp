@@ -15,6 +15,7 @@
 //   --fake-no-memory          report no memory breakdown (a server older than it)
 //   --plan FILE               write a plan (fits up to --max-context 225280) and exit
 //   INFERNIX_FAKE_PROBE=TEXT  logged at startup (a configuration's environment reaches the server)
+//   INFERNIX_FAKE_HELP_DELAY_MS=N  wait N ms before printing --help (a slow first start)
 //   INFERNIX_FAKE_BIND_FAIL_ONCE=FILE  refuse the port once, as infernix-serve does when another
 //                             program holds it, and note it in FILE (later starts bind normally)
 //
@@ -605,6 +606,10 @@ void generate(const std::string& protocol, const Json& body, const std::string& 
 }
 
 void print_help() {
+    // A cold start (a first run after boot, a virus scan) can take seconds before the help appears.
+    if (const char* delay = std::getenv("INFERNIX_FAKE_HELP_DELAY_MS"); delay != nullptr && *delay != '\0') {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(delay)));
+    }
     // INFERNIX_FAKE_SERVE_HELP names a text file to print instead (a real infernix-serve's --help,
     // say), so the launcher offers that server's options while this one answers the requests.
     if (const char* file = std::getenv("INFERNIX_FAKE_SERVE_HELP"); file != nullptr && *file != '\0') {
@@ -868,7 +873,7 @@ int main(int argc, char** argv) {
         return port_refused();
     }
     if (!server.bind_to_port(host, port)) { return port_refused(); }
-    std::thread loader([load_ms, hog_mib, fail_load] {
+    std::thread loader([load_ms, hog_mib, fail_load, host, port] {
         std::vector<std::unique_ptr<char[]>> hog;
         log("INFO", "loading weights | 21.4 GiB");
         for (int taken = 0; taken < hog_mib; taken += 256) {
@@ -886,8 +891,13 @@ int main(int argc, char** argv) {
         }
         hog.clear();
         log("INFO", "engine ready | " + g_state.model + " | total 1.5s");
-        std::lock_guard lock(g_state.mutex);
-        g_state.ready = true;
+        {
+            std::lock_guard lock(g_state.mutex);
+            g_state.ready = true;
+        }
+        // The real server's ready line (OperationalLog::server_ready): the launcher takes /health only from a server
+        // that logged it.
+        log("INFO", "listening on http://" + host + ":" + std::to_string(port) + " | model " + g_state.model + " | auth none");
     });
     loader.detach();
     server.listen_after_bind();

@@ -46,17 +46,21 @@ public:
     using Listener = std::function<void(const EventRecord& record)>;
 
     explicit EventLog(std::filesystem::path dir);
+    ~EventLog(); // writes what is still queued
 
-    // Moves both files to `dir` (later records only); false, with the reason, when it cannot be
-    // written (the records then stay in memory).
+    // Moves both files to `dir` (later records only; the queued ones are written where they were
+    // logged first); false, with the reason, when it cannot be written (the records then stay in memory).
     bool set_dir(const std::filesystem::path& dir, std::string& error);
     [[nodiscard]] std::filesystem::path dir() const;
     [[nodiscard]] std::filesystem::path events_file() const;
     [[nodiscard]] std::filesystem::path requests_file() const;
 
+    // add and add_request_body keep the record and queue its line; write_files (one writer, the launcher's log
+    // thread) writes the queued lines, so a slow or stalled log folder never holds up the thread that logs.
     void add(std::string level, std::string category, std::string message, Json fields = nullptr);
     // One request-content record (written to the requests file only).
     void add_request_body(const Json& record);
+    void write_files();
 
     // Without `after`, the newest `limit` records.
     [[nodiscard]] Json page(std::uint64_t after, std::size_t limit) const;
@@ -70,11 +74,17 @@ private:
         bool failed             = false;
     };
     void write_locked(File& file, const std::filesystem::path& path, std::uint64_t limit, const std::string& line);
+    void write_pending_locked(); // file_mutex_ held
 
-    mutable std::mutex mutex_;
-    std::filesystem::path dir_;
+    // Lock order: file_mutex_, then mutex_.
+    std::mutex file_mutex_;  // the files and their state, the folder they are written in
+    std::filesystem::path file_dir_;
     File events_;
     File requests_;
+    mutable std::mutex mutex_; // the records, the queues and the folder as reported
+    std::filesystem::path dir_;
+    std::vector<std::string> pending_events_;
+    std::vector<std::string> pending_requests_;
     std::deque<EventRecord> records_;
     std::uint64_t next_seq_ = 1;
     Listener listener_;

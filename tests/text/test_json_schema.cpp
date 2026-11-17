@@ -1,6 +1,7 @@
 #include "text/grammar.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -155,6 +156,20 @@ void contracts(infernix::text::GrammarCompiler& compiler) {
     for (const std::string separator : {"\n", "\r", "\u2028", "\u2029"})
         check(!accepts(compiler, dot, Json("a" + separator + "b").dump()),
               "ECMAScript dot admitted a line terminator");
+    // References shared by allOf branches (audit 2026-11-17 SV-02): d_i is allOf of two references to d_{i+1}, 40
+    // deep, d_40 a string. Each reference expands once per conjunction, not once per path (2^40): the schema compiles
+    // at once and means "a string".
+    Json defs = Json::object();
+    for (int i = 0; i < 40; ++i) {
+        const std::string next = "#/$defs/d" + std::to_string(i + 1);
+        defs["d" + std::to_string(i)] = {{"allOf", Json::array({Json{{"$ref", next}}, Json{{"$ref", next}}})}};
+    }
+    defs["d40"]         = {{"type", "string"}};
+    const auto started  = std::chrono::steady_clock::now();
+    const auto shared   = Constraint::json_schema(Json{{"$defs", defs}, {"$ref", "#/$defs/d0"}}.dump());
+    const bool admitted = accepts(compiler, shared, "\"ok\"") && !accepts(compiler, shared, "1");
+    check(admitted && std::chrono::steady_clock::now() - started < std::chrono::seconds(10),
+          "allOf branches sharing references expanded once per path");
 }
 } // namespace
 

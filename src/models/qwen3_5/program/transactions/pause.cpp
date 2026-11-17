@@ -34,6 +34,14 @@ bool ProgramImpl::start_pause(SequenceHandle handle, runtime::ExecutionTiming* o
     saved->frontier = control.lifecycle == Lifecycle::Prefilling  ? control.prefill->cursor
                       : control.lifecycle == Lifecycle::Replaying ? control.replay_target
                                                                   : state.execution_frontier;
+    // Offloaded experts: a prompt paused while it prefilled returns the stream's leases (the ring, the wide
+    // workspace) unless another lane still prefills over them, as clear_lane does: the pause is the resource-pressure
+    // action, and the frames they hold would otherwise stay lent while the request waits.
+    if (offload && control.lifecycle == Lifecycle::Prefilling && !other_lane_prefilling(lane)) {
+        try {
+            offload->return_stream(device.stream);
+        } catch (...) {}
+    }
     if (control.lifecycle == Lifecycle::Replaying) {
         control.lifecycle = control.resume_lifecycle;
         control.replay.reset();

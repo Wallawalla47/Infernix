@@ -17,6 +17,7 @@
 #include "launcher/routing.h"
 #include "launcher/serve_help.h"
 #include "launcher/sha256.h"
+#include "launcher/store.h"
 #include "launcher/supervisor.h"
 #include "launcher/telemetry.h"
 #include "launcher/updates.h"
@@ -238,7 +239,7 @@ void test_serve_log_files() {
     check(files.size() == 2, "one log file per server instance");
     if (files.size() == 2) {
         check(files[0].filename().string().ends_with("-first_model.log") && files[1].filename().string().ends_with("-second.log"),
-              "serve-<time>-<model>.log");
+              "serve-<time>-<run>-<model>.log");
         check(read_file(files[0]).value_or("") == "2026-10-30 11:55:04.605  INFO  build windows-2026.10.18\nraw line\n",
               "an instance's output as it came, in its own file");
         check(read_file(files[1]).value_or("") == "second output\n", "the next instance's in the next file");
@@ -247,7 +248,19 @@ void test_serve_log_files() {
         check(read_file(files[1]).value_or("") == "second output\nmore\n", "later output joins the open file");
     }
     logs.end_instance();
+    // Another start of that model straight away (audit 2026-11-17 LN-15: a retry on another port, within the same
+    // second) writes a file of its own instead of truncating the log of the start it retries.
+    logs.begin_instance(3, "second");
+    logs.append_output(3, "retried\n");
+    logs.end_instance();
     logs.write_files();
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ignored)) {
+        (void)entry;
+        ++count;
+    }
+    check(count == 3 && files.size() == 2 && read_file(files[1]).value_or("") == "second output\nmore\n",
+          "a restart of the same model keeps the previous run's log");
     std::filesystem::remove_all(dir, ignored);
 }
 
@@ -384,6 +397,46 @@ void test_library() {
     check(!has_flag(dense_args, "--draft-model"), "bundled drafters take no --draft-model");
     // Every KV page stays on the GPU: the server sizes the context to what its KV cache holds.
     check(contains(dense_args, {"--max-context", "auto"}), "the 27B context is the server's to size");
+}
+
+// A part file an artifact header names outside the artifact's folder (audit 2026-11-17 LN-10: an absolute path or
+// "..") is reported missing and is not one of the model's files, which "Delete model files" deletes.
+void test_library_part_paths() {
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "infernix-launcher-test-parts";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    const std::filesystem::path models = root / "models";
+    std::filesystem::create_directories(models);
+    const std::filesystem::path outside = root / "outside.bin";
+    { std::ofstream(outside, std::ios::binary) << std::string(4096 + 100, 'x'); }
+    { std::ofstream(models / "Next-00002-of-00002.infernix", std::ios::binary) << std::string(4096 + 2000, 'x'); }
+    Json directory     = flash_next_directory();
+    directory["files"] = Json::array({{{"path", nullptr}, {"payload_bytes", 1000}},
+                                      {{"path", "Next-00002-of-00002.infernix"}, {"payload_bytes", 2000}},
+                                      {{"path", "../outside.bin"}, {"payload_bytes", 100}},
+                                      {{"path", path_utf8(outside)}, {"payload_bytes", 100}}});
+    const std::string text = directory.dump();
+    std::string entry(32, '\0');
+    std::memcpy(entry.data(), "NINFER\0\x03", 8);
+    for (int i = 0; i < 8; ++i) { entry[8 + i] = static_cast<char>((text.size() >> (8 * i)) & 0xFF); }
+    for (int i = 0; i < 16; ++i) { entry[16 + i] = static_cast<char>(i + 1); }
+    entry += text;
+    entry.resize((entry.size() + 4095) / 4096 * 4096 + 1000, '\0');
+    { std::ofstream(models / "Next-00001-of-00002.infernix", std::ios::binary) << entry; }
+
+    const LibraryScan scan = scan_library({models}, 2);
+    const auto model = std::find_if(scan.models.begin(), scan.models.end(),
+                                    [](const ScannedModel& m) { return m.key == "0102030405060708090a0b0c0d0e0f10"; });
+    check(model != scan.models.end(), "the test artifact is scanned");
+    if (model != scan.models.end()) {
+        const bool kept_outside = std::any_of(model->part_files.begin(), model->part_files.end(),
+                                              [&](const std::filesystem::path& p) { return p.filename() == "outside.bin"; });
+        const auto outside_noted = std::count_if(model->missing_files.begin(), model->missing_files.end(),
+                                                 [](const std::string& f) { return f.find("outside") != std::string::npos; });
+        check(model->part_files.size() == 1 && !kept_outside, "only the part inside the folder is a model file");
+        check(outside_noted == 2, "both parts outside the folder are reported missing");
+    }
+    std::filesystem::remove_all(root, ignored);
 }
 
 void test_router() {
@@ -599,18 +652,27 @@ void test_event_log() {
     check(page["lines"].size() == 2 && page["lines"][1]["fields"]["kind"] == "crash", "records keep their fields");
     check(log.page(1, 10)["lines"].size() == 1, "a page after a sequence number");
     check(heard == std::vector<std::string>{"first", "second line\nwith a break"}, "the listener hears every record");
+    // A record is kept and queued; the file is written by write_files, on the launcher's log thread (audit 2026-11-17
+    // P4D-02: a slow log folder held up every thread that logged, the request threads among them).
+    check(read_file(dir / EventLog::kEventsFile).value_or("x").empty(), "logging a record writes nothing");
+    log.write_files();
     const std::optional<std::string> text = read_file(dir / EventLog::kEventsFile);
     check(text && text->find("  INFO   launcher  first\n") != std::string::npos, "the file has one text line per record");
     check(text && text->find("ERROR  watchdog  second line with a break\n") != std::string::npos, "one record, one line");
     log.add_request_body({{"id", 1}});
+    log.write_files();
     check(read_file(dir / EventLog::kRequestsFile) == std::optional<std::string>("{\"id\":1}\n"), "request bodies, one JSON line each");
 
     const std::filesystem::path moved = dir / "moved";
     std::string error;
+    log.add("info", "settings", "queued before the move");
     check(log.set_dir(moved, error), "the log folder can change");
     log.add("info", "settings", "third");
+    log.write_files();
     check(read_file(moved / EventLog::kEventsFile).value_or("").find("third") != std::string::npos, "later records go there");
-    check(log.page(0, 10)["lines"].size() == 3, "the memory keeps the earlier records");
+    check(read_file(dir / EventLog::kEventsFile).value_or("").find("queued before the move") != std::string::npos,
+          "a record queued before the move is written where it was logged");
+    check(log.page(0, 10)["lines"].size() == 4, "the memory keeps the earlier records");
 #ifdef _WIN32
     {
         // A full file another program holds open without sharing delete (a tail tool) cannot be
@@ -627,6 +689,7 @@ void test_event_log() {
         check(tail != INVALID_HANDLE_VALUE, "a tail tool holds the file");
         check(log.set_dir(held_dir, error), "the log folder can change to the held file's");
         log.add("info", "launcher", "past the limit");
+        log.write_files();
         const std::string head = read_file(held).value_or("").substr(0, 14);
         check(head == "oldest record\n" && std::filesystem::file_size(held, ignored) > EventLog::kEventsLimit &&
                   !std::filesystem::exists(held_dir / (std::string(EventLog::kEventsFile) + ".1")),
@@ -634,6 +697,7 @@ void test_event_log() {
         if (tail != INVALID_HANDLE_VALUE) { CloseHandle(tail); }
         const std::string block(64 << 10, 'y');
         for (int i = 0; i < 20; ++i) { log.add("info", "launcher", block); }
+        log.write_files();
         check(read_file(held_dir / (std::string(EventLog::kEventsFile) + ".1")).value_or("").starts_with("oldest record\n") &&
                   std::filesystem::file_size(held, ignored) < EventLog::kEventsLimit,
               "a later try rotates it once it is free");
@@ -881,6 +945,131 @@ void test_chats() {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// An unload, or a forced load of another model, while a model loads ends that load at once instead of once it is
+// ready (up to the load timeout; audit 2026-11-17 LN-03): the router calls cancel_load and load_cancelled turns
+// true for the load in progress. A cancelled load holds nothing: its model loads at its next request.
+void test_router_cancel() {
+    std::atomic<bool> cancelled{false};
+    std::atomic<int> loads{0};
+    Router* routed = nullptr;
+    Router router(Router::Hooks{
+        .load =
+            [&](const std::string& key) {
+                ++loads;
+                Router::Loaded loaded;
+                if (key == "slow") { // a long load, until the router cancels it (10 s at most)
+                    const auto until = std::chrono::steady_clock::now() + 10s;
+                    while (!routed->load_cancelled() && std::chrono::steady_clock::now() < until) {
+                        std::this_thread::sleep_for(5ms);
+                    }
+                    if (routed->load_cancelled()) {
+                        loaded.error     = "cancelled";
+                        loaded.cancelled = true;
+                        return loaded;
+                    }
+                }
+                loaded.instance = static_cast<std::uint32_t>(loads.load());
+                loaded.port     = 2000 + loads.load();
+                return loaded;
+            },
+        .cancel_load     = [&] { cancelled = true; },
+        .stop            = [] {},
+        .changed         = [] {},
+        .drain_timeout_s = [] { return 60; },
+        .load_timeout_s  = [] { return 30; },
+        .idle_unload_min = [](const std::string&) { return 0; },
+    });
+    routed = &router;
+    const auto wait_for = [](const auto& done) {
+        const auto until = std::chrono::steady_clock::now() + 5s;
+        while (!done() && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(5ms); }
+        return done();
+    };
+    router.request_load("slow", false);
+    check(wait_for([&] { return router.loading_model() == std::optional<std::string>("slow"); }), "the slow load starts");
+    const auto unload_at = std::chrono::steady_clock::now();
+    router.request_unload();
+    check(wait_for([&] { return !router.loading_model().has_value(); }) && cancelled &&
+              std::chrono::steady_clock::now() - unload_at < 2s,
+          "an unload ends the load in progress at once");
+    Router::Refusal peek;
+    check(!router.held("slow", peek), "a cancelled load holds nothing");
+
+    cancelled = false;
+    router.request_load("slow", false);
+    check(wait_for([&] { return router.loading_model() == std::optional<std::string>("slow"); }),
+          "the slow load starts again (no hold)");
+    router.request_load("fast", true);
+    Router::Refusal refusal;
+    auto lease = router.acquire("fast", nullptr, refusal);
+    check(cancelled && lease && lease->port() > 2000, "a forced load of another model ends the load in progress");
+    lease.reset();
+    router.request_load("fast", true); // the model loaded: nothing to cancel
+    check(!router.load_cancelled(), "a forced load of the loaded model cancels nothing");
+}
+
+// The memory file survives a torn write (audit 2026-11-17 LN-01): each save keeps the previous file as its backup,
+// and a memory file that is not valid JSON (a power loss after the rename, before the data reached the disk) or is
+// missing (a crash between the backup's rename and the new file's) loads the backup instead of defaults. The
+// temporary files of the atomic write leave nothing behind.
+void test_store_durability() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-store";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    const std::filesystem::path memory = dir / Store::kMemoryFile;
+    {
+        Store store(dir);
+        store.set_last_model(std::string("first"));
+        store.set_last_model(std::string("second"));
+    }
+    check(std::filesystem::exists(backup_path(memory)), "a save keeps the previous memory file as its backup");
+    bool temporary_left = false;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        temporary_left = temporary_left || entry.path().filename().string().find(".tmp") != std::string::npos;
+    }
+    check(!temporary_left, "the atomic write leaves no temporary file");
+    {
+        std::ofstream torn(memory, std::ios::binary | std::ios::trunc);
+        torn << "{\"schema\": 1, \"last_mo";
+    }
+    {
+        Store store(dir);
+        check(store.last_model() == std::optional<std::string>("first"),
+              "a torn memory file loads the backup (the save before the last)");
+    }
+    std::filesystem::remove(memory, ignored);
+    {
+        Store store(dir);
+        check(store.last_model().has_value(), "a missing memory file loads the backup");
+    }
+    // A file read while it is replaced (audit 2026-11-17 LN-09: a chat the UI reads while the next message's save
+    // renames over it): the read shares delete, so the replace is never refused, and the read gets one whole version.
+    const std::filesystem::path chat = dir / "chat.json";
+    write_file_atomic(chat, std::string(1 << 18, 'a'));
+    std::atomic<bool> writing{true};
+    std::atomic<int> torn_reads{0};
+    std::thread reader([&] {
+        while (writing) {
+            if (const std::optional<std::string> text = read_file(chat);
+                text && (text->size() != (1U << 18) || text->find_first_not_of(text->front()) != std::string::npos)) {
+                ++torn_reads;
+            }
+        }
+    });
+    int refused = 0;
+    for (int i = 0; i < 100; ++i) {
+        try {
+            write_file_atomic(chat, std::string(1 << 18, static_cast<char>('a' + i % 26)));
+        } catch (const std::exception&) { ++refused; }
+    }
+    writing = false;
+    reader.join();
+    if (refused != 0) { std::cerr << refused << " of 100 replaces refused\n"; }
+    check(refused == 0, "an atomic replace is not refused while the file is read");
+    check(torn_reads == 0, "a read during replaces gets one whole version");
+    std::filesystem::remove_all(dir, ignored);
+}
+
 // With a second NVIDIA card the inference GPU is the one with the most VRAM, listed first (the
 // dashboard shows the first, default launch parameters and load advice size from it); the others
 // keep NVML's order, and equals keep it too.
@@ -1019,13 +1208,16 @@ int main(int argc, char** argv) {
     test_args();
     test_blob_ids();
     test_chats();
+    test_store_durability();
     test_records();
     test_help();
     test_help_cache();
     test_serve_log_files();
     test_library();
+    test_library_part_paths();
     test_scan_folder();
     test_router();
+    test_router_cancel();
     test_load_advice();
     test_event_log();
     test_routing();

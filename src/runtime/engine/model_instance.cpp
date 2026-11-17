@@ -103,7 +103,10 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
     if (const auto interval = options.context_cache.hybrid.persistent_save_interval; interval.count() != 0) {
-        if (interval.count() < 0) { throw std::invalid_argument("prefix cache save interval must not be negative"); }
+        // Added to a steady_clock time at every save (int64 nanoseconds): past a year it would overflow there.
+        if (interval.count() < 0 || interval > std::chrono::hours(24 * 366)) {
+            throw std::invalid_argument("prefix cache save interval must be in [0, one year]");
+        }
         if (options.context_cache.hybrid.persistent_file.empty()) {
             throw std::invalid_argument("a periodic prefix cache save needs a prefix cache file");
         }

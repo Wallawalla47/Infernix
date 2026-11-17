@@ -4,6 +4,7 @@
 #include "core/paged_kv_cache.h"
 #include "models/qwen3_5/program/prefix/test_seams.h"
 #include "runtime/engine/context_cache/online_cost.h"
+#include "runtime/prefix_cache/prefix_holds.h"
 
 #include <algorithm>
 #include <atomic>
@@ -71,9 +72,11 @@ using runtime::prefix_cache::CacheCostModel;
 using runtime::prefix_cache::CopyState;
 using runtime::prefix_cache::InsertResult;
 using runtime::prefix_cache::kNoId;
+using runtime::prefix_cache::NodePin;
 using runtime::prefix_cache::NodeRef;
 using runtime::prefix_cache::NodeView;
 using runtime::prefix_cache::PrefixIndexConfig;
+using runtime::prefix_cache::SnapshotPin;
 using runtime::prefix_cache::SnapshotRef;
 using runtime::prefix_cache::SnapshotView;
 using runtime::prefix_cache::TapPlannerConfig;
@@ -439,10 +442,10 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
             return false;
         }
     }
-    index_->pin_snapshot(snapshot);
+    // Declared before the try: on a failure the catch below settles the copies and aborts the fill first.
+    SnapshotPin pin(*index_, snapshot);
     if (!index_->begin_snapshot_host_fill(snapshot, claim)) {
         // It stays Device-only: its slot is then its last copy (spec §9.2).
-        index_->unpin_snapshot(snapshot);
         ++counters_.host_image_write_refusals;
         return false;
     }
@@ -480,9 +483,9 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
             pending_.pop_back();
         }
         index_->abort_snapshot_host_fill(snapshot);
-        index_->unpin_snapshot(snapshot);
         throw;
     }
+    (void)pin.release(); // the pending write's: publish_write unpins it
     return true;
 }
 
@@ -499,6 +502,9 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
         write.nodes.clear();
     };
     try {
+        // A node pinned and filling is in write.nodes before anything else can throw (abort_batch undoes those):
+        // the push cannot allocate, and the pin's hold gives it back when begin_host_fill fails or refuses.
+        write.nodes.reserve(nodes.size());
         for (const NodeRef node : nodes) {
             const NodeView view = index_->node(node);
             if (view.device != CopyState::Resident || view.host != CopyState::Absent) { continue; }
@@ -506,15 +512,14 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
             // again recomputes it from a snapshot above), so a Host copy would only take a slab and link time
             // until the dead-KV sweep (a prefill cancelled past its last tap, a generation that left no endpoint).
             if (view.live_snapshots_below == 0) { continue; }
-            index_->pin_node(node);
-            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node);
+            NodePin pin(*index_, node);
+            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node); // may evict, and allocate
             if (!slab_id) {
                 // Everything left on the Host tier is pinned or filling; retry at a later release.
-                index_->unpin_node(node);
                 ++counters_.host_block_write_refusals;
                 break;
             }
-            write.nodes.push_back(node);
+            write.nodes.push_back(pin.release());
             add_copies(write_scratch_, block(view.device_id), *slab_id);
         }
     } catch (...) {
@@ -638,15 +643,24 @@ void HybridPrefixCache::restore_block(NodeRef node, HybridBlockPages destination
         throw std::logic_error("hybrid restore source block is not host-only");
     }
     adopt_destination(destination, kFullPage);
-    const std::uint32_t id = allocate_block_id(destination);
+    // From the adoption the destination is the cache's: every failure below returns it, and a Filling node is in
+    // restore_.nodes (abort_restore aborts those) before anything else can throw.
+    std::uint32_t id = 0;
     try {
+        id = allocate_block_id(destination);
+    } catch (...) {
+        release(destination);
+        throw;
+    }
+    try {
+        runtime::prefix_cache::reserve_for_push(restore_.nodes);
         index_->begin_device_fill(node, id);
     } catch (...) {
         release(destination);
         free_block_id(id);
         throw;
     }
-    restore_.nodes.push_back(node);
+    restore_.nodes.push_back(node); // reserved
     add_copies(restore_.copies, destination, view.host_slab);
 }
 
@@ -660,7 +674,13 @@ void HybridPrefixCache::restore_tail(SnapshotRef snapshot, HybridBlockPages dest
         throw std::logic_error("hybrid restore source tail is not host-only");
     }
     adopt_destination(destination, view.tail_len);
-    const std::uint32_t id = allocate_block_id(destination);
+    std::uint32_t id = 0;
+    try {
+        id = allocate_block_id(destination);
+    } catch (...) {
+        release(destination);
+        throw;
+    }
     try {
         index_->begin_tail_device_fill(snapshot, id);
     } catch (...) {
@@ -776,15 +796,19 @@ std::uint64_t HybridPrefixCache::land_restore(cudaStream_t consumer) {
     if (!restore_.submitted) { throw std::logic_error("hybrid restore was not submitted"); }
     CUDA_CHECK(cudaStreamWaitEvent(consumer, restore_.prelude, 0));
     // The admission's own pins end at activation; the copies' sources and destinations stay
-    // pinned by the batch until it lands.
-    for (const NodeRef node : restore_.nodes) { index_->pin_node(node); }
+    // pinned by the batch until it lands. Held until the batch is listed: a batch that cannot be (its
+    // deque block) stays the open restore, which abort_restore returns, and that knows no pins.
+    std::vector<NodePin> pins;
+    pins.reserve(restore_.nodes.size());
+    for (const NodeRef node : restore_.nodes) { pins.emplace_back(*index_, node); }
     const std::optional<SnapshotRef> source = restore_.tail ? restore_.tail : restore_.image;
-    if (source) {
-        index_->pin_snapshot(*source);
-        restore_.pinned_snapshot = source;
-    }
+    SnapshotPin snapshot_pin;
+    if (source) { snapshot_pin = SnapshotPin(*index_, *source); }
     const std::uint64_t ticket = restore_.ticket;
-    landing_.push_back(std::move(restore_));
+    landing_.push_back(std::move(restore_)); // a deque: unchanged when its new block cannot be allocated
+    landing_.back().pinned_snapshot = source;
+    for (NodePin& pin : pins) { (void)pin.release(); }
+    (void)snapshot_pin.release();
     restore_ = RestoreBatch{};
     return ticket;
 }
@@ -793,10 +817,13 @@ void HybridPrefixCache::detach_prefetch() {
     if (!restore_.submitted || restore_.image || restore_.tail) {
         throw std::logic_error("hybrid prefetch is not a submitted batch of blocks");
     }
-    for (const NodeRef node : restore_.nodes) { index_->pin_node(node); }
-    restore_.prefetch = true;
-    counters_.prefetched_blocks += restore_.nodes.size();
+    std::vector<NodePin> pins; // as land_restore's
+    pins.reserve(restore_.nodes.size());
+    for (const NodeRef node : restore_.nodes) { pins.emplace_back(*index_, node); }
     landing_.push_back(std::move(restore_));
+    landing_.back().prefetch = true;
+    for (NodePin& pin : pins) { (void)pin.release(); }
+    counters_.prefetched_blocks += landing_.back().nodes.size();
     restore_ = RestoreBatch{};
 }
 

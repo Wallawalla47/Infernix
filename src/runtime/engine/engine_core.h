@@ -148,34 +148,46 @@ public:
             if (worker_.joinable()) { worker_.join(); }
             throw;
         }
-        instance_.program->set_maintenance_waker([this] { request_maintenance(); });
-        // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
-        // Without the thread the Engine simply never prefills them.
-        if (next_turn_quiet_.count() > 0) {
-            try {
-                next_turn_thread_ = std::thread([this] { next_turn_prepare_loop(); });
-            } catch (...) {
-                next_turn_disabled_.store(true, std::memory_order_release);
+        // With the worker running, a step below that throws (a thread that cannot start, an allocation) stops and
+        // joins what started, as the destructor does: no destructor runs for a constructor that throws, and a
+        // joinable std::thread member would end the process.
+        try {
+            instance_.program->set_maintenance_waker([this] { request_maintenance(); });
+            // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
+            // Without the thread the Engine simply never prefills them.
+            if (next_turn_quiet_.count() > 0) {
+                try {
+                    next_turn_thread_ = std::thread([this] { next_turn_prepare_loop(); });
+                } catch (...) {
+                    next_turn_disabled_.store(true, std::memory_order_release);
+                }
             }
+            // The first constrained request would build the constraint compiler's vocabulary index
+            // before its prefill starts (measured 0.85 s of `prepare` with a 337-token prefill), so
+            // it is built beside startup instead.
+            constraint_warm_ = std::thread([this, frontend = instance_.frontend] {
+                const auto started = Clock::now();
+                try {
+                    frontend.warm_constraints();
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Debug,
+                                       "constraint vocabulary index built in %.3f s",
+                                       std::chrono::duration<double>(Clock::now() - started).count());
+                } catch (const std::exception& error) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                       "constraint vocabulary index not built ahead: %s", error.what());
+                } catch (...) {}
+            });
+        } catch (...) {
+            shut_down();
+            throw;
         }
-        // The first constrained request would build the constraint compiler's vocabulary index
-        // before its prefill starts (measured 0.85 s of `prepare` with a 337-token prefill), so
-        // it is built beside startup instead. Last, so nothing after it can throw past the thread.
-        constraint_warm_ = std::thread([this, frontend = instance_.frontend] {
-            const auto started = Clock::now();
-            try {
-                frontend.warm_constraints();
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Debug,
-                                   "constraint vocabulary index built in %.3f s",
-                                   std::chrono::duration<double>(Clock::now() - started).count());
-            } catch (const std::exception& error) {
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
-                                   "constraint vocabulary index not built ahead: %s", error.what());
-            } catch (...) {}
-        });
     }
 
-    ~EngineCore() noexcept {
+    ~EngineCore() noexcept { shut_down(); }
+
+    // Stops the worker and joins every thread this Engine started (the destructor's, and a constructor's that
+    // throws after the worker started).
+    void shut_down() noexcept {
         // The Program's monitor thread must not wake an engine that is going away.
         try { instance_.program->set_maintenance_waker({}); } catch (...) {}
         stop();
@@ -321,8 +333,6 @@ public:
                                "inference request expired before submission");
         }
 
-        std::uint64_t request_id        = 0;
-        std::uint64_t publication_order = 0;
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
@@ -332,12 +342,7 @@ public:
             if (outstanding_ >= max_outstanding_) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
-            if (next_request_id_ == 0 || next_publication_order_ == 0) {
-                throw std::overflow_error("request identity space exhausted");
-            }
             ++outstanding_;
-            request_id        = next_request_id_++;
-            publication_order = next_publication_order_++;
             // A request came first: a finished turn not yet being prefilled is dropped (the request
             // is often that conversation's next turn), and a running pass yields to it.
             ++submission_epoch_;
@@ -376,23 +381,28 @@ public:
                 observation.phase_timings,
                 std::chrono::duration<double>(ready - constraint_started).count());
             prepare_seconds += std::chrono::duration<double>(ready - submitted).count();
-            request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
-                                                std::move(output), prompt_summary, prepare_seconds,
-                                                std::move(options), consumer_mode,
-                                                std::move(observation), pending_deadline, ready);
-        } catch (...) {
-            release_reserved_capacity();
-            throw;
-        }
-
-        {
+            // The identity and the publication order are taken with the queue position, in one hold of the queue
+            // lock: ids then follow the queue's order (which the preemption victim choice, the candidate order and
+            // the paused order assume) whatever the grammar compile above took. A throw releases the lock, then the
+            // reserved capacity below.
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
-                --outstanding_;
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
+            if (next_request_id_ == 0 || next_publication_order_ == 0) {
+                throw std::overflow_error("request identity space exhausted");
+            }
+            request = std::make_shared<Request>(next_request_id_, next_publication_order_, std::move(prompt),
+                                                std::move(output), prompt_summary, prepare_seconds,
+                                                std::move(options), consumer_mode,
+                                                std::move(observation), pending_deadline, ready);
+            ++next_request_id_;
+            ++next_publication_order_;
             pending_.push_back(request);
+        } catch (...) {
+            release_reserved_capacity();
+            throw;
         }
         request_admission_check();
         queue_cv_.notify_one();
@@ -3076,8 +3086,13 @@ private:
                 no_progress_reported_  = false;
                 no_progress_recovered_ = false;
             } else {
+                // Not recovered now (a bind or restore holds the Program, or the Program refused): another interval
+                // tries again rather than none, while the requests are still held.
                 publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
-                                   "%s, and its state cannot be recovered (%s): it stays as it is", what, state.c_str());
+                                   "%s, and its state cannot be recovered now (%s): tried again in %.0f s", what,
+                                   state.c_str(), std::chrono::duration<double>(recovery_bound).count());
+                no_progress_since_     = now;
+                no_progress_recovered_ = false;
             }
         } catch (...) {} // the watch never fails the Engine
     }

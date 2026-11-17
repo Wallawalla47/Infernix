@@ -523,7 +523,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             rewrites the whole file (up to --host-context-mib,\n"
            "                             several GB), so a short interval writes a lot to\n"
            "                             the drive and wears an SSD faster; prefer 15-60\n"
-           "                             minutes\n"
+           "                             minutes (N: 1-525600, a year)\n"
            "  --ssd-context-gib N        an SSD tier of N GiB below the Host pool (default\n"
            "                             0: off). What the Host pool would otherwise lose\n"
            "                             (snapshots and their blocks) is kept in a scratch\n"
@@ -751,7 +751,23 @@ const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {
 
 bool is_loopback_host(std::string_view host) noexcept {
     if (host.size() >= 2 && host.front() == '[' && host.back() == ']') { host = host.substr(1, host.size() - 2); }
-    return host == "localhost" || host == "::1" || host.starts_with("127.");
+    if (host == "localhost" || host == "::1") { return true; }
+    // A dotted quad in 127.0.0.0/8 only: "127.example.com" is a name that may resolve anywhere.
+    if (!host.starts_with("127.")) { return false; }
+    int parts = 0;
+    for (std::size_t at = 0; at <= host.size();) {
+        const std::size_t end = std::min(host.find('.', at), host.size());
+        const std::string_view part = host.substr(at, end - at);
+        if (part.empty() || part.size() > 3 || !std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+            return false;
+        }
+        int value = 0;
+        for (const char c : part) { value = value * 10 + (c - '0'); }
+        if (value > 255) { return false; }
+        ++parts;
+        at = end + 1;
+    }
+    return parts == 4;
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -982,7 +998,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             cache_option_flag = "--prefix-cache-file";
         } else if (arg == "--prefix-cache-save-mins") {
             const int minutes = parse_nonnegative_int(require_value("--prefix-cache-save-mins"), "prefix-cache-save-mins");
-            if (minutes == 0) { throw std::invalid_argument("--prefix-cache-save-mins must be positive"); }
+            // At most a year: the Engine adds the interval to a steady_clock time (int64 nanoseconds, ~292 years).
+            if (minutes == 0 || minutes > 525600) {
+                throw std::invalid_argument("--prefix-cache-save-mins must be in [1,525600] (one year)");
+            }
             options.context_cache.hybrid.persistent_save_interval = std::chrono::minutes(minutes);
             cache_option_flag = "--prefix-cache-save-mins";
         } else if (arg == "--no-queue-holds") {
@@ -1408,6 +1427,37 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
+        }
+    }
+    // Files the server writes are neither the model artifact (a prefix cache save renames its file over its
+    // path; a route trace truncates it) nor one another's (two writers would interleave), as the request log
+    // already checks for itself.
+    {
+        const auto normalized = [](const std::filesystem::path& value) {
+            std::error_code error;
+            std::filesystem::path path = std::filesystem::absolute(value, error);
+            if (error) { path = value; }
+            return path.lexically_normal();
+        };
+        const std::pair<const char*, std::filesystem::path> outputs[] = {
+            {"--prefix-cache-file", options.context_cache.hybrid.persistent_file},
+            {"--route-trace", options.route_trace},
+            {"--log-file", std::filesystem::path(options.log_file)},
+            {"--request-log-jsonl", std::filesystem::path(options.request_log_jsonl)},
+        };
+        const std::filesystem::path artifact = normalized(std::filesystem::path(options.artifact_path));
+        for (std::size_t i = 0; i < std::size(outputs); ++i) {
+            const auto& [flag, value] = outputs[i];
+            if (value.empty()) { continue; }
+            const std::filesystem::path path = normalized(value);
+            if (!options.artifact_path.empty() && path == artifact) {
+                throw std::invalid_argument(std::string(flag) + " names the model artifact");
+            }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (!outputs[j].second.empty() && normalized(outputs[j].second) == path) {
+                    throw std::invalid_argument(std::string(flag) + " names the same file as " + outputs[j].first);
+                }
+            }
         }
     }
     return options;

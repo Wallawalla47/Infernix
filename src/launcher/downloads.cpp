@@ -33,21 +33,6 @@ std::string new_id() {
     return hex_string(reinterpret_cast<const std::uint8_t*>(&value), sizeof(value));
 }
 
-bool safe_relative(const std::string& path) {
-    if (path.empty() || path.front() == '/' || path.front() == '\\' || path.find(':') != std::string::npos) {
-        return false;
-    }
-    std::size_t start = 0;
-    while (start <= path.size()) {
-        const std::size_t end = path.find_first_of("/\\", start);
-        const std::string part = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
-        if (part == "..") { return false; }
-        if (end == std::string::npos) { break; }
-        start = end + 1;
-    }
-    return true;
-}
-
 // A file written at positions by several connections at once.
 class PartFile {
 public:
@@ -516,7 +501,10 @@ void Downloads::run_job(DownloadJob& job) {
     }
     for (const auto& file_ptr : job.files) {
         DownloadFile& file = *file_ptr;
-        if (file.state == "done" || file.state == "skipped") { continue; }
+        {
+            std::lock_guard lock(mutex_); // resume() rewrites a paused or failed file's state
+            if (file.state == "done" || file.state == "skipped") { continue; }
+        }
         if (interrupt_) { break; }
         const std::filesystem::path final_path = job.target_dir / utf8_path(file.path);
         std::filesystem::create_directories(final_path.parent_path(), error);
@@ -550,7 +538,8 @@ void Downloads::run_job(DownloadJob& job) {
             {
                 std::lock_guard lock(mutex_);
                 file.state = "verifying";
-                job.state  = "verifying";
+                // Only from running: a pause or cancel set since the last interrupt check stays (it stops this job).
+                if (job.state == "running") { job.state = "verifying"; }
             }
             notify();
             const std::optional<std::string> digest =
@@ -563,7 +552,7 @@ void Downloads::run_job(DownloadJob& job) {
             }
             {
                 std::lock_guard lock(mutex_);
-                job.state = "running";
+                if (job.state == "verifying") { job.state = "running"; }
             }
             if (!digest || *digest != expected) {
                 std::filesystem::remove(part, error);
@@ -629,6 +618,7 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
     }
     PartFile out(part);
     if (!out.ok() || (!resumable && !out.resize(size))) {
+        std::lock_guard lock(mutex_); // list() reads it under the lock
         file.error = "cannot write " + path_utf8(part);
         return false;
     }
@@ -669,11 +659,19 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
     std::atomic<bool> abort{false};
     std::mutex error_mutex;
     std::string failure;
+    // The first failure ends the file: its message is recorded before `abort` is set, so the other
+    // workers' transfers, cut short by it, cannot report their own "aborted" error instead.
+    const auto fail = [&](const std::string& message) {
+        std::lock_guard lock(error_mutex);
+        if (abort) { return; }
+        failure = message;
+        abort   = true;
+    };
 
     const auto worker = [&] {
         std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), &curl_easy_cleanup);
         if (!curl) {
-            abort = true;
+            fail("cannot start a transfer (curl_easy_init failed)");
             return;
         }
         curl_slist* headers = nullptr;
@@ -736,8 +734,7 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
                 // Discard the partial chunk; it is fetched again whole.
                 file.done -= transfer.written;
                 if (status == 401 || status == 403 || status == 404) {
-                    last_error = "huggingface.co answered HTTP " + std::to_string(status) + " for " + file.path;
-                    abort      = true;
+                    fail("huggingface.co answered HTTP " + std::to_string(status) + " for " + file.path);
                     break;
                 }
                 last_error = transfer.bad_status ? "unexpected HTTP " + std::to_string(status) + " for a range request"
@@ -750,9 +747,7 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
                 }
                 save_meta(false);
             } else if (!interrupt_) {
-                std::lock_guard lock(error_mutex);
-                if (failure.empty()) { failure = last_error.empty() ? "download failed" : last_error; }
-                abort = true;
+                fail(last_error.empty() ? "download failed" : last_error); // no-op once another failure ended it
             }
         }
         curl_slist_free_all(headers);
@@ -768,7 +763,10 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
     save_meta(true);
     const bool complete = std::all_of(done.begin(), done.end(), [](char flag) { return flag != 0; });
     if (complete) { out.finish(); }
-    if (!complete && !interrupt_) { file.error = failure.empty() ? "download failed" : failure; }
+    if (!complete && !interrupt_) {
+        std::lock_guard lock(mutex_); // list() reads it under the lock
+        file.error = failure.empty() ? "download failed" : failure;
+    }
     return complete && !interrupt_;
 }
 

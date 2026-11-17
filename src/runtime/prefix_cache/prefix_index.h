@@ -495,7 +495,9 @@ public:
     // device_adopted: the caller then attaches its image); what it does not take is freed or released.
     // A full snapshot table evicts a superseded snapshot, or the least valuable retained one when the new
     // snapshot is worth at least as much (`claim`; its own estimated priority when absent), and otherwise
-    // publishes nothing (an invalid reference; the slot is freed and the tail device id released).
+    // publishes nothing (an invalid reference; the slot is freed and the tail device id released). The slot
+    // and the tail device id are consumed on every outcome, a throw included: a refused call frees and
+    // releases them, and past its checks they are the snapshot's.
     [[nodiscard]] PublishResult publish_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
@@ -513,7 +515,8 @@ public:
     // (`tail_device_id`) is optional. Frontier rules as publish_snapshot. A duplicate (same anchor
     // and tail), or no snapshot entry to be had (publish_snapshot's rule and `claim`), releases the slabs
     // and the tail device id; a duplicate returns the existing snapshot with created=false, refreshed,
-    // retained and given the tail device id as publish_snapshot does. `image` is consumed either way.
+    // retained and given the tail device id as publish_snapshot does. `image` and the tail device id are
+    // consumed on every outcome, a throw included, as publish_snapshot's are.
     [[nodiscard]] PublishResult publish_host_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                       std::span<const TokenId> tail,
                                                       std::optional<std::uint32_t> tail_device_id,
@@ -640,6 +643,9 @@ public:
     // The reads failed: the Host slabs are freed, the snapshot unpinned, and the SSD copies read
     // are dropped (an entry left with no copy goes with its subtree, §9.4).
     void abort_ssd_promotion(SsdJob& job);
+    // The reads were never submitted (a refused submit read nothing, so nothing is damaged): the Host slabs are
+    // freed and the snapshot unpinned; the SSD copies stay.
+    void cancel_ssd_promotion(SsdJob& job);
     // The read rate the cost model uses for SSD candidates (§6.2).
     void set_ssd_rate(double bytes_per_second) noexcept;
 
@@ -842,6 +848,8 @@ private:
     void demote_snapshot(std::uint32_t snapshot);
     void drop_node_ssd_copy(std::uint32_t node);
     void drop_snapshot_ssd_copy(std::uint32_t snapshot);
+    // An open SSD promotion's Host slabs freed and its snapshot unpinned (cancel and abort both).
+    void release_ssd_promotion(SsdJob& job);
     void free_ssd_slab(std::uint32_t slab);
     // One eviction freeing SSD slabs for a write-back worth `claim` (its snapshot's priority), never
     // touching `protect`: dead blocks' copies, superseded SSD-only snapshots, backups of images

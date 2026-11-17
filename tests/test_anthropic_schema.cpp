@@ -1531,7 +1531,9 @@ int test_hidden_reasoning_signature() {
               "a foreign signature was interpreted as hidden reasoning");
     for (const char* malformed :
          {"ninfer-reasoning.v1:Zm9", "ninfer-reasoning.v1:Zm9v!mFy", "ninfer-reasoning.v1:Zg=A",
-          "ninfer-reasoning.v1:=m9v", "ninfer-reasoning.v1:Zm9vYg==Zm9v"}) {
+          "ninfer-reasoning.v1:=m9v", "ninfer-reasoning.v1:Zm9vYg==Zm9v",
+          // Bytes FF FE FD: Base64 that is well formed, carrying reasoning that is not UTF-8 (audit 2026-11-17 SV-10).
+          "ninfer-reasoning.v1://79"}) {
         bool threw = false;
         try {
             (void)decode_thinking_signature(malformed);

@@ -4,8 +4,9 @@
 
 namespace infernix::ops {
 
-// The encoder and the decoders stage this table into shared memory.
-__device__ std::int8_t g_kv_cache_vq2_codebook[kKVCacheVq2Patterns * 8] = {
+// The encoder and the decoders stage this table into shared memory, 16 bytes a load (cp.async, int4): aligned to 16
+// here rather than wherever the linker places a byte array.
+__device__ __align__(16) std::int8_t g_kv_cache_vq2_codebook[kKVCacheVq2Patterns * 8] = {
 #include "ops/kv_cache/vq2_codebook.inc"
 };
 

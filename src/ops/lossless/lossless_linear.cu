@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -204,9 +205,12 @@ void lossless_linear_grouped(const Tensor& x, const Weight& weight, const Tensor
             "the rows must lie within the weight");
     check_out(out, columns, 0, rows);
     require(out.ne[0] == rows, "the grouped form's out is [rows, columns]");
-    run(Call{&x, view_of(weight, route), row_offset, static_cast<const std::int32_t*>(tile_experts.data),
-             expert_stride, rows, &out, 0, columns, weight.qtype},
-        route, workspace, stream);
+    Call call{&x, view_of(weight, route), row_offset, static_cast<const std::int32_t*>(tile_experts.data),
+              expert_stride, rows, &out, 0, columns, weight.qtype};
+    // The ids are device data: a tile naming an expert whose rows would pass the weight's end is left unwritten (as
+    // an unused tile) rather than read out of bounds.
+    call.max_expert = expert_stride > 0 ? (weight.n - row_offset - rows) / expert_stride : std::numeric_limits<int>::max();
+    run(call, route, workspace, stream);
 }
 
 namespace {

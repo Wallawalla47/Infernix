@@ -65,6 +65,7 @@ private:
     bool check_requested_ = false;
     bool checking_        = false;
     bool stopping_        = false;
+    std::atomic<bool> cancel_{false}; // set by shutdown: a check in progress ends at once
     std::optional<std::int64_t> checked_at_;
     std::optional<std::string> error_;
     Json updates_ = Json::array();
@@ -96,7 +97,7 @@ private:
     void run();
     void check_now();
     void download_now();
-    [[nodiscard]] Json state_locked() const;
+    [[nodiscard]] Json state_locked(bool install_dir_writable) const;
     void publish();
 
     Options options_;

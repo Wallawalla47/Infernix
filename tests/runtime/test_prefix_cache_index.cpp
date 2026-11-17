@@ -1,4 +1,5 @@
 #include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/prefix_holds.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
@@ -1558,22 +1559,23 @@ void test_host_born_snapshots() {
     require(index.stats().host_free_slabs == 60, "a duplicate frees its reserved slabs");
     index.check_invariants();
 
-    // A reservation that does not match the publication stays reserved and can be released.
+    // A reservation that does not match the publication is consumed by the refusal, as by every other outcome
+    // (the caller cannot tell a refusal from a later throw, so it never gives the slabs back itself).
     const auto tail_tokens = make_tokens(10, 51);
     auto plain             = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
-    require(plain.has_value(), "plain reservation");
+    require(plain.has_value() && index.stats().host_free_slabs == 56, "plain reservation");
+    const std::uint32_t refused_tail = backend.allocate();
     require_throws(
         [&] {
-            (void)index.publish_host_snapshot(path[1], 138, tail_tokens, std::nullopt, std::move(*plain),
+            (void)index.publish_host_snapshot(path[1], 138, tail_tokens, refused_tail, std::move(*plain),
                                               SnapshotKind::Endpoint);
         },
         "a tail needs a reservation with a tail slab");
-    require(plain->slabs.size() == 4 && index.stats().host_free_slabs == 56,
-            "a refused publication leaves the reservation intact");
+    require(plain->slabs.empty() && index.stats().host_free_slabs == 60 && !backend.live.contains(refused_tail),
+            "a refused publication frees the reservation's slabs and releases the tail id");
     index.check_invariants();
-    index.release_host_image(std::move(*plain));
-    require(plain->slabs.empty() && index.stats().host_free_slabs == 60, "release frees the slabs");
-    index.release_host_image(std::move(*plain)); // already released: nothing to free
+    index.release_host_image(std::move(*plain)); // already consumed: nothing to free
+    require(index.stats().host_free_slabs == 60, "a consumed reservation frees nothing again");
     index.check_invariants();
 
     // An endpoint with a tail and a Device tail copy: the tail slab is part of the reservation.
@@ -3112,6 +3114,121 @@ void test_rotation_keeps_gdsf_time() {
     index.check_invariants();
 }
 
+// The holds of prefix_holds.h: one that dies holding gives its pin, retention, slot, reservation or block back,
+// also when its scope ends by an exception; one released hands it over untouched; a moved-from one gives nothing.
+void test_holds() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens = make_tokens(64 * 3, 870);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const SnapshotRef tap = publish_at(index, backend, path, tokens, 64 * 3, SnapshotKind::Tap);
+    index.release_path(path);
+    index.check_invariants();
+    const std::uint32_t evictable = index.device_evictable_blocks();
+    require(evictable == 3, "an unpinned path is evictable");
+
+    {
+        const PathPin pinned(index, path);
+        require(index.device_evictable_blocks() == 0, "a path hold pins the path");
+    }
+    require(index.device_evictable_blocks() == evictable, "a dying path hold releases the path");
+    require_throws(
+        [&] {
+            const PathPin pinned(index, path);
+            const NodePin pin(index, path[2]);
+            throw std::runtime_error("a step after the acquisitions fails");
+        },
+        "the scope's failure propagates");
+    require(index.device_evictable_blocks() == evictable && index.device_pinned_nodes() == 0,
+            "holds unwound by an exception give their pins back");
+    index.check_invariants();
+
+    NodePin moved_from(index, path[2]);
+    NodePin owner = std::move(moved_from);
+    require(!moved_from.held() && owner.held() && !index.node(path[2]).evictable, "a move hands the pin over");
+    const NodeRef handed = owner.release();
+    owner.reset(); // released: nothing to give back
+    require(handed == path[2] && !index.node(path[2]).evictable, "a released pin stays with its new owner");
+    index.unpin_node(path[2]);
+    require(index.node(path[2]).evictable, "the owner unpins it");
+
+    {
+        const SnapshotPin pin(index, tap);
+        const NodeRetention retention(index, path[0]);
+        require(index.snapshot(tap).pins == 1 && index.node(path[0]).pins != 0, "snapshot pin and retention held");
+    }
+    require(index.snapshot(tap).pins == 0 && index.node(path[0]).pins == 0,
+            "a dying snapshot pin and retention give them back");
+    index.check_invariants();
+
+    // A staging slot: the configuration's one slot (the tap's, evicted for it once the tap is backed on the Host)
+    // comes back when its hold dies.
+    backup_snapshot(index, tap);
+    {
+        const auto slot = index.acquire_device_slot();
+        require(slot.has_value() && index.stats().free_device_slots == 0, "the one slot is staged");
+        const DeviceSlotHold staging(index, *slot);
+    }
+    require(index.stats().free_device_slots == 1, "a dying slot hold frees its staging slot");
+
+    {
+        auto reserved = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+        require(reserved.has_value(), "a Host image reservation");
+        const std::uint32_t free_slabs = index.stats().host_free_slabs;
+        const HostImageHold image(index, std::move(*reserved));
+        require(image.get().slabs.size() == 4 && index.stats().host_free_slabs == free_slabs, "slabs reserved");
+    }
+    const std::uint32_t slabs_after = index.stats().host_free_slabs;
+    {
+        auto reserved = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+        HostImageHold image(index, std::move(*reserved));
+        HostImageReservation handed_image = image.release();
+        require(index.stats().host_free_slabs + 4 == slabs_after, "a released reservation stays reserved");
+        index.release_host_image(std::move(handed_image));
+    }
+    require(index.stats().host_free_slabs == slabs_after, "a dying reservation hold frees its slabs");
+
+    const std::uint32_t block = backend.allocate();
+    { const DeviceBlockHold held(backend, block); }
+    require(!backend.live.contains(block), "a dying block hold releases its Device block");
+    index.check_invariants();
+}
+
+// Every refused publication consumes the staging slot and the tail id it was given (CM-07): its caller cannot tell
+// a refusal from a throw past the index's first change, so it never gives them back itself.
+void test_publish_refusals_consume() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens = make_tokens(64 * 2, 880);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const auto tail_tokens = make_tokens(10, 881);
+
+    const auto refuse = [&](std::uint32_t frontier, std::span<const TokenId> tail, bool with_tail,
+                            const std::string& what) {
+        const auto slot = index.acquire_device_slot();
+        require(slot.has_value(), what + ": a staging slot");
+        std::optional<std::uint32_t> tail_id;
+        if (with_tail) { tail_id = backend.allocate(); }
+        require_throws(
+            [&] {
+                (void)index.publish_snapshot(path[1], frontier, tail, tail_id, *slot, SnapshotKind::Tap);
+            },
+            what);
+        require(!tail_id || !backend.live.contains(*tail_id), what + ": the tail id is released");
+        const auto again = index.acquire_device_slot();
+        require(again.has_value() && *again == *slot, what + ": the slot is free again");
+        index.release_device_slot(*again);
+        index.check_invariants();
+    };
+    refuse(129, {}, false, "a frontier that does not match the anchor");
+    refuse(138, tail_tokens, false, "a tail without its Device copy");
+    refuse(139, tail_tokens, true, "a tail frontier that does not match the anchor");
+    refuse(128, {}, true, "a tail id without a tail");
+    require(index.stats().snapshots == 0, "no refusal publishes anything");
+    index.release_path(path);
+    index.check_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -3166,6 +3283,8 @@ int main() {
         test_dead_device_blocks_first();
         test_sibling_revaluation();
         test_rotation_keeps_gdsf_time();
+        test_holds();
+        test_publish_refusals_consume();
         test_tap_planner();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

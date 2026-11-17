@@ -489,7 +489,7 @@ export interface LogPaths {
   events_file: string;
   /** Written only while Settings.log_bodies is on. */
   requests_file: string;
-  /** Per-run server console logs (serve-<time>-<model>.log, newest 20 kept). */
+  /** Per-run server console logs (serve-<time>-<run>-<model>.log, newest 20 kept). */
   serve_dir: string;
 }
 

@@ -1,7 +1,7 @@
 """The launcher against the stand-in server (no GPU): its features and its watchdog.
 
 python -I tools/launcher/launcher_check.py --launcher <infernix-launcher> --fake <infernix_launcher_fake_serve>
-    --models <dir> [--groups features,watchdog,windowless]
+    --models <dir> [--groups features,watchdog,windowless,autoload]
 Runs on Windows and Linux. <dir> holds at least one supported artifact (only its header is read;
 nothing in it is changed). Each group starts its own launcher with its memory and logs in a fresh
 temporary folder (printed; removed afterwards unless --keep).
@@ -15,6 +15,7 @@ watchdog: crash, lock-up, stall, the restart limit, idle servers, loads that do 
           floor (about 6 GiB of RAM for a few seconds; --skip-ram leaves it out), the event log and
           the request-content log (about three minutes).
 windowless: (Windows) a launcher started on a console without a window stops its server in order.
+autoload: the default model loads by itself after a slow first scan (about 20 s).
 """
 
 from __future__ import annotations
@@ -886,13 +887,38 @@ def windowless(launcher: Launcher, port: int, data: Path) -> None:
     check("windowless: an orderly stop", code == 0, str(code))
 
 
+def autoload(launcher: Launcher, port: int, data: Path) -> None:
+    """With autoload on, the launcher loads the default model by itself once its first scan has found
+    it, however long the server's --help takes before that scan (12 s here: a cold first start)."""
+    model = first_model(port)
+    key = model["key"]
+    code = launcher.stop()
+    launcher.kill()
+    check("autoload: the first launcher stops", code == 0, str(code))
+    memory = json.loads((data / "infernix-launcher.json").read_text(encoding="utf-8"))
+    memory["settings"].update({"autoload": True, "default_model": key})
+    (data / "infernix-launcher.json").write_text(json.dumps(memory), encoding="utf-8")
+    os.environ["INFERNIX_FAKE_HELP_DELAY_MS"] = "12000"
+    try:
+        launcher.start()
+    finally:
+        del os.environ["INFERNIX_FAKE_HELP_DELAY_MS"]
+    ready = wait_for(lambda: (lambda i: i if i["state"] == "ready" else None)(instance(port)), 60)
+    failed = [e["message"] for e in events(port) if e.get("level") == "error"]
+    check("autoload: the default model loads after a slow first scan",
+          bool(ready) and ready["model_key"] == key and not failed,
+          f"instance {ready}, errors {failed}")
+    code = launcher.stop()
+    check("autoload: an orderly stop", code == 0, str(code))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--launcher", required=True)
     parser.add_argument("--fake", required=True)
     parser.add_argument("--models", required=True)
     parser.add_argument("--port", type=int, default=1238)
-    parser.add_argument("--groups", default="features,watchdog,windowless")
+    parser.add_argument("--groups", default="features,watchdog,windowless,autoload")
     parser.add_argument("--skip-ram", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the temporary folders")
     options = parser.parse_args()
@@ -905,6 +931,8 @@ def main() -> int:
                   lambda launcher, port, data: watchdog(launcher, port, data, options.skip_ram))
     if "windowless" in groups and WINDOWS:
         run_group("windowless", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, windowless, windowless=True)
+    if "autoload" in groups:
+        run_group("autoload", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, autoload)
     failed = [r for r in results if not r[1]]
     log(f"SUMMARY: {len(results) - len(failed)} passed, {len(failed)} failed")
     for name, _, detail in failed:

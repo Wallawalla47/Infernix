@@ -32,21 +32,34 @@ template <class T> void store(T* word, T value) {
 } // namespace
 
 FetchChannel::FetchChannel() {
-    request_   = static_cast<FetchRequest*>(mapped(sizeof(FetchRequest)));
-    response_  = static_cast<FetchResponse*>(mapped(sizeof(FetchResponse)));
-    consumed_  = static_cast<std::uint64_t*>(mapped(64));
-    heartbeat_ = reinterpret_cast<std::uint32_t*>(consumed_ + 2);
-    cuda_require(cudaMalloc(&sequence_, sizeof(std::uint32_t)), "cudaMalloc");
-    cuda_require(cudaMemset(sequence_, 0, sizeof(std::uint32_t)), "cudaMemset");
-    experts_.reserve(kMaxFetch);
-    arrived_.assign(kMaxFetch, 0);
+    // A step that throws gives back what the earlier ones took (no destructor runs for a constructor that throws).
+    try {
+        request_   = static_cast<FetchRequest*>(mapped(sizeof(FetchRequest)));
+        response_  = static_cast<FetchResponse*>(mapped(sizeof(FetchResponse)));
+        consumed_  = static_cast<std::uint64_t*>(mapped(64));
+        heartbeat_ = reinterpret_cast<std::uint32_t*>(consumed_ + 2);
+        cuda_require(cudaMalloc(&sequence_, sizeof(std::uint32_t)), "cudaMalloc");
+        cuda_require(cudaMemset(sequence_, 0, sizeof(std::uint32_t)), "cudaMemset");
+        experts_.reserve(kMaxFetch);
+        arrived_.assign(kMaxFetch, 0);
+    } catch (...) {
+        release();
+        throw;
+    }
 }
 
-FetchChannel::~FetchChannel() {
-    cudaFree(sequence_);
+FetchChannel::~FetchChannel() { release(); }
+
+void FetchChannel::release() noexcept {
+    cudaFree(sequence_); // null-safe, as cudaFreeHost
     cudaFreeHost(consumed_);
     cudaFreeHost(response_);
     cudaFreeHost(request_);
+    sequence_  = nullptr;
+    consumed_  = nullptr;
+    heartbeat_ = nullptr;
+    response_  = nullptr;
+    request_   = nullptr;
 }
 
 MoeFetchChannel FetchChannel::channel(int layer) const {

@@ -40,6 +40,9 @@ constexpr std::size_t kFetchRunBytes = std::size_t{12} << 20;
 // Read-ahead (Options::ahead_min, ahead) keeps the drive reading while the device finishes a layer
 // and routes the next. Decode calls (a few records each) never read ahead.
 constexpr std::int32_t kAheadFetch = -2; // Ticket::fetch of a read-ahead ticket not yet adopted
+// Ticket::holders bits.
+constexpr std::uint8_t kDeviceHolder = 1;
+constexpr std::uint8_t kCpuHolder    = 2;
 // An open round with no work for this long (one that was abandoned without end_round) stops the
 // agent's spinning; it then polls about once per millisecond.
 constexpr auto kIdleSpin = std::chrono::seconds(2);
@@ -648,6 +651,11 @@ HostExpertTier::~HostExpertTier() {
     }
     copy_wake_.notify_all();
     for (auto& copier : copiers_) { copier.join(); }
+    // A shrink's decommits and releases queued on the memory worker use this tier's unpinned buffer: they finish
+    // before it goes, whichever of the two its owner destroys first (a job the worker dropped is ready, broken).
+    for (std::future<void>& job : releases_) {
+        if (job.valid()) { job.wait(); }
+    }
     queue_.reset(); // cancels and waits for any read still in flight
     // A growth that landed but was never linked: its chunks are released here (its job has run: the worker stops
     // before the tier goes, or is waited for now).
@@ -1518,10 +1526,13 @@ std::uint32_t HostExpertTier::new_ticket(std::uint32_t key, std::int32_t fetch) 
     ticket.fetch     = fetch;
     ticket.copy_from = nullptr;
     ticket.bytes     = nullptr;
-    ticket.done.store(false, std::memory_order_relaxed);
+    ticket.holders.store(fetch >= 0 ? kDeviceHolder : kCpuHolder, std::memory_order_relaxed);
     ticket.status.store(0, std::memory_order_relaxed);
-    round_ticket_of_key_[key].store(t + 1, std::memory_order_release);
     ticket.expand    = false;
+    // The key's round ticket is published last, on every path: a CPU demand on another thread that finds it
+    // (demand) reads its fields and state, which belong to this use only once they are written (indices
+    // recycle each round, so the fields still hold the last use's values until then).
+    const auto publish = [&] { round_ticket_of_key_[key].store(t + 1, std::memory_order_release); };
     if (const std::int32_t slot = tier_.slot_of(key); slot >= 0) { // already in RAM: nothing to read
         const auto s = static_cast<std::uint32_t>(slot);
         if (fetch >= 0 && slot_compressed(s)) {
@@ -1531,12 +1542,14 @@ std::uint32_t HostExpertTier::new_ticket(std::uint32_t key, std::int32_t fetch) 
             ticket.expand    = true;
             ticket.state.store(0, std::memory_order_relaxed);
             in_flight_.fetch_add(1, std::memory_order_acq_rel);
+            publish();
             return t;
         }
         ticket.slot     = s;
         ticket.bytes    = slot_compressed(s) ? ops::offloaded_moe::csf::tag(slot_bytes(s)) : slot_bytes(s);
         ticket.resident = true;
         ticket.state.store(1, std::memory_order_release);
+        publish();
         return t;
     }
     if (const std::uint8_t* unpinned = unpinned_record(key); unpinned != nullptr) {
@@ -1545,12 +1558,14 @@ std::uint32_t HostExpertTier::new_ticket(std::uint32_t key, std::int32_t fetch) 
             ticket.resident = true;
             unpinned_served_.fetch_add(1, std::memory_order_relaxed);
             ticket.state.store(1, std::memory_order_release);
+            publish();
             return t;
         }
         ticket.copy_from = unpinned; // the device reads pinned memory only: a ring slot takes a copy
     }
     ticket.state.store(0, std::memory_order_relaxed);
     in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    publish();
     return t;
 }
 
@@ -1654,7 +1669,17 @@ void HostExpertTier::stream_release(std::int32_t slot) {
 std::uint32_t HostExpertTier::demand(int layer, int expert) noexcept {
     const std::uint32_t key = this->key(static_cast<std::uint32_t>(layer), static_cast<std::uint32_t>(expert));
     if (const std::uint32_t known = round_ticket_of_key_[key].load(std::memory_order_acquire); known != 0) {
-        return known - 1;
+        // The round's ticket of this key (an earlier call's CPU demand, or the device's fetch): a RAM-resident
+        // record holds no ring slot. Otherwise this demand holds the ticket's slot until done(), unless take_slot
+        // already gave the slot to another record (it was done with): then the slot holds that record, and the key
+        // is read again on a ticket of its own.
+        Ticket& ticket = tickets_[known - 1];
+        if (ticket.resident) { return known - 1; }
+        std::lock_guard<std::mutex> lock(mutex_); // take_slot's
+        if (!ticket.recycled) {
+            ticket.holders.fetch_or(kCpuHolder, std::memory_order_acq_rel);
+            return known - 1;
+        }
     }
     const std::uint32_t t = new_ticket(key, -1);
     if (t == kNoTicket || tickets_[t].resident) { return t; }
@@ -1675,7 +1700,7 @@ void HostExpertTier::fail_ticket(std::uint32_t t) noexcept {
     std::uint32_t pending   = 0;
     if (!ticket.state.compare_exchange_strong(pending, 2, std::memory_order_acq_rel)) { return; }
     ticket.status.store(EIO, std::memory_order_relaxed);
-    ticket.done.store(true, std::memory_order_release);
+    ticket.holders.store(0, std::memory_order_release); // a failed ticket's slot is read by nobody
     in_flight_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -1830,7 +1855,7 @@ bool HostExpertTier::take_slot(std::uint32_t t) {
         // The oldest holder whose reader is done gives its slot back (its landing is then not admitted).
         for (auto it = holding_.begin(); it != holding_.end(); ++it) {
             Ticket& old = tickets_[*it];
-            if (old.done.load(std::memory_order_acquire) && old.state.load(std::memory_order_acquire) != 0) {
+            if (old.holders.load(std::memory_order_acquire) == 0 && old.state.load(std::memory_order_acquire) != 0) {
                 old.recycled = true;
                 ring_.push_back({old.slot, old.serial});
                 holding_.erase(it);
@@ -1877,7 +1902,7 @@ bool HostExpertTier::landed(std::uint32_t t) const noexcept {
 }
 
 void HostExpertTier::done(std::uint32_t t) noexcept {
-    if (t < ticket_capacity_) { tickets_[t].done.store(true, std::memory_order_release); }
+    if (t < ticket_capacity_) { tickets_[t].holders.fetch_and(static_cast<std::uint8_t>(~kCpuHolder), std::memory_order_acq_rel); }
 }
 
 void HostExpertTier::agent_loop() {
@@ -1939,11 +1964,16 @@ void HostExpertTier::agent_loop() {
         ticket.copy_from = unpinned_record(k);
         ticket.expand    = false;
         ticket.bytes     = nullptr;
-        ticket.done.store(false, std::memory_order_relaxed);
+        ticket.holders.store(kDeviceHolder, std::memory_order_relaxed);
         ticket.status.store(0, std::memory_order_relaxed);
         ticket.state.store(0, std::memory_order_relaxed);
         in_flight_.fetch_add(1, std::memory_order_acq_rel);
         return t;
+    };
+    // The device (or a dropped guess) is done with a ticket's slot: its bit only, so a CPU demand sharing the ticket
+    // keeps the slot, and a repeated release changes nothing.
+    const auto release_device = [&](std::uint32_t t) {
+        tickets_[t].holders.fetch_and(static_cast<std::uint8_t>(~kDeviceHolder), std::memory_order_acq_rel);
     };
     // Read-ahead tickets still waiting for a ring slot are dropped (nothing will read them).
     const auto drop_waiting_ahead = [&] {
@@ -2010,7 +2040,7 @@ void HostExpertTier::agent_loop() {
             if (fetch->poll(request)) {
                 // A new request means the device has copied every record of the previous one.
                 for (const std::uint32_t t : fetch_ticket) {
-                    if (t != kNoTicket) { tickets_[t].done.store(true, std::memory_order_release); }
+                    if (t != kNoTicket) { release_device(t); }
                 }
                 fetch_ticket.assign(request.experts.size(), kNoTicket);
                 released     = 0;
@@ -2057,7 +2087,7 @@ void HostExpertTier::agent_loop() {
                 for (const auto& [t, k] : ahead) {
                     if (ahead_of_key[k] == t + 1) { // not adopted
                         ahead_of_key[k] = 0;
-                        tickets_[t].done.store(true, std::memory_order_release);
+                        release_device(t);
                     }
                 }
                 ahead.clear();
@@ -2087,7 +2117,7 @@ void HostExpertTier::agent_loop() {
             const std::uint32_t consumed = std::min<std::uint32_t>(fetch->consumed(), static_cast<std::uint32_t>(fetch_ticket.size()));
             for (; released < consumed; ++released) {
                 if (fetch_ticket[released] != kNoTicket) {
-                    tickets_[fetch_ticket[released]].done.store(true, std::memory_order_release);
+                    release_device(fetch_ticket[released]);
                 }
             }
         }

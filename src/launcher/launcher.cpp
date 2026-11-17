@@ -26,10 +26,44 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <unistd.h>
 #endif
 
 namespace infernix::launcher {
 namespace {
+
+// The console writer's output, written to the handle itself rather than through stdout's FILE: a write a console
+// holds (a QuickEdit selection) then holds no C runtime lock, so the exit's stream flush is not held up by it.
+void write_console(const std::vector<std::string>& lines) {
+    std::string text;
+    for (const std::string& line : lines) {
+#ifdef _WIN32
+        text += line + "\r\n";
+#else
+        text += line + "\n";
+#endif
+    }
+#ifdef _WIN32
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    for (std::size_t at = 0; out != nullptr && out != INVALID_HANDLE_VALUE && at < text.size();) {
+        DWORD wrote = 0;
+        if (WriteFile(out, text.data() + at, static_cast<DWORD>(std::min<std::size_t>(text.size() - at, 1U << 20)), &wrote,
+                      nullptr) == 0 || wrote == 0) {
+            break;
+        }
+        at += wrote;
+    }
+#else
+    for (std::size_t at = 0; at < text.size();) {
+        const ssize_t wrote = ::write(STDOUT_FILENO, text.data() + at, text.size() - at);
+        if (wrote < 0 && errno == EINTR) { continue; }
+        if (wrote <= 0) { break; }
+        at += static_cast<std::size_t>(wrote);
+    }
+#endif
+}
 
 using Request  = httplib::Request;
 using Response = httplib::Response;
@@ -378,6 +412,12 @@ Launcher::Launcher(LauncherOptions options)
 
     router_ = std::make_unique<Router>(Router::Hooks{
         .load = [this](const std::string& key) { return load_model(key); },
+        // The instance starting now ends (the monitor kills it within its next poll); one not started yet is never
+        // started (load_model asks load_cancelled first).
+        .cancel_load =
+            [this] {
+                supervisor_->end_load(supervisor_->snapshot().instance, "cancelled", "the load was cancelled from the launcher");
+            },
         .stop = [this] { supervisor_->stop(std::chrono::seconds(store_.settings().stop_timeout_s)); },
         .changed =
             [this] {
@@ -444,7 +484,7 @@ Launcher::Launcher(LauncherOptions options)
 
     scanner_        = std::thread([this] { scan_loop(); });
     log_flusher_    = std::thread([this] { flush_logs_loop(); });
-    console_writer_ = std::thread([this] { console_loop(); });
+    console_writer_ = std::thread([queue = console_] { console_loop(queue); });
     register_routes();
 }
 
@@ -485,17 +525,16 @@ void Launcher::serve() {
     if (settings.autoload) {
         std::optional<std::string> key = settings.default_model ? settings.default_model : store_.last_model();
         if (key) {
-            std::thread([this, key = *key] {
-                // Let the first scan finish so the model is known.
-                for (int i = 0; i < 100; ++i) {
-                    {
-                        std::lock_guard lock(library_mutex_);
-                        if (library_.scanned_at != 0) { break; }
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            autoloader_ = std::thread([this, key = *key] {
+                // The first scan (after `infernix-serve --help`, however long both take) makes the model
+                // known; a load requested before it would fail and hold the model off for two minutes.
+                {
+                    std::unique_lock lock(library_mutex_);
+                    scan_cv_.wait(lock, [this] { return library_.scanned_at != 0 || stopping_; });
+                    if (stopping_) { return; }
                 }
                 router_->request_load(key, false);
-            }).detach();
+            });
         }
     }
     if (options_.open_browser && settings.open_browser) { open_in_browser(ui_url()); }
@@ -508,6 +547,10 @@ void Launcher::stop() {
     if (stopped_) { return; }
     event("info", "launcher", "shutting down");
     stopping_ = true;
+    // Saved first as well: a closed console window, a sign-out or a shutdown ends the process about 5 s from now,
+    // whatever the model's stop below still waits for.
+    usage_.flush();
+    store_.update_settings([](Settings&) {});
     events_.close_all();
     model_events_.close_all();
     server_.stop();
@@ -525,15 +568,28 @@ void Launcher::stop() {
     }
     scan_cv_.notify_all();
     if (scanner_.joinable()) { scanner_.join(); }
+    if (autoloader_.joinable()) { autoloader_.join(); }
+    {
+        std::lock_guard lock(install_stopper_mutex_);
+        if (install_stopper_.joinable()) { install_stopper_.join(); }
+    }
     // The server's log file and the console get what is still queued.
     stop_flushing_ = true;
     if (log_flusher_.joinable()) { log_flusher_.join(); }
-    {
-        std::lock_guard lock(console_mutex_);
-        console_stopping_ = true;
+    if (console_writer_.joinable()) {
+        // A few seconds for the last lines; a console held by a QuickEdit selection does not hold up the exit (the
+        // writer keeps its queue alive and is ended with the process).
+        std::unique_lock lock(console_->mutex);
+        console_->stopping = true;
+        console_->cv.notify_all();
+        const bool done = console_->cv.wait_for(lock, std::chrono::seconds(3), [this] { return console_->done; });
+        lock.unlock();
+        if (done) {
+            console_writer_.join();
+        } else {
+            console_writer_.detach();
+        }
     }
-    console_cv_.notify_all();
-    if (console_writer_.joinable()) { console_writer_.join(); }
     usage_.flush();
     // The API keys' last use is kept in memory between other changes.
     store_.update_settings([](Settings&) {});
@@ -557,6 +613,13 @@ void Launcher::flush_logs_loop() {
     for (;;) {
         const bool last = stop_flushing_;
         if (!last) { std::this_thread::sleep_for(std::chrono::milliseconds(150)); }
+        // A failed save of the memory file (a full disk, a read-only folder, an antivirus lock): the change is
+        // in memory only, so the user is told rather than finding it gone at the next start.
+        if (const std::optional<std::string> failure = store_.take_save_failure()) {
+            event("error", "settings", "the settings file could not be saved; the change is lost at the next start "
+                                        "unless a later save succeeds: " + *failure);
+            toast("error", "Settings could not be saved: " + *failure);
+        }
         std::vector<LogRecord> batch;
         std::vector<EventRecord> events;
         {
@@ -578,30 +641,32 @@ void Launcher::flush_logs_loop() {
             publish("log", {{"lines", lines}});
         }
         logs_.write_files();
+        event_log_.write_files(); // the event and request-content logs: their only writer
         if (last) { return; }
     }
 }
 
 void Launcher::print_console(std::string line) {
     {
-        std::lock_guard lock(console_mutex_);
-        console_lines_.push_back(std::move(line));
+        std::lock_guard lock(console_->mutex);
+        console_->lines.push_back(std::move(line));
     }
-    console_cv_.notify_one();
+    console_->cv.notify_all();
 }
 
-void Launcher::console_loop() {
-    std::unique_lock lock(console_mutex_);
+void Launcher::console_loop(const std::shared_ptr<ConsoleQueue>& queue) {
+    std::unique_lock lock(queue->mutex);
     for (;;) {
-        console_cv_.wait(lock, [this] { return console_stopping_ || !console_lines_.empty(); });
-        if (console_lines_.empty()) { return; } // stopping, and everything printed
+        queue->cv.wait(lock, [&] { return queue->stopping || !queue->lines.empty(); });
+        if (queue->lines.empty()) { break; } // stopping, and everything printed
         std::vector<std::string> lines;
-        lines.swap(console_lines_);
+        lines.swap(queue->lines);
         lock.unlock();
-        for (const std::string& line : lines) { std::fprintf(stdout, "%s\n", line.c_str()); }
-        std::fflush(stdout);
+        write_console(lines);
         lock.lock();
     }
+    queue->done = true;
+    queue->cv.notify_all();
 }
 
 Json Launcher::state_json() const {
@@ -644,7 +709,7 @@ void Launcher::scan_loop() {
         scan_requested_      = false;
         scanning_            = true;
         lock.unlock();
-        if (requested) { publish("library", library_json()); }
+        if (requested) { publish_library(); }
         const Settings settings = store_.settings();
         std::vector<std::filesystem::path> dirs;
         for (const std::string& dir : settings.model_dirs) { dirs.push_back(utf8_path(dir)); }
@@ -653,8 +718,8 @@ void Launcher::scan_loop() {
         library_  = std::move(scan);
         scanning_ = false;
         lock.unlock();
-        Json library = library_json();
-        Json compare = library;
+        scan_cv_.notify_all(); // the autoload waits for the first scan
+        Json compare = library_json();
         compare.erase("scanned_at");
         const std::string digest = compare.dump();
         lock.lock();
@@ -662,7 +727,7 @@ void Launcher::scan_loop() {
         library_digest_    = digest;
         lock.unlock();
         if (changed || requested) {
-            publish("library", library);
+            publish_library();
             publish("activity", activity_json());
         }
         if (changed) { publish_model_event("*", "models_reload"); }
@@ -916,7 +981,7 @@ Json Launcher::import_script_json(const std::string& text, const std::string& fi
 }
 
 Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& model, const Args& args,
-                             const EnvVars& env) const {
+                             const EnvVars& env, std::chrono::milliseconds timeout) const {
     Json out = {{"supported", true},    {"fits", nullptr},       {"summary", ""},      {"vram", nullptr},
                 {"ram", nullptr},       {"max_context", nullptr}, {"kv_tokens", nullptr}, {"error", nullptr},
                 {"suggestions", Json::array()}, {"report", nullptr}};
@@ -936,7 +1001,7 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
     const std::filesystem::path report = options_.data_dir / "plans" / ("plan-" + random_token(12) + ".json");
     argv.push_back("--plan");
     argv.push_back(path_utf8(report));
-    const std::optional<CaptureResult> run = run_capture(serve_executable(), argv, std::chrono::minutes(3), env);
+    const std::optional<CaptureResult> run = run_capture(serve_executable(), argv, timeout, env);
     const std::optional<std::string> text  = read_file(report);
     std::filesystem::remove(report, ignored);
     Json plan;
@@ -1243,12 +1308,16 @@ Router::Loaded Launcher::load_model(const std::string& key) {
         if (supported("--any-model-name")) { spec.args.push_back("--any-model-name"); }
         if (supported("--log-stats-panel")) { spec.args.insert(spec.args.end(), {"--log-stats-panel", "off"}); }
         if (supported("--log-colours")) { spec.args.insert(spec.args.end(), {"--log-colours", "off"}); }
-        port_retry_allowed_ = settings.child_port == 0 && attempt < kPortAttempts;
+        spec.port_retry = settings.child_port == 0 && attempt < kPortAttempts;
+        if (router_ && router_->load_cancelled()) {
+            result.error     = alias + ": the load was cancelled from the launcher";
+            result.cancelled = true;
+            return result;
+        }
         try {
             supervisor_->start(spec);
         } catch (const std::exception& failure) {
-            port_retry_allowed_ = false;
-            result.error        = failure.what();
+            result.error = failure.what();
             return result;
         }
         if (attempt == 1) { store_.set_last_model(key); }
@@ -1260,7 +1329,12 @@ Router::Loaded Launcher::load_model(const std::string& key) {
                   " was taken by another program before infernix-serve bound it; starting it on another port",
               {{"model_key", key}, {"port", port}});
     }
-    port_retry_allowed_ = false;
+    if (!ready && router_ && router_->load_cancelled()) {
+        if (snapshot.state == InstanceState::Starting) { supervisor_->stop(std::chrono::seconds(settings.stop_timeout_s)); }
+        result.error     = alias + ": the load was cancelled from the launcher";
+        result.cancelled = true;
+        return result;
+    }
     if (!ready) {
         if (snapshot.state == InstanceState::Starting) {
             supervisor_->stop(std::chrono::seconds(settings.stop_timeout_s));
@@ -1325,7 +1399,15 @@ Json Launcher::instance_json() const {
             {"incident", incident}};
 }
 
-void Launcher::publish_instance() { publish("instance", instance_json()); }
+void Launcher::publish_instance() {
+    std::lock_guard lock(publish_instance_mutex_);
+    publish("instance", instance_json());
+}
+
+void Launcher::publish_library() {
+    std::lock_guard lock(publish_library_mutex_);
+    publish("library", library_json());
+}
 
 // ---------------------------------------------------------------------------------------------
 // Event log and the watchdog's incidents
@@ -1345,17 +1427,25 @@ Json Launcher::log_paths_json() const {
 }
 
 void Launcher::apply_log_dir() {
-    const std::filesystem::path dir = log_dir();
-    if (dir == applied_log_dir_) { return; }
-    applied_log_dir_ = dir;
+    // Two settings saves at once (handlers run in parallel) apply the folders in order: the last one read is the
+    // one both logs end up in.
+    bool moved = false;
     std::string error;
-    if (event_log_.set_dir(dir, error)) {
+    std::filesystem::path dir;
+    {
+        std::lock_guard lock(log_dir_mutex_);
+        dir = log_dir();
+        if (dir == applied_log_dir_) { return; }
+        applied_log_dir_ = dir;
+        moved            = event_log_.set_dir(dir, error);
+        logs_.set_dir(dir / kServeLogDir);
+    }
+    if (moved) {
         event("info", "settings", "the logs are now written to " + path_utf8(dir));
     } else {
         event("error", "settings", "the log folder cannot be written (" + error + "); events stay in memory only");
         toast("error", "The log folder cannot be written: " + error);
     }
-    logs_.set_dir(dir / kServeLogDir);
     publish("logs", log_paths_json());
 }
 
@@ -1404,6 +1494,8 @@ void Launcher::on_instance_changed(const InstanceSnapshot& snapshot) {
         const std::string error = snapshot.error.value_or("it stopped while loading");
         if (snapshot.incident == "ram") {
             handle_load_failure(snapshot, "ram", error); // the launcher's RAM floor ended the load
+        } else if (snapshot.incident == "cancelled") {
+            event("info", "model", alias + ": the load was cancelled"); // an unload or another load: no restart
         } else if (snapshot.incident) {
             handle_incident(snapshot);
         } else {
@@ -1428,7 +1520,7 @@ std::string Launcher::failure_detail(const InstanceSnapshot& snapshot) const {
 }
 
 bool Launcher::port_retry_due(const InstanceSnapshot& snapshot) const {
-    return port_retry_allowed_ && !snapshot.incident && classify_load_failure(failure_detail(snapshot)) == "port";
+    return snapshot.port_retry && !snapshot.incident && classify_load_failure(failure_detail(snapshot)) == "port";
 }
 
 void Launcher::handle_load_failure(const InstanceSnapshot& snapshot, const std::string& kind, const std::string& detail) {
@@ -1453,10 +1545,15 @@ void Launcher::handle_load_failure(const InstanceSnapshot& snapshot, const std::
         }
     }
     Json suggestions = Json::array();
-    if (model && kind == "vram") {
+    if (model && kind == "vram" && !stopping_) {
         // The server's own plan (about a second; the failed server's memory is free again) names the
-        // largest context that fits exactly, where the refusal's figures give an estimate.
-        const Json plan = fit_plan_json(snapshot.model_key, *model, args, env);
+        // largest context that fits exactly, where the refusal's figures give an estimate. It runs here,
+        // on the supervisor's thread, so the next load starts only after it and does not fill the GPU
+        // the plan measures; the next load and every model switch wait for it, so it gets 20 s (a plan
+        // that hangs, a driver wedged by the out-of-memory failure, say, leaves the estimate). The
+        // dashboard shows the failure meanwhile.
+        publish_instance();
+        const Json plan = fit_plan_json(snapshot.model_key, *model, args, env, std::chrono::seconds(20));
         if (plan.value("fits", Json(nullptr)) == false) { suggestions = plan.value("suggestions", Json::array()); }
     }
     if (kind == "port") {
@@ -2786,7 +2883,7 @@ void Launcher::register_management_routes() {
         event("info", "settings", "configuration " + config.value("alias", "") + " " + what,
               {{"model_key", config.value("id", "")}, {"args", config.value("args", Json::array())}});
         publish("config", config);
-        publish("library", library_json());
+        publish_library();
         publish_model_event("*", "models_reload"); // a model id or the listing may have changed
     };
     server_.Get(api + config_path + "/config", admin([this, with_config](const Request& q, Response& s) {
@@ -2909,7 +3006,7 @@ void Launcher::register_management_routes() {
                        }
                        store_.erase_model_config(id);
                        event("info", "settings", "configuration " + alias + " deleted");
-                       publish("library", library_json());
+                       publish_library();
                        publish_model_event("*", "models_reload");
                        send_json(s, {{"ok", true}});
                    }));
@@ -3110,11 +3207,15 @@ void Launcher::register_management_routes() {
                      event("info", "launcher", "installing the Infernix update: the launcher stops and starts again");
                      send_json(s, infernix_update_->state());
                      // The answer goes out first; then an orderly stop (the model saves its caches) ends
-                     // the process and the update script takes over.
-                     std::thread([this] {
-                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                         server_.stop();
-                     }).detach();
+                     // the process and the update script takes over. A member thread, joined by stop(), so a
+                     // stop that finishes first never leaves it to use a destroyed launcher.
+                     std::lock_guard lock(install_stopper_mutex_);
+                     if (!install_stopper_.joinable() && !stopping_) {
+                         install_stopper_ = std::thread([this] {
+                             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                             server_.stop();
+                         });
+                     }
                  }));
 
     // Disk: deleting an artifact's files, a drafter or an n-gram volume.
@@ -3158,10 +3259,16 @@ void Launcher::register_management_routes() {
                                files.push_back(sidecar);
                            }
                        }
-                       if (supervisor_->snapshot().artifact_key == key &&
-                           supervisor_->snapshot().state != InstanceState::Idle &&
-                           supervisor_->snapshot().state != InstanceState::Failed) {
-                           throw std::invalid_argument(file_name + " is loaded: unload it first");
+                       // One snapshot, and the router's queued or starting load too (it acts up to 250 ms later):
+                       // deleting the parts of a model that is starting leaves a half-deleted artifact.
+                       const InstanceSnapshot instance = supervisor_->snapshot();
+                       const auto names = [&key](const std::optional<std::string>& config) {
+                           return config && artifact_key_of(*config) == key;
+                       };
+                       if ((instance.artifact_key == key && instance.state != InstanceState::Idle &&
+                            instance.state != InstanceState::Failed) ||
+                           (router_ && (names(router_->pending_model()) || names(router_->loading_model())))) {
+                           throw std::invalid_argument(file_name + " is loaded or about to load: unload it first");
                        }
                        check_confirm(q, file_name);
                        remove_files(files, file_name);

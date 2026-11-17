@@ -47,7 +47,7 @@
 namespace infernix::runtime::prefix_cache {
 namespace {
 
-constexpr std::uint32_t kVersion      = 6;
+constexpr std::uint32_t kVersion      = 7; // 7: the head carries its own hash after the footer
 constexpr std::array<char, 8> kFooter = {'N', 'I', 'N', 'F', 'P', 'C', 'E', 'D'};
 constexpr std::int32_t kRootIndex     = -1;
 constexpr std::uint32_t kNone         = kNoId;
@@ -117,6 +117,8 @@ public:
         std::memcpy(data, data_ + at_, count);
         at_ += count;
     }
+
+    [[nodiscard]] std::size_t offset() const noexcept { return at_; }
 
 private:
     const std::byte* data_;
@@ -392,6 +394,10 @@ PersistResult save_prefix_cache(const PrefixCacheIndex& index, const PersistBind
         table.bytes(kFooter.data(), kFooter.size());
         table.value(static_cast<std::uint32_t>(nodes.size()));
         table.value(static_cast<std::uint32_t>(snapshots.size()));
+        // The head's own hash (content_hash of every byte before it, patched last): the slabs carry theirs, and a
+        // flipped bit in a block's tokens or lookup hash would otherwise restore that block under another identity.
+        const std::size_t head_hash_at = table.size();
+        table.value(std::uint64_t{0});
         const std::uint64_t head_bytes = round_up_block(table.size());
         const std::uint64_t total      = head_bytes + static_cast<std::uint64_t>(slabs.size()) * binding.slab_bytes;
         table.patch(kHeadBytesOffset, head_bytes);
@@ -409,6 +415,7 @@ PersistResult save_prefix_cache(const PrefixCacheIndex& index, const PersistBind
             transfer_slabs(file, DirectScratchFile::Op::Write, head_bytes, binding.slab_bytes, slabs, hashes.data(), "write",
                            [&](std::uint64_t) { check_abandoned(); });
             for (std::size_t k = 0; k < hashes.size(); ++k) { table.patch(hash_at[k], hashes[k]); }
+            table.patch(head_hash_at, content_hash(table.data(), head_hash_at));
             const AlignedBytes head = aligned_bytes(static_cast<std::size_t>(head_bytes));
             std::memcpy(head.get(), table.data(), table.size());
             std::memset(head.get() + table.size(), 0, static_cast<std::size_t>(head_bytes) - table.size());
@@ -615,6 +622,12 @@ PersistResult load_prefix_cache(PrefixCacheIndex& index, const PersistBinding& b
         if (footer != kFooter || reader.value<std::uint32_t>() != node_count ||
             reader.value<std::uint32_t>() != snapshot_count) {
             throw std::runtime_error("prefix cache file tables are damaged");
+        }
+        {
+            const std::size_t hashed = reader.offset();
+            if (reader.value<std::uint64_t>() != content_hash(head.get(), hashed)) {
+                throw std::runtime_error("prefix cache file tables are damaged (their hash does not match)");
+            }
         }
         if (host_slab_count != saved_slab_count || file_bytes != head_bytes + host_slab_count * slab_bytes) {
             throw std::runtime_error("prefix cache file is truncated or damaged");

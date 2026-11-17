@@ -251,52 +251,78 @@ ConsoleStatsPanel::ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> pan
 
 void ConsoleStatsPanel::request_done(const GenerationOutcome& outcome) {
     const ConsoleRequestSample sample = make_console_request_sample(outcome);
-    std::lock_guard lock(mutex_);
-    ++state_.completed;
-    if (sample.speculative_backend != SpeculativeBackend::None) {
-        state_.speculative_backend = sample.speculative_backend;
+    Frame frame;
+    {
+        std::lock_guard lock(mutex_);
+        // A cancelled request is no completion (as Metrics::done counts it): it neither adds a sample to the
+        // session's rates nor a zero first-token time to its mean.
+        if (outcome.finish_reason == FinishReason::Cancelled) {
+            ++state_.cancelled;
+        } else {
+            ++state_.completed;
+            if (sample.speculative_backend != SpeculativeBackend::None) {
+                state_.speculative_backend = sample.speculative_backend;
+            }
+            state_.session.add(sample);
+            recent_.push_back(sample);
+            if (recent_.size() > kRecentRequests) { recent_.pop_front(); }
+            state_.recent = {};
+            for (const ConsoleRequestSample& entry : recent_) { state_.recent.add(entry); }
+        }
+        frame = render_locked();
     }
-    state_.session.add(sample);
-    recent_.push_back(sample);
-    if (recent_.size() > kRecentRequests) { recent_.pop_front(); }
-    state_.recent = {};
-    for (const ConsoleRequestSample& entry : recent_) { state_.recent.add(entry); }
-    publish_locked();
+    draw(std::move(frame));
 }
 
 void ConsoleStatsPanel::request_failure(const RequestFailure& failure) {
-    std::lock_guard lock(mutex_);
-    if (failure.classification == RequestFailureClass::ClientDisconnected) {
-        ++state_.cancelled;
-    } else {
-        ++state_.failed;
+    Frame frame;
+    {
+        std::lock_guard lock(mutex_);
+        if (failure.classification == RequestFailureClass::ClientDisconnected) {
+            ++state_.cancelled;
+        } else {
+            ++state_.failed;
+        }
+        frame = render_locked();
     }
-    publish_locked();
+    draw(std::move(frame));
 }
 
 void ConsoleStatsPanel::request_rejected(const RequestFailure& failure) {
-    std::lock_guard lock(mutex_);
-    if (failure.classification == RequestFailureClass::ClientDisconnected) {
-        ++state_.cancelled;
-    } else {
-        ++state_.rejected;
+    Frame frame;
+    {
+        std::lock_guard lock(mutex_);
+        if (failure.classification == RequestFailureClass::ClientDisconnected) {
+            ++state_.cancelled;
+        } else {
+            ++state_.rejected;
+        }
+        frame = render_locked();
     }
-    publish_locked();
+    draw(std::move(frame));
 }
 
 void ConsoleStatsPanel::runtime(const infernix::RuntimeStats& current) {
-    std::lock_guard lock(mutex_);
-    if (state_.running == current.running_requests && state_.waiting == current.waiting_requests) {
-        return;
+    Frame frame;
+    {
+        std::lock_guard lock(mutex_);
+        if (state_.running == current.running_requests && state_.waiting == current.waiting_requests) {
+            return;
+        }
+        state_.running = current.running_requests;
+        state_.waiting = current.waiting_requests;
+        frame = render_locked();
     }
-    state_.running = current.running_requests;
-    state_.waiting = current.waiting_requests;
-    publish_locked();
+    draw(std::move(frame));
 }
 
 void ConsoleStatsPanel::show() {
-    std::lock_guard lock(mutex_);
-    publish_locked();
+    Frame frame;
+    {
+        std::lock_guard lock(mutex_);
+        frame = render_locked();
+    }
+    draw(std::move(frame));
 }
 
 ConsoleStatsSnapshot ConsoleStatsPanel::snapshot() const {
@@ -304,11 +330,21 @@ ConsoleStatsSnapshot ConsoleStatsPanel::snapshot() const {
     return state_;
 }
 
-void ConsoleStatsPanel::publish_locked() {
+ConsoleStatsPanel::Frame ConsoleStatsPanel::render_locked() {
     // Without a terminal panel the statistics still accumulate for /metrics?format=json.
-    if (!panel_) { return; }
-    // Publishing under the statistics lock keeps concurrent updates from drawing out of order.
-    panel_->update(render_console_stats_panel(state_));
+    if (!panel_) { return {}; }
+    return {++rendered_, render_console_stats_panel(state_)};
+}
+
+void ConsoleStatsPanel::draw(Frame frame) {
+    if (!panel_ || frame.sequence == 0) { return; }
+    // The terminal write (which a console paused by a selection stalls) holds only the drawing lock: the
+    // statistics stay readable. Frames reach it out of order at most by a race between two updates, and the older
+    // one is then dropped, so the panel always ends at the newest statistics.
+    std::lock_guard lock(draw_mutex_);
+    if (frame.sequence <= drawn_) { return; }
+    drawn_ = frame.sequence;
+    panel_->update(std::move(frame.lines));
 }
 
 } // namespace infernix::serve

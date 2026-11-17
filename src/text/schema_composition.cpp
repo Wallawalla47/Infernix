@@ -156,7 +156,11 @@ private:
                            message + " at " + (path.empty() ? "/" : path), path);
     }
 
-    void expand(const Part& part, std::vector<Part>& output, std::set<std::string> refs = {}) {
+    // `refs`: the references on this path (a cycle); `expanded`: every reference this conjunction expanded. A
+    // reference's parts do not depend on where it is reached, and join drops repeated parts, so each is expanded
+    // once: a schema whose allOf branches share references expands linearly, not once per path (2^depth).
+    void expand(const Part& part, std::vector<Part>& output, std::set<std::string>& expanded,
+                std::set<std::string> refs = {}) {
         if (!part.value.is_object()) {
             output.push_back(part);
             return;
@@ -166,13 +170,14 @@ private:
             const auto ref = own["$ref"].get<std::string>();
             if (!refs.insert(ref).second)
                 fail(part.path, "reference cycle does not descend into a value");
-            expand({source_.at(Json::json_pointer(ref.substr(1))), ref.substr(1)}, output, refs);
+            if (expanded.insert(ref).second)
+                expand({source_.at(Json::json_pointer(ref.substr(1))), ref.substr(1)}, output, expanded, refs);
             own.erase("$ref");
         }
         if (own.contains("allOf")) {
             for (std::size_t i = 0; i < own["allOf"].size(); ++i)
                 expand({own["allOf"][i], child(child(part.path, "allOf"), std::to_string(i))},
-                       output, refs);
+                       output, expanded, refs);
             own.erase("allOf");
         }
         for (auto it = own.begin(); it != own.end();) {
@@ -317,7 +322,8 @@ private:
             fail(incoming.empty() ? "" : incoming[0].path,
                  "schema conjunction exceeds compilation limit");
         std::vector<Part> parts;
-        for (const auto& part : incoming) expand(part, parts);
+        std::set<std::string> expanded;
+        for (const auto& part : incoming) expand(part, parts, expanded);
         std::string key;
         std::set<std::string> seen;
         for (auto it = parts.begin(); it != parts.end();) {

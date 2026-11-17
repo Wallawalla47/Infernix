@@ -112,7 +112,6 @@ void Supervisor::notify() {
 }
 
 void Supervisor::start(const LaunchSpec& spec) {
-    std::uint32_t instance = 0;
     {
         std::lock_guard lock(mutex_);
         if (shutting_down_) { throw std::runtime_error("the launcher is shutting down"); }
@@ -120,6 +119,15 @@ void Supervisor::start(const LaunchSpec& spec) {
             state_.state == InstanceState::Stopping) {
             throw std::logic_error("an instance is already running");
         }
+    }
+    // The previous instance's monitor has recorded its end; its report (the changed callback reads the snapshot, and
+    // handles a failure from it) finishes before this instance replaces the state, so the failure is reported as that
+    // instance's, not as this one's start.
+    if (monitor_.joinable()) { monitor_.join(); }
+    std::uint32_t instance = 0;
+    {
+        std::lock_guard lock(mutex_);
+        if (shutting_down_) { throw std::runtime_error("the launcher is shutting down"); }
         instance          = next_instance_++;
         state_            = {};
         state_.state      = InstanceState::Starting;
@@ -130,16 +138,26 @@ void Supervisor::start(const LaunchSpec& spec) {
         state_.alias        = spec.alias;
         state_.name       = spec.name;
         state_.port       = spec.port;
+        state_.port_retry = spec.port_retry;
         state_.started_at = now_ms();
         state_.phase      = "starting infernix-serve";
         load_verdict_.reset();
+        listening_ = false;
+        // The ready line is an Info record: a --log-level above info hides it, and that server's /health is taken
+        // as before (waiting 30 s for a line that never comes would slow every load).
+        ready_line_expected_ = true;
+        for (std::size_t i = 0; i + 1 < spec.args.size(); ++i) {
+            if (spec.args[i] == "--log-level") {
+                const std::string& level = spec.args[i + 1];
+                ready_line_expected_ = level == "trace" || level == "debug" || level == "info";
+            }
+        }
         state_.argv       = {path_utf8(spec.executable)};
         state_.argv.insert(state_.argv.end(), spec.args.begin(), spec.args.end());
         stop_requested_   = false;
         stop_forced_      = false;
         metrics_          = nullptr;
     }
-    if (monitor_.joinable()) { monitor_.join(); }
     child_.reset();
     logs_.begin_instance(instance, spec.alias);
     logs_.add(instance, "info", "launcher", "loading " + spec.alias + " on port " + std::to_string(spec.port));
@@ -221,7 +239,7 @@ void Supervisor::stop(std::chrono::seconds timeout) {
         if (const auto response = client.Get("/metrics?format=json", headers); response && response->status == 200) {
             try {
                 callbacks_.metrics(Json::parse(response->body));
-            } catch (const Json::exception&) {}
+            } catch (const std::exception&) {} // a reading the launcher cannot use does not hold up the stop
         }
     }
     if (child_ && !child_->exit_code()) {
@@ -272,6 +290,8 @@ void Supervisor::monitor(std::uint32_t instance) {
     std::optional<std::uint64_t> progress;
     // The watchdog's verdict on this instance: its kind and the reason.
     std::optional<std::pair<std::string, std::string>> incident;
+    // When /health first answered 200 while this instance had not yet logged that it listens (its own line).
+    std::optional<Clock::time_point> health_unconfirmed_since;
 
     for (;;) {
         InstanceState state;
@@ -305,7 +325,7 @@ void Supervisor::monitor(std::uint32_t instance) {
                     state_.state    = InstanceState::Failed;
                     state_.error    = error;
                     state_.incident = incident->first;
-                    state_.phase    = "ended by the watchdog";
+                    state_.phase    = incident->first == "cancelled" ? "load cancelled" : "ended by the watchdog";
                 } else {
                     // The last error (or warning) record says why; else the exit status does. A start's
                     // last line says how far it got; a serving server's last line is only its last
@@ -342,7 +362,7 @@ void Supervisor::monitor(std::uint32_t instance) {
                 }
             }
             if (incident) {
-                logs_.add(instance, "error", "launcher", incident->second + "; ending the load");
+                logs_.add(instance, incident->first == "cancelled" ? "info" : "error", "launcher", incident->second + "; ending the load");
                 {
                     std::lock_guard lock(mutex_);
                     state_.phase = "ending the load";
@@ -353,6 +373,22 @@ void Supervisor::monitor(std::uint32_t instance) {
                 continue;
             }
             if (auto response = client.Get("/health"); response && response->status == 200) {
+                // Ready only once this instance logged 'listening on': another program listening on a fixed child
+                // port answers /health too, long before infernix-serve fails to bind it (and exits). A server that
+                // never logs the line (an older build) is taken after 30 s of answers while it runs.
+                bool confirmed = false;
+                {
+                    std::lock_guard lock(mutex_);
+                    confirmed = listening_ || !ready_line_expected_;
+                }
+                if (!confirmed) {
+                    if (!health_unconfirmed_since) { health_unconfirmed_since = Clock::now(); }
+                    if (Clock::now() - *health_unconfirmed_since < std::chrono::seconds(30)) {
+                        std::unique_lock lock(mutex_);
+                        cv_.wait_for(lock, kStartingPoll, [this] { return stop_requested_; });
+                        continue;
+                    }
+                }
                 {
                     std::lock_guard lock(mutex_);
                     if (state_.state == InstanceState::Starting) {
@@ -386,13 +422,13 @@ void Supervisor::monitor(std::uint32_t instance) {
                 unanswered_since.reset();
                 unanswered_polls = 0;
                 reported_idle    = false;
+                Json snapshot;
                 try {
-                    Json snapshot = Json::parse(response->body);
+                    snapshot = Json::parse(response->body);
                     {
                         std::lock_guard lock(mutex_);
                         metrics_ = snapshot;
                     }
-                    if (callbacks_.metrics) { callbacks_.metrics(snapshot); }
                     // A stall: requests in the server, yet nothing processed for the stall timeout. An
                     // idle server (nothing running or waiting) never stalls.
                     const Json live         = snapshot.value("live", Json::object());
@@ -409,6 +445,13 @@ void Supervisor::monitor(std::uint32_t instance) {
                                                  std::to_string(watch.stall_timeout_s) + " s"};
                     }
                 } catch (const Json::exception&) {}
+                // After the stall check and in a try of its own: the launcher's use of a reading (a field of an
+                // unexpected type, say) neither blinds the watchdog nor ends this thread.
+                if (callbacks_.metrics && snapshot.is_object()) {
+                    try {
+                        callbacks_.metrics(snapshot);
+                    } catch (const std::exception&) {}
+                }
             } else {
                 if (!unanswered_since) { unanswered_since = now; }
                 ++unanswered_polls;
@@ -467,6 +510,7 @@ void Supervisor::observe(const LogRecord& record) {
         std::lock_guard lock(mutex_);
         if (record.instance != state_.instance) { return; }
         if (!serve_build_ && record.text.starts_with("build ")) { serve_build_ = record.text.substr(6); }
+        if (record.text.starts_with("listening on ")) { listening_ = true; } // OperationalLog::server_ready
         if (state_.state == InstanceState::Starting && record.level == "info") {
             std::string phase = record.text;
             if (phase.starts_with("engine | ")) { phase.erase(0, 9); }

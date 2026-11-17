@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <utility>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -30,22 +31,33 @@ std::filesystem::path home_dir() {
     return std::filesystem::current_path();
 }
 
+// The memory file, or (when it is missing or not valid JSON) the previous one each save keeps beside it
+// (write_file_atomic's backup), or defaults.
 Json read_json(const std::filesystem::path& path) {
-    const std::optional<std::string> text = read_file(path);
-    if (!text) { return Json::object(); }
-    try {
-        Json value = Json::parse(*text);
-        return value.is_object() ? value : Json::object();
-    } catch (const Json::exception&) {
-        // Keep the unreadable file for the user and start from defaults.
-        std::error_code ignored;
-        std::filesystem::path aside = path;
-        aside += ".unreadable";
-        std::filesystem::rename(path, aside, ignored);
-        std::fprintf(stderr, "launcher: %s was not valid JSON; moved aside, defaults used\n",
-                     path_utf8(path).c_str());
-        return Json::object();
+    if (const std::optional<std::string> text = read_file(path)) {
+        try {
+            Json value = Json::parse(*text);
+            return value.is_object() ? value : Json::object();
+        } catch (const Json::exception&) {
+            // Keep the unreadable file for the user.
+            std::error_code ignored;
+            std::filesystem::path aside = path;
+            aside += ".unreadable";
+            std::filesystem::rename(path, aside, ignored);
+            std::fprintf(stderr, "launcher: %s was not valid JSON; moved aside\n", path_utf8(path).c_str());
+        }
     }
+    const std::filesystem::path backup = backup_path(path);
+    if (const std::optional<std::string> text = read_file(backup)) {
+        try {
+            Json value = Json::parse(*text);
+            if (value.is_object()) {
+                std::fprintf(stderr, "launcher: %s used\n", path_utf8(backup).c_str());
+                return value;
+            }
+        } catch (const Json::exception&) {}
+    }
+    return Json::object();
 }
 
 int clamp_int(const Json& value, int low, int high, int fallback) {
@@ -264,7 +276,7 @@ Store::Store(std::filesystem::path data_dir) : data_dir_(std::move(data_dir)) {
 std::filesystem::path Store::memory_file() const { return data_dir_ / kMemoryFile; }
 
 void Store::load() {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     const Json memory   = read_json(memory_file());
     const Json settings = memory.value("settings", Json::object());
     apply_settings(settings_, settings);
@@ -307,7 +319,7 @@ void Store::load() {
     downloads_ = memory.value("downloads", Json::array());
     if (!downloads_.is_array()) { downloads_ = Json::array(); }
     // First run: write the file so the user can find and back it up.
-    if (!std::filesystem::exists(memory_file())) { save_locked(); }
+    if (!std::filesystem::exists(memory_file())) { save(lock); }
 }
 
 Settings Store::settings() const {
@@ -316,18 +328,19 @@ Settings Store::settings() const {
 }
 
 bool Store::patch_settings(const Json& patch) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     const Settings before = settings_;
     apply_settings(settings_, patch);
-    save_locked();
-    return before.host != settings_.host || before.port != settings_.port || before.cors != settings_.cors ||
-           before.allow_remote_admin != settings_.allow_remote_admin;
+    const bool restart = before.host != settings_.host || before.port != settings_.port || before.cors != settings_.cors ||
+                         before.allow_remote_admin != settings_.allow_remote_admin;
+    save(lock);
+    return restart;
 }
 
 void Store::update_settings(const std::function<void(Settings&)>& change) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     change(settings_);
-    save_locked();
+    save(lock);
 }
 
 std::optional<StoredModelConfig> Store::model_config(const std::string& key) const {
@@ -338,15 +351,15 @@ std::optional<StoredModelConfig> Store::model_config(const std::string& key) con
 }
 
 void Store::put_model_config(const std::string& key, const StoredModelConfig& config) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     models_[key] = config;
-    save_locked();
+    save(lock);
 }
 
 void Store::erase_model_config(const std::string& key) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     models_.erase(key);
-    save_locked();
+    save(lock);
 }
 
 std::vector<std::pair<std::string, StoredModelConfig>> Store::named_configs(const std::string& artifact_key) const {
@@ -362,17 +375,17 @@ std::vector<std::pair<std::string, StoredModelConfig>> Store::named_configs(cons
 }
 
 void Store::add_api_key(const ApiKey& key) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     settings_.api_keys.push_back(key);
-    save_locked();
+    save(lock);
 }
 
 bool Store::remove_api_key(const std::string& id) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     const auto before = settings_.api_keys.size();
     std::erase_if(settings_.api_keys, [&](const ApiKey& key) { return key.id == id; });
     if (settings_.api_keys.size() == before) { return false; }
-    save_locked();
+    save(lock);
     return true;
 }
 
@@ -407,10 +420,10 @@ std::optional<std::string> Store::last_model() const {
 }
 
 void Store::set_last_model(const std::optional<std::string>& key) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (last_model_ == key) { return; }
     last_model_ = key;
-    save_locked();
+    save(lock);
 }
 
 std::string Store::hf_token() const {
@@ -437,13 +450,13 @@ Json Store::downloads() const {
 }
 
 void Store::set_downloads(const Json& jobs) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (downloads_ == jobs) { return; }
     downloads_ = jobs;
-    save_locked();
+    save(lock);
 }
 
-void Store::save_locked() const {
+void Store::save(std::unique_lock<std::mutex>& lock) const {
     Json models = Json::object();
     for (const auto& [key, config] : models_) {
         Json value = {{"listed", config.listed}};
@@ -464,11 +477,39 @@ void Store::save_locked() const {
                          {"models", models},
                          {"last_model", last_model_ ? Json(*last_model_) : Json(nullptr)},
                          {"downloads", downloads_}};
-    try {
-        write_file_atomic(memory_file(), memory.dump(2) + "\n");
-    } catch (const std::exception& error) {
+    // The change stays in memory when it cannot be saved (and is saved again by the next change); the launcher's
+    // event log reports the failure (take_save_failure), since a hidden console shows no one the line printed here.
+    const auto failed = [this](const std::exception& error) {
         std::fprintf(stderr, "launcher: %s\n", error.what());
+        save_failure_ = error.what();
+    };
+    std::string text;
+    try {
+        text = memory.dump(2) + "\n";
+    } catch (const std::exception& error) {
+        failed(error);
+        lock.unlock();
+        return;
     }
+    const std::uint64_t generation = ++generation_;
+    // The disk write (a flush and two renames: milliseconds, seconds while a scanner holds the file) runs with the
+    // lock released, so the settings every request reads never wait for it. Writes go one at a time, and a snapshot
+    // older than the one on disk is not written: the newest change is the one that stays.
+    lock.unlock();
+    std::lock_guard write(write_mutex_);
+    if (generation <= written_generation_) { return; }
+    try {
+        write_file_atomic(memory_file(), text, true);
+        written_generation_ = generation;
+    } catch (const std::exception& error) {
+        std::lock_guard relock(mutex_);
+        failed(error);
+    }
+}
+
+std::optional<std::string> Store::take_save_failure() {
+    std::lock_guard lock(mutex_);
+    return std::exchange(save_failure_, std::nullopt);
 }
 
 } // namespace infernix::launcher

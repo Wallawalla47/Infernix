@@ -122,6 +122,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
 
 void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     const cudaStream_t s = device_.stream;
+    walk_abandon_taps(); // an earlier span's, left by a failure (none after a completed one)
     walk_                = LayerWalk{};
     walk_.lane           = index;
     walk_.first_call     = lane.next_call;
@@ -161,13 +162,20 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.mtp.assign(n, std::nullopt);
     walk_.vision.assign(n, std::nullopt);
     walk_.mtp_vision.assign(n, {});
-    walk_plan_taps(lane);
-    walk_dflash_frontier_ = lane.dflash_frontier;
-    walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
+    // The pinned image first (an allocation that fails under host RAM pressure), then the taps, which open staged
+    // captures: one that fails part-way gives back those it opened.
     if (walk_host_.size() < n * walk_.io_stride) {
         walk_host_     = PinnedHostBuffer(n * walk_.io_stride);
         walk_prefetch_ = WalkPrefetch{};
     }
+    try {
+        walk_plan_taps(lane);
+    } catch (...) {
+        walk_abandon_taps();
+        throw;
+    }
+    walk_dflash_frontier_ = lane.dflash_frontier;
+    walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
     walk_.active = true;
 
     auto* io        = static_cast<std::byte*>(io_device_.p);
@@ -467,23 +475,35 @@ void ProgramImpl::walk_plan_taps(Lane& lane) {
 }
 
 void ProgramImpl::walk_commit_taps(Lane& lane) {
-    for (LayerWalk::Tap& tap : walk_.taps) {
-        if (tap.staged == 0) { continue; }
-        // The blocks up to the tap first, as after its chunk-major call (its anchor is the last).
-        prefix_publish(lane, tap.frontier);
-        const std::uint64_t staged = std::exchange(tap.staged, 0);
-        if (lane.prefix.path.size() < tap.frontier / kBlock) {
-            prefix_->abandon_staged_capture(staged);
-            continue;
+    try {
+        for (LayerWalk::Tap& tap : walk_.taps) {
+            if (tap.staged == 0) { continue; }
+            // The blocks up to the tap first, as after its chunk-major call (its anchor is the last).
+            prefix_publish(lane, tap.frontier);
+            if (lane.prefix.path.size() < tap.frontier / kBlock) {
+                prefix_->abandon_staged_capture(std::exchange(tap.staged, 0));
+                continue;
+            }
+            // Every cell up to the span's end is written (the prompt continues past each inner chunk).
+            prefix::PrefixCache::Capture capture =
+                prefix_capture_at(lane, tap.frontier, tap.kind, false, lane.mtp_live);
+            // Its DFlash2 ring was copied during the span, before the span's context reached the ring.
+            capture.meta.draft_frontier = std::min(capture.meta.draft_frontier, walk_dflash_frontier_);
+            const std::uint64_t id      = capture.id;
+            // The staged image is the capture's from here (commit_staged_capture returns it on its own failure).
+            prefix_->commit_staged_capture(std::exchange(tap.staged, 0), std::move(capture));
+            prefix_captured(lane, id, tap.frontier);
+            prefix_write_through(lane, tap.frontier); // the blocks below it are reachable from a snapshot now
         }
-        // Every cell up to the span's end is written (the prompt continues past each inner chunk).
-        prefix::PrefixCache::Capture capture = prefix_capture_at(lane, tap.frontier, tap.kind, false, lane.mtp_live);
-        // Its DFlash2 ring was copied during the span, before the span's context reached the ring.
-        capture.meta.draft_frontier = std::min(capture.meta.draft_frontier, walk_dflash_frontier_);
-        const std::uint64_t id               = capture.id;
-        prefix_->commit_staged_capture(staged, std::move(capture));
-        prefix_captured(lane, id, tap.frontier);
-        prefix_write_through(lane, tap.frontier); // the blocks below it are reachable from a snapshot now
+    } catch (...) {
+        walk_abandon_taps();
+        throw;
+    }
+}
+
+void ProgramImpl::walk_abandon_taps() noexcept {
+    for (LayerWalk::Tap& tap : walk_.taps) {
+        if (tap.staged != 0) { prefix_->abandon_staged_capture(std::exchange(tap.staged, 0)); }
     }
 }
 
@@ -757,15 +777,16 @@ PrefillProgress ProgramImpl::pair_step(Lane& lane, std::uint32_t index, Clock::t
 }
 
 void ProgramImpl::walk_abandon() noexcept {
-    if (!walk_.active) { return; }
+    if (!walk_.active) {
+        walk_abandon_taps(); // a span that failed before it began or while it committed its taps
+        return;
+    }
     try {
         device_.synchronize();
     } catch (...) {}
     // The walk's copies of layers it never reached are still landing in the ring: the ring goes back after them.
     expert_stream_->end(device_.stream);
-    for (const LayerWalk::Tap& tap : walk_.taps) {
-        if (tap.staged != 0) { prefix_->abandon_staged_capture(tap.staged); }
-    }
+    walk_abandon_taps();
     walk_          = LayerWalk{};
     walk_prefetch_ = WalkPrefetch{};
 }

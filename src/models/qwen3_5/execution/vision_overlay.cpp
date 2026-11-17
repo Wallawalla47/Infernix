@@ -78,6 +78,10 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
     }
     std::byte* lease = staging + vision_staging_align(assets.layout.staging_bytes);
 
+    // Declared before the guard, so on a failure it is destroyed after the guard's device synchronize: an item's
+    // queued copy into its pinned buffer has landed before the buffer is freed.
+    std::vector<PinnedVisionResult> results;
+
     struct RestoreGuard {
         EvictableWeightPool* pool;
         VisionWindowSource* window;
@@ -105,7 +109,6 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
 
     const DeviceSpan lease_span{lease, window_plan.capacity_bytes};
 
-    std::vector<PinnedVisionResult> results;
     std::size_t staged_bytes = 0;
     {
         VisionWeightStream stream(device, assets, staging);

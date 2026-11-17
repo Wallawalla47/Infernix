@@ -182,6 +182,9 @@ void test_jpeg_references() {
 // equals Pillow's pixels, alpha dropped as most engines drop it (llama.cpp, Ollama, LMDeploy, mlx-vlm, TGI; vLLM,
 // SGLang and TensorRT-LLM composite instead): lossy WebP through libwebp's upsampling and conversion, PNG through
 // the native decoder where the build has it, the rest through FFmpeg.
+void expect_error(std::span<const std::uint8_t> encoded, const infernix::media::decode::Policy& policy,
+                  infernix::media::decode::ErrorKind kind);
+
 void test_webp_gif_references() {
     std::string failures;
     for (const auto& fixture : webp_gif_fixtures::cases) {
@@ -218,6 +221,11 @@ void test_webp_gif_references() {
             worst = std::max(worst, std::abs(static_cast<int>(image.rgb[i]) - static_cast<int>(expected[i])));
         }
         if (worst != 0) { failures += " " + name + " (largest channel difference " + std::to_string(worst) + ")"; }
+        // One pixel under the image's own count is refused as over the budget (audit 2026-11-17 SV-05: the FFmpeg
+        // decoders now meet the budget before they allocate a frame, from the declared size and the codec's limit).
+        expect_error(encoded,
+                     {.max_decoded_pixels = static_cast<std::uint64_t>(fixture.width) * fixture.height - 1},
+                     infernix::media::decode::ErrorKind::BudgetExceeded);
     }
     if (!failures.empty()) { throw std::runtime_error("RGB differs from Pillow's:" + failures); }
 }
@@ -557,6 +565,43 @@ void test_png_row_width_guard() {
     }
 }
 
+// IHDR (colour type, bit depth) pairs outside the PNG specification's five legal sets are refused at the header,
+// before any sample is read: bit depth 32 used to reach to8's (1 << 32) - 1 divisor (zero: the process died), and
+// depths 3, 5, 6 and 7 the sample reader's negative shifts. A 1x1 image with a valid one-byte IDAT for each.
+void test_png_illegal_bit_depth() {
+    using namespace infernix::media::decode;
+    const auto image = [](std::uint8_t depth, std::uint8_t colour) {
+        // zlib stream of the two raw bytes {filter 0, sample 0} (stored block), enough for a 1x1 8-bit gray image.
+        return std::vector<std::uint8_t>{
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR, 13 bytes
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1 x 1
+            depth, colour, 0x00, 0x00, 0x00,                // depth, colour type, methods
+            0x00, 0x00, 0x00, 0x00,                         // CRC (not validated)
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, // IDAT, 13 bytes
+            0x78, 0x01, 0x01, 0x02, 0x00, 0xfd, 0xff, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,                         // CRC
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0x00, 0x00, 0x00, 0x00, // IEND
+        };
+    };
+    struct Pair {
+        std::uint8_t depth, colour;
+    };
+    for (const Pair p : {Pair{32, 0}, Pair{3, 0}, Pair{5, 0}, Pair{6, 0}, Pair{7, 0}, Pair{0, 0}, Pair{16, 3},
+                         Pair{4, 2}, Pair{1, 6}, Pair{2, 4}, Pair{8, 5}}) {
+        const auto png = image(p.depth, p.colour);
+        const std::string label =
+            "png colour type " + std::to_string(p.colour) + " depth " + std::to_string(p.depth);
+        expect_throws_invalid([&] { decode_png(png, 64); }, (label + " decode").c_str());
+        expect_throws_invalid([&] { (void)png_image_info(png, 64); }, (label + " info").c_str());
+    }
+    // The same bytes at a legal pair decode.
+    const Image gray = decode_png(image(8, 0), 64);
+    if (gray.width != 1 || gray.height != 1 || gray.rgb.size() != 3) {
+        throw std::runtime_error("png legal 1x1 gray8 did not decode");
+    }
+}
+
 #endif // INFERNIX_MEDIA_NATIVE_PNG
 
 } // namespace
@@ -573,6 +618,7 @@ int main() {
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
         test_png_decoders();
         test_png_row_width_guard();
+        test_png_illegal_bit_depth();
 #endif
         std::cout << "ok\n";
         return 0;

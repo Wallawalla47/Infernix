@@ -121,9 +121,11 @@ private:
     [[nodiscard]] std::optional<std::string> alias_owner(const std::string& alias) const;
     // POST /scripts/import: the script's server commands, matched to the library.
     [[nodiscard]] Json import_script_json(const std::string& text, const std::string& file_name) const;
-    // POST /models/{id}/plan: infernix-serve --plan for these parameters, as a FitPlan.
+    // POST /models/{id}/plan: infernix-serve --plan for these parameters, as a FitPlan; a plan not
+    // finished within `timeout` is reported as not finished.
     [[nodiscard]] Json fit_plan_json(const std::string& config_id, const ScannedModel& model, const Args& args,
-                                     const EnvVars& env) const;
+                                     const EnvVars& env,
+                                     std::chrono::milliseconds timeout = std::chrono::minutes(3)) const;
     [[nodiscard]] std::string effective_alias(const std::string& config_id, const ScannedModel& model,
                                               const LibraryScan& scan) const;
     // Not under the library lock: it may run --help and looks for the files the arguments name.
@@ -136,7 +138,10 @@ private:
     // Model lifecycle and the watchdog's incidents.
     Router::Loaded load_model(const std::string& key);
     [[nodiscard]] Json instance_json() const;
+    // Each takes its snapshot and publishes it in one step (threads publishing at once never publish an older state
+    // after a newer one, which the UI would show until the next change).
     void publish_instance();
+    void publish_library();
     void on_instance_changed(const InstanceSnapshot& snapshot);
     void handle_incident(const InstanceSnapshot& snapshot);
     // A load that did not fit ("vram" or "ram"): the error and the launch-parameter changes to try.
@@ -242,10 +247,9 @@ private:
     // Publishes the new log and event records to the web UI and writes the server's log file, every
     // 150 ms until stop() has ended everything that logs.
     void flush_logs_loop();
-    // A line for the launcher's console, printed in order by console_loop(): a console that does not
+    // A line for the launcher's console, printed in order by the console writer: a console that does not
     // take output (a QuickEdit selection holds it) delays only that thread.
     void print_console(std::string line);
-    void console_loop();
     void toast(const std::string& level, const std::string& message);
     [[nodiscard]] Json state_json() const;
     [[nodiscard]] Json hf_files_json(const std::string& repo) const;
@@ -260,6 +264,7 @@ private:
     Store store_;
     EventLog event_log_;
     LogBuffer logs_;
+    std::mutex log_dir_mutex_; // apply_log_dir: the compare, the member and both set_dir calls
     std::filesystem::path applied_log_dir_;
     EventHub events_;
     EventHub model_events_; // llama.cpp's /models/sse
@@ -289,10 +294,18 @@ private:
     std::vector<EventRecord> pending_events_;
     std::atomic<bool> stop_flushing_{false};
 
-    std::mutex console_mutex_;
-    std::condition_variable console_cv_;
-    std::vector<std::string> console_lines_;
-    bool console_stopping_ = false;
+    // The console writer's queue, shared with its thread: stop() waits for it a few seconds and then leaves it (a
+    // console held by a QuickEdit selection would otherwise hold up the exit), and the thread keeps the queue alive.
+    struct ConsoleQueue {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<std::string> lines;
+        bool stopping = false;
+        bool done     = false; // the writer printed everything and ended
+    };
+    // The writer: touches only its queue and stdout.
+    static void console_loop(const std::shared_ptr<ConsoleQueue>& queue);
+    std::shared_ptr<ConsoleQueue> console_ = std::make_shared<ConsoleQueue>();
 
     // The instance transitions already reported, the latest incident and the recent restarts.
     mutable std::mutex incident_mutex_;
@@ -312,12 +325,15 @@ private:
     std::unique_ptr<InfernixUpdate> infernix_update_;
 
     std::atomic<bool> restart_required_{false};
-    // load_model's current start may be retried on another port (an automatic port, attempts left).
-    std::atomic<bool> port_retry_allowed_{false};
     std::atomic<bool> stopping_{false};
     std::mutex stop_mutex_;
     bool stopped_ = false;
     std::thread scanner_;
+    std::thread autoloader_; // settings.autoload: loads the model once the first scan has found it
+    std::mutex publish_instance_mutex_; // publish_instance (taken with no other launcher lock held)
+    std::mutex publish_library_mutex_;  // publish_library (likewise)
+    std::mutex install_stopper_mutex_;
+    std::thread install_stopper_; // POST /infernix/install: stops the server after the answer went out
     std::thread log_flusher_;
     std::thread console_writer_;
     httplib::Server server_;

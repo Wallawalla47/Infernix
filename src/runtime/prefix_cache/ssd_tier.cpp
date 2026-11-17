@@ -619,6 +619,10 @@ void SsdTier::start_write_backs(PrefixCacheIndex& index) {
                 for (const std::byte* source : sources) {
                     offset += encode_slab(source, slab_bytes_, added.staging.get() + offset);
                 }
+                // The stream's last slab is written whole: its bytes past the stream are zeros, not what the
+                // recycled staging buffer held (an earlier stream), so the file's bytes follow from its content.
+                const std::size_t written = (offset + slab_bytes_ - 1U) / slab_bytes_ * slab_bytes_;
+                std::memset(added.staging.get() + offset, 0, written - offset);
                 added.stream_bytes = offset;
                 codec_done(tag);
             });
@@ -676,7 +680,9 @@ SsdTier::Promotion SsdTier::promote(PrefixCacheIndex& index, SnapshotRef snapsho
         } catch (const std::exception& error) {
             ++counters_.read_failures;
             last_error_ = error.what();
-            index.abort_ssd_promotion(entry->job);
+            // Nothing was read, so nothing on the SSD is damaged: the entry keeps its SSD copies (abort_ssd_promotion
+            // would drop them, and with them an SSD-only snapshot and every prefix resuming through it).
+            index.cancel_ssd_promotion(entry->job);
             give_staging(std::move(entry->staging));
             return Promotion::Unavailable;
         }

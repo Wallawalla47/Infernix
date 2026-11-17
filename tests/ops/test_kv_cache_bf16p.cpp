@@ -361,6 +361,9 @@ void compare(Pair& pair, std::size_t outputs, const std::vector<double>& oracle,
         const std::size_t bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
             pair.geometry, cache.storage, envelope_of(pair, split), batch, width, width, execution);
         DeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
+        // Workspace an earlier call left behind (finite positive floats, 0x3F3F3F3F): a partial slot no CTA of this
+        // call publishes would be merged with weight.
+        scratch.fill(0x3F);
         WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
         DeviceBuffer out(outputs * 2);
         out.fill(0x7F);
@@ -570,6 +573,12 @@ void run_long(int q_heads, int kv_heads, DeviceExecutionView execution) {
     fill(pair, 0, 16700, 40);
     cached(pair, 0, 16400, 280, false, 41, g + "cached 280 over two segments", execution);
     cached(pair, 0, 16200, 280, true, 42, g + "cached 280 over two segments, prompt split", execution);
+    // A first chunk over two segments with the prompt split: the first query tiles have fewer key blocks than
+    // splits, so some splits are empty in every segment and must still publish their neutral partials.
+    cached(pair, 0, 0, 300, true, 48, g + "cached 300 from position 0 over two segments, prompt split", execution);
+    // The same two split calls without the prompt split (same queries): split and unsplit each meet the oracle.
+    cached(pair, 0, 16200, 280, false, 42, g + "cached 280 over two segments, the split call unsplit", execution);
+    cached(pair, 0, 0, 300, false, 48, g + "cached 300 from position 0 over two segments, unsplit", execution);
     append_attend(pair, 280, {0}, {16700}, {}, {}, false, 43, g + "prompt 280 over two segments", execution);
     append_attend(pair, 1, {0}, {16980}, {}, {}, false, 44, g + "decode", execution);
     append_attend(pair, 4, {0}, {16981}, {}, {}, false, 45, g + "4 columns", execution);

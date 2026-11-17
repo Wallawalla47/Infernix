@@ -898,7 +898,12 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             }
         }
     }
-    if constexpr (Tile::kVq) { cp_wait<0>(); } // the codebook copy of a split without tiles
+    if constexpr (Tile::kVq) {
+        // The codebook copy of a split without tiles was never committed (issue() commits it with the first tile),
+        // and wait_group waits only on committed groups: commit, then wait, so no copy outlives the CTA.
+        cp_commit();
+        cp_wait<0>();
+    }
 }
 
 __global__ void merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
@@ -1291,6 +1296,8 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         commit();
         return;
     }
+    // gridDim.z holds 65,535 blocks: a wider call takes the prompt route (every shipped geometry has it).
+    require(columns <= kMaxGridRows, "a call of more than 65,535 columns needs the prompt route");
     const dim3 grid(splits, geometry.kv_heads, columns);
     // A column attends to at most budget + ratio - 1 tokens (dense below the budget, selected blocks
     // and the open block above it), so this bounds every split's tiles.

@@ -304,6 +304,14 @@ int test_schema_number_precision() {
          ""},
         {R"({"response_format":{"json_schema":{"schema":{"type":"number","default":0.10000000000000001,"minimum":0.1}}}})",
          ""},
+        // A repeated key: its last value is the one the DOM keeps, so an inexact earlier one (and its subtree's) no
+        // longer counts, and an inexact later one does.
+        {R"({"response_format":{"json_schema":{"schema":{"type":"number","minimum":0.10000000000000001,"minimum":0.1}}}})",
+         ""},
+        {R"({"response_format":{"json_schema":{"schema":{"type":"number","minimum":{"x":0.10000000000000001},"minimum":0.1}}}})",
+         ""},
+        {R"({"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"number","minimum":0.1,"minimum":0.10000000000000001}}}})",
+         "response_format.json_schema.schema/minimum"},
     };
     for (const auto& [body, expected] : cases) {
         httplib::Request request;
@@ -317,6 +325,21 @@ int test_schema_number_precision() {
                           error.error().param == expected,
                       "schema precision error lost its protocol location");
         }
+    }
+    // 100,000 inexact numbers and as many scalars after them (~4 MB, audit 2026-11-17 SV-03): each later scalar used to
+    // scan every recorded number (an allocation each), minutes of a handler thread; now a range of a sorted set.
+    {
+        std::string body = R"({"x":[)";
+        for (int i = 0; i < 100000; ++i) { body += (i == 0 ? "" : ",") + std::string("0.1000000000000000000001"); }
+        body += R"(],"y":[)";
+        for (int i = 0; i < 100000; ++i) { body += (i == 0 ? "\"s\"" : ",\"s\""); }
+        body += "]}";
+        httplib::Request request;
+        request.body       = body;
+        const auto started = std::chrono::steady_clock::now();
+        (void)infernix::serve::parse_json_body(request);
+        failures += check(std::chrono::steady_clock::now() - started < std::chrono::seconds(10),
+                          "a body of many inexact numbers parsed in quadratic time");
     }
     return failures;
 }

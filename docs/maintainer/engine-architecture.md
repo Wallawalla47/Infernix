@@ -454,7 +454,7 @@ fault may have published into. Qwen3.5's execution paths clear a failed unit's l
 others as `abort` does and keeps its cache; it refuses while a pending batch exists. The eighth such
 recovery with no successful unit since the first, or a Program that refuses, fails everything instead.
 The no-progress watch's heal (YJ-02) uses the same recovery without a binding in flight, which it
-leaves as it is. A service or read thread that has itself stopped makes every later unit fail, so the
+leaves as it is and tries again after another interval (it was tried once and never again). A service or read thread that has itself stopped makes every later unit fail, so the
 Program reports that as an ordinary (fatal) error with its cause. Every other CUDA error is never
 recoverable: the context state is unknown, and `CUDA_CHECK` aborts. Startup turns an out-of-memory
 error into a failed start (a CUDA Graph's, `GraphMemoryExhausted`, first retries with a smaller

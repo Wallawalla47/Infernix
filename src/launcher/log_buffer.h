@@ -3,7 +3,7 @@
 // The console log shown on the dashboard: infernix-serve's output split into records (its
 // `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message` lines parsed, other lines kept as raw), interleaved with
 // the launcher's own records, in a bounded ring with increasing sequence numbers. Each server
-// instance's output is also written to `serve-<time>-<model>.log` in the server-log folder: the
+// instance's output is also written to `serve-<time>-<run>-<model>.log` in the server-log folder: the
 // reader only queues it, and write_files() (one writer thread) writes it, so a slow disk never holds
 // up the server's output pipe.
 

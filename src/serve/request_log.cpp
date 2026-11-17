@@ -31,6 +31,11 @@ namespace {
 
 using Json = nlohmann::json;
 
+// One JSONL record. A string that is not UTF-8 (an argv or a path in the Windows ANSI code page, an exception's
+// text) is written with U+FFFD in place of its bad bytes: a strict dump throws, which aborted the startup record
+// and leaked out of the request failure path.
+std::string dump_record(const Json& record) { return record.dump(-1, ' ', false, Json::error_handler_t::replace); }
+
 // The log is a text-mode stream: each '\n' is written as "\r\n" on Windows.
 #ifdef _WIN32
 constexpr std::uint64_t kLineTerminatorBytes = 2;
@@ -656,7 +661,7 @@ std::string format_server_start_json(
     record["config"] =
         options.config_path ? Json{{"path", *options.config_path}, {"arguments", options.config_arguments}}
                             : Json(nullptr);
-    return record.dump();
+    return dump_record(record);
 }
 
 std::string
@@ -680,7 +685,7 @@ format_request_scheduling_json(const std::string& server_instance_id,
                  {"request_decode_tokens", observation.request_decode_tokens},
                  {"request_replayed_tokens", observation.request_replayed_tokens},
     };
-    return record.dump();
+    return dump_record(record);
 }
 
 std::string format_request_start_json(const std::string& server_instance_id,
@@ -688,7 +693,7 @@ std::string format_request_start_json(const std::string& server_instance_id,
     Json record                   = event_base(server_instance_id, timestamp, "request_start");
     record["request"]             = request_json(context);
     record["preparation_seconds"] = preparation_json(context);
-    return record.dump();
+    return dump_record(record);
 }
 
 std::string format_request_rejected_json(const std::string& server_instance_id,
@@ -698,7 +703,7 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
     record["phase"]   = "prepare";
     record["request"] = rejected_request_json(context);
     record["error"]   = error_json(context.error);
-    return record.dump();
+    return dump_record(record);
 }
 
 namespace {
@@ -766,7 +771,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
     if (outcome.prefix_miss_diagnostic_failed) {
         record["prefix_miss_diagnostic_failed"] = true;
     }
-    return record.dump();
+    return dump_record(record);
 }
 
 std::string format_request_error_json(const std::string& server_instance_id,
@@ -775,7 +780,7 @@ std::string format_request_error_json(const std::string& server_instance_id,
     Json record       = event_base(server_instance_id, timestamp, "request_error");
     record["request"] = request_json(context);
     record["error"]   = Json{{"message", message}};
-    return record.dump();
+    return dump_record(record);
 }
 
 std::string format_throughput_json(const std::string& server_instance_id, std::uint64_t timestamp,
@@ -993,7 +998,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     } else {
         record["gpu"] = nullptr;
     }
-    return record.dump();
+    return dump_record(record);
 }
 
 ServerLogEnvironment query_server_log_environment(int device) {
@@ -1155,16 +1160,27 @@ std::string JsonlRequestLog::rotate_locked() {
     if (rotation_.keep == 0) {
         std::filesystem::remove(path_, error);
     } else {
-        // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire PATH.
-        for (std::uint32_t index = rotation_.keep - 1; index >= 1; --index) {
-            std::error_code shift_error;
-            if (!std::filesystem::exists(rotated_path(index), shift_error)) { continue; }
-            std::filesystem::remove(rotated_path(index + 1), shift_error);
-            std::filesystem::rename(rotated_path(index), rotated_path(index + 1), shift_error);
+        // The step that fails (another process holding PATH open without delete sharing, on Windows) comes
+        // first: PATH moves aside before any retained file is touched, so a failed rotation loses nothing (it
+        // used to shift and delete the oldest, and with keep 1 the only retained file, at every attempt).
+        const std::string staged = path_ + ".rotating";
+        std::filesystem::rename(path_, staged, error);
+        if (!error) {
+            // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire the moved PATH.
+            for (std::uint32_t index = rotation_.keep - 1; index >= 1; --index) {
+                std::error_code shift_error;
+                if (!std::filesystem::exists(rotated_path(index), shift_error)) { continue; }
+                std::filesystem::remove(rotated_path(index + 1), shift_error);
+                std::filesystem::rename(rotated_path(index), rotated_path(index + 1), shift_error);
+            }
+            std::error_code remove_error;
+            std::filesystem::remove(rotated_path(1), remove_error);
+            std::filesystem::rename(staged, rotated_path(1), error);
+            if (error) { // keep appending to it under its own name
+                std::error_code back_error;
+                std::filesystem::rename(staged, path_, back_error);
+            }
         }
-        std::error_code remove_error;
-        std::filesystem::remove(rotated_path(1), remove_error);
-        std::filesystem::rename(path_, rotated_path(1), error);
     }
     std::string warning;
     if (error) {

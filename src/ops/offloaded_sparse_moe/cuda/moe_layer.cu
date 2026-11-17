@@ -661,13 +661,17 @@ __device__ __forceinline__ float route_value(unsigned key) {
 // Every array index is a compile-time constant (unrolled loops), so the values stay in registers;
 // the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id. Each
 // selection's warp step is two hardware reductions (redux.sync) instead of a five-step shuffle tree:
-// the largest key, then the lowest id among the lanes holding it, which is the tree's winner (a lane's
-// candidate is never NaN: NaN logits are never selected, as before). A selected -0 is returned as +0,
-// which changes no weight. A lane's own arg-max is a depth-4 tree over its 16 candidates' keys (on a tie
-// the lower index, so the lower id, wins; NaN and e >= experts take key 0, below every candidate, and a
-// lane left with none offers -inf and id 0x7FFFFFFF): the 16-step compare chain it replaced took ~7,400
-// of the fused route kernel's ~24,000 cycles at decode widths (2026-10-29). Each lane computes its own
-// softmax term once; the sum still adds the terms in selection order.
+// the largest key, then the lowest id among the lanes holding it, which is the tree's winner. A NaN logit
+// ranks as -inf (key kNegInfKey: below every number, tied with -inf by id), so a column of NaN logits
+// (a blown-up hidden state) still selects top_k real experts, at NaN weights, and every id stays below
+// `experts`; a selected expert takes key 0 and is never selected again. Finite logits select as before.
+// A selected -0 is returned as +0, which changes no weight. A lane's own arg-max is a depth-4 tree over
+// its 16 candidates' keys (on a tie the lower index, so the lower id, wins; e >= experts ranks as -inf too,
+// and loses every tie to a real expert, whose id is lower: top_k <= experts never reaches it; selected
+// experts take key 0, below every candidate, and a lane left with none offers -inf and id 0x7FFFFFFF,
+// which loses to any lane holding a candidate: top_k <= experts leaves one): the 16-step compare chain it
+// replaced took ~7,400 of the fused route kernel's ~24,000 cycles at decode widths (2026-10-29). Each
+// lane computes its own softmax term once; the sum still adds the terms in selection order.
 __device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                             bool bf16_logits, std::int32_t* __restrict__ ids,
                                             float* __restrict__ weights, float* __restrict__ shared_gate) {
@@ -684,10 +688,12 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
     const float score = lane == 0 ? router_logit(column[experts], bf16_logits) : 0.0F;
     constexpr unsigned kNegInfKey = 0x007FFFFFU; // route_key(-INFINITY)
     unsigned key[kPerLane];
+    // The keys once every logit is loaded, one select each: a NaN logit (and e >= experts, loaded as -inf) ranks as
+    // -inf. Mapping NaN on the loaded values (fmaxf beside each load) had the compiler reuse each load's register
+    // at once, so the 16 loads waited for one another, and keeping the experts bound in this select spilled its 16
+    // predicates (P2R): the decode route kernel took 7.8 % longer (10.7 against 9.9 us under ncu).
 #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        key[i] = lane + 32 * i < experts && !isnan(values[i]) ? route_key(values[i]) : 0U;
-    }
+    for (int i = 0; i < kPerLane; ++i) { key[i] = isnan(values[i]) ? kNegInfKey : route_key(values[i]); }
     // Lane k keeps the k-th selection.
     float selected = -INFINITY;
     int chosen     = 0;
@@ -720,7 +726,7 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
         }
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { key[i] = kNegInfKey; }
+            if (lane + 32 * i == best_id) { key[i] = 0U; }
         }
     }
     // softmax over all experts then renormalized over the selected ones equals the softmax of the
@@ -750,7 +756,9 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
 // without a slot is cleared and skipped, so the restricted selection is the top_k experts with a slot in that
 // order, and its weights are route_column's arithmetic over them. Whether a pick has a slot comes from its
 // owner lane's bit mask (one shuffle; the table is read once, coalesced), and the selected experts' slots are
-// read after the walk. The first top_k picks, slot or not, are the column's demand.
+// read after the walk. The first top_k picks, slot or not, are the column's demand. As there, a NaN logit
+// ranks as -inf and a pick is never picked again (its key becomes 0, below every candidate), so every pick is
+// a real expert: `experts` picks walk each expert once.
 __device__ __forceinline__ void route_pooled_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                                     bool bf16_logits, const std::int32_t* __restrict__ slot_of,
                                                     std::int32_t* __restrict__ demand, std::int32_t* __restrict__ ids,
@@ -767,25 +775,31 @@ __device__ __forceinline__ void route_pooled_column(const float* __restrict__ lo
         if (e < experts && __ldg(slot_of + e) >= 0) { pooled |= 1U << i; }
     }
     const float score = lane == 0 ? router_logit(column[experts], bf16_logits) : 0.0F;
+    // route_column's keys, after every load: a NaN logit (and e >= experts, loaded as -inf) ranks as -inf
+    // (kNegInfKey), a pick takes key 0, below every candidate. A lane's ties keep the lower id (its experts are
+    // walked in id order), so e >= experts loses every tie to a real expert and `experts` picks never reach it.
+    constexpr unsigned kNegInfKey = 0x007FFFFFU; // route_key(-INFINITY)
+    unsigned key[kPerLane];
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) { key[i] = isnan(values[i]) ? kNegInfKey : route_key(values[i]); }
     float selected = -INFINITY;
     int chosen     = -1; // lane k: the k-th selected expert
     int wish       = -1; // lane k: the k-th unrestricted pick
     int taken      = 0;
     for (int pick = 0; taken < top_k && pick < experts; ++pick) {
-        float best  = -INFINITY;
-        int best_id = 0x7FFFFFFF;
+        unsigned best_key = 0U;
+        int best_id       = 0x7FFFFFFF;
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
-            const int e = lane + 32 * i;
-            if (e < experts && (values[i] > best || (values[i] == best && e < best_id))) {
-                best    = values[i];
-                best_id = e;
+            if (key[i] > best_key) {
+                best_key = key[i];
+                best_id  = lane + 32 * i;
             }
         }
-        const unsigned top_key = __reduce_max_sync(0xFFFFFFFFU, route_key(best));
-        best_id = static_cast<int>(__reduce_min_sync(
-            0xFFFFFFFFU, route_key(best) == top_key ? static_cast<unsigned>(best_id) : 0x7FFFFFFFU));
-        best    = route_value(top_key);
+        const unsigned top_key = __reduce_max_sync(0xFFFFFFFFU, best_key);
+        best_id = static_cast<int>(
+            __reduce_min_sync(0xFFFFFFFFU, best_key == top_key ? static_cast<unsigned>(best_id) : 0x7FFFFFFFU));
+        const float best = route_value(top_key);
         if (lane == pick) { wish = best_id; }
         const unsigned owner = __shfl_sync(0xFFFFFFFFU, pooled, best_id % 32);
         if ((owner >> (best_id / 32)) & 1U) {
@@ -797,7 +811,7 @@ __device__ __forceinline__ void route_pooled_column(const float* __restrict__ lo
         }
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
+            if (lane + 32 * i == best_id) { key[i] = 0U; }
         }
     }
     const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
@@ -3288,7 +3302,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const int pass_jobs = source.staging_slots > 0
                               ? std::min(source.one_pass ? static_cast<int>(max_jobs) : source.staging_slots, kMaxPassJobs)
                               : max_jobs;
-    const int half      = source.staging_slots / 2;
+    // An overlapped pass stages into the kernel's per-pass shared lists too: at most kMaxPassJobs jobs.
+    const int half      = std::min(source.staging_slots / 2, kMaxPassJobs);
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
     const bool use_wide = !ggml && !nvfp4_a8 && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);

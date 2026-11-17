@@ -147,15 +147,24 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
     }
     require_nonoverlap(candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
                        successor_codebook, base_positions, configs, drafts, proposal_q);
-    for (const Tensor* written : std::initializer_list<const Tensor*>{
-             &column_candidates, &tree_rows, &tree_masks, &valid_columns}) {
-        const Range range{written->data, written->bytes(), "output"};
-        for (const Tensor* other :
-             std::initializer_list<const Tensor*>{&candidate_ids, &drafts, &proposal_q,
-                                                  &base_positions, &anchors, &current_extents}) {
-            if (overlaps(range, Range{other->data, other->bytes(), "operand"})) {
-                throw std::invalid_argument("candidate_selector_tree: outputs overlap operands");
-            }
+    // Every written tensor against every operand, the configs and each other (as candidate_tree checks).
+    const std::array<const Tensor*, 8> operands{&candidate_ids,        &unary_scores,       &projected_hidden,
+                                                &anchors,              &predecessor_codebook, &successor_codebook,
+                                                &base_positions,       &current_extents};
+    const std::array<const Tensor*, 6> outputs{&drafts,    &column_candidates, &proposal_q,
+                                               &tree_rows, &tree_masks,        &valid_columns};
+    const Range config_range{configs, static_cast<std::size_t>(batch_size) * sizeof(SamplingConfig), "configs"};
+    for (std::size_t first = 0; first < outputs.size(); ++first) {
+        const Range range{outputs[first]->data, outputs[first]->bytes(), "output"};
+        bool overlap = overlaps(range, config_range);
+        for (const Tensor* other : operands) {
+            overlap = overlap || overlaps(range, Range{other->data, other->bytes(), "operand"});
+        }
+        for (std::size_t second = first + 1; second < outputs.size(); ++second) {
+            overlap = overlap || overlaps(range, Range{outputs[second]->data, outputs[second]->bytes(), "output"});
+        }
+        if (overlap) {
+            throw std::invalid_argument("candidate_selector_tree: outputs overlap each other or an operand");
         }
     }
     auto scope         = workspace.scope();

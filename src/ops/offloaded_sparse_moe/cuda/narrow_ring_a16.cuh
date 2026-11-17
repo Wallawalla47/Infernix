@@ -245,12 +245,20 @@ __global__ void __launch_bounds__(kRingThreads, kRingMinBlocksPerSm) narrow_ring
             if (t.down != 0) {
                 // The job's h is encoded once all its gate/up tasks are done (they were taken before any
                 // down task, so no CTA waits on work queued behind its own).
-                // Bounded (MoeExpertSource::down_ready_timeout_ns): a defect fails the call through its error
-                // word, never hangs the stream; a ready job costs one acquire load, as before.
+                // Bounded (MoeExpertSource::down_ready_timeout_ns) from the job's last progress, as wait_job_count
+                // is: each gate/up task that finishes (job_done) restarts the bound, so a GPU time-sliced with
+                // another process stalls without failing every request, while a defect (no task finishing) still
+                // fails the call through its error word, never hangs the stream. A ready job costs one acquire
+                // load, as before.
                 if (ctid == 0 && ring_load_acquire(&a.job_ready[t.job]) == 0U) {
-                    const std::uint64_t entered = global_ns();
+                    std::uint32_t seen     = ring_load_acquire(&a.job_done[t.job]);
+                    std::uint64_t entered  = global_ns();
                     do {
-                        if (global_ns() - entered > a.source.down_ready_timeout_ns) {
+                        const std::uint32_t done = ring_load_acquire(&a.job_done[t.job]);
+                        if (done != seen) {
+                            seen    = done;
+                            entered = global_ns();
+                        } else if (global_ns() - entered > a.source.down_ready_timeout_ns) {
                             report_error(a.source, offloaded_moe::kErrorDownStalled);
                             break;
                         }

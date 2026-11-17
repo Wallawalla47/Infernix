@@ -101,7 +101,7 @@ __launch_bounds__(Packed ? S::kThreads + 32 * kBf16pProducerWarps<S> : S::kLaunc
     }
     const int split = slot.split, batch = slot.row;
     const int row_begin = tile * M, packed_rows = width * G::GroupSize;
-    const int live = Masked ? validity[batch] : width;
+    const int live = Masked ? min(validity[batch], width) : width; // as the int8/fp8 kernels and the metadata clamp
     q += static_cast<std::int64_t>(batch) * width * D * G::QHeads;
     positions += batch * width;
     if constexpr (Input::writes_cache) {

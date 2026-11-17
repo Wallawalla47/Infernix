@@ -197,6 +197,16 @@ void require_split_destinations(std::initializer_list<const Tensor*> others, con
     }
 }
 
+// The contiguous forms' one destination: the kernels take it __restrict__ and publish states while they write it.
+void require_destination(std::initializer_list<const Tensor*> others, const Tensor& out) {
+    require_accessible(out, "out");
+    for (const Tensor* other : others) {
+        if (other->data != nullptr && overlaps(out, *other)) {
+            throw std::invalid_argument("causal_conv1d: out must not overlap an operand");
+        }
+    }
+}
+
 // The prefill split route reads and writes __nv_bfloat162. The requirement is stated uniformly for
 // the entry rather than per route, so a caller does not have to know which route its column count
 // selects.
@@ -446,7 +456,7 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                   snapshot_base_slots)) {
         return;
     }
-    require_accessible(out, "out");
+    require_destination({&x, &weight, &conv_states, &valid_columns, &initial_state_slots, &snapshot_base_slots}, out);
     detail::causal_conv1d_snapshot_launch(x, weight, conv_states, valid_columns,
                                           initial_state_slots, snapshot_base_slots, out, stream);
 }
@@ -477,7 +487,7 @@ void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
     }
     validate_from_states_inputs(x, weight, conv_states, initial_state_slots);
     require_out_shape(x, out);
-    require_accessible(out, "out");
+    require_destination({&x, &weight, &conv_states, &initial_state_slots}, out);
     detail::causal_conv1d_from_states_launch(x, weight, conv_states, initial_state_slots, out, stream);
 }
 

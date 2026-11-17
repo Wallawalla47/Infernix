@@ -992,6 +992,7 @@ struct GemmArgs {
     int row_begin;
     const std::int32_t* tile_experts; // grouped: each 64-column tile's expert (-1: no columns), its rows
     int expert_stride;                // at expert * expert_stride + row_begin
+    int max_expert;                   // grouped: the last expert whose rows lie in the weight (a larger id: no columns)
     int tile_base;                    // the chunk's first tile
     int rows;
     int k;
@@ -1049,7 +1050,7 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
     int row_begin = args.row_begin;
     if (args.tile_experts != nullptr) {
         const int expert = args.tile_experts[args.tile_base + static_cast<int>(blockIdx.y)];
-        if (expert < 0) { return; }
+        if (expert < 0 || expert > args.max_expert) { return; } // never rows past the weight
         row_begin += expert * args.expert_stride;
     }
     WeightView w = args.w;
@@ -1509,6 +1510,7 @@ struct Call {
     const std::int32_t* in_columns  = nullptr;
     const std::int32_t* out_columns = nullptr;
     const float* act_column         = nullptr; // the activation scales of x's columns (w.act_div: the divisor)
+    int max_expert                  = 0;       // grouped (tile_experts): GemmArgs::max_expert
 };
 
 // The parts of a chunk a launch runs: `encode` encodes the chunk's activation columns (after zeroing the
@@ -1560,6 +1562,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         a.row_begin = c.row_begin;
         a.tile_experts  = c.tile_experts;
         a.expert_stride = c.expert_stride;
+        a.max_expert    = c.max_expert;
         a.tile_base = first / kTileTokens;
         a.rows      = c.rows;
         a.k         = k;

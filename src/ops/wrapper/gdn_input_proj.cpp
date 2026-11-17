@@ -506,6 +506,13 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      Tensor& value, Tensor& z, LinearPolicy policy,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy, weight.qtype);
+    // Every format's snapshot: no operand aliases another, the live workspace or the parent weight (the record forms
+    // check the same).
+    const std::array<const Tensor*, 10> operands{&x,     &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
+                                                 &snapshot_base_slots, &query, &key, &value, &z};
+    require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
+                                query, key, value, z, workspace);
+    require_parent_nonoverlap(weight, operands, workspace, "gdn_input_proj_conv_snapshot");
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
@@ -577,19 +584,6 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                             "gdn_input_proj_conv_snapshot", "value");
         require_conv_tensor(z, z_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "z");
-        require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
-                                    snapshot_base_slots, query, key, value, z, workspace);
-        const std::array<const Tensor*, 10> tensors{&x,
-                                                    &conv_weight,
-                                                    &conv_states,
-                                                    &valid_columns,
-                                                    &initial_state_slots,
-                                                    &snapshot_base_slots,
-                                                    &query,
-                                                    &key,
-                                                    &value,
-                                                    &z};
-        require_parent_nonoverlap(weight, tensors, workspace, "fp8 gdn_input_proj_conv_snapshot");
         detail::fp8_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                           initial_state_slots, snapshot_base_slots, query, key,
                                           value, z, policy, workspace, stream);
@@ -693,8 +687,13 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace);
 
         if (tree_rows != nullptr) {
-            auto scope = workspace.scope();
-            gdn_input_proj(x, weight, conv_record, z, policy, workspace, stream);
+            // The projection over the call's columns as one matrix (rows of a batch side by side), then each
+            // column's window over its ancestors.
+            auto scope         = workspace.scope();
+            Tensor x_flat      = flatten_columns(x, x.ne[0], geometry);
+            Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
+            Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
+            gdn_input_proj(x_flat, weight, record_flat, z_flat, policy, workspace, stream);
             detail::gdn_projected_conv_record_tree_launch(conv_record, conv_weight, conv_states,
                                                           valid_columns, initial_state_slots,
                                                           *tree_rows, query, key, value, stream);
@@ -1109,6 +1108,12 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                         "gdn_input_proj_conv_snapshot", "value");
     require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_snapshot",
                         "z");
+    const std::array<const Tensor*, 10> operands{&x,     &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
+                                                 &snapshot_base_slots, &query, &key, &value, &z};
+    require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
+                                query, key, value, z, ws);
+    require_parent_nonoverlap(qk_weight, operands, ws, "gdn_input_proj_conv_snapshot");
+    require_parent_nonoverlap(value_z_weight, operands, ws, "gdn_input_proj_conv_snapshot");
 
     // Batched rows and the column-invariant policy compose the projection and the convolution, so
     // a column reads the same BF16 projection whatever the call's width or batch.

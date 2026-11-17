@@ -6,6 +6,7 @@
 #include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/prefix_holds.h"
 #include "runtime/prefix_cache/source_policy.h"
 
 #include <algorithm>
@@ -461,7 +462,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     }
     if (chosen.host_only_blocks == 0) { return 0U; }
     const std::span<const pc::NodeRef> path(match.path.data(), chosen.path_blocks);
-    index.acquire_path(path);
+    // Declared before the try: on a failure the catch aborts the restore before the pins go.
+    const pc::PathPin pinned(index, path);
     std::uint32_t started = 0;
     try {
         std::uint32_t wanted = std::min(chosen.host_only_blocks, kPrefetchBatchBlocks);
@@ -491,10 +493,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
         }
     } catch (...) {
         prefix_->abort_restore();
-        index.release_path(path);
         throw;
     }
-    index.release_path(path);
     return started;
 }
 
@@ -689,8 +689,9 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
 void ProgramImpl::prefix_pin(const PrefixSelection& s) {
     if (!s.snapshot) { return; }
     const std::span<const pc::NodeRef> path(s.path.data(), s.frontier / kBlock);
-    if (!path.empty()) { prefix_->index().acquire_path(path); }
-    prefix_->index().pin_snapshot(*s.snapshot);
+    pc::PathPin pinned(prefix_->index(), path);
+    (void)pc::SnapshotPin(prefix_->index(), *s.snapshot).release();
+    pinned.release(); // the selection's: prefix_unpin releases both
 }
 
 void ProgramImpl::prefix_unpin(const PrefixSelection& s) noexcept {
@@ -1217,6 +1218,11 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
         // A tap or boundary taken just before the release (a cancel, a failure, a pause) may still be
         // copying the lane's partial page, and release() returns the lane's pages to the pool next.
         prefix_->order_page_reuse(lane.pages);
+    } catch (...) {}
+    // Whether or not those waits could be enqueued (a failed device): the path's pins are the lane's, and the
+    // path is cleared below, so a skipped release would leave its nodes unevictable until clear(). A restore
+    // still landing holds pins of its own.
+    try {
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();
     } catch (...) {}

@@ -18,6 +18,11 @@
 
 namespace infernix::ops {
 
+// The checks ggml_linear and ggml_linear_encoded make of a call's outputs and segments (one dtype, BF16 or FP32;
+// GGML formats whose blocks divide K; layouts their formats support; rows inside their outputs): the 8-bit
+// encoded entry, which takes no ggml_linear call first, makes them too.
+void ggml_linear_validate_call(int k, int columns, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs);
+
 // The widest call of the narrow route (ggml_linear's narrow calls: one below its tiles' kTileMinColumns).
 inline constexpr std::int32_t kA8MaxColumns = 31;
 // The narrowest call of the wide route (ggml_linear's wide calls, whose K is also a multiple of 64).

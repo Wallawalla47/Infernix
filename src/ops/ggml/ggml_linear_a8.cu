@@ -308,14 +308,9 @@ void ggml_linear_a8_encoded(const Tensor& encoded, std::int32_t k, std::span<con
     require(encoded.dtype == DType::I32 && encoded.is_contiguous() && encoded.ne[0] == column_stride(k, sums_of(segments)),
             "8-bit encoded columns must be contiguous I32 [a8_linear_column_words(k, sums), T]");
     require(!segments.empty() && !outs.empty() && k > 0 && k % 32 == 0, "a projection of K a multiple of 32");
-    for (const GgmlSegment& s : segments) {
-        require(s.output >= 0 && static_cast<std::size_t>(s.output) < outs.size() && s.data != nullptr && s.rows > 0,
-                "a segment's output index, weights and rows");
-        const Tensor& out = *outs[static_cast<std::size_t>(s.output)];
-        require((out.dtype == DType::BF16 || out.dtype == DType::FP32) && out.is_contiguous() && out.ne[1] == columns &&
-                    s.out_offset >= 0 && s.out_offset + s.rows <= out.ne[0],
-                "an output must be contiguous BF16 or FP32 [N, T] holding its segments' rows");
-    }
+    // What ggml_linear checks before it takes this route: run() launches every segment with the first output's dtype,
+    // and reads whole blocks of each segment's format.
+    ggml_linear_validate_call(k, columns, segments, outs);
     run({.encoded = static_cast<const std::int32_t*>(encoded.data), .stride = static_cast<int>(encoded.ne[0]), .k = k,
          .columns = columns},
         segments, outs, stream);

@@ -334,8 +334,15 @@ void lossless_moe_combine(const Tensor& expert_out, const Tensor& weights, const
                           cudaStream_t stream, bool add) {
     const int width = residual.ne[0], columns = residual.ne[1], top_k = ids.ne[0];
     require(residual.dtype == DType::BF16 && residual.is_contiguous() && expert_out.dtype == DType::BF16 &&
-                expert_out.ne[0] == width && weights.ne[1] == columns && ids.ne[1] == columns && top_k <= kMaxTopK,
-            "expert_out BF16 [H, C], weights and ids [top_k, T], residual BF16 [H, T]");
+                expert_out.ne[0] == width && weights.dtype == DType::FP32 && weights.is_contiguous() &&
+                weights.ne[0] == top_k && weights.ne[1] == columns && ids.dtype == DType::I32 && ids.is_contiguous() &&
+                ids.ne[1] == columns && top_k <= kMaxTopK &&
+                // Gathered (slot_column I32 [top_k, T]: each pair's column), else pair (t, slot) at column t top_k + slot.
+                (slot_column.data != nullptr
+                     ? slot_column.dtype == DType::I32 && slot_column.numel() == static_cast<std::int64_t>(top_k) * columns
+                     : expert_out.ne[1] >= static_cast<std::int64_t>(top_k) * columns),
+            "expert_out BF16 [H, C], weights FP32 and ids I32 [top_k, T], slot_column empty (C >= top_k T) or I32 "
+            "[top_k, T], residual BF16 [H, T]");
     require((shared_out == nullptr) == (shared_logits == nullptr), "the shared expert's output and gate come together");
     if (shared_out != nullptr) {
         require(shared_out->dtype == DType::BF16 && shared_out->ne[0] == width && shared_out->ne[1] == columns &&

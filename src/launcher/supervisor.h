@@ -46,6 +46,9 @@ struct LaunchSpec {
     EnvOverlay env;
     std::filesystem::path working_dir;
     int port = 0;
+    // A failure to bind its (automatic) port is retried on another port: the launcher does not report it. Kept with
+    // the instance, so the report of one start is judged by that start's own attempt, not a later one's.
+    bool port_retry = false;
 };
 
 struct InstanceSnapshot {
@@ -67,6 +70,7 @@ struct InstanceSnapshot {
     // Failed while ready: "crash", "hang" or "stall" (the watchdog's incident).
     std::optional<std::string> incident;
     std::optional<ProcessUsage> usage;
+    bool port_retry = false; // LaunchSpec::port_retry of this instance
 };
 
 struct WatchdogConfig {
@@ -126,6 +130,8 @@ private:
     bool stop_forced_    = false; // the stop ended the process itself (no signal, or past its timeout)
     bool shutting_down_  = false;
     std::optional<std::pair<std::string, std::string>> load_verdict_; // end_load's kind and reason
+    bool listening_ = false; // this instance logged "listening on ..." (its server is the one answering)
+    bool ready_line_expected_ = true; // its --log-level shows Info records (the ready line)
     Json metrics_;
     std::optional<std::string> serve_build_;
     std::uint32_t next_instance_ = 1;

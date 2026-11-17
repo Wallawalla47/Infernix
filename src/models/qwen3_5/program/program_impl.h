@@ -730,6 +730,9 @@ public:
             bool state_restored  = false;
             // This binding opened the cache's staged restore batch.
             bool restore_staged = false;
+            // The batch land_restore listed for it (0: none): its copies may still be writing the reserved state
+            // slot until it lands, so an abort before the lane adopts the binding waits for it.
+            std::uint64_t landed_ticket = 0;
             std::optional<KVPagePrefixForkReservation> text_fork;
             std::optional<KVPagePrefixForkReservation> backend_fork;
             std::uint64_t restore_bytes = 0;

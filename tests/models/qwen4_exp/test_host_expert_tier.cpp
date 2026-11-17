@@ -784,6 +784,79 @@ void test_fetch_unpinned(const ExpertStore& store) {
     tier.end_round();
 }
 
+// A key demanded again later in its round (a layer walk's later call of its layer) after the CPU finished its first
+// ticket and the ring gave that slot to another record: the demand reads the key again instead of returning the
+// slot's new bytes (audit 2026-11-17 EO-01). No pre-fill: every key goes through the 8-slot ring.
+void test_round_ticket_recycled(const ExpertStore& store) {
+    auto o        = options();
+    o.layer_calls = 4;
+    HostExpertTier tier(store, o);
+    tier.begin_round(32);
+    std::vector<std::uint32_t> statuses;
+    std::vector<bool> valid;
+    (void)serve(tier, {61}, statuses, valid);
+    check(valid[0], "round ticket: the first demand lands");
+    std::vector<std::uint32_t> others;
+    for (std::uint32_t k = 62; k < 78; ++k) { others.push_back(k); } // 16 records through 8 slots
+    (void)serve(tier, others, statuses, valid, 4);
+    bool all = true;
+    for (std::size_t i = 0; i < others.size(); ++i) { all = all && valid[i]; }
+    check(all, "round ticket: 16 more demands through the ring land");
+    (void)serve(tier, {61}, statuses, valid);
+    check(statuses[0] == 0 && valid[0], "round ticket: a key demanded again after its slot was reused has its own bytes");
+    tier.end_round();
+    tier.begin_round(32);
+    tier.controller().check();
+    tier.end_round();
+}
+
+// A CPU demand of a key the device fetched in the same round (audit 2026-11-17 EO-01): one sharing the device's ticket
+// while the device still reads it keeps the slot until its own done, however many records pass through the ring
+// after the device has consumed it; one that comes after the device's ticket gave its slot to another record reads
+// the key again. No pre-fill: every record goes through the 8-slot ring, consumed one at a time.
+void test_fetch_shared_ticket(const ExpertStore& store) {
+    infernix::ops::offloaded_moe::FetchChannel channel;
+    auto o        = options();
+    o.fetch       = &channel;
+    o.layer_calls = 4;
+    HostExpertTier tier(store, o);
+    DeviceSide device{channel.channel(0)};
+    tier.begin_round(32);
+    const auto pass = [&](std::uint32_t layer, std::int32_t first, std::int32_t count) {
+        std::vector<std::int32_t> experts;
+        for (std::int32_t e = first; e < first + count; ++e) { experts.push_back(e); }
+        device.publish(layer, experts);
+        bool ok = true;
+        for (std::uint32_t i = 0; i < experts.size(); ++i) {
+            std::uint32_t status       = 0;
+            const std::uint8_t* record = device.wait(i, status);
+            ok                         = ok && status == 0 && matches(record, layer * kExperts + experts[i]);
+            device.consume(i + 1);
+        }
+        return ok;
+    };
+    // Key 41 (layer 1, expert 1): fetched, then demanded by the CPU before the device consumes it.
+    device.publish(1, {1});
+    std::uint32_t status = 0;
+    check(matches(device.wait(0, status), 41) && status == 0, "shared ticket: the device's record lands");
+    const std::uint32_t shared = tier.demand(1, 1);
+    device.consume(1);
+    check(pass(1, 2, 16), "shared ticket: 16 more fetched records land");
+    const std::uint8_t* record = tier.wait(shared, status);
+    check(status == 0 && matches(record, 41), "shared ticket: the CPU's shared slot keeps its record after the device is done");
+    tier.done(shared);
+    // Key 81 (layer 2, expert 1): fetched and consumed, its slot reused, then demanded by the CPU.
+    check(pass(2, 1, 1) && pass(2, 2, 16), "shared ticket: layer 2's fetched records land");
+    const std::uint32_t later = tier.demand(2, 1);
+    record = tier.wait(later, status);
+    check(status == 0 && matches(record, 81), "shared ticket: a demand after the device's slot was reused reads again");
+    tier.done(later);
+    tier.end_round();
+    tier.begin_round(32);
+    tier.controller().check();
+    tier.end_round();
+}
+
 // A RAM resize (shrink, grow) of the pinned slots: four chunks of 16 slots; shrink gives back the chunk holding the
 // least valuable residents through the release callback (here the lists' chunk: their replacements evict the lowest
 // keys), passes over a chunk with a pinned slot or a refill's target, and stops at min_slots (15); growth allocates the
@@ -1871,10 +1944,12 @@ int main(int argc, char** argv) {
         test_resize_queued_record(store);
         test_agent_stop(store);
         test_slot_pool(store);
+        test_round_ticket_recycled(store);
         if (argc > 1 && std::string_view(argv[1]) == "--fetch") {
             test_fetch(store);
             test_read_ahead(store);
             test_fetch_unpinned(store);
+            test_fetch_shared_ticket(store);
         }
         test_stream_reads(store);
         {

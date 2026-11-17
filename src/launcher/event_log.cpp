@@ -69,31 +69,57 @@ EventLog::EventLog(std::filesystem::path dir) {
     set_dir(dir, ignored);
 }
 
+EventLog::~EventLog() { write_files(); }
+
 bool EventLog::set_dir(const std::filesystem::path& dir, std::string& error) {
-    std::lock_guard lock(mutex_);
+    std::lock_guard files(file_mutex_);
+    write_pending_locked(); // the lines logged so far go where they were logged
     for (File* file : {&events_, &requests_}) {
         if (file->stream.is_open()) { file->stream.close(); }
         file->bytes     = 0;
         file->rotate_at = 0;
         file->failed    = false;
     }
-    dir_ = dir;
+    file_dir_ = dir;
+    {
+        std::lock_guard lock(mutex_);
+        dir_ = dir;
+    }
     std::error_code code;
-    std::filesystem::create_directories(dir_, code);
-    if (code || !std::filesystem::is_directory(dir_, code)) {
-        error          = "cannot create " + path_utf8(dir_) + (code ? ": " + code.message() : std::string());
+    std::filesystem::create_directories(file_dir_, code);
+    if (code || !std::filesystem::is_directory(file_dir_, code)) {
+        error          = "cannot create " + path_utf8(file_dir_) + (code ? ": " + code.message() : std::string());
         events_.failed = requests_.failed = true;
         return false;
     }
     // Open the events file now, so an unwritable folder shows at once.
-    events_.stream.open(dir_ / kEventsFile, std::ios::binary | std::ios::app);
+    events_.stream.open(file_dir_ / kEventsFile, std::ios::binary | std::ios::app);
     if (!events_.stream) {
-        error          = "cannot write " + path_utf8(dir_ / kEventsFile);
+        error          = "cannot write " + path_utf8(file_dir_ / kEventsFile);
         events_.failed = true;
         return false;
     }
-    events_.bytes = static_cast<std::uint64_t>(std::filesystem::file_size(dir_ / kEventsFile, code));
+    events_.bytes = static_cast<std::uint64_t>(std::filesystem::file_size(file_dir_ / kEventsFile, code));
     return true;
+}
+
+void EventLog::write_files() {
+    std::lock_guard files(file_mutex_);
+    write_pending_locked();
+}
+
+void EventLog::write_pending_locked() {
+    std::vector<std::string> events;
+    std::vector<std::string> requests;
+    {
+        std::lock_guard lock(mutex_);
+        events.swap(pending_events_);
+        requests.swap(pending_requests_);
+    }
+    for (const std::string& line : events) { write_locked(events_, file_dir_ / kEventsFile, kEventsLimit, line); }
+    for (const std::string& line : requests) {
+        write_locked(requests_, file_dir_ / kRequestsFile, kRequestsLimit, line);
+    }
 }
 
 std::filesystem::path EventLog::dir() const {
@@ -154,7 +180,7 @@ void EventLog::add(std::string level, std::string category, std::string message,
         record.category = std::move(category);
         record.message  = std::move(message);
         record.fields   = std::move(fields);
-        write_locked(events_, dir_ / kEventsFile, kEventsLimit, format_event_line(record));
+        pending_events_.push_back(format_event_line(record));
         records_.push_back(record);
         while (records_.size() > kMemory) { records_.pop_front(); }
         listener = listener_;
@@ -163,9 +189,9 @@ void EventLog::add(std::string level, std::string category, std::string message,
 }
 
 void EventLog::add_request_body(const Json& record) {
-    const std::string line = record.dump(-1, ' ', false, Json::error_handler_t::replace);
+    std::string line = record.dump(-1, ' ', false, Json::error_handler_t::replace);
     std::lock_guard lock(mutex_);
-    write_locked(requests_, dir_ / kRequestsFile, kRequestsLimit, line);
+    pending_requests_.push_back(std::move(line));
 }
 
 Json EventLog::page(std::uint64_t after, std::size_t limit) const {

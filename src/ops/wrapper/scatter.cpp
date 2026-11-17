@@ -4,6 +4,7 @@
 #include "ops/launcher/scatter.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 namespace infernix::ops {
@@ -73,8 +74,11 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
         throw std::invalid_argument(
             "extract_bf16_columns: tensors must be contiguous and non-null");
     }
-    if (source.data == destination.data) {
-        throw std::invalid_argument("extract_bf16_columns: source and destination must not alias");
+    // Any overlap of the two extents (a pitched copy between overlapping ranges is undefined), not only one base.
+    const auto source_begin      = reinterpret_cast<std::uintptr_t>(source.data);
+    const auto destination_begin = reinterpret_cast<std::uintptr_t>(destination.data);
+    if (source_begin < destination_begin + destination.bytes() && destination_begin < source_begin + source.bytes()) {
+        throw std::invalid_argument("extract_bf16_columns: source and destination must not overlap");
     }
     const std::size_t element_bytes = dtype_size(DType::BF16);
     const std::size_t width         = static_cast<std::size_t>(destination.ne[0]) * element_bytes;

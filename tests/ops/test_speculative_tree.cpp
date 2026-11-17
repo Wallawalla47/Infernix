@@ -120,13 +120,16 @@ ops::SpeculativeTreeRow host_row(const std::vector<int>& parent, int main_depth,
         if (row.first_child[c] >= 0) continue;
         const int path   = row.paths++;
         const int length = row.depth[c] + 1;
+        // A chain row longer than a tree path lists only the columns that fit (ngram_chain_row): acceptance
+        // verifies it as a chain and writes its path itself.
+        const int listed = tree ? length : std::min(length, ops::kSpeculativeTreeMaxPathLength);
         int owned_from   = 0;
         for (int at = c, i = length - 1; at >= 0; at = parent[at], --i) {
-            row.path_columns[path][i] = static_cast<std::int8_t>(at);
+            if (i < listed) row.path_columns[path][i] = static_cast<std::int8_t>(at);
             if (owned_from == 0 && ((covered >> at) & 1U) != 0U) owned_from = i + 1;
         }
         for (int at = c; at >= 0; at = parent[at]) covered |= 1U << at;
-        row.path_length[path] = static_cast<std::int8_t>(length);
+        row.path_length[path] = static_cast<std::int8_t>(listed);
         row.owned_from[path]  = static_cast<std::int8_t>(owned_from);
     }
     return row;
@@ -675,12 +678,18 @@ void fill_random_round(int n, int batch, std::uint32_t seed, std::vector<std::ui
 
 // A tree row whose tree is a chain walks single children: the recursive rejection must reproduce
 // the chain Op bit for bit (same keys, same residual, same draws); chain rows are the chain Op.
-int chain_equivalence_case() {
-    constexpr int kDrafts = 5, batch = 8, n = kDrafts + 1;
-    const std::vector<int> extents{kDrafts, kDrafts, kDrafts, kDrafts, kDrafts, kDrafts, 3, 0};
+// Past a tree path's length (24 drafts, an n-gram tree round's copy chain) every row is a chain row, the
+// penalized rows' columns past 16 among them: their penalty overlay holds every earlier draft.
+int chain_equivalence_case(int drafts = 5) {
+    constexpr int batch = 8;
+    const int kDrafts = drafts, n = kDrafts + 1;
+    const bool trees  = kDrafts < ops::kSpeculativeTreeMaxPathLength;
+    const std::vector<int> extents =
+        trees ? std::vector<int>{kDrafts, kDrafts, kDrafts, kDrafts, kDrafts, kDrafts, 3, 0}
+              : std::vector<int>{kDrafts, kDrafts, kDrafts, kDrafts - 4, kDrafts, kDrafts - 7, 3, 0};
     std::vector<ops::SpeculativeTreeRow> rows;
     for (const int extent : extents)
-        rows.push_back(host_row(chain_parents(extent), kDrafts, extent == kDrafts));
+        rows.push_back(host_row(chain_parents(extent), kDrafts, trees && extent == kDrafts));
     auto tree_rows = upload_rows(rows);
     AcceptBuffers tree(n, batch), chain(n, batch);
     const auto tree_capacity =
@@ -689,7 +698,7 @@ int chain_equivalence_case() {
         kTokenDomain, {false}, kDrafts, kDrafts, batch, batch);
     GuardedDeviceBuffer tree_ws(tree_capacity), chain_ws(chain_capacity);
     int failures = 0;
-    for (std::uint32_t trial = 0; trial < 12; ++trial) {
+    for (std::uint32_t trial = 0; trial < (trees ? 12U : 4U); ++trial) {
         std::vector<std::uint16_t> logits;
         std::vector<int> drafts, candidates, targets;
         std::vector<float> q;
@@ -746,7 +755,8 @@ int chain_equivalence_case() {
         cuda_synchronize();
         const auto got          = read_outputs(tree);
         const auto expected     = read_outputs(chain);
-        const std::string label = "tree/chain acceptance trial " + std::to_string(trial);
+        const std::string label =
+            "tree/chain acceptance, " + std::to_string(kDrafts) + " drafts, trial " + std::to_string(trial);
         failures += verify_exact((label + " licensed").c_str(), got.licensed, expected.licensed);
         failures += verify_exact((label + " counts").c_str(), got.counts, expected.counts);
         failures += verify_exact((label + " accepted").c_str(), got.accepted, expected.accepted);
@@ -756,7 +766,7 @@ int chain_equivalence_case() {
             failures += expect(got.accepted[static_cast<std::size_t>(r)] == 0,
                                label + " proposal miss rejected row " + std::to_string(r));
         for (int r = 0; r < batch; ++r) {
-            bool ok = got.branch[r] == (extents[static_cast<std::size_t>(r)] == kDrafts ? 0 : -1);
+            bool ok = got.branch[r] == (trees && extents[static_cast<std::size_t>(r)] == kDrafts ? 0 : -1);
             for (int i = 0; i < n; ++i)
                 ok = ok && got.path[static_cast<std::size_t>(r) * n + i] ==
                                (i <= got.accepted[r] ? i : -1);
@@ -2461,6 +2471,7 @@ INFERNIX_OP_TEST(speculative_tree) {
         try {
             failures += greedy_tree_case();
             failures += chain_equivalence_case();
+            failures += chain_equivalence_case(24);
             for (int m = 1; m <= 4; ++m) failures += distribution_case(m);
         } catch (const std::exception& error) {
             std::cerr << "speculative tree FP32 test threw: " << error.what() << '\n';
@@ -2485,6 +2496,7 @@ INFERNIX_OP_TEST(speculative_tree) {
             failures += compact_kv_case(storage);
         failures += greedy_tree_case();
         failures += chain_equivalence_case();
+        failures += chain_equivalence_case(24);
         for (int m = 1; m <= 4; ++m) failures += distribution_case(m);
         failures += selector_case(16, 4);
         failures += selector_case(32, 8);

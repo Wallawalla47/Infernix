@@ -151,6 +151,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     [[maybe_unused]] bool suspends = false;
     [[maybe_unused]] float* state  = nullptr;
     if constexpr (Segmented) {
+        const bool empty   = kb_lo >= kb_hi; // a split with none of the CTA's blocks (n_block_max < splits)
         const bool resumes = segment.lo > kb_lo;
         suspends           = segment.hi < kb_hi;
         kb_lo              = max(kb_lo, segment.lo);
@@ -158,6 +159,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         if (kb_lo >= kb_hi) {
             infernix::ops::cp_commit(); // Q's copy
             infernix::ops::cp_wait<0>();
+            // An empty split runs in no segment, so it publishes the unsegmented epilogue's neutral partial (sum 0,
+            // the merge's "no weight") here, once: the merge reads every split's slot, and the workspace holds
+            // whatever an earlier call left there. Its accumulators are never read (the merge skips sum 0).
+            if constexpr (Split) {
+                if (empty && segment.lo == 0) {
+                    const int split = static_cast<int>(blockIdx.z);
+                    for (int row = q0 + tid; row < q0 + tile_rows; row += Threads) {
+                        const auto stat       = causal_stat_index<Geometry>(q_head, row, split, width);
+                        partial.maximum[stat] = 0.0f;
+                        partial.sum[stat]     = 0.0f;
+                    }
+                }
+            }
             return;
         }
         const std::int64_t cta =

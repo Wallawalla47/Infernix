@@ -216,7 +216,17 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
     stream          = compute;
     transfer_stream = load;
-    prepare_upload_staging(); // while the device is idle (upload_pinned's staging ring)
+    try {
+        prepare_upload_staging(); // while the device is idle (upload_pinned's staging ring)
+    } catch (...) {
+        // No destructor runs for a constructor that throws: the streams go back here (pinned memory pressure
+        // makes the ring's allocation throw DeviceMemoryExhausted).
+        destroy_stream(transfer_stream);
+        destroy_stream(stream);
+        transfer_stream = nullptr;
+        stream          = nullptr;
+        throw;
+    }
 }
 
 DeviceContext::~DeviceContext() {

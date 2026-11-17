@@ -118,7 +118,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             std::vector<std::string> call_ids;
             set_owned_json_content(res, make_chat_completion_response(identity, outcome, &call_ids),
                                    prepared.lifetime);
-            remember_reasoning(outcome, call_ids);
+            // A cancelled answer is cut: its reasoning is not kept for the next turn to resend.
+            if (outcome.finish_reason != infernix::FinishReason::Cancelled) { remember_reasoning(outcome, call_ids); }
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));

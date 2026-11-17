@@ -338,7 +338,15 @@ void q6_a16_mma_kernel(
         __syncthreads();
         if constexpr (BS == S) {
             const int prefetch_tile = k_tile + S;
-            if (prefetch_tile < k_tiles) { stage_inputs(stage, prefetch_tile); }
+            if (prefetch_tile < k_tiles) {
+                if constexpr (BS == 1) {
+                    // One stage: its quant was prefetched during the MMA above, so only the activation is staged
+                    // here (staging both fetched every weight byte of the tile twice).
+                    stage_activation(stage, prefetch_tile);
+                } else {
+                    stage_inputs(stage, prefetch_tile);
+                }
+            }
             cp_commit();
         } else {
             const int next_tile = k_tile + 1;

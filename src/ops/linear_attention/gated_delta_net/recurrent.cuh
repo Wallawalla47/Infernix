@@ -912,7 +912,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         stage_record_inputs(access, coord, valid, shared);
         __syncthreads();
         const RecordConvSharedAccess<RecordAccess<Masked, State>> inputs{access, shared, access.scale};
-        run_recurrent_sequence<true, RecordEffects>(state, inputs, coord, valid);
+        // A row with no valid column stages nothing: the sequence would record shared memory never written as its
+        // first key. Nothing reads that record (no column commits), so the row is skipped.
+        if (valid > 0) { run_recurrent_sequence<true, RecordEffects>(state, inputs, coord, valid); }
     } else {
         run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
     }

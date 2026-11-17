@@ -18,9 +18,15 @@ size_t append_body(char* data, size_t size, size_t count, void* user) {
     return body->size() > (64u << 20) ? 0 : size * count;
 }
 
+// Called about once a second even while nothing arrives (connecting, a stalled answer).
+int cancel_progress(void* user, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    return static_cast<const std::atomic<bool>*>(user)->load() ? 1 : 0;
+}
+
 } // namespace
 
-HttpResult http_get(const std::string& url, const std::string& token, long timeout_seconds) {
+HttpResult http_get(const std::string& url, const std::string& token, long timeout_seconds,
+                    const std::atomic<bool>* cancel) {
     HttpResult result;
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), &curl_easy_cleanup);
     if (!curl) {
@@ -45,6 +51,11 @@ HttpResult http_get(const std::string& url, const std::string& token, long timeo
 #endif
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, append_body);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &result.body);
+    if (cancel != nullptr) {
+        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, cancel_progress);
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(cancel));
+    }
     const CURLcode code = curl_easy_perform(curl.get());
     curl_slist_free_all(headers);
     if (code != CURLE_OK) {
@@ -88,10 +99,10 @@ std::string hf_resolve_url(const std::string& repo, const std::string& revision,
     return "https://huggingface.co/" + repo + "/resolve/" + revision + "/" + url_encode_path(path);
 }
 
-HfListing hf_list_files(const std::string& repo, const std::string& token) {
+HfListing hf_list_files(const std::string& repo, const std::string& token, const std::atomic<bool>* cancel) {
     if (!valid_repo_id(repo)) { throw std::runtime_error("not a Hugging Face repository id: " + repo); }
     const HttpResult result =
-        http_get("https://huggingface.co/api/models/" + repo + "/revision/main?blobs=true", token, 60);
+        http_get("https://huggingface.co/api/models/" + repo + "/revision/main?blobs=true", token, 60, cancel);
     if (!result.error.empty()) { throw std::runtime_error("cannot reach huggingface.co: " + result.error); }
     if (result.status == 401 || result.status == 403) {
         throw std::runtime_error(repo + " needs a Hugging Face token with access (Settings, Downloads)");
