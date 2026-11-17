@@ -26,10 +26,44 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <unistd.h>
 #endif
 
 namespace infernix::launcher {
 namespace {
+
+// The console writer's output, written to the handle itself rather than through stdout's FILE: a write a console
+// holds (a QuickEdit selection) then holds no C runtime lock, so the exit's stream flush is not held up by it.
+void write_console(const std::vector<std::string>& lines) {
+    std::string text;
+    for (const std::string& line : lines) {
+#ifdef _WIN32
+        text += line + "\r\n";
+#else
+        text += line + "\n";
+#endif
+    }
+#ifdef _WIN32
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    for (std::size_t at = 0; out != nullptr && out != INVALID_HANDLE_VALUE && at < text.size();) {
+        DWORD wrote = 0;
+        if (WriteFile(out, text.data() + at, static_cast<DWORD>(std::min<std::size_t>(text.size() - at, 1U << 20)), &wrote,
+                      nullptr) == 0 || wrote == 0) {
+            break;
+        }
+        at += wrote;
+    }
+#else
+    for (std::size_t at = 0; at < text.size();) {
+        const ssize_t wrote = ::write(STDOUT_FILENO, text.data() + at, text.size() - at);
+        if (wrote < 0 && errno == EINTR) { continue; }
+        if (wrote <= 0) { break; }
+        at += static_cast<std::size_t>(wrote);
+    }
+#endif
+}
 
 using Request  = httplib::Request;
 using Response = httplib::Response;
@@ -450,7 +484,7 @@ Launcher::Launcher(LauncherOptions options)
 
     scanner_        = std::thread([this] { scan_loop(); });
     log_flusher_    = std::thread([this] { flush_logs_loop(); });
-    console_writer_ = std::thread([this] { console_loop(); });
+    console_writer_ = std::thread([queue = console_] { console_loop(queue); });
     register_routes();
 }
 
@@ -542,12 +576,20 @@ void Launcher::stop() {
     // The server's log file and the console get what is still queued.
     stop_flushing_ = true;
     if (log_flusher_.joinable()) { log_flusher_.join(); }
-    {
-        std::lock_guard lock(console_mutex_);
-        console_stopping_ = true;
+    if (console_writer_.joinable()) {
+        // A few seconds for the last lines; a console held by a QuickEdit selection does not hold up the exit (the
+        // writer keeps its queue alive and is ended with the process).
+        std::unique_lock lock(console_->mutex);
+        console_->stopping = true;
+        console_->cv.notify_all();
+        const bool done = console_->cv.wait_for(lock, std::chrono::seconds(3), [this] { return console_->done; });
+        lock.unlock();
+        if (done) {
+            console_writer_.join();
+        } else {
+            console_writer_.detach();
+        }
     }
-    console_cv_.notify_all();
-    if (console_writer_.joinable()) { console_writer_.join(); }
     usage_.flush();
     // The API keys' last use is kept in memory between other changes.
     store_.update_settings([](Settings&) {});
@@ -606,24 +648,25 @@ void Launcher::flush_logs_loop() {
 
 void Launcher::print_console(std::string line) {
     {
-        std::lock_guard lock(console_mutex_);
-        console_lines_.push_back(std::move(line));
+        std::lock_guard lock(console_->mutex);
+        console_->lines.push_back(std::move(line));
     }
-    console_cv_.notify_one();
+    console_->cv.notify_all();
 }
 
-void Launcher::console_loop() {
-    std::unique_lock lock(console_mutex_);
+void Launcher::console_loop(const std::shared_ptr<ConsoleQueue>& queue) {
+    std::unique_lock lock(queue->mutex);
     for (;;) {
-        console_cv_.wait(lock, [this] { return console_stopping_ || !console_lines_.empty(); });
-        if (console_lines_.empty()) { return; } // stopping, and everything printed
+        queue->cv.wait(lock, [&] { return queue->stopping || !queue->lines.empty(); });
+        if (queue->lines.empty()) { break; } // stopping, and everything printed
         std::vector<std::string> lines;
-        lines.swap(console_lines_);
+        lines.swap(queue->lines);
         lock.unlock();
-        for (const std::string& line : lines) { std::fprintf(stdout, "%s\n", line.c_str()); }
-        std::fflush(stdout);
+        write_console(lines);
         lock.lock();
     }
+    queue->done = true;
+    queue->cv.notify_all();
 }
 
 Json Launcher::state_json() const {
@@ -3216,10 +3259,16 @@ void Launcher::register_management_routes() {
                                files.push_back(sidecar);
                            }
                        }
-                       if (supervisor_->snapshot().artifact_key == key &&
-                           supervisor_->snapshot().state != InstanceState::Idle &&
-                           supervisor_->snapshot().state != InstanceState::Failed) {
-                           throw std::invalid_argument(file_name + " is loaded: unload it first");
+                       // One snapshot, and the router's queued or starting load too (it acts up to 250 ms later):
+                       // deleting the parts of a model that is starting leaves a half-deleted artifact.
+                       const InstanceSnapshot instance = supervisor_->snapshot();
+                       const auto names = [&key](const std::optional<std::string>& config) {
+                           return config && artifact_key_of(*config) == key;
+                       };
+                       if ((instance.artifact_key == key && instance.state != InstanceState::Idle &&
+                            instance.state != InstanceState::Failed) ||
+                           (router_ && (names(router_->pending_model()) || names(router_->loading_model())))) {
+                           throw std::invalid_argument(file_name + " is loaded or about to load: unload it first");
                        }
                        check_confirm(q, file_name);
                        remove_files(files, file_name);

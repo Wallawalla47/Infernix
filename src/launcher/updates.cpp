@@ -282,19 +282,27 @@ void InfernixUpdate::shutdown() {
 }
 
 Json InfernixUpdate::state() const {
+#ifdef _WIN32
+    // The folder probe (a file made and removed) runs before the lock: the download's progress takes the same lock
+    // per chunk, and every publish asks for the state.
+    const bool install_dir_writable = writable(options_.install_dir);
+#else
+    const bool install_dir_writable = false;
+#endif
     std::lock_guard lock(mutex_);
-    return state_locked();
+    return state_locked(install_dir_writable);
 }
 
-Json InfernixUpdate::state_locked() const {
+Json InfernixUpdate::state_locked(bool install_dir_writable) const {
     const std::optional<std::string> current = release_version(options_.build_id);
     std::optional<std::string> blocked;
 #ifndef _WIN32
+    (void)install_dir_writable;
     blocked = "Infernix releases are Windows builds; on Linux, update from the source.";
 #else
     if (!latest_.is_null() && latest_["asset"].is_null()) {
         blocked = "The latest release has no Windows zip.";
-    } else if (!writable(options_.install_dir)) {
+    } else if (!install_dir_writable) {
         blocked = "The launcher's folder (" + path_utf8(options_.install_dir) + ") cannot be written.";
     }
 #endif

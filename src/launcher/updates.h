@@ -97,7 +97,7 @@ private:
     void run();
     void check_now();
     void download_now();
-    [[nodiscard]] Json state_locked() const;
+    [[nodiscard]] Json state_locked(bool install_dir_writable) const;
     void publish();
 
     Options options_;

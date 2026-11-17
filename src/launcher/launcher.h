@@ -247,10 +247,9 @@ private:
     // Publishes the new log and event records to the web UI and writes the server's log file, every
     // 150 ms until stop() has ended everything that logs.
     void flush_logs_loop();
-    // A line for the launcher's console, printed in order by console_loop(): a console that does not
+    // A line for the launcher's console, printed in order by the console writer: a console that does not
     // take output (a QuickEdit selection holds it) delays only that thread.
     void print_console(std::string line);
-    void console_loop();
     void toast(const std::string& level, const std::string& message);
     [[nodiscard]] Json state_json() const;
     [[nodiscard]] Json hf_files_json(const std::string& repo) const;
@@ -295,10 +294,18 @@ private:
     std::vector<EventRecord> pending_events_;
     std::atomic<bool> stop_flushing_{false};
 
-    std::mutex console_mutex_;
-    std::condition_variable console_cv_;
-    std::vector<std::string> console_lines_;
-    bool console_stopping_ = false;
+    // The console writer's queue, shared with its thread: stop() waits for it a few seconds and then leaves it (a
+    // console held by a QuickEdit selection would otherwise hold up the exit), and the thread keeps the queue alive.
+    struct ConsoleQueue {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<std::string> lines;
+        bool stopping = false;
+        bool done     = false; // the writer printed everything and ended
+    };
+    // The writer: touches only its queue and stdout.
+    static void console_loop(const std::shared_ptr<ConsoleQueue>& queue);
+    std::shared_ptr<ConsoleQueue> console_ = std::make_shared<ConsoleQueue>();
 
     // The instance transitions already reported, the latest incident and the recent restarts.
     mutable std::mutex incident_mutex_;
