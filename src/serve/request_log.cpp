@@ -1160,16 +1160,27 @@ std::string JsonlRequestLog::rotate_locked() {
     if (rotation_.keep == 0) {
         std::filesystem::remove(path_, error);
     } else {
-        // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire PATH.
-        for (std::uint32_t index = rotation_.keep - 1; index >= 1; --index) {
-            std::error_code shift_error;
-            if (!std::filesystem::exists(rotated_path(index), shift_error)) { continue; }
-            std::filesystem::remove(rotated_path(index + 1), shift_error);
-            std::filesystem::rename(rotated_path(index), rotated_path(index + 1), shift_error);
+        // The step that fails (another process holding PATH open without delete sharing, on Windows) comes
+        // first: PATH moves aside before any retained file is touched, so a failed rotation loses nothing (it
+        // used to shift and delete the oldest, and with keep 1 the only retained file, at every attempt).
+        const std::string staged = path_ + ".rotating";
+        std::filesystem::rename(path_, staged, error);
+        if (!error) {
+            // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire the moved PATH.
+            for (std::uint32_t index = rotation_.keep - 1; index >= 1; --index) {
+                std::error_code shift_error;
+                if (!std::filesystem::exists(rotated_path(index), shift_error)) { continue; }
+                std::filesystem::remove(rotated_path(index + 1), shift_error);
+                std::filesystem::rename(rotated_path(index), rotated_path(index + 1), shift_error);
+            }
+            std::error_code remove_error;
+            std::filesystem::remove(rotated_path(1), remove_error);
+            std::filesystem::rename(staged, rotated_path(1), error);
+            if (error) { // keep appending to it under its own name
+                std::error_code back_error;
+                std::filesystem::rename(staged, path_, back_error);
+            }
         }
-        std::error_code remove_error;
-        std::filesystem::remove(rotated_path(1), remove_error);
-        std::filesystem::rename(path_, rotated_path(1), error);
     }
     std::string warning;
     if (error) {

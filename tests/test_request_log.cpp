@@ -1265,6 +1265,27 @@ int main() {
                           unkept_records[0].at("event") == "server_start",
                       "keep 0 retained a rotated file or lost the server_start record");
 
+#ifdef _WIN32
+    // A rotation that cannot move the full file (another process holds it open without delete sharing, as an MSVC
+    // ifstream does) touches no retained file: PATH.1 survives, and the log keeps appending (audit 2026-11-17
+    // SS-01; with keep 1 every failed attempt used to delete the only retained file).
+    reset_rotation_dir();
+    {
+        JsonlRequestLog held(rotation_log.string(), {}, {},
+                             RequestLogRotation{.max_bytes = server_start_bytes + request_bytes / 2, .keep = 1});
+        write_server_start(held);
+        write_request(held, 1);
+        write_request(held, 2); // rotated: PATH.1 is the first full file
+        std::ifstream holder(rotation_log);
+        write_request(held, 3);
+        write_request(held, 4); // past the limit while held: the rotation fails
+        holder.close();
+    }
+    failures += check(std::filesystem::exists(rotated(1)) && !read_records(rotated(1)).empty() &&
+                          !read_records(rotation_log).empty(),
+                      "a failed rotation removed the retained file");
+#endif
+
     // A string that is not UTF-8 (a path or an argv in the Windows ANSI code page) is logged with replacement
     // characters instead of throwing out of the formatter (audit 2026-11-17 SS-02).
     {
