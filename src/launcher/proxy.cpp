@@ -35,6 +35,9 @@ struct Bridge {
     bool have_headers = false;
     bool done         = false;
     bool failed       = false;
+    // The upstream ended after its status line, before its answer was whole (a server killed or crashed
+    // mid-body): not a complete answer, whatever its status.
+    bool cut_off      = false;
     int status        = 0;
     httplib::Headers headers;
     // An event stream's chunks, relayed as they come; a whole answer collects in `body`.
@@ -156,6 +159,9 @@ std::shared_ptr<Bridge> start_bridge(httplib::Request upstream, int port, std::s
             if (!ok && !raw->have_headers) {
                 raw->failed = true;
                 raw->error  = httplib::to_string(error);
+            } else if (!ok && !raw->downstream_gone.load()) {
+                raw->cut_off = true;
+                raw->error   = httplib::to_string(error);
             }
         }
         raw->cv.notify_all();
@@ -163,8 +169,12 @@ std::shared_ptr<Bridge> start_bridge(httplib::Request upstream, int port, std::s
     return bridge;
 }
 
-// One step of relaying an event stream: waits up to a second for chunks and writes them.
-bool pump_stream(const std::shared_ptr<Bridge>& bridge, httplib::DataSink& sink) {
+// An error as one event of the client's protocol (defined below).
+std::string error_event(StreamDialect dialect, const std::string& code, const std::string& message);
+
+// One step of relaying an event stream: waits up to a second for chunks and writes them. A stream the upstream
+// cut off ends with an error event of the client's protocol, not as if it were complete.
+bool pump_stream(const std::shared_ptr<Bridge>& bridge, httplib::DataSink& sink, StreamDialect dialect) {
     std::unique_lock lock(bridge->mutex);
     bridge->cv.wait_for(lock, std::chrono::seconds(1), [&] { return !bridge->chunks.empty() || bridge->done; });
     while (!bridge->chunks.empty()) {
@@ -179,7 +189,16 @@ bool pump_stream(const std::shared_ptr<Bridge>& bridge, httplib::DataSink& sink)
         lock.lock();
     }
     if (bridge->done) {
+        const bool cut_off = bridge->cut_off;
+        const std::string error = bridge->error;
         lock.unlock();
+        if (cut_off) {
+            bridge->outcome.status = 502;
+            bridge->outcome.error  = "infernix-serve ended the stream early: " + error;
+            const std::string event = error_event(dialect, "upstream_unavailable", bridge->outcome.error);
+            bridge->delivered(event);
+            sink.write(event.data(), event.size());
+        }
         sink.done();
         return true;
     }
@@ -274,6 +293,17 @@ void forward_request(const httplib::Request& request, httplib::Response& respons
                 return;
             }
         }
+        if (bridge->cut_off) {
+            // A partial body with the upstream's 200 would read as a complete answer (its Content-Length is not
+            // relayed): the client gets an error instead.
+            bridge->outcome.status = 502;
+            bridge->outcome.error  = "infernix-serve ended its answer early: " + bridge->error;
+            const std::string message = bridge->outcome.error;
+            lock.unlock();
+            write_error(response, 502, message);
+            bridge->delivered(response.body);
+            return;
+        }
         std::string body = std::move(bridge->body);
         lock.unlock();
         bridge->delivered(body);
@@ -281,8 +311,10 @@ void forward_request(const httplib::Request& request, httplib::Response& respons
         return;
     }
 
+    const StreamDialect dialect =
+        request.path.find("/v1/messages") != std::string::npos ? StreamDialect::Anthropic : StreamDialect::OpenAI;
     response.set_chunked_content_provider(
-        content_type, [bridge](size_t, httplib::DataSink& sink) { return pump_stream(bridge, sink); },
+        content_type, [bridge, dialect](size_t, httplib::DataSink& sink) { return pump_stream(bridge, sink, dialect); },
         [bridge](bool success) {
             if (!success) { bridge->abandon(); }
         });
@@ -433,7 +465,7 @@ void forward_after_load(const httplib::Request& request, httplib::Response& resp
                     return true;
                 }
             }
-            return pump_stream(bridge, sink);
+            return pump_stream(bridge, sink, dialect);
         },
         [loading](bool success) {
             if (success) { return; }
