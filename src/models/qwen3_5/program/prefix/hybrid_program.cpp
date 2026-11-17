@@ -1132,6 +1132,14 @@ void ProgramImpl::abort_hybrid_binding(ContextTransaction& tx) noexcept {
             hybrid_->abort_restore();
             hb.restore_staged = false;
         }
+        // A restore that landed for a binding the lane never adopted (a later step of complete_hybrid_binding
+        // failed): its batch keeps its own pages and pins until it lands, but its copies may still be writing the
+        // reserved state slot, which the abort releases next.
+        if (hb.landed_ticket != 0 && !tx.adopted) {
+            const std::span<const cudaEvent_t> layers = hybrid_->restore_layer_events(hb.landed_ticket);
+            if (!layers.empty()) { (void)cudaEventSynchronize(layers.back()); }
+        }
+        hb.landed_ticket            = 0;
         pc::PrefixCacheIndex& index = hybrid_->index();
         if (hb.snapshot_pinned && index.valid(hb.quote->snapshot)) {
             index.unpin_snapshot(hb.quote->snapshot);
@@ -1157,6 +1165,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     if (hb.restore_staged) {
         ticket            = hybrid_->land_restore(device.stream);
         hb.restore_staged = false;
+        hb.landed_ticket  = ticket;
     }
     const auto commit = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                             std::optional<KVPagePrefixForkReservation>& fork,
