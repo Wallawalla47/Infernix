@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <mutex>
 #include <optional>
@@ -91,6 +92,26 @@ inline bool nothing_pinned(Engine& engine, std::string& detail) {
     return false;
 }
 
+// At idle, the occupied Device state slots plus the free Device snapshot slots: constant while nothing leaks (a
+// snapshot image moves a slot from one count to the other; a failed binding that kept its reserved slot raises the
+// sum by one each time). Zero where the Program reports neither (Flash-Next). Polled up to 2 s, while landings settle.
+inline std::int64_t idle_state_slots(Engine& engine) {
+    const RuntimeStats stats = engine.runtime_stats();
+    return static_cast<std::int64_t>(stats.device_state_occupied_slots) +
+           static_cast<std::int64_t>(stats.hybrid_free_device_snapshot_slots);
+}
+inline bool state_slots_kept(Engine& engine, std::int64_t expected, std::string& detail) {
+    std::int64_t now = 0;
+    for (int i = 0; i < 200; ++i) {
+        now = idle_state_slots(engine);
+        if (now == expected) { return true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    detail = std::to_string(now) + " occupied state slots plus free snapshot slots, " + std::to_string(expected) +
+             " before the sweep";
+    return false;
+}
+
 inline bool out_of_memory(const Outcome& outcome) {
     return outcome.error.find("out of device memory") != std::string::npos;
 }
@@ -136,8 +157,17 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
         return 1;
     }
 
-    // Swept counts: the failure lands from the first binding work to deep in a decode round's commit.
-    const std::vector<std::uint64_t> sweep{1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181};
+    // Swept counts: the failure lands from the first binding work to deep in a decode round's commit. With
+    // INFERNIX_TEST_OOM_SWEEP_STRIDE=S every S-th count up to 4181 as well (a dense sweep, a few minutes): far more of
+    // the windows between an acquisition and its owner's hold are hit.
+    std::vector<std::uint64_t> sweep{1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181};
+    if (const char* stride = std::getenv("INFERNIX_TEST_OOM_SWEEP_STRIDE"); stride != nullptr && *stride != '\0') {
+        const std::uint64_t step = std::max<std::uint64_t>(1, std::strtoull(stride, nullptr, 10));
+        for (std::uint64_t n = 1; n <= 4181; n += step) { sweep.push_back(n); }
+        std::sort(sweep.begin(), sweep.end());
+        sweep.erase(std::unique(sweep.begin(), sweep.end()), sweep.end());
+        std::printf("   dense sweep: %zu counts, every %llu\n", sweep.size(), static_cast<unsigned long long>(step));
+    }
     struct Swept {
         std::vector<TokenId> prompt, extended;
         Outcome reference, extended_reference;
@@ -155,6 +185,17 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
 
     std::printf("== sweep\n");
     const std::uint64_t recoveries_before = engine.runtime_stats().device_memory_recoveries;
+    std::int64_t idle_slots = 0;
+    for (int i = 0; i < 200; ++i) { // settled before the first injection
+        idle_slots = idle_state_slots(engine);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    {
+        const RuntimeStats stats = engine.runtime_stats();
+        std::printf("   state slots at idle: %u occupied, %u snapshot slots free\n",
+                    static_cast<unsigned>(stats.device_state_occupied_slots),
+                    static_cast<unsigned>(stats.hybrid_free_device_snapshot_slots));
+    }
     std::uint32_t failed = 0;
     // The first swept count that failed its request: the bound step's. (A shortage while a request binds can
     // leave it queued, so it binds again and completes; Flash-Next gives a failed binding back that way.)
@@ -163,7 +204,7 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
         const std::uint64_t injected = infernix::testing::memory_exhausted_injections();
         testing::request_memory_fault(sweep[i]);
         const Outcome outcome = run(engine, swept[i].prompt, outputs, true);
-        testing::request_memory_fault(0); // the next worker iteration disarms what did not fire
+        testing::request_memory_fault(0); // disarms at once what did not fire, before the next request's work
         const bool fired = infernix::testing::memory_exhausted_injections() > injected;
         const std::string label = "N = " + std::to_string(sweep[i]) + (fired ? " (fired)" : " (not reached)");
         if (outcome.error.empty()) {
@@ -178,6 +219,17 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
         failures += check(after.error.empty() && after.tokens == fresh_reference.tokens,
                           label + ": a fresh request after it returned its reference" +
                               (after.error.empty() ? std::string() : " (error '" + after.error + "')"));
+        // Whatever the failure unwound left no cached block pinned (a pin or a fill not given back) and no state slot
+        // held by nothing. Checked after the fresh request, which reuses nothing: its admission polls the swept
+        // request's Host writes, and Flash-Next polls none while it idles (a request that reuses a prefix leaves its
+        // write-through pinned until the next admission).
+        std::string pinned, slots;
+        const bool unpinned = nothing_pinned(engine, pinned);
+        failures += check(unpinned, label + ": no cached block is left pinned" +
+                                        (pinned.empty() ? std::string() : " (" + pinned + ")"));
+        const bool slots_kept = state_slots_kept(engine, idle_slots, slots);
+        failures += check(slots_kept, label + ": no state slot is left reserved" +
+                                          (slots.empty() ? std::string() : " (" + slots + ")"));
         const Outcome extended = run(engine, swept[i].extended, outputs, true);
         failures += check(extended.error.empty() && extended.tokens == swept[i].extended_reference.tokens,
                           label + ": its extension, with prefix reuse, returned its cold tokens" +

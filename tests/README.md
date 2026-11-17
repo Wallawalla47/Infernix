@@ -284,7 +284,9 @@ dense `INFERNIX_TEST_ARTIFACT`) make the N-th CUDA call of the Engine's work rep
 sweep of N from binding through prefill into decode (`tests/memory_exhausted_recovery.h`): the request in
 flight fails with the retryable out-of-memory error, or completes with its reference tokens; the next
 request and a prefix-cached extension of the failed one return their cold tokens; a queued request
-completes; and eight failures in a row stop the Engine.
+completes; and eight failures in a row stop the Engine. After each swept failure no cached block stays
+pinned and no Device state slot is left reserved. `INFERNIX_TEST_OOM_SWEEP_STRIDE=S` adds every S-th count
+up to 4181 to the sweep (28: 166 counts, about 5 minutes on the NVFP4 27B and 15 on FP4-Local).
 `infernix_qwen4_exp_wide_plan_real_test` and its `_<scenario>_` entries (the expert banks, the SSD tier,
 MTP, DFlash2 with `INFERNIX_QWEN4_DFLASH2` naming the drafter, two lanes, causal scoring,
 `--a8-activations`, the packed BF16 KV cache, a chat prompt's pair call, `--reproducible`, every other KV
