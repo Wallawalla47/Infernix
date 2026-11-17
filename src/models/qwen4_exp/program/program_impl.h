@@ -2423,6 +2423,25 @@ public:
         upload_pinned(counts, host, bytes, s);
     }
 
+    // Forced tokens are output tokens: the penalties count them (qwen3_5's append_forced_tokens), as the rebuild
+    // above counts them for a resumed request, so a request's logits do not depend on whether it was paused.
+    // Only a lane with penalties reads its counts (sampling_adjusts); the ids are the rebuild's (in the domain).
+    void count_forced_tokens(const Lane& lane, std::span<const TokenId> forced) {
+        if (lane.sampling.presence_penalty == 0.0F && lane.sampling.frequency_penalty == 0.0F) { return; }
+        std::vector<std::int32_t> ids;
+        ids.reserve(forced.size());
+        for (const TokenId token : forced) {
+            if (token >= 0 && token < token_domain_) { ids.push_back(static_cast<std::int32_t>(token)); }
+        }
+        if (ids.empty()) { return; }
+        const cudaStream_t s = device_.stream;
+        auto scope           = work_->scope();
+        Tensor device_ids    = work_->alloc(DType::I32, {static_cast<std::int32_t>(ids.size())});
+        upload_pinned(device_ids.data, ids.data(), 4ULL * ids.size(), s); // copied at the call (its staging ring)
+        Tensor counts(lane.sampling.token_counts, DType::I32, {token_domain_});
+        ops::increment_token_counts(device_ids, counts, s);
+    }
+
     // Pauses a resident at its committed boundary (design §19.3.13): the prefix cache receives the
     // lane's blocks and its state at the frontier, exactly as a consistent abort leaves them, the
     // lane is released and a Pause transaction hands the Engine the ResumeState.
@@ -3137,6 +3156,7 @@ public:
             if (lane.proposer) {
                 for (const auto token : forced) { lane.proposer->append(token); }
             }
+            count_forced_tokens(lane, forced);
             const auto begin = static_cast<std::int32_t>(lane.state_tokens);
             stage_sequence(index, begin, static_cast<std::int32_t>(stride), lane.history);
             const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
