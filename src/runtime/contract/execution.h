@@ -109,8 +109,9 @@ inline void set_no_progress_bounds(std::uint32_t warning_ms, std::uint32_t recov
 }
 
 // Out-of-memory injection for the Engine's recovery (fix sweep FS-01): the worker takes the request at its
-// next iteration and arms its own thread (infernix::testing::arm_memory_exhausted_here), so the `after`-th
-// later CUDA_CHECK of the work it runs throws DeviceMemoryExhausted. 0 disarms. Process-wide.
+// first iteration with a request queued or resident and arms its own thread
+// (infernix::testing::arm_memory_exhausted_here), so the `after`-th later CUDA_CHECK of the work it runs throws
+// DeviceMemoryExhausted; idle iterations before the request arrives do not count. 0 disarms at once. Process-wide.
 inline constexpr std::uint64_t kMemoryFaultDisarm = ~std::uint64_t{0};
 inline std::atomic<std::uint64_t>& memory_fault_request() noexcept {
     static std::atomic<std::uint64_t> request{0};

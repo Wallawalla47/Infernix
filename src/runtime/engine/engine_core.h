@@ -3138,9 +3138,18 @@ private:
             worker_busy_at_ = Clock::now();
             if (const std::uint64_t fault = testing::memory_fault_request().load(std::memory_order_relaxed);
                 fault != 0) [[unlikely]] {
-                // A test's out-of-memory injection (testing::request_memory_fault): armed on this thread.
-                testing::memory_fault_request().store(0, std::memory_order_relaxed);
-                ::infernix::testing::arm_memory_exhausted_here(fault == testing::kMemoryFaultDisarm ? 0 : fault);
+                // A test's out-of-memory injection (testing::request_memory_fault): armed on this thread once the request
+                // it is for has arrived (queued or resident), so the idle cycles before it (1 ms apart since the timer
+                // resolution is held) do not count down its checks.
+                bool work = fault == testing::kMemoryFaultDisarm || !resident_empty();
+                if (!work) {
+                    std::lock_guard lock(queue_mutex_);
+                    work = !pending_.empty();
+                }
+                if (work) {
+                    testing::memory_fault_request().store(0, std::memory_order_relaxed);
+                    ::infernix::testing::arm_memory_exhausted_here(fault == testing::kMemoryFaultDisarm ? 0 : fault);
+                }
             }
             try {
                 save_prefix_cache_if_due();
