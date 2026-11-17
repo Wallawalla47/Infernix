@@ -7948,9 +7948,13 @@ private:
     // would after chunk-major calls) by opening a staged capture each; committed by walk_commit_taps.
     void walk_plan_taps(Lane& lane);
     void walk_capture(std::size_t chunk, std::uint32_t layer);
+    // Commits the span's staged taps; a failure part-way abandons the rest (walk_abandon_taps).
     void walk_commit_taps(Lane& lane);
     void walk_enqueue(std::uint32_t to_layer);
     void walk_abandon() noexcept;
+    // The span's taps still staged go back (their Host-tier slabs and events), whether or not the walk is active:
+    // a walk that failed before it began, or after it ended in walk_commit_taps, holds them too.
+    void walk_abandon_taps() noexcept;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
 
