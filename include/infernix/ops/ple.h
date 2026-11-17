@@ -47,7 +47,9 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
 
 /// The T columns form `sequences` runs of T / sequences consecutive columns. Sequence i reads its
 /// convolution history from state slot source_slots[i] and writes the updated history to slot
-/// destination_slots[i] (both I32 [sequences]; equal slots update in place). An empty
+/// destination_slots[i] (both I32 [sequences]; equal slots update in place). The sequences update
+/// in parallel: a destination slot must be its own sequence's source or a slot no sequence reads
+/// (a swap or a chain of slots races). An empty
 /// destination_slots leaves every state unchanged (speculative verification, committed later by
 /// ple_conv_commit). weight: BF16 [C, K] (tap j of channel c at j*C + c); states: BF16
 /// [C, span, slots] with span = (K-1) * dilation, oldest column first. residual is updated in
