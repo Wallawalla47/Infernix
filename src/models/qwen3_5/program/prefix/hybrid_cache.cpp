@@ -642,15 +642,24 @@ void HybridPrefixCache::restore_block(NodeRef node, HybridBlockPages destination
         throw std::logic_error("hybrid restore source block is not host-only");
     }
     adopt_destination(destination, kFullPage);
-    const std::uint32_t id = allocate_block_id(destination);
+    // From the adoption the destination is the cache's: every failure below returns it, and a Filling node is in
+    // restore_.nodes (abort_restore aborts those) before anything else can throw.
+    std::uint32_t id = 0;
     try {
+        id = allocate_block_id(destination);
+    } catch (...) {
+        release(destination);
+        throw;
+    }
+    try {
+        restore_.nodes.reserve(restore_.nodes.size() + 1);
         index_->begin_device_fill(node, id);
     } catch (...) {
         release(destination);
         free_block_id(id);
         throw;
     }
-    restore_.nodes.push_back(node);
+    restore_.nodes.push_back(node); // reserved
     add_copies(restore_.copies, destination, view.host_slab);
 }
 
@@ -664,7 +673,13 @@ void HybridPrefixCache::restore_tail(SnapshotRef snapshot, HybridBlockPages dest
         throw std::logic_error("hybrid restore source tail is not host-only");
     }
     adopt_destination(destination, view.tail_len);
-    const std::uint32_t id = allocate_block_id(destination);
+    std::uint32_t id = 0;
+    try {
+        id = allocate_block_id(destination);
+    } catch (...) {
+        release(destination);
+        throw;
+    }
     try {
         index_->begin_tail_device_fill(snapshot, id);
     } catch (...) {

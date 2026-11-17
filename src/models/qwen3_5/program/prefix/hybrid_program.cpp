@@ -106,6 +106,33 @@ HistoryKeys history_keys(const PreparedPromptData& prompt, std::span<const Token
     return out;
 }
 
+// A block's transfer destinations, the text pool's and (with `backend`) the backend pool's: a failure of the second
+// returns the first, which no one would own otherwise (an occupied page outside every list).
+HybridBlockPages materialize_destinations(LogicalKVPageStore& text, DeviceKVPageReservation& text_reservation,
+                                          LogicalKVPageStore* backend, DeviceKVPageReservation* backend_reservation,
+                                          std::uint32_t columns) {
+    HybridBlockPages pages{.text = text.materialize_transfer_destination(text_reservation, columns)};
+    if (backend != nullptr) {
+        try {
+            pages.backend = backend->materialize_transfer_destination(*backend_reservation, columns);
+        } catch (...) {
+            text.abort_transfer_destination(pages.text, text_reservation);
+            throw;
+        }
+    }
+    return pages;
+}
+
+// Destinations not adopted by the cache (restore_block, register_tail_copy) go back to their reservations.
+void abort_destinations(const HybridBlockPages& pages, LogicalKVPageStore& text,
+                        DeviceKVPageReservation& text_reservation, LogicalKVPageStore* backend,
+                        DeviceKVPageReservation* backend_reservation) noexcept {
+    text.abort_transfer_destination(pages.text, text_reservation);
+    if (backend != nullptr && pages.backend) {
+        backend->abort_transfer_destination(*pages.backend, *backend_reservation);
+    }
+}
+
 } // namespace
 
 std::span<const TokenId> ProgramImpl::resume_ledger(const ResumeState& resume) noexcept {
@@ -530,13 +557,11 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
         if (text_pages && (backend_pool == nullptr || backend_pages)) {
             hybrid_->open_restore(device.stream);
             for (const pc::NodeRef node : host_only) {
-                HybridBlockPages pages{
-                    .text = text_kv_pages->materialize_transfer_destination(*text_pages, kBlock)};
-                if (backend_pool != nullptr) {
-                    pages.backend =
-                        backend_kv_pages->materialize_transfer_destination(*backend_pages, kBlock);
-                }
-                hybrid_->restore_block(node, pages);
+                // restore_block adopts the pages (and returns them on its own failure).
+                hybrid_->restore_block(node, materialize_destinations(
+                                                 *text_kv_pages, *text_pages,
+                                                 backend_pool != nullptr ? backend_kv_pages.get() : nullptr,
+                                                 backend_pages ? &*backend_pages : nullptr, kBlock));
                 ++started;
             }
             hybrid_->submit_restore();
@@ -1000,13 +1025,8 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             hybrid_->open_restore(device.stream);
             hb.restore_staged      = true;
             const auto destination = [&](std::uint32_t columns) {
-                HybridBlockPages pages{
-                    .text = text_kv_pages->materialize_transfer_destination(*text_pages, columns)};
-                if (backend_kv_pages) {
-                    pages.backend =
-                        backend_kv_pages->materialize_transfer_destination(*backend_pages, columns);
-                }
-                return pages;
+                return materialize_destinations(*text_kv_pages, *text_pages, backend_kv_pages.get(),
+                                                backend_pages ? &*backend_pages : nullptr, columns);
             };
             for (const pc::NodeRef node : host_only) {
                 hybrid_->restore_block(node, destination(kBlock));
@@ -1303,19 +1323,23 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_copy_tail(const HybridBlockPage
         backend_reservation = backend_kv_pages->physical_pool().reserve(1U);
         if (!backend_reservation) { return std::nullopt; }
     }
-    HybridBlockPages copy{
-        .text = text_kv_pages->materialize_transfer_destination(*text_reservation, columns)};
-    if (backend_pool) {
-        copy.backend =
-            backend_kv_pages->materialize_transfer_destination(*backend_reservation, columns);
-    }
-    // Each tail owns its bundle, so evicting any cache entry returns exactly one page per pool.
-    text_kv_pages->physical_pool().copy_page(text_kv_pages->physical(source.text),
-                                             text_kv_pages->physical(copy.text), device.stream);
-    if (backend_pool) {
-        backend_kv_pages->physical_pool().copy_page(backend_kv_pages->physical(*source.backend),
-                                                    backend_kv_pages->physical(*copy.backend),
-                                                    device.stream);
+    LogicalKVPageStore* const backend = backend_pool ? backend_kv_pages.get() : nullptr;
+    DeviceKVPageReservation* const backend_held = backend_reservation ? &*backend_reservation : nullptr;
+    const HybridBlockPages copy = materialize_destinations(*text_kv_pages, *text_reservation, backend, backend_held, columns);
+    try {
+        // Each tail owns its bundle, so evicting any cache entry returns exactly one page per pool.
+        text_kv_pages->physical_pool().copy_page(text_kv_pages->physical(source.text),
+                                                 text_kv_pages->physical(copy.text), device.stream);
+        if (backend_pool) {
+            backend_kv_pages->physical_pool().copy_page(backend_kv_pages->physical(*source.backend),
+                                                        backend_kv_pages->physical(*copy.backend),
+                                                        device.stream);
+        }
+    } catch (...) {
+        // A copy that could not be enqueued (a failed device): the destinations go back, behind what was.
+        (void)cudaStreamSynchronize(device.stream);
+        abort_destinations(copy, *text_kv_pages, *text_reservation, backend, backend_held);
+        throw;
     }
     return hybrid_->register_tail_copy(copy, columns);
 }
