@@ -112,7 +112,6 @@ void Supervisor::notify() {
 }
 
 void Supervisor::start(const LaunchSpec& spec) {
-    std::uint32_t instance = 0;
     {
         std::lock_guard lock(mutex_);
         if (shutting_down_) { throw std::runtime_error("the launcher is shutting down"); }
@@ -120,6 +119,15 @@ void Supervisor::start(const LaunchSpec& spec) {
             state_.state == InstanceState::Stopping) {
             throw std::logic_error("an instance is already running");
         }
+    }
+    // The previous instance's monitor has recorded its end; its report (the changed callback reads the snapshot, and
+    // handles a failure from it) finishes before this instance replaces the state, so the failure is reported as that
+    // instance's, not as this one's start.
+    if (monitor_.joinable()) { monitor_.join(); }
+    std::uint32_t instance = 0;
+    {
+        std::lock_guard lock(mutex_);
+        if (shutting_down_) { throw std::runtime_error("the launcher is shutting down"); }
         instance          = next_instance_++;
         state_            = {};
         state_.state      = InstanceState::Starting;
@@ -140,7 +148,6 @@ void Supervisor::start(const LaunchSpec& spec) {
         stop_forced_      = false;
         metrics_          = nullptr;
     }
-    if (monitor_.joinable()) { monitor_.join(); }
     child_.reset();
     logs_.begin_instance(instance, spec.alias);
     logs_.add(instance, "info", "launcher", "loading " + spec.alias + " on port " + std::to_string(spec.port));
