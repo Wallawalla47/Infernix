@@ -676,7 +676,9 @@ SsdTier::Promotion SsdTier::promote(PrefixCacheIndex& index, SnapshotRef snapsho
         } catch (const std::exception& error) {
             ++counters_.read_failures;
             last_error_ = error.what();
-            index.abort_ssd_promotion(entry->job);
+            // Nothing was read, so nothing on the SSD is damaged: the entry keeps its SSD copies (abort_ssd_promotion
+            // would drop them, and with them an SSD-only snapshot and every prefix resuming through it).
+            index.cancel_ssd_promotion(entry->job);
             give_staging(std::move(entry->staging));
             return Promotion::Unavailable;
         }

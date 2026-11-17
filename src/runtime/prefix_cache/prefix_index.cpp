@@ -1925,24 +1925,13 @@ void PrefixCacheIndex::complete_ssd_promotion(SsdJob& job) {
     job = SsdJob{};
 }
 
+void PrefixCacheIndex::cancel_ssd_promotion(SsdJob& job) {
+    release_ssd_promotion(job);
+    job = SsdJob{};
+}
+
 void PrefixCacheIndex::abort_ssd_promotion(SsdJob& job) {
-    for (const NodeRef ref : job.nodes) {
-        Node& node = require(ref);
-        if (node.host != CopyState::Filling) { invariant("prefix cache SSD promotion not open"); }
-        free_slab(node.host_slab);
-        set_node_slab(ref.index, kNoId);
-        node.host = CopyState::Absent;
-        refresh_node(ref.index);
-    }
-    if (job.image) {
-        Snapshot& snapshot = require(job.snapshot);
-        if (snapshot.host != CopyState::Filling) { invariant("prefix cache SSD image promotion not open"); }
-        for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
-        snapshot.host_slabs.clear();
-        snapshot.host = CopyState::Absent;
-        refresh_tail(job.snapshot.index);
-    }
-    io_unpin_snapshot(job.snapshot.index);
+    release_ssd_promotion(job);
     // The SSD copies read may be damaged: they go, and an entry left with no copy goes with its
     // subtree (§9.4). The snapshot first, then the blocks deepest first. An entry another transfer
     // pins keeps its copy (its loss would leave that transfer's source without one).
@@ -1960,6 +1949,26 @@ void PrefixCacheIndex::abort_ssd_promotion(SsdJob& job) {
         if (node.device == CopyState::Absent && node.host == CopyState::Absent) { remove_subtree(it->index); }
     }
     job = SsdJob{};
+}
+
+void PrefixCacheIndex::release_ssd_promotion(SsdJob& job) {
+    for (const NodeRef ref : job.nodes) {
+        Node& node = require(ref);
+        if (node.host != CopyState::Filling) { invariant("prefix cache SSD promotion not open"); }
+        free_slab(node.host_slab);
+        set_node_slab(ref.index, kNoId);
+        node.host = CopyState::Absent;
+        refresh_node(ref.index);
+    }
+    if (job.image) {
+        Snapshot& snapshot = require(job.snapshot);
+        if (snapshot.host != CopyState::Filling) { invariant("prefix cache SSD image promotion not open"); }
+        for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
+        snapshot.host_slabs.clear();
+        snapshot.host = CopyState::Absent;
+        refresh_tail(job.snapshot.index);
+    }
+    io_unpin_snapshot(job.snapshot.index);
 }
 
 std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {

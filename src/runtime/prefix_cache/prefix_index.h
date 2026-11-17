@@ -640,6 +640,9 @@ public:
     // The reads failed: the Host slabs are freed, the snapshot unpinned, and the SSD copies read
     // are dropped (an entry left with no copy goes with its subtree, §9.4).
     void abort_ssd_promotion(SsdJob& job);
+    // The reads were never submitted (a refused submit read nothing, so nothing is damaged): the Host slabs are
+    // freed and the snapshot unpinned; the SSD copies stay.
+    void cancel_ssd_promotion(SsdJob& job);
     // The read rate the cost model uses for SSD candidates (§6.2).
     void set_ssd_rate(double bytes_per_second) noexcept;
 
@@ -842,6 +845,8 @@ private:
     void demote_snapshot(std::uint32_t snapshot);
     void drop_node_ssd_copy(std::uint32_t node);
     void drop_snapshot_ssd_copy(std::uint32_t snapshot);
+    // An open SSD promotion's Host slabs freed and its snapshot unpinned (cancel and abort both).
+    void release_ssd_promotion(SsdJob& job);
     void free_ssd_slab(std::uint32_t slab);
     // One eviction freeing SSD slabs for a write-back worth `claim` (its snapshot's priority), never
     // touching `protect`: dead blocks' copies, superseded SSD-only snapshots, backups of images
