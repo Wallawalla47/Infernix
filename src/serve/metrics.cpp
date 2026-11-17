@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -385,7 +386,11 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             if (i == kBuckets.size()) {
                 out << "+Inf";
             } else {
-                out << kBuckets[i];
+                // The bound's shortest round-trip text ("0.1", not 17 digits' "0.10000000000000001"): stable label
+                // text for string-keyed dashboards and diffs.
+                char bound[32];
+                const auto written = std::to_chars(bound, bound + sizeof(bound), kBuckets[i]);
+                out.write(bound, written.ptr - bound);
             }
             out << "\"} " << count << '\n';
         }

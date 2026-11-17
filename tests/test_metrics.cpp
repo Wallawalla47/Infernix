@@ -117,6 +117,10 @@ int main() {
     check(live.find("_bucket{le=\"0.25\"} 1\n") != std::string::npos &&
               live.find("infernix_time_to_first_token_seconds_sum 0.25\n") != std::string::npos,
           "TTFT must include preparation and use inclusive histogram buckets");
+    // Bounds that are not binary fractions keep their short text (audit 2026-11-17 SS-12).
+    check(live.find("_bucket{le=\"0.1\"}") != std::string::npos && live.find("_bucket{le=\"0.025\"}") != std::string::npos &&
+              live.find("0.10000000000000001") == std::string::npos,
+          "histogram bounds print with their shortest round-trip text");
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
     check(live.find("kv=\"bf16\"") != std::string::npos,
