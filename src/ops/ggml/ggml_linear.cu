@@ -1477,6 +1477,10 @@ void launch_narrow_call(std::span<const GgmlSegment> segments, int k, const Colu
 
 } // namespace
 
+void ggml_linear_validate_call(int k, int columns, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs) {
+    validate_call(k, columns, segments, outs);
+}
+
 std::int32_t ggml_encoded_column_words(std::int32_t k) { return static_cast<std::int32_t>(fast::encoded_column_words(k)); }
 
 bool ggml_linear_takes_encoded(std::int32_t k, std::int32_t columns, LinearRoutes routes) {
