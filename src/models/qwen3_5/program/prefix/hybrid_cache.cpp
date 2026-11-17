@@ -4,6 +4,7 @@
 #include "core/paged_kv_cache.h"
 #include "models/qwen3_5/program/prefix/test_seams.h"
 #include "runtime/engine/context_cache/online_cost.h"
+#include "runtime/prefix_cache/prefix_holds.h"
 
 #include <algorithm>
 #include <atomic>
@@ -652,7 +653,7 @@ void HybridPrefixCache::restore_block(NodeRef node, HybridBlockPages destination
         throw;
     }
     try {
-        restore_.nodes.reserve(restore_.nodes.size() + 1);
+        runtime::prefix_cache::reserve_for_push(restore_.nodes);
         index_->begin_device_fill(node, id);
     } catch (...) {
         release(destination);
