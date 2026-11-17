@@ -1265,7 +1265,7 @@ public:
         const auto kv_heads = dim(c_.attention.kv_heads);
         execution::ForwardKV kv;
         kv.block_tables  = tables_->matrix();
-        std::fill_n(unpackable_flag(0), kMaximumConcurrency, 0);
+        std::fill_n(unpackable_flag(0), kUnpackableFlags, 0);
         for (std::uint32_t l = 0; l < plan_.kv_layers; ++l) {
             const prefix::PlaneRange planes = prefix::kv_layer_planes(kv_geometry_, l);
             std::size_t plane               = planes.begin;
@@ -7730,8 +7730,15 @@ private:
             const std::uint64_t reached = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
             std::int32_t* const nonfinite = nonfinite_flag(ContractAccess::lane(rows[row]));
             const bool nonfinite_row      = std::exchange(*nonfinite, 0) != 0;
-            // Likewise the packed BF16 KV's flag: a row with no packed form left the KV unlike the bf16 storage's.
-            const bool unpackable_row = std::exchange(*unpackable_flag(ContractAccess::lane(rows[row])), 0) != 0;
+            // Likewise the packed BF16 KV's flag: a row with no packed form left the KV unlike the bf16 storage's. A
+            // tree round (one lane) also wrote its side rows' KV through their own table rows, after the lanes'.
+            bool unpackable_row = std::exchange(*unpackable_flag(ContractAccess::lane(rows[row])), 0) != 0;
+            if (rows.size() == 1) {
+                for (std::int32_t side = plan_.lanes; side < plan_.lanes + std::max(0, plan_.tree_paths - 1); ++side) {
+                    unpackable_row = std::exchange(*unpackable_flag(static_cast<std::uint32_t>(side)), 0) != 0 ||
+                                     unpackable_row;
+                }
+            }
             ContractAccess::set_row_failure(pending, row,
                                             unpackable_row ? runtime::PendingRowFailure::UnpackableKv
                                             : nonfinite_row || runtime::testing::take_nonfinite_fault()
@@ -7750,7 +7757,10 @@ private:
     // Per KV table row (a lane's row is its index, tables_->acquire(index)): set by the packed BF16 KV's
     // append when a K or V row has no packed form (ops::kv_cache_append, ops::qsa_prepare), read and cleared by
     // the round's commit, which fails that request (PendingRowFailure::UnpackableKv).
-    PinnedHostBuffer unpackable_flags_{sizeof(std::int32_t) * kMaximumConcurrency};
+    // Indexed by table row (the kernels write a[table_rows[sequence]]): the lanes', then an n-gram tree round's side
+    // rows (lanes + r - 1, r < kNgramTreeMaximumPaths).
+    static constexpr std::uint32_t kUnpackableFlags = kMaximumConcurrency + kNgramTreeMaximumPaths - 1;
+    PinnedHostBuffer unpackable_flags_{sizeof(std::int32_t) * kUnpackableFlags};
     [[nodiscard]] std::int32_t* unpackable_flag(std::uint32_t lane) const noexcept {
         return static_cast<std::int32_t*>(unpackable_flags_.data()) + lane;
     }
