@@ -212,7 +212,11 @@ public:
     std::optional<double> cpu_temperature() {
         if (view_ == nullptr && !open()) { return std::nullopt; }
         const auto* header = static_cast<const HwinfoHeader*>(view_);
-        if (header->signature != kHwinfoActive || header->reading_size < sizeof(HwinfoReading)) {
+        // The readings must lie inside the view (a header of another layout, or one being rewritten, can say otherwise).
+        if (view_bytes_ < sizeof(HwinfoHeader) || header->signature != kHwinfoActive ||
+            header->reading_size < sizeof(HwinfoReading) ||
+            std::uint64_t{header->reading_offset} + std::uint64_t{header->reading_count} * header->reading_size >
+                view_bytes_) {
             close();
             return std::nullopt;
         }
@@ -248,22 +252,26 @@ private:
         mapping_  = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\HWiNFO_SENS_SM2");
         if (mapping_ == nullptr) { return false; }
         view_ = MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
-        if (view_ == nullptr) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (view_ == nullptr || VirtualQuery(view_, &region, sizeof(region)) == 0) {
             close();
             return false;
         }
+        view_bytes_ = region.RegionSize; // the whole section, as mapped
         return true;
     }
 
     void close() {
         if (view_ != nullptr) { UnmapViewOfFile(view_); }
         if (mapping_ != nullptr) { CloseHandle(mapping_); }
-        view_    = nullptr;
-        mapping_ = nullptr;
+        view_       = nullptr;
+        view_bytes_ = 0;
+        mapping_    = nullptr;
     }
 
     HANDLE mapping_ = nullptr;
     const void* view_ = nullptr;
+    std::size_t view_bytes_ = 0;
     std::chrono::steady_clock::time_point next_try_{};
 };
 
@@ -410,7 +418,10 @@ std::optional<double> hwmon_cpu_temperature() {
             const auto input = entry.path() / ("temp" + std::to_string(i) + "_input");
             const std::optional<std::string> value = read_line(input);
             if (!value) { continue; }
-            const double celsius = std::stod(*value) / 1000.0;
+            char* end          = nullptr;
+            const double milli = std::strtod(value->c_str(), &end); // an empty or odd reading is skipped, not thrown
+            if (end == value->c_str()) { continue; }
+            const double celsius = milli / 1000.0;
             const std::optional<std::string> label = read_line(entry.path() / ("temp" + std::to_string(i) + "_label"));
             if (label && (*label == "Package id 0" || *label == "Tctl" || *label == "Tdie")) { return celsius; }
             if (!fallback) { fallback = celsius; }
@@ -711,43 +722,47 @@ void Telemetry::run() {
             std::lock_guard lock(mutex_);
             if (stopping_) { return; }
         }
-        SystemReading reading;
-        reading.t         = now_ms();
-        reading.cpu_usage = sources_->cpu_usage();
-        sources_->memory(reading.ram_total, reading.ram_available);
-        const auto [temperature, source] = sources_->cpu_temperature();
-        reading.cpu_temp_c      = temperature;
-        reading.cpu_temp_source = source;
-        for (std::size_t i = 0; i < sources_->nvml.devices.size(); ++i) {
-            reading.gpus.push_back(sources_->nvml.read(sources_->nvml.indices[i], sources_->nvml.devices[i]));
-        }
-        if (server_) {
-            if (const auto probe = server_()) {
-                ServerReading server = probe->first;
-                const double cpu_seconds = probe->second;
-                const auto now           = std::chrono::steady_clock::now();
-                if (sources_->last_server_cpu_seconds && facts_.threads != 0) {
-                    const double elapsed = std::chrono::duration<double>(now - sources_->last_server_time).count();
-                    if (elapsed > 0.0 && cpu_seconds >= *sources_->last_server_cpu_seconds) {
-                        server.cpu = std::clamp(100.0 * (cpu_seconds - *sources_->last_server_cpu_seconds) /
-                                                    (elapsed * facts_.threads),
-                                                0.0, 100.0);
-                    }
-                }
-                sources_->last_server_cpu_seconds = cpu_seconds;
-                sources_->last_server_time        = now;
-                reading.server                    = server;
-            } else {
-                sources_->last_server_cpu_seconds.reset();
+        // A reading that fails (a source's odd answer, the listener's work) loses that second, not the launcher: an
+        // exception leaving this thread would end the launcher and its server with it.
+        try {
+            SystemReading reading;
+            reading.t         = now_ms();
+            reading.cpu_usage = sources_->cpu_usage();
+            sources_->memory(reading.ram_total, reading.ram_available);
+            const auto [temperature, source] = sources_->cpu_temperature();
+            reading.cpu_temp_c      = temperature;
+            reading.cpu_temp_source = source;
+            for (std::size_t i = 0; i < sources_->nvml.devices.size(); ++i) {
+                reading.gpus.push_back(sources_->nvml.read(sources_->nvml.indices[i], sources_->nvml.devices[i]));
             }
-        }
-        {
-            std::lock_guard lock(mutex_);
-            if (reading.cpu_temp_source) { facts_.cpu_temp_source = reading.cpu_temp_source; }
-            history_.push_back(reading);
-            while (history_.size() > kHistory) { history_.pop_front(); }
-        }
-        if (listener_) { listener_(reading); }
+            if (server_) {
+                if (const auto probe = server_()) {
+                    ServerReading server = probe->first;
+                    const double cpu_seconds = probe->second;
+                    const auto now           = std::chrono::steady_clock::now();
+                    if (sources_->last_server_cpu_seconds && facts_.threads != 0) {
+                        const double elapsed = std::chrono::duration<double>(now - sources_->last_server_time).count();
+                        if (elapsed > 0.0 && cpu_seconds >= *sources_->last_server_cpu_seconds) {
+                            server.cpu = std::clamp(100.0 * (cpu_seconds - *sources_->last_server_cpu_seconds) /
+                                                        (elapsed * facts_.threads),
+                                                    0.0, 100.0);
+                        }
+                    }
+                    sources_->last_server_cpu_seconds = cpu_seconds;
+                    sources_->last_server_time        = now;
+                    reading.server                    = server;
+                } else {
+                    sources_->last_server_cpu_seconds.reset();
+                }
+            }
+            {
+                std::lock_guard lock(mutex_);
+                if (reading.cpu_temp_source) { facts_.cpu_temp_source = reading.cpu_temp_source; }
+                history_.push_back(reading);
+                while (history_.size() > kHistory) { history_.pop_front(); }
+            }
+            if (listener_) { listener_(reading); }
+        } catch (const std::exception&) {}
         next += std::chrono::seconds(1);
         const auto now = std::chrono::steady_clock::now();
         if (next < now) { next = now; }
