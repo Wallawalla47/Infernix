@@ -1112,10 +1112,19 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         const std::int32_t heads    = dimension(config_.attention->num_attention_heads);
         const std::int32_t kv_heads = dimension(config_.attention->num_key_value_heads);
         const Tensor positions = cache_positions.view({T});
+        // The batched append finds a KV window's row through its slots (one row here, the lane's destination):
+        // the one-slot view a single sequence's attention takes names none, and every generation prompt's last
+        // layer failed on vq2 and k4v2 from f092da2b (2026-11-12) to 2026-11-17.
+        PagedKVBatchLayerView append_view = text_kv_layer(static_cast<std::uint32_t>(fidx));
+        if (append_view.window.present() && active_sequence_batch_ == 0) {
+            Tensor slot = work_.alloc(DType::I32, {1});
+            ops::set_i32_scalar(slot, linear_state_destination_slot_, s);
+            append_view.window       = state_images_.kv_window_view(static_cast<std::uint32_t>(fidx));
+            append_view.window.slots = slot;
+        }
         ops::kv_cache_append_batch(kn.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
                                    v.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
-                                   positions.slice(0, 0, skipped).view({skipped, 1}), kv_table_rows,
-                                   text_kv_layer(static_cast<std::uint32_t>(fidx)), s);
+                                   positions.slice(0, 0, skipped).view({skipped, 1}), kv_table_rows, append_view, s);
         Tensor tail = a.slice(2, skipped, kept);
         ops::causal_softmax_attention(
             qn.slice(2, skipped, kept), kn.slice(2, skipped, kept), v.slice(2, skipped, kept),

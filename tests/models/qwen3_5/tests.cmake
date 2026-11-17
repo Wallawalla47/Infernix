@@ -139,6 +139,14 @@ set_tests_properties(
   infernix_qwen3_5_resume_cold_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# A KV window (vq2) with no drafter: a generation prompt's trimmed last layer stores its skipped columns through the
+# batched append, which finds the window's row by slot (it failed every such prompt from 2026-11-12 to 11-17), and
+# the pair window keeps the cut there (hybrid spec §7.10).
+add_test(NAME infernix_qwen3_5_hybrid_prefix_vq2_real_test COMMAND infernix_qwen3_5_hybrid_prefix_real_test)
+set_tests_properties(infernix_qwen3_5_hybrid_prefix_vq2_real_test PROPERTIES
+  ENVIRONMENT "INFERNIX_HYBRID_KV_DTYPE=vq2;INFERNIX_HYBRID_REAL_SCENARIO=pair-window"
+  SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
+
 # Recovery from a unit out of device memory (fix sweep FS-01): an injected shortage at a sweep of CUDA_CHECK
 # counts fails the request in flight, the Engine keeps serving with an intact prefix cache, a queued request
 # completes, and eight failures in a row stop the Engine (tests/memory_exhausted_recovery.h).
