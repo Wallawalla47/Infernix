@@ -815,6 +815,13 @@ void test_file_damage(const std::filesystem::path& directory) {
         flip_byte(file, end - 10);
         load("damaged tables", false, 0);
         flip_byte(file, end - 10);
+        // So does a flipped byte anywhere inside them (a block's tokens or lookup hash, a snapshot's fields): the
+        // tables carry their own hash, so a block is never restored under another identity (audit 2026-11-17 PC-04).
+        for (const std::size_t at : {end / 2, end * 3 / 4, std::size_t{64}}) {
+            flip_byte(file, at);
+            load("a flipped byte inside the tables", false, 0);
+            flip_byte(file, at);
+        }
     }
     // A truncated file is refused before anything is read.
     std::filesystem::resize_file(file, std::filesystem::file_size(file) - kSlabBytes);
