@@ -58,12 +58,20 @@ float median(const std::vector<float>& values) {
     return n % 2 == 0 ? 0.5F * (values[n / 2] + values[n / 2 - 1]) : values[n / 2];
 }
 
+// llama.cpp's summary line. One without arguments (a heading, a blank line: no conversion and no "%%") is copied as is,
+// so no format that is not a literal reaches snprintf (GCC's -Wformat-security).
 template <class... Args>
 void line(std::string& out, const char* format, Args... args) {
-    char buffer[256];
-    const int written = std::snprintf(buffer, sizeof buffer, format, args...);
-    if (written < 0 || static_cast<std::size_t>(written) >= sizeof buffer) { throw std::logic_error("summary line overflow"); }
-    out += buffer;
+    if constexpr (sizeof...(Args) == 0) {
+        out += format;
+    } else {
+        char buffer[256];
+        const int written = std::snprintf(buffer, sizeof buffer, format, args...);
+        if (written < 0 || static_cast<std::size_t>(written) >= sizeof buffer) {
+            throw std::logic_error("summary line overflow");
+        }
+        out += buffer;
+    }
 }
 
 void require_row(std::span<const std::uint16_t> row, std::size_t vocab) {
