@@ -7555,7 +7555,11 @@ private:
         device_.synchronize();
         if (give != 0) {
             const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
-            if (resized.frames > frames - give) { return false; } // a lease holds the frames
+            if (resized.frames > frames - give) { // a lease holds the frames (it may have shrunk part-way)
+                frames_now_ = residency_->frames();
+                pool_now_   = residency_->pool_bytes();
+                return false;
+            }
         }
         const std::size_t mapped_before = kv_vmm_->mapped_bytes();
         if (!map_kv(target)) {
