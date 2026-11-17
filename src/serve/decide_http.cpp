@@ -122,10 +122,12 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
             run.lifecycle = begin_request(make_request_log_context(
                 req_id, "decide", run.generation, metadata, *run.prepared));
         } catch (const ApiException& exception) {
+            run.prepared.reset(); // a throw after prepare (the log record's start): finish must not run it
             record_request_rejected(make_request_rejection_log_context(
                 req_id, "decide", run.generation, metadata, exception.error()));
             run.error = exception.error();
         } catch (const std::exception& exception) {
+            run.prepared.reset(); // as above: no lifecycle to report its outcome to
             ApiError error = internal_error(exception.what(), "internal_error");
             record_request_rejected(make_request_rejection_log_context(
                 req_id, "decide", run.generation, metadata, error));
