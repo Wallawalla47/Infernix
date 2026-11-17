@@ -576,6 +576,9 @@ void run_long(int q_heads, int kv_heads, DeviceExecutionView execution) {
     // A first chunk over two segments with the prompt split: the first query tiles have fewer key blocks than
     // splits, so some splits are empty in every segment and must still publish their neutral partials.
     cached(pair, 0, 0, 300, true, 48, g + "cached 300 from position 0 over two segments, prompt split", execution);
+    // The same two split calls without the prompt split (same queries): split and unsplit each meet the oracle.
+    cached(pair, 0, 16200, 280, false, 42, g + "cached 280 over two segments, the split call unsplit", execution);
+    cached(pair, 0, 0, 300, false, 48, g + "cached 300 from position 0 over two segments, unsplit", execution);
     append_attend(pair, 280, {0}, {16700}, {}, {}, false, 43, g + "prompt 280 over two segments", execution);
     append_attend(pair, 1, {0}, {16980}, {}, {}, false, 44, g + "decode", execution);
     append_attend(pair, 4, {0}, {16981}, {}, {}, false, 45, g + "4 columns", execution);
