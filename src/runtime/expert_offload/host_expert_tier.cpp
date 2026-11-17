@@ -651,6 +651,11 @@ HostExpertTier::~HostExpertTier() {
     }
     copy_wake_.notify_all();
     for (auto& copier : copiers_) { copier.join(); }
+    // A shrink's decommits and releases queued on the memory worker use this tier's unpinned buffer: they finish
+    // before it goes, whichever of the two its owner destroys first (a job the worker dropped is ready, broken).
+    for (std::future<void>& job : releases_) {
+        if (job.valid()) { job.wait(); }
+    }
     queue_.reset(); // cancels and waits for any read still in flight
     // A growth that landed but was never linked: its chunks are released here (its job has run: the worker stops
     // before the tier goes, or is waited for now).
