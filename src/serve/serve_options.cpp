@@ -523,7 +523,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             rewrites the whole file (up to --host-context-mib,\n"
            "                             several GB), so a short interval writes a lot to\n"
            "                             the drive and wears an SSD faster; prefer 15-60\n"
-           "                             minutes\n"
+           "                             minutes (N: 1-525600, a year)\n"
            "  --ssd-context-gib N        an SSD tier of N GiB below the Host pool (default\n"
            "                             0: off). What the Host pool would otherwise lose\n"
            "                             (snapshots and their blocks) is kept in a scratch\n"
