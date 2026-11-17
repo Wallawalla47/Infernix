@@ -98,7 +98,10 @@ void LogBuffer::begin_instance(std::uint32_t instance, const std::string& label)
     std::lock_guard lock(mutex_);
     partial_.clear();
     partial_instance_ = instance;
-    file_writes_.push_back(FileWrite{.open = log_dir_ / ("serve-" + file_stamp() + "-" + safe + ".log")});
+    // The instance number keeps two starts within one second (a retry on another port, a restart) in two files: the
+    // second would otherwise truncate the log that explains why the first was retried.
+    file_writes_.push_back(FileWrite{
+        .open = log_dir_ / ("serve-" + file_stamp() + "-" + std::to_string(instance) + "-" + safe + ".log")});
 }
 
 void LogBuffer::open_file(const std::filesystem::path& path) {

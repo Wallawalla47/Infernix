@@ -631,7 +631,7 @@ export function SettingsPage() {
             <FieldRow label="Request contents" help="Written only while request and response contents are recorded (below)." stacked>
               <PathBox path={logs?.requests_file ?? null} />
             </FieldRow>
-            <FieldRow label="Server logs" help="One file per server run (serve-<time>-<model>.log); the newest 20 are kept." stacked>
+            <FieldRow label="Server logs" help="One file per server run (serve-<time>-<run>-<model>.log); the newest 20 are kept." stacked>
               <PathBox path={logs?.serve_dir ?? null} />
             </FieldRow>
             <FieldRow

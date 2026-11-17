@@ -239,7 +239,7 @@ void test_serve_log_files() {
     check(files.size() == 2, "one log file per server instance");
     if (files.size() == 2) {
         check(files[0].filename().string().ends_with("-first_model.log") && files[1].filename().string().ends_with("-second.log"),
-              "serve-<time>-<model>.log");
+              "serve-<time>-<run>-<model>.log");
         check(read_file(files[0]).value_or("") == "2026-10-30 11:55:04.605  INFO  build windows-2026.10.18\nraw line\n",
               "an instance's output as it came, in its own file");
         check(read_file(files[1]).value_or("") == "second output\n", "the next instance's in the next file");
@@ -248,7 +248,19 @@ void test_serve_log_files() {
         check(read_file(files[1]).value_or("") == "second output\nmore\n", "later output joins the open file");
     }
     logs.end_instance();
+    // Another start of that model straight away (audit 2026-11-17 LN-15: a retry on another port, within the same
+    // second) writes a file of its own instead of truncating the log of the start it retries.
+    logs.begin_instance(3, "second");
+    logs.append_output(3, "retried\n");
+    logs.end_instance();
     logs.write_files();
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ignored)) {
+        (void)entry;
+        ++count;
+    }
+    check(count == 3 && files.size() == 2 && read_file(files[1]).value_or("") == "second output\nmore\n",
+          "a restart of the same model keeps the previous run's log");
     std::filesystem::remove_all(dir, ignored);
 }
 
