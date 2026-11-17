@@ -148,34 +148,46 @@ public:
             if (worker_.joinable()) { worker_.join(); }
             throw;
         }
-        instance_.program->set_maintenance_waker([this] { request_maintenance(); });
-        // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
-        // Without the thread the Engine simply never prefills them.
-        if (next_turn_quiet_.count() > 0) {
-            try {
-                next_turn_thread_ = std::thread([this] { next_turn_prepare_loop(); });
-            } catch (...) {
-                next_turn_disabled_.store(true, std::memory_order_release);
+        // With the worker running, a step below that throws (a thread that cannot start, an allocation) stops and
+        // joins what started, as the destructor does: no destructor runs for a constructor that throws, and a
+        // joinable std::thread member would end the process.
+        try {
+            instance_.program->set_maintenance_waker([this] { request_maintenance(); });
+            // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
+            // Without the thread the Engine simply never prefills them.
+            if (next_turn_quiet_.count() > 0) {
+                try {
+                    next_turn_thread_ = std::thread([this] { next_turn_prepare_loop(); });
+                } catch (...) {
+                    next_turn_disabled_.store(true, std::memory_order_release);
+                }
             }
+            // The first constrained request would build the constraint compiler's vocabulary index
+            // before its prefill starts (measured 0.85 s of `prepare` with a 337-token prefill), so
+            // it is built beside startup instead.
+            constraint_warm_ = std::thread([this, frontend = instance_.frontend] {
+                const auto started = Clock::now();
+                try {
+                    frontend.warm_constraints();
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Debug,
+                                       "constraint vocabulary index built in %.3f s",
+                                       std::chrono::duration<double>(Clock::now() - started).count());
+                } catch (const std::exception& error) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                       "constraint vocabulary index not built ahead: %s", error.what());
+                } catch (...) {}
+            });
+        } catch (...) {
+            shut_down();
+            throw;
         }
-        // The first constrained request would build the constraint compiler's vocabulary index
-        // before its prefill starts (measured 0.85 s of `prepare` with a 337-token prefill), so
-        // it is built beside startup instead. Last, so nothing after it can throw past the thread.
-        constraint_warm_ = std::thread([this, frontend = instance_.frontend] {
-            const auto started = Clock::now();
-            try {
-                frontend.warm_constraints();
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Debug,
-                                   "constraint vocabulary index built in %.3f s",
-                                   std::chrono::duration<double>(Clock::now() - started).count());
-            } catch (const std::exception& error) {
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
-                                   "constraint vocabulary index not built ahead: %s", error.what());
-            } catch (...) {}
-        });
     }
 
-    ~EngineCore() noexcept {
+    ~EngineCore() noexcept { shut_down(); }
+
+    // Stops the worker and joins every thread this Engine started (the destructor's, and a constructor's that
+    // throws after the worker started).
+    void shut_down() noexcept {
         // The Program's monitor thread must not wake an engine that is going away.
         try { instance_.program->set_maintenance_waker({}); } catch (...) {}
         stop();
