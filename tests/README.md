@@ -277,7 +277,8 @@ expert frames a Vision window may be lent (the image request waits or is refused
 (`INFERNIX_HYBRID_REAL_SCENARIO`) checks the withdrawal on Qwen3.5, and its `pair-window`,
 `pair-window-dflash2` and `pair-window-mtp` scenarios compare a chat turn whose opener tap is taken inside
 its last pass with the cut one (the testing seam `set_pair_windows`), then sweep device-memory faults over
-paired turns (hybrid spec §7.10).
+paired turns, and `pair-window-restore` pairs a turn while its resume is still restoring from the Host
+(hybrid spec §7.10).
 `infernix_qwen4_exp_memory_exhausted_real_test` and `infernix_qwen3_5_memory_exhausted_real_test` (the
 dense `INFERNIX_TEST_ARTIFACT`) make the N-th CUDA call of the Engine's work report no device memory, over a
 sweep of N from binding through prefill into decode (`tests/memory_exhausted_recovery.h`): the request in

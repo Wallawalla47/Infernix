@@ -933,23 +933,24 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
 // pair's width as at its own (heads of ~200 columns here; a resumed 77-column head paired to 84 changed its next
 // turn's tokens in a served A/B). Two turns: a cold one, then one resumed from its tap that pairs its own opener.
 // Each arm runs on a fresh Engine. A KV window (vq2, q4k-vq2) keeps the cut: both arms cut.
-int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend backend) {
-    const std::string name = std::string("pair-window") +
-                             (backend == infernix::SpeculativeBackend::DFlash2 ? " (dflash2)"
-                              : backend == infernix::SpeculativeBackend::Mtp   ? " (mtp)"
-                                                                               : "");
-    const infernix::ChatMessage system =
-        text_message(infernix::ChatRole::System, "You are a concise assistant for a hardware shop. Answer in plain words.");
+// The pair-window exercises' conversation: a cold turn, a short follow-up, and a long resumed turn with its reply.
+struct PairConversation {
+    infernix::ChatMessage system, first_user, reply, second_user, follow_user, follow_reply;
+    std::string question;
+};
+
+PairConversation pair_conversation() {
+    PairConversation p;
+    p.system = text_message(infernix::ChatRole::System, "You are a concise assistant for a hardware shop. Answer in plain words.");
     // Longer than the 64-token cluster distance, so the opener keeps its own exact tap past the system block's.
-    std::string question = "A customer asks which of three drills to buy.";
+    p.question = "A customer asks which of three drills to buy.";
     for (int i = 0; i < 6; ++i) {
-        question += " Drill " + std::to_string(i) + " has a different battery, chuck size, weight and warranty, and the "
-                    "customer mostly hangs shelves and assembles furniture at home.";
+        p.question += " Drill " + std::to_string(i) + " has a different battery, chuck size, weight and warranty, and the "
+                      "customer mostly hangs shelves and assembles furniture at home.";
     }
-    const infernix::ChatMessage first_user = text_message(infernix::ChatRole::User, question);
-    const infernix::ChatMessage reply =
-        text_message(infernix::ChatRole::Assistant, "Take the lightest one with a two-year warranty and a spare battery.");
-    const infernix::ChatMessage second_user = text_message(infernix::ChatRole::User, "And which bits should go with it?");
+    p.first_user = text_message(infernix::ChatRole::User, p.question);
+    p.reply = text_message(infernix::ChatRole::Assistant, "Take the lightest one with a two-year warranty and a spare battery.");
+    p.second_user = text_message(infernix::ChatRole::User, "And which bits should go with it?");
     // The resumed turn's question: long enough that its opener lies well past where it resumes (its own exact tap,
     // with a wide head).
     std::string follow_up = "Thanks. Now the same customer also asks about storage.";
@@ -957,9 +958,21 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
         follow_up += " Case " + std::to_string(i) + " is a plastic box with foam inserts, a metal clasp, room for twenty "
                      "bits and a belt clip, sold at a slightly different price.";
     }
-    const infernix::ChatMessage follow_user = text_message(infernix::ChatRole::User, follow_up);
-    const infernix::ChatMessage follow_reply =
-        text_message(infernix::ChatRole::Assistant, "The second case: foam inserts keep the bits from rattling.");
+    p.follow_user  = text_message(infernix::ChatRole::User, follow_up);
+    p.follow_reply = text_message(infernix::ChatRole::Assistant, "The second case: foam inserts keep the bits from rattling.");
+    return p;
+}
+
+int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend backend) {
+    const std::string name = std::string("pair-window") +
+                             (backend == infernix::SpeculativeBackend::DFlash2 ? " (dflash2)"
+                              : backend == infernix::SpeculativeBackend::Mtp   ? " (mtp)"
+                                                                               : "");
+    const PairConversation conv = pair_conversation();
+    const infernix::ChatMessage &system = conv.system, &first_user = conv.first_user, &reply = conv.reply,
+                                &second_user = conv.second_user, &follow_user = conv.follow_user,
+                                &follow_reply = conv.follow_reply;
+    const std::string& question = conv.question;
     const bool kv_window = kv_storage == infernix::KvCacheStorage::Vq2 || kv_storage == infernix::KvCacheStorage::Q4KeyVq2Value;
     struct Arm {
         std::vector<std::uint32_t> bases, follow_bases; // where each text pass of the two turns began
@@ -984,9 +997,10 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
         arm.bases = passes();
         const infernix::GenerationResult second =
             engine.generate(engine.prepare(conversation({system, first_user, reply, second_user})), greedy(24));
-        // The resumed turn (from the first turn's opener tap) whose own opener pairs, then the turn after it. It is
-        // sent as a client's next turn arrives, once the previous reply's snapshots have landed on the Host: a turn
-        // sent at once may find every Device snapshot slot still held, and its pass is then cut (hybrid spec §7.10).
+        // The resumed turn (from the first turn's opener tap) whose own opener pairs, then the turn after it. A turn
+        // that finds every Device snapshot slot still held (the previous reply's snapshots landing on the Host) is
+        // cut instead (hybrid spec §7.10); the pause, as a client's next turn arrives, makes the pair the usual case
+        // without depending on it: a cut is accepted where a slot refusal explains it.
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         arm.refusals = engine.runtime_stats().hybrid_device_slot_refusals;
         qwen_testing::record_text_passes(true);
@@ -1045,8 +1059,10 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
     // The resumed turn: it resumes at the first turn's opener, its own last pass begins at its opener in the cut
     // (2-8 tokens before its end) and not in the pair, and the turn after it resumes there with the cut's tokens.
     const std::uint32_t follow_opener = cut.follow_bases.empty() ? 0U : cut.follow_bases.back();
+    const bool follow_paired = pair.follow_bases == paired(cut.follow_bases);
+    const bool follow_cut_for_room = !follow_paired && pair.follow_bases == cut.follow_bases && pair.refusals > 0;
     if (cut.follow_reused != opener || pair.follow_reused != opener || follow_opener + 8U < cut.follow_tokens ||
-        follow_opener + 2U > cut.follow_tokens || pair.follow_bases != paired(cut.follow_bases)) {
+        follow_opener + 2U > cut.follow_tokens || !(follow_paired || follow_cut_for_room)) {
         std::cerr << name << ": the resumed turn reused " << cut.follow_reused << " / " << pair.follow_reused << " of "
                   << cut.follow_tokens << " tokens and ran " << cut.follow_bases.size() << " passes cut, "
                   << pair.follow_bases.size() << " paired (last cut pass from " << follow_opener << "; "
@@ -1063,7 +1079,8 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
               << pair.bases.size() << " paired (opener at " << opener << "); the next turn resumed at " << pair.reused
               << " (cut " << cut.reused << "), tokens " << (pair.second == cut.second ? "equal" : "different")
               << "; a resumed " << cut.follow_tokens << "-token turn ran " << cut.follow_bases.size() << " passes cut and "
-              << pair.follow_bases.size() << " paired (opener at " << follow_opener << "); the turn after it resumed at "
+              << pair.follow_bases.size() << (follow_cut_for_room ? " (cut: no slot)" : " paired") << " (opener at "
+              << follow_opener << "); the turn after it resumed at "
               << pair.last_reused << ", tokens " << (pair.last == cut.last ? "equal" : "different") << '\n';
     if (backend != infernix::SpeculativeBackend::None || kv_window) { return failures; }
 
@@ -1121,6 +1138,101 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
     std::cout << name << ": " << failed << " of " << sweep.size() << " faulted pair turns failed; afterwards a new "
               << "conversation's opener was " << (last_paired ? "paired" : "cut") << " and its next turn resumed at "
               << next.reused_prompt_tokens << '\n';
+    return failures;
+}
+
+// QK-02 beside a landing restore: the pair takes its tap's room before its pass, superseding the snapshot its turn
+// resumed from, while that snapshot's Host restore is still landing. With one Device snapshot slot the first turn's
+// opener tap gives its Device copy up to another conversation's snapshot, so the resumed turn restores it from the
+// Host, held back by testing::set_restore_delay so the copies are in flight when the pair asks for room. In both arms
+// the resumed turn restores from the Host and resumes at the first opener, and the turn after it resumes at the
+// resumed turn's opener with the same tokens; the pair arm pairs, or is cut where a slot refusal explains it.
+int exercise_pair_window_restore(const char* artifact) {
+    const std::string name = "pair-window-restore";
+    const PairConversation conv = pair_conversation();
+    const infernix::ChatMessage other_system =
+        text_message(infernix::ChatRole::System, "You answer questions about trains in one short sentence.");
+    std::string other_question = "Which train leaves first?";
+    for (int i = 0; i < 6; ++i) {
+        other_question += " Train " + std::to_string(i) + " leaves platform " + std::to_string(i + 2) +
+                          " a few minutes after the one before it and stops at every station on the coast line.";
+    }
+    const infernix::ChatMessage other_user = text_message(infernix::ChatRole::User, other_question);
+    struct Arm {
+        std::uint32_t first_tokens = 0, follow_reused = 0, last_reused = 0;
+        std::vector<std::uint32_t> follow_bases;
+        std::uint64_t restores = 0, refusals = 0;
+        std::vector<infernix::TokenId> last;
+    };
+    const auto run = [&](bool pair) {
+        qwen_testing::set_pair_windows(pair);
+        infernix::Engine engine(hybrid_options(artifact, infernix::SpeculativeBackend::None, 8192, 1ULL << 30, 1));
+        Arm arm;
+        const infernix::GenerationResult first =
+            engine.generate(engine.prepare(conversation({conv.system, conv.first_user})), greedy(8));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // its snapshots land on the Host
+        (void)engine.generate(engine.prepare(conversation({other_system, other_user})), greedy(8));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const infernix::RuntimeStats before = engine.runtime_stats();
+        qwen_testing::set_restore_delay(20000);
+        qwen_testing::record_text_passes(true);
+        infernix::GenerationResult follow;
+        try {
+            follow = engine.generate(
+                engine.prepare(conversation({conv.system, conv.first_user, conv.reply, conv.follow_user})), greedy(8));
+        } catch (...) {
+            qwen_testing::set_restore_delay(0);
+            qwen_testing::record_text_passes(false);
+            throw;
+        }
+        qwen_testing::set_restore_delay(0);
+        for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { arm.follow_bases.push_back(pass.base); }
+        qwen_testing::record_text_passes(false);
+        const infernix::RuntimeStats after = engine.runtime_stats();
+        arm.restores = after.hybrid_host_image_restores - before.hybrid_host_image_restores;
+        arm.refusals = after.hybrid_device_slot_refusals - before.hybrid_device_slot_refusals;
+        const infernix::GenerationResult last = engine.generate(
+            engine.prepare(conversation(
+                {conv.system, conv.first_user, conv.reply, conv.follow_user, conv.follow_reply, conv.second_user})),
+            greedy(24));
+        arm.first_tokens  = first.prompt.prompt_tokens;
+        arm.follow_reused = follow.reused_prompt_tokens;
+        arm.last_reused   = last.reused_prompt_tokens;
+        arm.last          = last.generated_token_ids;
+        return arm;
+    };
+    Arm cut, pair;
+    try {
+        cut  = run(false);
+        pair = run(true);
+    } catch (...) {
+        qwen_testing::set_pair_windows(true);
+        throw;
+    }
+    qwen_testing::set_pair_windows(true);
+    int failures = 0;
+    const std::uint32_t follow_opener = cut.follow_bases.empty() ? 0U : cut.follow_bases.back();
+    const bool paired = !cut.follow_bases.empty() &&
+                        pair.follow_bases == std::vector<std::uint32_t>(cut.follow_bases.begin(), cut.follow_bases.end() - 1);
+    const bool cut_for_room = !paired && pair.follow_bases == cut.follow_bases && pair.refusals > 0;
+    if (cut.restores == 0 || pair.restores == 0 || cut.follow_reused != pair.follow_reused ||
+        cut.follow_reused + 16U < cut.first_tokens || cut.follow_reused >= cut.first_tokens || !(paired || cut_for_room)) {
+        std::cerr << name << ": the resumed turn restored " << cut.restores << " / " << pair.restores
+                  << " images from the Host and reused " << cut.follow_reused << " / " << pair.follow_reused << " of "
+                  << cut.first_tokens << " tokens; " << pair.follow_bases.size() << " passes paired against "
+                  << cut.follow_bases.size() << " cut (" << pair.refusals << " slot refusals)\n";
+        ++failures;
+    }
+    if (cut.last_reused != follow_opener || pair.last_reused != follow_opener || pair.last != cut.last) {
+        std::cerr << name << ": the turn after the resumed one reused " << cut.last_reused << " (cut) and "
+                  << pair.last_reused << " (pair), expected " << follow_opener << ", and generated "
+                  << (pair.last == cut.last ? "equal" : "different") << " tokens\n";
+        ++failures;
+    }
+    std::cout << name << ": the resumed turn restored " << pair.restores << " images from the Host (cut " << cut.restores
+              << ") under a held restore and was " << (paired ? "paired" : cut_for_room ? "cut (no slot)" : "?")
+              << "; the turn after it resumed at " << pair.last_reused << ", tokens "
+              << (pair.last == cut.last ? "equal" : "different") << '\n';
     return failures;
 }
 
@@ -1713,8 +1825,9 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 26> kScenarios{"all",
+    constexpr std::array<std::string_view, 27> kScenarios{"all",
                                                           "pair-window",
+                                                          "pair-window-restore",
                                                           "pair-window-dflash2",
                                                           "pair-window-mtp",
                                                           "vision-resume",
@@ -1771,6 +1884,7 @@ int main() {
         if (all || scenario == "pair-window-mtp") {
             failures += exercise_pair_window(artifact, infernix::SpeculativeBackend::Mtp);
         }
+        if (all || scenario == "pair-window-restore") { failures += exercise_pair_window_restore(artifact); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
         if (all || scenario == "vision-resume") { failures += exercise_vision_resume(artifact); }
