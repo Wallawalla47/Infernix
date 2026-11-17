@@ -556,6 +556,15 @@ not explained by acceptance alone and was not attributed further. Recipe A, reci
 FP4-Local (MXFP8 dense, with 16- and with 4-bit expert activations) are registered by the rule for a
 path that changes no logit (6.1), with these as the nearest timings.
 
+NVIDIA's NVFP4-QAD artifacts (exact and Dense8, Flash-Next design §6.1.3; 2026-11-17) have FP4-Local's
+`--expert-a4-activations` configuration (MXFP8 dense, 4-bit expert activations) and take its registered paths
+without a gate of their own (6.1: approval follows the kernels a path changes). Their shared experts run as the
+routed experts' call's last job, on the same exact W4A4 expert kernels, and the Dense8 artifact's Q8 mixers and head
+are recipe B's kernels; no path registered for that configuration changes either. With `--a16-activations` they have
+FP4-Local's default configuration (MXFP8 dense, 16-bit expert activations), where `expert-a4-residual` is
+registered: there it also takes the shared expert's prefill calls (the shared job of every call of more than eight
+columns), which FP4-Local's MXFP8 shared expert never ran on, so that pairing is inherited, not gated.
+
 **`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
 `ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
 oracle than the exact route (output relative RMS 2.08e-3 against 3.60e-3, state 8.6e-4 against

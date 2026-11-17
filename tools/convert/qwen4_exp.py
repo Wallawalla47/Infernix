@@ -256,8 +256,9 @@ def import_fp8_expert_bank(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
-def _expert_input_scales(store: SafetensorsSource, prefix: str, experts: int) -> LogicalSource:
-    """FP32 ``[experts, 3]`` activation global scales in (gate, up, down) order, as stored."""
+def _expert_input_scales(store: SafetensorsSource, prefix: str, experts: int, *, single: bool = False) -> LogicalSource:
+    """FP32 ``[experts, 3]`` activation global scales in (gate, up, down) order, as stored; ``single``: one gated
+    expert's (``{prefix}gate_proj.input_scale``, a shared expert bank's [1, 3])."""
 
     cache: list[torch.Tensor] = []
 
@@ -266,7 +267,7 @@ def _expert_input_scales(store: SafetensorsSource, prefix: str, experts: int) ->
             words = []
             for e in range(experts):
                 for role in ("gate", "up", "down"):
-                    name = f"{prefix}{e}.{role}_proj.input_scale"
+                    name = f"{prefix}{role}_proj.input_scale" if single else f"{prefix}{e}.{role}_proj.input_scale"
                     info = store.describe(name)
                     if info.dtype != "F32" or prod(info.shape) != 1:
                         raise ValueError(f"{name}: expected one FP32 scalar")
@@ -389,12 +390,18 @@ class _Qwen4ExpBuilder(_Builder):
         self.add(p + "router", store, sp + "gate.weight", (e, h), inputs=(ffn_input,))
         self.add(p + "shared_score", store, sp + "shared_expert_gate.weight", (1, h), inputs=(ffn_input,))
         self.group(p + "router", p + "shared_score")
-        for role in ("gate", "up"):
-            self.add(p + "shared/" + role, store, sp + "shared_expert." + role + "_proj.weight", (shared, h),
-                     inputs=(ffn_input,))
-        self.add(p + "shared/down", store, sp + "shared_expert.down_proj.weight", (h, shared),
-                 inputs=(p + "shared/product",))
-        self.group(p + "shared/gate", p + "shared/up")
+        # NVIDIA's NVFP4-QAD stores the shared expert in ModelOpt NVFP4 (with input scales) at the routed experts'
+        # geometry: it becomes a one-record bank in their nvfp4_expert_rg16_v1 layout after the routed bank, which
+        # the routed experts' call runs as its last job in their arithmetic (design §8.6; engine MoeConfig::
+        # shared_bank). Every other export's shared expert is dense projections.
+        shared_bank = not mtp and store.describe(sp + "shared_expert.gate_proj.weight").dtype == "U8"
+        if not shared_bank:
+            for role in ("gate", "up"):
+                self.add(p + "shared/" + role, store, sp + "shared_expert." + role + "_proj.weight", (shared, h),
+                         inputs=(ffn_input,))
+            self.add(p + "shared/down", store, sp + "shared_expert.down_proj.weight", (h, shared),
+                     inputs=(p + "shared/product",))
+            self.group(p + "shared/gate", p + "shared/up")
         if mtp:
             # Each expert's matrices become row ranges of two parents (gate and up interleaved per
             # expert, then every down), so the drafter's resident-expert kernel selects them by id.
@@ -427,6 +434,8 @@ class _Qwen4ExpBuilder(_Builder):
         # Qwen's official FP8 export: block-FP8 experts, imported verbatim and run W8A16 (design §19.3.25).
         if not store.has(sp + "experts.0.gate_proj.weight_packed") and \
                 store.describe(sp + "experts.0.gate_proj.weight").dtype == "F8_E4M3":
+            if shared_bank:
+                raise ValueError(f"{sp}shared_expert: an NVFP4 shared expert needs NVFP4 routed experts")
             bank = Fp8ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.")
             self.model.add(Parameter(p + "experts", (e, h, ir), bank, None, (ffn_input,), "fp8_e4m3fn_b128",
                                      residency="text"))
@@ -439,6 +448,19 @@ class _Qwen4ExpBuilder(_Builder):
         if not packed:
             self.model.add(Parameter(p + "expert_input_scales", (e, 3), _expert_input_scales(store, sp + "experts.", e),
                                      None, (), "fp32", residency="text"))
+        if shared_bank:
+            if shared != ir or packed:
+                raise ValueError(f"{sp}shared_expert: a shared expert bank needs ModelOpt routed experts of its width")
+            one = ExpertBankSource((1, h, shared), f"{store.path}:{sp}shared_expert", store, sp + "shared_expert.",
+                                   single=True)
+            if one.weight_only != bank.weight_only:
+                raise ValueError(f"{sp}shared_expert: the shared and routed experts' activation scales must agree")
+            self.model.add(Parameter(p + "shared_expert", (1, h, shared), one, None, (ffn_input,), "nvfp4_mul",
+                                     residency="text"))
+            if not one.weight_only:
+                self.model.add(Parameter(p + "shared_expert_input_scales", (1, 3),
+                                         _expert_input_scales(store, sp + "shared_expert.", 1, single=True),
+                                         None, (), "fp32", residency="text"))
 
     def ple(self, prefix, source_prefix, store, config):
         h, width, dim = config["hidden_size"], config["hc_count"] * config["hidden_size"], config["ple_embed_dim"]

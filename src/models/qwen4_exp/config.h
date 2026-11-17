@@ -80,6 +80,9 @@ struct MoeConfig {
     // The text config's expert_a4_activations: optional (NVIDIA FP4-Local, design §6.1.2): the banks
     // carry their calibrated activation scales and permit 4-bit activations, but default to 16-bit.
     bool a4_optional = false;
+    // Every layer stores its shared expert as a one-record NVFP4 bank of the routed bank's layout (NVIDIA's
+    // NVFP4-QAD): the routed experts' call runs it as its last job, in the routed bank's arithmetic (load_plan).
+    bool shared_bank = false;
 };
 
 struct HyperConnectionConfig {

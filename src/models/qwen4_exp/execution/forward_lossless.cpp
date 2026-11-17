@@ -403,15 +403,26 @@ Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint3
     // Router: l = bf16(x W_router), w = bf16(fp32(p / fp32(sum of the top k))); the shared gate's logit.
     Tensor logits = work_.alloc(DType::BF16, {E, T});
     Tensor shared_logit = work_.alloc(DType::BF16, {1, T});
-    // The router, the shared gate's logit and the shared expert's gate and up: one encode of x.
-    Tensor gate = work_.alloc(DType::BF16, {I, T}), up = work_.alloc(DType::BF16, {I, T});
+    // The router, the shared gate's logit and the shared expert's gate and up: one encode of x. A shared expert bank
+    // (MoeConfig::shared_bank) is instead the routed call's last job, on the same lossless expert pass.
+    const bool shared_job = p.shared_bank != nullptr;
+    const std::int32_t SJ = shared_job ? 1 : 0;
+    Tensor gate, up;
     {
         const Weight router = bf16_rows(p.router), shared_score = bf16_rows(p.shared_score);
-        const LosslessPart parts[] = {{nullptr, &router, 0, E, &logits, 0},
-                                      {nullptr, &shared_score, 0, 1, &shared_logit, 0},
-                                      {&p.shared_gate_up, nullptr, 0, I, &gate, 0},
-                                      {&p.shared_gate_up, nullptr, I, I, &up, 0}};
-        lossless_project_shared(x, parts);
+        if (shared_job) {
+            const LosslessPart parts[] = {{nullptr, &router, 0, E, &logits, 0},
+                                          {nullptr, &shared_score, 0, 1, &shared_logit, 0}};
+            lossless_project_shared(x, parts);
+        } else {
+            gate = work_.alloc(DType::BF16, {I, T});
+            up   = work_.alloc(DType::BF16, {I, T});
+            const LosslessPart parts[] = {{nullptr, &router, 0, E, &logits, 0},
+                                          {nullptr, &shared_score, 0, 1, &shared_logit, 0},
+                                          {&p.shared_gate_up, nullptr, 0, I, &gate, 0},
+                                          {&p.shared_gate_up, nullptr, I, I, &up, 0}};
+            lossless_project_shared(x, parts);
+        }
     }
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
@@ -420,9 +431,9 @@ Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint3
     if (experts_.route_log != nullptr && static_cast<std::size_t>(K) * T <= experts_.route_stride) {
         route_log = experts_.route_log + layer * experts_.route_stride;
     }
-    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
-    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    ops::moe_dispatch(routing, E, dispatch, route_log, s);
+    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E + SJ, (K + SJ) * T));
+    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E + SJ, (K + SJ) * T);
+    ops::moe_dispatch(routing, E, dispatch, route_log, s, shared_job);
     // The routed experts: every bank's lossless pass, GPU only, serial staging passes.
     ops::MoeExpertSource source = expert_source(p, layer);
     source.cpu       = ops::MoeCpuChannel{};
@@ -431,18 +442,28 @@ Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint3
     // The design reference: a W4A4 bank's experts quantize their inputs (lossless_scales then carry the
     // input scales beside the weights' multipliers).
     source.lossless_design = p.lossless_design;
-    Tensor outputs   = work_.alloc(DType::BF16, {H, K * T});
-    const std::int32_t max_jobs = std::min(E, K * T);
+    if (shared_job) {
+        source.shared_expert = E;
+        source.shared_record = reinterpret_cast<const std::uint8_t*>(p.shared_bank->planes.device_records);
+    }
+    Tensor outputs   = work_.alloc(DType::BF16, {H, (K + SJ) * T});
+    const std::int32_t max_jobs = std::min(E, K * T) + SJ;
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(
-        source.shape, max_jobs, K * T, T, source.activation, ops::offloaded_moe::WideA16::kLossless));
+        source.shape, max_jobs, (K + SJ) * T, T, source.activation, ops::offloaded_moe::WideA16::kLossless));
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, false);
-    // The shared expert (its gate and up projected with the router above) and its gate.
-    Tensor product = work_.alloc(DType::BF16, {I, T});
-    ops::lossless_silu_mul(gate, up, product, s);
-    Tensor shared = work_.alloc(DType::BF16, {H, T});
-    lossless_project(product, p.shared_down, 0, H, shared, 0);
+    // The shared expert (its gate and up projected with the router above, or the call's shared job) and its gate.
+    Tensor shared;
+    if (shared_job) {
+        shared = outputs.slice(1, K * T, T);
+    } else {
+        Tensor product = work_.alloc(DType::BF16, {I, T});
+        ops::lossless_silu_mul(gate, up, product, s);
+        shared = work_.alloc(DType::BF16, {H, T});
+        lossless_project(product, p.shared_down, 0, H, shared, 0);
+    }
     // y = bf16(sum over the experts in ascending id of bf16(y_e w_e), then + the gated shared output).
-    ops::lossless_moe_combine(outputs, routing.weights, routing.ids, Tensor{}, &shared, &shared_logit, 0, ym, s,
+    const Tensor routed = shared_job ? outputs.slice(1, 0, K * T) : outputs;
+    ops::lossless_moe_combine(routed, routing.weights, routing.ids, Tensor{}, &shared, &shared_logit, 0, ym, s,
                               /*add=*/false);
     return ym;
 }
@@ -546,11 +567,14 @@ std::size_t Forward::lossless_workspace_bytes(const TextConfig& c, std::int32_t 
                  ops::lossless_paged_attention_workspace_bytes(dim(c.attention.heads), dim(c.attention.kv_heads), dim(t),
                                                                std::max(sequences, 1), key_capacity);
     }
+    const std::size_t sj  = c.moe.shared_bank ? 1 : 0; // a shared expert bank's job: one more expert, T more entries
     const std::size_t moe = h * t * bf + c.moe.experts * t * bf + t * bf + k * t * 8 + t * 4 +
-                            ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t)) + h * k * t * bf +
+                            ops::moe_dispatch_bytes(dim(c.moe.experts + sj), dim((k + sj) * t)) + h * (k + sj) * t * bf +
                             ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape,
-                                                             std::min<std::int32_t>(dim(c.moe.experts), dim(k * t)), dim(k * t),
-                                                             dim(t), ops::offloaded_moe::ExpertActivation::kA16,
+                                                             std::min<std::int32_t>(dim(c.moe.experts), dim(k * t)) +
+                                                                 static_cast<std::int32_t>(sj),
+                                                             dim((k + sj) * t), dim(t),
+                                                             ops::offloaded_moe::ExpertActivation::kA16,
                                                              ops::offloaded_moe::WideA16::kLossless) +
                             std::size_t(c.moe.shared_intermediate) * t * bf * 3 + h * t * bf;
     const std::size_t layer = S * t * bf + std::max({ple, mix + std::max({gdn, attn, cached}), mix + moe});

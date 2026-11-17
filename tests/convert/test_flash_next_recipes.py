@@ -250,6 +250,88 @@ def test_fp4_local_recipe_keeps_the_mxfp8_words_and_defaults_the_experts_to_a16(
         qwen3_8_flash_next_fp4_local(fp8_table, Recipe(fp8_table), {"base": None})
 
 
+class _ScaledStore:
+    """A store whose every matrix carries an activation scale: ModelOpt W4A4 banks."""
+
+    def has(self, name: str) -> bool:
+        return name.endswith(".input_scale")
+
+
+def test_nvfp4_qad_recipes_keep_the_w4a4_banks_and_mxfp8_words() -> None:
+    """NVIDIA NVFP4-QAD (design §6.1.3): the routed bank and the one-record shared expert bank are W4A4 nvfp4_mul banks
+    in nvfp4_expert_rg16_v1 (AllowA4, no optional-A4 marker), each its own parent, with their FP32 activation scales;
+    the MXFP8 GDN and QSA projections keep their words (A16Only), every other main tensor its stored dtype, and the
+    drafter is recipe A's. The Dense8 variant adds q8_g32_fp16 only for the classes still BF16 (HC mixers, PLE
+    projections, final mixer, lm_head). Recipe A refuses a shared expert bank; the QAD recipes refuse a model without
+    one and another n-gram table."""
+
+    from tools.convert.official_recipes import qwen3_8_flash_next_nvfp4_qad, qwen3_8_flash_next_nvfp4_qad_dense8
+
+    shared = f"{LAYER}/moe/shared_expert"
+    mxfp8 = tuple(n for n in DENSE8 if any(n.endswith(s) for s in ("/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z",
+                                                                      "/gdn/output", "/attention/output")))
+    mxfp8 += (f"{LAYER}/attention/query", f"{LAYER}/attention/key", f"{LAYER}/attention/value",
+              f"{LAYER}/attention/index_query")
+    bf16_classes = tuple(n for n in DENSE8 if n not in mxfp8 and "/moe/shared/" not in n)  # HC, PLE, final, head
+
+    def model(with_shared=True, table="fp8_e4m3fn") -> Model:
+        m = Model({"text": {"config": {"architectures": ["Qwen4ExpForCausalLM"], "ngram_table": {"format": table},
+                                       "layer_types": ["linear_attention"]}}})
+        for name in dict.fromkeys((*mxfp8, *bf16_classes, *KEPT, *DRAFTER_Q8, *DRAFTER_KEPT, *DRAFTER_EXPERTS)):
+            inputs = () if name == "text/token_embedding" else ("input",)
+            source = array_source(torch.ones((4, 64), dtype=torch.bfloat16), name)
+            m.add(Parameter(name, (4, 64), source, lambda store, format=None, s=source: s, inputs))
+        store = _ScaledStore()
+        m.add(Parameter(BANK, (2, 4, 64), ExpertBankSource((2, 4, 64), BANK, store, "experts."), inputs=("input",)))
+        scales = f"{LAYER}/moe/expert_input_scales"
+        m.add(Parameter(scales, (2, 3), array_source(torch.ones((2, 3)), scales), direct_format="fp32"))
+        if with_shared:
+            one = ExpertBankSource((1, 4, 64), shared, store, "shared_expert.", single=True)
+            m.add(Parameter(shared, (1, 4, 64), one, inputs=("input",)))
+            shared_scales = f"{LAYER}/moe/shared_expert_input_scales"
+            m.add(Parameter(shared_scales, (1, 3), array_source(torch.ones((1, 3)), shared_scales),
+                            direct_format="fp32"))
+        return m
+
+    for recipe_function, dense8 in ((qwen3_8_flash_next_nvfp4_qad, False), (qwen3_8_flash_next_nvfp4_qad_dense8, True)):
+        m = model()
+        recipe = Recipe(m)
+        recipe_function(m, recipe, {"base": None})
+        selections = recipe.selections
+        for name in (BANK, shared):
+            bank = _only(selections, name)
+            assert (bank.format, bank.layout, bank.method) == ("nvfp4_mul", "nvfp4_expert_rg16_v1", import_expert_bank)
+            assert all(recipe.policies[(name, use)] == "AllowA4" for use in m.parameters[name].inputs), name
+            assert any(tuple(names) == (name,) for names, _ in recipe.explicit_groups), f"{name} is its own parent"
+        for name in (f"{LAYER}/moe/expert_input_scales", f"{LAYER}/moe/shared_expert_input_scales"):
+            chosen = _only(selections, name)
+            assert (chosen.format, chosen.method) == ("fp32", cast_direct), name
+        assert "expert_a4_activations" not in m.components["text"]["config"], "W4A4 is the artifact's only arithmetic"
+        for name in mxfp8:
+            chosen = _only(selections, name)
+            assert (chosen.format, chosen.method) == ("fp8_e4m3fn_g32_e8m0", import_encoded), name
+            assert all(recipe.policies[(name, use)] == "A16Only" for use in m.parameters[name].inputs), name
+        for name in bf16_classes:
+            chosen = _only(selections, name)
+            expected = (Q8, grouped_absmax) if dense8 else ("bf16", cast_direct)
+            assert (chosen.format, chosen.method) == expected, name
+        for name in (*KEPT, *DRAFTER_KEPT):
+            if name not in mxfp8:  # the embedding, GDN a/b, router and shared-expert gate
+                chosen = _only(selections, name)
+                assert (chosen.format, chosen.method) == ("bf16", cast_direct), name
+        for name in DRAFTER_EXPERTS:
+            assert (_only(selections, name).format, _only(selections, name).method) == (Q4, grouped_mse), name
+        for name in DRAFTER_Q8:
+            assert (_only(selections, name).format, _only(selections, name).method) == (Q8, grouped_absmax), name
+    for recipe_function in (qwen3_8_flash_next_nvfp4, qwen3_8_flash_next_nvfp4_dense8):
+        m = model()
+        with pytest.raises(ValueError, match="NVFP4-QAD recipe"):
+            recipe_function(m, Recipe(m), {})
+    for broken in (model(with_shared=False), model(table="nvfp4")):
+        with pytest.raises(ValueError, match="NVFP4-QAD recipe"):
+            qwen3_8_flash_next_nvfp4_qad(broken, Recipe(broken), {"base": None})
+
+
 def test_iq3s_recipe_tiles_the_tiled_formats_and_takes_a_q2_drafter() -> None:
     """On a GGUF-built model the IQ3_S recipe stores the Q4_K, Q5_K, Q6_K and IQ4_XS dense matrices in
     ggml_tiles16_v1 and every other GGUF format, and the token embedding (a row gather), in

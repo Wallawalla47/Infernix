@@ -146,7 +146,7 @@ __global__ void __launch_bounds__(G::kHidden / 16) encode_nmma4_kernel(Nmma4Args
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     if (c >= count || moe::wide_route(count, scales)) { return; }
-    const int token = dispatch.entries[first + c] / a.top_k;
+    const int token = moe::wide::entry_column(dispatch.entries[first + c], a.top_k, dispatch.shared_first);
     nmma4_encode_block<G>(a.x + static_cast<std::size_t>(token) * G::kHidden, scales.input_gate, static_cast<int>(threadIdx.x),
                           a.x_rows + static_cast<std::size_t>(first + c) * Nmma4Shape<G>::kXRowBytes);
 }
@@ -234,7 +234,7 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
         // The job's columns' A4(x) while the rings fill: one block of one column a thread.
         for (int i = static_cast<int>(threadIdx.x); i < count * (G::kHidden / 16); i += kNmma4GuThreads) {
             const int c = i / (G::kHidden / 16), b = i % (G::kHidden / 16);
-            const int token = dispatch.entries[first + c] / a.top_k;
+            const int token = moe::wide::entry_column(dispatch.entries[first + c], a.top_k, dispatch.shared_first);
             nmma4_encode_block<G>(a.x + static_cast<std::size_t>(token) * G::kHidden, scales.input_gate, b, sm.x[c]);
         }
     }

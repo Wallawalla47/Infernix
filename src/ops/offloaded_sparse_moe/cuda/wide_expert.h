@@ -323,7 +323,7 @@ struct Call {
     std::uint16_t* outputs                    = nullptr; // BF16 [H, entries]
     const void* descriptors                   = nullptr;
     std::int32_t passes                       = 0;
-    std::int32_t mean_job_columns             = 0; // entries / max_jobs (kWarpTile64MinColumns' rule)
+    std::int32_t mean_job_columns             = 0; // routed entries / routed jobs (kWarpTile64MinColumns' rule)
     bool a16                                  = false;
     // W4A16 (wide_expert_a16.cuh)
     const std::uint8_t* x_limbs = nullptr; // [T][kA16XRowBytes]

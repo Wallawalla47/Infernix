@@ -62,13 +62,16 @@ struct MoeParameters {
     Tensor shared_score;             // BF16 [H, 1]: the shared-expert gate row
     LinearParameters shared_gate_up; // [2 * I_shared, H]: gate rows, then up rows
     LinearParameters shared_down;    // [H, I_shared]
+    // Or (MoeConfig::shared_bank) the shared expert as one device-resident record of the routed bank's layout and
+    // arithmetic, the routed call's last job; shared_gate_up and shared_down are then empty.
+    const ExpertBank* shared_bank = nullptr;
     const ExpertBank* bank = nullptr;
-    const ops::offloaded_moe::ExpertScales* device_scales = nullptr; // [E]
+    const ops::offloaded_moe::ExpertScales* device_scales = nullptr; // [E], or [E + 1] with shared_bank
     // A W4A4 bank whose every expert's gate and up input scales are equal (MoeExpertSource::a4_shared_input).
     bool a4_shared_input = false;
     // The lossless route's (TextConfig::lossless): each NVFP4 matrix's weight multiplier in alpha_* (an
     // A4 bank's alpha also folds in its input scale); [E], null without the route. The design reference
-    // (TextConfig::design_reference) adds a W4A4 bank's input scales in input_*.
+    // (TextConfig::design_reference) adds a W4A4 bank's input scales in input_*. [E + 1] with shared_bank.
     const ops::offloaded_moe::ExpertScales* lossless_scales = nullptr;
     ops::offloaded_moe::LosslessExpertDesign lossless_design = ops::offloaded_moe::LosslessExpertDesign::kNone;
 };

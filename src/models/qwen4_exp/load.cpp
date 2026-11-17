@@ -160,12 +160,22 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     MoeWeights out;
     out.router       = b.parameter(p + "router", {e, h}, input);
     out.shared_score = b.parameter(p + "shared_score", {1, h}, input);
-    out.shared_gate  = b.parameter(p + "shared/gate", {s, h}, input);
-    out.shared_up    = b.parameter(p + "shared/up", {s, h}, input);
-    out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
+    // NVIDIA's NVFP4-QAD stores its shared expert in the routed experts' NVFP4 words: a one-record bank in device
+    // memory (the routed call's shared job); every other artifact's are dense projections.
+    const bool shared_bank = b.stored(p + "shared_expert");
+    if (shared_bank) {
+        out.shared_expert = b.parameter(p + "shared_expert", {1, h, s}, input, QType::NVFP4_MUL);
+    } else {
+        out.shared_gate = b.parameter(p + "shared/gate", {s, h}, input);
+        out.shared_up   = b.parameter(p + "shared/up", {s, h}, input);
+        out.shared_down = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
+    }
     // NVFP4 banks (nvfp4_mul), block-FP8 banks or a GGUF import's ggml banks; plan_load checks the
     // layouts.
     out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, std::nullopt, experts);
+    if (shared_bank && b.weights.at(out.shared_expert.index).policy != b.weights.at(out.experts.index).policy) {
+        throw ArtifactError(p + "shared_expert: the shared expert bank's Use must equal the routed bank's");
+    }
     // parse_config chose the arithmetic. A W4A4 bank (§16.2) permits 4-bit activations and carries
     // its activation scales; an A16-only bank is W4A16 (design §16.2.1) and has none. A bank whose
     // 4-bit activations are optional permits them and carries its scales, which only W4A4 reads; so does a
@@ -175,6 +185,10 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     if (!c.moe.a16_experts) {
         if (!a4_permitted) { throw ArtifactError(p + "experts: 4-bit activations need a Use that permits them"); }
         out.input_scales = b.parameter(p + "expert_input_scales", {e, 3}, {}, QType::FP32, Residency::Values);
+        if (shared_bank) {
+            out.shared_input_scales =
+                b.parameter(p + "shared_expert_input_scales", {1, 3}, {}, QType::FP32, Residency::Values);
+        }
     } else if (c.moe.a4_optional || c.moe.a4_native) {
         if (!b.stored(p + "expert_input_scales")) {
             throw ArtifactError(p + "expert_input_scales: a bank that permits 4-bit activations needs its activation "
@@ -609,6 +623,7 @@ struct LoadPlan::Impl {
     TextWeights weights;
     std::vector<PendingWeight> pending;
     std::vector<artifact::HostValues> input_scales; // [layer], W4A4 banks only (empty for W4A16)
+    std::vector<artifact::HostValues> shared_input_scales; // [layer], W4A4 shared expert banks only
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
@@ -821,7 +836,32 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         for (const auto& layer : out->weights.layers) {
             out->input_scales.push_back(
                 binder.values(bindings.weights.at(layer.moe.input_scales.index).reference.binding, QType::FP32));
+            if (layer.moe.shared_expert.valid()) {
+                out->shared_input_scales.push_back(binder.values(
+                    bindings.weights.at(layer.moe.shared_input_scales.index).reference.binding, QType::FP32));
+            }
         }
+    }
+    {
+        // A shared expert bank (bind_moe) is every layer's or none: one record of the routed bank's NVFP4 layout and
+        // geometry, which the routed call reads as its last job.
+        std::size_t shared_banks = 0;
+        for (const auto& layer : out->weights.layers) {
+            if (!layer.moe.shared_expert.valid()) { continue; }
+            ++shared_banks;
+            const auto& binding = bindings.weights.at(layer.moe.shared_expert.index).reference.binding;
+            const auto& tensor  = reader.directory().tensor(binding.parts.front().object);
+            const auto g = weight_geometry(artifact::parse_format(tensor.format), artifact::parse_layout(tensor.layout),
+                                           tensor.shape);
+            if (binding.parts.size() != 1 || g.layout != QuantLayout::ExpertRg16 || g.format != QType::NVFP4_MUL ||
+                tensor.shape.size() != 3 || tensor.shape[0] != 1) {
+                throw ArtifactError("Qwen4Exp: a shared expert bank must be one nvfp4_mul record in nvfp4_expert_rg16_v1");
+            }
+        }
+        if (shared_banks != 0 && shared_banks != out->weights.layers.size()) {
+            throw ArtifactError("Qwen4Exp: every layer or none stores its shared expert as a bank");
+        }
+        out->config.text.moe.shared_bank = shared_banks != 0;
     }
     {
         // One bank kind for every layer: NVFP4, block-FP8, or (exactly in a GGUF import) ggml banks.
@@ -881,7 +921,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                 const auto& attention = std::get<AttentionWeights>(layer.mixer);
                 out->config.text.ggml_projections += blocks(attention.query) + blocks(attention.output);
             }
-            out->config.text.ggml_projections += blocks(layer.moe.shared_gate) + blocks(layer.moe.shared_down);
+            if (layer.moe.shared_gate.valid()) {
+                out->config.text.ggml_projections += blocks(layer.moe.shared_gate) + blocks(layer.moe.shared_down);
+            }
         }
     }
     {
@@ -954,12 +996,14 @@ Model::Model(Config config, LoadOptions options, TextWeights weights, std::vecto
              std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
              std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
              std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing,
-             PackedWeights packed, CsfTables csf_tables)
+             PackedWeights packed, CsfTables csf_tables, std::vector<ExpertBank> shared_banks,
+             std::vector<std::vector<float>> shared_multipliers)
     : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)), packed_(std::move(packed)),
       expert_store_(std::move(expert_store)),
       config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
-      csf_tables_(std::move(csf_tables)), resources_(std::move(resources)), info_(std::move(info)),
+      csf_tables_(std::move(csf_tables)), shared_multipliers_(std::move(shared_multipliers)),
+      shared_banks_(std::move(shared_banks)), resources_(std::move(resources)), info_(std::move(info)),
       overlay_vision_(std::move(overlay_vision)) {}
 
 Model::~Model() = default;
@@ -1063,6 +1107,48 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         }
         banks.push_back(std::move(bank));
     }
+    // Shared expert banks (MoeConfig::shared_bank): one device-resident record each, in its routed bank's layout and
+    // arithmetic. Its multipliers (the record's scale tail) live in device memory only, so they are read from the
+    // artifact into Model memory (each vector's buffer stays put when the outer vector moves).
+    std::vector<ExpertBank> shared_banks;
+    std::vector<std::vector<float>> shared_multipliers;
+    if (data->config.text.moe.shared_bank) {
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& weight = bound.at(layers[i].moe.shared_expert.index);
+            const auto& view   = weight.view;
+            if (view.parts.size() != 1 || !is_complete_weight(view) || view.parts.front().parent->device == nullptr) {
+                throw ArtifactError(weight.name + ": a shared expert bank must be one complete device-resident parent");
+            }
+            const auto& parent = *view.parts.front().parent;
+            const auto object  = data->pending.at(layers[i].moe.shared_expert.index).reference.binding.parts.front().object;
+            std::vector<float> words(parent.geometry.scale_bytes / sizeof(float));
+            reader.read_into(artifact::object_offset(reader.directory().object(object)) + parent.geometry.scale_offset,
+                             std::as_writable_bytes(std::span(words)));
+            ExpertBank bank;
+            bank.planes                = expert_bank_layout(parent.geometry, words.data());
+            bank.planes.device_records = parent.device;
+            const ExpertBank& routed   = banks[i];
+            if (bank.planes.experts != 1 || bank.planes.hidden != routed.planes.hidden ||
+                bank.planes.intermediate != routed.planes.intermediate ||
+                bank.planes.record_stride != routed.planes.record_stride ||
+                routed.planes.gate_up_format != QType::NVFP4_MUL) {
+                throw ArtifactError(weight.name + ": the shared expert must be one record of the routed NVFP4 bank's geometry");
+            }
+            bank.activation = routed.activation;
+            if (routed.activation == ops::offloaded_moe::ExpertActivation::kA4) {
+                bank.scales = expert_scales(bank.planes, data->shared_input_scales.at(i),
+                                            bound.at(layers[i].moe.shared_input_scales.index).name);
+            } else {
+                try {
+                    bank.scales = runtime::expert_offload::a16_expert_scales(bank.planes, weight.name);
+                } catch (const std::invalid_argument& error) {
+                    throw ArtifactError(error.what());
+                }
+            }
+            shared_banks.push_back(std::move(bank));
+            shared_multipliers.push_back(std::move(words));
+        }
+    }
     // With LoadOptions::expert_csf the pinned NVFP4 banks' records become CSF records (runtime::expert_offload::
     // compress_banks): every reader takes their tables, so each host-to-device copy and CPU walk of a record reads ~5 %
     // fewer bytes.
@@ -1088,7 +1174,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                             std::move(banks), std::move(data->resources),
                                             std::move(data->info), std::move(overlay), std::move(backing),
                                             std::move(store), std::move(draft_backing), std::move(packed),
-                                            std::move(csf_tables)));
+                                            std::move(csf_tables), std::move(shared_banks),
+                                            std::move(shared_multipliers)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

@@ -5,8 +5,8 @@
 
 Every logical parameter the recipe stores as the checkpoint has it must equal the checkpoint's words:
 
-- each routed expert's E2M1 codes, E4M3 block scales and FP32 multiplier (decoded from the
-  ``nvfp4_expert_rg16_v1`` record): ModelOpt's ``weight_scale_2`` with its gate/up/down
+- each routed expert's (and NVFP4-QAD's one-record shared expert banks') E2M1 codes, E4M3 block scales and FP32
+  multiplier (decoded from the ``nvfp4_expert_rg16_v1`` record): ModelOpt's ``weight_scale_2`` with its gate/up/down
   ``input_scale`` words, or a weight-only compressed-tensors export's reciprocal global scale; or,
   for Qwen's official FP8 checkpoint, each ``fp8_expert_b128_v1`` record byte for byte (its E4M3FN
   codes and BF16 tile scales);
@@ -136,15 +136,19 @@ def verify_rg16(artifact, store, binding, parameter) -> bool:
             and multiplier == expected.weight_multiplier)
 
 
-def verify_bank(artifact, store, binding, prefix, shape, packed) -> int:
+def verify_bank(artifact, store, binding, source) -> int:
+    """Each expert record of an NVFP4 bank (a layer's routed experts, or NVFP4-QAD's one-record shared expert bank)
+    against its checkpoint matrices' codes, block scales and multipliers; returns the mismatching matrices."""
+
     obj = artifact.object(binding["object"])
+    shape = source.shape
     words = decode_nvfp4_expert_bank_words(artifact.read_object(obj.id), shape)
-    read = nvfp4_packed_matrix_words if packed else nvfp4_matrix_words
+    read = nvfp4_packed_matrix_words if source.packed else nvfp4_matrix_words
     e, h, i = shape
     bad = 0
     for x in range(e):
         for role, rows, cols in (("gate", i, h), ("up", i, h), ("down", h, i)):
-            src = read(store, f"{prefix}{x}.{role}_proj", (rows, cols))
+            src = read(store, source.leaf(x, role), (rows, cols))
             col = {"gate": 0, "up": 1, "down": 2}[role]
             ok = (
                 torch.equal(words[f"{role}_codes"][x], src.codes)
@@ -269,13 +273,12 @@ def main() -> int:
             raise ValueError(f"artifact bindings differ from the logical model: {missing} {extra}")
         for name, parameter in model.parameters.items():
             binding = bindings[name]
-            if name.endswith("/moe/experts") and name.startswith("text/"):
+            if name.endswith(("/moe/experts", "/moe/shared_expert")) and name.startswith("text/"):
                 source = parameter.source
                 if isinstance(source, qwen4_exp.Fp8ExpertBankSource):
                     report["expert_mismatches"] += verify_fp8_bank(artifact, binding, source)
                 else:
-                    report["expert_mismatches"] += verify_bank(artifact, store, binding, source.prefix, source.shape,
-                                                               source.packed)
+                    report["expert_mismatches"] += verify_bank(artifact, store, binding, source)
                 report["experts"] += source.shape[0]
                 print(f"{name}: {source.shape[0]} experts verified ({time.time() - start:.0f}s)", flush=True)
                 continue
@@ -301,7 +304,7 @@ def main() -> int:
                 continue
             fmt, stored = _binding_values(artifact, binding)
             expected = parameter.source.values()
-            if name.endswith("/moe/expert_input_scales"):
+            if name.endswith(("/moe/expert_input_scales", "/moe/shared_expert_input_scales")):
                 report["input_scale_mismatches"] += int((_bits(stored) != _bits(expected.to(torch.float32))).sum())
                 continue
             report["tensors"] += 1

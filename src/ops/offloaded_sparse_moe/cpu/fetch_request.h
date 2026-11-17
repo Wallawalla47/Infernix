@@ -19,6 +19,9 @@
 namespace infernix::ops::offloaded_moe {
 
 inline constexpr int kMaxFetch = 512; // fetch-served experts per layer call (a layer's experts)
+// Jobs of a fetch-planned call: a layer's experts and its shared job (MoeExpertSource::shared_record: always resident,
+// never fetch-served), so a call's fetch requests still hold at most kMaxFetch experts.
+inline constexpr int kMaxFetchJobs = kMaxFetch + 1;
 
 // Device-detected failure codes of a call's error word (layer << 16 | code). Host-reported failures
 // carry an errno value, all below 0x8000.

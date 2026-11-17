@@ -843,6 +843,71 @@ by the lossless route (`--lossless`). The persistent prefix
 cache's signature records the experts' activation precision, so a file saved under one setting is
 not loaded under the other.
 
+### 6.1.3 Recipes `qwen3_8_flash_next_nvfp4_qad` (E) and `qwen3_8_flash_next_nvfp4_qad_dense8`
+
+The source is [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)
+(revision `a874339c`, published 2026-11-17, 129.7 GB in 36 shards): NVIDIA's quantization-aware distillation of
+its NVFP4 release, 100 optimizer updates, ModelOpt `MIXED_PRECISION` (`quantization_recipe.json`). It quantizes more
+than recipe A's source: the shared experts are NVFP4 too, and the GDN, QSA and indexer projections MXFP8, as
+FP4-Local's. Both recipes import every quantized tensor bit-exactly and run the experts **W4A4, as NVIDIA serves
+the checkpoint** (its vLLM command on GB300 uses the native NVFP4 kernels for the routed and shared experts; the
+owner chose this arithmetic on 2026-11-17 over FP4-Local's 16-bit default).
+
+| Tensor class | Source form | Recipe E | Dense8 | Reason |
+|---|---|---|---|---|
+| Routed experts (48 × 512) | ModelOpt NVFP4: E2M1 codes, plain E4M3 per 16 (no CSF), FP32 `weight_scale_2` and `input_scale` per matrix | **Exact import** as recipe A's: `nvfp4_mul` banks in `nvfp4_expert_rg16_v1`, `AllowA4`, W4A4 (§16.2) | Same | NVIDIA's weights and activation calibration |
+| Shared experts (48) | ModelOpt NVFP4 as the routed experts, at their width (640); gate and up share `weight_scale_2` and `input_scale` in every layer | **Exact import** as a one-record bank `moe/shared_expert` of the same layout, with its FP32 activation scales (`moe/shared_expert_input_scales`), `AllowA4`; device-resident (2.76 MB a layer) | Same | The routed call runs it as its last job (§8.6), in the routed experts' exact W4A4 arithmetic: x → A4 → gate/up → BF16 → SwiGLU → BF16 h → A4 → down → BF16, the structure of vLLM's dense NVFP4 shared expert |
+| GDN q/k/v (`in_proj_qkv`), z, `out_proj`; QSA q/gate, k, v, `o_proj`; indexer (`index_qk_proj`) | MXFP8: E4M3FN codes, UE8M0 scale per 32 K | **Exact import** as FP4-Local's (`fp8_e4m3fn_g32_e8m0`, W8A16; the QSA parent of 13,952 rows and the GDN one of 16,384) | Same | The checkpoint's words, on FP4-Local's 16-bit route. NVIDIA's serving helpers name native MXFP8 kernels, which suggests 8-bit activations there (inferred, not confirmed); `--a8-activations` runs these projections' prefill calls on two E4M3 terms per 32 values |
+| GDN a/b (`in_proj_a/b`) | MXFP8 | Their exact BF16 values, as FP4-Local's | Same | Exact |
+| HC mixers, PLE key/value projections, final mixer, `lm_head` | BF16 | BF16 | `q8_g32_fp16` (W8A16), as recipe C's BF16 classes | Recipe B's dense-byte saving where the checkpoint is still BF16 |
+| Router, shared-expert gate, embedding, vision tower, norms, `A_log`, `dt_bias`, convolutions | BF16 | BF16 | BF16 | As stored |
+| N-gram table (128 shards) | FP8 E4M3 per tensor, BF16 scale (frozen in QAD) | Recipe A's FP8 volume, bound with `--ngram-reuse` (the converter checks 512 rows, `verify_artifact` every row) | Same | The card calls the table frozen from NVIDIA's NVFP4 release |
+| MTP (block-FP8 experts, BF16 dense) | As recipe A's source | Recipe A's drafter (`q8_g32_fp16` dense, `q4_g64_fp16` MSE experts) | Same | Affects only acceptance; NVIDIA did not validate MTP on these weights |
+
+**The shared job on W4A4 banks.** The routed experts' call already ran a shared expert as its last job for
+Qwen3.5-122B's NVFP4 W4A16 banks: expert E (one past the routed ones) with entries `k*T + t`, its record a resident
+device pointer that no copy, CPU job or tail skip ever takes, and its scalars `scales[E]`. Four A4 sites read an
+entry's column as `entry / top_k` (the wide route's A4 quantizer, the one-column narrow kernels and the tensor-core
+narrow kernels' two encoders) and now map it through `entry_column`; `moe_experts` accepts a shared job on any
+NVFP4 bank. The shared job has the call's T columns, so it takes the exact narrow route in every call of at most
+eight columns and the wide route (F1: the FP4 tensor cores' FP32 accumulation, held to its FP64 oracle, bit-equal to
+the narrow route on NVIDIA's real scales but not on every word) in wider ones, by the routed experts' rule. Flash-Next's
+decode and verification calls have at most 1 + the draft length columns (8 with MTP, DFlash2 or n-gram drafts of up to
+seven; a lane per column in plain rounds of up to eight lanes), so the shared expert decodes on the exact narrow route
+whatever the other requests: request invariance is unchanged. Prefill chunks take the wide route, as their wide
+routed experts do (verification rounds wider than eight columns, `--ngram-draft-tokens` above 7 or n-gram trees, too).
+Where an expert is computed never changes a bit. The `--lossless` route runs the shared job on its exact expert pass. `infernix_offloaded_moe_shared_a4_test` compares
+every routed and shared output with the CPU engine's W4A4 bits at 1-300 columns, staged, forked and CPU-served.
+Qwen4Exp binds the bank when the artifact stores `moe/shared_expert` (`MoeConfig::shared_bank`, every layer or none)
+and runs no dense shared projections then.
+
+**Fast paths.** The configuration is read from the GDN projection's format and the experts' activations (MXFP8
+dense, 4-bit expert activations), FP4-Local's `--expert-a4-activations` configuration, so these artifacts inherit
+its qualified paths (model-quality §6.7). The fast paths change the same kernels there; the only kernel these
+artifacts add on those routes is the shared job, which runs the routed experts' exact W4A4 kernels. Dense8's Q8
+mixers and head are recipe B's kernels.
+
+**One job more than the routed ones.** The shared job adds one job to every call, and three limits sized for a
+layer's routed jobs had to take it (2026-11-17, found by the first measurements):
+- the SSD tier's fetch plan held `kMaxFetch` (512) jobs, so a call of 52+ columns on the tier (the exclusive layout's
+  default) failed with "experts fetch channel is incomplete"; its per-job arrays hold `kMaxFetchJobs` (513) now, while
+  a request still names at most 512 experts (the shared job is resident, never fetched);
+- Qwen4Exp's staging held `top_k x max_width` (80) records and the fork route needs every job within the slots, so
+  every eight-column verification call lost the fork (and its landings): MTP decode after a 4K prompt was 14-16 %
+  behind FP4-Local in every mode until a shared bank's staging took one slot more (+16-19 %, level with FP4-Local);
+- the wide route's WarpTile64 rule reads the mean columns per job, which the shared job's T columns raised (the rule
+  then switched at about 23,900 instead of 26,200 columns a call; the bits are the same either way); it reads the
+  routed jobs' mean now.
+
+**`--a16-activations` and `--a8-activations`.** Both run the W4A4 banks as 16-bit banks (`LoadOptions::
+expert_a16_activations`), the routed and the shared bank alike: the shared job then takes the routed experts' W4A16
+routes (narrow ring, row and tensor-core kernels, the exact wide route), and with `--a8-activations` their 8-bit
+route (the 8-bit narrow kernels through 128 columns, the int8 tiles beyond), the MXFP8 projections' prefill on two
+E4M3 terms per 32 values. `--a16-activations` gives FP4-Local's default configuration (16-bit experts), where
+`expert-a4-residual` and its decode candidate are registered; they then also take the shared job. Every one of these
+routes maps a shared job's entries to their columns (`entry_column`), and `infernix_offloaded_moe_shared_a4_test`
+checks the shared outputs in each arithmetic against the same record run as a routed expert of the same width.
+
 ### 6.2 Expert storage layout `nvfp4_expert_rg16_v1`
 
 The pinned host bank is read by the GPU (DMA into a frame, then the expert kernels) and by the CPU
