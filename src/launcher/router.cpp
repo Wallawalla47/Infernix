@@ -169,6 +169,7 @@ bool Router::unloaded(std::uint32_t instance) const {
 }
 
 bool Router::queue_load(const std::string& key, bool force, std::optional<std::uint32_t> ended) {
+    bool cancel = false;
     {
         std::lock_guard lock(mutex_);
         if (stopping_ || (ended && *ended <= unloaded_through_)) { return false; }
@@ -187,14 +188,21 @@ bool Router::queue_load(const std::string& key, bool force, std::optional<std::u
             }
             epochs_.clear();
             epochs_.push_back(epoch);
+            // So does a load of another model in progress.
+            if (!loading_key_.empty() && loading_key_ != key && !load_cancelled_) {
+                cancel          = true;
+                load_cancelled_ = true;
+            }
         }
     }
     cv_.notify_all();
+    if (cancel && hooks_.cancel_load) { hooks_.cancel_load(); }
     if (hooks_.changed) { hooks_.changed(); }
     return true;
 }
 
 void Router::request_unload() {
+    bool cancel = false;
     {
         std::lock_guard lock(mutex_);
         for (const auto& epoch : epochs_) {
@@ -205,9 +213,18 @@ void Router::request_unload() {
         unload_requested_ = true;
         // The loaded instance, or one whose end (a crash) was seen first: neither is restarted.
         unloaded_through_ = std::max({unloaded_through_, ready_instance_, last_ended_});
+        // A load in progress ends now rather than once it is ready (up to the load timeout).
+        cancel          = !loading_key_.empty() && !load_cancelled_;
+        load_cancelled_ = load_cancelled_ || !loading_key_.empty();
     }
     cv_.notify_all();
+    if (cancel && hooks_.cancel_load) { hooks_.cancel_load(); }
     if (hooks_.changed) { hooks_.changed(); }
+}
+
+bool Router::load_cancelled() const {
+    std::lock_guard lock(mutex_);
+    return load_cancelled_;
 }
 
 void Router::instance_ended(std::uint32_t instance) {
@@ -313,6 +330,7 @@ void Router::run() {
         drain_since_.reset();
         const std::string key = front->key;
         loading_key_          = key;
+        load_cancelled_       = false;
         ready_key_.clear();
         unloaded_through_ = std::max(unloaded_through_, ready_instance_); // the instance it replaces
         ready_instance_   = 0;
@@ -321,13 +339,15 @@ void Router::run() {
         Loaded loaded = hooks_.load(key);
         lock.lock();
         loading_key_.clear();
+        load_cancelled_ = false;
         if (!loaded.error && loaded.instance <= last_ended_) {
             loaded.error = "infernix-serve stopped as soon as it became ready (see the console)";
         }
         if (loaded.error) {
             front->failed = true;
             front->error  = *loaded.error;
-            holds_[key]   = {Clock::now() + kFailedLoadHold, *loaded.error};
+            // A cancelled load is no failure of the model: its next request loads it at once.
+            if (!loaded.cancelled) { holds_[key] = {Clock::now() + kFailedLoadHold, *loaded.error}; }
             if (!epochs_.empty() && epochs_.front() == front) { epochs_.pop_front(); }
         } else {
             ready_key_      = key;

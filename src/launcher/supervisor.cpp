@@ -305,7 +305,7 @@ void Supervisor::monitor(std::uint32_t instance) {
                     state_.state    = InstanceState::Failed;
                     state_.error    = error;
                     state_.incident = incident->first;
-                    state_.phase    = "ended by the watchdog";
+                    state_.phase    = incident->first == "cancelled" ? "load cancelled" : "ended by the watchdog";
                 } else {
                     // The last error (or warning) record says why; else the exit status does. A start's
                     // last line says how far it got; a serving server's last line is only its last
@@ -342,7 +342,7 @@ void Supervisor::monitor(std::uint32_t instance) {
                 }
             }
             if (incident) {
-                logs_.add(instance, "error", "launcher", incident->second + "; ending the load");
+                logs_.add(instance, incident->first == "cancelled" ? "info" : "error", "launcher", incident->second + "; ending the load");
                 {
                     std::lock_guard lock(mutex_);
                     state_.phase = "ending the load";

@@ -26,11 +26,17 @@ public:
         std::optional<std::string> error;
         int port               = 0;
         std::uint32_t instance = 0;
+        bool cancelled         = false; // ended by cancel_load: not held as a failed load
     };
 
     struct Hooks {
-        // Loads `key` (stopping whatever runs), blocking until it is ready; the error otherwise.
+        // Loads `key` (stopping whatever runs), blocking until it is ready; the error otherwise. It ends early
+        // (Loaded::cancelled) once load_cancelled() is true: it checks before starting a process, and cancel_load
+        // ends one that is starting.
         std::function<Loaded(const std::string& key)> load;
+        // Ends the load in progress (an unload, or a forced load of another model, while it loads). Any thread,
+        // called without the router's lock; optional.
+        std::function<void()> cancel_load;
         // Stops the current instance (blocking).
         std::function<void()> stop;
         std::function<void()> changed;
@@ -107,6 +113,8 @@ public:
     // The model a queued switch will load next, if any.
     [[nodiscard]] std::optional<std::string> pending_model() const;
     [[nodiscard]] std::optional<std::string> loading_model() const;
+    // Whether the load in progress was cancelled (request_unload, or a forced load of another model, since it began).
+    [[nodiscard]] bool load_cancelled() const;
     void shutdown();
 
 private:
@@ -147,6 +155,7 @@ private:
     std::uint32_t last_ended_     = 0; // the newest instance reported ended
     std::uint32_t unloaded_through_ = 0; // every instance up to this one was unloaded
     std::string loading_key_;
+    bool load_cancelled_         = false; // set while loading_key_ is: the load should end
     int in_flight_               = 0;
     bool unload_requested_       = false;
     bool stopping_               = false;

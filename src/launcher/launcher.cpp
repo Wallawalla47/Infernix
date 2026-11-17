@@ -378,6 +378,12 @@ Launcher::Launcher(LauncherOptions options)
 
     router_ = std::make_unique<Router>(Router::Hooks{
         .load = [this](const std::string& key) { return load_model(key); },
+        // The instance starting now ends (the monitor kills it within its next poll); one not started yet is never
+        // started (load_model asks load_cancelled first).
+        .cancel_load =
+            [this] {
+                supervisor_->end_load(supervisor_->snapshot().instance, "cancelled", "the load was cancelled from the launcher");
+            },
         .stop = [this] { supervisor_->stop(std::chrono::seconds(store_.settings().stop_timeout_s)); },
         .changed =
             [this] {
@@ -1244,6 +1250,12 @@ Router::Loaded Launcher::load_model(const std::string& key) {
         if (supported("--log-stats-panel")) { spec.args.insert(spec.args.end(), {"--log-stats-panel", "off"}); }
         if (supported("--log-colours")) { spec.args.insert(spec.args.end(), {"--log-colours", "off"}); }
         port_retry_allowed_ = settings.child_port == 0 && attempt < kPortAttempts;
+        if (router_ && router_->load_cancelled()) {
+            port_retry_allowed_ = false;
+            result.error        = alias + ": the load was cancelled from the launcher";
+            result.cancelled    = true;
+            return result;
+        }
         try {
             supervisor_->start(spec);
         } catch (const std::exception& failure) {
@@ -1261,6 +1273,12 @@ Router::Loaded Launcher::load_model(const std::string& key) {
               {{"model_key", key}, {"port", port}});
     }
     port_retry_allowed_ = false;
+    if (!ready && router_ && router_->load_cancelled()) {
+        if (snapshot.state == InstanceState::Starting) { supervisor_->stop(std::chrono::seconds(settings.stop_timeout_s)); }
+        result.error     = alias + ": the load was cancelled from the launcher";
+        result.cancelled = true;
+        return result;
+    }
     if (!ready) {
         if (snapshot.state == InstanceState::Starting) {
             supervisor_->stop(std::chrono::seconds(settings.stop_timeout_s));
@@ -1404,6 +1422,8 @@ void Launcher::on_instance_changed(const InstanceSnapshot& snapshot) {
         const std::string error = snapshot.error.value_or("it stopped while loading");
         if (snapshot.incident == "ram") {
             handle_load_failure(snapshot, "ram", error); // the launcher's RAM floor ended the load
+        } else if (snapshot.incident == "cancelled") {
+            event("info", "model", alias + ": the load was cancelled"); // an unload or another load: no restart
         } else if (snapshot.incident) {
             handle_incident(snapshot);
         } else {

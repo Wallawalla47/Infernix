@@ -882,6 +882,69 @@ void test_chats() {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// An unload, or a forced load of another model, while a model loads ends that load at once instead of once it is
+// ready (up to the load timeout; audit 2026-11-17 LN-03): the router calls cancel_load and load_cancelled turns
+// true for the load in progress. A cancelled load holds nothing: its model loads at its next request.
+void test_router_cancel() {
+    std::atomic<bool> cancelled{false};
+    std::atomic<int> loads{0};
+    Router* routed = nullptr;
+    Router router(Router::Hooks{
+        .load =
+            [&](const std::string& key) {
+                ++loads;
+                Router::Loaded loaded;
+                if (key == "slow") { // a long load, until the router cancels it (10 s at most)
+                    const auto until = std::chrono::steady_clock::now() + 10s;
+                    while (!routed->load_cancelled() && std::chrono::steady_clock::now() < until) {
+                        std::this_thread::sleep_for(5ms);
+                    }
+                    if (routed->load_cancelled()) {
+                        loaded.error     = "cancelled";
+                        loaded.cancelled = true;
+                        return loaded;
+                    }
+                }
+                loaded.instance = static_cast<std::uint32_t>(loads.load());
+                loaded.port     = 2000 + loads.load();
+                return loaded;
+            },
+        .cancel_load     = [&] { cancelled = true; },
+        .stop            = [] {},
+        .changed         = [] {},
+        .drain_timeout_s = [] { return 60; },
+        .load_timeout_s  = [] { return 30; },
+        .idle_unload_min = [](const std::string&) { return 0; },
+    });
+    routed = &router;
+    const auto wait_for = [](const auto& done) {
+        const auto until = std::chrono::steady_clock::now() + 5s;
+        while (!done() && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(5ms); }
+        return done();
+    };
+    router.request_load("slow", false);
+    check(wait_for([&] { return router.loading_model() == std::optional<std::string>("slow"); }), "the slow load starts");
+    const auto unload_at = std::chrono::steady_clock::now();
+    router.request_unload();
+    check(wait_for([&] { return !router.loading_model().has_value(); }) && cancelled &&
+              std::chrono::steady_clock::now() - unload_at < 2s,
+          "an unload ends the load in progress at once");
+    Router::Refusal peek;
+    check(!router.held("slow", peek), "a cancelled load holds nothing");
+
+    cancelled = false;
+    router.request_load("slow", false);
+    check(wait_for([&] { return router.loading_model() == std::optional<std::string>("slow"); }),
+          "the slow load starts again (no hold)");
+    router.request_load("fast", true);
+    Router::Refusal refusal;
+    auto lease = router.acquire("fast", nullptr, refusal);
+    check(cancelled && lease && lease->port() > 2000, "a forced load of another model ends the load in progress");
+    lease.reset();
+    router.request_load("fast", true); // the model loaded: nothing to cancel
+    check(!router.load_cancelled(), "a forced load of the loaded model cancels nothing");
+}
+
 // The memory file survives a torn write (audit 2026-11-17 LN-01): each save keeps the previous file as its backup,
 // and a memory file that is not valid JSON (a power loss after the rename, before the data reached the disk) or is
 // missing (a crash between the backup's rename and the new file's) loads the backup instead of defaults. The
@@ -1065,6 +1128,7 @@ int main(int argc, char** argv) {
     test_library();
     test_scan_folder();
     test_router();
+    test_router_cancel();
     test_load_advice();
     test_event_log();
     test_routing();
