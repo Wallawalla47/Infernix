@@ -507,7 +507,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         storage.input_turns      = std::move(request.prompt.input_turns);
         storage.input_items      = std::move(request.prompt.input_items);
         storage.previous_context = std::move(resolved.parent);
-        storage.enabled          = request.store;
+        // A cancelled response (status "cancelled": the client left, or the server is stopping) is answered but not
+        // kept: it would take store room and a later previous_response_id could chain onto a cut answer.
+        storage.enabled = request.store && outcome.finish_reason != infernix::FinishReason::Cancelled;
         try {
             commit_stored_response(openai_responses_store_, std::move(storage), id, response->body,
                                    std::move(response->output_history), prepared.preserve_thinking);

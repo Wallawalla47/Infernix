@@ -274,6 +274,17 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         }
         const GenerationOutcome totals = state->totals();
         lifecycle->done(totals);
+        if (totals.finish_reason == infernix::FinishReason::Cancelled) {
+            // A message cannot carry a cancelled generation (the client left, or the server is stopping): the
+            // cancellation error the server gives elsewhere, not a render failure counted as internal.
+            ApiError error;
+            error.status  = 499;
+            error.type    = "request_cancelled";
+            error.code    = "client_disconnected";
+            error.message = "the request was cancelled before it finished";
+            write_anthropic_error(res, error, request_id);
+            return;
+        }
         try {
             set_ngram_generation_header(res, state->final_outcome.ngram_archive);
             const std::vector<AnthropicResponseSegment> segments = state->segments();
