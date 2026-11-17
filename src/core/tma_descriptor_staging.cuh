@@ -43,8 +43,9 @@ namespace infernix {
 // captured again over the same workspace reuses them instead of adding more.
 //
 // Invariants, documented here because this is the single staging site:
-//   - one stream: every eager staged launch runs on the engine's single compute stream, so the
-//     persistent device buffer orders against itself in-stream;
+//   - one buffer per stream: an eager staged launch stores into its stream's own device buffer
+//     (made once, under the lock), which orders against itself in-stream; launches on different
+//     streams (two Programs in one process) never share one;
 //   - allocation and copies outside the graph: buffers are allocated, and captured descriptors
 //     copied, in relaxed capture mode by synchronous calls, so a route first reached while a
 //     decode graph is being captured still works and the copy has landed before any replay;
@@ -156,13 +157,13 @@ class TmaDescriptorStaging {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
         if (capture == cudaStreamCaptureStatusActive) return captured(descriptors);
-        if (device_ == nullptr) device_ = allocate(1);
+        Descriptor* const device = eager(stream);
         tma_staging_detail::DescriptorWords<kWords> words;
         std::memcpy(words.words, &descriptors, sizeof(Descriptor));
         tma_staging_detail::store_descriptor_words<kWords>
-            <<<1, 64, 0, stream>>>(words, reinterpret_cast<std::uint64_t*>(device_));
+            <<<1, 64, 0, stream>>>(words, reinterpret_cast<std::uint64_t*>(device));
         CUDA_CHECK(cudaGetLastError());
-        return device_;
+        return device;
     }
 
   private:
@@ -204,8 +205,18 @@ class TmaDescriptorStaging {
         return slot;
     }
 
-    Descriptor* device_ = nullptr;
+    // An eager launch's descriptor slot: one per stream, made once under the lock. Stream order keeps a launch's store
+    // before its read and before the next launch's store on that stream; launches on two streams (two Programs in
+    // one process, say) never share a slot.
+    Descriptor* eager(cudaStream_t stream) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        Descriptor*& slot = eager_[stream];
+        if (slot == nullptr) { slot = allocate(1); }
+        return slot;
+    }
+
     std::mutex mutex_;
+    std::map<cudaStream_t, Descriptor*> eager_;
     std::map<Key, Descriptor*> captured_;
     std::vector<Descriptor*> chunks_;
     std::size_t used_ = 0;
