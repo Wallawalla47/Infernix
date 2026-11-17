@@ -563,6 +563,13 @@ void Launcher::flush_logs_loop() {
     for (;;) {
         const bool last = stop_flushing_;
         if (!last) { std::this_thread::sleep_for(std::chrono::milliseconds(150)); }
+        // A failed save of the memory file (a full disk, a read-only folder, an antivirus lock): the change is
+        // in memory only, so the user is told rather than finding it gone at the next start.
+        if (const std::optional<std::string> failure = store_.take_save_failure()) {
+            event("error", "settings", "the settings file could not be saved; the change is lost at the next start "
+                                        "unless a later save succeeds: " + *failure);
+            toast("error", "Settings could not be saved: " + *failure);
+        }
         std::vector<LogRecord> batch;
         std::vector<EventRecord> events;
         {

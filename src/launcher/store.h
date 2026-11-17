@@ -133,9 +133,15 @@ public:
     // The Hugging Face token: settings, else HF_TOKEN, else the huggingface_hub token file.
     [[nodiscard]] std::string hf_token() const;
 
+    // Why the last save of the memory file failed, once (then empty until another fails): the change it held is
+    // in memory only until a later save succeeds.
+    [[nodiscard]] std::optional<std::string> take_save_failure();
+
 private:
     void load();
-    void save_locked() const;
+    // Called with `lock` (on mutex_) held after a change: snapshots the state, then writes it with the lock released
+    // (it returns released), so a slow disk never holds up the readers.
+    void save(std::unique_lock<std::mutex>& lock) const;
 
     std::filesystem::path data_dir_;
     mutable std::mutex mutex_;
@@ -143,6 +149,10 @@ private:
     std::map<std::string, StoredModelConfig> models_;
     std::optional<std::string> last_model_;
     Json downloads_ = Json::array();
+    mutable std::optional<std::string> save_failure_;
+    mutable std::uint64_t generation_ = 0;         // snapshots taken (mutex_)
+    mutable std::mutex write_mutex_;               // one write of the memory file at a time
+    mutable std::uint64_t written_generation_ = 0; // the newest snapshot on disk (write_mutex_)
 };
 
 [[nodiscard]] Json settings_to_json(const Settings& settings);

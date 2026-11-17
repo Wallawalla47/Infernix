@@ -110,10 +110,10 @@ std::shared_ptr<Router::Lease> Router::acquire(const std::string& key, const std
     lock.unlock();
     cv_.notify_all();
     if (hooks_.changed) { hooks_.changed(); }
-    lock.lock();
-
+    // Read with the lock released: the hooks copy the settings under the Store's lock.
     const auto deadline =
         Clock::now() + std::chrono::seconds(hooks_.load_timeout_s() + hooks_.drain_timeout_s() + 30);
+    lock.lock();
     std::shared_ptr<Lease> lease;
     for (;;) {
         if (epoch->failed) {
@@ -325,7 +325,18 @@ void Router::run() {
         // Another model must be loaded: drain the running requests first.
         if (in_flight_ > 0 && !front->forced) {
             if (!drain_since_) { drain_since_ = Clock::now(); }
-            if (Clock::now() - *drain_since_ < std::chrono::seconds(hooks_.drain_timeout_s())) { continue; }
+            // Asked without the lock held (the hook copies the settings under the Store's lock); what changed
+            // meanwhile is looked at again on the next pass.
+            lock.unlock();
+            const int drain_s = hooks_.drain_timeout_s();
+            lock.lock();
+            if (stopping_ || unload_requested_ || epochs_.empty() || epochs_.front() != front || front->failed ||
+                ready_key_ == front->key || !drain_since_) {
+                continue;
+            }
+            if (in_flight_ > 0 && !front->forced && Clock::now() - *drain_since_ < std::chrono::seconds(drain_s)) {
+                continue;
+            }
         }
         drain_since_.reset();
         const std::string key = front->key;
