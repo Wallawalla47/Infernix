@@ -29,6 +29,11 @@ void record_text_passes(bool enabled);
 [[nodiscard]] std::vector<TextPass> text_passes();
 void note_text_pass(std::uint32_t base, std::int32_t rope_delta);
 
+// QK-02: false makes a prompt's last pass cut at its exact tap instead of taking it inside one pair window (the
+// reference a test compares a pair window's tap with); true (the default) restores the pair. For tests only.
+void set_pair_windows(bool enabled) noexcept;
+[[nodiscard]] bool pair_windows() noexcept;
+
 // Every Host restore opened after the call (until it is reset with 0) holds its copy stream `microseconds` before
 // its first copy. For tests only.
 void set_restore_delay(std::uint32_t microseconds) noexcept;

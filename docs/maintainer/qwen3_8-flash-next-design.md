@@ -8284,14 +8284,22 @@ left over were read again from the artifact as shadows of the least-used seeds: 
 copies and read 1,860 of them back (4.8 GiB), 27,433 records for 24,576 experts. Now each class releases only as many
 copies as its remaining keys need, most-used seed first, and the least-used keep the copies they have; a class that
 still has a key on the SSD while it keeps a shadow (a seed the order does not name, a pinned or listed slot) releases
-the rest and is filled again. The keys in RAM, VRAM and the shadows are the same as before; only the slots of 4,562
-records differ. FP4-Local, `--host-context-mib 16384` (RTX 5090, i9-13900K): every start reads each record once
-(the real host test's four starts: 24,576), the step after the warm start takes 1.11-1.15 s against 1.83-1.88 s and
-the start 15.7 / 15.8 s against 16.5 / 16.5 / 16.5 s (alternated, CPU rates confirmed at once). In one earlier series
-five of six starts of this build read the CPU rates at ~16,500 against ~20,000 experts/s while the alternated starts
-of the build before did not; 18 later starts of this build in three orders (same-build runs, alternated, the reference
-rewritten or fixed) read 19,600-21,000, and the cause was not found. The 122B with `--expert-ram-mib 40000` needs
-every copy's slot, so it releases them all, as before (7,449 experts in RAM, 2,402 on the SSD, both builds).
+the rest and is filled again. When every seed had a copy from the first pass (FP4-Local: 4,562 of 4,562), the keys
+in RAM, in VRAM and the shadows are the same as before and only the slots of those records differ. FP4-Local,
+`--host-context-mib 16384` (RTX 5090, i9-13900K): every start reads each record once (the real host test's four
+starts: 24,576), and the step after the warm start takes 1.11-1.15 s against 1.83-1.88 s (12 of 12 alternated
+starts with a normal warm start). Starts with the CPU rates confirmed at once: 15.7 / 15.8 / 16.9 s against 16.5 /
+16.5 / 16.5 s; the 16.9 s start's warm start took 1.2 s longer, a step before this change (another series, with
+the full settle every start: 20.0 / 19.9 / 19.9 against 20.6 / 20.7 / 23.9 s, the 23.9 s start's warm start 3.2 s
+longer). Decode on the new slot layout was not measured. In one earlier series five of six starts of this build read
+the 1-column CPU rate at ~16,500 against ~20,000 experts/s while the alternated starts of the build before did not;
+the 8-column rate of those readings stayed normal (47,100-48,400 against 48,400-52,200 columns/s), every start had
+the same saved state and so the same fill order, and 18 later starts of this build in three orders (same-build runs,
+alternated, the reference rewritten or fixed) read 19,600-21,000: the cause was not found. The 122B with
+`--expert-ram-mib 40000` needs every copy's slot, so it releases them all, as before (7,449 experts in RAM, 2,402 on
+the SSD, both builds). IQ3_S (several record sizes; the deploy flags with `--expert-ram-mib`, one start a build):
+at 30,000 MiB every slot is needed and both builds hold 14,388 experts in RAM with 3,708 on the SSD; at 40,000 MiB
+both hold 18,096 in RAM and copies of the 1,398 least-used seeds, none on the SSD (read in 7.4 against 7.9 s).
 
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 

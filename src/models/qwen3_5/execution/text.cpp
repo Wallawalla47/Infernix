@@ -230,13 +230,13 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
                                cudaMemcpyDeviceToDevice, stream));
 }
 
-void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
-    if (!consume_prefill || tokens != active_tokens) {
+void DFlashFeatureSink::consume_prefill_columns(std::int32_t first, std::int32_t count) {
+    if (!consume_prefill || first < 0 || count <= 0 || first + count > active_tokens) {
         throw std::logic_error("DFlash prefill feature consumer is unavailable");
     }
-    Tensor feature_window  = features->slice(1, 0, tokens);
-    Tensor position_window = positions->slice(0, 0, tokens);
-    consume_prefill(feature_window, position_window, rewrite_checkpoint);
+    Tensor feature_window  = features->slice(1, first, count);
+    Tensor position_window = positions->slice(0, first, count);
+    consume_prefill(feature_window, position_window, first);
 }
 
 TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weights,
@@ -1112,10 +1112,19 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         const std::int32_t heads    = dimension(config_.attention->num_attention_heads);
         const std::int32_t kv_heads = dimension(config_.attention->num_key_value_heads);
         const Tensor positions = cache_positions.view({T});
+        // The batched append finds a KV window's row through its slots (one row here, the lane's destination):
+        // the one-slot view a single sequence's attention takes names none, and every generation prompt's last
+        // layer failed on vq2 and k4v2 from f092da2b (2026-11-12) to 2026-11-17.
+        PagedKVBatchLayerView append_view = text_kv_layer(static_cast<std::uint32_t>(fidx));
+        if (append_view.window.present() && active_sequence_batch_ == 0) {
+            Tensor slot = work_.alloc(DType::I32, {1});
+            ops::set_i32_scalar(slot, linear_state_destination_slot_, s);
+            append_view.window       = state_images_.kv_window_view(static_cast<std::uint32_t>(fidx));
+            append_view.window.slots = slot;
+        }
         ops::kv_cache_append_batch(kn.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
                                    v.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
-                                   positions.slice(0, 0, skipped).view({skipped, 1}), kv_table_rows,
-                                   text_kv_layer(static_cast<std::uint32_t>(fidx)), s);
+                                   positions.slice(0, 0, skipped).view({skipped, 1}), kv_table_rows, append_view, s);
         Tensor tail = a.slice(2, skipped, kept);
         ops::causal_softmax_attention(
             qn.slice(2, skipped, kept), kn.slice(2, skipped, kept), v.slice(2, skipped, kept),
@@ -1222,8 +1231,21 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
-                                      s);
+        if (pair_column_ > 0) {
+            // QK-02: the columns before the tap leave their convolution history in the tap's slot, and the rest
+            // continue from it, as two passes cut at the tap compute it.
+            const std::int32_t a = pair_column_, b = T - pair_column_;
+            Tensor conv_state_tap = state_.conv_slot(static_cast<std::uint32_t>(gidx), prefill_pair_slot_);
+            Tensor qc_a = qc.slice(1, 0, a), kc_a = kc.slice(1, 0, a), vc_a = vc.slice(1, 0, a);
+            Tensor qc_b = qc.slice(1, a, b), kc_b = kc.slice(1, a, b), vc_b = vc.slice(1, a, b);
+            ops::causal_conv1d_silu_split(qkv.slice(1, 0, a), p.convolution, conv_state_in, conv_state_tap, qc_a,
+                                          kc_a, vc_a, s);
+            ops::causal_conv1d_silu_split(qkv.slice(1, a, b), p.convolution, conv_state_tap, conv_state_out,
+                                          qc_b, kc_b, vc_b, s);
+        } else {
+            ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
+                                          s);
+        }
     }
 
     Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
@@ -1287,11 +1309,29 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor recurrent_state_out =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta,
-                             static_cast<float>(1.0 / std::sqrt(static_cast<double>(
-                                                          config_.gdn->linear_key_head_dim))),
-                             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
-                             o, ctx_.execution_view(), execution_schedule_.gdn_arithmetic);
+        const float scale =
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
+        if (pair_column_ > 0) {
+            // QK-02: the recurrence to the tap publishes its state in the tap's slot, and the rest starts from it:
+            // each call's chunk grid starts at its first column, as in two passes cut at the tap, so both states
+            // are the cut's for the same inputs.
+            const std::int32_t a = pair_column_, b = T - pair_column_;
+            Tensor recurrent_state_tap =
+                state_.recurrent_slot(static_cast<std::uint32_t>(gidx), prefill_pair_slot_);
+            Tensor o_a = o.slice(2, 0, a), o_b = o.slice(2, a, b);
+            ops::gated_delta_net(q_recurrent.slice(2, 0, a), k_recurrent.slice(2, 0, a), vv.slice(2, 0, a),
+                                 g.slice(1, 0, a), beta.slice(1, 0, a), scale, /*normalize_qk=*/true, work_,
+                                 recurrent_state_in, recurrent_state_tap, o_a, ctx_.execution_view(),
+                                 execution_schedule_.gdn_arithmetic);
+            ops::gated_delta_net(q_recurrent.slice(2, a, b), k_recurrent.slice(2, a, b), vv.slice(2, a, b),
+                                 g.slice(1, a, b), beta.slice(1, a, b), scale, /*normalize_qk=*/true, work_,
+                                 recurrent_state_tap, recurrent_state_out, o_b, ctx_.execution_view(),
+                                 execution_schedule_.gdn_arithmetic);
+        } else {
+            ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, scale, /*normalize_qk=*/true, work_,
+                                 recurrent_state_in, recurrent_state_out, o, ctx_.execution_view(),
+                                 execution_schedule_.gdn_arithmetic);
+        }
     }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
@@ -1606,6 +1646,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const std::int64_t split_abs = prefill_split_frontier_;
     const bool has_split = split_abs > base64 && split_abs <= base64 + static_cast<std::int64_t>(T);
     const int split_rel  = has_split ? static_cast<int>(split_abs - base64) : -1;
+    // QK-02 (set_prefill_pair_tap): the tap's column inside the call's one window, 0 without a pair.
+    const std::int64_t pair_abs = prefill_pair_frontier_;
+    const int pair_rel = pair_abs > base64 && pair_abs < base64 + static_cast<std::int64_t>(T)
+                             ? static_cast<int>(pair_abs - base64)
+                             : 0;
+    if (pair_abs >= 0 && (pair_rel == 0 || prefill_pair_slot_ < 0 || has_split || T > chunk ||
+                          multimodal != nullptr || execution_schedule_.lossless || state_images_.has_kv_window())) {
+        throw std::logic_error("a pair window needs one text window holding its tap, a tap slot, no split, no "
+                               "lossless route and no KV window");
+    }
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
@@ -1733,21 +1783,27 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // every column, the drafter taps the last layer, or no such width exists (trim_columns 0).
                 const TextParameters& text = phase_text(Phase::Prefill, len);
                 const int last_layer       = static_cast<int>(text.layers.size()) - 1;
-                const std::int32_t kept    = prefill_last_rows_only_ && !prepare_mtp_prompt &&
+                std::int32_t kept          = prefill_last_rows_only_ && !prepare_mtp_prompt &&
                                                   !tap.reads_layer(last_layer)
                                               ? trim_columns(text.layers.back(), len,
                                                              offloaded_experts_ != nullptr && offloaded_experts_->router_mma)
                                               : 0;
+                // A pair window also reads the final hidden at the column before its tap (the tap's continuation
+                // hidden): the trimmed tail reaches back to it.
+                if (kept > 0 && pair_rel > 0) { kept = std::max<std::int32_t>(kept, len - pair_rel + 1); }
                 const bool trim_last       = kept > 0 && len > kept;
                 if constexpr (Tap::enabled) { tap.begin(x); }
                 trim_last_columns_ = trim_last ? kept : 0;
+                pair_column_       = pair_rel;
                 try {
                     run_layers(x, Phase::Prefill, tap);
                 } catch (...) {
                     trim_last_columns_ = 0;
+                    pair_column_       = 0;
                     throw;
                 }
                 trim_last_columns_ = 0;
+                pair_column_       = 0;
                 if constexpr (requires { tap.capture_positions(positions, s); }) {
                     tap.capture_positions(positions, s);
                 }
@@ -1760,6 +1816,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     ops::rmsnorm(x.slice(1, len - 1, 1), *final_norm_, config_.rms_norm_eps, true, column, s);
                 } else {
                     ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+                }
+                if (pair_rel > 0) { // the tap's continuation hidden, as a pass ending at the tap writes it
+                    Tensor tap_hidden = state_images_.continuation_hidden_slot(prefill_pair_slot_);
+                    if (trim_last) {
+                        ops::rmsnorm(x.slice(1, pair_rel - 1, 1), *final_norm_, config_.rms_norm_eps, true, tap_hidden,
+                                     s);
+                    } else {
+                        const Tensor column = xf.slice(1, pair_rel - 1, 1);
+                        CUDA_CHECK(cudaMemcpyAsync(tap_hidden.data, column.data, column.bytes(),
+                                                   cudaMemcpyDeviceToDevice, s));
+                    }
                 }
             }
             // Offloaded experts: the pass's routes reach the host for the cache update the Program
@@ -1889,9 +1956,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
         }
 
-        if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
+        if constexpr (requires { tap.consume_prefill_columns(0, len); }) {
             work_.reset();
-            tap.consume_prefill_chunk(len, split_rel > 0 && t0 + len == split_rel);
+            if (pair_rel > 0) {
+                // The drafter's local ring as the columns before the tap leave it goes to the tap's image before
+                // the rest overwrite its oldest positions.
+                tap.consume_prefill_columns(0, pair_rel);
+                state_images_.copy_fork_local(linear_state_destination_slot_, prefill_pair_slot_, s);
+                tap.consume_prefill_columns(pair_rel, len - pair_rel);
+            } else {
+                tap.consume_prefill_columns(0, len);
+            }
         }
 
         t0 += len;
@@ -1899,6 +1974,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
 
     prefill_split_frontier_ = -1;
+    prefill_pair_frontier_  = -1;
+    prefill_pair_slot_      = -1;
 
     if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
     timing.begin_wait();

@@ -58,7 +58,7 @@ be positive, §17); every other value is derived from the rest of the configurat
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
 | §5.7 SSD tier | implemented 2026-11-06 (opt-in `--ssd-context-gib` with `--ssd-context-dir`), both bindings; the write policy 2026-11-07 (fate counters, Qwen4Exp's ring left out, the image codec, `--ssd-context-gib-per-hour`): host-only unit tests (index write-back, demotion, promotion, SSD eviction order, partial and packed copies, a randomized stress with invariant checks), `infernix_ssd_tier_test` (bytes through a real scratch file, the codec's exactness, packed and partial copies, the write budget), `infernix_direct_scratch_file_test`, real scenarios `ssd-restore`/`ssd-restore-mtp` (27B) and `--ssd` (Flash-Next, also with DFlash2), timing `--ssd-scale` (§16.9) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again |
-| §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1). The Qwen4Exp binding takes the opener's tap without the split another way, its pair call (Flash-Next design §19.3.56) |
+| §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented as specified: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1). The generation opener's tap, in a prompt's last pass, is taken without the split: the Qwen3.5 binding's pair window (§7.10, 2026-11-17) and the Qwen4Exp binding's pair call (Flash-Next design §19.3.56) |
 | §11.2 KV transfer Op | copy-engine path only: a restore enqueues one copy per block and plane as one `cudaMemcpyBatchAsync` per model layer; write-through moves runs of consecutive pages and slabs as one `cudaMemcpy2DAsync` per plane |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
@@ -1025,6 +1025,8 @@ Candidates, in priority order:
 
 - **Exact** taps split the prefill chunk at `p` (one more forward pass each) and snapshot there.
   Semantic boundaries are where later prompts diverge, so the exact position is worth the split.
+  The generation opener's tap in a prompt's last pass is the exception: it is taken inside that
+  pass (§7.10).
 - **Flexible** taps never split: the snapshot is taken at the end of the chunk that reaches `p`, or
   at the start of the prompt's final chunk when `p` lies in it (the prompt tail always does). A
   chunk boundary costs nothing beyond the snapshot copy.
@@ -1092,7 +1094,8 @@ breakpoint or structural boundary falls inside the new tokens.
 
 **Not implemented** (§7.2 and §7.3 together form the zero-split tap). The implemented tap copies
 the lane's committed StateImage at a chunk boundary (≈0.25 ms D2D), so only exact taps pay a split.
-Build this only if measurement shows the remaining exact-tap split matters.
+Build this only if measurement shows the remaining exact-tap split matters. The split the opener's
+tap paid in a prompt's last pass is gone another way, without phase alignment (§7.10).
 
 The chunked GDN kernel's intra-chunk grid is relative to the call start. To make every internal
 boundary an absolute multiple of 64, the Op gains a `phase = base % 64` parameter:
@@ -1331,6 +1334,69 @@ prefill-chunk grid, as Qwen3.5's does (`infernix_qwen4_exp_resume_width_real_tes
   applies), and on offloaded-expert models the expert traffic of its prefill.
 - **Observation.** `RuntimeStats::next_turn_prefills_{started,completed,yielded,skipped,dropped}` and
   `next_turn_prefill_tokens`; the serve `throughput` record's `context_cache.hybrid.next_turn_prefill`.
+
+### 7.10 The pair window: the opener's tap without a split (Qwen3.5, 2026-11-17)
+
+A conversation whose client does not echo the model's replies token for token (it drops the
+reasoning, or sends its own text) re-renders the history at the generation opener, so every
+continuing turn plans the opener as an exact tap (§7.1) 2-8 tokens before its prompt's end, and
+its last pass used to run as two: the head to the opener, then the tail. Now that pass runs once
+(`TextContext::set_prefill_pair_tap`), and the tap is written inside it:
+
+- **GDN layers.** Projections, gating, normalization and the output projection run once over every
+  column; only the convolution and the recurrence run twice, the head from the lane's source state
+  into the tap's state image and the tail from that image into the lane's destination. Each call's
+  chunk grid starts at its first column, as in the two passes, so the tap's convolution and
+  recurrent state are the cut's for the same inputs. Attention and the FFN (MoE, offloaded
+  experts) run once.
+- **The rest of the image.** The continuation hidden of the column before the tap (YC-01's trimmed
+  last layer reaches back to it: a tail of at most 8 tokens stays within its ~20 columns), and with
+  a DFlash drafter its local ring: the head's columns are appended, the ring is copied to the tap's
+  image, then the tail's columns are appended. The tail's append writes its bindings on the device,
+  since the first append's pinned ingress may not have been read yet. MTP needs nothing: a tap
+  carries no MTP state (§7.3), and a resume bridges the position before it.
+- **Room.** The tap's Device snapshot slot, state image and supersessions are taken before the pass
+  (`hybrid_reserve_tap`; `hybrid_tap_due` decides the tap without consuming the plan). When every
+  slot still holds one of the previous request's snapshots whose Host copy is landing, the copies
+  that landed are published (a non-blocking poll) and the room asked for again; still without room
+  the pass is cut as before and the capture after its head pass tries again. Nothing waits on the
+  Engine thread. A failed pass gives the room back. The image is published after the pass with the
+  cut's checks (`hybrid_publish_reserved`).
+- **Where.** Free cache resume only (the reproducible and lossless routes cut on the chunk grid and
+  take no exact opener tap), a prompt's last pass, a tail of 2-8 tokens, a head of two or more, no
+  other exact tap in the tail, no Vision, no KV window (vq2/k4v2 keep the cut).
+- **Numerics.** The convolution and recurrence are the cut's calls on the same inputs, but the head's
+  projections, attention and FFN run at the pair's width, and the tail's columns take the head's
+  routes. Where the head's kernels take the same routes at both widths the tap's state is the cut's:
+  in the real test (heads of about 200 columns, a cold turn and a resumed one; no drafter, DFlash2,
+  MTP) the turns resuming from the pair's taps generate the cut's tokens. A resumed 77-column head
+  paired to 84 is not: on the served A/B below its next turn generated other tokens in 5 of 6
+  conversations from the same resume point. The default route's text can therefore change after a
+  paired turn, as after any cut that moves (free cache resume already makes the bits depend on
+  where the cache cuts the prompt); the reproducible and lossless routes are untouched.
+- **Measured** (RTX 5090, `infernix-serve`, `--kv-dtype int8 --prefill-chunk 4096
+  --preserve-thinking`, six four-turn conversations with fixed replies, alternated passes, server
+  time to first token on the turns that take the opener tap, pair against cut, medians):
+
+  | artifact, drafting | passes | turn 1 | turn 3 | other turns |
+  |---|---|---|---|---|
+  | 27B NVFP4, off | 8 | 21.8 against 37.3 ms (6 of 6) | 23.2 against 38.0 ms (5 of 6) | +0.3, -0.1 ms |
+  | 27B NVFP4, `--spec auto` (DFlash2) | 8 | 30.4 against 45.0 ms (6 of 6) | 31.3 against 46.3 ms (5 of 6) | -0.2, +0.7 ms |
+  | 35B-A3B, `--spec auto` (MTP) | 4 | 23.5 against 28.7 ms (6 of 6) | 24.0 against 29.1 ms (4 of 6) | +0.3, -0.1 ms |
+  | 122B NVFP4 (offloaded experts), `--spec auto` (MTP) | 4 | 377.8 against 402.9 ms (6 of 6) | 301.5 against 329.2 ms (6 of 6) | +2.0, +2.6 ms |
+
+  The turn 3 not faster resumed elsewhere in one arm (a reply's first token decides whether a
+  prompt-end tap forms, and the replies differ). The 122B's other turns run the same code in both
+  arms; its turn 0 (+2.0 ms, -1.9 to +7.9) shows the spread. Decode on requests whose replies the
+  arms share: 82.3 against 82.3 (27B, off), 761 against 766 (35B), 96.1 against 93.2 tok/s (122B).
+  Replies equal to the cut's: 19 of 24 (27B, off), 18-19 (27B, DFlash2), 19-20 (35B), 13 (122B).
+  These rows ran with a form that waited for the oldest Host write when no slot was free (no opener
+  turn was cut); the poll that replaced it, so that nothing waits on the Engine thread, cut 1 of 48
+  opener turns in four further passes. Rejected forms on the way: the room taken before the pass
+  with no fallback lost a tap when no slot was free (its next turn recomputed from an earlier
+  snapshot); only the image before the pass and the slot after it never paired (only a slot's
+  eviction frees an image); the room before the pass with the cut as fallback and no poll cut 13 of
+  48 opener turns; the wait (it can block every lane behind another lane's Host writes).
 
 ---
 
@@ -1965,7 +2031,7 @@ With the cache disabled, `host_capacity_bytes`, `device_snapshot_slots` and
 
 | risk | mitigation |
 |---|---|
-| Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one split per chat request, and none after an endpoint resume. The zero-split GDN tap (§7.2–§7.3) removes the rest if measurement shows it matters. |
+| Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one split per chat request, and none after an endpoint resume; the opener's in a prompt's last pass is taken without one (§7.10). The zero-split GDN tap (§7.2–§7.3) removes the rest if measurement shows it matters. |
 | Snapshots crowd KV out of host memory | GDSF weighs bytes against recompute seconds on the same scale for both. Dead-KV sweep runs first. |
 | Write-through competes with decode | Copy engines only, written as taps publish since 2026-11-15 (one batch at release before); decode rounds/s were unchanged with prefetch and write-through active (§16.3), and the continuous form showed no difference (§16.13). Write-through can be throttled when decode is active without changing correctness. |
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
@@ -2011,7 +2077,8 @@ served 90.8% and 90.9% of prompt tokens from cache with no errors.
 2. **Snapshots copy the committed state at chunk boundaries; the zero-split GDN tap was not
    built.** A tap copies the lane's StateImage into a snapshot slot (about 0.25 ms D2D), so only
    exact taps split a prefill chunk, at about 15 ms per split on 27B. §7.2–§7.3 remain the design
-   for removing that split if measurement shows it matters.
+   for removing that split if measurement shows it matters. The opener's tap in a prompt's last
+   pass, the split every re-rendered chat turn paid, is taken inside that pass (§7.10).
 3. **Hybrid ignores the chat template's rewrite frontiers.** Legacy splits prefill after each
    assistant header, after `<think>` and after the reasoning close for its rewrite checkpoints.
    Hybrid captures nothing there, so a short chat turn prefills in two passes (to the opener, then
