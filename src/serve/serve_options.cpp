@@ -1429,6 +1429,37 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("--default-max-tokens must be positive");
         }
     }
+    // Files the server writes are neither the model artifact (a prefix cache save renames its file over its
+    // path; a route trace truncates it) nor one another's (two writers would interleave), as the request log
+    // already checks for itself.
+    {
+        const auto normalized = [](const std::filesystem::path& value) {
+            std::error_code error;
+            std::filesystem::path path = std::filesystem::absolute(value, error);
+            if (error) { path = value; }
+            return path.lexically_normal();
+        };
+        const std::pair<const char*, std::filesystem::path> outputs[] = {
+            {"--prefix-cache-file", options.context_cache.hybrid.persistent_file},
+            {"--route-trace", options.route_trace},
+            {"--log-file", std::filesystem::path(options.log_file)},
+            {"--request-log-jsonl", std::filesystem::path(options.request_log_jsonl)},
+        };
+        const std::filesystem::path artifact = normalized(std::filesystem::path(options.artifact_path));
+        for (std::size_t i = 0; i < std::size(outputs); ++i) {
+            const auto& [flag, value] = outputs[i];
+            if (value.empty()) { continue; }
+            const std::filesystem::path path = normalized(value);
+            if (!options.artifact_path.empty() && path == artifact) {
+                throw std::invalid_argument(std::string(flag) + " names the model artifact");
+            }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (!outputs[j].second.empty() && normalized(outputs[j].second) == path) {
+                    throw std::invalid_argument(std::string(flag) + " names the same file as " + outputs[j].first);
+                }
+            }
+        }
+    }
     return options;
 }
 

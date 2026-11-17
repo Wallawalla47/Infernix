@@ -1011,6 +1011,25 @@ int main() {
     }
     failures += check(rejected_cache_file({"--prefix-cache-save-mins", "15"}),
                       "--prefix-cache-save-mins was accepted without --prefix-cache-file");
+    // Output files that name the model artifact or one another (audit 2026-11-17 SS-07): a prefix cache save
+    // renames its file over its path, so --prefix-cache-file equal to the artifact would replace the model.
+    {
+        const std::string model = (std::filesystem::temp_directory_path() / "infernix-alias-test.infernix").string();
+        const auto refused = [&](std::vector<std::string> extra) {
+            std::vector<std::string> arguments{"infernix-serve", model};
+            arguments.insert(arguments.end(), extra.begin(), extra.end());
+            try {
+                (void)parse(std::move(arguments));
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        failures += check(refused({"--prefix-cache-file", model}), "--prefix-cache-file accepted the model artifact");
+        failures += check(refused({"--route-trace", model}), "--route-trace accepted the model artifact");
+        failures += check(refused({"--log-file", "same.log", "--request-log-jsonl", "same.log"}),
+                          "--log-file and --request-log-jsonl accepted one file");
+        failures += check(!refused({"--log-file", "a.log", "--request-log-jsonl", "b.jsonl"}),
+                          "distinct output files were refused");
+    }
     // Past a year the Engine's next-save time would overflow steady_clock (audit 2026-11-17 SS-04).
     failures += check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--prefix-cache-save-mins", "200000000"}),
                       "a --prefix-cache-save-mins past a year was accepted");
