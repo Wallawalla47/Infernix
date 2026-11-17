@@ -1011,6 +1011,9 @@ int main() {
     }
     failures += check(rejected_cache_file({"--prefix-cache-save-mins", "15"}),
                       "--prefix-cache-save-mins was accepted without --prefix-cache-file");
+    // Past a year the Engine's next-save time would overflow steady_clock (audit 2026-11-17 SS-04).
+    failures += check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--prefix-cache-save-mins", "200000000"}),
+                      "a --prefix-cache-save-mins past a year was accepted");
     // The SSD tier (hybrid-prefix-cache-spec §5.7): off by default, GiB with an existing directory
     // (resolved absolute at launch), refused alone, without a Host tier or in a missing directory.
     {

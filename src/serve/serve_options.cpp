@@ -998,7 +998,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             cache_option_flag = "--prefix-cache-file";
         } else if (arg == "--prefix-cache-save-mins") {
             const int minutes = parse_nonnegative_int(require_value("--prefix-cache-save-mins"), "prefix-cache-save-mins");
-            if (minutes == 0) { throw std::invalid_argument("--prefix-cache-save-mins must be positive"); }
+            // At most a year: the Engine adds the interval to a steady_clock time (int64 nanoseconds, ~292 years).
+            if (minutes == 0 || minutes > 525600) {
+                throw std::invalid_argument("--prefix-cache-save-mins must be in [1,525600] (one year)");
+            }
             options.context_cache.hybrid.persistent_save_interval = std::chrono::minutes(minutes);
             cache_option_flag = "--prefix-cache-save-mins";
         } else if (arg == "--no-queue-holds") {
