@@ -1414,7 +1414,11 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
 
     __shared__ SamplingPartialTopKStorage topk_storage;
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
-    __shared__ std::int32_t overlay[kSpeculativeTreeMaxPathLength];
+    // A column's overlay (speculative_tree_overlay): a chain row's column c takes all c drafts before it, and
+    // chain rows reach extent kSpeculativeTreeMaxNodes - 1 (an n-gram tree round's copy chain); a tree column its
+    // depth, below kSpeculativeTreeMaxPathLength.
+    static_assert(kSpeculativeTreeMaxPathLength <= kSpeculativeTreeMaxNodes);
+    __shared__ std::int32_t overlay[kSpeculativeTreeMaxNodes - 1];
     __shared__ int overlay_len;
 
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
