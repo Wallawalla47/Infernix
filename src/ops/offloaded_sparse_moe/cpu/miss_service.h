@@ -116,6 +116,9 @@ private:
     static constexpr std::uint32_t kIdleDeepWaitUs = 1000;
 
     void serve();
+    // Frees the mapped and device words and the wait handles (whichever were taken): the destructor's, and a
+    // constructor's that throws partway.
+    void release() noexcept;
     // One timed wait, ended early by wake(); none when a wake() is already pending.
     void idle_wait(std::uint32_t microseconds) noexcept;
     void record_failure(std::string what) noexcept;

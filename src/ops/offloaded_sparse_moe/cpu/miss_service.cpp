@@ -111,6 +111,9 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         std::memset(p, 0, bytes);
         return p;
     };
+    // A step that throws gives back what the earlier ones took (the destructor does not run for a constructor that
+    // throws).
+    try {
     request_ = static_cast<MissRequest*>(mapped(sizeof(MissRequest)));
     // A service that takes prefill calls sizes for every job a call may hand it: a gated call's cap
     // (MoeCpuChannel::wide_jobs, set per call) may rise to kMaxCpuJobs.
@@ -127,21 +130,35 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     idle_timer_ = ::CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif
     thread_ = std::thread([this] { serve(); });
+    } catch (...) {
+        release();
+        throw;
+    }
 }
 
 CpuMissService::~CpuMissService() {
     stop_.store(true, std::memory_order_release);
     wake();
     if (thread_.joinable()) { thread_.join(); }
+    release();
+}
+
+void CpuMissService::release() noexcept {
 #if defined(_WIN32)
     if (wake_event_ != nullptr) { ::CloseHandle(wake_event_); }
     if (idle_timer_ != nullptr) { ::CloseHandle(idle_timer_); }
+    wake_event_ = idle_timer_ = nullptr;
 #endif
-    cudaFree(sequence_);
+    cudaFree(sequence_); // null-safe, as cudaFreeHost
     cudaFreeHost(done_);
     cudaFreeHost(y_);
     cudaFreeHost(x_);
     cudaFreeHost(request_);
+    sequence_ = nullptr;
+    done_     = nullptr;
+    y_        = nullptr;
+    x_        = nullptr;
+    request_  = nullptr;
 }
 
 void CpuMissService::wake() const noexcept {
