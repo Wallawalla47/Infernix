@@ -436,7 +436,12 @@ private:
         const std::uint8_t* copy_from = nullptr;
         bool expand = false;
         const std::uint8_t* bytes     = nullptr; // the record once landed (state 1)
-        std::atomic<bool> done{false};
+        // Who still reads its ring slot: kDeviceHolder (a fetch or read-ahead ticket until the device has copied it or
+        // the guess is dropped) and kCpuHolder (a CPU demand, its own or one sharing the key's round ticket, until
+        // done()). Each holder clears only its own bit, so a release repeated by one never frees the slot under the
+        // other; take_slot recycles a landed slot with no holder. The CPU side is the one service thread, which
+        // finishes a call's records (done) before it demands the next call's.
+        std::atomic<std::uint8_t> holders{0};
         std::atomic<std::uint32_t> state{0}; // 0 pending, 1 landed, 2 failed
         std::atomic<std::uint32_t> status{0};
     };
