@@ -1265,6 +1265,17 @@ int main() {
                           unkept_records[0].at("event") == "server_start",
                       "keep 0 retained a rotated file or lost the server_start record");
 
+    // A string that is not UTF-8 (a path or an argv in the Windows ANSI code page) is logged with replacement
+    // characters instead of throwing out of the formatter (audit 2026-11-17 SS-02).
+    {
+        const std::string ansi = std::string("cannot open E:\\Mod") + static_cast<char>(0xE8) + "les\\m.infernix";
+        bool parsed = false;
+        try {
+            parsed = Json::parse(format_request_error_json("serve-test", 1, context, ansi)).is_object();
+        } catch (const std::exception&) {}
+        failures += check(parsed, "a non-UTF-8 message did not make a JSON record");
+    }
+
     bool rotated_artifact_rejected = false;
     try {
         JsonlRequestLog unsafe_rotation((rotation_dir / "model.jsonl").string(),
