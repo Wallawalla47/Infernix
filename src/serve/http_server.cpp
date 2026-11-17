@@ -401,8 +401,18 @@ void HttpServer::run_stats_reporter() {
     // The device's clocks, power, energy and throttle reasons beside each interval (NVML; every
     // sample is invalid without it).
     const infernix::GpuTelemetry telemetry(options_.device);
-    infernix::GpuTelemetrySample gpu_previous = telemetry.sample();
-    infernix::RuntimeStats previous   = service_->runtime_stats();
+    // Inside the guard as every later sample is: an Engine that failed at this instant throws from
+    // runtime_stats, and an exception leaving this thread would terminate the server.
+    infernix::GpuTelemetrySample gpu_previous;
+    infernix::RuntimeStats previous;
+    try {
+        gpu_previous = telemetry.sample();
+        previous     = service_->runtime_stats();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[infernix-serve] throughput report failed: %s; reporting continues\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "[infernix-serve] throughput report failed; reporting continues\n");
+    }
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
