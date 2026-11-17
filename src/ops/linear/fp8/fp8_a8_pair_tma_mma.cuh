@@ -148,7 +148,7 @@ fp8_a8_pair_tma_mma_kernel(
     const int token_begin = token_offset + token_tile * BT;
 
     // Every stage base is a multiple of 1,024 bytes, as the 128-byte TMA swizzle requires.
-    extern __shared__ __align__(128) unsigned char fp8_pair_shared[];
+    extern __shared__ __align__(1024) unsigned char fp8_pair_shared[];
     auto* activation_hi = fp8_pair_shared;
     auto* activation_lo = activation_hi + plane_bytes;
     auto* weight        = activation_lo + plane_bytes;
@@ -511,7 +511,7 @@ fp8_a8_pair_block32_tma_mma_kernel(
 
     // Every code stage base is a multiple of 1,024 bytes, as the 128-byte TMA swizzle requires; the
     // scale words follow the code planes.
-    extern __shared__ __align__(128) unsigned char fp8_pair_block32_shared[];
+    extern __shared__ __align__(1024) unsigned char fp8_pair_block32_shared[];
     auto* activation_hi = fp8_pair_block32_shared;
     auto* activation_lo = activation_hi + plane_bytes;
     auto* weight        = activation_lo + plane_bytes;

@@ -149,7 +149,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
     const int row_begin   = row_tile * (BR / (RowPolicy::kPaired ? 2 : 1));
     const int token_begin = token_offset + token_tile * BT;
 
-    extern __shared__ __align__(128) unsigned char fp8_tma_shared[];
+    extern __shared__ __align__(1024) unsigned char fp8_tma_shared[];
     auto* activation = fp8_tma_shared;
     auto* weight     = activation + S * BT * BK;
     auto* full       = reinterpret_cast<std::uint64_t*>(fp8_tma_shared +

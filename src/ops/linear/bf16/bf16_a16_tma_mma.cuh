@@ -120,7 +120,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     int tile_r, tile_t;
     bf16_mma_tile_coordinates<Schedule>(blockIdx.x, tiles_r, tiles_t, tile_r, tile_t);
     const int row_begin = tile_r * BR, token_begin = token_offset + tile_t * BT;
-    extern __shared__ __align__(128) unsigned char storage[];
+    extern __shared__ __align__(1024) unsigned char storage[];
     auto* a = reinterpret_cast<__nv_bfloat16*>(storage);
     auto* b = a + S * BR * BK;
     auto* full =

@@ -243,7 +243,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     constexpr int loaded_rows = Schedule::kBlockRows / branches;
     static_assert(Schedule::kStages >= 2, "the activation-scale buffer needs two slots");
 
-    extern __shared__ __align__(128) unsigned char shared_bytes[];
+    extern __shared__ __align__(1024) unsigned char shared_bytes[];
     auto& shared =
         *reinterpret_cast<Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>*>(shared_bytes);
     int block_x = 0;
