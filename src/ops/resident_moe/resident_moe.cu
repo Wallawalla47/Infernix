@@ -6,6 +6,7 @@
 #include "infernix/ops/resident_moe.h"
 
 #include "core/device.h"
+#include "core/grid_rows.h"
 #include "ops/common/bytes.cuh"
 
 #include <cuda_bf16.h>
@@ -130,44 +131,49 @@ __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int
 // before the wait (candidates §2.3 W5) measured within chance (6 blocks, removed 2026-10-28).
 template <class Codec>
 __global__ void __launch_bounds__(kThreads)
-    gate_up_kernel(const bf16* __restrict__ x, const std::int32_t* __restrict__ ids, int top_k, int hidden,
-                   int intermediate, Bank bank, float* __restrict__ h) {
+    gate_up_kernel(const bf16* __restrict__ x, const std::int32_t* __restrict__ ids, int top_k, int entries,
+                   int hidden, int intermediate, Bank bank, float* __restrict__ h) {
     __shared__ __align__(16) float xs[kMaxHidden];
-    const int entry = static_cast<int>(blockIdx.y);
-    const int t     = entry / top_k;
-    const int e     = ids[entry];
-    for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
-        xs[staged_index<Codec>(i)] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
-    }
-    __syncthreads();
-    const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
-    for (int i = 0; i < 2; ++i) {
-        const int r = static_cast<int>(blockIdx.x) * kGateRowsPerCta + warp * 2 + i;
-        if (r >= intermediate) { break; }
-        const std::int64_t base = static_cast<std::int64_t>(e) * 2 * intermediate;
-        const float g = row_dot<Codec>(bank, base + r, xs, lane);
-        const float u = row_dot<Codec>(bank, base + intermediate + r, xs, lane);
-        if (lane == 0) { h[static_cast<std::int64_t>(entry) * intermediate + r] = g / (1.0F + __expf(-g)) * u; }
+    // gridDim.y is grid_rows(entries): a call of more than 65,535 entries (top_k x T) wraps.
+    for (int entry = static_cast<int>(blockIdx.y); entry < entries; entry += static_cast<int>(gridDim.y)) {
+        if (entry != static_cast<int>(blockIdx.y)) { __syncthreads(); } // the last entry's reads of xs are done
+        const int t = entry / top_k;
+        const int e = ids[entry];
+        for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
+            xs[staged_index<Codec>(i)] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
+        }
+        __syncthreads();
+        const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
+        for (int i = 0; i < 2; ++i) {
+            const int r = static_cast<int>(blockIdx.x) * kGateRowsPerCta + warp * 2 + i;
+            if (r >= intermediate) { break; }
+            const std::int64_t base = static_cast<std::int64_t>(e) * 2 * intermediate;
+            const float g = row_dot<Codec>(bank, base + r, xs, lane);
+            const float u = row_dot<Codec>(bank, base + intermediate + r, xs, lane);
+            if (lane == 0) { h[static_cast<std::int64_t>(entry) * intermediate + r] = g / (1.0F + __expf(-g)) * u; }
+        }
     }
 }
 
 template <class Codec>
 __global__ void __launch_bounds__(kThreads)
-    down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int top_k, int hidden,
+    down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int entries, int hidden,
                 int intermediate, Bank bank, bf16* __restrict__ out) {
     __shared__ __align__(16) float hs[kMaxIntermediate];
-    const int entry = static_cast<int>(blockIdx.y);
-    const int e     = ids[entry];
-    for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
-        hs[staged_index<Codec>(i)] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
-    }
-    __syncthreads();
-    const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
-    for (int i = 0; i < kDownRowsPerCta / kWarps; ++i) {
-        const int r = static_cast<int>(blockIdx.x) * kDownRowsPerCta + warp * (kDownRowsPerCta / kWarps) + i;
-        if (r >= hidden) { break; }
-        const float y = row_dot<Codec>(bank, static_cast<std::int64_t>(e) * hidden + r, hs, lane);
-        if (lane == 0) { out[static_cast<std::int64_t>(entry) * hidden + r] = __float2bfloat16_rn(y); }
+    for (int entry = static_cast<int>(blockIdx.y); entry < entries; entry += static_cast<int>(gridDim.y)) {
+        if (entry != static_cast<int>(blockIdx.y)) { __syncthreads(); } // the last entry's reads of hs are done
+        const int e = ids[entry];
+        for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
+            hs[staged_index<Codec>(i)] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
+        }
+        __syncthreads();
+        const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
+        for (int i = 0; i < kDownRowsPerCta / kWarps; ++i) {
+            const int r = static_cast<int>(blockIdx.x) * kDownRowsPerCta + warp * (kDownRowsPerCta / kWarps) + i;
+            if (r >= hidden) { break; }
+            const float y = row_dot<Codec>(bank, static_cast<std::int64_t>(e) * hidden + r, hs, lane);
+            if (lane == 0) { out[static_cast<std::int64_t>(entry) * hidden + r] = __float2bfloat16_rn(y); }
+        }
     }
 }
 
@@ -179,13 +185,14 @@ template <class Codec>
 void launch(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down, int top_k, int hidden,
             int intermediate, float* h, Tensor& outputs, cudaStream_t stream) {
     const int entries = ids.ne[0] * ids.ne[1];
-    gate_up_kernel<Codec><<<dim3((intermediate + kGateRowsPerCta - 1) / kGateRowsPerCta, entries), kThreads, 0,
-                            stream>>>(static_cast<const bf16*>(x.data), static_cast<const std::int32_t*>(ids.data),
-                                      top_k, hidden, intermediate, bank_of(gate_up), h);
+    gate_up_kernel<Codec><<<dim3((intermediate + kGateRowsPerCta - 1) / kGateRowsPerCta, grid_rows(entries)),
+                            kThreads, 0, stream>>>(static_cast<const bf16*>(x.data),
+                                                   static_cast<const std::int32_t*>(ids.data), top_k, entries, hidden,
+                                                   intermediate, bank_of(gate_up), h);
     CUDA_CHECK(cudaGetLastError());
-    down_kernel<Codec><<<dim3((hidden + kDownRowsPerCta - 1) / kDownRowsPerCta, entries), kThreads, 0, stream>>>(
-        h, static_cast<const std::int32_t*>(ids.data), top_k, hidden, intermediate, bank_of(down),
-        static_cast<bf16*>(outputs.data));
+    down_kernel<Codec><<<dim3((hidden + kDownRowsPerCta - 1) / kDownRowsPerCta, grid_rows(entries)), kThreads, 0,
+                         stream>>>(h, static_cast<const std::int32_t*>(ids.data), entries, hidden, intermediate,
+                                   bank_of(down), static_cast<bf16*>(outputs.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
