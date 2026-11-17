@@ -176,6 +176,12 @@ infernix_add_test(infernix_http_stream_stall_test
   LIBRARIES infernix_serve infernix_product_logging)
 set_tests_properties(infernix_http_stream_stall_test PROPERTIES TIMEOUT 60)
 
+# Audit 2026-11-17 SV-07: non-streamed answers of a cancelled generation over loopback HTTP: Anthropic 499
+# request_cancelled, a cancelled Response answered but not stored, Chat's cut answer.
+infernix_add_test(infernix_http_cancelled_answer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_cancelled_answer.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
 infernix_add_test(infernix_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES infernix_serve)

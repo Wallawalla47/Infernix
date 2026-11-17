@@ -281,6 +281,12 @@ the generation goes on, and a write waits up to 60 seconds for the client once i
 are full (on Linux a zero receive window held for the 15-second retransmission limit can end the
 connection sooner) before the request is cancelled as disconnected.
 
+A non-streamed request whose generation is cancelled (its client disconnected, or the server is
+stopping) answers as far as a client still reads it: Chat Completions returns the cut answer, which
+is not kept for reasoning continuation; Responses returns a `cancelled` Response, which is not
+stored even with `store: true`; Anthropic Messages, which has no cancelled message, answers HTTP 499
+with `request_cancelled`.
+
 ## Models
 
 `GET /v1/models` and `GET /v1/models/{id}` return the configured public OpenAI model alias
@@ -1370,7 +1376,8 @@ On the unconstrained route, malformed tool markup is flushed back as ordinary te
 ### Local response state and resources
 
 `store` defaults to `true`. Stored Responses live only in this server process and are bounded by an
-LRU store. They are lost on restart and are not OpenAI's durable cloud retention service.
+LRU store. They are lost on restart and are not OpenAI's durable cloud retention service. A
+cancelled Response is not stored.
 
 `previous_response_id` reconstructs the complete stored input/output Item history before the new
 input. The current `instructions` value is placed first but is not saved into the continuation
