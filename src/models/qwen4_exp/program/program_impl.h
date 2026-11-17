@@ -3436,6 +3436,7 @@ public:
                 if (lanes_[i].phase != Phase::Free) { release(i); }
             }
             transaction_lane_.reset();
+            pause_.reset(); // an open Pause the failure kept poll_context from collecting: in_transaction() would stay true
             pending_transaction_ = 0;
             round_width_         = 1;
             deferred_.pending    = false; // the failed round's cache update
@@ -3460,6 +3461,7 @@ public:
             if (lanes_[i].phase != Phase::Free) { release(i); }
         }
         transaction_lane_.reset();
+        pause_.reset(); // likewise an open Pause
         pending_transaction_ = 0;
         round_width_         = 1; // an abandoned verification round leaves no width behind (candidates QA-16)
         deferred_.pending    = false; // after a failure the last round's cache update is dropped (shutdown settles it first)
