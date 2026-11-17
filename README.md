@@ -528,20 +528,26 @@ download a model) under **Models**, press **Load**, and point your tools at the 
 Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
 the CUDA 13.4 toolkit (CMake refuses an older one; later ones are untested, and 13.5's device link may need over 46 GB of RAM:
 [build system](docs/maintainer/build-system.md)), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
-`vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths at
+`vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree), and Python 3.11 or
+later for the PDFium download below; adjust the paths at
 the top of `build_native.bat`. It builds with Ninja Multi-Config (about 30 % faster than the Visual
 Studio generator); a `build-windows` tree from the Visual Studio generator is configured afresh on its
 next build.
 
-PDF documents need PDFium: `tools\deps\fetch_pdfium.py` downloads the pinned prebuilt release, checks
-its SHA-256 and unpacks it where `build_native.bat` finds it (without it the build succeeds and PDFs
-are refused).
+PDF documents need PDFium: `tools\deps\fetch_pdfium.py` downloads the pinned prebuilt release
+(bblanchon/pdfium-binaries), checks its SHA-256 and unpacks it into `build-deps\pdfium`, where
+`build_native.bat` finds it (`--archive FILE` unpacks a copy you already downloaded; set `PDFIUM_ROOT`
+to use a tree elsewhere). Without it the build succeeds and PDFs are refused.
 
 ```bat
-py -3.11 -I tools\deps\fetch_pdfium.py
+py -3 -I tools\deps\fetch_pdfium.py
 build_native.bat configure
 build_native.bat build
 ```
+
+The configure step confirms it with `infernix: PDF documents through PDFium 159.0.8152.0 (...)`. A
+`build-windows` configured before the download keeps refusing PDFs until `build_native.bat configure`
+runs again.
 
 The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs (`pdfium.dll` among them) beside it.
 
@@ -645,23 +651,27 @@ prompts ([guide](docs/qwen3_5-122b.md)). `--expert-csf` keeps the offloaded NVFP
 Another PC needs an RTX 50-series GPU and NVIDIA driver 580 or later (no CUDA toolkit): copy the
 DLLs beside `infernix-serve.exe` and install the Visual C++ redistributable if missing.
 `packaging\windows\package_release.ps1` packs the server, DLLs and licences into a release zip
-([third-party notices](packaging/windows/THIRD_PARTY_NOTICES.md)).
+([third-party notices](packaging/windows/THIRD_PARTY_NOTICES.md)); it stops on a build without PDFium.
 
 ## Quick start (Linux)
 
 64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4
 (CMake refuses an older toolkit: CUDA 13.2 miscompiles sm_120a code; later ones are untested), CMake 3.28+, a C++20
-compiler, Ninja, `pkg-config`, and the FFmpeg, libjpeg-turbo and curl development packages:
+compiler, Ninja, `pkg-config`, the FFmpeg, libjpeg-turbo and curl development packages, and Python 3.11
+or later for the PDFium download:
 
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libjpeg-turbo8-dev libcurl4-openssl-dev
-python3.11 -I tools/deps/fetch_pdfium.py   # PDF documents (PDFium); prints the tree for PDFIUM_ROOT
+python3 -I tools/deps/fetch_pdfium.py   # PDF documents (PDFium); prints the tree for PDFIUM_ROOT
 cmake --preset release -DPDFIUM_ROOT="$PWD/build-deps/pdfium/chromium-8152/linux-x64"
 cmake --build build -j
 ```
 
-The server is `build/apps/infernix-serve`, with the same options, and the launcher
-`build/apps/infernix-launcher`. Under WSL2 use the Windows NVIDIA
+Without `PDFIUM_ROOT` the build succeeds and PDFs are refused; the configure step confirms PDFium as on
+Windows. The server is `build/apps/infernix-serve`, with the same options, and the launcher
+`build/apps/infernix-launcher`. The server loads `libpdfium.so` from the PDFium tree: keep that tree
+in place, or put the library on the loader path (the Dockerfile copies it to `/usr/local/lib`) when
+moving the server. Under WSL2 use the Windows NVIDIA
 driver (install none inside WSL) and copy models into the Linux filesystem; `/mnt/` reads are slow.
 Ubuntu 24.04's FFmpeg (6.1) decodes every image format but animated WebP, which needs FFmpeg 8; an
 animated WebP sent to such a build is refused with a message saying so. Under WSL2 Infernix plans RAM

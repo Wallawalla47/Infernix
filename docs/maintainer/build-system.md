@@ -19,6 +19,7 @@ The default configuration is Release. Ninja links and archives share the single-
 | `INFERNIX_BUILD_APPS` | ON | CLI, HTTP server, launcher, perplexity evaluator and `infernix-certify` |
 | `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
 | `INFERNIX_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
+| `PDFIUM_ROOT` | `$ENV{PDFIUM_ROOT}` | The unpacked PDFium tree for PDF documents; empty builds without it |
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
 logging and serving. This is one derived condition, not a separate user option. FFmpeg and
@@ -75,9 +76,20 @@ Configure that environment with `cmake --preset local`. Compiler paths may also 
 changing compilers requires a fresh build directory. There is no tools option, installed SDK,
 package export or configure-time dependency download.
 
+PDFium is the one prebuilt dependency fetched before configuring: `tools/deps/fetch_pdfium.py`
+downloads bblanchon/pdfium-binaries at the release it pins (the build without V8 and XFA), checks the
+archive against its pinned SHA-256 and unpacks it to `build-deps/pdfium/<release>/<platform>`, where
+`build_native.bat` finds it; the Linux build and the `Dockerfile` pass the tree as `PDFIUM_ROOT`. Without
+it the build succeeds, `infernix_citations_test` skips its PDF cases and the server refuses PDF documents
+(`documents_not_supported`); Windows release packaging requires it. The configure prints which PDFium it
+found. A `PDFIUM_ROOT` naming another tree drops the cached PDFium paths and finds them again, so a new
+pinned release needs the fetch and one configure (`build_native.bat build` configures only a new tree).
+The pin lives in `fetch_pdfium.py`, the `Dockerfile`, `build_native.bat`'s default path and the README's
+build steps (the Linux `PDFIUM_ROOT` path, the configure line's version), which change together.
+
 ## Targets and dependencies
 
-`cmake/Dependencies.cmake` discovers system CUDA, Threads, FFmpeg, libjpeg and conditional curl, and
+`cmake/Dependencies.cmake` discovers system CUDA, Threads, FFmpeg, libjpeg, conditional curl and optional PDFium, and
 exposes the repository-pinned JSON/HTTP headers and conditional spdlog library. External include
 requirements follow their consuming targets. `cmake/InfernixTargets.cmake` provides private
 project includes and the two CUDA archive policies.
@@ -90,7 +102,7 @@ project includes and the two CUDA archive policies.
 | `core/` | `infernix_core` |
 | `artifact/` | `infernix_artifact` |
 | `text/` | `infernix_text`, including bundled utf8proc C source |
-| `media/` | `infernix_media_decode` |
+| `media/` | `infernix_media_decode`, `infernix_media_pdf` |
 | `ops/` | `infernix_ops`, `infernix_nvfp4_non_rdc` |
 | `models/` | `infernix_model_loading`, `infernix_model_runtime` |
 | `runtime/` | `infernix_runtime_support`, `infernix_engine` and its `infernix::engine` alias |

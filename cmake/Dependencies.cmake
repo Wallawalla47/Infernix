@@ -45,6 +45,15 @@ find_package(JPEG REQUIRED)
 # entry, or the environment) names the unpacked tree, whose PDFiumConfig.cmake defines the `pdfium` target.
 # Without it the build still succeeds and PDF documents are refused; Windows release packaging requires it.
 set(PDFIUM_ROOT "$ENV{PDFIUM_ROOT}" CACHE PATH "Unpacked pdfium-binaries tree (tools/deps/fetch_pdfium.py)")
+# find_package caches PDFium_DIR and PDFiumConfig.cmake caches the files it finds, so a PDFIUM_ROOT naming another
+# tree (a new pinned release, a moved tree) drops them: the build links the tree PDFIUM_ROOT names.
+if(NOT "${PDFIUM_ROOT}" STREQUAL "${INFERNIX_PDFIUM_ROOT_FOUND}")
+  unset(PDFium_DIR CACHE)
+  unset(PDFium_INCLUDE_DIR CACHE)
+  unset(PDFium_LIBRARY CACHE)
+  unset(PDFium_IMPLIB CACHE)
+  set(INFERNIX_PDFIUM_ROOT_FOUND "${PDFIUM_ROOT}" CACHE INTERNAL "The PDFIUM_ROOT the cached PDFium paths came from")
+endif()
 set(INFERNIX_HAVE_PDFIUM OFF)
 if(PDFIUM_ROOT)
   find_package(PDFium CONFIG PATHS "${PDFIUM_ROOT}" NO_DEFAULT_PATH)
