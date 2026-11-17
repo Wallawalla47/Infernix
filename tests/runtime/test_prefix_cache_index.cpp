@@ -1559,22 +1559,23 @@ void test_host_born_snapshots() {
     require(index.stats().host_free_slabs == 60, "a duplicate frees its reserved slabs");
     index.check_invariants();
 
-    // A reservation that does not match the publication stays reserved and can be released.
+    // A reservation that does not match the publication is consumed by the refusal, as by every other outcome
+    // (the caller cannot tell a refusal from a later throw, so it never gives the slabs back itself).
     const auto tail_tokens = make_tokens(10, 51);
     auto plain             = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
-    require(plain.has_value(), "plain reservation");
+    require(plain.has_value() && index.stats().host_free_slabs == 56, "plain reservation");
+    const std::uint32_t refused_tail = backend.allocate();
     require_throws(
         [&] {
-            (void)index.publish_host_snapshot(path[1], 138, tail_tokens, std::nullopt, std::move(*plain),
+            (void)index.publish_host_snapshot(path[1], 138, tail_tokens, refused_tail, std::move(*plain),
                                               SnapshotKind::Endpoint);
         },
         "a tail needs a reservation with a tail slab");
-    require(plain->slabs.size() == 4 && index.stats().host_free_slabs == 56,
-            "a refused publication leaves the reservation intact");
+    require(plain->slabs.empty() && index.stats().host_free_slabs == 60 && !backend.live.contains(refused_tail),
+            "a refused publication frees the reservation's slabs and releases the tail id");
     index.check_invariants();
-    index.release_host_image(std::move(*plain));
-    require(plain->slabs.empty() && index.stats().host_free_slabs == 60, "release frees the slabs");
-    index.release_host_image(std::move(*plain)); // already released: nothing to free
+    index.release_host_image(std::move(*plain)); // already consumed: nothing to free
+    require(index.stats().host_free_slabs == 60, "a consumed reservation frees nothing again");
     index.check_invariants();
 
     // An endpoint with a tail and a Device tail copy: the tail slab is part of the reservation.
@@ -3193,6 +3194,41 @@ void test_holds() {
     index.check_invariants();
 }
 
+// Every refused publication consumes the staging slot and the tail id it was given (CM-07): its caller cannot tell
+// a refusal from a throw past the index's first change, so it never gives them back itself.
+void test_publish_refusals_consume() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens = make_tokens(64 * 2, 880);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const auto tail_tokens = make_tokens(10, 881);
+
+    const auto refuse = [&](std::uint32_t frontier, std::span<const TokenId> tail, bool with_tail,
+                            const std::string& what) {
+        const auto slot = index.acquire_device_slot();
+        require(slot.has_value(), what + ": a staging slot");
+        std::optional<std::uint32_t> tail_id;
+        if (with_tail) { tail_id = backend.allocate(); }
+        require_throws(
+            [&] {
+                (void)index.publish_snapshot(path[1], frontier, tail, tail_id, *slot, SnapshotKind::Tap);
+            },
+            what);
+        require(!tail_id || !backend.live.contains(*tail_id), what + ": the tail id is released");
+        const auto again = index.acquire_device_slot();
+        require(again.has_value() && *again == *slot, what + ": the slot is free again");
+        index.release_device_slot(*again);
+        index.check_invariants();
+    };
+    refuse(129, {}, false, "a frontier that does not match the anchor");
+    refuse(138, tail_tokens, false, "a tail without its Device copy");
+    refuse(139, tail_tokens, true, "a tail frontier that does not match the anchor");
+    refuse(128, {}, true, "a tail id without a tail");
+    require(index.stats().snapshots == 0, "no refusal publishes anything");
+    index.release_path(path);
+    index.check_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -3248,6 +3284,7 @@ int main() {
         test_sibling_revaluation();
         test_rotation_keeps_gdsf_time();
         test_holds();
+        test_publish_refusals_consume();
         test_tap_planner();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

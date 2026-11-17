@@ -495,7 +495,9 @@ public:
     // device_adopted: the caller then attaches its image); what it does not take is freed or released.
     // A full snapshot table evicts a superseded snapshot, or the least valuable retained one when the new
     // snapshot is worth at least as much (`claim`; its own estimated priority when absent), and otherwise
-    // publishes nothing (an invalid reference; the slot is freed and the tail device id released).
+    // publishes nothing (an invalid reference; the slot is freed and the tail device id released). The slot
+    // and the tail device id are consumed on every outcome, a throw included: a refused call frees and
+    // releases them, and past its checks they are the snapshot's.
     [[nodiscard]] PublishResult publish_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
@@ -513,7 +515,8 @@ public:
     // (`tail_device_id`) is optional. Frontier rules as publish_snapshot. A duplicate (same anchor
     // and tail), or no snapshot entry to be had (publish_snapshot's rule and `claim`), releases the slabs
     // and the tail device id; a duplicate returns the existing snapshot with created=false, refreshed,
-    // retained and given the tail device id as publish_snapshot does. `image` is consumed either way.
+    // retained and given the tail device id as publish_snapshot does. `image` and the tail device id are
+    // consumed on every outcome, a throw included, as publish_snapshot's are.
     [[nodiscard]] PublishResult publish_host_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                       std::span<const TokenId> tail,
                                                       std::optional<std::uint32_t> tail_device_id,
