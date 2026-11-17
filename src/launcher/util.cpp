@@ -5,12 +5,15 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -124,12 +127,37 @@ std::string hex_string(const std::uint8_t* data, std::size_t size) {
 }
 
 std::optional<std::string> read_file(const std::filesystem::path& path) {
+#ifdef _WIN32
+    // Shares delete too (std::ifstream does not), so a writer's atomic replace of this file, a rename over it, is not
+    // refused while it is read: chats are read unlocked while the next message's save replaces them.
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) { return std::nullopt; }
+    constexpr std::size_t kChunk = std::size_t{1} << 20;
+    std::string text;
+    if (LARGE_INTEGER size{}; GetFileSizeEx(file, &size) != 0 && size.QuadPart > 0) {
+        text.reserve(static_cast<std::size_t>(size.QuadPart) + kChunk); // the last read's room included
+    }
+    bool ok = true;
+    for (;;) { // to the end, as the stream read: a file that grows meanwhile is read whole
+        const std::size_t at = text.size();
+        text.resize(at + kChunk);
+        DWORD got = 0;
+        ok        = ReadFile(file, text.data() + at, static_cast<DWORD>(kChunk), &got, nullptr) != 0;
+        text.resize(at + (ok ? got : 0));
+        if (!ok || got == 0) { break; }
+    }
+    CloseHandle(file);
+    if (!ok) { return std::nullopt; }
+    return text;
+#else
     std::ifstream in(path, std::ios::binary);
     if (!in) { return std::nullopt; }
     std::ostringstream text;
     text << in.rdbuf();
     if (in.bad()) { return std::nullopt; }
     return text.str();
+#endif
 }
 
 std::filesystem::path backup_path(const std::filesystem::path& path) {
@@ -175,9 +203,34 @@ void write_durable(const std::filesystem::path& temporary, std::string_view cont
     }
 }
 
+#ifdef _WIN32
+// The POSIX rename (Windows 10 1709 and later, NTFS): `to` is replaced even while another handle has it open (sharing
+// delete, as read_file does); that handle keeps reading the old file. The classic rename refuses an open target.
+// False, with nothing renamed, where it is not supported (another file system, an older Windows).
+bool posix_rename(const std::filesystem::path& from, const std::filesystem::path& to) {
+    const HANDLE file = CreateFileW(from.c_str(), DELETE | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) { return false; }
+    const std::wstring target = std::filesystem::absolute(to).wstring();
+    const std::size_t bytes   = sizeof(FILE_RENAME_INFO) + target.size() * sizeof(wchar_t);
+    std::vector<std::byte> buffer(bytes);
+    auto* info           = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+    info->Flags          = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    info->RootDirectory  = nullptr;
+    info->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
+    std::memcpy(info->FileName, target.data(), target.size() * sizeof(wchar_t));
+    bool ok = SetFileInformationByHandle(file, FileRenameInfoEx, info, static_cast<DWORD>(bytes)) != 0;
+    // The rename durable before it is reported, as MOVEFILE_WRITE_THROUGH makes the classic one.
+    ok = ok && FlushFileBuffers(file) != 0;
+    CloseHandle(file);
+    return ok;
+}
+#endif
+
 // Renames `from` over `to`, durably: write-through on Windows; the folder's entry synced on POSIX.
 bool rename_durable(const std::filesystem::path& from, const std::filesystem::path& to, std::string& error) {
 #ifdef _WIN32
+    if (posix_rename(from, to)) { return true; }
     if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
         error = std::system_category().message(static_cast<int>(GetLastError()));
         return false;

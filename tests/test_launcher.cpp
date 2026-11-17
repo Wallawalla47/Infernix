@@ -1042,6 +1042,31 @@ void test_store_durability() {
         Store store(dir);
         check(store.last_model().has_value(), "a missing memory file loads the backup");
     }
+    // A file read while it is replaced (audit 2026-11-17 LN-09: a chat the UI reads while the next message's save
+    // renames over it): the read shares delete, so the replace is never refused, and the read gets one whole version.
+    const std::filesystem::path chat = dir / "chat.json";
+    write_file_atomic(chat, std::string(1 << 18, 'a'));
+    std::atomic<bool> writing{true};
+    std::atomic<int> torn_reads{0};
+    std::thread reader([&] {
+        while (writing) {
+            if (const std::optional<std::string> text = read_file(chat);
+                text && (text->size() != (1U << 18) || text->find_first_not_of(text->front()) != std::string::npos)) {
+                ++torn_reads;
+            }
+        }
+    });
+    int refused = 0;
+    for (int i = 0; i < 100; ++i) {
+        try {
+            write_file_atomic(chat, std::string(1 << 18, static_cast<char>('a' + i % 26)));
+        } catch (const std::exception&) { ++refused; }
+    }
+    writing = false;
+    reader.join();
+    if (refused != 0) { std::cerr << refused << " of 100 replaces refused\n"; }
+    check(refused == 0, "an atomic replace is not refused while the file is read");
+    check(torn_reads == 0, "a read during replaces gets one whole version");
     std::filesystem::remove_all(dir, ignored);
 }
 
