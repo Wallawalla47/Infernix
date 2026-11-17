@@ -138,7 +138,10 @@ private:
     // Model lifecycle and the watchdog's incidents.
     Router::Loaded load_model(const std::string& key);
     [[nodiscard]] Json instance_json() const;
+    // Each takes its snapshot and publishes it in one step (threads publishing at once never publish an older state
+    // after a newer one, which the UI would show until the next change).
     void publish_instance();
+    void publish_library();
     void on_instance_changed(const InstanceSnapshot& snapshot);
     void handle_incident(const InstanceSnapshot& snapshot);
     // A load that did not fit ("vram" or "ram"): the error and the launch-parameter changes to try.
@@ -320,6 +323,8 @@ private:
     std::mutex stop_mutex_;
     bool stopped_ = false;
     std::thread scanner_;
+    std::mutex publish_instance_mutex_; // publish_instance (taken with no other launcher lock held)
+    std::mutex publish_library_mutex_;  // publish_library (likewise)
     std::thread log_flusher_;
     std::thread console_writer_;
     httplib::Server server_;

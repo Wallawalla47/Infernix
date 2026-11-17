@@ -662,7 +662,7 @@ void Launcher::scan_loop() {
         scan_requested_      = false;
         scanning_            = true;
         lock.unlock();
-        if (requested) { publish("library", library_json()); }
+        if (requested) { publish_library(); }
         const Settings settings = store_.settings();
         std::vector<std::filesystem::path> dirs;
         for (const std::string& dir : settings.model_dirs) { dirs.push_back(utf8_path(dir)); }
@@ -671,8 +671,7 @@ void Launcher::scan_loop() {
         library_  = std::move(scan);
         scanning_ = false;
         lock.unlock();
-        Json library = library_json();
-        Json compare = library;
+        Json compare = library_json();
         compare.erase("scanned_at");
         const std::string digest = compare.dump();
         lock.lock();
@@ -680,7 +679,7 @@ void Launcher::scan_loop() {
         library_digest_    = digest;
         lock.unlock();
         if (changed || requested) {
-            publish("library", library);
+            publish_library();
             publish("activity", activity_json());
         }
         if (changed) { publish_model_event("*", "models_reload"); }
@@ -1355,7 +1354,15 @@ Json Launcher::instance_json() const {
             {"incident", incident}};
 }
 
-void Launcher::publish_instance() { publish("instance", instance_json()); }
+void Launcher::publish_instance() {
+    std::lock_guard lock(publish_instance_mutex_);
+    publish("instance", instance_json());
+}
+
+void Launcher::publish_library() {
+    std::lock_guard lock(publish_library_mutex_);
+    publish("library", library_json());
+}
 
 // ---------------------------------------------------------------------------------------------
 // Event log and the watchdog's incidents
@@ -2823,7 +2830,7 @@ void Launcher::register_management_routes() {
         event("info", "settings", "configuration " + config.value("alias", "") + " " + what,
               {{"model_key", config.value("id", "")}, {"args", config.value("args", Json::array())}});
         publish("config", config);
-        publish("library", library_json());
+        publish_library();
         publish_model_event("*", "models_reload"); // a model id or the listing may have changed
     };
     server_.Get(api + config_path + "/config", admin([this, with_config](const Request& q, Response& s) {
@@ -2946,7 +2953,7 @@ void Launcher::register_management_routes() {
                        }
                        store_.erase_model_config(id);
                        event("info", "settings", "configuration " + alias + " deleted");
-                       publish("library", library_json());
+                       publish_library();
                        publish_model_event("*", "models_reload");
                        send_json(s, {{"ok", true}});
                    }));
