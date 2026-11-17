@@ -99,10 +99,14 @@ void grouped(const CausalAttentionOperands& p, const VqKvCacheView& cache,
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::kArenaBytes);
         CUDA_CHECK(status);
         const dim3 grid(G::KVHeads * (Parallel ? div_up(p.width, Tokens) : 1), splits, p.batch);
-        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kThreads), Shape::kArenaBytes, stream}, kernel,
-                                        p.q, p.positions, cache, p.width, p.visible_capacity,
-                                        partition, window_splits, row_splits, p.scale, partial.acc,
-                                        partial.maximum, partial.sum));
+        // Only window CTAs read what this call's append writes, and they wait for it; without a window every CTA
+        // streams the new codes before any wait, so that launch follows the append instead of overlapping it.
+        const pdl::Dependency dependency =
+            cache.window_tags != nullptr ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
+        CUDA_CHECK(pdl::launch_with(dependency, {grid, dim3(kThreads), Shape::kArenaBytes, stream}, kernel,
+                                    p.q, p.positions, cache, p.width, p.visible_capacity,
+                                    partition, window_splits, row_splits, p.scale, partial.acc,
+                                    partial.maximum, partial.sum));
     };
     if constexpr (TreeCapable) {
         if (cache.tree_masks) {
