@@ -24,6 +24,7 @@ std::atomic<std::uint32_t> restore_delay_us{0};
 std::atomic<std::uint64_t> transfer_wait_count{0};
 std::atomic<std::uint64_t> binding_vision_encode_count{0};
 std::atomic<bool> text_pass_recording{false};
+std::atomic<bool> pair_windows_on{true};
 std::mutex text_pass_mutex;
 std::vector<TextPass> recorded_text_passes;
 
@@ -45,6 +46,10 @@ void note_text_pass(std::uint32_t base, std::int32_t rope_delta) {
     const std::lock_guard lock(text_pass_mutex);
     recorded_text_passes.push_back(TextPass{.base = base, .rope_delta = rope_delta});
 }
+
+void set_pair_windows(bool enabled) noexcept { pair_windows_on.store(enabled); }
+
+bool pair_windows() noexcept { return pair_windows_on.load(std::memory_order_relaxed); }
 
 void set_restore_delay(std::uint32_t microseconds) noexcept { restore_delay_us.store(microseconds); }
 

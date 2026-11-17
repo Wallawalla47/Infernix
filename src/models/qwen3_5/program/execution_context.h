@@ -79,6 +79,10 @@ struct PrefillContext {
     // YC-01 (TextContext::set_prefill_last_rows_only): a generation prompt, which reads each window's final hidden
     // at its last column only. Causal scoring and the other prompt-shaped passes leave it off.
     bool last_rows_only = false;
+    // QK-02 (TextContext::set_prefill_pair_tap): an exact tap this text pass takes without a split, and the
+    // physical state image slot it fills (ProgramImpl::hybrid_reserve_pair); -1: none.
+    std::int64_t pair_tap_frontier = -1;
+    std::int32_t pair_tap_slot     = -1;
 };
 
 struct OrdinaryBatchContext {

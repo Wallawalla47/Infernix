@@ -4,6 +4,7 @@
 #include "test_temp_path.h"
 #include "kv_cache_storage.h"
 #include "runtime/contract/execution.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -26,6 +27,8 @@
 #include <vector>
 
 namespace {
+
+namespace qwen_testing = infernix::models::qwen3_5::testing;
 
 constexpr std::uint32_t kPrefillChunk = 512;
 // Tokens per cached KV block.
@@ -922,6 +925,147 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
     return failures;
 }
 
+// QK-02, the pair window: a chat turn whose generation opener tap falls in its prompt's last pass takes the tap
+// inside that pass. With the cut (testing::set_pair_windows(false)) the turn's last pass begins at the opener; with
+// the pair no pass does, the next turn still resumes at the opener, and it generates the tokens it generates
+// resuming from the cut's tap: the tap's state (the GDN convolution and recurrence split at the opener, the
+// continuation hidden, the drafter's ring) is the cut's. Each arm runs on a fresh Engine.
+int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend backend) {
+    const std::string name = std::string("pair-window") +
+                             (backend == infernix::SpeculativeBackend::DFlash2 ? " (dflash2)"
+                              : backend == infernix::SpeculativeBackend::Mtp   ? " (mtp)"
+                                                                               : "");
+    const infernix::ChatMessage system =
+        text_message(infernix::ChatRole::System, "You are a concise assistant for a hardware shop. Answer in plain words.");
+    // Longer than the 64-token cluster distance, so the opener keeps its own exact tap past the system block's.
+    std::string question = "A customer asks which of three drills to buy.";
+    for (int i = 0; i < 6; ++i) {
+        question += " Drill " + std::to_string(i) + " has a different battery, chuck size, weight and warranty, and the "
+                    "customer mostly hangs shelves and assembles furniture at home.";
+    }
+    const infernix::ChatMessage first_user = text_message(infernix::ChatRole::User, question);
+    const infernix::ChatMessage reply =
+        text_message(infernix::ChatRole::Assistant, "Take the lightest one with a two-year warranty and a spare battery.");
+    const infernix::ChatMessage second_user = text_message(infernix::ChatRole::User, "And which bits should go with it?");
+    struct Arm {
+        std::vector<std::uint32_t> bases; // where each text pass of the first turn began
+        std::uint32_t first_tokens = 0, reused = 0;
+        std::vector<infernix::TokenId> second;
+    };
+    const auto run = [&](bool pair) {
+        qwen_testing::set_pair_windows(pair);
+        infernix::EngineOptions options = hybrid_options(artifact, backend, 8192, 1ULL << 30, 0);
+        options.context_cache.hybrid.device_snapshot_slots.reset();
+        infernix::Engine engine(std::move(options));
+        Arm arm;
+        qwen_testing::record_text_passes(true);
+        const infernix::GenerationResult first = engine.generate(engine.prepare(conversation({system, first_user})), greedy(8));
+        for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { arm.bases.push_back(pass.base); }
+        qwen_testing::record_text_passes(false);
+        const infernix::GenerationResult second =
+            engine.generate(engine.prepare(conversation({system, first_user, reply, second_user})), greedy(24));
+        arm.first_tokens = first.prompt.prompt_tokens;
+        arm.reused       = second.reused_prompt_tokens;
+        arm.second       = second.generated_token_ids;
+        return arm;
+    };
+    Arm cut, pair;
+    try {
+        cut  = run(false);
+        pair = run(true);
+    } catch (...) {
+        qwen_testing::set_pair_windows(true);
+        qwen_testing::record_text_passes(false);
+        throw;
+    }
+    qwen_testing::set_pair_windows(true);
+    int failures = 0;
+    // The cut's last pass begins at the opener, 2-8 tokens before the prompt's end.
+    if (cut.bases.size() < 2 || cut.bases.back() + 8U < cut.first_tokens || cut.bases.back() + 2U > cut.first_tokens) {
+        std::cerr << name << ": the cut's first turn ran " << cut.bases.size() << " passes, the last from "
+                  << (cut.bases.empty() ? 0U : cut.bases.back()) << " of " << cut.first_tokens
+                  << " tokens; expected one from the generation opener\n";
+        return 1;
+    }
+    const std::uint32_t opener = cut.bases.back();
+    const std::vector<std::uint32_t> head(cut.bases.begin(), cut.bases.end() - 1);
+    if (pair.bases != head) {
+        std::cerr << name << ": the pair's first turn ran " << pair.bases.size() << " passes; expected the cut's "
+                  << cut.bases.size() << " without the one from the opener (" << opener << ")\n";
+        ++failures;
+    }
+    if (cut.reused != opener || pair.reused != opener) {
+        std::cerr << name << ": the second turn reused " << cut.reused << " (cut) and " << pair.reused
+                  << " (pair) tokens; expected the opener, " << opener << '\n';
+        ++failures;
+    }
+    if (pair.second != cut.second) {
+        std::cerr << name << ": the second turn generated other tokens after the pair's tap than after the cut's\n";
+        ++failures;
+    }
+    std::cout << name << ": a " << cut.first_tokens << "-token turn ran " << cut.bases.size() << " passes cut and "
+              << pair.bases.size() << " paired (opener at " << opener << "); the next turn resumed at " << pair.reused
+              << " (cut " << cut.reused << ") and generated " << pair.second.size() << " tokens, "
+              << (pair.second == cut.second ? "equal" : "different") << '\n';
+    if (backend != infernix::SpeculativeBackend::None) { return failures; }
+
+    // A device failure anywhere in a pair turn's work, its pass among them, gives back the room the pass's tap took
+    // (its Device snapshot slot and state image). On an Engine with two Device snapshot slots each swept turn (a new
+    // question, so each pairs its opener) fails with the out-of-memory error or completes, a clean turn after it
+    // completes, and then a new conversation's next turn still resumes at its opener: two leaked slots would leave
+    // its tap none, paired or cut (a pass without room for its tap is cut, and the capture after its head pass
+    // tries again).
+    const std::uint32_t tail = cut.first_tokens - opener;
+    infernix::EngineOptions faulted = hybrid_options(artifact, backend, 8192, 1ULL << 30, 2);
+    infernix::Engine engine(std::move(faulted));
+    const auto turn = [&](const std::string& text) {
+        return conversation({system, text_message(infernix::ChatRole::User, text)});
+    };
+    const std::vector<std::uint64_t> sweep{1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597};
+    std::uint32_t failed = 0;
+    for (std::size_t i = 0; i < sweep.size(); ++i) {
+        infernix::runtime::testing::request_memory_fault(sweep[i]);
+        std::string error;
+        try {
+            (void)engine.generate(engine.prepare(turn(question + " Case " + std::to_string(i) + ".")), greedy(4));
+        } catch (const std::exception& e) { error = e.what(); }
+        infernix::runtime::testing::request_memory_fault(0);
+        if (!error.empty()) {
+            ++failed;
+            if (error.find("out of device memory") == std::string::npos) {
+                std::cerr << name << ": a turn faulted at check " << sweep[i] << " failed otherwise: " << error << '\n';
+                ++failures;
+            }
+        }
+        try {
+            (void)engine.generate(engine.prepare(turn("Say yes. Item " + std::to_string(i) + ".")), greedy(2));
+        } catch (const std::exception& e) {
+            std::cerr << name << ": a clean turn after the fault at check " << sweep[i] << " failed: " << e.what() << '\n';
+            return failures + 1;
+        }
+    }
+    const infernix::ChatMessage last_user = text_message(infernix::ChatRole::User, question + " After the faults.");
+    qwen_testing::record_text_passes(true);
+    const infernix::GenerationResult last = engine.generate(engine.prepare(conversation({system, last_user})), greedy(8));
+    std::vector<std::uint32_t> last_bases;
+    for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { last_bases.push_back(pass.base); }
+    qwen_testing::record_text_passes(false);
+    const infernix::GenerationResult next =
+        engine.generate(engine.prepare(conversation({system, last_user, reply, second_user})), greedy(4));
+    const std::uint32_t last_opener = last.prompt.prompt_tokens - tail;
+    const bool paired = std::find(last_bases.begin(), last_bases.end(), last_opener) == last_bases.end();
+    if (next.reused_prompt_tokens != last_opener) {
+        std::cerr << name << ": after " << failed << " faulted turns a new conversation's opener (" << last_opener
+                  << ", " << (paired ? "paired" : "cut") << ") did not serve its next turn, which resumed at "
+                  << next.reused_prompt_tokens << '\n';
+        ++failures;
+    }
+    std::cout << name << ": " << failed << " of " << sweep.size() << " faulted pair turns failed; afterwards a new "
+              << "conversation's opener was " << (paired ? "paired" : "cut") << " and its next turn resumed at "
+              << next.reused_prompt_tokens << '\n';
+    return failures;
+}
+
 std::vector<std::uint8_t> gradient_ppm(int size, int phase) {
     std::vector<std::uint8_t> ppm;
     const std::string header =
@@ -1511,7 +1655,10 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 23> kScenarios{"all",
+    constexpr std::array<std::string_view, 26> kScenarios{"all",
+                                                          "pair-window",
+                                                          "pair-window-dflash2",
+                                                          "pair-window-mtp",
                                                           "vision-resume",
                                                           "ssd-restore",
                                                           "ssd-restore-mtp",
@@ -1557,6 +1704,15 @@ int main() {
             failures += exercise_ssd_restore(artifact, infernix::SpeculativeBackend::Mtp);
         }
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
+        if (all || scenario == "pair-window") {
+            failures += exercise_pair_window(artifact, infernix::SpeculativeBackend::None);
+        }
+        if (all || scenario == "pair-window-dflash2") {
+            failures += exercise_pair_window(artifact, infernix::SpeculativeBackend::DFlash2);
+        }
+        if (all || scenario == "pair-window-mtp") {
+            failures += exercise_pair_window(artifact, infernix::SpeculativeBackend::Mtp);
+        }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
         if (all || scenario == "vision-resume") { failures += exercise_vision_resume(artifact); }

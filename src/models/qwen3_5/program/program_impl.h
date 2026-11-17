@@ -1046,6 +1046,31 @@ public:
     // published as SnapshotKind::Boundary. True when it was skipped for lack of room (no Device
     // snapshot slot or state image); a `retry` counts no second skip.
     bool hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary, bool retry = false);
+    // The tap a prefill frontier realizes (hybrid_tap_due): a boundary snapshot, whether a flexible tap is among
+    // what it realizes (the last one, which stays planned when the tap finds no room), and whether it is only a
+    // retried flexible tap (no second skip is counted).
+    struct HybridTapDue {
+        bool boundary   = false;
+        bool retry_only = false;
+        std::optional<std::size_t> last_flexible;
+    };
+    // Advances the lane's planned taps past the prefill frontier `cursor` and returns the tap due there, unless
+    // none is or it may not be taken there (inside an exclusion, at or before the last capture, a flexible one too
+    // close to it), which counts a skip. With `apply` false it changes nothing and counts nothing: the answer the
+    // call with `apply` would give in the lane's present state.
+    [[nodiscard]] std::optional<HybridTapDue> hybrid_tap_due(SequenceState& sequence, std::uint32_t cursor,
+                                                             std::uint32_t prompt_tokens, bool apply = true);
+    // A due tap that found no room: its last flexible tap stays planned for a later boundary.
+    void hybrid_tap_no_room(SequenceState& sequence, const HybridTapDue& due);
+    // The room a tap at `frontier` takes before its state is written (QK-02's pair window writes it during the
+    // pass): the snapshots it supersedes, a Device snapshot slot and a state image. Nullopt with `no_room` when
+    // there is none (a skip is counted unless `retry`).
+    [[nodiscard]] std::optional<HybridPendingTap> hybrid_reserve_tap(SequenceState& sequence, std::uint32_t frontier,
+                                                                     bool boundary, bool retry, bool& no_room);
+    // The reserved image holds the lane's state at its frontier: it is published as a pending tap.
+    void hybrid_publish_reserved(SequenceState& sequence, const HybridPendingTap& reserved, bool retry);
+    // A reservation whose state was not written: its image and slot are released, its supersessions undone.
+    void hybrid_release_reserved(SequenceState& sequence, const HybridPendingTap& reserved);
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);

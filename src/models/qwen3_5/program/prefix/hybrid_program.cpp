@@ -1441,15 +1441,32 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
 
 bool ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier,
                                      bool boundary, bool retry) {
-    HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
-    pc::PrefixCacheIndex& index   = hybrid_->index();
-    HybridCacheCounters& counters = hybrid_->counters();
     // A tap no prefill plan foresaw (a coalescing sibling's) may find the DFlash2 ring missing
     // positions YE-01 skipped: a snapshot always carries a whole ring, so the tap is passed over.
     if (frontier == 0 || frontier > sequence.text_kv_valid || !dflash_ring_whole(sequence, frontier)) {
-        if (!retry) { ++counters.taps_skipped; }
+        if (!retry) { ++hybrid_->counters().taps_skipped; }
         return false;
     }
+    bool no_room = false;
+    const std::optional<HybridPendingTap> reserved = hybrid_reserve_tap(sequence, frontier, boundary, retry, no_room);
+    if (!reserved) { return no_room; }
+    try {
+        state_images->copy_slot(state_store->physical_slot(sequence.state.write),
+                                state_store->physical_slot(reserved->image), device.stream);
+    } catch (...) {
+        hybrid_release_reserved(sequence, *reserved);
+        throw;
+    }
+    hybrid_publish_reserved(sequence, *reserved, retry);
+    return false;
+}
+
+std::optional<HybridPendingTap> ProgramImpl::hybrid_reserve_tap(SequenceState& sequence, std::uint32_t frontier,
+                                                                bool boundary, bool retry, bool& no_room) {
+    HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
+    pc::PrefixCacheIndex& index   = hybrid_->index();
+    HybridCacheCounters& counters = hybrid_->counters();
+    no_room                       = true;
     // Superseded first so the slot can come from the lineage; undone if the tap is not taken.
     const HybridSupersession superseded{
         .resume = hybrid_supersede_resume(lane, frontier, sequence.ledger),
@@ -1463,34 +1480,38 @@ bool ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
             ++counters.taps_skipped;
             ++counters.taps_skipped_no_slot;
         }
-        return true;
+        return std::nullopt;
     }
     const std::optional<StateImageHandle> image = state_store->reserve_destination();
     if (!image) {
         index.release_device_slot(*slot);
         hybrid_undo_supersession(lane, superseded);
         if (!retry) { ++counters.taps_skipped; }
-        return true;
+        return std::nullopt;
     }
+    no_room = false;
+    return HybridPendingTap{
+        .frontier = frontier, .image = *image, .slot = *slot, .boundary = boundary, .superseded = superseded};
+}
+
+void ProgramImpl::hybrid_publish_reserved(SequenceState& sequence, const HybridPendingTap& reserved, bool retry) {
+    HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     try {
-        state_images->copy_slot(state_store->physical_slot(sequence.state.write),
-                                state_store->physical_slot(*image), device.stream);
-        state_store->publish_copied_snapshot(*image);
-        lane.pending.push_back(HybridPendingTap{.frontier   = frontier,
-                                                .image      = *image,
-                                                .slot       = *slot,
-                                                .boundary   = boundary,
-                                                .superseded = superseded});
+        state_store->publish_copied_snapshot(reserved.image);
+        lane.pending.push_back(reserved);
     } catch (...) {
-        (void)state_store->release(*image);
-        index.release_device_slot(*slot);
-        hybrid_undo_supersession(lane, superseded);
+        hybrid_release_reserved(sequence, reserved);
         throw;
     }
-    lane.last_capture = frontier;
-    if (retry) { ++counters.taps_retried; }
+    lane.last_capture = reserved.frontier;
+    if (retry) { ++hybrid_->counters().taps_retried; }
     hybrid_publish_pending(sequence, false);
-    return false;
+}
+
+void ProgramImpl::hybrid_release_reserved(SequenceState& sequence, const HybridPendingTap& reserved) {
+    (void)state_store->release(reserved.image);
+    hybrid_->index().release_device_slot(reserved.slot);
+    hybrid_undo_supersession(hybrid_lanes_[sequence.lane], reserved.superseded);
 }
 
 void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
@@ -1498,14 +1519,32 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
     HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     if (!lane.active || !lane.publish || cursor >= prompt_tokens) { return; }
+    const std::optional<HybridTapDue> due = hybrid_tap_due(sequence, cursor, prompt_tokens);
+    if (!due) { return; }
+    const bool no_room = hybrid_capture_tap(sequence, cursor, due->boundary, due->retry_only);
+    lane.tap_retry     = false;
+    if (no_room) { hybrid_tap_no_room(sequence, *due); }
+}
+
+void ProgramImpl::hybrid_tap_no_room(SequenceState& sequence, const HybridTapDue& due) {
+    HybridLaneState& lane = hybrid_lanes_[sequence.lane];
+    lane.tap_retry        = due.last_flexible.has_value();
+    if (due.last_flexible) { lane.next_tap = *due.last_flexible; }
+}
+
+std::optional<ProgramImpl::HybridTapDue> ProgramImpl::hybrid_tap_due(SequenceState& sequence, std::uint32_t cursor,
+                                                                     std::uint32_t prompt_tokens, bool apply) {
+    HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     // Without free cache resume prefill splits only on the chunk grid, every tap is realized at a
     // grid boundary, and blocks publish up to the last one reached.
     const bool invariant = execution_schedule.grid_cache;
     const bool on_grid   = cursor % prefill_chunk == 0;
     if (invariant) {
-        if (!on_grid) { return; }
-        lane.publish_frontier = cursor;
-        hybrid_publish_blocks(sequence);
+        if (!on_grid) { return std::nullopt; }
+        if (apply) {
+            lane.publish_frontier = cursor;
+            hybrid_publish_blocks(sequence);
+        }
     }
     // The next chunk reaches the prompt end, so a flexible tap inside it is realized here.
     const bool final_chunk_next = prompt_tokens - cursor <= prefill_chunk;
@@ -1517,9 +1556,10 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     // the DFlash2 ring whole for it (YE-01 projects from the earliest planned read on).
     const std::optional<std::size_t> pending = lane.tap_retry ? std::optional<std::size_t>(lane.next_tap) : std::nullopt;
     std::optional<std::size_t> last_flexible;
-    bool fresh = false; // a tap is due here for the first time
-    while (lane.next_tap < lane.taps.size()) {
-        const pc::PlannedTap& tap = lane.taps[lane.next_tap];
+    bool fresh       = false; // a tap is due here for the first time
+    std::size_t next = lane.next_tap;
+    while (next < lane.taps.size()) {
+        const pc::PlannedTap& tap = lane.taps[next];
         if (tap.placement == pc::TapPlacement::Exact && !invariant) {
             if (tap.position > cursor) { break; }
             exact    = exact || tap.position == cursor;
@@ -1529,31 +1569,27 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
             break;
         } else {
             flexible      = true;
-            last_flexible = lane.next_tap;
-            fresh         = fresh || !pending || lane.next_tap != *pending;
+            last_flexible = next;
+            fresh         = fresh || !pending || next != *pending;
             // On the grid a coalescing tap (VR-01) lands at its grid boundary and stays a boundary, so
             // the sibling's deeper taps do not supersede the snapshot the waiting request resumes from.
             boundary = boundary || (invariant && tap.boundary && tap.position == cursor);
         }
-        ++lane.next_tap;
+        ++next;
     }
-    if (!exact && !flexible) { return; }
+    if (apply) { lane.next_tap = next; }
+    if (!exact && !flexible) { return std::nullopt; }
     // A retried tap counts no second skip; one taken counts in taps_retried.
-    const bool retry_only = pending.has_value() && !fresh;
-    const auto keep_planned = [&] {
-        lane.tap_retry = last_flexible.has_value();
-        if (last_flexible) { lane.next_tap = *last_flexible; }
-    };
+    const HybridTapDue due{.boundary = boundary, .retry_only = pending.has_value() && !fresh,
+                           .last_flexible = last_flexible};
     if (inside_exclusion(cursor, lane.exclusions) || cursor <= lane.last_capture ||
         (!exact && cursor - lane.last_capture < pc::kMinimumTapSeparation)) {
-        if (!retry_only) { ++hybrid_->counters().taps_skipped; }
+        if (apply && !due.retry_only) { ++hybrid_->counters().taps_skipped; }
         // A retried tap waits for a boundary it may take.
-        if (pending) { keep_planned(); }
-        return;
+        if (apply && pending) { hybrid_tap_no_room(sequence, due); }
+        return std::nullopt;
     }
-    const bool no_room = hybrid_capture_tap(sequence, cursor, boundary, retry_only);
-    lane.tap_retry     = false;
-    if (no_room && flexible) { keep_planned(); }
+    return due;
 }
 
 void ProgramImpl::hybrid_after_begin(SequenceState& sequence) {

@@ -50,7 +50,8 @@ struct PrefillChunkResult {
 
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
-    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
+    // A prefill window's features and positions from its column `first` on (a pair window's tail starts past 0).
+    using PrefillConsumer         = std::function<void(const Tensor& features, const Tensor& positions, std::int32_t first)>;
 
     Tensor* features                  = nullptr;
     Tensor* positions                 = nullptr;
@@ -71,7 +72,8 @@ struct DFlashFeatureSink {
     }
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
-    void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
+    // The drafter takes the window's columns [first, first + count) (the call's capture covers them all).
+    void consume_prefill_columns(std::int32_t first, std::int32_t count);
 };
 
 class VisionPrefillSession;
@@ -143,6 +145,16 @@ public:
 
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
+    }
+
+    // QK-02, the pair window: an exact prefix-cache tap at `position` inside this call's one window, taken without
+    // splitting it. The GDN layers run their convolution and recurrence over the columns before the tap from the
+    // source slot into `slot` (the tap's state image), then over the rest from `slot` into the destination; the tap
+    // image also takes the continuation hidden at position - 1 and, with a drafter, its local ring as the columns
+    // before the tap leave it. Every projection, attention and FFN runs once over the whole window. -1: none.
+    void set_prefill_pair_tap(std::int64_t position, std::int32_t slot) noexcept {
+        prefill_pair_frontier_ = position;
+        prefill_pair_slot_     = slot;
     }
 
     // Execution settings: prefill chunks' prompt kernels, every launch's fast-path permission and
@@ -377,6 +389,10 @@ private:
     const Tensor* verification_tree_          = nullptr;
     const Tensor* tree_ancestor_masks_        = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
+    // set_prefill_pair_tap; pair_column_ is the window's tap column while its layers run (gdn_mix), 0 otherwise.
+    std::int64_t prefill_pair_frontier_       = -1;
+    std::int32_t prefill_pair_slot_           = -1;
+    std::int32_t pair_column_                 = 0;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
     std::span<const cudaEvent_t> layer_ready_;
