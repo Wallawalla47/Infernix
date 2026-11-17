@@ -117,7 +117,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     const bool narrow     = *std::max_element(widths.begin(), widths.end()) <= plan_.static_columns;
     std::size_t walk_wide = 0;
     if (narrow) {
-        (void)span_need(work_capacity_); // sets the groups' budget
+        (void)span_need(work_capacity_ > kWideSlack ? work_capacity_ - kWideSlack : 0); // sets the groups' budget
     } else {
         walk_wide = span_need(walk_budget());
     }

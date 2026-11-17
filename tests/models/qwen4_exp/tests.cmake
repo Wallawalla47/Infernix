@@ -233,8 +233,9 @@ set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RET
 
 # The wide prefill workspace against its plan (design §19.3.7): every wide scope's peak stays within its arena and the
 # forward's own allocation plan, on the expert banks, the SSD tier, MTP, DFlash2, two lanes, causal scoring,
-# --a8-activations, the packed BF16 KV cache, a chat prompt's pair call, the reproducible route, every KV storage and
-# the expert-A4 routes (a4*: FP4-Local's W4A16 banks only).
+# --a8-activations, the packed BF16 KV cache, a chat prompt's pair call, the reproducible route, every KV storage, the
+# expert-A4 routes (a4*: FP4-Local's W4A16 banks only), a 48K prompt's 32,768-column MoE group (long) and a walk
+# whose chunks a structural tap cuts below the prefill chunk (cut).
 infernix_add_test(infernix_qwen4_exp_wide_plan_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_plan_real.cpp"
   LIBRARIES infernix_engine
