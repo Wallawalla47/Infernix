@@ -516,7 +516,10 @@ void Downloads::run_job(DownloadJob& job) {
     }
     for (const auto& file_ptr : job.files) {
         DownloadFile& file = *file_ptr;
-        if (file.state == "done" || file.state == "skipped") { continue; }
+        {
+            std::lock_guard lock(mutex_); // resume() rewrites a paused or failed file's state
+            if (file.state == "done" || file.state == "skipped") { continue; }
+        }
         if (interrupt_) { break; }
         const std::filesystem::path final_path = job.target_dir / utf8_path(file.path);
         std::filesystem::create_directories(final_path.parent_path(), error);
@@ -550,7 +553,8 @@ void Downloads::run_job(DownloadJob& job) {
             {
                 std::lock_guard lock(mutex_);
                 file.state = "verifying";
-                job.state  = "verifying";
+                // Only from running: a pause or cancel set since the last interrupt check stays (it stops this job).
+                if (job.state == "running") { job.state = "verifying"; }
             }
             notify();
             const std::optional<std::string> digest =
@@ -563,7 +567,7 @@ void Downloads::run_job(DownloadJob& job) {
             }
             {
                 std::lock_guard lock(mutex_);
-                job.state = "running";
+                if (job.state == "verifying") { job.state = "running"; }
             }
             if (!digest || *digest != expected) {
                 std::filesystem::remove(part, error);

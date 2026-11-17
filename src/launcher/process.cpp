@@ -124,11 +124,13 @@ struct ChildProcess::Impl {
             TerminateProcess(process, 1);
             WaitForSingleObject(process, 5000);
         }
+        // The job first (kill on close): a process the server started that still holds the output pipe ends with it,
+        // so the reader sees the pipe's end even when the one cancel below lands between two of its reads.
+        if (job != nullptr) { CloseHandle(job); }
         if (pipe != nullptr) { CancelIoEx(pipe, nullptr); }
         if (reader.joinable()) { reader.join(); }
         if (pipe != nullptr) { CloseHandle(pipe); }
         if (process != nullptr) { CloseHandle(process); }
-        if (job != nullptr) { CloseHandle(job); }
     }
 };
 

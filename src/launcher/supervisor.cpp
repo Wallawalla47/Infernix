@@ -229,7 +229,7 @@ void Supervisor::stop(std::chrono::seconds timeout) {
         if (const auto response = client.Get("/metrics?format=json", headers); response && response->status == 200) {
             try {
                 callbacks_.metrics(Json::parse(response->body));
-            } catch (const Json::exception&) {}
+            } catch (const std::exception&) {} // a reading the launcher cannot use does not hold up the stop
         }
     }
     if (child_ && !child_->exit_code()) {
@@ -412,13 +412,13 @@ void Supervisor::monitor(std::uint32_t instance) {
                 unanswered_since.reset();
                 unanswered_polls = 0;
                 reported_idle    = false;
+                Json snapshot;
                 try {
-                    Json snapshot = Json::parse(response->body);
+                    snapshot = Json::parse(response->body);
                     {
                         std::lock_guard lock(mutex_);
                         metrics_ = snapshot;
                     }
-                    if (callbacks_.metrics) { callbacks_.metrics(snapshot); }
                     // A stall: requests in the server, yet nothing processed for the stall timeout. An
                     // idle server (nothing running or waiting) never stalls.
                     const Json live         = snapshot.value("live", Json::object());
@@ -435,6 +435,13 @@ void Supervisor::monitor(std::uint32_t instance) {
                                                  std::to_string(watch.stall_timeout_s) + " s"};
                     }
                 } catch (const Json::exception&) {}
+                // After the stall check and in a try of its own: the launcher's use of a reading (a field of an
+                // unexpected type, say) neither blinds the watchdog nor ends this thread.
+                if (callbacks_.metrics && snapshot.is_object()) {
+                    try {
+                        callbacks_.metrics(snapshot);
+                    } catch (const std::exception&) {}
+                }
             } else {
                 if (!unanswered_since) { unanswered_since = now; }
                 ++unanswered_polls;
