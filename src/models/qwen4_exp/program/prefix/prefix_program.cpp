@@ -1195,6 +1195,11 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
         // A tap or boundary taken just before the release (a cancel, a failure, a pause) may still be
         // copying the lane's partial page, and release() returns the lane's pages to the pool next.
         prefix_->order_page_reuse(lane.pages);
+    } catch (...) {}
+    // Whether or not those waits could be enqueued (a failed device): the path's pins are the lane's, and the
+    // path is cleared below, so a skipped release would leave its nodes unevictable until clear(). A restore
+    // still landing holds pins of its own.
+    try {
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();
     } catch (...) {}
