@@ -669,11 +669,19 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
     std::atomic<bool> abort{false};
     std::mutex error_mutex;
     std::string failure;
+    // The first failure ends the file: its message is recorded before `abort` is set, so the other
+    // workers' transfers, cut short by it, cannot report their own "aborted" error instead.
+    const auto fail = [&](const std::string& message) {
+        std::lock_guard lock(error_mutex);
+        if (abort) { return; }
+        failure = message;
+        abort   = true;
+    };
 
     const auto worker = [&] {
         std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), &curl_easy_cleanup);
         if (!curl) {
-            abort = true;
+            fail("cannot start a transfer (curl_easy_init failed)");
             return;
         }
         curl_slist* headers = nullptr;
@@ -736,8 +744,7 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
                 // Discard the partial chunk; it is fetched again whole.
                 file.done -= transfer.written;
                 if (status == 401 || status == 403 || status == 404) {
-                    last_error = "huggingface.co answered HTTP " + std::to_string(status) + " for " + file.path;
-                    abort      = true;
+                    fail("huggingface.co answered HTTP " + std::to_string(status) + " for " + file.path);
                     break;
                 }
                 last_error = transfer.bad_status ? "unexpected HTTP " + std::to_string(status) + " for a range request"
@@ -750,9 +757,7 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
                 }
                 save_meta(false);
             } else if (!interrupt_) {
-                std::lock_guard lock(error_mutex);
-                if (failure.empty()) { failure = last_error.empty() ? "download failed" : last_error; }
-                abort = true;
+                fail(last_error.empty() ? "download failed" : last_error); // no-op once another failure ended it
             }
         }
         curl_slist_free_all(headers);
