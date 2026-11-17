@@ -14,6 +14,7 @@
 //   --fake-experts            report an expert cache, expert memory and an SSD tier (offloaded-expert models)
 //   --fake-no-memory          report no memory breakdown (a server older than it)
 //   --plan FILE               write a plan (fits up to --max-context 225280) and exit
+//   --log-level L             above info (warning, error, critical, off): no Info records, "listening on" among them
 //   INFERNIX_FAKE_PROBE=TEXT  logged at startup (a configuration's environment reaches the server)
 //   INFERNIX_FAKE_HELP_DELAY_MS=N  wait N ms before printing --help (a slow first start)
 //   INFERNIX_FAKE_BIND_FAIL_ONCE=FILE  refuse the port once, as infernix-serve does when another
@@ -22,7 +23,7 @@
 // A port that is really held is refused with infernix-serve's own message.
 //
 // Everything else on the command line (the artifact, launch parameters) is accepted and ignored,
-// except --host, --port, --model-id and --max-context.
+// except --host, --port, --model-id, --max-context and --log-level.
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -68,8 +69,12 @@ constexpr double kPrefillRate = 3200.0; // tokens/s
 constexpr auto kTokenEvery    = std::chrono::microseconds(6700);
 
 std::mutex g_log_mutex;
+// --log-level above info (warning, error, critical, off) drops the Info records, as infernix-serve's does: the
+// "listening on" line among them.
+bool g_info_logged = true;
 
 void log(const char* level, const std::string& message) {
+    if (!g_info_logged && std::strcmp(level, "INFO") == 0) { return; }
     const auto now         = std::chrono::system_clock::now();
     const std::time_t secs = std::chrono::system_clock::to_time_t(now);
     const auto millis      = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
@@ -754,6 +759,9 @@ int main(int argc, char** argv) {
             g_state.experts = true;
         } else if (arg == "--fake-no-memory") {
             g_state.memory = false;
+        } else if (arg == "--log-level") {
+            const std::string level = value();
+            g_info_logged = level == "trace" || level == "debug" || level == "info";
         }
     }
     if (!plan_file.empty()) { return write_plan(plan_file, context); }

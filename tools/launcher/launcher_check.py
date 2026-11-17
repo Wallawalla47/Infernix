@@ -441,6 +441,21 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         check("...and an SSD prefix cache folder that does not exist",
               any(w.startswith("--ssd-context-dir: folder not found") for w in absent), "; ".join(absent))
 
+    with section("A server started above info is taken from /health at once"):
+        # infernix-serve logs its "listening on" line at Info, so one started with --log-level warning never shows
+        # it: the launcher then takes /health at once, not after the 30 s it gives a server without the line.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+        call(port, "PUT", f"{cfg}/config", {"args": fast + ["--log-level", "warning"]})
+        started = time.monotonic()
+        status, _ = call(port, "POST", "/v1/chat/completions", chat("fake-main", 8))
+        took = time.monotonic() - started
+        served += status == 200
+        check("a server started with --log-level warning is answered without the 30 s wait for its ready line",
+              status == 200 and took < 15, f"{status} after {took:.1f} s")
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+
     with section("Keep-alive while a model loads"):
         # Keep-alive while a model loads (the main configuration now takes 12 s to load).
         slow = base + ["--fake-load-ms", "12000"]
