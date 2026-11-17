@@ -3086,8 +3086,13 @@ private:
                 no_progress_reported_  = false;
                 no_progress_recovered_ = false;
             } else {
+                // Not recovered now (a bind or restore holds the Program, or the Program refused): another interval
+                // tries again rather than none, while the requests are still held.
                 publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
-                                   "%s, and its state cannot be recovered (%s): it stays as it is", what, state.c_str());
+                                   "%s, and its state cannot be recovered now (%s): tried again in %.0f s", what,
+                                   state.c_str(), std::chrono::duration<double>(recovery_bound).count());
+                no_progress_since_     = now;
+                no_progress_recovered_ = false;
             }
         } catch (...) {} // the watch never fails the Engine
     }

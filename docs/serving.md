@@ -246,7 +246,8 @@ How failures end:
   with `the Engine made no progress for N s while holding requests` (logged as an Error with the
   count), their state is discarded and queued requests are admitted again;
   `infernix_no_progress_recoveries_total` and `live.no_progress_recoveries` count these. A state
-  the recovery does not handle (a binding in flight) is left as it is, with an Error line.
+  the recovery does not handle now (a binding in flight) is left as it is, with an Error line, and
+  the heal is tried again after another two minutes while the requests are still held.
 
 The listener's port is its own: a second server cannot bind it beside a running one (Windows sets
 `SO_EXCLUSIVEADDRUSE`, which also refuses a wildcard bind beside another program's `127.0.0.1`
