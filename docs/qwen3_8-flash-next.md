@@ -417,10 +417,16 @@ The exact artifact is 77.7 GB and the Dense8 one 76.5 GB, three parts each; each
 imported tensor equal to the checkpoint, only the drafter re-quantized (and Dense8's 293 BF16-class parameters), and
 all 320,001,536 n-gram rows equal to NVIDIA's FP8 volume (2026-11-17).
 
-**Quality.** On the 1M-token corpus (quick, 4K context, BF16 KV, `--reproducible`; one build, 2026-11-17) the exact
-artifact scores 3.4422 and Dense8 3.4385, against 3.5066 for FP4-Local with `--expert-a4-activations` (the same 4-bit
-expert arithmetic), lower in every domain. With `--a16-activations` the exact artifact scores 3.4138 (3.4122 on the
-default route, where `expert-a4-residual` takes its prefill experts).
+Builds before `eac2b3d8` refuse both artifacts at load ("missing logical parameter text/layers/0/moe/shared/gate",
+checked with a build of `main` at `49893d9c`, `windows-2026.11.07-120-g49893d9c`).
+
+**Quality.** On the 1M-token corpus (quick, 4K context, BF16 KV, `--reproducible`; 2026-11-17) the exact artifact
+scores 3.4422 and Dense8 3.4385, against 3.5095 for NVIDIA's NVFP4 Dense8 on the same build and 3.5066 for FP4-Local
+with `--expert-a4-activations` (the same 4-bit expert arithmetic), lower than both in every domain. With
+`--a16-activations` the exact artifact scores 3.4138 (3.4122 on the default route, where `expert-a4-residual` takes its
+prefill experts); with `--a8-activations`, which runs on the default route only, 3.4139 (its 8-bit routes and the
+`expert-a4-residual` fast path its 16-bit-bank configuration registers; the default arithmetic scores 3.4422 there
+too).
 
 **Speed** (RTX 5090 on PCIe 5.0 x8, INT8 KV, one request, `infernix_bench --expert-state off`, two interleaved runs
 each against FP4-Local in the matching mode, 2026-11-17): MTP auto decode after a 4K prompt 250.8 / 249.4 tok/s
@@ -429,6 +435,19 @@ against 253.6 / 253.0 (FP4-Local with `--expert-a4-activations`), 248.4 / 249.0 
 254.0. DFlash2 auto decode 264.0 / 263.8 against 270.3 / 269.7: QAD's routing sends about 3 % more misses to the CPU in
 the same rounds. Prefill is level (pp1024-16384 within 0.5 %, pp8192 3,306-3,334 tok/s on both). Both runs left part of
 the experts on the artifact (the exclusive layout with no saved expert state).
+
+Re-measured on `b5242057` (the same settings, three interleaved runs, every n-gram volume on one drive, 2026-11-17
+evening). Runs that measured an 8,192-token prefill before the decode test decode about 7 % slower than runs that
+did not (the exact artifact's DFlash2: 259.5 against 280.2 tok/s), so compare rows of the same kind only:
+- **Drive check** (with the prefill test first): the exact artifact's DFlash2 decode was 259.5 tok/s mean with its FP8
+  volume on either drive, since 99 % of its rows came from the host cache. The drive was not behind the gaps above.
+- **Exact artifact against FP4-Local** (decode test only): DFlash2 decode 279.8-280.7 against FP4-Local's
+  288.0-289.2 tok/s (`--expert-a4-activations`), 2.9 % slower with the same acceptance. Plain decode 118.7 and 118.9
+  against 120.0-120.5; a third run at 127.8 took another expert-cache course (475 landings against 671).
+- **Dense8 against NVIDIA's NVFP4 Dense8** (with the prefill test first): DFlash2 decode 271.0-272.8 against
+  280.1-281.3 tok/s, 3.1 % slower in every run; acceptance 7.53 against 7.63 tokens a round explains part of that.
+  The bit-exact artifact's 259.5 under the same workload puts Dense8 4.9 % ahead of it. MTP decode 244.3-258.8 against
+  242.8-250.8, 3.5 % faster on average. pp8192 level (3,345-3,373 against 3,368-3,383).
 
 ## Run
 

@@ -68,7 +68,7 @@ it:
 |---|---|---|
 | NVIDIA NVFP4 Flash-Next (Dense8 and the bit-exact conversion) | Routed experts **4-bit** (W4A4 with NVIDIA's calibrated scales), because NVIDIA's checkpoint specifies it; everything else 16-bit | `--a8-activations`: experts 8-bit. `--a16-activations`: experts 16-bit on the stored 4-bit weights |
 | NVIDIA FP4-Local Flash-Next (and Huihui's abliterated FP4-Local) | 16-bit, as NVIDIA serves it | `--expert-a4-activations`: experts 4-bit. `--a8-activations`: experts 8-bit |
-| NVIDIA NVFP4-QAD Flash-Next (Dense8 and the bit-exact conversion) | Routed and shared experts **4-bit** (W4A4 with NVIDIA's scales), as NVIDIA serves it; MXFP8 projections and everything else 16-bit | `--a16-activations`: experts 16-bit (perplexity 3.4138 against 3.4422, decode within 1 %). `--a8-activations`: experts 8-bit |
+| NVIDIA NVFP4-QAD Flash-Next (Dense8 and the bit-exact conversion) | Routed and shared experts **4-bit** (W4A4 with NVIDIA's scales), as NVIDIA serves it; MXFP8 projections and everything else 16-bit | `--a16-activations`: experts 16-bit (perplexity 3.4138 against 3.4422, decode within 1 %). `--a8-activations`: experts 8-bit (3.4139 on the default route, with `expert-a4-residual`) |
 | Uncensored NVFP4 Flash-Next | 16-bit (weight-only NVFP4 experts) | `--a8-activations`: experts 8-bit |
 | IQ3_S GGUF Flash-Next | 16-bit everywhere | `--a8-activations`: dense projections and experts 8-bit, as Strata and Basalt |
 | Qwen3.8-27B NVFP4 | 4-bit at its NVFP4 layers, as the artifact specifies (NInfer the same) | none |
@@ -555,7 +555,8 @@ The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs (`p
 [Infernix Launcher](#infernix-launcher-beta).
 
 To run the server directly instead, Qwen3.8-Flash-Next ([guide](docs/qwen3_8-flash-next.md#run)) with the
-recommended conversion, NVIDIA's NVFP4-QAD Dense8. It needs a build from `main` at `eac2b3d8` or later:
+recommended conversion, NVIDIA's NVFP4-QAD Dense8. It needs a build from `main` at `eac2b3d8` or later, or a Windows
+release after `windows-2026.11.07`:
 
 ```bat
 infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft --max-concurrency 2 --vram-past-budget
@@ -703,7 +704,7 @@ Each repository's model card gives its files, requirements, recommended command,
 
 | Repository | Converted from | What it is |
 |---|---|---|
-| **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix)** (**recommended**) | [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | NVIDIA's quantization-aware distillation with NVFP4 shared experts and MXFP8 GDN, attention and indexer projections. Experts, MXFP8 words and FP8 n-gram table are bit-exact; the hyper-connection mixers, PLE projections and `lm_head` are in 8 bits, as in Dense8. Experts run W4A4 as NVIDIA serves it. Perplexity 3.4385 on the quick corpus (BF16 KV), against 3.5066 for FP4-Local at the same 4-bit expert arithmetic and 3.5114 for NVIDIA NVFP4 Dense8 on an earlier build; decode 2-7 % faster than the bit-exact QAD conversion. Its repository has no n-gram volume: use the FP8 one. Needs `main` at `eac2b3d8` or later. |
+| **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix)** (**recommended**) | [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | NVIDIA's quantization-aware distillation with NVFP4 shared experts and MXFP8 GDN, attention and indexer projections. Experts, MXFP8 words and FP8 n-gram table are bit-exact; the hyper-connection mixers, PLE projections and `lm_head` are in 8 bits, as in Dense8. Experts run W4A4 as NVIDIA serves it. Perplexity 3.4385 on the quick corpus (BF16 KV), against 3.5095 for NVIDIA NVFP4 Dense8 on the same build and 3.5066 for FP4-Local at the same 4-bit expert arithmetic; decode 2-7 % faster than the bit-exact QAD conversion. Against NVIDIA NVFP4 Dense8 on one build (benchmark text, three interleaved runs): DFlash2 decode 3.1 % slower (272 against 281 tok/s), MTP decode 3.5 % faster, prefill level. Its repository has no n-gram volume: use the FP8 one. Needs `main` at `eac2b3d8` or later (a release after `windows-2026.11.07`). |
 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | The same checkpoint with every weight exactly as NVIDIA stores it. Perplexity 3.4422, or 3.4138 with `--a16-activations` (16-bit expert activations). |
 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | NVIDIA's NVFP4 experts and FP8 n-gram table bit-exact, dense projections in 8 bits: about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654 against 4.666); the one [benchmarked](#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt). |
 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | Every weight exactly as NVIDIA stores it. |
@@ -737,7 +738,7 @@ FP8 with BF16, both FP4-Local conversions with FP4-Local's NVFP4 table; the unce
 Swift and NVFP4-QAD repositories carry none
 ([n-gram table formats](docs/qwen3_8-flash-next.md#n-gram-table-formats)). IQ3_S and FP8 need
 Infernix `windows-2026.10.18` or later, the uncensored conversion `windows-2026.10.09.2`, the
-NVFP4-QAD conversions a build from `main` at `eac2b3d8` or later (no release yet), the DFlash2
+NVFP4-QAD conversions `main` at `eac2b3d8` or later (a release after `windows-2026.11.07`), the DFlash2
 drafter a build whose `--help` lists `--draft-model`; older builds accept only an artifact's own
 n-gram table or BF16.
 

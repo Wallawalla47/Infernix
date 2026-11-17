@@ -49,8 +49,9 @@ tags:
 
 > [!NOTE]
 > **Engine version:** this artifact needs [Infernix](https://github.com/Wallawalla47/Infernix) built from
-> GitHub `main` at commit `eac2b3d8` or later, which runs its NVFP4 shared experts. No Windows release runs it
-> yet, and older builds refuse to load it.
+> GitHub `main` at commit `eac2b3d8` or later, which runs its NVFP4 shared experts, or a Windows release after
+> `windows-2026.11.07`. Older builds refuse to load it: they stop at startup with "missing logical parameter
+> text/layers/0/moe/shared/gate" (checked with a build of `main` at `49893d9c`, 120 commits after `windows-2026.11.07`).
 
 NVIDIA's [Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)
 (revision `a874339c`), a quantization-aware distillation of Qwen3.8-Flash-Next with a more aggressive
@@ -186,9 +187,12 @@ Three expert arithmetics are available. The default is the one NVIDIA trained an
 |---|---|---:|---:|
 | default | W4A4: 4-bit activations at NVIDIA's scales | 3.4422 | 250.8 / 249.4 tok/s |
 | `--a16-activations` | W4A16: BF16 activations, exact sums | 3.4138 | 248.4 / 249.0 tok/s |
-| `--a8-activations` | 8-bit activations (opt-in, changes the output) | not measured | 253.2 / 250.6 tok/s |
+| `--a8-activations` | 8-bit activations (opt-in, changes the output) | 3.4139 (default route, see below) | 253.2 / 250.6 tok/s |
 
-`--a16-activations` measured 0.8 % lower perplexity at decode within 1 % of the default. Under it the
+`--a16-activations` measured 0.8 % lower perplexity at decode within 1 % of the default. `--a8-activations` runs on
+the default route only. It scored 3.4139 there, with its 8-bit routes and the `expert-a4-residual` fast path that
+its 16-bit-bank configuration registers; the default arithmetic scores the same 3.4422 on the default route as on
+the reproducible route. Under `--a16-activations` the
 `expert-a4-residual` fast path takes long prefills, as on NVIDIA FP4-Local; `--reproducible` turns it
 off. The shared experts follow the routed experts' choice in every mode.
 
@@ -203,7 +207,7 @@ off. The shared experts follow the routed experts' choice in every mode.
     artifact. It is slower, with the same output.
 - **Disk:** 77.7 GB for the artifact, plus the 52 GB n-gram volume on an NVMe drive.
 - **Engine:** [Infernix](https://github.com/Wallawalla47/Infernix) from GitHub `main` at commit
-  `eac2b3d8` or later, built from source (Windows or Linux).
+  `eac2b3d8` or later (Windows or Linux), or a Windows release after `windows-2026.11.07`.
 
 ## Run
 
@@ -241,19 +245,20 @@ for the options, KV formats and the SSD expert tier.
 ## Quality
 
 Perplexity on Infernix's 1M-token perplexity corpus. The quick run uses one stream per domain, 4K
-context, BF16 KV and the reproducible route, all on one Infernix build (2026-11-17). NVIDIA FP4-Local
-is shown with `--expert-a4-activations`, the same 4-bit expert arithmetic:
+context, BF16 KV and the reproducible route, on Infernix builds of 2026-11-17 (this artifact and QAD Dense8 gave
+the same figures on both). NVIDIA FP4-Local is shown with `--expert-a4-activations`, the same 4-bit expert
+arithmetic:
 
-| Domain | This artifact | This artifact, `--a16-activations` | QAD Dense8 | NVIDIA FP4-Local, `--expert-a4-activations` |
-|---|---:|---:|---:|---:|
-| English reference | 3.0257 | 2.9925 | 3.0242 | 3.1448 |
-| English long-form | 6.5225 | 6.4712 | 6.5092 | 6.5934 |
-| Chinese reference | 4.3080 | 4.2621 | 4.2976 | 4.3568 |
-| Code | 1.6401 | 1.6346 | 1.6413 | 1.6624 |
-| **All** | **3.4422** | **3.4138** | **3.4385** | **3.5066** |
+| Domain | This artifact | This artifact, `--a16-activations` | QAD Dense8 | NVIDIA FP4-Local, `--expert-a4-activations` | NVIDIA NVFP4 Dense8 |
+|---|---:|---:|---:|---:|---:|
+| English reference | 3.0257 | 2.9925 | 3.0242 | 3.1448 | 3.1179 |
+| English long-form | 6.5225 | 6.4712 | 6.5092 | 6.5934 | 6.6153 |
+| Chinese reference | 4.3080 | 4.2621 | 4.2976 | 4.3568 | 4.3840 |
+| Code | 1.6401 | 1.6346 | 1.6413 | 1.6624 | 1.6663 |
+| **All** | **3.4422** | **3.4138** | **3.4385** | **3.5066** | **3.5095** |
 
-This artifact's perplexity is 1.8 % lower than FP4-Local's at the same expert arithmetic, and lower in
-every domain. Lower perplexity on this corpus is not proof of better answers: NVIDIA's own task
+This artifact's perplexity is 1.8 % lower than FP4-Local's at the same expert arithmetic and 1.9 % lower than
+NVIDIA's NVFP4 Dense8 conversion's, and lower than both in every domain. Lower perplexity on this corpus is not proof of better answers: NVIDIA's own task
 evaluations found no statistically established gain from QAD.
 
 ## Performance
@@ -279,16 +284,33 @@ with the text.
 | Prefill, 8,192-token prompt | 3,323 / 3,320 | 3,319 / 3,334 | 3,330 / 3,332 |
 | Prefill, 16,384-token prompt | 6,628 / 6,624 | | 6,638 / 6,631 |
 
+**Re-measured on a later build** (commit `b5242057`, 2026-11-17 evening; the same settings with both n-gram volumes
+on one drive, three runs each in alternating order; each run only the decode test, as above):
+
+| Measure | This artifact (W4A4) | NVIDIA FP4-Local, `--expert-a4-activations` (W4A4) |
+|---|---:|---:|
+| Decode, DFlash2 auto + proposal head | 280.7 / 280.0 / 279.8 tok/s | 288.0 / 288.7 / 289.2 |
+| Decode, plain | 127.8 / 118.7 / 118.9 | 120.5 / 120.0 / 120.3 |
+
 **Results:**
 
 - **MTP decode:** level with FP4-Local.
 - **Prefill:** 0.15-0.5 % behind FP4-Local in every pair.
-- **DFlash2:** 2.3 % slower than FP4-Local. In the same rounds, this model's routing sends about 3 % more
-  expert misses to the CPU.
-- **Plain decode:** unresolved. FP4-Local's first run started from another expert-cache state.
+- **DFlash2:** 2.3 % slower than FP4-Local on the first build and 2.9 % on the later one, in every run, with the
+  same draft acceptance. This artifact's n-gram volume sat on another drive than FP4-Local's in the first
+  measurement. Moving it to FP4-Local's drive changed nothing: 259.5 tok/s mean on either drive, since 99 % of the
+  rows came from the host cache. Those check runs measured an 8,192-token prefill before decoding, which costs
+  decode about 7 %, so 259.5 compares only with runs of that kind. So the drive is not the cause. In the same rounds this model's routing sends about
+  3 % more expert misses to the CPU.
+- **Plain decode:** 1.2 % slower than FP4-Local in two of three runs on the later build (118.7 and 118.9 against
+  120.0-120.5). Its other run, at 127.8, took a different expert-cache course (475 landings against 671); the cause
+  is not established.
 - **Two requests at once (MTP):** this artifact decoded at 116 tok/s. FP4-Local's lower 85 tok/s comes
   from a lower expert-cache hit rate in that run, which is an FP4-Local matter, not something this
   artifact gains.
+- **Against NVIDIA NVFP4 Dense8:** see the
+  [QAD Dense8 card](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix#performance)
+  for the head-to-head of the two Dense8 conversions.
 
 ## Provenance
 

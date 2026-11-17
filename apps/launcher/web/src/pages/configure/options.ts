@@ -828,7 +828,7 @@ const ROUTES: FormSection = {
       kind: "switch",
       flag: "--a16-activations",
       label: "16-bit expert activations",
-      help: "NVIDIA's W4A4 experts (the NVFP4 and Dense8 conversions): run them with 16-bit activations instead of the 4-bit ones the checkpoint specifies. Changes the output; the default follows NVIDIA and is recommended.",
+      help: "NVIDIA's W4A4 experts (the NVFP4, NVFP4 Dense8 and NVFP4-QAD conversions; on QAD the shared experts too): run them with 16-bit activations instead of the 4-bit ones the checkpoint specifies. Changes the output; the default follows NVIDIA and is recommended.",
       when: w4a4Experts,
     },
     {
