@@ -59,7 +59,9 @@ int main() {
     for (const auto* host : {"127.0.0.1", "127.1.2.3", "localhost", "::1", "[::1]"}) {
         failures += check(is_loopback_host(host), "a loopback --host warned of external reach");
     }
-    for (const auto* host : {"0.0.0.0", "::", "192.168.1.20", "myhost", "128.0.0.1", ""}) {
+    // A name that only starts like a loopback address, and malformed quads (audit 2026-11-17 SS-08).
+    for (const auto* host : {"0.0.0.0", "::", "192.168.1.20", "myhost", "128.0.0.1", "", "127.example.com",
+                             "127.1.2.3.evil", "127.0.0.256", "127.0.0", "127..0.1"}) {
         failures += check(!is_loopback_host(host), "a --host reachable beyond this machine passed as loopback");
     }
     for (const auto* factor : {"1", "2.5", "4"}) {

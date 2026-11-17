@@ -751,7 +751,23 @@ const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {
 
 bool is_loopback_host(std::string_view host) noexcept {
     if (host.size() >= 2 && host.front() == '[' && host.back() == ']') { host = host.substr(1, host.size() - 2); }
-    return host == "localhost" || host == "::1" || host.starts_with("127.");
+    if (host == "localhost" || host == "::1") { return true; }
+    // A dotted quad in 127.0.0.0/8 only: "127.example.com" is a name that may resolve anywhere.
+    if (!host.starts_with("127.")) { return false; }
+    int parts = 0;
+    for (std::size_t at = 0; at <= host.size();) {
+        const std::size_t end = std::min(host.find('.', at), host.size());
+        const std::string_view part = host.substr(at, end - at);
+        if (part.empty() || part.size() > 3 || !std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+            return false;
+        }
+        int value = 0;
+        for (const char c : part) { value = value * 10 + (c - '0'); }
+        if (value > 255) { return false; }
+        ++parts;
+        at = end + 1;
+    }
+    return parts == 4;
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
