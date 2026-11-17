@@ -246,26 +246,40 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     }
     // The anchor must outlive the copy: the capturing lane may release its path before it lands.
     if (capture.anchor.valid()) { index_->retain_node(capture.anchor); }
-    cudaEvent_t start = take_event();
-    CUDA_CHECK(cudaEventRecord(start, producer));
-    CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
-    recycle(start);
-    const std::vector<std::byte*> segments = image_segments(*image);
-    write_state_image_header(lanes_->layout(), capture.meta, segments.front());
-    const HostImage destination{segments, host_.slab_bytes};
-    std::byte* const tail_record     = tail ? slab(image->slabs.back()) : nullptr;
-    const std::uint32_t tail_group   = tail ? slab_group(image->slabs.back()) : 0U;
     const std::optional<DeviceKVPageHandle> tail_page = capture.tail_page;
     PendingCapture pending{std::move(capture), std::move(*image), {}};
-    for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
-        copy_capture_group(g, lane, destination, tail_record, tail_group, tail_page);
-        cudaEvent_t event = take_event();
-        CUDA_CHECK(cudaEventRecord(event, transfer_));
-        pending.events.push_back(event);
+    cudaEvent_t start = nullptr;
+    try {
+        start = take_event();
+        CUDA_CHECK(cudaEventRecord(start, producer));
+        CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
+        recycle(std::exchange(start, nullptr));
+        const std::vector<std::byte*> segments = image_segments(pending.image);
+        write_state_image_header(lanes_->layout(), pending.capture.meta, segments.front());
+        const HostImage destination{segments, host_.slab_bytes};
+        std::byte* const tail_record   = tail ? slab(pending.image.slabs.back()) : nullptr;
+        const std::uint32_t tail_group = tail ? slab_group(pending.image.slabs.back()) : 0U;
+        pending.events.reserve(lanes_->layout().groups());
+        for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
+            copy_capture_group(g, lane, destination, tail_record, tail_group, tail_page);
+            cudaEvent_t event = take_event();
+            pending.events.push_back(event); // reserved
+            CUDA_CHECK(cudaEventRecord(event, transfer_));
+        }
+        captures_.push_back(std::move(pending)); // a deque: unchanged when its new block cannot be allocated
+    } catch (...) {
+        // A failed copy (a device fault, an allocation) still returns the reservation and the anchor's retention:
+        // owned by nothing else, they would shrink the Host tier until clear(). The copies enqueued so far land
+        // first (the slabs go back once idle).
+        (void)cudaStreamSynchronize(transfer_);
+        if (start != nullptr) { recycle(start); }
+        for (cudaEvent_t event : pending.events) { recycle(event); }
+        if (pending.capture.anchor.valid()) { index_->unretain_node(pending.capture.anchor); }
+        index_->release_host_image(std::move(pending.image));
+        throw;
     }
     counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
     ++counters_.host_image_writes;
-    captures_.push_back(std::move(pending));
     return true;
 }
 
@@ -345,10 +359,22 @@ void PrefixCache::commit_staged_capture(std::uint64_t staged, Capture&& capture)
     StagedCapture s = std::move(found->second);
     staged_.erase(found);
     if (capture.anchor.valid()) { index_->retain_node(capture.anchor); }
-    write_state_image_header(lanes_->layout(), capture.meta, slab(s.image.slabs[0]));
+    PendingCapture pending{std::move(capture), std::move(s.image), std::move(s.events)};
+    try {
+        write_state_image_header(lanes_->layout(), pending.capture.meta, slab(pending.image.slabs[0]));
+        captures_.push_back(std::move(pending)); // a deque: unchanged when its new block cannot be allocated
+    } catch (...) {
+        // Past the erase nothing else holds the staged image, its events and the anchor's retention.
+        for (cudaEvent_t event : pending.events) {
+            (void)cudaEventSynchronize(event);
+            recycle(event);
+        }
+        if (pending.capture.anchor.valid()) { index_->unretain_node(pending.capture.anchor); }
+        index_->release_host_image(std::move(pending.image));
+        throw;
+    }
     counters_.host_write_bytes += host_.image_bytes + (s.tail ? host_.page.page_stride : 0U);
     ++counters_.host_image_writes;
-    captures_.push_back(PendingCapture{std::move(capture), std::move(s.image), std::move(s.events)});
 }
 
 void PrefixCache::abandon_staged_capture(std::uint64_t staged) noexcept {
