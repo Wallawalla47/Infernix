@@ -359,10 +359,22 @@ public:
             stream_              = format_->streams[stream_index_];
             const AVCodec* codec = avcodec_find_decoder(stream_->codecpar->codec_id);
             if (codec == nullptr) { throw_invalid_media("media codec is not supported"); }
+            // The pixel budget before the decoder allocates a frame: the declared size here, and the decoder's own
+            // limit for a frame larger than declared (a 16383 x 16383 WebP would otherwise be allocated first).
+            if (const AVCodecParameters* parameters = stream_->codecpar;
+                parameters->width > 0 && parameters->height > 0 &&
+                static_cast<std::uint64_t>(parameters->width) * static_cast<std::uint64_t>(parameters->height) >
+                    max_decoded_pixels_) {
+                throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
+            }
             codec_ = avcodec_alloc_context3(codec);
             if (codec_ == nullptr) { throw std::bad_alloc(); }
-            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0 ||
-                (rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
+            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0) {
+                throw_invalid_media("failed to open media codec: " + av_error(rc));
+            }
+            codec_->max_pixels = static_cast<std::int64_t>(std::min<std::uint64_t>(
+                max_decoded_pixels_, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())));
+            if ((rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
                 throw_invalid_media("failed to open media codec: " + av_error(rc));
             }
             packet_ = av_packet_alloc();
@@ -611,7 +623,9 @@ std::vector<int> sample_indices(int total, double source_fps, double target_fps,
         max_frames < min_frames) {
         throw std::invalid_argument("invalid video sampling configuration");
     }
-    int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
+    // Clamped before the cast (a tiny source rate makes the quotient exceed int).
+    const double wanted = static_cast<double>(total) / source_fps * target_fps;
+    int count = wanted < static_cast<double>(max_frames) ? static_cast<int>(wanted) : max_frames;
     count     = std::min({std::max(count, min_frames), max_frames, total});
     std::vector<int> indices(static_cast<std::size_t>(count));
     if (count == 1) {
@@ -644,11 +658,15 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
                             ? static_cast<int>(probe.stream()->nb_frames)
                             : 0;
     plan.duration     = probe.duration_seconds();
-    if (plan.total_frames == 0 && plan.duration > 0.0) {
-        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
-    }
+    // The duration limit first, and a frame estimate the int holds: a container's huge duration or frame rate made
+    // the cast undefined. An estimate past int's range is past every frame limit too.
     if (plan.duration > policy.max_video_duration_seconds) {
         throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
+    }
+    if (plan.total_frames == 0 && plan.duration > 0.0) {
+        const double frames = std::nearbyint(plan.duration * plan.fps);
+        plan.total_frames   = frames < static_cast<double>(std::numeric_limits<int>::max()) ? static_cast<int>(frames)
+                                                                                           : std::numeric_limits<int>::max();
     }
     if (plan.total_frames == 0) { plan.total_frames = count_frames(bytes, policy); }
     if (plan.total_frames == 0) { throw_invalid_media("video contains no decoded frame"); }

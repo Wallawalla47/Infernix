@@ -182,6 +182,9 @@ void test_jpeg_references() {
 // equals Pillow's pixels, alpha dropped as most engines drop it (llama.cpp, Ollama, LMDeploy, mlx-vlm, TGI; vLLM,
 // SGLang and TensorRT-LLM composite instead): lossy WebP through libwebp's upsampling and conversion, PNG through
 // the native decoder where the build has it, the rest through FFmpeg.
+void expect_error(std::span<const std::uint8_t> encoded, const infernix::media::decode::Policy& policy,
+                  infernix::media::decode::ErrorKind kind);
+
 void test_webp_gif_references() {
     std::string failures;
     for (const auto& fixture : webp_gif_fixtures::cases) {
@@ -218,6 +221,11 @@ void test_webp_gif_references() {
             worst = std::max(worst, std::abs(static_cast<int>(image.rgb[i]) - static_cast<int>(expected[i])));
         }
         if (worst != 0) { failures += " " + name + " (largest channel difference " + std::to_string(worst) + ")"; }
+        // One pixel under the image's own count is refused as over the budget (audit 2026-11-17 SV-05: the FFmpeg
+        // decoders now meet the budget before they allocate a frame, from the declared size and the codec's limit).
+        expect_error(encoded,
+                     {.max_decoded_pixels = static_cast<std::uint64_t>(fixture.width) * fixture.height - 1},
+                     infernix::media::decode::ErrorKind::BudgetExceeded);
     }
     if (!failures.empty()) { throw std::runtime_error("RGB differs from Pillow's:" + failures); }
 }
