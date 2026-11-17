@@ -210,10 +210,14 @@ bool pump_stream(const std::shared_ptr<Bridge>& bridge, httplib::DataSink& sink,
     return true;
 }
 
+// Error text can come from the server's raw output (a message in the system code page) or a cut body: invalid
+// UTF-8 is replaced, as everywhere else the launcher writes JSON, instead of throwing and dropping the answer.
+std::string dump_lenient(const Json& value) { return value.dump(-1, ' ', false, Json::error_handler_t::replace); }
+
 void write_error(httplib::Response& response, int status, const std::string& message) {
     response.status = status;
     response.set_content(
-        Json{{"error", {{"message", message}, {"type", "server_error"}, {"code", "upstream_unavailable"}}}}.dump(),
+        dump_lenient({{"error", {{"message", message}, {"type", "server_error"}, {"code", "upstream_unavailable"}}}}),
         "application/json");
 }
 
@@ -221,9 +225,11 @@ void write_error(httplib::Response& response, int status, const std::string& mes
 std::string error_event(StreamDialect dialect, const std::string& code, const std::string& message) {
     if (dialect == StreamDialect::Anthropic) {
         return "event: error\ndata: " +
-               Json{{"type", "error"}, {"error", {{"type", "overloaded_error"}, {"message", message}}}}.dump() + "\n\n";
+               dump_lenient({{"type", "error"}, {"error", {{"type", "overloaded_error"}, {"message", message}}}}) +
+               "\n\n";
     }
-    return "data: " + Json{{"error", {{"message", message}, {"type", "server_error"}, {"code", code}}}}.dump() + "\n\n";
+    return "data: " + dump_lenient({{"error", {{"message", message}, {"type", "server_error"}, {"code", code}}}}) +
+           "\n\n";
 }
 
 // The message of an error answer's JSON body (OpenAI or Anthropic shape), else the body itself.
