@@ -121,9 +121,11 @@ private:
     [[nodiscard]] std::optional<std::string> alias_owner(const std::string& alias) const;
     // POST /scripts/import: the script's server commands, matched to the library.
     [[nodiscard]] Json import_script_json(const std::string& text, const std::string& file_name) const;
-    // POST /models/{id}/plan: infernix-serve --plan for these parameters, as a FitPlan.
+    // POST /models/{id}/plan: infernix-serve --plan for these parameters, as a FitPlan; a plan not
+    // finished within `timeout` is reported as not finished.
     [[nodiscard]] Json fit_plan_json(const std::string& config_id, const ScannedModel& model, const Args& args,
-                                     const EnvVars& env) const;
+                                     const EnvVars& env,
+                                     std::chrono::milliseconds timeout = std::chrono::minutes(3)) const;
     [[nodiscard]] std::string effective_alias(const std::string& config_id, const ScannedModel& model,
                                               const LibraryScan& scan) const;
     // Not under the library lock: it may run --help and looks for the files the arguments name.

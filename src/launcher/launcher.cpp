@@ -934,7 +934,7 @@ Json Launcher::import_script_json(const std::string& text, const std::string& fi
 }
 
 Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& model, const Args& args,
-                             const EnvVars& env) const {
+                             const EnvVars& env, std::chrono::milliseconds timeout) const {
     Json out = {{"supported", true},    {"fits", nullptr},       {"summary", ""},      {"vram", nullptr},
                 {"ram", nullptr},       {"max_context", nullptr}, {"kv_tokens", nullptr}, {"error", nullptr},
                 {"suggestions", Json::array()}, {"report", nullptr}};
@@ -954,7 +954,7 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
     const std::filesystem::path report = options_.data_dir / "plans" / ("plan-" + random_token(12) + ".json");
     argv.push_back("--plan");
     argv.push_back(path_utf8(report));
-    const std::optional<CaptureResult> run = run_capture(serve_executable(), argv, std::chrono::minutes(3), env);
+    const std::optional<CaptureResult> run = run_capture(serve_executable(), argv, timeout, env);
     const std::optional<std::string> text  = read_file(report);
     std::filesystem::remove(report, ignored);
     Json plan;
@@ -1485,10 +1485,15 @@ void Launcher::handle_load_failure(const InstanceSnapshot& snapshot, const std::
         }
     }
     Json suggestions = Json::array();
-    if (model && kind == "vram") {
+    if (model && kind == "vram" && !stopping_) {
         // The server's own plan (about a second; the failed server's memory is free again) names the
-        // largest context that fits exactly, where the refusal's figures give an estimate.
-        const Json plan = fit_plan_json(snapshot.model_key, *model, args, env);
+        // largest context that fits exactly, where the refusal's figures give an estimate. It runs here,
+        // on the supervisor's thread, so the next load starts only after it and does not fill the GPU
+        // the plan measures; the next load and every model switch wait for it, so it gets 20 s (a plan
+        // that hangs, a driver wedged by the out-of-memory failure, say, leaves the estimate). The
+        // dashboard shows the failure meanwhile.
+        publish_instance();
+        const Json plan = fit_plan_json(snapshot.model_key, *model, args, env, std::chrono::seconds(20));
         if (plan.value("fits", Json(nullptr)) == false) { suggestions = plan.value("suggestions", Json::array()); }
     }
     if (kind == "port") {

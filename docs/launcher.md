@@ -487,8 +487,9 @@ and nothing ends a lock-up, a stall or a load.
 
 For a load that did not fit, the banner lists changes worked out from the server's figures and the
 model's parameters, most effective first: for VRAM, the largest context that fits by the server's
-own plan (`infernix-serve --plan`, run once the failed server's memory is free; the suggestions show
-a second or so after the error), giving up the 1 GiB of VRAM headroom, one request at a time, INT8 KV
+own plan (`infernix-serve --plan`, run once the failed server's memory is free and before the next
+load starts; the suggestions show a second or so after the error, and a plan not done in 20 s leaves
+the estimate), giving up the 1 GiB of VRAM headroom, one request at a time, INT8 KV
 when it was BF16; for RAM, more RAM left free with automatic expert sizing (`--ram-free-mib`,
 `--expert-ram-mib auto`) and a smaller Host prefix cache (`--host-context-mib`); and how much other
 programs hold. **Apply** saves a change into the model's parameters; **Apply and load** also loads it.
