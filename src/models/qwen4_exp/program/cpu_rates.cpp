@@ -90,18 +90,16 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
                              .ggml_a8    = cpu_ggml_a8(), // decode's misses take the 8-bit route
                              .nvfp4_a8   = cpu_narrow_a16() == moe::NarrowA16::kA8, // likewise
                              .cpus       = placement_.cpus});
-    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
-    // The probe's stream and the engine thread's CPUs come back on every way out (a CUDA error or a team failure
+    // The engine thread's CPUs and the probe's stream come back on every way out (a CUDA error or a team failure
     // throws from rate()): left pinned to the placement's first CPU, the engine thread would compete with the team.
+    ScopedThreadCpus pinned(placement_.cpus.empty() ? 0 : placement_.cpus.front());
     cudaStream_t stream = nullptr;
-    struct Restore {
-        std::uint64_t cpus;
+    struct StreamGuard {
         cudaStream_t& stream;
-        ~Restore() {
-            (void)set_current_thread_cpus(cpus);
+        ~StreamGuard() {
             if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
         }
-    } restore{caller_cpus, stream};
+    } stream_guard{stream};
     std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * kNarrowColumns);
     std::vector<std::uint16_t> y(static_cast<std::size_t>(moe::kHidden) * kRateJobs * kNarrowColumns);
     for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
@@ -176,7 +174,7 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
         if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
         std::this_thread::sleep_for(kRetryPause);
     }
-    (void)set_current_thread_cpus(caller_cpus);
+    pinned.restore();
     CUDA_CHECK(cudaStreamDestroy(std::exchange(stream, nullptr)));
     reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
     char share[160];

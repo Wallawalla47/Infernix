@@ -5122,30 +5122,14 @@ private:
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
         settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s);
-        // A call the CPU can share (design §19.3.12) gates the stream on each layer's routing.
-        split_call_ = streamed && split_policy_ && batch * width <= split_columns();
-        bool begun  = false;
-        // Lives to the end of the call (after the stream's end and the route download), as before; built inside
-        // the try, since its fallback allocation can fail the call (RecoverableExecutionError).
+        // Declared first, so it outlives the stream's end and the route download; built after the stream begins.
         std::optional<WideWork> wide;
-        try {
-            if (streamed) {
-                expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_);
-                begun                = true;
-                tier_losses_at_span_ = tier_losses();
-            }
-            wide.emplace(*this, batch * width);
-            forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
-            if (dflash2_) { dflash2_call_context(batch, width); }
-        } catch (...) {
-            // A failed call (an unreadable record, the wide workspace's allocation, say) still returns the
-            // stream's slots: left active, the next streamed chunk could never begin and the release would refuse.
-            if (begun) { expert_stream_->end(s); }
-            split_call_ = false;
-            throw;
-        }
-        if (streamed) { expert_stream_->end(s); }
-        split_call_ = false;
+        // A call the CPU can share (design §19.3.12) gates the stream on each layer's routing.
+        StreamSpan span(*this, streamed, streamed && split_policy_ && batch * width <= split_columns());
+        wide.emplace(*this, batch * width); // its fallback allocation can fail the call (RecoverableExecutionError)
+        forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
+        if (dflash2_) { dflash2_call_context(batch, width); }
+        span.end();
         residency_->enqueue_route_download(s, batch * width);
     }
 
@@ -5235,39 +5219,33 @@ private:
                 const std::uint32_t layers = std::max(1U, residency_->lease_layers(lease));
                 return (lease.count + layers - 1) / layers;
             };
-            ExpertResidency::FrameLease wide, walk;
             // The leases taken here go back on every way out but the last: one left loaned would keep the KV pool
             // from growing into the cache (leases_returnable) and the cache from resizing.
-            const auto give_back = [&] {
-                if (walk.valid()) { residency_->give_back(walk, device_.stream); }
-                if (wide.valid()) { residency_->give_back(wide, device_.stream); }
-            };
-            try {
-                if (const std::size_t wide_bytes = pending_wide_bytes(width); wide_bytes > 0) {
-                    if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
-                    wide = residency_->lend(wide_bytes, device_.stream, writers);
-                }
-                if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
-                    walk = residency_->lend(walk_bytes, device_.stream, writers);
-                }
-                const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide), per_layer(walk)));
-                // The ring as wide as the room left allows (at most 2 * half + 1 slots).
-                const auto room_slots    = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
-                const std::uint32_t half = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
-                if (half < kStreamHalfMin) {
-                    give_back();
-                    return false;
-                }
-                stream_lease_ = residency_->lend((2ULL * half + 1) * slot, device_.stream, writers);
-            } catch (...) {
-                give_back();
-                throw;
+            ExpertResidency::LeaseHold wide, walk;
+            if (const std::size_t wide_bytes = pending_wide_bytes(width); wide_bytes > 0) {
+                if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
+                wide = ExpertResidency::LeaseHold(*residency_, residency_->lend(wide_bytes, device_.stream, writers),
+                                                  device_.stream);
             }
-            stream_wide_lease_ = wide;
-            stream_walk_lease_ = walk;
+            if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
+                walk = ExpertResidency::LeaseHold(*residency_, residency_->lend(walk_bytes, device_.stream, writers),
+                                                  device_.stream);
+            }
+            const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide.get()), per_layer(walk.get())));
+            // The ring as wide as the room left allows (at most 2 * half + 1 slots).
+            const auto room_slots    = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
+            const std::uint32_t half = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
+            if (half < kStreamHalfMin) {
+                walk.give_back();
+                wide.give_back();
+                return false;
+            }
+            stream_lease_      = residency_->lend((2ULL * half + 1) * slot, device_.stream, writers);
+            stream_wide_lease_ = wide.release();
+            stream_walk_lease_ = walk.release();
             stream_ring_bytes_ = stream_lease_.memory.bytes;
-            stream_wide_bytes_ = wide.memory.bytes;
-            stream_walk_bytes_ = walk.memory.bytes;
+            stream_wide_bytes_ = stream_wide_lease_.memory.bytes;
+            stream_walk_bytes_ = stream_walk_lease_.memory.bytes;
             stream_at_lease_   = expert_stream_->stats();
             split_at_lease_    = forward_->split_stats();
             prefetched_at_lease_ = walk_prefetched_chunks_;
@@ -5324,6 +5302,42 @@ private:
         }
         WideWork(const WideWork&)            = delete;
         WideWork& operator=(const WideWork&) = delete;
+
+    private:
+        ProgramImpl& program_;
+        bool active_ = false;
+    };
+
+    // A call's expert stream (and its split flag), begun for a streamed call and ended on every way out of it: left
+    // active after a failed call (an unreadable record, the wide workspace's allocation), the next streamed chunk
+    // could never begin and the release would refuse. The call's success path ends it with end(), where the call's
+    // order puts it: before the route download, while the wide workspace still lives.
+    class StreamSpan {
+    public:
+        StreamSpan(ProgramImpl& program, bool streamed, bool split) : program_(program) {
+            program.split_call_ = split;
+            try {
+                if (streamed) {
+                    program.expert_stream_->begin(program.ring_span(), program.residency_->host_table(),
+                                                  program.device_.stream, split);
+                    active_                      = true;
+                    program.tier_losses_at_span_ = program.tier_losses();
+                }
+            } catch (...) {
+                end();
+                throw;
+            }
+        }
+        ~StreamSpan() { end(); }
+        StreamSpan(const StreamSpan&)            = delete;
+        StreamSpan& operator=(const StreamSpan&) = delete;
+        void end() noexcept {
+            if (active_) {
+                active_ = false;
+                program_.expert_stream_->end(program_.device_.stream);
+            }
+            program_.split_call_ = false;
+        }
 
     private:
         ProgramImpl& program_;
