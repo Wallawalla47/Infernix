@@ -550,8 +550,11 @@ void CpuExpertTeam::worker_main(int w) {
             now = epoch_.load(std::memory_order_acquire);
         }
         while (now == seen) {
-            sleepers_.fetch_add(1, std::memory_order_acq_rel);
-            epoch_.wait(seen, std::memory_order_acquire);
+            // Sequentially consistent with run()'s epoch increment and sleepers load (a Dekker handshake): one of
+            // the two sides sees the other, so a parking worker is never left unnotified. On x86 these are the same
+            // instructions as acquire/release.
+            sleepers_.fetch_add(1, std::memory_order_seq_cst);
+            epoch_.wait(seen, std::memory_order_seq_cst);
             sleepers_.fetch_sub(1, std::memory_order_acq_rel);
             now = epoch_.load(std::memory_order_acquire);
         }
@@ -607,8 +610,8 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat h
     next_unit_.store(0, std::memory_order_relaxed);
     next_encode_h_.store(0, std::memory_order_relaxed);
     next_rows_.store(0, std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);
-    if (sleepers_.load(std::memory_order_acquire) > 0) { epoch_.notify_all(); }
+    epoch_.fetch_add(1, std::memory_order_seq_cst); // seq_cst with worker_main's park (see there)
+    if (sleepers_.load(std::memory_order_seq_cst) > 0) { epoch_.notify_all(); }
     work(0);
     while (finished_.load(std::memory_order_acquire) != workers_ - 1) { cpu_relax(); }
     jobs_      = {};
