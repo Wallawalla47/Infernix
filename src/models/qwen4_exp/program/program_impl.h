@@ -1483,10 +1483,33 @@ public:
                 for (const auto& layer : parameters_.layers) { banks.push_back(layer.moe.bank); }
                 tier.csf = runtime::expert_offload::tier_csf_shape(banks);
             }
+            // The slots page-lock beside the startup fill's reads (HostExpertTier::fill_pool, candidates QK-06): a pool of
+            // this start's own holds the chunks with the first keys of the fill order read into them, and the tier takes
+            // them and keeps those records. Not with an EngineHost's pool (its chunks already hold records), an expert
+            // stripe or CSF records.
+            if (!options_.expert_slot_pool && options_.expert_stripe.empty() && !tier.csf) {
+                const auto [load, source] = startup_expert_state(false);
+                (void)source;
+                const std::vector<std::uint32_t> order = tier_fill_order(load.state ? &*load.state : nullptr);
+                startup_pool_ = std::make_shared<runtime::expert_offload::HostSlotPool>([](void* p) { (void)cudaFreeHost(p); });
+                startup_fill_ = HostExpertTier::fill_pool(*records, tier, order, *startup_pool_, pool_identity());
+                tier.pool          = startup_pool_;
+                tier.pool_identity = pool_identity();
+                char line[256];
+                std::snprintf(line, sizeof(line),
+                              "SSD expert tier: %u records (%.1f GiB) read into %u slot chunks while they were "
+                              "page-locked, in %.1f s (page-locking %.1f s), %u reads failed",
+                              startup_fill_.records,
+                              static_cast<double>(startup_fill_.records) * static_cast<double>(records->record_bytes()) /
+                                  (1ULL << 30),
+                              startup_fill_.chunks, startup_fill_.seconds, startup_fill_.pin_seconds, startup_fill_.failed);
+                diagnostic(line, DiagnosticLevel::Debug);
+            }
             tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
             // What the tier did not take (another size, more than it pins) is released before anything else is
             // page-locked, so the Program ends with the memory a start without the host would hold.
             if (options_.expert_slot_pool) { options_.expert_slot_pool->release_idle(); }
+            if (startup_pool_) { startup_pool_->release_idle(); }
             residency_->attach_tier(tier_.get(), options_.expert_ram_exclusive);
             if (tier_->refused_slots() > 0) {
                 diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
@@ -3892,14 +3915,12 @@ public:
         diagnostic(text, DiagnosticLevel::Info);
     }
 
-    // ---- warm start (design §19.3.5 S4b) ----
-    // Fills the frames from the saved state, before the first request; without one (a first start, a
-    // state of another artifact, or no file given: the bench and the tools), from the calibrated expert
-    // order when the model has its shape, unless --expert-state off asked for an empty cache. With the
-    // SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies are released
-    // and their slots refilled with the next keys of the fill order, so the two levels hold different
-    // experts. Only a given file is read or saved.
-    void warm_start_experts() {
+    // Where the warm start's ranking and counts came from.
+    enum class SeedSource { None, Saved, Calibrated };
+
+    // The saved state the warm start seeds from (or the calibrated order), and its source. The SSD tier's slot pool
+    // (HostExpertTier::fill_pool) reads it before the tier exists, for the same fill order.
+    std::pair<expert_cache::ExpertStateLoad, SeedSource> startup_expert_state(bool report) {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         expert_cache::ExpertStateLoad load;
         SeedSource source = SeedSource::None;
@@ -3910,13 +3931,25 @@ public:
             if (load.state) {
                 source = SeedSource::Saved;
             } else if (options_.expert_seed && has_calibrated_order()) {
-                if (!options_.expert_state.empty()) {
+                if (report && !options_.expert_state.empty()) {
                     diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
                 }
                 load.state = calibrated_expert_order();
                 source     = SeedSource::Calibrated;
             }
         }
+        return {std::move(load), source};
+    }
+
+    // ---- warm start (design §19.3.5 S4b) ----
+    // Fills the frames from the saved state, before the first request; without one (a first start, a
+    // state of another artifact, or no file given: the bench and the tools), from the calibrated expert
+    // order when the model has its shape, unless --expert-state off asked for an empty cache. With the
+    // SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies are released
+    // and their slots refilled with the next keys of the fill order, so the two levels hold different
+    // experts. Only a given file is read or saved.
+    void warm_start_experts() {
+        auto [load, source] = startup_expert_state(true);
         const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
         if (tier_) {
@@ -3933,9 +3966,6 @@ public:
     }
 
 private:
-    // Where the warm start's ranking and counts came from.
-    enum class SeedSource { None, Saved, Calibrated };
-
     // The calibrated order (program/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
     // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
     [[nodiscard]] bool has_calibrated_order() const noexcept {
@@ -3959,7 +3989,7 @@ private:
     // filled the first layers and left the last ones on disk).
     [[nodiscard]] std::vector<std::uint32_t> tier_fill_order(const expert_cache::SavedState* state) const {
         const std::uint32_t layers = c_.num_hidden_layers, experts = c_.moe.experts, keys = layers * experts;
-        if (tier_->keys() != keys) { throw std::logic_error("Qwen3.8-Flash-Next: the SSD tier has another key count"); }
+        if (tier_ && tier_->keys() != keys) { throw std::logic_error("Qwen3.8-Flash-Next: the SSD tier has another key count"); }
         // A key's place in the layer-interleaved order: expert e of every layer before expert e + 1.
         const auto spread = [&](std::uint32_t key) { return (key % experts) * layers + key / experts; };
         std::vector<std::uint32_t> order;
@@ -4063,9 +4093,13 @@ private:
             std::snprintf(shadow_text, sizeof(shadow_text), " and copies of the %u least-used in VRAM", shadows);
         }
         const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
-        // An EngineHost's slots: the records still there from its last Engine were kept, the rest read.
-        char read[96];
-        if (tier_->stats().kept > 0) {
+        // An EngineHost's slots: the records still there from its last Engine were kept, the rest read. This start's own
+        // pool (fill_pool): the records read while their slots were page-locked, then the rest.
+        char read[128];
+        if (startup_pool_ && tier_->stats().kept > 0) {
+            std::snprintf(read, sizeof(read), "%llu read in %.1f s as their slots were page-locked, the rest in %.1f s",
+                          static_cast<unsigned long long>(tier_->stats().kept), startup_fill_.seconds, seconds);
+        } else if (tier_->stats().kept > 0) {
             std::snprintf(read, sizeof(read), "%llu kept from the last Engine, the rest read in %.1f s",
                           static_cast<unsigned long long>(tier_->stats().kept), seconds);
         } else {
@@ -7714,6 +7748,10 @@ private:
     // in the stripe file.
     std::optional<ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
+    // The startup's own slot pool (HostExpertTier::fill_pool): declared before tier_, so it outlives the tier, which
+    // gives its chunks back to it when it ends.
+    std::shared_ptr<runtime::expert_offload::HostSlotPool> startup_pool_;
+    HostExpertTier::PoolFill startup_fill_;
     std::unique_ptr<HostExpertTier> tier_;
     // The tier's losses (keys that left both tiers) when the current stream span began (ForwardBatch::stream_whole).
     std::uint64_t tier_losses_at_span_ = 0;

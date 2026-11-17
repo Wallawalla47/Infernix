@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -126,6 +127,12 @@ std::uint32_t class_demotion(std::uint32_t demotion, std::uint32_t class_layers,
     return std::max<std::uint32_t>(1, (demotion * class_layers + layers - 1) / layers);
 }
 
+// The slots of a region's chunk that starts at slot `next`: pin_slots pins in these chunks and fill_pool page-locks
+// the same ones, so the pool holds exactly the sizes the tier asks it for.
+std::uint32_t chunk_slots(std::uint32_t per_chunk, std::uint32_t region_slots, std::uint32_t next) {
+    return std::min(per_chunk, region_slots - next);
+}
+
 } // namespace
 
 std::uint32_t HostExpertTier::slots_for_bytes(const ExpertStore& store, std::uint64_t bytes, const Options& raw) {
@@ -218,7 +225,7 @@ HostExpertTier::Pinned HostExpertTier::pin_slots(const Plan& plan, const Options
     const auto pin_chunk = [&](std::uint32_t r) {
         const Region& region = plan.regions[r];
         if (next[r] >= region.slots) { return 0; }
-        const std::uint32_t here  = std::min(options.slots_per_chunk, region.slots - next[r]);
+        const std::uint32_t here  = chunk_slots(options.slots_per_chunk, region.slots, next[r]);
         const std::uint64_t bytes = static_cast<std::uint64_t>(here) * region.pitch;
         // A reused chunk of this size first (it stays page-locked between tiers), with the records it holds.
         std::byte* p = nullptr;
@@ -288,6 +295,213 @@ HostExpertTier::Pinned HostExpertTier::pin_slots(const Plan& plan, const Options
                                      "close programs that use it, or lower --host-context-mib)");
         }
     }
+    return out;
+}
+
+HostExpertTier::PoolFill HostExpertTier::fill_pool(const ExpertStore& store, Options raw,
+                                                   std::span<const std::uint32_t> order, HostSlotPool& pool,
+                                                   const std::string& identity) {
+    using Clock = std::chrono::steady_clock;
+    PoolFill out;
+    const auto start      = Clock::now();
+    const Options options = normalized(std::move(raw));
+    if (options.csf) { return out; }
+    const Plan plan = plan_slots(store, options);
+    if (plan.regions.size() != 1) { return out; } // records of several sizes: their classes are not filled here
+    const Region region = plan.regions[0];
+    // The one region's slots in the controller's order (the constructor's and HostTier's): the ring, the prefetch list
+    // and the demotion list, then the free resident slots, then the bounce slots when records are unpinned. The fill
+    // places the first keys of `order` into the free resident slots, so those keys are read here.
+    const std::uint32_t lists      = options.ring + options.prefetch + options.demotion;
+    const std::uint32_t bounce     = options.unpinned > 0 ? options.bounce + options.stream_bounce : 0;
+    const std::uint32_t controller = region.slots > bounce ? region.slots - bounce : 0;
+    const std::uint32_t residents  = controller > lists ? controller - lists : 0;
+    const std::uint32_t keys_total = store.layers() * store.experts();
+    const auto filled              = static_cast<std::uint32_t>(std::min<std::size_t>(residents, order.size()));
+    if (filled == 0) { return out; }
+    // The fill keeps a record in any free resident slot (slot_jobs), so the keys read here take the slots in their file
+    // order: neighbouring records land in neighbouring slots and are read as one scatter read (the fill's runs).
+    std::vector<std::uint32_t> placed(order.begin(), order.begin() + filled);
+    std::erase_if(placed, [&](std::uint32_t key) { return key >= keys_total; });
+    const auto first_segment = [&](std::uint32_t key) { return store.segments(key / store.experts(), key % store.experts())[0]; };
+    std::sort(placed.begin(), placed.end(), [&](std::uint32_t a, std::uint32_t b) {
+        const auto sa = first_segment(a), sb = first_segment(b);
+        return sa.file != sb.file ? sa.file < sb.file : sa.offset < sb.offset;
+    });
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> chunks; // first slot, slots
+    for (std::uint32_t next = 0; next < region.slots;) {
+        const std::uint32_t here = chunk_slots(options.slots_per_chunk, region.slots, next);
+        chunks.emplace_back(next, here);
+        next += here;
+    }
+
+    // The worker page-locks the chunks in order; this thread reads into each as it lands.
+    struct Landed {
+        std::size_t index      = 0;
+        std::uint8_t* memory   = nullptr;
+    };
+    std::mutex mutex;
+    std::condition_variable landed_cv;
+    std::deque<Landed> landed;
+    bool pinning_done = false;
+    std::atomic<bool> stop{false};
+    std::exception_ptr pin_error;
+    int device = 0;
+    (void)cudaGetDevice(&device);
+    std::thread pinner([&] {
+        const auto pin_start = Clock::now();
+        try {
+            (void)cudaSetDevice(device);
+            for (std::size_t i = 0; i < chunks.size() && !stop.load(std::memory_order_acquire); ++i) {
+                const std::uint64_t bytes = static_cast<std::uint64_t>(chunks[i].second) * region.pitch;
+                auto* p = static_cast<std::uint8_t*>(options.allocate(static_cast<std::size_t>(bytes)));
+                if (p == nullptr) { break; } // the OS refuses: the tier asks for the rest and meets the refusal itself
+                if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
+                    options.release(p); // pin_slots throws on it
+                    break;
+                }
+                {
+                    std::lock_guard lock(mutex);
+                    landed.push_back({i, p});
+                }
+                landed_cv.notify_one();
+            }
+        } catch (...) { pin_error = std::current_exception(); }
+        out.pin_seconds = std::chrono::duration<double>(Clock::now() - pin_start).count();
+        {
+            std::lock_guard lock(mutex);
+            pinning_done = true;
+        }
+        landed_cv.notify_one();
+    });
+    const auto finish_pinner = [&] {
+        stop.store(true, std::memory_order_release);
+        pinner.join();
+        for (const Landed& chunk : landed) { options.release(chunk.memory); } // landed, never read into or kept
+        landed.clear();
+    };
+
+    double read_seconds     = 0;
+    std::uint64_t read_bytes = 0;
+    try {
+        DirectReadQueue::Options io = options.io;
+        io.demand_depth = std::max<std::uint32_t>(io.demand_depth, 16);
+        io.total_depth  = std::max(io.total_depth, io.demand_depth + io.restore_depth + io.prefetch_depth);
+        DirectReadQueue queue(io);
+        queue.set_faults(options.io_faults);
+        std::vector<std::uint32_t> files;
+        for (const auto& path : store.files()) { files.push_back(queue.open(path)); }
+        std::vector<DirectReadQueue::Completion> done;
+        for (;;) {
+            Landed chunk;
+            {
+                std::unique_lock lock(mutex);
+                landed_cv.wait(lock, [&] { return !landed.empty() || pinning_done; });
+                if (landed.empty()) { break; }
+                chunk = landed.front();
+                landed.pop_front();
+            }
+            const auto [first, here] = chunks[chunk.index];
+            std::vector<std::int32_t> keys(here, HostSlotPool::kNoKey);
+            std::vector<std::uint8_t> failed(here, 0);
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> runs; // a read's first slot of the chunk and slots
+            std::uint32_t pending = 0;
+            const auto read_start = Clock::now();
+            try {
+                for (std::uint32_t j = 0; j < here;) {
+                    const std::uint32_t slot = first + j;
+                    if (slot < lists || slot >= lists + placed.size()) {
+                        ++j;
+                        continue;
+                    }
+                    const std::uint32_t key = placed[slot - lists];
+                    keys[j]                 = static_cast<std::int32_t>(key);
+                    std::uint8_t* at        = chunk.memory + static_cast<std::size_t>(j) * region.pitch;
+                    const auto segments     = store.segments(key / store.experts(), key % store.experts());
+                    if (segments.size() > 1) { // a record split across files: segment by segment
+                        for (std::size_t s = 0; s < segments.size(); ++s) {
+                            queue.submit({files[segments[s].file], segments[s].offset, segments[s].bytes, at + segments[s].at,
+                                          DirectReadQueue::Priority::Demand, runs.size()});
+                            ++pending;
+                        }
+                        runs.emplace_back(j, 1);
+                        ++j;
+                        continue;
+                    }
+                    // The following slots' records while each follows the last in its file (the fill's run limits).
+                    DirectReadQueue::Read read;
+                    read.file   = files[segments[0].file];
+                    read.offset = segments[0].offset;
+                    read.tag    = runs.size();
+                    read.scatter.push_back({at, segments[0].bytes});
+                    read.bytes        = segments[0].bytes;
+                    std::uint64_t end = segments[0].offset + segments[0].bytes;
+                    std::uint32_t n   = 1;
+                    while (j + n < here && first + j + n < lists + placed.size() && n < DirectReadQueue::kMaxTargets) {
+                        const std::uint32_t next = placed[first + j + n - lists];
+                        const auto s             = store.segments(next / store.experts(), next % store.experts());
+                        if (s.size() != 1 || s[0].file != segments[0].file || s[0].offset != end ||
+                            read.bytes + s[0].bytes > kFillRunBytes) {
+                            break;
+                        }
+                        keys[j + n] = static_cast<std::int32_t>(next);
+                        read.scatter.push_back({chunk.memory + static_cast<std::size_t>(j + n) * region.pitch, s[0].bytes});
+                        read.bytes += s[0].bytes;
+                        end += s[0].bytes;
+                        ++n;
+                    }
+                    if (n == 1) { // a lone record: a plain read
+                        read.destination = at;
+                        read.scatter.clear();
+                    }
+                    queue.submit(read);
+                    ++pending;
+                    runs.emplace_back(j, n);
+                    j += n;
+                }
+                while (pending > 0) {
+                    done.clear();
+                    (void)queue.poll(done, std::chrono::milliseconds(50));
+                    for (const auto& completion : done) {
+                        --pending;
+                        if (completion.status != DirectReadQueue::Status::Ok) {
+                            const auto [from, count] = runs[completion.tag];
+                            for (std::uint32_t k = 0; k < count; ++k) { failed[from + k] = 1; }
+                        }
+                    }
+                }
+            } catch (...) {
+                queue.cancel_all();
+                options.release(chunk.memory);
+                throw;
+            }
+            read_seconds += std::chrono::duration<double>(Clock::now() - read_start).count();
+            for (std::uint32_t j = 0; j < here; ++j) {
+                if (keys[j] == HostSlotPool::kNoKey) { continue; }
+                if (failed[j] != 0) {
+                    keys[j] = HostSlotPool::kNoKey; // the tier reads it
+                    ++out.failed;
+                } else {
+                    ++out.records;
+                    read_bytes += store.record_bytes();
+                }
+            }
+            const std::uint64_t bytes = static_cast<std::uint64_t>(here) * region.pitch;
+            pool.keep(chunk.memory, static_cast<std::size_t>(bytes), identity, region.pitch, std::move(keys));
+            ++out.chunks;
+            out.bytes += bytes;
+        }
+    } catch (...) {
+        finish_pinner();
+        throw;
+    }
+    finish_pinner();
+    if (pin_error) { std::rethrow_exception(pin_error); }
+    // The tier's fill then reads few records: the rate its refills are timed by is this read's.
+    if (read_seconds > 0 && out.records > 0) {
+        pool.note_read_rate(static_cast<double>(read_bytes) / read_seconds, out.records);
+    }
+    out.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return out;
 }
 

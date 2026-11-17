@@ -8264,6 +8264,20 @@ counts, another list layout, another artifact's chunks, the first round, chunk s
 `infernix_qwen4_exp_engine_host_real_test` checks that the reproducible route's tokens equal those
 of an Engine without a host.
 
+**A start's own pool** (2026-11-17, `HostExpertTier::fill_pool`, candidates QK-06). Without a host the slots were
+page-locked before the fill read anything, and `cudaHostAlloc` is serial in the driver (0.12 s/GiB from one to eight
+threads, 64 MiB or 1 GiB pieces alike; unbuffered reads keep their rate beside it: 6.6 against 6.1-6.5 GiB/s). Now,
+before the tier is built, a worker page-locks the chunks `pin_slots` will take, in its order and sizes, while the
+Program reads the fill order's first keys into each chunk's free resident slots (past the ring, prefetch and demotion
+lists) as it lands, in their file order so neighbouring records go as one scatter read; the chunks then go to a pool of
+this start's own with those keys, and the tier keeps them unread as it keeps a host's. A chunk the OS refuses ends the
+page-locking: the tier asks for the rest itself and meets the refusal and the pin reserve as before (the unit test
+compares that end state with a tier built without the pool), and a failed read leaves its slot to the fill. Records of
+one size only (not a GGUF import's classes), no CSF, no stripe, not on a host. FP4-Local with `--host-context-mib 16384`
+(58.2 GiB of slots; RTX 5090, i9-13900K, alternated starts): 56.3 GiB read in 8.9 s with the page-locking (7.2-7.6 s)
+under it, start 20.5 / 20.7 s against 27.5 / 27.6 s (six starts of the build before: 27.4-35.4 s, median 27.5); a start
+whose experts all fit as banks (7500) is unchanged (23.0 / 23.2 against 22.7 / 23.6 s).
+
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
 Branch `claude/fn-prefill`. The steps are §19.3.6 item 4's F0-F6 (`strata-amendments.md`, "Prefill");

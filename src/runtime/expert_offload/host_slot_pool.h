@@ -1,7 +1,8 @@
 #pragma once
 
 // Page-locked expert slots kept between SSD expert tiers of one process (an EngineHost; design
-// docs/maintainer/qwen3_8-flash-next-design.md §19.3.7, "a reused host"). A tier built with a pool takes its
+// docs/maintainer/qwen3_8-flash-next-design.md §19.3.7, "a reused host"), or filled for one start before its tier exists
+// (HostExpertTier::fill_pool: the slots page-locked beside the startup fill's reads). A tier built with a pool takes its
 // chunks from it before it page-locks new memory, and gives them back when it ends with the record each slot
 // then held: the next tier of the same artifact keeps those records where they are (its startup fill reads only
 // the others), and none page-locks memory again. Page-locking costs about 0.11 s/GiB (Qwen3.8-Flash-Next's

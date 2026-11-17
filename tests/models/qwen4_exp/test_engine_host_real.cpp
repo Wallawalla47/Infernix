@@ -3,7 +3,8 @@
 // one after another on one host keep the expert records the last left in the tier's page-locked slots, and give the
 // tokens Engines without a host give. The reproducible route (fast paths off), whose output depends only on the request,
 // the artifact and the options, whatever the caches hold:
-//   A  without a host: a 1,500-token prompt's greedy continuation and a seeded sampled one (the reference).
+//   A  without a host (its own start pool reads most records while their slots are page-locked): a 1,500-token
+//      prompt's greedy continuation and a seeded sampled one (the reference).
 //   B  on a new host (nothing kept: every record read): the same tokens; then a 4,000-token prompt moves the RAM tier.
 //   C  on the host with other options (two lanes, MTP 3): it keeps most of B's records and serves a request.
 //   D  on the host with A's options: it keeps most records, reads the rest, and gives A's tokens.
@@ -113,7 +114,6 @@ int main() {
             fresh     = report("A (no host)", engine);
             reference = run(engine, prompt);
         }
-        check(fresh.read > 0 && fresh.kept == 0, "A reads its records and keeps none");
         infernix::EngineHost host;
         Start b;
         {
@@ -127,6 +127,12 @@ int main() {
             (void)engine.generate(engine.prepare_tokens(synthetic_tokens(4000, 22)), request(0.0F, 0, 8));
         }
         check(b.read > 0 && b.kept == 0, "B on a new host reads every record");
+        // Without a host the start's own pool (HostExpertTier::fill_pool) reads most records while their slots are
+        // page-locked, and the tier keeps them: A reads as many records in its start as B does.
+        const std::uint64_t a_total = fresh.read + fresh.kept;
+        check(fresh.kept > 0 && 100 * a_total >= 99 * b.read && 100 * a_total <= 101 * b.read,
+              "A keeps the records its own pool read (" + std::to_string(fresh.kept) + " kept, " +
+                  std::to_string(fresh.read) + " read, against B's " + std::to_string(b.read) + ")");
         check(host.kept_bytes() > 0, "the host keeps B's slots");
         {
             infernix::EngineOptions options        = base_options(artifact);

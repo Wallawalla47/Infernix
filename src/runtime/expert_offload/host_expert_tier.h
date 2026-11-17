@@ -170,6 +170,24 @@ public:
     // shares each class's lent slots among min(its layers, this), so each layer's reads fit them.
     static constexpr std::uint32_t kStreamWindow = 4;
 
+    // Before a tier of `store` with `options` is built: page-locks the chunks its construction pins (Options::allocate,
+    // on a worker thread, in the order pin_slots takes them) and reads the first keys of `order` (the startup fill's)
+    // into each chunk's resident slots as the chunk lands, then gives every chunk to `pool` with the records it holds
+    // (HostSlotPool::keep under `identity`). A tier built next with that pool takes the chunks and its fill keeps those
+    // records unread, so the page-locking (~0.12 s/GiB, serial in the driver) runs beside the reads instead of before
+    // them (candidates QK-06; a FP4-Local start with 58 GiB of slots spent 7.8 s pinning, then 13.8 s reading). A chunk
+    // the OS refuses ends the pinning: the tier asks for the rest itself and meets the refusal as before. A failed read
+    // leaves its slot unheld (the tier reads it). Records of one size and no CSF only; otherwise nothing is done.
+    struct PoolFill {
+        std::uint32_t chunks  = 0; // given to the pool
+        std::uint32_t records = 0; // read, every one equal to the artifact's bytes
+        std::uint32_t failed  = 0; // reads that failed (their slots left unheld)
+        std::uint64_t bytes   = 0; // of the chunks
+        double seconds = 0, pin_seconds = 0; // the whole call; the worker's page-locking
+    };
+    [[nodiscard]] static PoolFill fill_pool(const ExpertStore& store, Options options, std::span<const std::uint32_t> order,
+                                            HostSlotPool& pool, const std::string& identity);
+
     HostExpertTier(const HostExpertTier&)            = delete;
     HostExpertTier& operator=(const HostExpertTier&) = delete;
 
