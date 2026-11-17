@@ -3,6 +3,7 @@
 // Hugging Face Hub access over libcurl: a repository's files at a pinned commit (sizes and LFS
 // SHA-256), resolve URLs, and small HTTPS GETs.
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -29,14 +30,17 @@ struct HttpResult {
     std::string error;
 };
 
-// GET with optional bearer token; follows redirects. `error` is set when no response arrived.
-[[nodiscard]] HttpResult http_get(const std::string& url, const std::string& token, long timeout_seconds);
+// GET with optional bearer token; follows redirects. `error` is set when no response arrived. A set `cancel` ends
+// the request within about a second (a launcher that is stopping does not wait for a slow or unreachable host).
+[[nodiscard]] HttpResult http_get(const std::string& url, const std::string& token, long timeout_seconds,
+                                  const std::atomic<bool>* cancel = nullptr);
 
 // `owner/name` validation: letters, digits, '-', '_', '.' in two parts.
 [[nodiscard]] bool valid_repo_id(const std::string& repo);
 
-// Lists a model repository's files at `main` (throws std::runtime_error with a readable reason).
-[[nodiscard]] HfListing hf_list_files(const std::string& repo, const std::string& token);
+// Lists a model repository's files at `main` (throws std::runtime_error with a readable reason); `cancel` as http_get.
+[[nodiscard]] HfListing hf_list_files(const std::string& repo, const std::string& token,
+                                      const std::atomic<bool>* cancel = nullptr);
 
 [[nodiscard]] std::string hf_resolve_url(const std::string& repo, const std::string& revision, const std::string& path);
 

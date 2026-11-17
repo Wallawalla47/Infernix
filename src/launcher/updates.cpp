@@ -161,6 +161,7 @@ void ModelUpdates::shutdown() {
         if (stopping_) { return; }
         stopping_ = true;
     }
+    cancel_ = true;
     cv_.notify_all();
     if (worker_.joinable()) { worker_.join(); }
 }
@@ -226,8 +227,9 @@ void ModelUpdates::check_now() {
     std::optional<std::string> error;
     const std::string token = hooks_.token ? hooks_.token() : std::string();
     for (const auto& [place, job] : newest) {
+        if (cancel_) { return; } // the launcher is stopping: the result would not be shown
         try {
-            const HfListing listing = hf_list_files(place.first, token);
+            const HfListing listing = hf_list_files(place.first, token, &cancel_);
             if (listing.revision == job.value("revision", "")) { continue; }
             Json files          = Json::array();
             std::uint64_t bytes = 0;
@@ -362,7 +364,7 @@ void InfernixUpdate::check_now() {
         if (phase_ != "ready") { phase_ = "checking"; }
     }
     publish();
-    const HttpResult result = http_get(kReleaseApi, "", 30);
+    const HttpResult result = http_get(kReleaseApi, "", 30, &cancel_);
     {
         std::lock_guard lock(mutex_);
         checked_at_ = now_ms();
