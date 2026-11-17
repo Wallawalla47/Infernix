@@ -1357,17 +1357,23 @@ its last pass used to run as two: the head to the opener, then the tail. Now tha
   carries no MTP state (§7.3), and a resume bridges the position before it.
 - **Room.** The tap's Device snapshot slot, state image and supersessions are taken before the pass
   (`hybrid_reserve_tap`; `hybrid_tap_due` decides the tap without consuming the plan). When every
-  slot still holds one of the previous request's snapshots whose Host copy is landing, the landed
-  copies are published and the oldest writes waited for (a few milliseconds, where the cut's head
-  pass would run); still without room the pass is cut as before and the capture after its head pass
-  tries again. A failed pass gives the room back. The image is published after the pass with the
+  slot still holds one of the previous request's snapshots whose Host copy is landing, the copies
+  that landed are published (a non-blocking poll) and the room asked for again; still without room
+  the pass is cut as before and the capture after its head pass tries again. Nothing waits on the
+  Engine thread. A failed pass gives the room back. The image is published after the pass with the
   cut's checks (`hybrid_publish_reserved`).
 - **Where.** Free cache resume only (the reproducible and lossless routes cut on the chunk grid and
   take no exact opener tap), a prompt's last pass, a tail of 2-8 tokens, a head of two or more, no
   other exact tap in the tail, no Vision, no KV window (vq2/k4v2 keep the cut).
-- **Numerics.** The tap's state is the cut's: the real test's next turn, resuming from it, generates
-  what it generates from the cut's tap (no drafter, DFlash2, MTP). The tail's columns take the
-  head's projection and FFN routes, so default-route text can change after a paired turn.
+- **Numerics.** The convolution and recurrence are the cut's calls on the same inputs, but the head's
+  projections, attention and FFN run at the pair's width, and the tail's columns take the head's
+  routes. Where the head's kernels take the same routes at both widths the tap's state is the cut's:
+  in the real test (heads of about 200 columns, a cold turn and a resumed one; no drafter, DFlash2,
+  MTP) the turns resuming from the pair's taps generate the cut's tokens. A resumed 77-column head
+  paired to 84 is not: on the served A/B below its next turn generated other tokens in 5 of 6
+  conversations from the same resume point. The default route's text can therefore change after a
+  paired turn, as after any cut that moves (free cache resume already makes the bits depend on
+  where the cache cuts the prompt); the reproducible and lossless routes are untouched.
 - **Measured** (RTX 5090, `infernix-serve`, `--kv-dtype int8 --prefill-chunk 4096
   --preserve-thinking`, six four-turn conversations with fixed replies, alternated passes, server
   time to first token on the turns that take the opener tap, pair against cut, medians):

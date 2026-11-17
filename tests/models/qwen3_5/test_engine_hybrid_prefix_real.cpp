@@ -929,7 +929,10 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
 // inside that pass. With the cut (testing::set_pair_windows(false)) the turn's last pass begins at the opener; with
 // the pair no pass does, the next turn still resumes at the opener, and it generates the tokens it generates
 // resuming from the cut's tap: the tap's state (the GDN convolution and recurrence split at the opener, the
-// continuation hidden, the drafter's ring) is the cut's. Each arm runs on a fresh Engine.
+// continuation hidden, the drafter's ring) is the cut's, where the head's kernels take the same routes at the
+// pair's width as at its own (heads of ~200 columns here; a resumed 77-column head paired to 84 changed its next
+// turn's tokens in a served A/B). Two turns: a cold one, then one resumed from its tap that pairs its own opener.
+// Each arm runs on a fresh Engine. A KV window (vq2, q4k-vq2) keeps the cut: both arms cut.
 int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend backend) {
     const std::string name = std::string("pair-window") +
                              (backend == infernix::SpeculativeBackend::DFlash2 ? " (dflash2)"
@@ -947,10 +950,22 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
     const infernix::ChatMessage reply =
         text_message(infernix::ChatRole::Assistant, "Take the lightest one with a two-year warranty and a spare battery.");
     const infernix::ChatMessage second_user = text_message(infernix::ChatRole::User, "And which bits should go with it?");
+    // The resumed turn's question: long enough that its opener lies well past where it resumes (its own exact tap,
+    // with a wide head).
+    std::string follow_up = "Thanks. Now the same customer also asks about storage.";
+    for (int i = 0; i < 6; ++i) {
+        follow_up += " Case " + std::to_string(i) + " is a plastic box with foam inserts, a metal clasp, room for twenty "
+                     "bits and a belt clip, sold at a slightly different price.";
+    }
+    const infernix::ChatMessage follow_user = text_message(infernix::ChatRole::User, follow_up);
+    const infernix::ChatMessage follow_reply =
+        text_message(infernix::ChatRole::Assistant, "The second case: foam inserts keep the bits from rattling.");
+    const bool kv_window = kv_storage == infernix::KvCacheStorage::Vq2 || kv_storage == infernix::KvCacheStorage::Q4KeyVq2Value;
     struct Arm {
-        std::vector<std::uint32_t> bases; // where each text pass of the first turn began
-        std::uint32_t first_tokens = 0, reused = 0;
-        std::vector<infernix::TokenId> second;
+        std::vector<std::uint32_t> bases, follow_bases; // where each text pass of the two turns began
+        std::uint32_t first_tokens = 0, follow_tokens = 0, reused = 0, follow_reused = 0, last_reused = 0;
+        std::uint64_t refusals = 0; // Device snapshot slots refused during the resumed turn
+        std::vector<infernix::TokenId> second, last;
     };
     const auto run = [&](bool pair) {
         qwen_testing::set_pair_windows(pair);
@@ -958,15 +973,36 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
         options.context_cache.hybrid.device_snapshot_slots.reset();
         infernix::Engine engine(std::move(options));
         Arm arm;
+        const auto passes = [] {
+            std::vector<std::uint32_t> bases;
+            for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { bases.push_back(pass.base); }
+            qwen_testing::record_text_passes(false);
+            return bases;
+        };
         qwen_testing::record_text_passes(true);
         const infernix::GenerationResult first = engine.generate(engine.prepare(conversation({system, first_user})), greedy(8));
-        for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { arm.bases.push_back(pass.base); }
-        qwen_testing::record_text_passes(false);
+        arm.bases = passes();
         const infernix::GenerationResult second =
             engine.generate(engine.prepare(conversation({system, first_user, reply, second_user})), greedy(24));
-        arm.first_tokens = first.prompt.prompt_tokens;
-        arm.reused       = second.reused_prompt_tokens;
-        arm.second       = second.generated_token_ids;
+        // The resumed turn (from the first turn's opener tap) whose own opener pairs, then the turn after it. It is
+        // sent as a client's next turn arrives, once the previous reply's snapshots have landed on the Host: a turn
+        // sent at once may find every Device snapshot slot still held, and its pass is then cut (hybrid spec §7.10).
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        arm.refusals = engine.runtime_stats().hybrid_device_slot_refusals;
+        qwen_testing::record_text_passes(true);
+        const infernix::GenerationResult follow =
+            engine.generate(engine.prepare(conversation({system, first_user, reply, follow_user})), greedy(8));
+        arm.follow_bases = passes();
+        arm.refusals     = engine.runtime_stats().hybrid_device_slot_refusals - arm.refusals;
+        const infernix::GenerationResult last = engine.generate(
+            engine.prepare(conversation({system, first_user, reply, follow_user, follow_reply, second_user})), greedy(24));
+        arm.first_tokens  = first.prompt.prompt_tokens;
+        arm.follow_tokens = follow.prompt.prompt_tokens;
+        arm.reused        = second.reused_prompt_tokens;
+        arm.follow_reused = follow.reused_prompt_tokens;
+        arm.last_reused   = last.reused_prompt_tokens;
+        arm.second        = second.generated_token_ids;
+        arm.last          = last.generated_token_ids;
         return arm;
     };
     Arm cut, pair;
@@ -988,10 +1024,13 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
         return 1;
     }
     const std::uint32_t opener = cut.bases.back();
-    const std::vector<std::uint32_t> head(cut.bases.begin(), cut.bases.end() - 1);
-    if (pair.bases != head) {
-        std::cerr << name << ": the pair's first turn ran " << pair.bases.size() << " passes; expected the cut's "
-                  << cut.bases.size() << " without the one from the opener (" << opener << ")\n";
+    // The pair arm's passes: the cut's without the one from the opener (with a KV window, the cut's).
+    const auto paired = [&](const std::vector<std::uint32_t>& bases) {
+        return kv_window ? bases : std::vector<std::uint32_t>(bases.begin(), bases.end() - 1);
+    };
+    if (pair.bases != paired(cut.bases)) {
+        std::cerr << name << ": the pair's first turn ran " << pair.bases.size() << " passes, the cut's "
+                  << cut.bases.size() << (kv_window ? " (a KV window keeps the cut)" : "") << '\n';
         ++failures;
     }
     if (cut.reused != opener || pair.reused != opener) {
@@ -1003,11 +1042,30 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
         std::cerr << name << ": the second turn generated other tokens after the pair's tap than after the cut's\n";
         ++failures;
     }
+    // The resumed turn: it resumes at the first turn's opener, its own last pass begins at its opener in the cut
+    // (2-8 tokens before its end) and not in the pair, and the turn after it resumes there with the cut's tokens.
+    const std::uint32_t follow_opener = cut.follow_bases.empty() ? 0U : cut.follow_bases.back();
+    if (cut.follow_reused != opener || pair.follow_reused != opener || follow_opener + 8U < cut.follow_tokens ||
+        follow_opener + 2U > cut.follow_tokens || pair.follow_bases != paired(cut.follow_bases)) {
+        std::cerr << name << ": the resumed turn reused " << cut.follow_reused << " / " << pair.follow_reused << " of "
+                  << cut.follow_tokens << " tokens and ran " << cut.follow_bases.size() << " passes cut, "
+                  << pair.follow_bases.size() << " paired (last cut pass from " << follow_opener << "; "
+                  << pair.refusals << " Device snapshot slots refused during it)\n";
+        ++failures;
+    }
+    if (cut.last_reused != follow_opener || pair.last_reused != follow_opener || pair.last != cut.last) {
+        std::cerr << name << ": the turn after the resumed one reused " << cut.last_reused << " (cut) and "
+                  << pair.last_reused << " (pair), expected " << follow_opener << ", and generated "
+                  << (pair.last == cut.last ? "equal" : "different") << " tokens\n";
+        ++failures;
+    }
     std::cout << name << ": a " << cut.first_tokens << "-token turn ran " << cut.bases.size() << " passes cut and "
               << pair.bases.size() << " paired (opener at " << opener << "); the next turn resumed at " << pair.reused
-              << " (cut " << cut.reused << ") and generated " << pair.second.size() << " tokens, "
-              << (pair.second == cut.second ? "equal" : "different") << '\n';
-    if (backend != infernix::SpeculativeBackend::None) { return failures; }
+              << " (cut " << cut.reused << "), tokens " << (pair.second == cut.second ? "equal" : "different")
+              << "; a resumed " << cut.follow_tokens << "-token turn ran " << cut.follow_bases.size() << " passes cut and "
+              << pair.follow_bases.size() << " paired (opener at " << follow_opener << "); the turn after it resumed at "
+              << pair.last_reused << ", tokens " << (pair.last == cut.last ? "equal" : "different") << '\n';
+    if (backend != infernix::SpeculativeBackend::None || kv_window) { return failures; }
 
     // A device failure anywhere in a pair turn's work, its pass among them, gives back the room the pass's tap took
     // (its Device snapshot slot and state image). On an Engine with two Device snapshot slots each swept turn (a new
@@ -1053,15 +1111,15 @@ int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend back
     const infernix::GenerationResult next =
         engine.generate(engine.prepare(conversation({system, last_user, reply, second_user})), greedy(4));
     const std::uint32_t last_opener = last.prompt.prompt_tokens - tail;
-    const bool paired = std::find(last_bases.begin(), last_bases.end(), last_opener) == last_bases.end();
+    const bool last_paired = std::find(last_bases.begin(), last_bases.end(), last_opener) == last_bases.end();
     if (next.reused_prompt_tokens != last_opener) {
         std::cerr << name << ": after " << failed << " faulted turns a new conversation's opener (" << last_opener
-                  << ", " << (paired ? "paired" : "cut") << ") did not serve its next turn, which resumed at "
+                  << ", " << (last_paired ? "paired" : "cut") << ") did not serve its next turn, which resumed at "
                   << next.reused_prompt_tokens << '\n';
         ++failures;
     }
     std::cout << name << ": " << failed << " of " << sweep.size() << " faulted pair turns failed; afterwards a new "
-              << "conversation's opener was " << (paired ? "paired" : "cut") << " and its next turn resumed at "
+              << "conversation's opener was " << (last_paired ? "paired" : "cut") << " and its next turn resumed at "
               << next.reused_prompt_tokens << '\n';
     return failures;
 }

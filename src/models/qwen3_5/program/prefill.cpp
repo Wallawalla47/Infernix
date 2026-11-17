@@ -893,18 +893,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         bool no_room = false;
                         pair_tap = hybrid_reserve_tap(sequence, *hybrid_split, due->boundary, true, no_room);
                         // Every slot may still hold one of the previous request's snapshots whose Host copy is landing
-                        // (none may give its Device copy up yet): what landed is published, then the oldest writes are
-                        // waited for, a few milliseconds where the cut's head pass would have run (2026-11-17, 27B:
-                        // 13 of 48 opener turns found no room at once and fell back to the cut).
+                        // (none may give its Device copy up yet): the copies that landed are published (non-blocking)
+                        // and the room asked for again (2026-11-17, 27B: without it 13 of 48 opener turns found no
+                        // room at once and fell back to the cut).
                         if (!pair_tap && no_room) {
                             hybrid_->poll();
                             pair_tap = hybrid_reserve_tap(sequence, *hybrid_split, due->boundary, true, no_room);
                         }
-                        while (!pair_tap && no_room && hybrid_->settle_oldest_transfer()) {
-                            pair_tap = hybrid_reserve_tap(sequence, *hybrid_split, due->boundary, true, no_room);
-                        }
                         if (pair_tap) {
-                            pair_due = hybrid_tap_due(sequence, *hybrid_split, staged.prompt_tokens);
+                            (void)hybrid_tap_due(sequence, *hybrid_split, staged.prompt_tokens); // its bookkeeping
+                            pair_due = due;
                             split_frontier.reset();
                             schedule_state.pair_tap_frontier = *hybrid_split;
                             schedule_state.pair_tap_slot     = state_store->physical_slot(pair_tap->image);
