@@ -258,8 +258,17 @@ bool linear_qsa_group_supported(const Weight& w, const Tensor* const* parts, Lin
 void linear_qsa_group(const Tensor& x, const Weight& w, Tensor* const* parts, LinearPolicy policy,
                       WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
     if (!linear_qsa_group_supported(w, parts, policy) || !valid_linear_routes(routes) || x.dtype != DType::BF16 ||
-        !x.is_contiguous() || x.ne[0] != w.k || x.ne[1] != parts[0]->ne[1] || x.ne[1] <= 0) {
+        !x.is_contiguous() || x.ne[0] != w.k || x.ne[1] != parts[0]->ne[1] || x.ne[1] <= 0 || x.ne[2] != 1 ||
+        x.ne[3] != 1 || !aligned_to(x.data, 16)) {
         throw std::invalid_argument("linear_qsa_group: unsupported weight, segments or input");
+    }
+    // The x checks linear() makes, and no segment over x (the kernels read x while they write the segments).
+    const auto x_begin = reinterpret_cast<std::uintptr_t>(x.data);
+    for (std::int32_t i = 0; i < kQsaGroupSegments; ++i) {
+        const auto part_begin = reinterpret_cast<std::uintptr_t>(parts[i]->data);
+        if (part_begin < x_begin + x.bytes() && x_begin < part_begin + parts[i]->bytes()) {
+            throw std::invalid_argument("linear_qsa_group: a segment overlaps x");
+        }
     }
     detail::QsaGroupParts out{};
     for (std::int32_t i = 0; i < kQsaGroupSegments; ++i) { out.data[i] = static_cast<__nv_bfloat16*>(parts[i]->data); }
