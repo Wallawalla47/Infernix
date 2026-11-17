@@ -405,6 +405,13 @@ python -m tools.flash_next.verify_artifact --model <dir>/Qwen3.8-Flash-Next-NVFP
 The Dense8 artifact takes `--recipe qwen3_8_flash_next_nvfp4_qad_dense8` and the name
 `Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix`.
 
+Both are published:
+[Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix)
+and [Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix).
+Neither repository carries an n-gram volume: run them with NVIDIA's FP8 volume
+[`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram),
+whose SHA-256 equals the volume they were converted against.
+
 The exact artifact is 77.7 GB and the Dense8 one 76.5 GB, three parts each; each conversion took 25-33 minutes
 (beside a build). `verify_artifact` found all 24,624 expert records (the 48 shared experts among them) and every
 imported tensor equal to the checkpoint, only the drafter re-quantized (and Dense8's 293 BF16-class parameters), and
