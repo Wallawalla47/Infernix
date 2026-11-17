@@ -8278,6 +8278,21 @@ one size only (not a GGUF import's classes), no CSF, no stripe, not on a host. F
 under it, start 20.5 / 20.7 s against 27.5 / 27.6 s (six starts of the build before: 27.4-35.4 s, median 27.5); a start
 whose experts all fit as banks (7500) is unchanged (23.0 / 23.2 against 22.7 / 23.6 s).
 
+**The seeds' copies stay** (2026-11-17, `HostExpertTier::refill_over_seeds`). After the frames' warm start the first
+pass's RAM copies of the VRAM seeds were all released, their slots took the fill order's remaining keys, and the slots
+left over were read again from the artifact as shadows of the least-used seeds: an FP4-Local start released 4,562
+copies and read 1,860 of them back (4.8 GiB), 27,433 records for 24,576 experts. Now each class releases only as many
+copies as its remaining keys need, most-used seed first, and the least-used keep the copies they have; a class that
+still has a key on the SSD while it keeps a shadow (a seed the order does not name, a pinned or listed slot) releases
+the rest and is filled again. The keys in RAM, VRAM and the shadows are the same as before; only the slots of 4,562
+records differ. FP4-Local, `--host-context-mib 16384` (RTX 5090, i9-13900K): every start reads each record once
+(the real host test's four starts: 24,576), the step after the warm start takes 1.11-1.15 s against 1.83-1.88 s and
+the start 15.7 / 15.8 s against 16.5 / 16.5 / 16.5 s (alternated, CPU rates confirmed at once). In one earlier series
+five of six starts of this build read the CPU rates at ~16,500 against ~20,000 experts/s while the alternated starts
+of the build before did not; 18 later starts of this build in three orders (same-build runs, alternated, the reference
+rewritten or fixed) read 19,600-21,000, and the cause was not found. The 122B with `--expert-ram-mib 40000` needs
+every copy's slot, so it releases them all, as before (7,449 experts in RAM, 2,402 on the SSD, both builds).
+
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
 Branch `claude/fn-prefill`. The steps are §19.3.6 item 4's F0-F6 (`strata-amendments.md`, "Prefill");

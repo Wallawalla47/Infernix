@@ -1270,32 +1270,30 @@ void ExpertOffload::warm_start(cudaStream_t compute) {
         state_saved_ = Clock::now();
     }
     if (!tier_) { return; }
-    // The seeds are in VRAM: their RAM copies (shadows) are released and their slots take the next keys
-    // of the fill order (all of it past the keys VRAM holds: the first pass passed over the keys of a record
-    // size whose slots it had filled, wherever they rank); the unpinned records take the next keys neither the
-    // slots nor the frames hold.
+    // The seeds are in VRAM: their RAM copies (shadows) give their slots to the next keys of the fill
+    // order, most-used first (all of it past the keys VRAM holds: the first pass passed over the keys of a
+    // record size whose slots it had filled, wherever they rank), and the least-used keep theirs; the
+    // unpinned records take the next keys neither the slots nor the frames hold.
     const auto began       = Clock::now();
-    std::uint32_t released = 0, refilled = 0;
+    std::uint32_t refilled = 0;
     const std::int32_t* in_vram = residency_->host_table();
     const auto vram_holds = [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; };
-    if (seeded > 0) {
-        released = tier_->controller().release_shadows();
-        if (released > 0) { refilled = tier_->prefill(order, vram_holds); }
-    }
+    const auto seed_copies = static_cast<std::uint32_t>(tier_->controller().shadow_count());
+    if (seeded > 0 && seed_copies > 0) { refilled = tier_->refill_over_seeds(order, vram_holds).refilled; }
     const std::uint32_t unpinned = tier_->fill_unpinned(order, vram_holds);
     // Slots still free hold shadows of the least-used seeds (a loan's and decode's first victims), as
     // Qwen3.8-Flash-Next's Program does.
-    std::uint32_t shadows = 0;
     if (seeded > 0 && in_vram != nullptr) {
         std::vector<std::uint32_t> least_used_seeds;
         for (auto it = order.rbegin(); it != order.rend(); ++it) {
             if (in_vram[*it] >= 0) { least_used_seeds.push_back(*it); }
         }
-        shadows = tier_->prefill_shadows(least_used_seeds);
+        (void)tier_->prefill_shadows(least_used_seeds);
     }
-    const double seconds     = tier_seconds + std::chrono::duration<double>(Clock::now() - began).count();
-    const std::uint32_t in_ram = filled - released + refilled;
-    const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
+    const auto shadows         = static_cast<std::uint32_t>(tier_->controller().shadow_count());
+    const double seconds       = tier_seconds + std::chrono::duration<double>(Clock::now() - began).count();
+    const std::uint32_t in_ram = filled - seed_copies + refilled;
+    const std::uint32_t on_ssd = keys - in_ram - seed_copies - unpinned;
     char line[600];
     if (on_ssd == 0) {
         std::snprintf(line, sizeof(line),

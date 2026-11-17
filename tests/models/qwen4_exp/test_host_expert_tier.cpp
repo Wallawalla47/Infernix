@@ -496,13 +496,55 @@ void test_mixed_strides() {
             host.promotion_issued(k);
             host.promotion_completed(k, true);
         }
-        check(host.release_shadows() == 2, "mixed strides: the seeds' RAM copies are released");
         const auto in_vram = [](std::uint32_t k) { return k == kExpertsHere || k == kExpertsHere + 1; };
-        check(warm.prefill(order, in_vram) == 2 && holds(warm.record(kExpertsHere + 5), kExpertsHere + 5) &&
+        const auto refill  = warm.refill_over_seeds(order, in_vram);
+        check(refill.released == 2 && refill.refilled == 2 && holds(warm.record(kExpertsHere + 5), kExpertsHere + 5) &&
                   holds(warm.record(kExpertsHere + 6), kExpertsHere + 6) && warm.record(kExpertsHere + 7) == nullptr &&
-                  warm.record(kExpertsHere) == nullptr,
-              "mixed strides: the refill takes the passed-over keys first and skips the frames' keys");
+                  warm.record(kExpertsHere) == nullptr && warm.record(kExpertsHere + 1) == nullptr,
+              "mixed strides: both seeds' copies give their slots to the passed-over keys, the frames' keys skipped");
         host.check();
+    }
+    {
+        // The refill needs one slot of layer 1's class: the more-used seed (20) gives its copy, the less-used (21) keeps
+        // its own, as the shadow the top-up would otherwise read again; layer 0's class, without seeds, keeps its keys.
+        HostExpertTier warm(store, o);
+        std::vector<std::uint32_t> order;
+        for (std::uint32_t k = kExpertsHere; k < kExpertsHere + 6; ++k) { order.push_back(k); }
+        for (std::uint32_t k = 0; k < 5; ++k) { order.push_back(k); }
+        check(warm.prefill(order) == 10 && warm.record(kExpertsHere + 5) == nullptr, "seed refill: 25 passed over");
+        auto& host = warm.controller();
+        for (const std::uint32_t k : {kExpertsHere, kExpertsHere + 1}) {
+            host.queued(k);
+            host.promotion_issued(k);
+            host.promotion_completed(k, true);
+        }
+        const auto in_vram     = [](std::uint32_t k) { return k == kExpertsHere || k == kExpertsHere + 1; };
+        const auto reads       = warm.stats().prefill_reads;
+        const auto refill      = warm.refill_over_seeds(order, in_vram);
+        const std::vector<std::uint32_t> least_used{kExpertsHere + 1, kExpertsHere};
+        check(refill.released == 1 && refill.refilled == 1 && holds(warm.record(kExpertsHere + 5), kExpertsHere + 5) &&
+                  warm.record(kExpertsHere) == nullptr && holds(warm.record(kExpertsHere + 1), kExpertsHere + 1) &&
+                  host.shadow_count() == 1 && holds(warm.record(4), 4),
+              "seed refill: only the copy the refill needs goes, the more-used first");
+        check(warm.prefill_shadows(least_used) == 0 && warm.stats().prefill_reads == reads + 1,
+              "seed refill: the top-up finds no slot and reads nothing (releasing both read 21 again)");
+        host.check();
+        // An order that does not name the seeds: no copy goes by rank, so the class with a key left on the SSD gives
+        // up all its shadows and is filled again.
+        HostExpertTier unnamed(store, o);
+        check(unnamed.prefill(order) == 10, "seed refill, seeds unnamed: the first pass");
+        auto& unnamed_host = unnamed.controller();
+        for (const std::uint32_t k : {kExpertsHere, kExpertsHere + 1}) {
+            unnamed_host.queued(k);
+            unnamed_host.promotion_issued(k);
+            unnamed_host.promotion_completed(k, true);
+        }
+        const std::vector<std::uint32_t> rest(order.begin() + 2, order.end());
+        const auto net = unnamed.refill_over_seeds(rest, in_vram);
+        check(net.released == 2 && net.refilled == 1 && holds(unnamed.record(kExpertsHere + 5), kExpertsHere + 5) &&
+                  unnamed_host.shadow_count() == 0,
+              "seed refill, seeds unnamed: no ranked key stays on the SSD beside a shadow of its class");
+        unnamed_host.check();
     }
     {
         // A RAM resize with record-size classes, in chunks of two slots: the transit region stays, each class keeps
@@ -1438,10 +1480,15 @@ void test_slot_pool(const ExpertStore& store) {
             host.promotion_issued(k);
             host.promotion_completed(k, true);
         }
-        check(overwritten.size() == 2 && host.release_shadows() == 2, "pool passes: the two seeds' slots are released");
-        check(tier.prefill(overwritten) == 2 && tier.stats().kept == 0 && tier.stats().prefill_reads == 56 &&
+        // The fill order names the seeds first (as the real order ranks them), then the two overwritten keys.
+        const std::vector<std::uint32_t> refill_order{60, 61, overwritten.empty() ? 0U : overwritten[0],
+                                                      overwritten.size() < 2 ? 0U : overwritten[1]};
+        const auto seeds   = [](std::uint32_t k) { return k == 60 || k == 61; };
+        check(overwritten.size() == 2, "pool passes: the two seeds overwrote two of the last tier's records");
+        const auto refill  = tier.refill_over_seeds(refill_order, seeds);
+        check(refill.released == 2 && refill.refilled == 2 && tier.stats().kept == 0 && tier.stats().prefill_reads == 56 &&
                   matches(tier.record(overwritten[0]), overwritten[0]) && matches(tier.record(overwritten[1]), overwritten[1]),
-              "pool passes: the refill reads the keys whose slots the first pass overwrote");
+              "pool passes: the seeds' slots go to the keys whose records the first pass overwrote, read again");
         host.check();
     }
     {
@@ -1781,7 +1828,7 @@ int main(int argc, char** argv) {
         }
         {
             // The warm start's second pass: the frames took keys 0 and 1 (their RAM copies become
-            // shadows and are released), and the refill skips keys that still have a copy.
+            // shadows and give their slots up), and the refill skips keys that still have a copy.
             HostExpertTier tier(store, options());
             std::vector<std::uint32_t> ranked(50);
             for (std::uint32_t k = 0; k < 50; ++k) { ranked[k] = k; }
@@ -1792,10 +1839,10 @@ int main(int argc, char** argv) {
                 host.promotion_issued(k);
                 host.promotion_completed(k, true);
             }
-            check(host.release_shadows() == 2 && tier.record(0) == nullptr && tier.record(1) == nullptr,
-                  "warm fill: the seeds' RAM copies are released");
-            const std::vector<std::uint32_t> next{5, 6, 50, 51, 52};
-            check(tier.prefill(next) == 2, "warm fill: the refill skips keys with a copy and stops when full");
+            for (const std::uint32_t k : {50U, 51U, 52U}) { ranked.push_back(k); }
+            const auto refill = tier.refill_over_seeds(ranked, [](std::uint32_t k) { return k < 2; });
+            check(refill.released == 2 && refill.refilled == 2 && tier.record(0) == nullptr && tier.record(1) == nullptr,
+                  "warm fill: three keys want a slot, both seeds' copies give theirs up");
             check(matches(tier.record(50), 50) && matches(tier.record(51), 51) && tier.record(52) == nullptr,
                   "warm fill: the refilled records equal the file bytes");
             host.check();

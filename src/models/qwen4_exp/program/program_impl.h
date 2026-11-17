@@ -4074,39 +4074,41 @@ private:
         return fill;
     }
 
-    // After the frames' warm start: the seeds are in VRAM, so their RAM copies (shadows) are
-    // released and their slots take the next keys of the fill order. A seed VRAM later evicts is
-    // demoted into RAM when it outranks the coldest resident (T4), as any key without a host copy.
-    // Slots still free once every other key has a host copy (the exclusive layout's reserve) hold
-    // shadows of the least-used seeds, the first a prefill's loan or decode evicts, so those
-    // evictions keep a RAM copy instead of leaving the expert to the SSD.
+    // After the frames' warm start: the seeds are in VRAM, so their RAM copies (shadows) give their
+    // slots to the next keys of the fill order, most-used first, and the least-used keep theirs. A
+    // seed VRAM later evicts is demoted into RAM when it outranks the coldest resident (T4), as any
+    // key without a host copy. Slots still free once every other key has a host copy (the exclusive
+    // layout's reserve) hold shadows of the least-used seeds, the first a prefill's loan or decode
+    // evicts, so those evictions keep a RAM copy instead of leaving the expert to the SSD.
     void finish_tier_fill(const TierFill& fill, std::uint32_t seeded) {
         const auto start        = std::chrono::steady_clock::now();
-        std::uint32_t released  = 0, refilled = 0;
+        std::uint32_t refilled  = 0;
         const std::int32_t* in_vram = residency_->host_table();
         const auto vram_holds = [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; };
-        if (seeded > 0) {
-            released = tier_->controller().release_shadows();
+        // The seeds' RAM copies the first pass read; the slots the others hold are the order's other keys.
+        const auto seed_copies = static_cast<std::uint32_t>(tier_->controller().shadow_count());
+        if (seeded > 0 && seed_copies > 0) {
             // The whole order again, past the keys VRAM holds: with record-size classes the first pass passed over
-            // the keys of a class it had filled, wherever they rank, so the released slots are theirs first. From
-            // the position the first pass stopped at, IQ3_S kept 17 experts on the SSD beside 2,895 shadows, and the
-            // first 16K prefill read them (6,700-6,723 against 6,836-6,845 tok/s, 2026-10-29).
-            if (released > 0) { refilled = tier_->prefill(fill.order, vram_holds); }
+            // the keys of a class it had filled, wherever they rank, so the freed slots are theirs first. From the
+            // position the first pass stopped at, IQ3_S kept 17 experts on the SSD beside 2,895 shadows, and the
+            // first 16K prefill read them (6,700-6,723 against 6,836-6,845 tok/s, 2026-10-29). Only the copies those
+            // keys need go; releasing them all read the least-used again as shadows below (1,860 records a start).
+            refilled = tier_->refill_over_seeds(fill.order, vram_holds).refilled;
         }
         // The unpinned records take the next keys of the order that neither the slots nor the frames
         // hold: they keep them for good, so a copy of a VRAM seed would be wasted.
         const std::uint32_t unpinned = tier_->fill_unpinned(fill.order, vram_holds);
-        std::uint32_t shadows = 0;
         if (seeded > 0 && in_vram != nullptr) {
             std::vector<std::uint32_t> least_used_seeds;
             for (auto it = fill.order.rbegin(); it != fill.order.rend(); ++it) {
                 if (in_vram[*it] >= 0) { least_used_seeds.push_back(*it); }
             }
-            shadows = tier_->prefill_shadows(least_used_seeds);
+            (void)tier_->prefill_shadows(least_used_seeds);
         }
+        const auto shadows = static_cast<std::uint32_t>(tier_->controller().shadow_count());
         const double seconds =
             fill.seconds + std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - released + refilled;
+        const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - seed_copies + refilled;
         const std::uint32_t slots = tier_->pinned_slots();
         const double gib          = static_cast<double>(tier_->record_bytes()) / (1ULL << 30); // an unpinned record: the largest
         char split[160] = "";
@@ -4118,7 +4120,7 @@ private:
         if (shadows > 0) {
             std::snprintf(shadow_text, sizeof(shadow_text), " and copies of the %u least-used in VRAM", shadows);
         }
-        const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
+        const std::uint32_t on_ssd = keys - in_ram - seed_copies - unpinned;
         // An EngineHost's slots: the records still there from its last Engine were kept, the rest read. This start's own
         // pool (fill_pool): the records read while their slots were page-locked, then the rest.
         char read[128];
@@ -4151,7 +4153,7 @@ private:
                       fill.source == SeedSource::Saved        ? "the saved ranking, then the last session's use counts"
                       : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
                                                               : "spread across the layers",
-                      released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
+                      seed_copies > 0 ? (", none of them among the " + std::to_string(seed_copies) + " in VRAM").c_str() : "",
                       shadow_text, split, seconds, on_ssd, keys);
         diagnostic(line, DiagnosticLevel::Debug);
         if (const std::string csf = tier_->csf_summary(); !csf.empty()) { diagnostic(csf, DiagnosticLevel::Debug); }

@@ -302,7 +302,7 @@ void HostTier::replace_in_list(std::vector<std::uint32_t>& list, std::uint32_t o
 }
 
 bool HostTier::prefill(std::uint32_t key, std::int32_t& slot) {
-    if (host_copy(key) || held(key) || copying_[key]) { return false; }
+    if (!placeable(key)) { return false; }
     const std::int32_t s = take_free(key_class_[key]);
     if (s < 0) { return false; }
     set_resident(static_cast<std::uint32_t>(s), key, SlotState::kResident);
@@ -421,16 +421,28 @@ void HostTier::rerank_shadow(std::uint32_t key) {
     }
 }
 
-std::uint32_t HostTier::release_shadows() {
+std::uint32_t HostTier::release_shadows(std::uint8_t c) {
     std::uint32_t released = 0;
     for (std::uint32_t s = 0; s < slots_.size(); ++s) {
         const Slot& slot = slots_[s];
-        if (slot.state != SlotState::kShadow || slot.pins != 0 || slot.list != SlotList::kNone) { continue; }
+        if (slot_class_[s] != c || slot.state != SlotState::kShadow || slot.pins != 0 || slot.list != SlotList::kNone) {
+            continue;
+        }
         evict(s);
         classes_[slot_class_[s]].free.push_back(s);
         ++released;
     }
     return released;
+}
+
+bool HostTier::release_shadow(std::uint32_t key) {
+    if (key >= slot_of_.size() || slot_of_[key] < 0) { return false; }
+    const auto s     = static_cast<std::uint32_t>(slot_of_[key]);
+    const Slot& slot = slots_[s];
+    if (slot.state != SlotState::kShadow || slot.pins != 0 || slot.list != SlotList::kNone) { return false; }
+    evict(s);
+    classes_[slot_class_[s]].free.push_back(s);
+    return true;
 }
 
 std::vector<std::uint32_t> HostTier::lend(std::span<const std::uint32_t> per_class) {

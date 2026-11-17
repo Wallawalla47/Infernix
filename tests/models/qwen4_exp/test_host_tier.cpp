@@ -469,14 +469,17 @@ void test_warm_fill() {
     tier.promotion_completed(1, true);
     tier.promotion_completed(2, true);
     check(tier.shadow_count() == 2, "two shadows");
-    check(tier.release_shadows() == 2 && tier.shadow_count() == 0, "release_shadows frees the published copies");
+    check(!tier.release_shadow(3) && !tier.release_shadow(40), "release_shadow: an in-flight copy and a resident stay");
+    check(tier.release_shadow(1) && !tier.release_shadow(1) && tier.shadow_count() == 1 && !tier.host_copy(1),
+          "release_shadow frees one published copy");
+    check(tier.release_shadows(0) == 1 && tier.shadow_count() == 0, "release_shadows frees the class's other copy");
     check(!tier.host_copy(1) && !tier.host_copy(2) && tier.host_copy(3), "a pinned slot keeps its key");
     check(dirty(tier) == std::vector<std::uint32_t>{1, 2}, "released keys are dirty");
     tier.check();
     std::int32_t slot = -1;
     check(tier.prefill(90, slot) && tier.prefill(91, slot) && !tier.has_free_resident(),
           "the released slots take the next keys");
-    check(tier.release_shadows() == 0, "nothing more to release");
+    check(tier.release_shadows(0) == 0, "nothing more to release");
     // A released key VRAM evicts later is demoted like any key without a host copy (T4).
     {
         const std::uint32_t used[] = {1};

@@ -930,6 +930,49 @@ std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked,
     return kept + static_cast<std::uint32_t>(jobs.size());
 }
 
+HostExpertTier::SeedRefill HostExpertTier::refill_over_seeds(std::span<const std::uint32_t> ranked,
+                                                             const std::function<bool(std::uint32_t)>& in_vram) {
+    SeedRefill out;
+    if (!in_vram) { return out; }
+    const std::size_t classes = tier_.class_count();
+    // Each class's keys the fill places (prefill's own test, HostTier::placeable), less the free slots it has.
+    const auto wanting = [&] {
+        std::vector<std::int64_t> want(classes, 0);
+        for (const std::uint32_t key : ranked) {
+            if (key < keys() && !in_vram(key) && tier_.placeable(key)) { ++want[tier_.class_of(key)]; }
+        }
+        return want;
+    };
+    std::vector<std::int64_t> need = wanting();
+    for (std::uint32_t c = 0; c < classes; ++c) {
+        need[c] -= static_cast<std::int64_t>(tier_.free_resident(static_cast<std::uint8_t>(c)));
+    }
+    // The most-used copies give their slots first: the least-used stay, as prefill_shadows would place them.
+    for (const std::uint32_t key : ranked) {
+        if (key >= keys() || !in_vram(key)) { continue; }
+        std::int64_t& left = need[tier_.class_of(key)];
+        if (left > 0 && tier_.release_shadow(key)) {
+            --left;
+            ++out.released;
+        }
+    }
+    out.refilled = prefill(ranked, in_vram);
+    // No ranked key stays on the SSD while its class keeps a shadow (one of a seed `ranked` does not name, or
+    // whose slot the loop above could not take): that class's shadows go and it is filled again.
+    const std::vector<std::int64_t> still = wanting();
+    std::uint32_t again                    = 0;
+    for (std::uint32_t c = 0; c < classes; ++c) {
+        if (still[c] > 0 && tier_.shadows_in(static_cast<std::uint8_t>(c)) > 0) {
+            again += tier_.release_shadows(static_cast<std::uint8_t>(c));
+        }
+    }
+    if (again > 0) {
+        out.released += again;
+        out.refilled += prefill(ranked, in_vram);
+    }
+    return out;
+}
+
 bool HostExpertTier::refill_within(double seconds) const noexcept {
     if (read_rate_ <= 0) { return true; }
     const double queued = static_cast<double>(kRefills - refill_free_.size()) + 1.0;

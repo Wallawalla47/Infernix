@@ -214,6 +214,17 @@ public:
     // into free resident slots of their record size until none is left; returns how many. A key whose
     // size has no free slot is passed over, so later keys can be read before it.
     std::uint32_t prefill(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip = {});
+    // After the frames' warm start from the first fill, `in_vram` naming the keys VRAM now holds: the RAM copies of
+    // those keys (shadows) give up as many slots as the fill order's other keys need (each class's keys prefill would
+    // place, less its free slots), most-used first (`ranked` order), and those keys are read (prefill(ranked,
+    // in_vram)). The least-used copies stay as the shadows a later prefill_shadows would otherwise read again from the
+    // artifact (1,860-2,857 records of a FP4-Local start). A class whose ranked keys still lack a host copy while it
+    // keeps a shadow then gives up the rest of its shadows and is filled again: no ranked key stays on the SSD for a
+    // shadow. Returns the shadows released and the records read.
+    struct SeedRefill {
+        std::uint32_t released = 0, refilled = 0;
+    };
+    SeedRefill refill_over_seeds(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& in_vram);
     // Reads the keys of `ranked` (best first) that have no host copy and that `skip` rejects into
     // unpinned records until none is left; they keep them for good. Returns how many.
     std::uint32_t fill_unpinned(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip);

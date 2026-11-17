@@ -178,6 +178,8 @@ public:
     // its class has none left or the key already has a host copy. The caller writes the bytes
     // before the first round.
     bool prefill(std::uint32_t key, std::int32_t& slot);
+    // Whether prefill would place the key given a free slot of its class (no host copy, not held, not being copied).
+    [[nodiscard]] bool placeable(std::uint32_t key) const { return !host_copy(key) && !held(key) && copying_[key] == 0; }
     // The same for a key VRAM holds (the warm start's spare slots): the slot is its shadow, so its
     // eviction from VRAM (a lend's or a decode victim's) needs no copy back (T3).
     bool prefill_shadow(std::uint32_t key, std::int32_t& slot);
@@ -208,10 +210,15 @@ public:
     // first). Counts the cap ties keep their uncapped order (a key's seed gains under half a use in
     // proportion to its uncapped count). The seeds decay like any use.
     void seed_uses(std::span<const std::uint32_t> counts, std::uint32_t cap);
-    // Frees every unpinned shadow slot: its key stays readable in its VRAM frame, and a later VRAM
-    // eviction demotes it (T4) or drops it (T5) like any key without a host copy. Returns how many.
-    // The warm start uses it so RAM holds the keys ranked below the VRAM seeds, not copies of them.
-    std::uint32_t release_shadows();
+    // Frees the key's shadow slot: the key stays readable in its VRAM frame, and a later VRAM eviction
+    // demotes it (T4) or drops it (T5) like any key without a host copy. False when it has none, or the
+    // slot is pinned or listed. The warm start uses it so RAM holds the keys ranked below the VRAM seeds,
+    // not copies of them (HostExpertTier::refill_over_seeds).
+    bool release_shadow(std::uint32_t key);
+    // Frees every unpinned, unlisted shadow slot of class c as release_shadow does; returns how many.
+    std::uint32_t release_shadows(std::uint8_t c);
+    // Class c's shadow slots.
+    [[nodiscard]] std::uint32_t shadows_in(std::uint8_t c) const { return classes_[c].shadows; }
     // ---- lending (engine thread, no round in flight)
     // Lends up to per_class[c] resident slots of each class c (free ones first, then the lowest-ranked
     // unpinned residents, shadows before residents, which leave RAM; a class with a shadow floor lends
