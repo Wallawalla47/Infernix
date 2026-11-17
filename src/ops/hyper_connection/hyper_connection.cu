@@ -296,17 +296,21 @@ void hyper_connection_gates(const Tensor& z, std::int32_t rank, std::int32_t str
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 // The composed route's intermediates: Rn, z, m and u in BF16, then the projections' own workspace.
+// The composed route's buffers for calls of up to `max_tokens` columns: the normalized residual, z and m, and unless
+// the up + collapse route keeps W_up m on chip (`up_collapse`), u and the up linear's scratch.
 std::size_t composed_bytes(const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
-                           std::int32_t rank, std::int32_t max_tokens) {
+                           std::int32_t rank, std::int32_t max_tokens, bool up_collapse) {
     const auto width = static_cast<std::size_t>(up.n);
     const auto T     = static_cast<std::size_t>(max_tokens);
     (void)streams;
     // bf16_p12 matrices run their linears decoded (hyper_connection_mix).
     const auto format = [](const Weight& w) { return w.qtype == QType::BF16_P12 ? QType::BF16 : w.qtype; };
-    return align256(width * T * 2) + align256(static_cast<std::size_t>(down.n) * T * 2) +
-           align256(static_cast<std::size_t>(rank) * T * 2) + align256(width * T * 2) +
-           std::max(linear_workspace_capacity_bytes(format(down), down.n, down.k, policy, 1, max_tokens),
-                    linear_workspace_capacity_bytes(format(up), up.n, up.k, policy, 1, max_tokens));
+    const std::size_t down_scratch = linear_workspace_capacity_bytes(format(down), down.n, down.k, policy, 1, max_tokens);
+    const std::size_t shared       = align256(width * T * 2) + align256(static_cast<std::size_t>(down.n) * T * 2) +
+                               align256(static_cast<std::size_t>(rank) * T * 2);
+    if (up_collapse) { return shared + down_scratch; }
+    return shared + align256(width * T * 2) +
+           std::max(down_scratch, linear_workspace_capacity_bytes(format(up), up.n, up.k, policy, 1, max_tokens));
 }
 
 } // namespace
@@ -428,8 +432,16 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, co
                                                           std::int32_t streams, std::int32_t rank,
                                                           std::int32_t max_tokens) {
     require(max_tokens > 0 && streams > 0 && rank > 0, "mix workspace needs positive T, streams and rank");
-    std::size_t bytes = composed_bytes(down, up, policy, streams, rank, max_tokens) + decoded_bytes(down) +
-                        decoded_bytes(up);
+    // Calls of up to 96 columns compose W_up m as u; wider ones keep it on chip where the up + collapse route serves
+    // them (hc_up_collapse_supported: a Q8 W_up past 96 columns, whatever the width beyond).
+    constexpr std::int32_t kComposedUpColumns = 96;
+    const std::int32_t narrow = std::min(max_tokens, kComposedUpColumns);
+    std::size_t bytes         = composed_bytes(down, up, policy, streams, rank, narrow, false);
+    if (max_tokens > kComposedUpColumns) {
+        const bool collapse = detail::hc_up_collapse_supported(up, up.n / streams, streams, max_tokens);
+        bytes = std::max(bytes, composed_bytes(down, up, policy, streams, rank, max_tokens, collapse));
+    }
+    bytes += decoded_bytes(down) + decoded_bytes(up);
     for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
         bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T) + 256);
     }
