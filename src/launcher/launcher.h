@@ -323,6 +323,7 @@ private:
     std::mutex stop_mutex_;
     bool stopped_ = false;
     std::thread scanner_;
+    std::thread autoloader_; // settings.autoload: loads the model once the first scan has found it
     std::mutex publish_instance_mutex_; // publish_instance (taken with no other launcher lock held)
     std::mutex publish_library_mutex_;  // publish_library (likewise)
     std::thread log_flusher_;

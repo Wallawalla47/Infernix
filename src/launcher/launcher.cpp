@@ -491,17 +491,16 @@ void Launcher::serve() {
     if (settings.autoload) {
         std::optional<std::string> key = settings.default_model ? settings.default_model : store_.last_model();
         if (key) {
-            std::thread([this, key = *key] {
-                // Let the first scan finish so the model is known.
-                for (int i = 0; i < 100; ++i) {
-                    {
-                        std::lock_guard lock(library_mutex_);
-                        if (library_.scanned_at != 0) { break; }
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            autoloader_ = std::thread([this, key = *key] {
+                // The first scan (after `infernix-serve --help`, however long both take) makes the model
+                // known; a load requested before it would fail and hold the model off for two minutes.
+                {
+                    std::unique_lock lock(library_mutex_);
+                    scan_cv_.wait(lock, [this] { return library_.scanned_at != 0 || stopping_; });
+                    if (stopping_) { return; }
                 }
                 router_->request_load(key, false);
-            }).detach();
+            });
         }
     }
     if (options_.open_browser && settings.open_browser) { open_in_browser(ui_url()); }
@@ -535,6 +534,7 @@ void Launcher::stop() {
     }
     scan_cv_.notify_all();
     if (scanner_.joinable()) { scanner_.join(); }
+    if (autoloader_.joinable()) { autoloader_.join(); }
     // The server's log file and the console get what is still queued.
     stop_flushing_ = true;
     if (log_flusher_.joinable()) { log_flusher_.join(); }
@@ -671,6 +671,7 @@ void Launcher::scan_loop() {
         library_  = std::move(scan);
         scanning_ = false;
         lock.unlock();
+        scan_cv_.notify_all(); // the autoload waits for the first scan
         Json compare = library_json();
         compare.erase("scanned_at");
         const std::string digest = compare.dump();
