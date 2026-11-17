@@ -3,15 +3,16 @@
 #include <nlohmann/json.hpp>
 #include <cstddef>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace infernix::text {
 struct ParsedJsonNumbers {
     nlohmann::ordered_json value;
-    std::vector<std::string> inexact_numbers;
+    // JSON pointers of the numbers whose spelling a double does not keep, sorted (a value's subtree is one range).
+    std::set<std::string> inexact_numbers;
 };
 
 // The deepest nesting of arrays and objects a parsed document may have: the DOM is built
