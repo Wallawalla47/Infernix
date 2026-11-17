@@ -612,18 +612,27 @@ void test_event_log() {
     check(page["lines"].size() == 2 && page["lines"][1]["fields"]["kind"] == "crash", "records keep their fields");
     check(log.page(1, 10)["lines"].size() == 1, "a page after a sequence number");
     check(heard == std::vector<std::string>{"first", "second line\nwith a break"}, "the listener hears every record");
+    // A record is kept and queued; the file is written by write_files, on the launcher's log thread (audit 2026-11-17
+    // P4D-02: a slow log folder held up every thread that logged, the request threads among them).
+    check(read_file(dir / EventLog::kEventsFile).value_or("x").empty(), "logging a record writes nothing");
+    log.write_files();
     const std::optional<std::string> text = read_file(dir / EventLog::kEventsFile);
     check(text && text->find("  INFO   launcher  first\n") != std::string::npos, "the file has one text line per record");
     check(text && text->find("ERROR  watchdog  second line with a break\n") != std::string::npos, "one record, one line");
     log.add_request_body({{"id", 1}});
+    log.write_files();
     check(read_file(dir / EventLog::kRequestsFile) == std::optional<std::string>("{\"id\":1}\n"), "request bodies, one JSON line each");
 
     const std::filesystem::path moved = dir / "moved";
     std::string error;
+    log.add("info", "settings", "queued before the move");
     check(log.set_dir(moved, error), "the log folder can change");
     log.add("info", "settings", "third");
+    log.write_files();
     check(read_file(moved / EventLog::kEventsFile).value_or("").find("third") != std::string::npos, "later records go there");
-    check(log.page(0, 10)["lines"].size() == 3, "the memory keeps the earlier records");
+    check(read_file(dir / EventLog::kEventsFile).value_or("").find("queued before the move") != std::string::npos,
+          "a record queued before the move is written where it was logged");
+    check(log.page(0, 10)["lines"].size() == 4, "the memory keeps the earlier records");
 #ifdef _WIN32
     {
         // A full file another program holds open without sharing delete (a tail tool) cannot be
@@ -640,6 +649,7 @@ void test_event_log() {
         check(tail != INVALID_HANDLE_VALUE, "a tail tool holds the file");
         check(log.set_dir(held_dir, error), "the log folder can change to the held file's");
         log.add("info", "launcher", "past the limit");
+        log.write_files();
         const std::string head = read_file(held).value_or("").substr(0, 14);
         check(head == "oldest record\n" && std::filesystem::file_size(held, ignored) > EventLog::kEventsLimit &&
                   !std::filesystem::exists(held_dir / (std::string(EventLog::kEventsFile) + ".1")),
@@ -647,6 +657,7 @@ void test_event_log() {
         if (tail != INVALID_HANDLE_VALUE) { CloseHandle(tail); }
         const std::string block(64 << 10, 'y');
         for (int i = 0; i < 20; ++i) { log.add("info", "launcher", block); }
+        log.write_files();
         check(read_file(held_dir / (std::string(EventLog::kEventsFile) + ".1")).value_or("").starts_with("oldest record\n") &&
                   std::filesystem::file_size(held, ignored) < EventLog::kEventsLimit,
               "a later try rotates it once it is free");

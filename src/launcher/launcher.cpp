@@ -584,6 +584,7 @@ void Launcher::flush_logs_loop() {
             publish("log", {{"lines", lines}});
         }
         logs_.write_files();
+        event_log_.write_files(); // the event and request-content logs: their only writer
         if (last) { return; }
     }
 }
