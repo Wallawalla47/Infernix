@@ -76,6 +76,17 @@ public:
         return memory.total - memory.reserved;
     }
 
+    // The device's memory in use and free over every process (nvmlDeviceGetMemoryInfo_v2); false unknown.
+    [[nodiscard]] bool memory_info(std::uint64_t& used, std::uint64_t& free) const {
+        if (device_ == nullptr || memory_ == nullptr) { return false; }
+        MemoryV2 memory{};
+        memory.version = static_cast<unsigned>(sizeof(MemoryV2)) | (2U << 24U);
+        if (memory_(device_, &memory) != 0) { return false; }
+        used = memory.used;
+        free = memory.free;
+        return true;
+    }
+
     // 1 active, 0 inactive, -1 unknown.
     [[nodiscard]] int display_active() const {
         if (device_ == nullptr) { return -1; }
@@ -212,6 +223,7 @@ public:
             out.local_usage     = local;
         }
 #endif
+        (void)nvml_->memory_info(out.physical_used, out.physical_free);
         const int active = nvml_->display_active();
         if (out.outputs > 0 || active == 1) {
             out.display = DisplayState::Attached;

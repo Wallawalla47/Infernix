@@ -408,6 +408,9 @@ private:
     void create_stream();
     void create_cpu_service();
     void size_frames(cudaStream_t compute);
+    // What a grow of the frames must still leave (growth_room): the elastic controller's bound now, else the
+    // startup sizing's headroom and reserve.
+    [[nodiscard]] GrowthLimit growth_limit() const;
     void warm_start(cudaStream_t compute);
     [[nodiscard]] VramDemand frame_demand(std::uint64_t frame_bytes) const;
     void on_vram_snapshot(const VramSnapshot& snapshot);

@@ -44,6 +44,11 @@ struct VramSnapshot {
     // size, often half of RAM (80 % on that machine); the NON_LOCAL budget is not the limit.
     std::uint64_t shared_system  = 0;
     std::uint64_t nonlocal_usage = 0;
+    // NVML (nvmlDeviceGetMemoryInfo_v2): the device's memory in use and free over every process, 0 unknown. For the
+    // sizing and ledger lines only, no sizing reads them: under WDDM neither the budget nor cudaMemGetInfo moved
+    // while another process held 3 GiB (RTX 5090, 2026-11-17, issue #68), NVML did.
+    std::uint64_t physical_used = 0;
+    std::uint64_t physical_free = 0;
 };
 
 // One device's source. query() may be called from any thread on which the device is current.
@@ -90,6 +95,8 @@ public:
     explicit SpillGuard(VramBudgetSource& source) : source_(source) {}
     // Records free memory before a step.
     void begin() { before_ = source_.query(); }
+    // The reading begin() took: what a caller decides the step against before taking it.
+    [[nodiscard]] const VramSnapshot& before() const noexcept { return before_; }
     // After a step that allocated `bytes`: the bytes not placed in device memory (0: resident), from
     // the drop in free device memory. Another program that frees or takes device memory during the
     // step changes that drop, so a caller that knows what it page-locked uses the form below.

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <future>
 #include <stdexcept>
 #include <string>
@@ -575,6 +576,85 @@ void test_control_law() {
     require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
 }
 
+// RT7/RT9, issue #68: a grow maps a chunk only while growth_room, the sizing's own room, covers it. Under WDDM the
+// budget and free memory do not see another process's memory: with a 3 GiB holder in another process the sizing
+// planned as on an empty card, Windows lowered the budget as the card filled, and the grow mapped past it until a
+// chunk read as placed in system memory (RTX 5090, 2026-11-17).
+void test_growth_room() {
+    const auto bytes          = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
+    const std::uint64_t fixed = 3 * kGiB;
+    // growth_room is size_expert_frames' room with nothing left to allocate, under every bound.
+    std::vector<VramSnapshot> cases{card(28 * kGiB, DisplayState::Headless), card(28 * kGiB, DisplayState::Attached)};
+    VramSnapshot budgeted = card(28 * kGiB, DisplayState::Attached);
+    budgeted.has_budget   = true;
+    budgeted.local_budget = 26 * kGiB; // below free memory: the budget's bound
+    cases.push_back(budgeted);
+    budgeted.local_budget = 30 * kGiB; // above it: free memory's bound
+    cases.push_back(budgeted);
+    VramSnapshot past     = wddm(8 * kGiB, 0, DisplayState::Headless, 32'059 * kMiB); // --vram-past-budget's widened budget
+    past.budget_allowance = 640 * kMiB;
+    cases.push_back(past);
+    for (const VramSnapshot& s : cases) {
+        const VramSizing sizing = size_expert_frames(s, demand(fixed, 20));
+        require(growth_room(s, GrowthLimit{sizing.headroom, sizing.reserve}) - bytes(fixed) == sizing.frame_bytes,
+                "growth_room is the sizing's room: " + sizing.describe());
+    }
+
+    // A startup grow on the card the sizing read maps every chunk of the plan.
+    const std::uint64_t other = 6 * kGiB;
+    VramDemand elastic        = demand(0, 20);
+    elastic.elastic           = true;
+    const VramSizing sized    = size_expert_frames(wddm(0, other), elastic);
+    const GrowthLimit limit{sized.headroom, sized.reserve};
+    const std::uint64_t planned = static_cast<std::uint64_t>(sized.frame_bytes) / kChunk * kChunk;
+    const auto grow = [&](const std::function<std::uint64_t(std::uint64_t)>& budget_at) {
+        std::uint64_t pool = 0;
+        while (pool < planned &&
+               growth_room(wddm(pool, other, DisplayState::Headless, budget_at(pool)), limit) >= bytes(kChunk)) {
+            pool += kChunk;
+        }
+        return pool;
+    };
+    require(grow([](std::uint64_t) { return 31'419 * kMiB; }) == planned, "an unchanged card takes the whole plan");
+    // Another process holds 3 GiB the budget does not see; Windows cuts the budget by it once the card fills.
+    const std::uint64_t held = 3 * kGiB;
+    const auto cut_budget    = [&](std::uint64_t pool) {
+        return pool + other + held > 31'419 * kMiB ? 31'419 * kMiB - held : 31'419 * kMiB;
+    };
+    const std::uint64_t stopped = grow(cut_budget);
+    require(stopped < planned && stopped + other <= 31'419 * kMiB - held + kChunk,
+            "the grow stops where the budget fell, within the chunk that crossed it");
+    require(planned + other > 31'419 * kMiB - held + 2 * kGiB,
+            "without the live bound the plan maps over 2 GiB past the cut budget");
+
+    // The elastic controller's target is the same bound: growth_room's room plus the pool, on the chunk grid.
+    VramControl control(elastic, kChunk, other, 0);
+    const std::uint64_t pool   = 10 * kGiB;
+    const VramSnapshot now     = wddm(pool, other);
+    const std::uint64_t target = static_cast<std::uint64_t>(growth_room(now, control.growth_limit(now, pool)) + bytes(pool));
+    require(control.target(now, pool) == static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                             target / kChunk * kChunk / kRecord, elastic.max_frames)),
+            "the controller's target is growth_room's");
+
+    // NVML's figures are for the lines only: they size nothing, the nominal launch drops them, the line names them.
+    VramSnapshot measured  = card(28 * kGiB, DisplayState::Headless);
+    measured.physical_used = 4'129 * kMiB;
+    measured.physical_free = 28'058 * kMiB;
+    require(size_expert_frames(measured, demand(fixed, 20)).frame_bytes ==
+                size_expert_frames(card(28 * kGiB, DisplayState::Headless), demand(fixed, 20)).frame_bytes,
+            "NVML's figures do not size the frames");
+    const VramSnapshot nominal = nominal_snapshot(measured, 758 * kMiB);
+    require(nominal.physical_used == 0 && nominal.physical_free == 0, "the nominal launch carries no NVML figures");
+    const std::string line = size_expert_frames(measured, demand(fixed, 20)).describe();
+    require(line.find("every process uses 4129 MiB, 28058 free (NVML)") != std::string::npos,
+            "the sizing line names NVML's figures: " + line);
+    require(size_expert_frames(card(28 * kGiB, DisplayState::Headless), demand(fixed, 20)).describe().find("NVML") ==
+                std::string::npos,
+            "without NVML's figures the line names none");
+    require(short_of_room_line(7'912, 9'108).find("starts with 7912 of 9108 frames") != std::string::npos,
+            "the stop's line names the frames");
+}
+
 void test_exclusive_tier() {
     // The 122B: 48 x 256 experts, 4,993 frames, a ring of 2 x 256 + 1 and a 304-frame wide workspace, 57 frames of
     // KV growth.
@@ -845,6 +925,7 @@ int main() {
         test_sizing();
         test_spill();
         test_control_law();
+        test_growth_room();
         test_exclusive_tier();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

@@ -229,7 +229,8 @@ std::vector<std::uint32_t> ExpertResidency::split_frames(std::uint32_t frames) c
     return out;
 }
 
-ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram) {
+ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram,
+                                                std::optional<GrowthLimit> limit) {
     Resize out;
     for (const auto& pool : pools_) {
         if (pool.controller->loaned_frames() != 0) {
@@ -246,11 +247,11 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
     const auto targets = split_frames(frames);
     // Shrinks first, so their chunks are released before any pool grows.
     for (std::size_t p = 0; p < pools_.size(); ++p) {
-        if (targets[p] < pools_[p].frames) { resize_pool(pools_[p], targets[p], compute, vram, out); }
+        if (targets[p] < pools_[p].frames) { resize_pool(pools_[p], targets[p], compute, vram, limit, out); }
     }
     for (std::size_t p = 0; p < pools_.size(); ++p) {
-        if (targets[p] > pools_[p].frames && !out.refused && out.spilled == 0) {
-            resize_pool(pools_[p], targets[p], compute, vram, out);
+        if (targets[p] > pools_[p].frames && !out.refused && out.spilled == 0 && !out.short_of_room) {
+            resize_pool(pools_[p], targets[p], compute, vram, limit, out);
         }
     }
     if (table_dirty_) { upload_table(compute); }
@@ -261,16 +262,25 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
 }
 
 void ExpertResidency::resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram,
-                                  Resize& out) {
+                                  const std::optional<GrowthLimit>& limit, Resize& out) {
     auto& commands = pool.commands;
     commands.clear();
     SpillGuard guard(vram);
+    // The bytes the reading guard.begin() just took leaves a grow (growth_room); without a limit, no bound.
+    const auto room = [&]() -> std::int64_t {
+        return limit ? growth_room(guard.before(), *limit) : std::numeric_limits<std::int64_t>::max();
+    };
     if (!pool.arena) {
-        // One allocation of the first size; frames the driver placed in system memory are given back
-        // once and the pool starts smaller.
+        // One allocation of the first size, no larger than the room free memory leaves now; frames the driver
+        // placed in system memory are given back once and the pool starts smaller.
         if (pool.frames == 0 && frames > 0) {
             for (int attempt = 0;; ++attempt) {
                 guard.begin();
+                if (const std::int64_t left = room(); left < static_cast<std::int64_t>(frames) * static_cast<std::int64_t>(pool.pitch)) {
+                    frames = left > 0 ? static_cast<std::uint32_t>(left / static_cast<std::int64_t>(pool.pitch)) : 0U;
+                    out.short_of_room = true;
+                    if (frames == 0) { break; }
+                }
                 pool.memory = DeviceBuffer(static_cast<std::size_t>(frames) * pool.pitch);
                 pool.memory.fill(0);
                 const std::uint64_t spilled = guard.end(pool.memory.bytes);
@@ -303,6 +313,10 @@ void ExpertResidency::resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t
         const std::size_t need = static_cast<std::size_t>(frames) * pool.pitch;
         while (pool.arena->mapped_bytes() < need) {
             guard.begin();
+            if (room() < static_cast<std::int64_t>(pool.arena->chunk_bytes())) {
+                out.short_of_room = true; // free memory went since sizing: stop before the chunk, not after it
+                break;
+            }
             if (!pool.arena->map_chunk()) {
                 out.refused = true;
                 break;

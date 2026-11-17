@@ -178,6 +178,20 @@ struct VramSizing {
 // memory and B the OS budget less this process's usage (no budget: F's bound alone); frames =
 // clamp(frame_bytes / frame size, 0, max_frames).
 [[nodiscard]] VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand);
+// What a grow of the expert frames must still leave free: the sizing's headroom and its reserve for Infernix's
+// later allocations (the startup sizing's, or VramControl::growth_limit's).
+struct GrowthLimit {
+    std::uint64_t headroom = 0;
+    std::uint64_t reserve  = 0;
+};
+// The bytes a grow may still map at `snapshot`: size_expert_frames' room with nothing left to allocate,
+// min(F - headroom, B - 64 MiB) - reserve. ExpertResidency::resize maps a chunk only while this covers it, so memory
+// that went since sizing stops a grow cleanly. Under WDDM neither F nor B sees another process's memory: with a
+// 3 GiB holder in another process the sizing planned as on an empty card, Windows lowered the budget as the card
+// filled, and the grow mapped past it until a chunk read as placed in system memory (RTX 5090, 2026-11-17, #68).
+[[nodiscard]] std::int64_t growth_room(const VramSnapshot& snapshot, const GrowthLimit& limit) noexcept;
+// The startup line for a grow growth_room stopped at `frames` of the `planned`.
+[[nodiscard]] std::string short_of_room_line(std::uint32_t frames, std::uint32_t planned);
 // The expert cache's pools for these per-layer record strides: one per distinct stride (the layers of
 // one stride share a pool, ExpertResidency), so an NVFP4 or block-FP8 artifact has one.
 [[nodiscard]] std::size_t frame_pools(std::span<const std::uint64_t> strides);
@@ -203,7 +217,8 @@ struct LendCapacity {
 // The reproducible route fits its prefill chunk to the frames a launch would size with kNominalInUseBytes
 // in use before loading, an attached display's headroom and no OS budget below free memory: a function of
 // the GPU, the options and the artifact, not of what other programs held at launch (Flash-Next and the
-// offloaded Qwen3.5 alike). Without the launch's figure the snapshot stands.
+// offloaded Qwen3.5 alike). Without the launch's figure the snapshot stands. NVML's device-wide figures are
+// cleared: they describe this launch's GPU.
 inline constexpr std::uint64_t kNominalInUseBytes = 3ULL << 30;
 [[nodiscard]] VramSnapshot nominal_snapshot(VramSnapshot snapshot, std::optional<std::uint64_t> in_use_before_load) noexcept;
 
@@ -233,6 +248,9 @@ public:
     [[nodiscard]] std::uint32_t target(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
     [[nodiscard]] std::uint64_t headroom(DisplayState display) const;
     [[nodiscard]] std::uint64_t reserve_left(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
+    // What a grow toward the target must still leave (its headroom, the reserve left): the target's own bound,
+    // so a grow stopped by memory that went meanwhile does not leave a target the next boundary grows toward.
+    [[nodiscard]] GrowthLimit growth_limit(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
     // A fixed allocation grew (positive) or shrank by `bytes` since sizing (the elastic KV pool, design
     // §19.3.11): it is not the reserve's use.
     void account_fixed(std::int64_t bytes) noexcept {

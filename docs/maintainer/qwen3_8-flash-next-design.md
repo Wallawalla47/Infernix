@@ -7613,6 +7613,21 @@ measured results are under "Status" at the end of this section.
   shrinking before VidMm contention (device free is the primary signal; budget and `Demoted` are
   secondary). Infernix never changes driver settings; the docs mention "Prefer No Sysmem Fallback" as
   optional.
+- **Other processes' memory** (issue #68, 2026-11-17): neither the budget nor cudaMemGetInfo sees it.
+  RTX 5090, no display, a probe process holding 3 GiB: the DXGI budget (31,419 MiB) and free memory
+  stayed as on an empty card while NVML's free fell by 3.5 GiB, so FP4-Local sized 9,108 frames (as on
+  the empty card), Windows cut the budget as the card filled (to 27,527 MiB) and the grow mapped past it:
+  "55 MiB … placed in system memory", 7,912 of 9,108 frames (8 MiB free after: the free figure clamped at
+  0 before the last chunk). The same without `--vram-past-budget` (7,670 of 8,866). A grow now reads
+  free memory before every chunk and maps it only while `growth_room` (the sizing's room with nothing
+  left to allocate: min(F − headroom, B − 64 MiB) − reserve) covers it; the elastic controller's target
+  is the same bound, so it does not regrow toward a target the stop left. The reporter's signature (a
+  whole 64 MiB chunk lost with 3.6 GiB counted free, display attached) is not reproduced on a headless
+  card; the sizing and ledger lines now give NVML's device-wide used and free, which see other
+  processes, to tell a physically full card from a budget cut. NVML sizes nothing: on the quiet card its
+  figures and the budget's differ by a few hundred MiB either way (at idle 198 MiB in use beyond the one
+  process's budget usage; after startup 362 MiB free against the engine's 161), so it stays a diagnostic
+  until a physically full card is measured.
 
 #### Feature 2: the SSD expert tier
 

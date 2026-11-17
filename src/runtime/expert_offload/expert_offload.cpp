@@ -948,12 +948,14 @@ void ExpertOffload::size_frames(cudaStream_t compute) {
     // Each pool maps whole chunks: one chunk of slack per pool.
     const std::uint32_t slack = pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
     sizing_.frames            = sizing_.frames > slack ? sizing_.frames - slack : 0U;
-    const auto grown = residency_->resize(sizing_.frames, compute, *vram_);
+    const auto grown = residency_->resize(sizing_.frames, compute, *vram_, GrowthLimit{sizing_.headroom, sizing_.reserve});
     if (grown.spilled != 0) {
         diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory and given "
                        "back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames",
                    DiagnosticLevel::Warning);
+    } else if (grown.short_of_room) {
+        diagnostic(short_of_room_line(grown.frames, sizing_.frames), DiagnosticLevel::Info);
     } else if (grown.refused) {
         diagnostic("the GPU refused expert-cache memory; the cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames",
@@ -1098,13 +1100,14 @@ void ExpertOffload::apply_vram_target(cudaStream_t compute, bool idle) {
     const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
     if (d.frames == frames_now_) { return; }
     const std::uint32_t before = frames_now_;
-    const auto resized         = residency_->resize(d.frames, compute, *vram_);
+    const auto resized         = residency_->resize(d.frames, compute, *vram_, growth_limit());
     frames_now_                = resized.frames;
     pool_now_                  = residency_->pool_bytes();
     const VramSnapshot after   = monitor_->refresh();
     diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") + std::to_string(after.device_free >> 20) +
                    " MiB: expert cache " + std::to_string(before) + " -> " + std::to_string(frames_now_) + " frames" +
-                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""),
+                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)"
+                    : resized.short_of_room ? " (free memory went while it grew)" : ""),
                DiagnosticLevel::Info);
     if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
         diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
@@ -1113,6 +1116,11 @@ void ExpertOffload::apply_vram_target(cudaStream_t compute, bool idle) {
         low_frames_warned_ = true;
     }
     if (frames_now_ * 4 >= startup_frames_) { low_frames_warned_ = false; }
+}
+
+GrowthLimit ExpertOffload::growth_limit() const {
+    if (control_) { return control_->growth_limit(vram_->query(), residency_->pool_bytes()); }
+    return GrowthLimit{sizing_.headroom, sizing_.reserve};
 }
 
 std::uint32_t ExpertOffload::spare_frames() const {
@@ -1149,7 +1157,8 @@ bool ExpertOffload::take_frames(std::uint64_t bytes, cudaStream_t compute) {
 void ExpertOffload::give_frames(std::uint64_t bytes, cudaStream_t compute) {
     const std::lock_guard<std::mutex> lock(vram_mutex_);
     const std::uint32_t frames = residency_->frames();
-    (void)residency_->resize(frames + static_cast<std::uint32_t>(bytes / residency_->frame_bytes()), compute, *vram_);
+    (void)residency_->resize(frames + static_cast<std::uint32_t>(bytes / residency_->frame_bytes()), compute, *vram_,
+                             growth_limit());
     if (control_) { control_->account_fixed(-static_cast<std::int64_t>(bytes)); }
     frames_now_ = residency_->frames();
     pool_now_   = residency_->pool_bytes();

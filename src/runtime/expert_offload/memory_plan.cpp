@@ -19,6 +19,23 @@ std::uint64_t saturating_sub(std::uint64_t a, std::uint64_t b) { return a > b ? 
 
 double gib(std::uint64_t bytes) { return static_cast<double>(bytes) / static_cast<double>(kLedgerGiB); }
 
+// min(F - headroom, B - 64 MiB) and whether the budget's bound applied: the room size_expert_frames, growth_room and
+// VramControl share before their fixed allocations, pool and reserve.
+struct Room {
+    std::int64_t bytes  = 0;
+    bool budget_limited = false;
+};
+
+Room room_before_reserve(const VramSnapshot& snapshot, std::uint64_t headroom) noexcept {
+    const auto s = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
+    Room out{s(snapshot.device_free) - s(headroom), false};
+    if (snapshot.has_budget) {
+        const std::int64_t budget = s(snapshot.local_budget) - s(snapshot.local_usage) - s(kVramBudgetMarginBytes);
+        if (budget < out.bytes) { out = Room{budget, true}; }
+    }
+    return out;
+}
+
 } // namespace
 
 HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand) {
@@ -162,17 +179,9 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
     out.demand   = demand;
     out.headroom = display_headroom(snapshot.display, demand.elastic, demand.headroom);
     out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic);
-    const auto signed_bytes = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
-    std::int64_t room = signed_bytes(snapshot.device_free) - signed_bytes(demand.fixed) - signed_bytes(out.headroom);
-    if (snapshot.has_budget) {
-        const std::int64_t budget = signed_bytes(snapshot.local_budget) - signed_bytes(snapshot.local_usage) -
-                                    signed_bytes(demand.fixed) - signed_bytes(kVramBudgetMarginBytes);
-        if (budget < room) {
-            room               = budget;
-            out.budget_limited = true;
-        }
-    }
-    out.frame_bytes = room - signed_bytes(out.reserve);
+    const Room room    = room_before_reserve(snapshot, out.headroom);
+    out.budget_limited = room.budget_limited;
+    out.frame_bytes    = room.bytes - static_cast<std::int64_t>(demand.fixed) - static_cast<std::int64_t>(out.reserve);
     if (out.frame_bytes > 0 && demand.frame_bytes > 0) {
         const std::uint64_t frames = static_cast<std::uint64_t>(out.frame_bytes) / demand.frame_bytes;
         out.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, demand.max_frames));
@@ -210,9 +219,21 @@ VramSnapshot nominal_snapshot(VramSnapshot s, std::optional<std::uint64_t> in_us
     const std::uint64_t used = *in_use_before_load;
     s.device_free = used >= kNominalInUseBytes ? s.device_free + (used - kNominalInUseBytes)
                                                : s.device_free - std::min<std::uint64_t>(s.device_free, kNominalInUseBytes - used);
-    s.has_budget  = false;
-    s.display     = DisplayState::Attached;
+    s.has_budget    = false;
+    s.display       = DisplayState::Attached;
+    s.physical_used = 0;
+    s.physical_free = 0;
     return s;
+}
+
+std::int64_t growth_room(const VramSnapshot& snapshot, const GrowthLimit& limit) noexcept {
+    return room_before_reserve(snapshot, limit.headroom).bytes - static_cast<std::int64_t>(limit.reserve);
+}
+
+std::string short_of_room_line(std::uint32_t frames, std::uint32_t planned) {
+    return "free VRAM went while the expert cache grew (another program holds memory, or Windows lowered the budget as "
+           "the card filled): the expert cache starts with " + std::to_string(frames) + " of " + std::to_string(planned) +
+           " frames";
 }
 
 VramControl::VramControl(const VramDemand& demand, std::uint64_t chunk_bytes, std::uint64_t usage,
@@ -238,14 +259,12 @@ std::uint64_t VramControl::reserve_left(const VramSnapshot& snapshot, std::uint6
     return used >= total ? 0 : total - used;
 }
 
+GrowthLimit VramControl::growth_limit(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const {
+    return GrowthLimit{headroom(snapshot.display), reserve_left(snapshot, pool_bytes)};
+}
+
 std::int64_t VramControl::frame_bytes(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const {
-    const auto s = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
-    std::int64_t room = s(snapshot.device_free) + s(pool_bytes) - s(headroom(snapshot.display));
-    if (snapshot.has_budget) {
-        room = std::min(room, s(snapshot.local_budget) - s(snapshot.local_usage) + s(pool_bytes) -
-                                  s(kVramBudgetMarginBytes));
-    }
-    return room - s(reserve_left(snapshot, pool_bytes));
+    return growth_room(snapshot, growth_limit(snapshot, pool_bytes)) + static_cast<std::int64_t>(pool_bytes);
 }
 
 std::uint32_t VramControl::target(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const {
@@ -303,11 +322,16 @@ std::string VramSizing::describe() const {
         std::snprintf(budget, sizeof(budget), "; OS budget %llu MiB, used %llu", mib(snapshot.local_budget),
                       mib(snapshot.local_usage));
     }
-    char line[512];
+    char physical[96] = "";
+    if (snapshot.physical_used != 0 || snapshot.physical_free != 0) {
+        std::snprintf(physical, sizeof(physical), "; every process uses %llu MiB, %llu free (NVML)",
+                      mib(snapshot.physical_used), mib(snapshot.physical_free));
+    }
+    char line[640];
     std::snprintf(line, sizeof(line),
-                  "VRAM sizing: free %llu of %llu MiB; %s%s; to allocate %llu; reserve %llu (%u graphs); headroom "
+                  "VRAM sizing: free %llu of %llu MiB; %s%s%s; to allocate %llu; reserve %llu (%u graphs); headroom "
                   "%llu (%s) -> expert frames %u (%.2f GiB)%s%s",
-                  mib(snapshot.device_free), mib(snapshot.device_total), display, budget, mib(demand.fixed),
+                  mib(snapshot.device_free), mib(snapshot.device_total), display, budget, physical, mib(demand.fixed),
                   mib(reserve), demand.graphs, mib(headroom), demand.headroom ? "set" : "auto", frames,
                   gib(static_cast<std::uint64_t>(frames) * demand.frame_bytes),
                   budget_limited ? ", limited by the OS budget" : "",

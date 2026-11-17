@@ -809,7 +809,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto& sizing = instance->program->vram_sizing();
     const std::uint64_t frames_bytes =
         static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_frame_bytes;
-    const std::uint64_t after_startup = vram->query().device_free;
+    const VramSnapshot after          = vram->query();
+    const std::uint64_t after_startup = after.device_free;
     {
         const char* display = before.display == DisplayState::Headless   ? "no display"
                               : before.display == DisplayState::Attached ? "display attached"
@@ -818,14 +819,21 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         const std::string past = before.budget_allowance == 0
                                      ? std::string()
                                      : " (" + std::to_string(mib(before.budget_allowance)) + " MiB past the OS budget)";
-        char line[704];
+        // NVML's device-wide figures, which see other processes' memory where the budget does not (issue #68).
+        const std::string physical =
+            before.physical_used == 0 && after.physical_free == 0
+                ? std::string()
+                : "; every process used " + std::to_string(mib(before.physical_used)) + " MiB before loading and " +
+                      std::to_string(mib(after.physical_free)) + " MiB is free after startup (NVML)";
+        char line[832];
         std::snprintf(line, sizeof(line),
                       "VRAM ledger: %llu MiB card, %s, %llu in use before loading%s; %s; reserve %llu (%u graphs); "
-                      "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup",
+                      "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup%s",
                       mib(before.device_total), display, mib(before.device_total - before.device_free), past.c_str(),
                       device_contributors(dense, device_plan).c_str(), mib(sizing.reserve), device_plan.graph_bound,
                       mib(sizing.headroom), options.vram_headroom_bytes ? "set" : "auto", sizing.frames,
-                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup));
+                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup),
+                      physical.c_str());
         report(options, DiagnosticLevel::Debug, line);
         const double gib = static_cast<double>(1ULL << 30);
         char summary[320];

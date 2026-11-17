@@ -1712,11 +1712,14 @@ public:
             const std::uint32_t slack =
                 pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
             sizing_.frames = sizing_.frames > slack ? sizing_.frames - slack : 0U;
-            const auto grown = residency_->resize(sizing_.frames, device_.stream, *vram_);
+            const auto grown =
+                residency_->resize(sizing_.frames, device_.stream, *vram_, GrowthLimit{sizing_.headroom, sizing_.reserve});
             if (grown.spilled != 0) {
                 diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory "
                        "and given back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames", DiagnosticLevel::Warning);
+            } else if (grown.short_of_room) {
+                diagnostic(short_of_room_line(grown.frames, sizing_.frames), DiagnosticLevel::Info);
             } else if (grown.refused) {
                 diagnostic("the GPU refused expert-cache memory; the cache starts with " +
                                                      std::to_string(grown.frames) + " of " +
@@ -3752,6 +3755,13 @@ public:
 
 private:
     // ---------------------------------------------------------------- VRAM monitor (design §19.3.7)
+    // What a grow of the frames must still leave (memory_plan's growth_room): the elastic controller's bound now,
+    // else the startup sizing's headroom and reserve.
+    GrowthLimit growth_limit() {
+        if (control_) { return control_->growth_limit(vram_->query(), residency_->pool_bytes()); }
+        return GrowthLimit{sizing_.headroom, sizing_.reserve};
+    }
+
     void start_vram_monitor(const VramDemand& demand) {
         if (!options_.vram_monitor) { return; }
         const VramSnapshot now = vram_->query();
@@ -4435,14 +4445,15 @@ public:
         const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
         if (d.frames == frames_now_) { return; }
         const std::uint32_t before = frames_now_;
-        const auto resized         = residency_->resize(d.frames, device_.stream, *vram_);
+        const auto resized         = residency_->resize(d.frames, device_.stream, *vram_, growth_limit());
         frames_now_                = resized.frames;
         pool_now_                  = residency_->pool_bytes();
         const VramSnapshot after   = monitor_->refresh();
         diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") +
                    std::to_string(after.device_free >> 20) + " MiB: expert cache " + std::to_string(before) +
                    " -> " + std::to_string(frames_now_) + " frames" +
-                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""), DiagnosticLevel::Info);
+                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)"
+                    : resized.short_of_room ? " (free memory went while it grew)" : ""), DiagnosticLevel::Info);
         if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
             diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
                        std::to_string(startup_frames_) +
@@ -7716,7 +7727,7 @@ private:
             const std::size_t kept = kv_vmm_->mapped_bytes() - mapped_before;
             if (control_ && kept != 0) { control_->account_fixed(static_cast<std::int64_t>(kept)); }
             const auto held = static_cast<std::uint32_t>(std::min<std::uint64_t>(give, (kept + stride - 1) / stride));
-            if (give > held) { (void)residency_->resize(frames - held, device_.stream, *vram_); }
+            if (give > held) { (void)residency_->resize(frames - held, device_.stream, *vram_, growth_limit()); }
             frames_now_ = residency_->frames();
             pool_now_   = residency_->pool_bytes();
             return false;
@@ -7784,7 +7795,8 @@ private:
         const std::size_t freed   = before - kv_vmm_->mapped_bytes();
         const std::uint64_t stride = residency_->frame_bytes();
         const std::uint32_t frames = residency_->frames();
-        (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
+        (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_,
+                                 growth_limit());
         if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
         frames_now_ = residency_->frames();
         pool_now_   = residency_->pool_bytes();

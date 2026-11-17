@@ -43,6 +43,7 @@
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "ops/offloaded_sparse_moe/csf_record.h"
+#include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/expert_cache.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_predictor.h"
@@ -147,6 +148,7 @@ public:
         std::uint32_t frames  = 0;     // frames backed afterwards, over every pool
         std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
         bool refused          = false; // the device had no memory for the next chunk
+        bool short_of_room    = false; // a grow stopped: free memory no longer left the next chunk (growth_room)
     };
     // Backs `frames` frames over the pools (every layer frames / layers; clamped to frame_limit());
     // unchanged while frames are lent. Call only between rounds, with nothing in flight on the
@@ -154,8 +156,11 @@ public:
     // lowest-score experts, moves the survivors above its new top below it on `compute` and
     // releases the top chunks; a grow maps chunks one at a time, stops at the first the driver
     // refuses or places in system memory (`vram` tells), and fills the new frames from the queue.
-    // Without VMM only the first call allocates.
-    Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram);
+    // With `limit`, a grow reads free memory before each chunk (one allocation without VMM) and maps it only
+    // while growth_room covers it, so free memory that went since sizing stops it short of `frames`
+    // (short_of_room) instead of mapping past the budget. Without VMM only the first call allocates.
+    Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram,
+                  std::optional<GrowthLimit> limit = std::nullopt);
     // Frame lending (design §19.3.2, "Frame lending"): a contiguous run of one pool's frames serves
     // another use of device memory (the prefill stream's ring and areas, the Vision window) and
     // comes back. Lent frames hold no expert and are never resized; decode graphs reach frames
@@ -362,7 +367,8 @@ private:
     // Frames per pool for `frames` average frames.
     [[nodiscard]] std::vector<std::uint32_t> split_frames(std::uint32_t frames) const;
     // Resizes one pool to `frames`; returns false when a grow was refused or spilled (out.*).
-    void resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram, Resize& out);
+    void resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram,
+                     const std::optional<GrowthLimit>& limit, Resize& out);
     // The pool a lease comes from: the most lendable bytes.
     [[nodiscard]] std::size_t lend_pool() const noexcept;
     [[nodiscard]] std::uint32_t pool_lendable(const Pool& pool) const noexcept;

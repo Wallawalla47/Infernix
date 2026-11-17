@@ -33,6 +33,8 @@ using runtime::expert_offload::ExpertStream;
 using runtime::expert_offload::ExpertStripe;
 using runtime::expert_offload::ggml_format;
 using runtime::expert_offload::graph_bound;
+using runtime::expert_offload::GrowthLimit;
+using runtime::expert_offload::short_of_room_line;
 using runtime::expert_offload::HostExpertTier;
 using runtime::expert_offload::HostMemoryDemand;
 using runtime::expert_offload::HostMemoryLedger;
