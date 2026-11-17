@@ -333,8 +333,6 @@ public:
                                "inference request expired before submission");
         }
 
-        std::uint64_t request_id        = 0;
-        std::uint64_t publication_order = 0;
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
@@ -344,12 +342,7 @@ public:
             if (outstanding_ >= max_outstanding_) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
-            if (next_request_id_ == 0 || next_publication_order_ == 0) {
-                throw std::overflow_error("request identity space exhausted");
-            }
             ++outstanding_;
-            request_id        = next_request_id_++;
-            publication_order = next_publication_order_++;
             // A request came first: a finished turn not yet being prefilled is dropped (the request
             // is often that conversation's next turn), and a running pass yields to it.
             ++submission_epoch_;
@@ -388,23 +381,28 @@ public:
                 observation.phase_timings,
                 std::chrono::duration<double>(ready - constraint_started).count());
             prepare_seconds += std::chrono::duration<double>(ready - submitted).count();
-            request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
-                                                std::move(output), prompt_summary, prepare_seconds,
-                                                std::move(options), consumer_mode,
-                                                std::move(observation), pending_deadline, ready);
-        } catch (...) {
-            release_reserved_capacity();
-            throw;
-        }
-
-        {
+            // The identity and the publication order are taken with the queue position, in one hold of the queue
+            // lock: ids then follow the queue's order (which the preemption victim choice, the candidate order and
+            // the paused order assume) whatever the grammar compile above took. A throw releases the lock, then the
+            // reserved capacity below.
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
-                --outstanding_;
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
+            if (next_request_id_ == 0 || next_publication_order_ == 0) {
+                throw std::overflow_error("request identity space exhausted");
+            }
+            request = std::make_shared<Request>(next_request_id_, next_publication_order_, std::move(prompt),
+                                                std::move(output), prompt_summary, prepare_seconds,
+                                                std::move(options), consumer_mode,
+                                                std::move(observation), pending_deadline, ready);
+            ++next_request_id_;
+            ++next_publication_order_;
             pending_.push_back(request);
+        } catch (...) {
+            release_reserved_capacity();
+            throw;
         }
         request_admission_check();
         queue_cv_.notify_one();
