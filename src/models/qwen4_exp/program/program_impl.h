@@ -71,6 +71,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -5101,18 +5102,23 @@ private:
         residency_->before_round(s);
         // A call the CPU can share (design §19.3.12) gates the stream on each layer's routing.
         split_call_ = streamed && split_policy_ && batch * width <= split_columns();
-        if (streamed) {
-            expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_);
-            tier_losses_at_span_ = tier_losses();
-        }
-        const WideWork wide(*this, batch * width);
+        bool begun  = false;
+        // Lives to the end of the call (after the stream's end and the route download), as before; built inside
+        // the try, since its fallback allocation can fail the call (RecoverableExecutionError).
+        std::optional<WideWork> wide;
         try {
+            if (streamed) {
+                expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_);
+                begun                = true;
+                tier_losses_at_span_ = tier_losses();
+            }
+            wide.emplace(*this, batch * width);
             forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
             if (dflash2_) { dflash2_call_context(batch, width); }
         } catch (...) {
-            // A failed call (an unreadable record, say) still returns the stream's slots: left
-            // active, the next streamed chunk could never begin and the release would refuse.
-            if (streamed) { expert_stream_->end(s); }
+            // A failed call (an unreadable record, the wide workspace's allocation, say) still returns the
+            // stream's slots: left active, the next streamed chunk could never begin and the release would refuse.
+            if (begun) { expert_stream_->end(s); }
             split_call_ = false;
             throw;
         }
