@@ -1,10 +1,10 @@
 // The wide prefill workspace against its plan on the real artifact (design §19.3.7, "the wide workspace"; candidates
-// QG-01). A prefill call wider than the static arena runs in an arena lent from the expert frames. Each scenario runs
-// prompts whose calls are that wide and records every wide scope (testing::record_wide_scopes): where it was entered,
-// the columns it was entered with, the widest call it ran (a layer walk's MoE runs over a group of chunks), the bytes
-// its arena was given, the bytes the forward's own allocation plan gives it (0 while none is computed) and the
-// arena's peak. Every peak stays within what its arena was given (the arena throws past it), and within the plan
-// where one is computed. One line is printed per scope, with the plan's headroom over the peak.
+// QG-01). A prefill call wider than the static arena runs in an arena lent from the expert frames, sized by the
+// forward's own allocation plan of the scope (Forward::plan_run and its siblings). Each scenario runs prompts whose
+// calls are that wide and records every wide scope (testing::record_wide_scopes): where it was entered, the columns
+// it was entered with, the widest call it ran (a layer walk's MoE runs over a group of chunks), the bytes its arena
+// was given, the plan and the arena's peak. Every scope is given at least its plan, and peaks within it (the arena
+// throws past what it was given). One line is printed per scope, with the plan's headroom over the peak.
 //
 //   infernix_qwen4_exp_wide_plan_real_test SCENARIO
 //   SCENARIO: banks (the experts in RAM as banks), tier (the SSD tier: INFERNIX_EXPERT_RAM_MIB, default 30000),
@@ -12,7 +12,10 @@
 //             scoring (CausalScoring), a8 (--a8-activations), bf16p (the packed BF16 KV cache), chat (a chat prompt of
 //             530-565 tokens with prefix reuse: its opener tap makes the last call a wide pair call, which must run),
 //             reproducible (--reproducible: no fast path), kv-<bf16|fp8|nvfp4|k8v4|vq2|k4v2> (that KV storage),
-//             a4 (--expert-a4-activations), a4-residual / a4-residual-3 (the expert-a4-residual candidates)
+//             a4 (--expert-a4-activations), a4-residual / a4-residual-3 (the expert-a4-residual candidates),
+//             long (48,000 tokens at max context 65,536: a 32,768-column MoE group, then a second group, which must run),
+//             cut (a system block and a user message of about 10K tokens each with prefix reuse: a walk whose chunks
+//             the structural tap cuts below the prefill chunk, grouped past the widest, which must run)
 // Every scope must carry the forward's plan (none on the lossless route, which keeps its formula).
 // Skips (77) without INFERNIX_QWEN4_ARTIFACT (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram), or
 // for dflash2 without INFERNIX_QWEN4_DFLASH2.
@@ -97,6 +100,7 @@ int check_scopes(const std::string& scenario) {
     }
     std::uint64_t widest_peak = 0, widest_given = 0, widest_planned = 0;
     double min_ratio = 1e30, max_ratio = 0.0;
+    std::uint64_t min_margin = ~std::uint64_t{0};
     for (const q4t::WideScope& s : scopes) {
         const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / (1 << 20); };
         std::printf("  %-9s %6d columns (widest call %6d): given %8.1f MiB, planned %8.1f MiB, peak %8.1f MiB", site_name(s.site),
@@ -113,6 +117,9 @@ int check_scopes(const std::string& scenario) {
         if (s.planned == 0) {
             std::printf("FAIL %s: a %d-column scope carries no plan\n", scenario.c_str(), s.columns);
             ++failures;
+        } else if (s.given < s.planned) {
+            std::printf("FAIL %s: a %d-column scope was given less than its plan\n", scenario.c_str(), s.columns);
+            ++failures;
         } else if (s.peak > s.planned) {
             std::printf("FAIL %s: a %d-column scope's peak exceeds the forward's plan\n", scenario.c_str(), s.columns);
             ++failures;
@@ -128,10 +135,12 @@ int check_scopes(const std::string& scenario) {
             min_ratio          = std::min(min_ratio, ratio);
             max_ratio          = std::max(max_ratio, ratio);
         }
+        if (s.planned >= s.peak) { min_margin = std::min(min_margin, s.planned - s.peak); }
     }
     if (max_ratio > 0.0) {
-        std::printf("%s: planned/peak over the scopes peaking at half their plan or more: %.3f to %.3f\n",
-                    scenario.c_str(), min_ratio, max_ratio);
+        std::printf("%s: planned/peak over the scopes peaking at half their plan or more: %.3f to %.3f; the smallest "
+                    "margin %llu bytes\n",
+                    scenario.c_str(), min_ratio, max_ratio, static_cast<unsigned long long>(min_margin));
     }
     std::printf("%s: %zu wide scopes; the heaviest peaked at %.1f MiB of %.1f MiB given (%.2fx)", scenario.c_str(), scopes.size(),
                 static_cast<double>(widest_peak) / (1 << 20), static_cast<double>(widest_given) / (1 << 20),
@@ -156,7 +165,8 @@ int main(int argc, char** argv) {
     constexpr std::string_view kScenarios[] = {"banks",   "tier",    "mtp",     "dflash2", "two-lanes",
                                                "scoring", "a8",      "bf16p",   "chat",    "reproducible",
                                                "kv-bf16", "kv-fp8",  "kv-nvfp4", "kv-k8v4", "kv-vq2",
-                                               "kv-k4v2", "a4",      "a4-residual", "a4-residual-3"};
+                                               "kv-k4v2", "a4",      "a4-residual", "a4-residual-3", "long",
+                                               "cut"};
     if (std::find(std::begin(kScenarios), std::end(kScenarios), scenario) == std::end(kScenarios)) {
         std::printf("unknown scenario %s\n", scenario.c_str());
         return 1;
@@ -203,6 +213,7 @@ int main(int argc, char** argv) {
             options.max_context   = 9000;
             options.prefill_chunk = 9000;
         }
+        if (scenario == "long") { options.max_context = 65536; }
         infernix::Engine engine(options);
         q4t::record_wide_scopes(true);
         if (scenario == "scoring") {
@@ -212,6 +223,25 @@ int main(int argc, char** argv) {
             infernix::PromptInput prompt = chat_prompt(engine, 530, 565);
             q4t::record_wide_scopes(true);
             (void)engine.generate(engine.prepare(std::move(prompt)), one_token(true));
+        } else if (scenario == "long") {
+            // 48,000 tokens: one walk span of two full chunks (a 32,768-column MoE group) and the rest (a second group).
+            (void)engine.generate(engine.prepare_tokens(synthetic_tokens(48000, 7)), one_token());
+        } else if (scenario == "cut") {
+            // A system block and a user message of about 10K tokens each, with prefix reuse: the system block's
+            // structural tap cuts the walk's calls below the chunk, and its MoE groups them past the widest one.
+            infernix::PromptInput input;
+            input.options.enable_thinking = false;
+            for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::User}) {
+                std::string text;
+                for (int i = 0; i < 1100; ++i) {
+                    text += "Box " + std::to_string(i) + " goes to shelf " + std::to_string((i * 7 + (role == infernix::ChatRole::User ? 3 : 0)) % 13) + ". ";
+                }
+                infernix::ChatMessage m;
+                m.role = role;
+                m.parts.push_back(infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = text});
+                input.messages.push_back(m);
+            }
+            (void)engine.generate(engine.prepare(std::move(input)), one_token(true));
         } else if (scenario == "two-lanes") {
             auto a = engine.submit(engine.prepare_tokens(synthetic_tokens(9000, 1)), one_token());
             auto b = engine.submit(engine.prepare_tokens(synthetic_tokens(9000, 2)), one_token());
@@ -226,12 +256,23 @@ int main(int argc, char** argv) {
         q4t::record_wide_scopes(false);
         std::printf("== %s\n", scenario.c_str());
         int failures = check_scopes(scenario);
-        if (scenario == "chat") {
-            const std::vector<q4t::WideScope> scopes = q4t::wide_scopes();
-            if (std::none_of(scopes.begin(), scopes.end(), [](const q4t::WideScope& s) { return s.site == q4t::WideSite::PairCall; })) {
-                std::printf("FAIL chat: the prompt ran no wide pair call\n");
-                ++failures;
-            }
+        const std::vector<q4t::WideScope> scopes = q4t::wide_scopes();
+        const auto any = [&](auto&& predicate) { return std::any_of(scopes.begin(), scopes.end(), predicate); };
+        const auto walks = [](const q4t::WideScope& s) {
+            return s.site == q4t::WideSite::WalkSpan || s.site == q4t::WideSite::WalkStep;
+        };
+        if (scenario == "chat" && !any([](const q4t::WideScope& s) { return s.site == q4t::WideSite::PairCall; })) {
+            std::printf("FAIL chat: the prompt ran no wide pair call\n");
+            ++failures;
+        }
+        if (scenario == "long" && !any([&](const q4t::WideScope& s) { return walks(s) && s.inner >= 32768; })) {
+            std::printf("FAIL long: no walk ran a 32,768-column MoE group\n");
+            ++failures;
+        }
+        if (scenario == "cut" &&
+            !any([&](const q4t::WideScope& s) { return walks(s) && s.columns < options.prefill_chunk && s.inner > s.columns; })) {
+            std::printf("FAIL cut: no walk grouped chunks cut below the prefill chunk\n");
+            ++failures;
         }
         if (failures == 0) { std::printf("wide plan checks passed\n"); }
         return failures == 0 ? 0 : 1;

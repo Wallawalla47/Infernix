@@ -1308,6 +1308,9 @@ public:
         if (!c_.lossless) {
             planner_ = execution::Forward::planner(parameters_, device_, *work_, dim(options_.max_context),
                                                    options_.fast_paths, options_.kv_cache);
+            // The chunk's wide arena by the forward's plan (the device plan's figure is the formula's, made before
+            // the parameters bound).
+            if (wide_work_ > 0) { wide_work_ = wide_need(chunk_); }
         }
 
         // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
@@ -1400,8 +1403,15 @@ public:
         if (options_.expert_cache) {
             const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
             const VramSnapshot now  = vram_->query();
+            const auto fit_start    = Clock::now();
             fit_wide_work_to_cache(size_expert_frames(now, demand).frames,
                                    size_expert_frames(nominal_snapshot(now), demand).frames);
+            // The forward's plans are made here first (Forward::plan_run and its siblings, memoized per shape).
+            diagnostic("prefill chunk fitted to the expert cache in " +
+                           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - fit_start).count()) +
+                           " ms (wide arena " + std::to_string(wide_work_ >> 20) + " MiB at " + std::to_string(chunk_) +
+                           " tokens)",
+                       DiagnosticLevel::Debug);
         }
         // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
         // records the tier keeps and the rest are read from the artifact when a round needs them.
@@ -5132,8 +5142,9 @@ private:
         std::optional<WideWork> wide;
         // A call the CPU can share (design §19.3.12) gates the stream on each layer's routing.
         StreamSpan span(*this, streamed, streamed && split_policy_ && batch * width <= split_columns());
-        wide.emplace(*this, batch * width); // its fallback allocation can fail the call (RecoverableExecutionError)
-        if (wide_active_) { wide_scope_.planned = planned_call(batch * width, chunk); }
+        // Its fallback allocation can fail the call (RecoverableExecutionError). The plan reads the split flag.
+        wide.emplace(*this, batch * width, testing::WideSite::Call,
+                     batch * width > plan_.static_columns ? planned_call(batch * width, chunk) : 0);
         forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
         if (dflash2_) { dflash2_call_context(batch, width); }
         span.end();
@@ -5200,8 +5211,9 @@ private:
     // lease also holds a layer walk's area after the ring (stream_walk_bytes_; zero when the
     // lendable frames do not cover it): the experts its frames evict widen each half by their
     // per-layer share. A walk's first call (walk_span_end, which checks the span's width) may be
-    // narrower than stream_min_columns.
-    bool stream_chunk(std::int32_t width, std::size_t walk_bytes = 0) {
+    // narrower than stream_min_columns. `walk_wide`: the walk's wide arena (its plan, with its MoE groups), when
+    // it exceeds the prompts' pending one.
+    bool stream_chunk(std::int32_t width, std::size_t walk_bytes = 0, std::size_t walk_wide = 0) {
         if (!expert_stream_ || (walk_bytes == 0 && width < stream_min_columns()) || residency_->frames() == 0) {
             return false;
         }
@@ -5229,7 +5241,7 @@ private:
             // The leases taken here go back on every way out but the last: one left loaned would keep the KV pool
             // from growing into the cache (leases_returnable) and the cache from resizing.
             ExpertResidency::LeaseHold wide, walk;
-            if (const std::size_t wide_bytes = pending_wide_bytes(width); wide_bytes > 0) {
+            if (const std::size_t wide_bytes = std::max(pending_wide_bytes(width), walk_wide); wide_bytes > 0) {
                 if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
                 wide = ExpertResidency::LeaseHold(*residency_, residency_->lend(wide_bytes, device_.stream, writers),
                                                   device_.stream);
@@ -5260,31 +5272,58 @@ private:
         return true;
     }
 
-    // The wide arena a call of `columns` needs (candidates BX-01), and the one the prefilling lanes' calls
-    // need from this call (`width` columns) on: the widest of it and every prefilling lane's remaining calls,
-    // so a short prompt no longer evicts the experts of a whole chunk's arena (the arena holds intermediates
-    // only, so no bit changes). Against a whole chunk's arena (Dense8, MTP 3, warm cache, 2026-10-24): a
-    // 1,024-token prompt then 128 tokens prefilled 1.038x and decoded 1.040x as fast (6 of 6 pairs); cold
-    // 512- and 4,096-token prompts unchanged.
-    [[nodiscard]] std::size_t wide_bytes_for(std::int32_t columns) const {
-        if (wide_work_ == 0 || columns >= chunk_) { return wide_work_; }
-        return std::min(wide_work_, workspace_bytes(c_, options_, plan_, plan_.lanes, columns));
+    // The wide arena a scope gets beyond its plan: the lease's base need not be aligned as the plan's offsets are
+    // (the builder aligns offsets, the arena addresses), which moves the arena's peak by less than its alignment.
+    static constexpr std::size_t kWideSlack = 1ULL << 20;
+    // The wide arena a call of `width` columns may need (candidates QG-01): the most of the forward's plans of the
+    // scopes such a call runs in (a chunk-major call with its MTP cells, logits and the copy-ahead's guess wherever
+    // the call is narrow enough to be gated; a layer walk's mixer steps, finish and a group of that one chunk; the
+    // DFlash2 drafter's context call), with kWideSlack. The chunk fits, the prompts' pending lease and the
+    // fallback allocation take it; a scope lends its own plan (WideWork). The lossless route keeps the formula.
+    [[nodiscard]] std::size_t wide_need(std::int32_t width) const {
+        if (!planner_) { return workspace_bytes(c_, options_, plan_, plan_.lanes, width); }
+        const std::int32_t cells = mtp_ ? width + 1 : 0;
+        const bool gate          = width <= ops::offloaded_moe::kMaxCpuCallColumns;
+        return std::max({planner_->plan_run({.columns = width, .mtp_cells = cells, .logits = true, .may_gate = gate}),
+                         planner_->plan_walk_mixer(width), planner_->plan_walk_finish(width, cells, true),
+                         planner_->plan_walk_moe(width), drafter_bytes()}) +
+               kWideSlack;
     }
+    // The wide arena the prefilling lanes' calls need from this call (`width` columns) on: the most of it and every
+    // prefilling lane's remaining calls (the last two as one pair call where its tail is short enough to pair), so a
+    // short prompt no longer evicts the experts of a whole chunk's arena (candidates BX-01: the arena holds
+    // intermediates only, so no bit changes; against a whole chunk's arena, Dense8, MTP 3, warm cache, 2026-10-24, a
+    // 1,024-token prompt then 128 tokens prefilled 1.038x and decoded 1.040x as fast, 6 of 6 pairs). A layer walk
+    // adds its MoE groups' plan when it takes its lease (walk_span_end).
     [[nodiscard]] std::size_t pending_wide_bytes(std::int32_t width) const {
         if (wide_work_ == 0) { return wide_work_; }
-        std::uint32_t widest = static_cast<std::uint32_t>(std::max(width, 0));
+        const auto need = [&](std::uint32_t columns) -> std::size_t {
+            if (columns <= static_cast<std::uint32_t>(plan_.static_columns)) { return 0; }
+            const std::size_t bytes = wide_need(static_cast<std::int32_t>(columns));
+            return planner_ ? bytes : std::min(wide_work_, bytes);
+        };
+        std::size_t most = need(static_cast<std::uint32_t>(std::max(width, 0)));
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             const Lane& lane = lanes_[i];
             if (lane.phase != Phase::Prefill) { continue; }
             // A call in flight has advanced next_call; its end is where the next call starts.
             std::uint32_t from = lane.next_call > 0 ? lane.calls[lane.next_call - 1] : lane.state_tokens;
             for (std::size_t k = lane.next_call; k < lane.calls.size(); ++k) {
-                widest = std::max(widest, lane.calls[k] - from);
-                from   = lane.calls[k];
+                most = std::max(most, need(lane.calls[k] - from));
+                // The pair call's chunks as pair_ready takes them (free cache resume only): a head and a tail of two or
+                // more tokens each.
+                const std::uint32_t tail = k + 2 == lane.calls.size() ? lane.calls[k + 1] - lane.calls[k] : 0;
+                if (planner_ && options_.free_cache_resume && tail >= 2 && tail <= static_cast<std::uint32_t>(kPairTailColumns) &&
+                    lane.calls[k] - from >= 2 &&
+                    lane.calls[k + 1] - from > static_cast<std::uint32_t>(plan_.static_columns)) {
+                    most = std::max(most, planned_pair(static_cast<std::int32_t>(lane.calls[k] - from),
+                                                       static_cast<std::int32_t>(lane.calls[k + 1] - lane.calls[k])) +
+                                              kWideSlack);
+                }
+                from = lane.calls[k];
             }
         }
-        return widest > static_cast<std::uint32_t>(plan_.static_columns) ? wide_bytes_for(static_cast<std::int32_t>(widest))
-                                                                         : 0;
+        return most;
     }
 
     // The ring (the stream lease) and the walk's area (its own lease).
@@ -5298,11 +5337,13 @@ private:
     // Forward keeps its arena reference; the arenas' contents are swapped for the call.
     class WideWork {
     public:
-        // `site`: where the scope is entered, for the wide scopes a test records (testing::record_wide_scopes).
-        WideWork(ProgramImpl& program, std::int32_t columns, testing::WideSite site = testing::WideSite::Call)
+        // `site`: where the scope is entered, for the wide scopes a test records (testing::record_wide_scopes);
+        // `planned`: the forward's plan of the scope (planned_call, planned_walk, planned_pair; 0 on the lossless
+        // route, whose arena keeps the formula). The arena holds the plan and kWideSlack.
+        WideWork(ProgramImpl& program, std::int32_t columns, testing::WideSite site, std::size_t planned)
             : program_(program) {
             if (columns > program.plan_.static_columns && program.wide_work_ > 0) {
-                program.enter_wide(columns, site);
+                program.enter_wide(columns, site, planned);
                 active_ = true;
             }
         }
@@ -5394,8 +5435,7 @@ private:
     // with a frame to spare.
     [[nodiscard]] std::int32_t chunk_lent_by(std::int32_t limit, const ExpertResidency::LendCapacity& lends) const {
         return widest_fitting_chunk(limit, [&](std::int32_t chunk) {
-            return lends.pitch != 0 &&
-                   (workspace_bytes(c_, options_, plan_, plan_.lanes, chunk) + lends.pitch - 1) / lends.pitch < lends.frames;
+            return lends.pitch != 0 && (wide_need(chunk) + lends.pitch - 1) / lends.pitch < lends.frames;
         });
     }
 
@@ -5424,10 +5464,23 @@ private:
             smallest_chunk_ = std::min(smallest_chunk_, nominal_chunk_);
         }
         chunk_     = options_.free_cache_resume ? chunk_lent_by(chunk_, now) : smallest_chunk_;
-        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        wide_work_ = chunk_ > plan_.static_columns ? wide_need(chunk_) : 0;
         const bool nominal_binds = options_.reproducible && chunk_ == nominal_chunk_;
         const auto& lent         = options_.free_cache_resume ? now : nominal_binds ? nominal_lends : smallest;
+        // Without free cache resume the chunk never moves, nor do a walk's MoE groups: their budget is what this
+        // cache lends at its smallest (or nominal) beside a full span's walk area, the ring's least and a frame.
+        if (!options_.free_cache_resume) { walk_budget_ = walk_room(lent.frames * lent.pitch); }
         return lent.frames * lent.pitch;
+    }
+    // What a walk's MoE groups may plan out of `lendable` bytes: a kWalkMoeColumns group's plan at most, beside a full
+    // span's walk area, the ring's least and a frame to spare.
+    [[nodiscard]] std::size_t walk_room(std::uint64_t lendable) const {
+        if (!planner_ || residency_->frames() == 0) { return 0; }
+        const std::uint64_t reserve = walk_bytes(kWalkMaxTokens, static_cast<std::size_t>(kWalkMaxTokens) /
+                                                                     static_cast<std::size_t>(std::max(chunk_, 1)) + 2) +
+                                      (2ULL * (kStreamHalfMin + 1) + 1) * plan_.record_stride +
+                                      residency_->lend_pitch() + kWideSlack;
+        return std::min<std::size_t>(planner_->plan_walk_moe(kWalkMoeColumns), lendable > reserve ? lendable - reserve : 0);
     }
 
     // The reproducible route's nominal launch (expert_offload::nominal_snapshot); without the launch's
@@ -5450,14 +5503,14 @@ private:
         const std::size_t need       = pending_wide_bytes(0);
         if (need == 0 || need + pitch <= lendable) { return; }
         const std::int32_t chunk = widest_fitting_chunk(chunk_, [&](std::int32_t width) {
-            return workspace_bytes(c_, options_, plan_, plan_.lanes, width) + pitch <= lendable;
+            return wide_need(width) + pitch <= lendable;
         });
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) +
                        " for the prompts in progress: the expert cache can lend " + std::to_string(lendable >> 20) +
                        " MiB now",
                    DiagnosticLevel::Debug);
         chunk_     = chunk;
-        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        wide_work_ = chunk_ > plan_.static_columns ? wide_need(chunk_) : 0;
         std::vector<std::uint32_t> cuts;
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             Lane& lane = lanes_[i];
@@ -5495,27 +5548,34 @@ private:
         const std::uint64_t pitch    = residency_->lend_pitch();
         const std::uint64_t lendable = residency_->lendable_bytes();
         const std::int32_t chunk     = widest_fitting_chunk(loaded_chunk_, [&](std::int32_t width) {
-            return workspace_bytes(c_, options_, plan_, plan_.lanes, width) + pitch + reserved <= lendable;
+            return wide_need(width) + pitch + reserved <= lendable;
         });
         if (chunk == chunk_) { return; }
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) + ": the expert cache can lend " +
                        std::to_string(lendable >> 20) + " MiB now",
                    DiagnosticLevel::Debug);
         chunk_     = chunk;
-        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        wide_work_ = chunk_ > plan_.static_columns ? wide_need(chunk_) : 0;
     }
 
-    void enter_wide(std::int32_t columns, testing::WideSite site = testing::WideSite::Call) {
+    void enter_wide(std::int32_t columns, testing::WideSite site, std::size_t planned) {
         DeviceSpan span{};
-        // This call's need, and a lease for the prefilling lanes' remaining calls (one too small for this
-        // call is lent again).
-        const std::size_t need = wide_bytes_for(columns);
+        // This scope's need (its plan with kWideSlack; on the lossless route the formula's for its columns), and a
+        // lease for the prefilling lanes' remaining calls (one too small for this scope is lent again).
+        const std::size_t need =
+            planner_ ? planned + kWideSlack
+                     : (columns >= chunk_ ? wide_work_
+                                          : std::min(wide_work_, workspace_bytes(c_, options_, plan_, plan_.lanes, columns)));
         if (stream_lease_.valid() && stream_wide_bytes_ >= need) {
             span = {stream_wide_lease_.memory.data, need};
         } else {
             if (work_lease_.valid() && work_lease_.memory.bytes < need) {
                 residency_->give_back(work_lease_, device_.stream);
                 work_lease_ = {};
+            }
+            if (wide_fallback_.p != nullptr && wide_fallback_.bytes < need) {
+                device_.synchronize(); // the earlier calls' kernels may still read it
+                wide_fallback_ = DeviceBuffer{};
             }
             if (!work_lease_.valid() && wide_fallback_.p == nullptr) {
                 const std::size_t lend = std::max(need, pending_wide_bytes(columns));
@@ -5524,27 +5584,26 @@ private:
                     work_lease_ = residency_->lend(lend, device_.stream, writers);
                 } else {
                     diagnostic("the prefill workspace could not be lent from the expert cache; " +
-                                   std::to_string(wide_work_ >> 20) + " MiB are allocated for the prompt",
+                                   std::to_string(lend >> 20) + " MiB are allocated for the prompt",
                                DiagnosticLevel::Warning);
                     // The cache shrank under VRAM pressure: a failed allocation fails this prompt's
                     // requests, not the Engine.
                     try {
-                        wide_fallback_ = DeviceBuffer(wide_work_);
+                        wide_fallback_ = DeviceBuffer(lend);
                     } catch (const std::exception& error) {
                         throw runtime::RecoverableExecutionError(
-                            "the prefill workspace (" + std::to_string(wide_work_ >> 20) +
+                            "the prefill workspace (" + std::to_string(lend >> 20) +
                             " MiB) could neither be lent from the expert cache nor allocated (" + error.what() +
                             "); a smaller --prefill-chunk needs less");
                     }
                 }
             }
-            span = work_lease_.valid() ? DeviceSpan{work_lease_.memory.data, need}
-                                       : DeviceSpan{wide_fallback_.p, wide_work_};
+            span = work_lease_.valid() ? DeviceSpan{work_lease_.memory.data, need} : DeviceSpan{wide_fallback_.p, need};
         }
         wide_arena_ = std::make_unique<WorkspaceArena>(span);
         std::swap(*work_, *wide_arena_);
         wide_active_ = true;
-        wide_scope_  = testing::WideScope{.site = site, .columns = columns, .inner = columns};
+        wide_scope_  = testing::WideScope{.site = site, .columns = columns, .inner = columns, .planned = planned};
     }
 
     // ---- the wide workspace's plan (candidates QG-01) ----
@@ -5559,19 +5618,35 @@ private:
     }
     // A chunk-major call (run()): its MTP chunk's cells, the logits of its last column, and the copy-ahead's guess
     // where the call is gated (split_call_).
-    [[nodiscard]] std::size_t planned_call(std::int32_t columns, const execution::MtpChunk* chunk) {
+    [[nodiscard]] std::size_t planned_call(std::int32_t columns, const execution::MtpChunk* chunk) const {
         if (!planner_) { return 0; }
         const std::int32_t cells = chunk != nullptr ? (chunk->prepend ? 1 : 0) + chunk->columns : 0;
         return std::max(planner_->plan_run({.columns = columns, .mtp_cells = cells, .logits = true, .may_gate = split_call_}),
                         drafter_bytes());
     }
     // The pair call (pair_step): run_split's head and tail, and the drafter's context calls inside its scope.
-    [[nodiscard]] std::size_t planned_pair(std::int32_t head, std::int32_t tail) {
+    [[nodiscard]] std::size_t planned_pair(std::int32_t head, std::int32_t tail) const {
         if (!planner_) { return 0; }
         return std::max(planner_->plan_split(head, tail), drafter_bytes());
     }
     // The layer walk's span (prefill_walk.cpp): its widest chunk's mixer steps and finish, and its widest MoE group.
-    [[nodiscard]] std::size_t planned_walk();
+    [[nodiscard]] std::size_t planned_walk() const;
+    // The same plan for a span of chunks of these widths grouped as walk_groups groups them (`cells`: the MTP cells
+    // its finish may write).
+    [[nodiscard]] std::size_t planned_walk(std::span<const std::int32_t> widths,
+                                           std::span<const std::pair<std::size_t, std::size_t>> groups,
+                                           std::int32_t cells) const;
+    // A layer walk's MoE groups (design §19.3.29): consecutive chunks of at least kStreamMinColumns while their
+    // columns fit kWalkMoeColumns and the group's plan fits `budget`; a chunk too narrow to stream (the prompt's last,
+    // walk_span_end) is a group of its own, so its router takes the chunk-major call's form (router-mma acts on calls
+    // of kRouterMmaMinColumns or more). Groups of one chunk whatever their plan: the walk needs that much anyway.
+    [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> walk_groups(std::span<const std::int32_t> widths,
+                                                                               std::size_t budget) const;
+    // The bytes a walk's MoE groups may plan: on the reproducible route a figure fixed when the chunk is fitted (the
+    // nominal cache's, walk_budget_), so a request's groups depend on nothing but its calls; elsewhere the plan of a
+    // kWalkMoeColumns group, as far as the expert cache can lend beside a frame to spare now.
+    [[nodiscard]] std::size_t walk_budget() const;
+    std::size_t walk_budget_ = 0; // the reproducible route's (fit_wide_work_to_cache)
 
     void leave_wide() noexcept {
         std::swap(*work_, *wide_arena_);
@@ -7998,6 +8073,8 @@ private:
 
     [[nodiscard]] std::size_t walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept;
     std::size_t walk_span_end(const Lane& lane, std::uint32_t index);
+    // The budget walk_span_end grouped the span's MoE by (walk_groups), which walk_begin groups it by again.
+    std::size_t walk_span_budget_ = 0;
     void walk_begin(Lane& lane, std::uint32_t index, std::size_t end);
     PrefillProgress walk_step(Lane& lane, std::uint32_t index, Clock::time_point start);
     // The pair call (design §19.3.1, the zero-split tap): the prompt's last two calls, a call too narrow

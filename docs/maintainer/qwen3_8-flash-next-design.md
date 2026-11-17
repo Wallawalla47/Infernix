@@ -8614,7 +8614,9 @@ the drive's knee) remains open.
   - **MoE groups (2026-10-12).** The walk runs each layer in two halves: `layer_mixer` per chunk
     (everything before the MoE; its input and inject weights go to the span area), then
     `layer_moe` once over a group of consecutive chunks (up to `kWalkMoeColumns` = 32,768 columns
-    since 2026-10-19, 16,384 before, and what the active arena holds, `Forward::moe_workspace_bytes`).
+    since 2026-10-19, 16,384 before, and as far as the group's plan, `Forward::plan_walk_moe`, fits the walk's
+    budget: what the expert cache can lend now beside the walk area and the ring, or on the reproducible route a
+    figure fixed when the chunk is fitted; the span's wide arena is lent for its groups, §19.3.7).
     Every MoE step acts column by column, so the outputs are the chunk-major ones; the expert calls
     see 2-8x the columns (the IQ3_S expert tiles run 33-50 % more effective TOPS at 16,384 tokens
     than at 4,096, and 7-14 % more again at 32,768; §19.3.29). The route log keeps the group's last
@@ -8957,6 +8959,47 @@ end-to-end effect is not measured yet.
 - The ~40K prompt's ids are identical in all three runs.
 - The tg512 and pp16384 differences are within one run's spread at this short context, so they
   are not claimed as gains.
+
+**Sizing by the forward's plan (2026-11-17).** The wide arena was sized by `Forward::workspace_bytes`, a sum of
+every buffer a call could hold, 2.0-3.9 times what a call uses (FP4-Local, a 16,384-token walk: 2,632 MiB peak in
+a 7,792 MiB arena). It is now the forward's own plan:
+- The prefill steps (`run`, `run_split`, `embed`, the layer and its mixer and MoE halves, `finish`, the MTP block's
+  K/V-only form) are templates on an allocator: `WorkspaceArena` runs them, `WorkspaceLayoutBuilder` places their
+  allocations and runs nothing. Every allocation's guard reads the parameters, the fast paths, the KV storage or the
+  call's shape (`CallShape`, `FinishShape`, `AttentionShape`); an Op's scratch is its capacity query.
+- A planner `Forward` (`Forward::planner`: no state, KV or experts) is built from the parameters before the chunk is
+  fitted at load, and memoizes `plan_run`, `plan_split`, `plan_walk_mixer`, `plan_walk_moe` and `plan_walk_finish` per
+  shape. The lossless route keeps the formula.
+- Each wide scope lends its own plan and 1 MiB (`kWideSlack`: the lease's base need not be aligned as the plan's
+  offsets are): a chunk-major call's, the pair call's (with the DFlash2 drafter's context call), a walk's (its widest
+  chunk's steps and its MoE groups). The chunk fits, the prompts' pending lease and the fallback allocation take
+  `wide_need(width)`, the most of a width's scopes.
+- A walk's MoE groups are formed before its lease is taken, by a budget: what the cache can lend now beside the walk
+  area and the ring, or on the reproducible route a figure fixed when the chunk is fitted, so a request's groups
+  depend only on its calls. A span of chunks the static arena holds groups by that arena.
+- `infernix_qwen4_exp_wide_plan_real_test` checks every scope against its plan (six artifacts, every KV storage,
+  MTP, DFlash2, scoring, two lanes, the A4 and A8 routes, `--reproducible`, a pair call, a 32,768-column group, chunks
+  cut below the prefill chunk). Planned against peak, over the scopes that run their whole plan: 1.000-1.003 on
+  FP4-Local's default route; up to 1.03 where the projections' capacity queries cover f16-accumulate-prefill's scratch
+  that the call does not take (`--reproducible`, BF16 KV), a constant ~60 MiB on IQ3_S's `--a8-activations` (the GGUF
+  planes), 1.15-1.18 on Dense8 (an Op's capacity query past its route; not traced to the Op).
+
+| RTX 5090, INT8 KV, chunk 16384, plain decode | Arena or lease (MiB) | pp32768 (tok/s) | tg256 after it | pp4096 | tg256 after it |
+|---|---:|---:|---:|---:|---:|
+| FP4-Local, sum formula | 7,792 | 12,503 | 104.5 | 2,769 | 127.4 |
+| FP4-Local, plan | 3,944 lease, 2,636 a walk scope | 12,562 (+0.5 %) | 112.3 (+7.4 %) | 2,826 (+2.1 %) | 129.7 (+1.8 %) |
+| IQ3_S, sum formula | under 5,804 (16,384 needed 6,998; chunk cut to 13,440) | 8,326 | 110.4 | 3,309 | 103.7 |
+| IQ3_S, plan | 3,336 lease, 2,143 a walk scope (chunk 16,384) | 8,393 (+0.8 %) | 114.4 (+3.6 %) | 3,367 (+1.8 %) | 104.6 (+0.9 %) |
+
+- `infernix_bench -pg P,256 -r 3 --warmup 1`, two runs an arm rotated A B B A, every B run above every A run; the
+  merged tree before and after the change (48e11c33 against its successor). The decode after a long prompt gains most:
+  fewer experts are evicted for the prefill's loan.
+- Bits: the replies of the planner built in shadow equal the build before it on the reproducible route (FP4-Local,
+  IQ3_S, Dense8) and the default route (plain, MTP, DFlash2; FP4-Local). With the loans by the plan, FP4-Local and
+  Dense8 reply the same on the reproducible route; IQ3_S's prefill chunk now fits at 16,384 where the formula cut it
+  (11,008 on that launch), which moves its call grid: one of six prompts replied otherwise (16,565 tokens).
+- The pending lease is the most any remaining call may need, a chunk-major call's (FP4-Local 3,944 MiB at 16,384),
+  though a walk's scopes use less (2,636 MiB).
 
 #### VRAM item 2: the ~1.6 GB "in use before loading" (2026-10-05)
 

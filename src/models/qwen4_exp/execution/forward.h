@@ -366,10 +366,6 @@ public:
     // residual columns (BF16 [S*H, n]) into that tap's rows of `features` (BF16 [taps * H, n], any
     // column pitch); layer() applies it to ForwardBatch::draft_features, a layer walk to its spans.
     void capture_draft_features(std::uint32_t layer, const Tensor& residual, const Tensor& features);
-    // Workspace of one layer_moe call over `columns` columns, with the W4A16 experts' wide route
-    // `wide_a16` (the expert-a4-residual layout is larger: Forward::moe carves it when selected).
-    [[nodiscard]] static std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t columns,
-                                                         ops::offloaded_moe::WideA16 wide_a16);
 
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);

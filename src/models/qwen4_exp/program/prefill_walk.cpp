@@ -102,6 +102,36 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         tokens.push_back(total);
     }
     if (end - first < 2) { return first; }
+    // The span's MoE groups and the wide arena they plan, decided before its lease is taken (walk_begin groups the
+    // span again by the same budget). Off the fixed budget (free cache resume), a held lease too small for them first
+    // groups the span within it.
+    std::vector<std::int32_t> widths;
+    for (std::size_t i = 1; i < tokens.size(); ++i) { widths.push_back(static_cast<std::int32_t>(tokens[i] - tokens[i - 1])); }
+    const std::int32_t cells = mtp_ ? *std::max_element(widths.begin(), widths.end()) + 1 : 0;
+    const auto span_need     = [&](std::size_t budget) {
+        walk_span_budget_ = budget;
+        return planner_ ? planned_walk(widths, walk_groups(widths, budget), cells) + kWideSlack : std::size_t{0};
+    };
+    // A span of chunks the static arena holds (none past its columns) opens no wide scope: its groups' MoE runs in the
+    // static arena, so they are grouped by its capacity and lend nothing.
+    const bool narrow     = *std::max_element(widths.begin(), widths.end()) <= plan_.static_columns;
+    std::size_t walk_wide = 0;
+    if (narrow) {
+        (void)span_need(work_capacity_); // sets the groups' budget
+    } else {
+        walk_wide = span_need(walk_budget());
+    }
+    if (!narrow && stream_lease_.valid() && walk_wide > stream_wide_bytes_) {
+        const std::size_t held = options_.free_cache_resume && stream_wide_bytes_ > kWideSlack
+                                     ? span_need(stream_wide_bytes_ - kWideSlack)
+                                     : walk_wide;
+        if (held <= stream_wide_bytes_) {
+            walk_wide = held;
+        } else {
+            walk_wide = span_need(walk_budget());
+            return_stream_lease(); // between calls nothing reads it: it is lent again with room for the span
+        }
+    }
     if (stream_lease_.valid() && walk_bytes(tokens[2], 2) > stream_walk_bytes_) {
         // Between calls nothing reads the lease; its frames go back and come out again with the area.
         return_stream_lease();
@@ -112,7 +142,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         const std::uint32_t remaining = std::min(lane.prefill_end - lane.state_tokens, kWalkMaxTokens);
         const std::size_t chunks      = remaining / static_cast<std::uint32_t>(chunk_) + 2;
         if (!stream_chunk(static_cast<std::int32_t>(lane.calls[first] - lane.state_tokens),
-                          walk_bytes(remaining, chunks))) {
+                          walk_bytes(remaining, chunks), walk_wide)) {
             return first;
         }
     }
@@ -140,23 +170,9 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.io_stride      = walk_align(io_layout_.bytes);
     walk_.residual_bytes = walk_align(2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(offset));
     walk_.moe_offset     = walk_.residual_bytes + n * walk_.io_stride;
-    // MoE groups: consecutive chunks while their columns fit kWalkMoeColumns and the arena the calls
-    // run in (WideWork of the span's widest chunk: the wide arena when it exceeds the static one's). A
-    // chunk too narrow to stream (the prompt's last, walk_span_end) is a group of its own, so its router
-    // takes the chunk-major call's form (router-mma acts on calls of kRouterMmaMinColumns or more).
+    // MoE groups (walk_groups), by the budget walk_span_end planned the span's wide arena with.
     const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
-    const std::size_t arena   = widest > plan_.static_columns && wide_work_ > 0 ? wide_work_ : plan_.work;
-    for (std::size_t c = 0; c < n;) {
-        std::size_t e       = c + 1;
-        std::int32_t columns = walk_.widths[c];
-        while (e < n && walk_.widths[e] >= kStreamMinColumns && columns + walk_.widths[e] <= kWalkMoeColumns &&
-               execution::Forward::moe_workspace_bytes(c_, columns + walk_.widths[e], wide_a16(options_)) <= arena) {
-            columns += walk_.widths[e];
-            ++e;
-        }
-        walk_.groups.emplace_back(c, e);
-        c = e;
-    }
+    walk_.groups              = walk_groups(walk_.widths, walk_span_budget_);
     walk_.layers_per_step =
         static_cast<std::uint32_t>((c_.num_hidden_layers + n - 1) / n); // about one call's work per step
     walk_.mtp.assign(n, std::nullopt);
@@ -240,9 +256,8 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         }
         // The chunk's embedding and first layer run while the host stages the next chunk (its MoE
         // once its group's last chunk is staged).
-        const WideWork wide(*this, widest, testing::WideSite::WalkSpan);
+        const WideWork wide(*this, widest, testing::WideSite::WalkSpan, planned_walk());
         wide_scope_.inner = std::max(widest, walk_widest_group());
-        if (wide_active_) { wide_scope_.planned = planned_walk(); }
         walk_mixer(c, 0);
         for (std::size_t g = 0; g < walk_.groups.size(); ++g) {
             if (walk_.groups[g].second == c + 1) { walk_moe(g, 0); }
@@ -366,17 +381,51 @@ void ProgramImpl::walk_mixer(std::size_t c, std::uint32_t l) {
     walk_capture(c, l); // the layer's state (the MoE writes none) at the chunk's end
 }
 
-std::size_t ProgramImpl::planned_walk() {
-    if (!planner_) { return 0; }
-    // Every step begins its call (begin_call resets the arena): a chunk's embedding and layer mixers, a group's MoE,
-    // a chunk's finish (its MTP cells, and the logits of the prompt's last chunk).
-    const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
-    std::int32_t cells        = 0;
+std::size_t ProgramImpl::planned_walk() const {
+    std::int32_t cells = 0;
     for (const auto& chunk : walk_.mtp) {
         if (chunk) { cells = std::max(cells, (chunk->prepend ? 1 : 0) + chunk->columns); }
     }
-    return std::max({planner_->plan_walk_mixer(widest), planner_->plan_walk_moe(walk_widest_group()),
-                     planner_->plan_walk_finish(widest, cells, true)});
+    return planned_walk(walk_.widths, walk_.groups, cells);
+}
+
+std::size_t ProgramImpl::planned_walk(std::span<const std::int32_t> widths,
+                                      std::span<const std::pair<std::size_t, std::size_t>> groups,
+                                      std::int32_t cells) const {
+    if (!planner_ || widths.empty()) { return 0; }
+    // Every step begins its call (begin_call resets the arena): a chunk's embedding and layer mixers, a group's MoE,
+    // a chunk's finish (its MTP cells, and the logits of the prompt's last chunk).
+    const std::int32_t widest = *std::max_element(widths.begin(), widths.end());
+    std::size_t most = std::max(planner_->plan_walk_mixer(widest), planner_->plan_walk_finish(widest, cells, true));
+    for (const auto& [first, end] : groups) {
+        std::int32_t columns = 0;
+        for (std::size_t c = first; c < end; ++c) { columns += widths[c]; }
+        if (columns > 0) { most = std::max(most, planner_->plan_walk_moe(columns)); }
+    }
+    return most;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> ProgramImpl::walk_groups(std::span<const std::int32_t> widths,
+                                                                          std::size_t budget) const {
+    std::vector<std::pair<std::size_t, std::size_t>> groups;
+    const std::size_t n = widths.size();
+    for (std::size_t c = 0; c < n;) {
+        std::size_t e        = c + 1;
+        std::int32_t columns = widths[c];
+        while (planner_ && e < n && widths[e] >= kStreamMinColumns && columns + widths[e] <= kWalkMoeColumns &&
+               planner_->plan_walk_moe(columns + widths[e]) <= budget) {
+            columns += widths[e];
+            ++e;
+        }
+        groups.emplace_back(c, e);
+        c = e;
+    }
+    return groups;
+}
+
+std::size_t ProgramImpl::walk_budget() const {
+    if (!options_.free_cache_resume) { return walk_budget_; }
+    return walk_room(residency_->lendable_bytes());
 }
 
 std::int32_t ProgramImpl::walk_widest_group() const noexcept {
@@ -554,9 +603,8 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         const nvtx::ScopedRange step_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                            static_cast<std::uint64_t>(tokens));
         const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
-        const WideWork wide(*this, widest, testing::WideSite::WalkStep);
+        const WideWork wide(*this, widest, testing::WideSite::WalkStep, planned_walk());
         wide_scope_.inner = std::max(widest, walk_widest_group());
-        if (wide_active_) { wide_scope_.planned = planned_walk(); }
         walk_enqueue(to);
     }
     ++walk_.steps;
@@ -708,8 +756,7 @@ PrefillProgress ProgramImpl::pair_step(Lane& lane, std::uint32_t index, Clock::t
         settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s);
         split_call_ = false;
-        const WideWork wide(*this, T, testing::WideSite::PairCall);
-        if (wide_active_) { wide_scope_.planned = planned_pair(w0, w1); }
+        const WideWork wide(*this, T, testing::WideSite::PairCall, T > plan_.static_columns ? planned_pair(w0, w1) : 0);
         require_tier_round();
 
         execution::ForwardBatch head = io_batch(static_cast<std::byte*>(io_device_.p), 1, w0, 1);

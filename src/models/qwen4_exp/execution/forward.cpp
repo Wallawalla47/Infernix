@@ -798,21 +798,6 @@ std::int32_t Forward::last_layer_kept(std::int32_t columns) const noexcept {
     return kept < columns ? kept : 0;
 }
 
-std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t columns,
-                                         ops::offloaded_moe::WideA16 wide_a16) {
-    const std::size_t t = static_cast<std::size_t>(columns);
-    const std::size_t h = c.hidden_size, k = c.moe.top_k;
-    std::size_t bytes = (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4; // router logits, routing
-    bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
-    bytes += h * k * t * 2 + ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts), dim(k * t), std::max(columns, 1),
-                                                             expert_activation(c), wide_a16);
-    bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * 2 * 3 + h * t * 2 * 2; // shared expert, y
-    if (c.ggml_weights) { // the shared expert's projections encode their inputs
-        bytes += ops::ggml_linear_workspace_bytes(dim(h), std::max(columns, 1)) +
-                 ops::ggml_linear_workspace_bytes(dim(c.moe.shared_intermediate), std::max(columns, 1));
-    }
-    return bytes + (16ULL << 20); // alignment slack
-}
 
 void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits) {
     finish_impl(work_, &batch, finish_shape(batch, logits), residual, logits);

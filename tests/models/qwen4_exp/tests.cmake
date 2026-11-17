@@ -240,7 +240,7 @@ infernix_add_test(infernix_qwen4_exp_wide_plan_real_test
   LIBRARIES infernix_engine
   ARGS banks)
 foreach(scenario IN ITEMS tier mtp dflash2 two-lanes scoring a8 bf16p chat reproducible kv-bf16 kv-fp8 kv-nvfp4
-                          kv-k8v4 kv-vq2 kv-k4v2 a4 a4-residual a4-residual-3)
+                          kv-k8v4 kv-vq2 kv-k4v2 a4 a4-residual a4-residual-3 long cut)
   add_test(NAME infernix_qwen4_exp_wide_plan_${scenario}_real_test COMMAND infernix_qwen4_exp_wide_plan_real_test ${scenario})
   list(APPEND infernix_qwen4_exp_wide_plan_tests infernix_qwen4_exp_wide_plan_${scenario}_real_test)
 endforeach()
