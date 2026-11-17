@@ -10,10 +10,14 @@
 //   SCENARIO: banks (the experts in RAM as banks), tier (the SSD tier: INFERNIX_EXPERT_RAM_MIB, default 30000),
 //             mtp, dflash2 (INFERNIX_QWEN4_DFLASH2 names the drafter companion), two-lanes (two prompts at once),
 //             scoring (CausalScoring), a8 (--a8-activations), bf16p (the packed BF16 KV cache), chat (a chat prompt of
-//             530-565 tokens with prefix reuse: its opener tap makes the last call a wide pair call, which must run)
+//             530-565 tokens with prefix reuse: its opener tap makes the last call a wide pair call, which must run),
+//             reproducible (--reproducible: no fast path), kv-<bf16|fp8|nvfp4|k8v4|vq2|k4v2> (that KV storage),
+//             a4 (--expert-a4-activations), a4-residual / a4-residual-3 (the expert-a4-residual candidates)
+// Every scope must carry the forward's plan (none on the lossless route, which keeps its formula).
 // Skips (77) without INFERNIX_QWEN4_ARTIFACT (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram), or
 // for dflash2 without INFERNIX_QWEN4_DFLASH2.
 
+#include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "infernix/engine.h"
 
@@ -92,6 +96,7 @@ int check_scopes(const std::string& scenario) {
         return 1;
     }
     std::uint64_t widest_peak = 0, widest_given = 0, widest_planned = 0;
+    double min_ratio = 1e30, max_ratio = 0.0;
     for (const q4t::WideScope& s : scopes) {
         const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / (1 << 20); };
         std::printf("  %-9s %6d columns (widest call %6d): given %8.1f MiB, planned %8.1f MiB, peak %8.1f MiB", site_name(s.site),
@@ -105,7 +110,10 @@ int check_scopes(const std::string& scenario) {
             std::printf("FAIL %s: a %d-column scope's peak exceeds its arena\n", scenario.c_str(), s.columns);
             ++failures;
         }
-        if (s.planned > 0 && s.peak > s.planned) {
+        if (s.planned == 0) {
+            std::printf("FAIL %s: a %d-column scope carries no plan\n", scenario.c_str(), s.columns);
+            ++failures;
+        } else if (s.peak > s.planned) {
             std::printf("FAIL %s: a %d-column scope's peak exceeds the forward's plan\n", scenario.c_str(), s.columns);
             ++failures;
         }
@@ -114,6 +122,16 @@ int check_scopes(const std::string& scenario) {
             widest_given   = s.given;
             widest_planned = s.planned;
         }
+        // The plan's slack over the heavier scopes (a narrow chunk's scope inside a wide span peaks far below it).
+        if (s.planned > 0 && s.peak * 2 >= s.planned) {
+            const double ratio = static_cast<double>(s.planned) / static_cast<double>(s.peak);
+            min_ratio          = std::min(min_ratio, ratio);
+            max_ratio          = std::max(max_ratio, ratio);
+        }
+    }
+    if (max_ratio > 0.0) {
+        std::printf("%s: planned/peak over the scopes peaking at half their plan or more: %.3f to %.3f\n",
+                    scenario.c_str(), min_ratio, max_ratio);
     }
     std::printf("%s: %zu wide scopes; the heaviest peaked at %.1f MiB of %.1f MiB given (%.2fx)", scenario.c_str(), scopes.size(),
                 static_cast<double>(widest_peak) / (1 << 20), static_cast<double>(widest_given) / (1 << 20),
@@ -135,7 +153,10 @@ int main(int argc, char** argv) {
         return 77;
     }
     const std::string scenario = argc > 1 ? argv[1] : "banks";
-    constexpr std::string_view kScenarios[] = {"banks", "tier", "mtp", "dflash2", "two-lanes", "scoring", "a8", "bf16p", "chat"};
+    constexpr std::string_view kScenarios[] = {"banks",   "tier",    "mtp",     "dflash2", "two-lanes",
+                                               "scoring", "a8",      "bf16p",   "chat",    "reproducible",
+                                               "kv-bf16", "kv-fp8",  "kv-nvfp4", "kv-k8v4", "kv-vq2",
+                                               "kv-k4v2", "a4",      "a4-residual", "a4-residual-3"};
     if (std::find(std::begin(kScenarios), std::end(kScenarios), scenario) == std::end(kScenarios)) {
         std::printf("unknown scenario %s\n", scenario.c_str());
         return 1;
@@ -172,6 +193,11 @@ int main(int argc, char** argv) {
         }
         if (scenario == "a8") { options.a8_activations = true; }
         if (scenario == "bf16p") { options.kv_cache = infernix::KvCacheStorage::Bf16Packed; }
+        if (scenario == "reproducible") { options.fast_paths = false; }
+        if (scenario.starts_with("kv-")) { options.kv_cache = infernix::test::parse_kv_cache_storage(scenario.substr(3)); }
+        if (scenario == "a4") { options.expert_a4_activations = true; }
+        if (scenario == "a4-residual") { options.fast_path_candidates = {infernix::FastPath::ExpertA4Residual}; }
+        if (scenario == "a4-residual-3") { options.fast_path_candidates = {infernix::FastPath::ExpertA4Residual3}; }
         if (scenario == "scoring") {
             options.purpose       = infernix::EnginePurpose::CausalScoring;
             options.max_context   = 9000;

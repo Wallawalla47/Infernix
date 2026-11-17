@@ -22,9 +22,11 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <vector>
 
 namespace infernix::models::qwen4_exp::execution {
@@ -390,12 +392,111 @@ public:
                                                          std::int32_t draft_columns, std::int32_t vocabulary_rows,
                                                          std::int32_t max_context, KvCacheStorage storage);
 
+    // ---- the wide workspace's plan (candidates QG-01; design §19.3.7) ----
+    // A prefill call wider than the Program's static arena runs in an arena lent from the expert frames. Its plan is
+    // the arena's peak over the call's steps, found by running their own allocation code on a WorkspaceLayoutBuilder
+    // (nothing launches) from the parameters, the fast paths and the KV storage alone, so it holds whatever the
+    // Program's state, cache or stream: every allocation's guard reads those or the planned call's shape. Prefill
+    // steps only (one sequence of two or more columns, no verification); not the lossless route. A planner
+    // (Forward::planner) is built before the Program's state and expert cache exist and plans only; each result is
+    // memoized per shape.
+    struct PrefillPlan {
+        std::int32_t columns   = 0;
+        std::int32_t mtp_cells = 0;     // the MTP cells its finish writes (0: none)
+        bool logits            = true;  // its finish writes the logits of its last column
+        bool may_gate          = false; // a gated streamed call: its MoE also routes the copy-ahead's guess
+    };
+    // run(): a chunk-major call.
+    [[nodiscard]] std::size_t plan_run(const PrefillPlan& call);
+    // run_split(): a pair call of a `head`- and a `tail`-column chunk.
+    [[nodiscard]] std::size_t plan_split(std::int32_t head, std::int32_t tail);
+    // A layer walk's steps: a chunk's embedding and every layer's layer_mixer; every layer's layer_moe over a group
+    // of `columns` columns; a chunk's finish.
+    [[nodiscard]] std::size_t plan_walk_mixer(std::int32_t columns);
+    [[nodiscard]] std::size_t plan_walk_moe(std::int32_t columns);
+    [[nodiscard]] std::size_t plan_walk_finish(std::int32_t columns, std::int32_t mtp_cells, bool logits);
+    [[nodiscard]] static std::unique_ptr<Forward> planner(const Parameters& parameters, DeviceContext& device,
+                                                          WorkspaceArena& work, std::int32_t max_context,
+                                                          ForwardFastPaths fast_paths, KvCacheStorage storage);
+
 private:
+    struct PlanOnly {};
+    // A planner: the parameters, fast paths and KV storage; no state, KV or experts (plans read none).
+    Forward(PlanOnly, const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, std::int32_t max_context,
+            ForwardFastPaths fast_paths, KvCacheStorage storage);
+    // A call's shape as its workspace allocations see it: what decides them besides the parameters, the fast paths
+    // and the KV storage. Run mode derives it from the batch (call_shape), a plan from the planned call.
+    struct CallShape {
+        std::int32_t batch    = 1;
+        std::int32_t width    = 0;
+        bool verify           = false;
+        bool bf16_rows        = false; // BF16 n-gram rows, read in place (no decoded embedding)
+        bool trim_last_layer  = false; // ForwardBatch::trim_last_layer
+        bool may_gate         = false; // plans: PrefillPlan::may_gate (run mode routes the guess when its stream says)
+    };
+    [[nodiscard]] CallShape call_shape(const ForwardBatch& batch) const;
+    // finish()'s shape: the MTP cells it writes (0: none) and the logit columns (0: no logits).
+    struct FinishShape {
+        std::int32_t mtp_cells     = 0;
+        std::int32_t logit_columns = 0;
+        bool screened_head         = false;
+    };
+    // An attention call's shape (AttentionCall's, and the KV storage).
+    struct AttentionShape {
+        std::int32_t batch = 1;
+        std::int32_t width = 0;
+        bool kv_only       = false;
+        bool key_records   = false;
+        KvCacheStorage storage{};
+    };
+    // The routed experts' wide route for this layer's bank (moe's, one expression for run and plan).
+    [[nodiscard]] ops::offloaded_moe::WideA16 expert_wide_a16(const MoeParameters& p) const;
+    // The steps on an allocator A: WorkspaceArena runs them, WorkspaceLayoutBuilder plans their allocations (a plan
+    // passes no batch, call or tap and launches nothing).
+    template <class A> void run_impl(A& a, const ForwardBatch* batch, const CallShape& shape, const FinishShape& finish,
+                                     Tensor* logits, const ForwardTap* tap);
+    template <class A> void run_split_impl(A& a, const ForwardBatch* head, const ForwardBatch* tail, const CallShape& head_shape,
+                                           const CallShape& tail_shape, Tensor& logits, const Tensor& draft_features,
+                                           const std::function<void(std::uint32_t)>* at_split);
+    template <class A> void embed_impl(A& a, const ForwardBatch* batch, Tensor& residual);
+    template <class A> void layer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
+                                       Tensor& residual, const ForwardTap* tap);
+    template <class A> void layer_mixer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
+                                             Tensor& residual, Tensor& xm, Tensor& inject);
+    template <class A> void layer_moe_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
+                                           const Tensor& xm, const Tensor& inject, Tensor& residual,
+                                           std::int32_t route_columns, std::int32_t route_skipped, std::int32_t chunk_columns);
+    template <class A> void finish_impl(A& a, const ForwardBatch* batch, const FinishShape& shape, Tensor& residual,
+                                        Tensor* logits);
+    template <class A> void ple_impl(A& a, const PleParameters& p, Tensor& residual, const ForwardBatch* batch,
+                                     const CallShape& shape);
+    template <class A> Tensor ple_embedding_impl(A& a, const PleParameters& p, const ForwardBatch* batch,
+                                                 const CallShape& shape, std::int32_t columns);
+    template <class A> Tensor mix_impl(A& a, const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject,
+                                       Tensor* into = nullptr);
+    template <class A> Tensor mix_mixer_input_impl(A& a, const BlockParameters& block, Tensor& residual, Tensor& inject,
+                                                   Tensor& x_a8);
+    template <class A> Tensor mixer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
+                                         const Tensor& xa, const Tensor* xa_a8);
+    template <class A> Tensor gdn_impl(A& a, const GdnParameters& p, const Tensor& x, std::uint32_t index,
+                                       const ForwardBatch* batch, const CallShape& shape, const Tensor* x_a8);
+    struct AttentionCall;
+    [[nodiscard]] static FinishShape finish_shape(const ForwardBatch& batch, const Tensor* logits);
+    [[nodiscard]] static AttentionShape attention_shape(const AttentionCall& call);
+    template <class A> Tensor attention_impl(A& a, const AttentionParameters& p, const Tensor& x, const AttentionCall* call,
+                                             const AttentionShape& shape, const Tensor* x_a8);
+    template <class A> Tensor moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uint32_t layer,
+                                       Tensor* route_tap, const ForwardBatch* batch, const CallShape& shape,
+                                       std::int32_t route_columns, const Tensor* inject, Tensor* residual,
+                                       std::int32_t route_skipped, const Tensor* streams, std::int32_t chunk_columns);
+    template <class A> void mtp_block_impl(A& a, const MtpCall* call, std::int32_t columns, bool kv_only, Tensor& rows);
+    // A memoized plan (`kind` names the plan function).
+    template <class F> std::size_t memoized(int kind, std::int32_t a, std::int32_t b, std::int32_t c, const F& plan);
+
     // Head logits are FP32, or BF16 on the lossless route (lossless_linear rounds each exact sum once).
     [[nodiscard]] bool head_logits_dtype(const Tensor& logits) const noexcept {
         return logits.dtype == DType::FP32 || (config_.lossless && logits.dtype == DType::BF16);
     }
-    void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     // The call's PLE embedding (BF16 [embed, T]): its n-gram rows, decoded exactly and rounded to BF16.
     Tensor ple_embedding(const PleParameters& p, const ForwardBatch& batch);
     // The layer's routed-expert source without a call's scheduling (frames, host records, staging, the
@@ -429,20 +530,16 @@ private:
     void lossless_layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual);
     // The final mixer and the LM head over residuals (BF16 [S*H, n]) into FP32 logits [V, n].
     void lossless_head(const Tensor& residuals, Tensor& logits);
-    // The block's mixed input (into `into` when given, else the workspace).
+    // The block's mixed input (into `into` when given, else the workspace): mix_impl on the call's arena.
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
-    // The attention half's mix, and (--a8-activations, where it applies) its mixer input projection's 8-bit columns
-    // into x_a8 (empty otherwise).
-    Tensor mix_mixer_input(const BlockParameters& block, Tensor& residual, Tensor& inject, Tensor& x_a8);
+    // mix_mixer_input_impl: the attention half's mix, and (--a8-activations, where it applies) its mixer input
+    // projection's 8-bit columns into x_a8 (empty otherwise).
     [[nodiscard]] std::vector<ops::GgmlSegment> mixer_input_segments(const BlockParameters& block) const;
-    // The layer's token mixer (GDN or QSA attention) over its mixed input (and, when given, the 8-bit columns of
-    // its GGUF input projection, mix_mixer_input's).
-    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa, const Tensor* xa_a8 = nullptr);
-    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch,
-               const Tensor* x_a8 = nullptr);
+    // mixer_impl: the layer's token mixer (GDN or QSA attention) over its mixed input (and, when given, the 8-bit
+    // columns of its GGUF input projection, mix_mixer_input's).
     // INFERNIX_TMP_ACTIVATION_SCAN: scans a prefill call's projection input (no-op when off).
     void scan_input(const Tensor& x, std::uint32_t layer, ActivationScan::Site site);
-    // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
+    // attention_impl: one QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
     // set (verification and MTP catch-up: tails unchanged) or advance the tails when update_tails;
     // kv_only stops after the K/V and index-key writes and returns an empty tensor.
     struct AttentionCall {
@@ -458,19 +555,14 @@ private:
         const Tensor& table_rows;
         std::int32_t batch = 0, width = 0;
     };
-    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call, const Tensor* x_a8 = nullptr);
-    // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
+    // moe_impl: `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
     // columns. With inject and residual, the output is injected into the residual streams (and not
     // returned).
     // `route_skipped` (layer_moe's): the route log's leading -1 columns before the call's own.
     // `streams`: the call's residual streams as x was mixed from them (before this MoE's inject), the copy-ahead's guess
     // input; a gated call without them copies nothing ahead.
-    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-               const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
-               Tensor* residual = nullptr, std::int32_t route_skipped = 0, const Tensor* streams = nullptr,
-               std::int32_t chunk_columns = 0);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
-    void mtp_block(const MtpCall& call, Tensor& residual);
+    // mtp_block_impl: the MTP block over `rows` (BF16 [S*H, columns]); a plan covers its K/V-only form.
     // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes
     // (ggml-bf16-prefill, f16-accumulate-prefill, --a8-activations' prefill routes) only in eager calls
     // (prefill chunks, forced tokens), so decode and verification rounds keep their routes whatever their
@@ -487,6 +579,8 @@ private:
     std::int32_t max_context_;
     // The selected fast paths (program/fast_paths.h); all off on the exact route.
     ForwardFastPaths fast_;
+    KvCacheStorage storage_{}; // the attention blocks' KV storage (a plan's AttentionShape)
+    std::map<std::tuple<int, std::int32_t, std::int32_t, std::int32_t>, std::size_t> plans_; // memoized plans
     ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
     std::vector<std::uint32_t> draft_taps_; // the DFlash2 drafter's target layers (empty without it)
     // INFERNIX_TMP_ACTIVATION_SCAN (activation_scan.h): null when off; the layer mixer() last entered.

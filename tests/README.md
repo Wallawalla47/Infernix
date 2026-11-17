@@ -287,9 +287,11 @@ request and a prefix-cached extension of the failed one return their cold tokens
 completes; and eight failures in a row stop the Engine.
 `infernix_qwen4_exp_wide_plan_real_test` and its `_<scenario>_` entries (the expert banks, the SSD tier,
 MTP, DFlash2 with `INFERNIX_QWEN4_DFLASH2` naming the drafter, two lanes, causal scoring,
-`--a8-activations`, the packed BF16 KV cache, a chat prompt's pair call) record every prefill call that
+`--a8-activations`, the packed BF16 KV cache, a chat prompt's pair call, `--reproducible`, every other KV
+storage, and the expert-A4 routes, which only FP4-Local's W4A16 banks take) record every prefill call that
 runs in the wide workspace lent from the expert frames (`testing::record_wide_scopes`) and print its
-arena, the forward's plan for it and its peak; a peak past either fails.
+arena, the forward's plan for it (`Forward::plan_run` and its siblings) and its peak; a scope without a
+plan, or a peak past its arena or its plan, fails.
 
 These tests start their Engines on one `EngineHost` per process (`tests/models/qwen4_exp/engine_host.h`).
 Each start after the first takes the SSD expert tier's page-locked slots, and the expert records the

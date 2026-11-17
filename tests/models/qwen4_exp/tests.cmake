@@ -230,12 +230,14 @@ set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RET
 
 # The wide prefill workspace against its plan (design §19.3.7): every wide scope's peak stays within its arena and the
 # forward's own allocation plan, on the expert banks, the SSD tier, MTP, DFlash2, two lanes, causal scoring,
-# --a8-activations, the packed BF16 KV cache and a chat prompt's pair call.
+# --a8-activations, the packed BF16 KV cache, a chat prompt's pair call, the reproducible route, every KV storage and
+# the expert-A4 routes (a4*: FP4-Local's W4A16 banks only).
 infernix_add_test(infernix_qwen4_exp_wide_plan_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_plan_real.cpp"
   LIBRARIES infernix_engine
   ARGS banks)
-foreach(scenario IN ITEMS tier mtp dflash2 two-lanes scoring a8 bf16p chat)
+foreach(scenario IN ITEMS tier mtp dflash2 two-lanes scoring a8 bf16p chat reproducible kv-bf16 kv-fp8 kv-nvfp4
+                          kv-k8v4 kv-vq2 kv-k4v2 a4 a4-residual a4-residual-3)
   add_test(NAME infernix_qwen4_exp_wide_plan_${scenario}_real_test COMMAND infernix_qwen4_exp_wide_plan_real_test ${scenario})
   list(APPEND infernix_qwen4_exp_wide_plan_tests infernix_qwen4_exp_wide_plan_${scenario}_real_test)
 endforeach()

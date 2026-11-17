@@ -1302,6 +1302,12 @@ public:
         wide_work_     = plan_.wide_work;
         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
         allocated += work_capacity_;
+        // The wide arena's planner (candidates QG-01), from the parameters alone: the load-time chunk fits below run
+        // before the Forward exists. The lossless route keeps its workspace formula.
+        if (!c_.lossless) {
+            planner_ = execution::Forward::planner(parameters_, device_, *work_, dim(options_.max_context),
+                                                   options_.fast_paths, options_.kv_cache);
+        }
 
         // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
         // faults on a registered block's host address where the device maps it elsewhere: WDDM).
@@ -5106,6 +5112,7 @@ private:
             tier_losses_at_span_ = tier_losses();
         }
         const WideWork wide(*this, batch * width);
+        if (wide_active_) { wide_scope_.planned = planned_call(batch * width, chunk); }
         try {
             forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
             if (dflash2_) { dflash2_call_context(batch, width); }
@@ -5487,6 +5494,32 @@ private:
         wide_active_ = true;
         wide_scope_  = testing::WideScope{.site = site, .columns = columns, .inner = columns};
     }
+
+    // ---- the wide workspace's plan (candidates QG-01) ----
+    // What the forward's own allocation code needs of the wide arena in a scope (Forward::plan_run and its siblings),
+    // with the DFlash2 drafter's context call where it runs inside the scope (DFlash2::workspace_bytes; its
+    // materialize resets the arena); 0 on the lossless route. Recorded beside each scope's peak
+    // (testing::WideScope::planned) while the loans keep their sizes.
+    [[nodiscard]] std::size_t drafter_bytes() const {
+        return dflash2_ ? execution::DFlash2::workspace_bytes(c_, *plan_.dflash2_config, plan_.lanes, plan_.dflash_k + 1,
+                                                              dim(plan_.dflash2_config->window), options_.max_context)
+                        : 0;
+    }
+    // A chunk-major call (run()): its MTP chunk's cells, the logits of its last column, and the copy-ahead's guess
+    // where the call is gated (split_call_).
+    [[nodiscard]] std::size_t planned_call(std::int32_t columns, const execution::MtpChunk* chunk) {
+        if (!planner_) { return 0; }
+        const std::int32_t cells = chunk != nullptr ? (chunk->prepend ? 1 : 0) + chunk->columns : 0;
+        return std::max(planner_->plan_run({.columns = columns, .mtp_cells = cells, .logits = true, .may_gate = split_call_}),
+                        drafter_bytes());
+    }
+    // The pair call (pair_step): run_split's head and tail, and the drafter's context calls inside its scope.
+    [[nodiscard]] std::size_t planned_pair(std::int32_t head, std::int32_t tail) {
+        if (!planner_) { return 0; }
+        return std::max(planner_->plan_split(head, tail), drafter_bytes());
+    }
+    // The layer walk's span (prefill_walk.cpp): its widest chunk's mixer steps and finish, and its widest MoE group.
+    [[nodiscard]] std::size_t planned_walk();
 
     void leave_wide() noexcept {
         std::swap(*work_, *wide_arena_);
@@ -8017,6 +8050,8 @@ private:
     };
     OverlapResources overlap_;
     std::unique_ptr<execution::Forward> forward_;
+    // The wide arena's planner (Forward::planner; candidates QG-01): null on the lossless route.
+    std::unique_ptr<execution::Forward> planner_;
     std::array<DecodeGraph, kMaximumConcurrency> graphs_;
     std::vector<DecodeGraph> mtp_draft_graphs_; // (batch - 1) * mtp_k_ + steps - 1
     // With sampled drafts, the same for rounds with a sampled row (greedy rounds keep the argmax).

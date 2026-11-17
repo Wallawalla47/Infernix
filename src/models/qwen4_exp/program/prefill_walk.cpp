@@ -234,6 +234,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         // once its group's last chunk is staged).
         const WideWork wide(*this, widest, testing::WideSite::WalkSpan);
         wide_scope_.inner = std::max(widest, walk_widest_group());
+        if (wide_active_) { wide_scope_.planned = planned_walk(); }
         walk_mixer(c, 0);
         for (std::size_t g = 0; g < walk_.groups.size(); ++g) {
             if (walk_.groups[g].second == c + 1) { walk_moe(g, 0); }
@@ -355,6 +356,19 @@ void ProgramImpl::walk_mixer(std::size_t c, std::uint32_t l) {
     if (l == 0) { forward_->embed(fb, residual); }
     forward_->layer_mixer(l, fb, residual, xm, inject);
     walk_capture(c, l); // the layer's state (the MoE writes none) at the chunk's end
+}
+
+std::size_t ProgramImpl::planned_walk() {
+    if (!planner_) { return 0; }
+    // Every step begins its call (begin_call resets the arena): a chunk's embedding and layer mixers, a group's MoE,
+    // a chunk's finish (its MTP cells, and the logits of the prompt's last chunk).
+    const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
+    std::int32_t cells        = 0;
+    for (const auto& chunk : walk_.mtp) {
+        if (chunk) { cells = std::max(cells, (chunk->prepend ? 1 : 0) + chunk->columns); }
+    }
+    return std::max({planner_->plan_walk_mixer(widest), planner_->plan_walk_moe(walk_widest_group()),
+                     planner_->plan_walk_finish(widest, cells, true)});
 }
 
 std::int32_t ProgramImpl::walk_widest_group() const noexcept {
@@ -522,6 +536,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
         const WideWork wide(*this, widest, testing::WideSite::WalkStep);
         wide_scope_.inner = std::max(widest, walk_widest_group());
+        if (wide_active_) { wide_scope_.planned = planned_walk(); }
         walk_enqueue(to);
     }
     ++walk_.steps;
@@ -674,6 +689,7 @@ PrefillProgress ProgramImpl::pair_step(Lane& lane, std::uint32_t index, Clock::t
         residency_->before_round(s);
         split_call_ = false;
         const WideWork wide(*this, T, testing::WideSite::PairCall);
+        if (wide_active_) { wide_scope_.planned = planned_pair(w0, w1); }
         require_tier_round();
 
         execution::ForwardBatch head = io_batch(static_cast<std::byte*>(io_device_.p), 1, w0, 1);
