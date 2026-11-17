@@ -681,16 +681,15 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
     float values[kPerLane];
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
+        // A NaN logit as -inf (fmaxf(NaN, -inf) is -inf, fmaxf(x, -inf) is x bit for bit); no expert: NaN.
         const int e = lane + 32 * i;
-        values[i]   = e < experts ? router_logit(column[e], bf16_logits) : -INFINITY;
+        values[i]   = e < experts ? fmaxf(router_logit(column[e], bf16_logits), -INFINITY) : __int_as_float(0x7FC00000);
     }
     const float score = lane == 0 ? router_logit(column[experts], bf16_logits) : 0.0F;
     constexpr unsigned kNegInfKey = 0x007FFFFFU; // route_key(-INFINITY)
     unsigned key[kPerLane];
 #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        key[i] = lane + 32 * i >= experts ? 0U : isnan(values[i]) ? kNegInfKey : route_key(values[i]);
-    }
+    for (int i = 0; i < kPerLane; ++i) { key[i] = !isnan(values[i]) ? route_key(values[i]) : 0U; }
     // Lane k keeps the k-th selection.
     float selected = -INFINITY;
     int chosen     = 0;
@@ -768,8 +767,8 @@ __device__ __forceinline__ void route_pooled_column(const float* __restrict__ lo
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
         const int e = lane + 32 * i;
-        values[i]   = e < experts ? router_logit(column[e], bf16_logits) : -INFINITY;
-        if (isnan(values[i])) { values[i] = -INFINITY; }
+        // NaN as -inf (fmaxf; every other value keeps its bits).
+        values[i]   = e < experts ? fmaxf(router_logit(column[e], bf16_logits), -INFINITY) : -INFINITY;
         if (e < experts && __ldg(slot_of + e) >= 0) { pooled |= 1U << i; }
     }
     const float score = lane == 0 ? router_logit(column[experts], bf16_logits) : 0.0F;
