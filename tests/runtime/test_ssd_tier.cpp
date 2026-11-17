@@ -644,6 +644,56 @@ void test_refused_submit(const std::filesystem::path& directory) {
     index.check_invariants();
 }
 
+// A promotion whose read cannot be submitted (here a misaligned destination, which the file refuses) has read
+// nothing, so the entry keeps its SSD copies (PC-03): Unavailable now, and a later promotion reads them back.
+void test_refused_promotion(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    Backend backend;
+    PrefixCacheIndex index(config(), backend);
+    bool misaligned = false;
+    SsdTier tier(directory, 64, kSlabBytes,
+                 [&](std::uint32_t slab) { return backend.slab(slab) + (misaligned ? 512 : 0); });
+    const Conversation a = publish(index, backend, 91, 2);
+    (void)publish(index, backend, 92, 3);
+    // As the main test: captures take the Host tier while the write-back keeps ahead, so a moves to the SSD.
+    std::vector<HostImageReservation> reservations;
+    for (;;) {
+        (void)tier.poll(index);
+        settle(tier, index);
+        auto image = index.reserve_host_image(false, kAny);
+        if (!image) { break; }
+        reservations.push_back(std::move(*image));
+    }
+    for (HostImageReservation& reservation : reservations) { index.release_host_image(std::move(reservation)); }
+    require(index.snapshot(a.endpoint).host == CopyState::Absent && index.snapshot(a.endpoint).ssd == CopyState::Resident,
+            "the endpoint is on the SSD only");
+    index.check_invariants();
+
+    misaligned = true;
+    require(tier.promote(index, a.endpoint) == SsdTier::Promotion::Unavailable,
+            "a promotion whose read cannot be submitted is unavailable");
+    require(index.valid(a.endpoint) && index.snapshot(a.endpoint).ssd == CopyState::Resident &&
+                index.snapshot(a.endpoint).host == CopyState::Absent,
+            "...and the entry keeps its SSD copies (nothing was read)");
+    index.check_invariants();
+
+    misaligned = false;
+    require(tier.promote(index, a.endpoint) == SsdTier::Promotion::Pending, "a later promotion starts");
+    bool landed     = false;
+    const auto stop = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!landed && std::chrono::steady_clock::now() < stop) {
+        landed = tier.poll(index);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(landed && tier.promote(index, a.endpoint) == SsdTier::Promotion::Ready, "...and reads the copies back");
+    const SnapshotView image = index.snapshot(a.endpoint);
+    for (std::size_t k = 0; k < image.host_slabs.size(); ++k) {
+        require(holds(backend, image.host_slabs[k], 1000U + a.endpoint.index * 8U + static_cast<std::uint32_t>(k)),
+                "the promoted image holds its bytes");
+    }
+    index.check_invariants();
+}
+
 // The prefix cache file's binding for a Host tier alone; `slab` maps a slab id to its memory.
 PersistBinding host_binding(std::function<std::byte*(std::uint32_t)> slab, std::uint32_t image_slabs,
                             std::uint32_t host_slabs = kHostSlabs) {
@@ -901,6 +951,7 @@ int main() {
         test_room_wait(directory / "room");
         test_idle_retry(directory / "retry");
         test_refused_submit(directory / "refused");
+        test_refused_promotion(directory / "refused-promotion");
         test_file_round_trip(directory / "file");
         test_file_damage(directory / "damage");
         test_restore_without_ssd(directory / "no-ssd");
