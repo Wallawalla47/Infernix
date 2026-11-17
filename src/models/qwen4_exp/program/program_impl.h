@@ -906,10 +906,15 @@ public:
         // exclusive layout's tier holds every expert VRAM does not, and with 64 slots its eight-column
         // verification calls lost the fork: IQ3_S struct decode 363.7 -> 419.4 tok/s with 80 (2026-10-28).
         // INFERNIX_TMP_STAGING_SLOTS fixes the count (a temporary A/B: n-gram 15 asks for 160 slots).
+        // A shared expert bank (MoeConfig::shared_bank) adds the call's last job, so a call of the widest width has one
+        // job more than it routes; the fork needs every job within the slots (ops::moe_experts), so it takes one slot
+        // more: without it NVIDIA NVFP4-QAD's eight-column verification calls lost the fork, MTP decode 15 % behind
+        // FP4-Local's (2026-11-17).
         const std::int32_t fixed_slots = temporary_switches::offload().staging_slots;
+        const std::int32_t shared_job  = c.moe.shared_bank ? 1 : 0;
         d.staging_slots = fixed_slots > 0                                     ? fixed_slots
                           : o.expert_ram_bytes != 0 && !o.expert_ram_exclusive ? kStagingSlots
-                                                                               : std::clamp(static_cast<std::int32_t>(c.moe.top_k) * d.max_width,
+                                                                               : std::clamp(static_cast<std::int32_t>(c.moe.top_k) * d.max_width + shared_job,
                                                                                             kStagingSlots, kMaxStagingSlots);
         d.staging       = static_cast<std::size_t>(d.staging_slots) * d.record_stride;
 

@@ -451,6 +451,8 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    if any(name.endswith("/moe/shared_expert") for name in model.parameters):
+        raise ValueError("NVFP4 shared experts take the NVFP4-QAD recipe (qwen3_8_flash_next_nvfp4_qad)")
     for name, parameter in model.parameters.items():
         if name.startswith("text/layers/") and name.endswith("/moe/experts"):
             if weight_only_bank(parameter.source):
@@ -665,6 +667,86 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
     _flash_next_drafter(model, recipe)
 
 
+# The MXFP8 dense projections of NVIDIA's Flash-Next checkpoints (FP4-Local, NVFP4-QAD): GDN q/k/v/z and output, the
+# QSA query/gate/key/value, indexer and output. FP4-Local also stores its shared experts so; NVFP4-QAD stores them NVFP4.
+_NVIDIA_MXFP8_ROLES = (
+    "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+    "/attention/query", "/attention/gate", "/attention/key", "/attention/value",
+    "/attention/index_query", "/attention/index_key", "/attention/output",
+)
+
+
+def qwen3_8_flash_next_nvfp4_qad(model, recipe, sources):
+    """nvidia/Qwen3.8-Flash-Next-NVFP4-QAD (design §6.1.3): NVIDIA's quantization-aware-distilled mixed-precision
+    checkpoint, bit-exact, run W4A4 as NVIDIA serves it (the owner's choice, 2026-11-17).
+
+    - The routed experts keep their NVFP4 codes, plain E4M3 block scales and FP32 multipliers as ``nvfp4_mul`` banks in
+      ``nvfp4_expert_rg16_v1`` with their FP32 activation scales, ``AllowA4``: W4A4 (design §16.2), as recipe A.
+    - The shared experts, NVFP4 at the routed experts' geometry with their own activation scales, are one-record banks
+      of the same layout (``moe/shared_expert``, the builder's), which the routed experts' call runs as its last job
+      in the same exact W4A4 arithmetic (design §8.6).
+    - The MXFP8 GDN, QSA and indexer projections keep their E4M3FN codes and UE8M0 group scales
+      (``fp8_e4m3fn_g32_e8m0``, W8A16), FP4-Local's route; the GDN a/b projections become their exact BF16 values.
+    - Every BF16 tensor (HC mixers, router, shared-expert gate, PLE projections, ``lm_head``, embedding, vision, norms)
+      keeps its dtype; the FP8 n-gram table is recipe A's (bind its volume with ``--ngram-reuse``).
+    - Only the MTP drafter is re-quantized (``_flash_next_drafter``; its block-FP8 experts as ``q4_g64_fp16``)."""
+
+    from .expert_banks import ExpertBankSource, import_expert_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    shared = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/shared_expert")]
+    w4a4 = lambda name: isinstance(model.parameters[name].source, ExpertBankSource) and \
+        not model.parameters[name].source.weight_only
+    if not banks or len(shared) != len(banks) or not all(w4a4(name) for name in banks + shared):
+        raise ValueError("the NVFP4-QAD recipe imports W4A4 ModelOpt NVFP4 routed and shared experts "
+                         "(nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)")
+    if model.config["ngram_table"]["format"] != "fp8_e4m3fn":
+        raise ValueError("the NVFP4-QAD recipe binds the checkpoint's FP8 n-gram table")
+    base = sources["base"]
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/"):
+            continue
+        if name.endswith(("/moe/experts", "/moe/shared_expert")):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="AllowA4",
+            )
+            recipe.group(name, shape=parameter.shape)
+        elif name.endswith(_NVIDIA_MXFP8_ROLES):
+            recipe.assign(
+                name,
+                format=MXFP8,
+                method=import_encoded,
+                source=model.source(name, base, MXFP8),
+                activation_policy="A16Only",
+            )
+    _flash_next_drafter(model, recipe)
+
+
+def qwen3_8_flash_next_nvfp4_qad_dense8(model, recipe, sources):
+    """The NVFP4-QAD recipe plus recipe B's dense-byte saving where the checkpoint is still BF16: the hyper-connection
+    mixers, the PLE key/value projections, the final mixer and ``lm_head`` in ``q8_g32_fp16`` (W8A16), as recipe C
+    stores its BF16 classes. The NVFP4 experts and the MXFP8 projections (already 4 and 8 bits, and trained so) keep
+    their words; the router, shared-expert gate, GDN a/b, embedding and vision stay as the exact recipe has them."""
+
+    qwen3_8_flash_next_nvfp4_qad(model, recipe, sources)
+    dense8 = (
+        "/attn_hc/down", "/attn_hc/inject", "/attn_hc/up",
+        "/mlp_hc/down", "/mlp_hc/inject", "/mlp_hc/up",
+        "/ple/key_projection", "/ple/value_projection",
+    )
+    for name in model.parameters:
+        if name.startswith("text/layers/") and name.endswith(dense8):
+            _assign(recipe, name, Q8)
+    for name in ("text/final_mixer/down", "text/final_mixer/up", "text/output_head"):
+        _assign(recipe, name, Q8)
+
+
 # FP4-Local's weight-only NVFP4 vision matrices: each layer's MLP and the merger.
 _FP4_LOCAL_VISION_NVFP4 = ("/mlp/fc1", "/mlp/fc2", "/merger/fc1", "/merger/fc2")
 
@@ -760,6 +842,8 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
     "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
     "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
+    "qwen3_8_flash_next_nvfp4_qad": qwen3_8_flash_next_nvfp4_qad,
+    "qwen3_8_flash_next_nvfp4_qad_dense8": qwen3_8_flash_next_nvfp4_qad_dense8,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
 }

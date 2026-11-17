@@ -310,10 +310,22 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
         gdn_value_perm_ = DeviceBuffer(perm.size() * sizeof(std::int32_t));
         gdn_value_perm_.copy_from_host(perm.data(), perm.size() * sizeof(std::int32_t), 0);
     }
-    const std::size_t per_layer = sizeof(ops::offloaded_moe::ExpertScales) * c.moe.experts;
+    // With shared expert banks each layer's table holds E + 1 entries: the shared job's (expert E, MoeExpertSource::
+    // shared_expert) after the routed experts'.
+    const auto shared_banks = source.shared_expert_banks();
+    if (c.moe.shared_bank != !shared_banks.empty() || (!shared_banks.empty() && shared_banks.size() != banks.size())) {
+        throw std::logic_error("Qwen4Exp: one shared expert bank per layer, or none");
+    }
+    const std::size_t routed_bytes = sizeof(ops::offloaded_moe::ExpertScales) * c.moe.experts;
+    const std::size_t per_layer =
+        routed_bytes + (shared_banks.empty() ? 0 : sizeof(ops::offloaded_moe::ExpertScales));
     scales_ = DeviceBuffer(per_layer * banks.size());
     for (std::size_t i = 0; i < banks.size(); ++i) {
-        scales_.copy_from_host(banks[i].scales.data(), per_layer, per_layer * i);
+        scales_.copy_from_host(banks[i].scales.data(), routed_bytes, per_layer * i);
+        if (!shared_banks.empty()) {
+            scales_.copy_from_host(shared_banks[i].scales.data(), sizeof(ops::offloaded_moe::ExpertScales),
+                                   per_layer * i + routed_bytes);
+        }
     }
     std::vector<ops::offloaded_moe::LosslessExpertDesign> lossless_design(banks.size());
     if (c.lossless) {
@@ -321,7 +333,7 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
         // reference adds a W4A4 bank's input scales (its declared A4 activations).
         lossless_scales_ = DeviceBuffer(per_layer * banks.size());
         for (std::size_t i = 0; i < banks.size(); ++i) {
-            std::vector<ops::offloaded_moe::ExpertScales> scales(c.moe.experts);
+            std::vector<ops::offloaded_moe::ExpertScales> scales(c.moe.experts + (shared_banks.empty() ? 0 : 1));
             const float* m = banks[i].planes.multipliers;
             if (banks[i].planes.gate_up_format == QType::NVFP4_MUL && m == nullptr) {
                 throw std::invalid_argument("Qwen4Exp lossless: an NVFP4 bank without its multipliers");
@@ -335,6 +347,13 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
                 const ops::offloaded_moe::ExpertScales in = a4 ? banks[i].scales[e] : ops::offloaded_moe::ExpertScales{};
                 scales[e] = {in.input_gate, in.input_up, in.input_down, m[3 * std::size_t(e)], m[3 * std::size_t(e) + 1],
                              m[3 * std::size_t(e) + 2]};
+                separate_up = separate_up || in.input_up != in.input_gate;
+            }
+            if (!shared_banks.empty()) {
+                // The shared job's entry: its own multipliers and (design reference) input scales.
+                const float* sm = shared_banks[i].planes.multipliers;
+                const ops::offloaded_moe::ExpertScales in = a4 ? shared_banks[i].scales[0] : ops::offloaded_moe::ExpertScales{};
+                scales[c.moe.experts] = {in.input_gate, in.input_up, in.input_down, sm[0], sm[1], sm[2]};
                 separate_up = separate_up || in.input_up != in.input_gate;
             }
             lossless_design[i] = !a4          ? ops::offloaded_moe::LosslessExpertDesign::kNone
@@ -371,15 +390,20 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
         }
         out.moe.router         = prepare.tensor(layer.moe.router);
         out.moe.shared_score   = prepare.tensor(layer.moe.shared_score);
-        out.moe.shared_gate_up = prepare.linear({layer.moe.shared_gate, layer.moe.shared_up});
-        out.moe.shared_down    = prepare.linear({layer.moe.shared_down});
+        if (shared_banks.empty()) {
+            out.moe.shared_gate_up = prepare.linear({layer.moe.shared_gate, layer.moe.shared_up});
+            out.moe.shared_down    = prepare.linear({layer.moe.shared_down});
+        } else {
+            out.moe.shared_bank = &shared_banks[i];
+        }
         out.moe.bank           = &banks[i];
         out.moe.device_scales  = reinterpret_cast<const ops::offloaded_moe::ExpertScales*>(
             static_cast<const std::byte*>(scales_.p) + per_layer * i);
+        const auto same_input = [](const ops::offloaded_moe::ExpertScales& s) { return s.input_up == s.input_gate; };
         out.moe.a4_shared_input =
             banks[i].activation == ops::offloaded_moe::ExpertActivation::kA4 && !banks[i].scales.empty() &&
-            std::all_of(banks[i].scales.begin(), banks[i].scales.end(),
-                        [](const ops::offloaded_moe::ExpertScales& s) { return s.input_up == s.input_gate; });
+            std::all_of(banks[i].scales.begin(), banks[i].scales.end(), same_input) &&
+            (shared_banks.empty() || std::all_of(shared_banks[i].scales.begin(), shared_banks[i].scales.end(), same_input));
         if (c.lossless) {
             out.moe.lossless_scales = reinterpret_cast<const ops::offloaded_moe::ExpertScales*>(
                 static_cast<const std::byte*>(lossless_scales_.p) + per_layer * i);

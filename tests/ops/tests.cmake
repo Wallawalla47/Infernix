@@ -104,6 +104,15 @@ infernix_add_family_op_test(infernix_offloaded_moe_fp8_test FAMILY offloaded_moe
 infernix_add_family_op_test(infernix_offloaded_moe_qwen3_5_122b_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_qwen3_5_122b.cu"
   LIBRARIES infernix_ops)
+# The shared expert as the call's last job on NVFP4 banks at Flash-Next's geometry (NVIDIA's NVFP4-QAD) in every
+# arithmetic its artifacts run (W4A4; --a16-activations' W4A16 exact; expert-a4-residual's terms; --a8-activations'
+# 8-bit route): frames, zero-copy, staged, forked and CPU-served misses, narrow and wide widths, against the exact
+# host experts bit for bit where they bind and against the same record run as a routed expert, and the combine
+# against the FP64 formula.
+infernix_add_family_op_test(infernix_offloaded_moe_shared_a4_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_shared_a4.cu"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_offloaded_moe_shared_a4_test PROPERTIES TIMEOUT 900)
 # The expert-a4-residual fast paths (two and three NVFP4 terms) at that geometry, 24 to 16,384 columns:
 # gate/up, down and end to end against the FP64 expert oracle, narrow entries against the exact host
 # expert bit for bit, repeat and staging determinism; 4,096 columns and more on the 64-token warp tiles.

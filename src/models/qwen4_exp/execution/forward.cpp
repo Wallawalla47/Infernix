@@ -229,12 +229,15 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
         bytes += ops::qsa_attention_unpack_bytes(qsa_geometry(c), max_context);
     }
     bytes += (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4;           // FP32 router logits, routing
-    bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
+    // A shared expert bank is the call's last job: one more expert and T more entries and outputs.
+    const std::size_t sj = c.moe.shared_bank ? 1 : 0;
+    bytes += ops::moe_dispatch_bytes(dim(c.moe.experts + sj), dim((k + sj) * t));
     // A gated call's copy-ahead guess (its routing and dispatch; gated calls are at most the CPU channel's width).
     const std::size_t g = std::min<std::size_t>(t, ops::offloaded_moe::kMaxCpuCallColumns);
     bytes += k * g * 8 + g * 4 + ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * g));
-    bytes += h * k * t * bf + ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts), dim(k * t), std::max(columns, 1),
-                                                               expert_activation(c), wide_a16);
+    bytes += h * (k + sj) * t * bf +
+             ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts + sj),
+                                              dim((k + sj) * t), std::max(columns, 1), expert_activation(c), wide_a16);
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * bf * 3;
     // Linear and GDN scratch (chunked recurrence), plus alignment slack per allocation.
     bytes += ops::gated_delta_net_workspace_capacity_bytes(dim(c.gdn.key_heads), dim(c.gdn.value_heads), 1,
@@ -565,9 +568,11 @@ std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t colum
     const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t h = c.hidden_size, k = c.moe.top_k;
     std::size_t bytes = (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4; // router logits, routing
-    bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
-    bytes += h * k * t * 2 + ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts), dim(k * t), std::max(columns, 1),
-                                                             expert_activation(c), wide_a16);
+    const std::size_t sj = c.moe.shared_bank ? 1 : 0; // a shared expert bank's job
+    bytes += ops::moe_dispatch_bytes(dim(c.moe.experts + sj), dim((k + sj) * t));
+    bytes += h * (k + sj) * t * 2 +
+             ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts + sj),
+                                              dim((k + sj) * t), std::max(columns, 1), expert_activation(c), wide_a16);
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * 2 * 3 + h * t * 2 * 2; // shared expert, y
     if (c.ggml_weights) { // the shared expert's projections encode their inputs
         bytes += ops::ggml_linear_workspace_bytes(dim(h), std::max(columns, 1)) +
@@ -1101,8 +1106,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             log_tail = log;
         }
     }
-    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
-    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+    // A shared expert bank (MoeConfig::shared_bank) is the call's last job: expert E with entries K*T + t, its outputs
+    // the last T columns of `outputs` (design §8.6), in the routed bank's arithmetic.
+    const bool shared_job = p.shared_bank != nullptr;
+    const std::int32_t SJ = shared_job ? 1 : 0;
+    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E + SJ, (K + SJ) * T));
+    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E + SJ, (K + SJ) * T);
     // Without a route tap or a streamed prefill chunk (whose host-side split reads the dispatch), the
     // route waits until the experts' source is known, so its kernel also plans the CPU-served misses.
     const bool streamed_chunk = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
@@ -1204,8 +1213,13 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             add(next.mlp_hc.down.weight.payload, next.mlp_hc.down.weight.payload_bytes);
             add(next.mlp_hc.up.weight.payload, next.mlp_hc.up.weight.payload_bytes);
             add(next.moe.router.data, next.moe.router.bytes());
-            add_linear(next.moe.shared_gate_up, H, ~std::size_t{0});
-            add_linear(next.moe.shared_down, dim(config_.moe.shared_intermediate), ~std::size_t{0});
+            if (next.moe.shared_bank != nullptr) {
+                // The shared expert's record: the next call's resident last job.
+                add(next.moe.shared_bank->planes.device_records, next.moe.shared_bank->shape().record_bytes());
+            } else {
+                add_linear(next.moe.shared_gate_up, H, ~std::size_t{0});
+                add_linear(next.moe.shared_down, dim(config_.moe.shared_intermediate), ~std::size_t{0});
+            }
         }
         std::size_t left = whole_chain ? kChainWarm : ~std::size_t{0};
         int i = 0;
@@ -1219,8 +1233,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             ++i;
         }
     }
-    Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
-    const std::int32_t max_jobs = std::min(E, K * T);
+    if (shared_job) {
+        source.shared_expert = E;
+        source.shared_record = reinterpret_cast<const std::uint8_t*>(p.shared_bank->planes.device_records);
+    }
+    Tensor outputs = work_.alloc(DType::BF16, {H, (K + SJ) * T});
+    const std::int32_t max_jobs = std::min(E, K * T) + SJ;
     // --a8-activations' wide route (GGUF and NVFP4 W4A16 banks, beside their 8-bit narrow route) takes a call of
     // more than 128 columns first. The A4 residual routes exist for NVFP4 W4A16 banks only; their layouts carry no
     // x limbs, which the GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the
@@ -1241,11 +1259,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     source.narrow_a16 = nvfp4_a16 && fast_.expert_a4_narrow ? ops::offloaded_moe::NarrowA16::kA4Residual
                         : nvfp4_a16 && fast_.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
                                                         : ops::offloaded_moe::NarrowA16::kExact;
-    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(source.shape, max_jobs, K * T, T, source.activation,
-                                                                                 source.wide_a16));
+    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(source.shape, max_jobs, (K + SJ) * T, T,
+                                                                                 source.activation, source.wide_a16));
     const std::int32_t I = dim(m.shared_intermediate);
-    Tensor product = work_.alloc(DType::BF16, {I, T});
-    Tensor shared  = work_.alloc(DType::BF16, {H, T});
+    // The dense shared expert's product and output; a shared job's output is the call's last T columns.
+    Tensor product = shared_job ? Tensor{} : work_.alloc(DType::BF16, {I, T});
+    Tensor shared  = shared_job ? outputs.slice(1, K * T, T) : work_.alloc(DType::BF16, {H, T});
     // The shared expert runs while the host computes the CPU-served misses, and in decode and
     // verification calls on its own stream while the routed experts compute too. It reads only x,
     // and its scoped workspace lies past every buffer the routed experts use; this stream allocates
@@ -1261,7 +1280,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // has one) on the side stream at once, beside the router and the route's plan (a nearly idle device), instead of
     // after the plan beside the routed experts. Its scoped workspace lies past every buffer this call allocated, and
     // this stream allocates nothing until the join.
-    const bool shared_early = side && experts_.shared_early && scan_ == nullptr;
+    const bool shared_early = side && !shared_job && experts_.shared_early && scan_ == nullptr;
     if (early || shared_early) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[2], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[2], 0));
@@ -1293,7 +1312,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             ops::projection_fp32(x_chunk, rows, logits_chunk, s);
         }
     }
-    if (!route_plans) { ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s); }
+    if (!route_plans) {
+        ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s, ops::RouterLogits::kFp32, shared_job);
+    }
     if (route_tap != nullptr &&
         cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
             cudaSuccess) {
@@ -1416,14 +1437,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         }
     }
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
-                                                                     max_jobs, expert_ws.data, outputs, s);
+                                                                     max_jobs, expert_ws.data, outputs, s,
+                                                                     ops::RouterLogits::kFp32, shared_job);
     if (log_tail != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(log_tail, static_cast<const std::int32_t*>(routing.ids.data) + static_cast<std::size_t>(K) * (T - logged),
                                    static_cast<std::size_t>(K) * logged * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
     }
     cudaStream_t shared_s = s;
     if (early) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[3], 0)); }
-    if (side && !shared_early) {
+    if (side && !shared_early && !shared_job) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
         CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
         shared_s = experts_.shared_stream;
@@ -1439,7 +1461,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         // design §19.3.12).
         (void)streaming->plan_ahead(layer + 1, guess_columns_, runtime::expert_offload::ExpertStream::ahead_rows(T), 0);
     }
-    if (!shared_early) {
+    if (!shared_early && !shared_job) {
         scan_input(x, layer, ActivationScan::Site::SharedInput);
         for (const auto [from, n] : chunks) {
             if (n == 0) { continue; }
@@ -1454,16 +1476,18 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         }
     }
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
-    if (side) {
+    if (side && !shared_job) {
         if (!shared_early) { CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s)); }
         CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0));
     }
+    // y = bf16(sum_i w_i y_i + s y_shared): the routed entries (a shared job's T columns follow them).
+    const Tensor routed = shared_job ? outputs.slice(1, 0, K * T) : outputs;
     if (inject != nullptr) {
-        ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s);
+        ops::moe_combine_inject(routed, routing, shared, *inject, *residual, s);
         return Tensor{};
     }
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    ops::moe_combine(outputs, routing, shared, y, s);
+    ops::moe_combine(routed, routing, shared, y, s);
     return y;
 }
 

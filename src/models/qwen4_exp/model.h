@@ -65,6 +65,9 @@ public:
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
     [[nodiscard]] std::span<const ExpertBank> expert_banks() const noexcept { return banks_; }
+    // With MoeConfig::shared_bank: each layer's shared expert, one device-resident record of its routed bank's layout
+    // and arithmetic (empty otherwise).
+    [[nodiscard]] std::span<const ExpertBank> shared_expert_banks() const noexcept { return shared_banks_; }
     // The pinned banks' CSF tables (runtime::expert_offload::compress_banks; empty: the records as stored).
     [[nodiscard]] const CsfTables& csf_tables() const noexcept { return csf_tables_; }
     // With LoadOptions::stream_experts: where each record lies in the artifact (the banks then
@@ -121,7 +124,8 @@ private:
           std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
           std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
           std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing,
-          PackedWeights packed, CsfTables csf_tables);
+          PackedWeights packed, CsfTables csf_tables, std::vector<ExpertBank> shared_banks,
+          std::vector<std::vector<float>> shared_multipliers);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
@@ -134,6 +138,8 @@ private:
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBank> banks_;
     CsfTables csf_tables_; // banks_' CSF tables
+    std::vector<std::vector<float>> shared_multipliers_; // back shared_banks_' planes
+    std::vector<ExpertBank> shared_banks_;
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<qwen3_5::VisionOverlayAssets> overlay_vision_;

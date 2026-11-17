@@ -324,7 +324,8 @@ struct MoeExpertSource {
     // records, which cannot be read in place (zero-copy).
     bool one_pass               = false;
     MoeCpuChannel cpu;
-    MoeFetchChannel fetch; // with host_table only; needs staging_slots > 0 and max_jobs <= kMaxFetch
+    // With host_table only; needs staging_slots > 0 and max_jobs <= kMaxFetch (+1 with a shared job, never fetched).
+    MoeFetchChannel fetch;
     // Optional overlap of staging with compute for calls of several passes (prefill chunks): the
     // slots are split in two halves and pass p+1 is staged on `overlap_stream` while pass p
     // computes. The stream and the five events (start, staged[2], consumed[2]) are caller-owned;
@@ -375,10 +376,11 @@ struct MoeExpertSource {
     // residual and lossless routes. x and outputs have shape.hidden rows; the CPU channel's service serves the
     // same geometry.
     offloaded_moe::ExpertShape shape = offloaded_moe::kFlashNextShape;
-    // The layer's shared expert as the call's last job (design §8.6; NVFP4 W4A16 banks): expert
-    // index shared_expert (= E, one past the routed experts; -1: none) of a dispatch made with
-    // shared_job, its record shared_record (device memory, the bank's record layout: always
-    // resident, never staged or CPU-served) and scales[E] its multipliers (so scales holds E + 1).
+    // The layer's shared expert as the call's last job (design §8.6; NVFP4 banks, W4A16 or W4A4: Qwen3.5-122B's,
+    // NVIDIA's Qwen3.8-Flash-Next NVFP4-QAD): expert index shared_expert (= E, one past the routed experts; -1: none)
+    // of a dispatch made with shared_job, its record shared_record (device memory, the bank's record layout: always
+    // resident, never staged or CPU-served) and scales[E] its scalars (multipliers, and a W4A4 bank's input scales;
+    // so scales holds E + 1).
     // Its outputs are the last T columns of outputs, which has k*T + T columns.
     std::int32_t shared_expert         = -1;
     const std::uint8_t* shared_record  = nullptr;

@@ -1207,10 +1207,11 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
     }
 }
 
-// Quantizes column x[:, t] of entry `first` to A4 codes of blocks [0, blocks) with `scale` into smem.
+// Quantizes column x[:, t] of entry `first` to A4 codes of blocks [0, blocks) with `scale` into smem (t the entry's
+// column: a shared job's entries follow the routed ones, MoeDispatch::shared_first).
 __device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
-                                      int top_k, float scale, ActCodes* acts, int blocks) {
-    const int t = entries[first] / top_k;
+                                      int top_k, int shared_first, float scale, ActCodes* acts, int blocks) {
+    const int t = moe::wide::entry_column(entries[first], top_k, shared_first);
     for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
         const auto* v = reinterpret_cast<const std::uint16_t*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
         const canon::A4Codes c = canon::quantize_a4_codes(v, scale);
@@ -1272,8 +1273,8 @@ __global__ void __launch_bounds__(kThreads, 2)
         for (int parity = 0; parity < (split_input ? 2 : 1); ++parity) {
             __syncthreads();
             const float input_scale = parity == 0 ? scales.input_gate : scales.input_up;
-            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, input_scale, sm.acts,
-                                  moe::kGateUpBlocks);
+            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, dispatch.shared_first, input_scale,
+                                  sm.acts, moe::kGateUpBlocks);
             stage_wait();
             // The down pass (a programmatic dependent in captured graphs) may launch once every CTA has its
             // slice: its CTAs then fetch their weights while this pass computes and finishes.
@@ -2481,10 +2482,11 @@ __global__ void __launch_bounds__(kThreads)
 // ran in its own kernel), or (Named) the fused route kernel's planning threads after the CPU plan, so a
 // decode call's fetch plan costs no kernel of its own (Dense8 decode on the SSD tier: 3 us a call).
 struct FetchPlanShared {
-    int expert_of[offloaded_moe::kMaxFetch];
-    int flag_of[offloaded_moe::kMaxFetch];
-    short rank_of[offloaded_moe::kMaxFetch]; // fetch jobs before this one
-    unsigned char fetch_of[offloaded_moe::kMaxFetch];
+    // One entry per job: a layer's experts and a shared job (never fetched), kMaxFetchJobs.
+    int expert_of[offloaded_moe::kMaxFetchJobs];
+    int flag_of[offloaded_moe::kMaxFetchJobs];
+    short rank_of[offloaded_moe::kMaxFetchJobs]; // fetch jobs before this one
+    unsigned char fetch_of[offloaded_moe::kMaxFetchJobs];
     int warp_fetch[kWarps];
     int carry;
 };
@@ -3072,8 +3074,9 @@ bool fetch_served(const MoeExpertSource& source) { return source.fetch.request !
 void require_fetch_channel(const MoeExpertSource& source, std::int32_t max_jobs) {
     require(source.host_table != nullptr && source.fetch.response != nullptr && source.fetch.consumed != nullptr &&
                 source.fetch.sequence != nullptr && source.fetch.heartbeat != nullptr && source.staging_slots > 0 &&
-                max_jobs <= offloaded_moe::kMaxFetch,
-            "experts fetch channel is incomplete (it needs a host table, staging and at most kMaxFetch jobs)");
+                max_jobs <= offloaded_moe::kMaxFetch + (source.shared_record != nullptr ? 1 : 0),
+            "experts fetch channel is incomplete (it needs a host table, staging and at most kMaxFetch jobs, and one "
+            "more for a shared job)");
 }
 
 // The call's routing-independent preparation, before any fork of its passes: the narrow ring's x (its job words
@@ -3208,14 +3211,14 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                                        ggml || source.ggml.gate_up_format == QType::FP8_E4M3FN_B128),
             "experts: this expert geometry is registered for NVFP4 W4A16 banks on the exact, A4 residual and "
             "reference routes");
-    // A shared job (design §8.6) adds one entry per column after the k*T routed ones.
+    // A shared job (design §8.6) adds one entry per column after the k*T routed ones: the shared expert of an NVFP4
+    // bank in the bank's record layout and arithmetic (W4A16, or W4A4 with its own input scales in scales[E]).
     const bool shared_job = source.shared_record != nullptr;
     require(shared_job == (source.shared_expert >= 0) &&
                 (!shared_job || (dispatch.shared_first == x.ne[1] * top_k && !ggml &&
-                                 source.activation == moe::ExpertActivation::kA16 &&
                                  source.ggml.gate_up_format == QType::NVFP4_MUL)) &&
                 (shared_job || dispatch.shared_first == 0x7FFFFFFF),
-            "experts: a shared job needs an NVFP4 W4A16 bank, its record and a dispatch made with shared_job");
+            "experts: a shared job needs an NVFP4 bank, its record and a dispatch made with shared_job");
     require(x.ne[0] == source.shape.hidden && outputs.ne[0] == source.shape.hidden &&
                 outputs.ne[1] == x.ne[1] * top_k + (shared_job ? x.ne[1] : 0),
             "experts geometry differs from the bank's record");

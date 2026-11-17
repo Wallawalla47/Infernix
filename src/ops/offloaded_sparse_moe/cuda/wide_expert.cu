@@ -85,7 +85,7 @@ __global__ void __launch_bounds__(kQuantizeThreads)
         for (int task = static_cast<int>(threadIdx.x); task < count * kGateUpBlocks; task += kQuantizeThreads) {
             const int i = task / kGateUpBlocks, b = task % kGateUpBlocks;
             const int p = first + i;
-            const int t = dispatch.entries[p] / top_k;
+            const int t = entry_column(dispatch.entries[p], top_k, dispatch.shared_first);
             const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
             const uint4 v0 = source[0], v1 = source[1];
             std::uint16_t v[16];
@@ -669,7 +669,9 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.h_plane     = reinterpret_cast<std::uint8_t*>(workspace.h_blocks);
     call.outputs     = static_cast<std::uint16_t*>(outputs.data);
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
-    call.mean_job_columns = entries / max_jobs;
+    // The routed experts' mean (the rule's measurements were routed-only): a shared job's entries and job left out.
+    const int shared_job  = dispatch.shared_first != 0x7FFFFFFF ? 1 : 0;
+    call.mean_job_columns = (shared_job != 0 ? dispatch.shared_first : entries) / std::max(1, max_jobs - shared_job);
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");

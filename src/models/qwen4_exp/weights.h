@@ -48,11 +48,16 @@ struct GdnWeights {
 
 struct MoeWeights {
     WeightId router, shared_score;
+    // The shared expert as dense projections, or (NVIDIA's NVFP4-QAD) as shared_expert: a one-record nvfp4_mul bank
+    // in the routed bank's nvfp4_expert_rg16_v1 layout, device-resident, which the routed experts' call runs as its
+    // last job (design §8.6) in the routed bank's arithmetic. Exactly one of the two is bound.
     WeightId shared_gate, shared_up, shared_down;
+    WeightId shared_expert;
     WeightId experts;      // nvfp4_mul bank in nvfp4_expert_rg16_v1, pinned host memory
     // FP32 [experts, 3]: gate, up, down activation global scales of a W4A4 bank (its use allows A4);
     // not bound for a W4A16 bank (its use is A16-only: experts stored without activation scales).
-    WeightId input_scales;
+    // shared_input_scales: the shared expert bank's FP32 [1, 3], bound with input_scales.
+    WeightId input_scales, shared_input_scales;
 };
 
 struct PleWeights {
