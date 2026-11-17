@@ -1969,6 +1969,161 @@ void test_route_nan(int experts, int top_k, int slots, std::uint32_t seed) {
     }
 }
 
+// A shared job through the SSD tier's fetch channel (NVIDIA NVFP4-QAD, design §6.1.3): every one of a layer's 512
+// experts routed in a 64-column call, plus the shared job, is 513 jobs, one more than the fetch plan's 512 routed
+// experts (kMaxFetch). The shared expert is held in device memory and never fetched; the fetch channel serves the
+// routed experts with no host record. Before 2026-11-17 such a call was refused ("experts fetch channel is
+// incomplete"), which failed every prompt of about 52 tokens on the exclusive RAM layout.
+// Oracle: each routed output (every expert has at most two columns: the narrow route) equals the CPU engine's bits;
+// every output, the shared job's wide W4A4 output included, equals the zero-copy reference call's, whatever the
+// staging pass or the fetch channel served.
+void test_shared_fetch(std::uint32_t seed) {
+    constexpr int experts = 512, columns = 64, top_k = 10;
+    std::mt19937 rng(seed);
+    const std::size_t stride = moe::kRecordBytes;
+    std::vector<fixtures::Expert> bank;
+    std::vector<moe::ExpertScales> scales;
+    for (int e = 0; e < experts; ++e) {
+        bank.push_back(fixtures::random_expert(rng, false));
+        scales.push_back(bank.back().scales);
+    }
+    const fixtures::Expert shared_expert = fixtures::random_expert(rng, false);
+    std::vector<moe::ExpertScales> all_scales = scales;
+    all_scales.push_back(shared_expert.scales);
+    auto* d_scales        = device_copy(all_scales);
+    auto* d_shared_record = device_copy(shared_expert.record);
+    std::uint8_t* host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    for (int e = 0; e < experts; ++e) { std::memcpy(host + stride * e, bank[e].record.data(), moe::kRecordBytes); }
+    std::uint8_t* host_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
+    // Every third expert resident in a frame; every third of the others SSD-only (no host record: only a fetch serves
+    // it), the rest read from the pinned bank through the table.
+    std::vector<std::int32_t> frames(experts, -1);
+    std::vector<std::uint8_t> frame_bytes;
+    std::vector<const std::uint8_t*> table(experts, nullptr);
+    int resident = 0, ssd_only = 0;
+    for (int e = 0; e < experts; ++e) {
+        if (e % 3 == 0) {
+            frames[e] = resident++;
+            frame_bytes.insert(frame_bytes.end(), bank[e].record.begin(), bank[e].record.end());
+        } else if (e % 9 == 1) {
+            ++ssd_only;
+        } else {
+            table[e] = host_device + stride * e;
+        }
+    }
+    auto* d_frame_base = device_copy(frame_bytes);
+    auto* d_frames     = device_copy(frames);
+    auto* d_table      = device_copy(table);
+
+    // Column t's slot k routes expert order[(t * k_count + k) % E]: ten distinct experts per column and every expert
+    // routed at least once (640 slots over 512 experts), so the call has 512 routed jobs and the shared one.
+    std::vector<int> order(experts);
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), rng);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(top_k) * columns);
+    for (int t = 0; t < columns; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            ids[static_cast<std::size_t>(t) * top_k + k] = order[static_cast<std::size_t>((t * top_k + k) % experts)];
+        }
+    }
+    std::vector<float> weights(ids.size(), 0.1F), gate(static_cast<std::size_t>(columns), 0.5F);
+    auto* d_ids     = device_copy(ids);
+    auto* d_weights = device_copy(weights);
+    auto* d_gate    = device_copy(gate);
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
+                                      Tensor(d_weights, DType::FP32, {top_k, columns}), Tensor(d_gate, DType::FP32, {columns})};
+    const int entries  = (top_k + 1) * columns;
+    const int max_jobs = std::min(experts, top_k * columns) + 1; // 513
+    void* d_dispatch   = nullptr;
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts + 1, entries)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts + 1, entries);
+    const auto x  = fixtures::random_activations(rng, columns);
+    auto* d_x     = device_copy(x);
+
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(moe::kHidden) * top_k * columns);
+    for (int i = 0; i < top_k * columns; ++i) {
+        const auto y = cpu_column(bank[ids[static_cast<std::size_t>(i)]], &x[static_cast<std::size_t>(i / top_k) * moe::kHidden],
+                                  moe::ExpertActivation::kA4);
+        std::memcpy(&expected[static_cast<std::size_t>(i) * moe::kHidden], y.data(), moe::kHidden * sizeof(std::uint16_t));
+    }
+
+    std::uint8_t* d_staging = nullptr;
+    cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
+    void* d_workspace = nullptr;
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(moe::kFlashNextShape, max_jobs, entries, columns,
+                                                                                  moe::ExpertActivation::kA4, moe::WideA16::kExact)),
+               "cudaMalloc");
+    std::uint16_t* d_out = nullptr;
+    cuda_check(cudaMalloc(&d_out, sizeof(std::uint16_t) * moe::kHidden * entries), "cudaMalloc");
+    std::uint32_t* error_host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&error_host), 64, cudaHostAllocMapped), "cudaHostAlloc");
+    std::uint32_t* error_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&error_device), error_host, 0), "cudaHostGetDevicePointer");
+    Responder responder(host, stride);
+
+    struct Config {
+        const char* name;
+        int slots;
+        bool fetched;
+    };
+    std::vector<std::uint16_t> reference;
+    for (const Config config : {Config{"zero-copy reference", 0, false}, Config{"fetch channel, 64 staging slots", 64, true},
+                                Config{"fetch channel, 3 staging slots", 3, true}}) {
+        infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr, /*shared_job=*/true);
+        cuda_check(cudaMemset(d_out, 0xFF, sizeof(std::uint16_t) * moe::kHidden * entries), "cudaMemset");
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                              .frames        = d_frames,
+                                              .host_records  = host_device,
+                                              .record_stride = stride,
+                                              .scales        = d_scales,
+                                              .staging_base  = config.slots > 0 ? d_staging : nullptr,
+                                              .staging_slots = config.slots};
+        source.activation           = moe::ExpertActivation::kA4;
+        source.a4_shared_input      = true;
+        source.shared_expert        = experts;
+        source.shared_record        = d_shared_record;
+        source.heartbeat_timeout_ns = kTestHeartbeatTimeoutNs;
+        if (config.fetched) {
+            source.host_records = nullptr; // only the table, and the fetch channel for its SSD-only experts
+            source.host_table   = d_table;
+            responder.set(Responder::Mode::kAnswer);
+            source.fetch = responder.channel(7);
+        }
+        *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+        source.error = error_device;
+        const std::uint64_t requests_before = responder.requests();
+        Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+        Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "moe_experts");
+        std::vector<std::uint16_t> got(static_cast<std::size_t>(moe::kHidden) * entries);
+        cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+        const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
+        const bool routed_ok = std::equal(expected.begin(), expected.end(), got.begin());
+        if (reference.empty()) { reference = got; }
+        const bool same = got == reference;
+        const std::uint64_t requests = responder.requests() - requests_before;
+        std::printf("shared job, E=%d T=%d k=%d (%d jobs, %d SSD-only), %s: error word %#x, %llu fetch request(s), routed "
+                    "outputs %s the CPU engine's, all outputs %s the reference\n",
+                    experts, columns, top_k, max_jobs, ssd_only, config.name, error, static_cast<unsigned long long>(requests),
+                    routed_ok ? "equal" : "DIFFER from", same ? "equal" : "DIFFER from");
+        check(error == 0, "a 513-job call with a shared job ends without an error word");
+        check(routed_ok, "a 513-job call's routed outputs equal the CPU engine's bits");
+        check(same, "a 513-job call's outputs, the shared job's included, equal the zero-copy reference's");
+        if (config.fetched) { check(requests > 0, "the fetch channel served the SSD-only experts"); }
+    }
+    cudaFreeHost(error_host);
+    for (void* p : {static_cast<void*>(d_out), d_workspace, static_cast<void*>(d_staging), static_cast<void*>(d_x), d_dispatch,
+                    static_cast<void*>(d_ids), static_cast<void*>(d_weights), static_cast<void*>(d_gate), static_cast<void*>(d_table),
+                    static_cast<void*>(d_frames), static_cast<void*>(d_frame_base), static_cast<void*>(d_shared_record),
+                    static_cast<void*>(d_scales)}) {
+        cudaFree(p);
+    }
+    cudaFreeHost(host);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(offloaded_moe_layer) {
@@ -2009,6 +2164,7 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_combine_wide(94080, 8, 4, 96, 311); // the 122B's fitted 94,592-token chunk at INT8 KV's waves
             test_service_column_bound();
             test_service_failure_reported();
+            test_shared_fetch(331); // a shared job beside every expert of a layer: 513 jobs through the fetch channel
         }
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
