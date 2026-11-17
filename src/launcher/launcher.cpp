@@ -1383,17 +1383,25 @@ Json Launcher::log_paths_json() const {
 }
 
 void Launcher::apply_log_dir() {
-    const std::filesystem::path dir = log_dir();
-    if (dir == applied_log_dir_) { return; }
-    applied_log_dir_ = dir;
+    // Two settings saves at once (handlers run in parallel) apply the folders in order: the last one read is the
+    // one both logs end up in.
+    bool moved = false;
     std::string error;
-    if (event_log_.set_dir(dir, error)) {
+    std::filesystem::path dir;
+    {
+        std::lock_guard lock(log_dir_mutex_);
+        dir = log_dir();
+        if (dir == applied_log_dir_) { return; }
+        applied_log_dir_ = dir;
+        moved            = event_log_.set_dir(dir, error);
+        logs_.set_dir(dir / kServeLogDir);
+    }
+    if (moved) {
         event("info", "settings", "the logs are now written to " + path_utf8(dir));
     } else {
         event("error", "settings", "the log folder cannot be written (" + error + "); events stay in memory only");
         toast("error", "The log folder cannot be written: " + error);
     }
-    logs_.set_dir(dir / kServeLogDir);
     publish("logs", log_paths_json());
 }
 

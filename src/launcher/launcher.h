@@ -265,6 +265,7 @@ private:
     Store store_;
     EventLog event_log_;
     LogBuffer logs_;
+    std::mutex log_dir_mutex_; // apply_log_dir: the compare, the member and both set_dir calls
     std::filesystem::path applied_log_dir_;
     EventHub events_;
     EventHub model_events_; // llama.cpp's /models/sse
