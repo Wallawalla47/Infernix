@@ -1390,10 +1390,13 @@ its last pass used to run as two: the head to the opener, then the tail. Now tha
   arms; its turn 0 (+2.0 ms, -1.9 to +7.9) shows the spread. Decode on requests whose replies the
   arms share: 82.3 against 82.3 (27B, off), 761 against 766 (35B), 96.1 against 93.2 tok/s (122B).
   Replies equal to the cut's: 19 of 24 (27B, off), 18-19 (27B, DFlash2), 19-20 (35B), 13 (122B).
-  Rejected forms on the way: the room taken before the pass with no fallback lost a tap when no
-  slot was free (its next turn recomputed from an earlier snapshot); only the image before the pass
-  and the slot after it never paired (only a slot's eviction frees an image); the room before the
-  pass with the cut as fallback but no wait cut 13 of 48 opener turns.
+  These rows ran with a form that waited for the oldest Host write when no slot was free (no opener
+  turn was cut); the poll that replaced it, so that nothing waits on the Engine thread, cut 1 of 48
+  opener turns in four further passes. Rejected forms on the way: the room taken before the pass
+  with no fallback lost a tap when no slot was free (its next turn recomputed from an earlier
+  snapshot); only the image before the pass and the slot after it never paired (only a slot's
+  eviction frees an image); the room before the pass with the cut as fallback and no poll cut 13 of
+  48 opener turns; the wait (it can block every lane behind another lane's Host writes).
 
 ---
 

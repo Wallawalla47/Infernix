@@ -8297,8 +8297,9 @@ the 8-column rate of those readings stayed normal (47,100-48,400 against 48,400-
 the same saved state and so the same fill order, and 18 later starts of this build in three orders (same-build runs,
 alternated, the reference rewritten or fixed) read 19,600-21,000: the cause was not found. The 122B with
 `--expert-ram-mib 40000` needs every copy's slot, so it releases them all, as before (7,449 experts in RAM, 2,402 on
-the SSD, both builds). Not run: an artifact with several record sizes (IQ3_S), where the per-class release has only
-the unit tests.
+the SSD, both builds). IQ3_S (several record sizes; the deploy flags with `--expert-ram-mib`, one start a build):
+at 30,000 MiB every slot is needed and both builds hold 14,388 experts in RAM with 3,708 on the SSD; at 40,000 MiB
+both hold 18,096 in RAM and copies of the 1,398 least-used seeds, none on the SSD (read in 7.4 against 7.9 s).
 
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
