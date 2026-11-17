@@ -143,6 +143,15 @@ void Supervisor::start(const LaunchSpec& spec) {
         state_.phase      = "starting infernix-serve";
         load_verdict_.reset();
         listening_ = false;
+        // The ready line is an Info record: a --log-level above info hides it, and that server's /health is taken
+        // as before (waiting 30 s for a line that never comes would slow every load).
+        ready_line_expected_ = true;
+        for (std::size_t i = 0; i + 1 < spec.args.size(); ++i) {
+            if (spec.args[i] == "--log-level") {
+                const std::string& level = spec.args[i + 1];
+                ready_line_expected_ = level == "trace" || level == "debug" || level == "info";
+            }
+        }
         state_.argv       = {path_utf8(spec.executable)};
         state_.argv.insert(state_.argv.end(), spec.args.begin(), spec.args.end());
         stop_requested_   = false;
@@ -370,7 +379,7 @@ void Supervisor::monitor(std::uint32_t instance) {
                 bool confirmed = false;
                 {
                     std::lock_guard lock(mutex_);
-                    confirmed = listening_;
+                    confirmed = listening_ || !ready_line_expected_;
                 }
                 if (!confirmed) {
                     if (!health_unconfirmed_since) { health_unconfirmed_since = Clock::now(); }

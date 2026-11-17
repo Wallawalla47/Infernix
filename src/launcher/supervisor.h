@@ -131,6 +131,7 @@ private:
     bool shutting_down_  = false;
     std::optional<std::pair<std::string, std::string>> load_verdict_; // end_load's kind and reason
     bool listening_ = false; // this instance logged "listening on ..." (its server is the one answering)
+    bool ready_line_expected_ = true; // its --log-level shows Info records (the ready line)
     Json metrics_;
     std::optional<std::string> serve_build_;
     std::uint32_t next_instance_ = 1;
