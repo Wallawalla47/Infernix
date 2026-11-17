@@ -901,6 +901,13 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     }
     const auto unwind = [&] {
         abort_hybrid_binding(transaction);
+        // The state slot reserved below goes back here: the transaction is not the Program's yet (context_transaction_),
+        // so abort_context never sees it, and a staging failure (a vision encoder, an allocation, the prompt's copy)
+        // would otherwise lose a slot for good until admission reported a state-slot shortage.
+        if (transaction.reserved_state) {
+            (void)state_store->release(*transaction.reserved_state);
+            transaction.reserved_state.reset();
+        }
         requests[lane] = {};
     };
     try {
