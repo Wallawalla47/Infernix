@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace infernix::models::qwen4_exp::testing {
 
@@ -48,5 +49,28 @@ void set_binding_hold(std::chrono::milliseconds hold) noexcept;
 [[nodiscard]] bool binding_held() noexcept;
 void count_held_finish() noexcept;
 [[nodiscard]] std::uint64_t held_finishes() noexcept;
+
+// The wide workspace scopes (ProgramImpl::WideWork, a prefill call wider than the static arena): where each was
+// entered, the columns it was entered with, the widest call it ran (a layer walk's MoE runs over a group of chunks),
+// the bytes the arena was given, the bytes the forward's own allocation plan gives it (0 while none is computed) and
+// the arena's peak. Recorded while record_wide_scopes(true) (which clears what was recorded); note_wide_scope is the
+// Program's. For tests only.
+enum class WideSite : std::uint8_t {
+    Call,     // one forward call (ProgramImpl::run)
+    WalkSpan, // a layer walk's span setup: each chunk's embedding and first layer
+    WalkStep, // a layer walk's step over its next layers
+    PairCall, // a prompt's narrow head and opener tail as one call (run_split)
+};
+struct WideScope {
+    WideSite site          = WideSite::Call;
+    std::int32_t columns   = 0;
+    std::int32_t inner     = 0;
+    std::uint64_t given    = 0;
+    std::uint64_t planned  = 0;
+    std::uint64_t peak     = 0;
+};
+void record_wide_scopes(bool enabled);
+[[nodiscard]] std::vector<WideScope> wide_scopes();
+void note_wide_scope(const WideScope& scope);
 
 } // namespace infernix::models::qwen4_exp::testing

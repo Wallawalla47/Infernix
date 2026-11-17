@@ -5275,9 +5275,11 @@ private:
     // Forward keeps its arena reference; the arenas' contents are swapped for the call.
     class WideWork {
     public:
-        WideWork(ProgramImpl& program, std::int32_t columns) : program_(program) {
+        // `site`: where the scope is entered, for the wide scopes a test records (testing::record_wide_scopes).
+        WideWork(ProgramImpl& program, std::int32_t columns, testing::WideSite site = testing::WideSite::Call)
+            : program_(program) {
             if (columns > program.plan_.static_columns && program.wide_work_ > 0) {
-                program.enter_wide(columns);
+                program.enter_wide(columns, site);
                 active_ = true;
             }
         }
@@ -5444,7 +5446,7 @@ private:
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
     }
 
-    void enter_wide(std::int32_t columns) {
+    void enter_wide(std::int32_t columns, testing::WideSite site = testing::WideSite::Call) {
         DeviceSpan span{};
         // This call's need, and a lease for the prefilling lanes' remaining calls (one too small for this
         // call is lent again).
@@ -5483,12 +5485,19 @@ private:
         wide_arena_ = std::make_unique<WorkspaceArena>(span);
         std::swap(*work_, *wide_arena_);
         wide_active_ = true;
+        wide_scope_  = testing::WideScope{.site = site, .columns = columns, .inner = columns};
     }
 
     void leave_wide() noexcept {
         std::swap(*work_, *wide_arena_);
         wide_active_ = false;
+        wide_scope_.given = wide_arena_->capacity();
+        wide_scope_.peak  = wide_arena_->peak_used();
+        try {
+            testing::note_wide_scope(wide_scope_);
+        } catch (...) {} // a test's record only
     }
+    testing::WideScope wide_scope_; // the open wide scope (enter_wide .. leave_wide), for testing::note_wide_scope
     bool wide_active_ = false; // *work_ is the wide arena (enter_wide .. leave_wide)
 
     // After a prompt's last wide call is enqueued: the wide arena's own lease or allocation goes back
@@ -7894,6 +7903,8 @@ private:
     [[nodiscard]] Tensor walk_residual(std::size_t first, std::size_t end);
     void walk_mixer(std::size_t chunk, std::uint32_t layer);
     void walk_moe(std::size_t group, std::uint32_t layer);
+    // The columns of the span's widest MoE group (walk_.groups).
+    [[nodiscard]] std::int32_t walk_widest_group() const noexcept;
     // The span's taps: realizes the lane's taps due at its inner chunk ends (as prefix_after_prefill_call
     // would after chunk-major calls) by opening a staged capture each; committed by walk_commit_taps.
     void walk_plan_taps(Lane& lane);

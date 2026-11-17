@@ -232,7 +232,8 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         }
         // The chunk's embedding and first layer run while the host stages the next chunk (its MoE
         // once its group's last chunk is staged).
-        const WideWork wide(*this, widest);
+        const WideWork wide(*this, widest, testing::WideSite::WalkSpan);
+        wide_scope_.inner = std::max(widest, walk_widest_group());
         walk_mixer(c, 0);
         for (std::size_t g = 0; g < walk_.groups.size(); ++g) {
             if (walk_.groups[g].second == c + 1) { walk_moe(g, 0); }
@@ -354,6 +355,16 @@ void ProgramImpl::walk_mixer(std::size_t c, std::uint32_t l) {
     if (l == 0) { forward_->embed(fb, residual); }
     forward_->layer_mixer(l, fb, residual, xm, inject);
     walk_capture(c, l); // the layer's state (the MoE writes none) at the chunk's end
+}
+
+std::int32_t ProgramImpl::walk_widest_group() const noexcept {
+    std::int32_t widest = 0;
+    for (const auto& [first, end] : walk_.groups) {
+        if (end > first) {
+            widest = std::max(widest, walk_.offsets[end - 1] + walk_.widths[end - 1] - walk_.offsets[first]);
+        }
+    }
+    return widest;
 }
 
 // Layer l's MoE over group g's chunks, then (the last layer) each chunk's MTP cells and, for the
@@ -508,7 +519,9 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     {
         const nvtx::ScopedRange step_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                            static_cast<std::uint64_t>(tokens));
-        const WideWork wide(*this, *std::max_element(walk_.widths.begin(), walk_.widths.end()));
+        const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
+        const WideWork wide(*this, widest, testing::WideSite::WalkStep);
+        wide_scope_.inner = std::max(widest, walk_widest_group());
         walk_enqueue(to);
     }
     ++walk_.steps;
@@ -660,7 +673,7 @@ PrefillProgress ProgramImpl::pair_step(Lane& lane, std::uint32_t index, Clock::t
         settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s);
         split_call_ = false;
-        const WideWork wide(*this, T);
+        const WideWork wide(*this, T, testing::WideSite::PairCall);
         require_tier_round();
 
         execution::ForwardBatch head = io_batch(static_cast<std::byte*>(io_device_.p), 1, w0, 1);

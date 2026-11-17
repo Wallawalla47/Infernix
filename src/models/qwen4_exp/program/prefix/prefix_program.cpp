@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace infernix::models::qwen4_exp::testing {
 namespace {
@@ -23,7 +25,27 @@ std::atomic<std::uint64_t> drain_count{0};
 std::atomic<std::uint64_t> tap_block_write_count{0};
 std::atomic<std::int64_t> binding_hold_until{0}; // steady_clock ticks; 0: none
 std::atomic<std::uint64_t> held_finish_count{0};
+std::atomic<bool> wide_recording{false};
+std::mutex wide_mutex;
+std::vector<WideScope> recorded_wide_scopes;
 } // namespace
+
+void record_wide_scopes(bool enabled) {
+    const std::lock_guard lock(wide_mutex);
+    if (enabled) { recorded_wide_scopes.clear(); }
+    wide_recording.store(enabled);
+}
+
+std::vector<WideScope> wide_scopes() {
+    const std::lock_guard lock(wide_mutex);
+    return recorded_wide_scopes;
+}
+
+void note_wide_scope(const WideScope& scope) {
+    if (!wide_recording.load(std::memory_order_relaxed)) { return; }
+    const std::lock_guard lock(wide_mutex);
+    recorded_wide_scopes.push_back(scope);
+}
 
 void set_binding_hold(std::chrono::milliseconds hold) noexcept {
     binding_hold_until.store(hold.count() == 0 ? 0

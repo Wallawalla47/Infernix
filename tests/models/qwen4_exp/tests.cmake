@@ -228,6 +228,20 @@ infernix_add_test(infernix_qwen4_exp_preemption_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The wide prefill workspace against its plan (design §19.3.7): every wide scope's peak stays within its arena and the
+# forward's own allocation plan, on the expert banks, the SSD tier, MTP, DFlash2, two lanes, causal scoring,
+# --a8-activations, the packed BF16 KV cache and a chat prompt's pair call.
+infernix_add_test(infernix_qwen4_exp_wide_plan_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_plan_real.cpp"
+  LIBRARIES infernix_engine
+  ARGS banks)
+foreach(scenario IN ITEMS tier mtp dflash2 two-lanes scoring a8 bf16p chat)
+  add_test(NAME infernix_qwen4_exp_wide_plan_${scenario}_real_test COMMAND infernix_qwen4_exp_wide_plan_real_test ${scenario})
+  list(APPEND infernix_qwen4_exp_wide_plan_tests infernix_qwen4_exp_wide_plan_${scenario}_real_test)
+endforeach()
+set_tests_properties(infernix_qwen4_exp_wide_plan_real_test ${infernix_qwen4_exp_wide_plan_tests}
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against
 # one plain-decoding reference: the sampler's output distribution, greedy tokens, concurrency and the
 # drafter's ring through a prefix resume.
