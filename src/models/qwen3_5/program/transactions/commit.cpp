@@ -583,7 +583,14 @@ FinishResult ProgramImpl::finish(SequenceHandle handle) noexcept {
         hybrid_finish_lane(sequences[lane], true, &out.cache_created_prompt_tokens);
         clear_lane(sequences[lane], request);
         out.status = runtime::ConsumeStatus::Consumed;
-    } catch (...) { clear_lane(sequences[lane], request); }
+    } catch (...) {
+        // The reply is whole on the host; the device failed under the work still enqueued (an out-of-memory
+        // synchronize). The lane goes without an endpoint (its state may hold that failed work: clear_lane releases
+        // its prefix-cache pins and path), and the Engine completes the request, then recovers the device.
+        out.device_error = std::current_exception();
+        clear_lane(sequences[lane], request);
+        out.status = runtime::ConsumeStatus::Consumed;
+    }
     return out;
 }
 
@@ -593,14 +600,20 @@ AbortResult ProgramImpl::abort(SequenceHandle handle) noexcept {
     const auto lane = ContractAccess::lane(handle).value;
     out.timings     = requests[lane].timings;
     out.speculative = std::move(requests[lane].speculative_stats);
+    bool synchronized = true;
     try {
         device.synchronize();
-    } catch (...) { return out; }
+    } catch (...) {
+        // The device failed under the enqueued work: the lane is released as below but leaves no endpoint, and the
+        // Engine recovers the device once this request is answered.
+        out.device_error = std::current_exception();
+        synchronized     = false;
+    }
     if (context_transaction_ && context_transaction_->lane == lane) {
         abort_context();
     }
     if (requests[lane].lifecycle != Lifecycle::Empty) {
-        hybrid_finish_lane(sequences[lane], endpoint_consistent(requests[lane], sequences[lane]));
+        hybrid_finish_lane(sequences[lane], synchronized && endpoint_consistent(requests[lane], sequences[lane]));
     }
     clear_lane(sequences[lane], requests[lane]);
     out.status = runtime::ConsumeStatus::Consumed;

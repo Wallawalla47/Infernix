@@ -1130,6 +1130,26 @@ private:
     // (a tool call the parameter decoder refuses, a value past its nesting bound) fails this
     // request only: its lane is released unless the Program already released it, and the Engine
     // keeps serving. Returns nothing once the request has been failed.
+    // A Program released a finished or aborted lane in place after a device failure (FinishResult and
+    // AbortResult::device_error): its request is answered as usual, and the error is raised at the cycle's next safe
+    // point (raise_device_error_after_release, inside the worker's try), so the worker's out-of-memory recovery fails
+    // only the other residents and counts toward the failures in a row.
+    void note_device_error_after_release(const std::exception_ptr& error) noexcept {
+        if (error && !device_error_after_release_) { device_error_after_release_ = error; }
+    }
+    void raise_device_error_after_release() {
+        if (auto error = std::exchange(device_error_after_release_, nullptr)) { std::rethrow_exception(error); }
+    }
+    // A test's device failure inside the next finish or abort call (testing::request_finish_fault, request_abort_fault).
+    template <class Call>
+    auto with_release_fault(std::atomic<std::uint64_t>& request, Call&& call) {
+        const std::uint64_t armed = request.exchange(0, std::memory_order_relaxed);
+        if (armed != 0) [[unlikely]] { ::infernix::testing::arm_memory_exhausted_here(armed); }
+        auto result = call();
+        if (armed != 0) [[unlikely]] { ::infernix::testing::arm_memory_exhausted_here(0); }
+        return result;
+    }
+
     std::optional<PublishedOutput> commit_output(std::uint32_t lane,
                                                  const std::shared_ptr<Request>& request,
                                                  bool released) {
@@ -1140,10 +1160,13 @@ private:
                                "%s: failed 1 request; the Engine keeps serving", error.what());
             const std::exception_ptr failure = std::current_exception();
             if (!released) {
-                auto aborted = instance_.program->abort(*request->sequence);
+                auto aborted = with_release_fault(testing::abort_fault_request(),
+                                                  [&] { return instance_.program->abort(*request->sequence); });
                 if (aborted.status != ConsumeStatus::Consumed) {
+                    if (aborted.device_error) { std::rethrow_exception(aborted.device_error); }
                     throw std::logic_error("a request whose output failed could not be released");
                 }
+                note_device_error_after_release(aborted.device_error);
                 request->generation_timings = aborted.timings;
                 request->speculative_stats  = std::move(aborted.speculative);
             }
@@ -1215,16 +1238,22 @@ private:
             if constexpr (kFinishHeld) {
                 if (transaction) {
                     if (!instance_.program->can_finish_held(*request->sequence)) { break; }
-                    finished = instance_.program->finish_held(*request->sequence);
+                    finished = with_release_fault(testing::finish_fault_request(),
+                                                  [&] { return instance_.program->finish_held(*request->sequence); });
                 } else {
-                    finished = instance_.program->finish(*request->sequence);
+                    finished = with_release_fault(testing::finish_fault_request(),
+                                                  [&] { return instance_.program->finish(*request->sequence); });
                 }
             } else {
-                finished = instance_.program->finish(*request->sequence);
+                finished = with_release_fault(testing::finish_fault_request(),
+                                              [&] { return instance_.program->finish(*request->sequence); });
             }
             if (finished.status != ConsumeStatus::Consumed) {
+                if (finished.device_error) { std::rethrow_exception(finished.device_error); }
                 throw std::logic_error("terminal native sequence could not finish");
             }
+            // Released in place after a device failure: the request completes, then the device recovers.
+            note_device_error_after_release(finished.device_error);
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             request->constrained_draws  = std::move(finished.constrained_draws);
@@ -1271,10 +1300,13 @@ private:
                 throw std::logic_error("active cancellation has no sequence binding");
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            auto aborted = instance_.program->abort(*request->sequence);
+            auto aborted = with_release_fault(testing::abort_fault_request(),
+                                              [&] { return instance_.program->abort(*request->sequence); });
             if (aborted.status != ConsumeStatus::Consumed) {
+                if (aborted.device_error) { std::rethrow_exception(aborted.device_error); }
                 throw std::logic_error("a cancelled request could not be released");
             }
+            note_device_error_after_release(aborted.device_error);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -1456,7 +1488,11 @@ private:
             rollback_generated();
             const auto discarded = instance_.program->abort_pending(std::move(pending));
             if (discarded.status != ConsumeStatus::Consumed) {
-                throw std::logic_error("failed pending batch could not be discarded");
+                std::string cause = "unknown error";
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& e) { cause = e.what(); } catch (...) {}
+                throw std::logic_error("failed pending batch could not be discarded (after: " + cause + ")");
             }
             std::rethrow_exception(error);
         }
@@ -2630,6 +2666,7 @@ private:
     // then, or when the Program's cleanup failed; the caller then fails everything, as for any
     // other worker error.
     bool recover_locked(const std::exception_ptr& error, bool with_binding = false) noexcept {
+        device_error_after_release_ = nullptr; // this recovery covers a failure a release reported too
         try {
             if ((materializing_ || context_owner_) && !with_binding) { return false; }
             // A paused request releases its suspended state as a cancelled one does, while the
@@ -2692,6 +2729,7 @@ private:
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error, bool shutdown = false) noexcept {
+        device_error_after_release_ = nullptr;
         if (!shutdown) {
             std::string what = "unknown error";
             try {
@@ -3162,6 +3200,7 @@ private:
                 poll_storage();
                 (void)settle_terminal_requests(boundary);
                 cancel_active_requests(snapshot_cancellations(), boundary);
+                raise_device_error_after_release();
                 for (auto it = paused_.begin();
                      !instance_.program->has_context_transaction() && it != paused_.end();) {
                     const auto request = *it;
@@ -3366,6 +3405,7 @@ private:
                 }
                 watch_progress(executed);
                 publish_runtime_stats();
+                raise_device_error_after_release(); // before a successful unit resets the failure count
                 if (executed) { unit_recoveries_in_a_row_ = 0; }
             } catch (const RecoverableExecutionError&) {
                 if (!recover_unit_failure_locked(std::current_exception())) { return; }
@@ -3486,6 +3526,8 @@ private:
     // (cumulative, RuntimeStats::device_memory_recoveries).
     static constexpr std::uint32_t kMaximumUnitRecoveries = 8;
     std::uint32_t unit_recoveries_in_a_row_     = 0;
+    // A device failure a Program reported after releasing a lane in place (note_device_error_after_release).
+    std::exception_ptr device_error_after_release_;
     std::uint64_t memory_exhausted_recoveries_ = 0;
     std::shared_ptr<Request> next_turn_request_;           // worker: the pass queued, binding or resident
     NextTurnCounters next_turn_counters_;                  // worker

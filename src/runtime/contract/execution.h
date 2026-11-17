@@ -120,6 +120,19 @@ inline std::atomic<std::uint64_t>& memory_fault_request() noexcept {
 inline void request_memory_fault(std::uint64_t after) noexcept {
     memory_fault_request().store(after == 0 ? kMemoryFaultDisarm : after);
 }
+// A device failure inside the Program's finish or abort call (a request's release): the Engine arms its thread just
+// before the next such call, so the `after`-th CUDA_CHECK of that call throws DeviceMemoryExhausted, and disarms after
+// it. One shot; 0: off.
+inline std::atomic<std::uint64_t>& finish_fault_request() noexcept {
+    static std::atomic<std::uint64_t> request{0};
+    return request;
+}
+inline std::atomic<std::uint64_t>& abort_fault_request() noexcept {
+    static std::atomic<std::uint64_t> request{0};
+    return request;
+}
+inline void request_finish_fault(std::uint64_t after) noexcept { finish_fault_request().store(after); }
+inline void request_abort_fault(std::uint64_t after) noexcept { abort_fault_request().store(after); }
 } // namespace testing
 
 // Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.

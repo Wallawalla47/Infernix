@@ -31,7 +31,7 @@ int main() {
         options.max_pending_requests = 2;
         options.fast_paths           = false;
         infernix::Engine engine(options, infernix::test::engine_host());
-        failures = infernix::test::memory_exhausted::run_all(engine, 700, 24);
+        failures = infernix::test::memory_exhausted::run_all(engine, 700, 24, false);
     } catch (const std::exception& error) {
         infernix::runtime::testing::request_memory_fault(0);
         std::printf("  FAIL exception: %s\n", error.what());

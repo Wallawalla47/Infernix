@@ -14,6 +14,8 @@
 //   decode   a short prompt's request with a longer output, swept past its prefill into the decode rounds (their
 //            graph launches, drafting, first-token copies and commits): the same outcomes as above.
 //   queued   a request queued behind a failing one is admitted after the recovery and returns its reference.
+//   release  a failure inside the Program's finish or abort (the request's release): the request completes with its
+//            reference (or ends cancelled), the Engine recovers the device and serves on.
 //   bound    eight failures in a row with no successful unit between them stop the Engine (docs/serving.md,
 //            "How failures end").
 //
@@ -24,6 +26,7 @@
 #include "infernix/engine.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -74,6 +77,20 @@ inline Outcome run(Engine& engine, const std::vector<TokenId>& prompt, std::uint
     return outcome;
 }
 
+// Once the Engine is idle, every cached Device block of the prefix cache is evictable: nothing a failed release left
+// still pins one. Polled up to 2 s, while blocks pinned only by Host writes in flight land.
+inline bool nothing_pinned(Engine& engine, std::string& detail) {
+    RuntimeStats stats;
+    for (int i = 0; i < 200; ++i) {
+        stats = engine.runtime_stats();
+        if (stats.hybrid_evictable_blocks == stats.hybrid_cached_blocks) { return true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    detail = std::to_string(stats.hybrid_evictable_blocks) + " of " + std::to_string(stats.hybrid_cached_blocks) +
+             " cached blocks evictable";
+    return false;
+}
+
 inline bool out_of_memory(const Outcome& outcome) {
     return outcome.error.find("out of device memory") != std::string::npos;
 }
@@ -104,7 +121,9 @@ private:
 
 // Runs every step on `engine` (started on the exact route, one lane, at least two pending requests). The
 // prompts are synthetic ids; `prompt_tokens` and `outputs` size them.
-inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t outputs) {
+// `cancel_aborts`: cancelling a decoding request releases its lane through Program::abort (Qwen3.5); Qwen3.8-Flash-Next
+// releases it inside the round's commit, so its abort faults are not reached there.
+inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t outputs, bool cancel_aborts) {
     namespace testing = runtime::testing;
     int failures = 0;
     const std::vector<TokenId> fresh = synthetic_tokens(prompt_tokens, 7);
@@ -169,6 +188,98 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
                 static_cast<unsigned long long>(recoveries));
     failures += check(failed >= 6 && failing_count != 0, "at least six swept requests failed with the injected shortage");
     failures += check(recoveries >= failed, "RuntimeStats counted a recovery for every failed request");
+
+    std::printf("== release\n");
+    {
+        // A device failure inside the Program's finish (testing::request_finish_fault: at the count-th check of the finish
+        // call; before, the Engine failed with 'terminal native sequence could not finish'): the reply is whole, so the
+        // request completes with its reference; the Engine then recovers the device (one more out-of-memory recovery) and
+        // serves on. A request queued behind it completes, a fresh request returns its reference, and the extension with
+        // prefix reuse returns its cold tokens (the failed finish leaves no endpoint).
+        std::uint32_t fired_finishes = 0;
+        for (const std::uint64_t count : {1ULL, 2ULL, 4ULL, 8ULL, 16ULL}) {
+            const std::uint64_t recoveries = engine.runtime_stats().device_memory_recoveries;
+            const std::uint64_t injected   = infernix::testing::memory_exhausted_injections();
+            testing::request_finish_fault(count);
+            Async finishing(engine, swept[2].prompt, outputs, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            Async waiting(engine, queued, outputs, false);
+            const Outcome first  = finishing.get();
+            const Outcome second = waiting.get();
+            testing::request_finish_fault(0);
+            const bool fired = infernix::testing::memory_exhausted_injections() > injected;
+            fired_finishes += fired ? 1U : 0U;
+            const std::string label = "finish fault at check " + std::to_string(count) + (fired ? " (fired)" : " (not reached)");
+            failures += check(first.error.empty() && first.tokens == swept[2].reference.tokens,
+                              label + ": the finishing request completed with its reference" +
+                                  (first.error.empty() ? std::string() : " (error '" + first.error + "')"));
+            failures += check(second.error.empty() && second.tokens == queued_reference.tokens,
+                              label + ": the request queued behind it completed with its reference" +
+                                  (second.error.empty() ? std::string() : " (error '" + second.error + "')"));
+            const Outcome after = run(engine, fresh, outputs, false);
+            failures += check(after.error.empty() && after.tokens == fresh_reference.tokens,
+                              label + ": a fresh request after it returned its reference");
+            // A failure finish reported is recovered at the end of its cycle; one the Program contained in its
+            // publication (Flash-Next's prefix copies) needs none. Either way nothing may stay pinned.
+            std::printf("   %s: %llu device recoveries\n", label.c_str(),
+                        static_cast<unsigned long long>(engine.runtime_stats().device_memory_recoveries - recoveries));
+            std::string pinned;
+            const bool unpinned = nothing_pinned(engine, pinned);
+            failures += check(unpinned, label + ": once idle, no cached block stays pinned" +
+                                            (pinned.empty() ? std::string() : " (" + pinned + ")"));
+            const Outcome extended = run(engine, swept[2].extended, outputs, true);
+            failures += check(extended.error.empty() && extended.tokens == swept[2].extended_reference.tokens,
+                              label + ": its extension, with prefix reuse, returned its cold tokens");
+        }
+        failures += check(fired_finishes >= 1, "a finish fault fired (" + std::to_string(fired_finishes) + " of 5)");
+
+        // A device failure inside the Program's abort, the release of a request cancelled while it decodes: it ends
+        // cancelled, the Engine recovers the device and a fresh request returns its reference.
+        class Count final : public OutputSink {
+        public:
+            std::atomic<std::uint32_t> deltas{0};
+            void start(GenerationStart) override {}
+            void progress(PromptProgress) override {}
+            void timing(GenerationTimingObservation) override {}
+            void publish(OutputDelta) override { deltas.fetch_add(1); }
+            void tool_call(ToolCallDelta) override {}
+        };
+        std::uint32_t fired_aborts = 0;
+        for (const std::uint64_t count : {1ULL, 2ULL, 4ULL}) {
+            const std::uint64_t recoveries = engine.runtime_stats().device_memory_recoveries;
+            const std::uint64_t injected   = infernix::testing::memory_exhausted_injections();
+            testing::request_abort_fault(count);
+            Count sink;
+            std::string error;
+            GenerationResult result;
+            try {
+                GenerationHandle handle = engine.submit(engine.prepare_tokens(swept[3].prompt), greedy(outputs * 8U, false),
+                                                        OutputConsumerMode::Streaming);
+                result = handle.wait(&sink, CancellationView([&sink] { return sink.deltas.load() >= 2; }));
+            } catch (const std::exception& e) { error = e.what(); }
+            testing::request_abort_fault(0);
+            const bool fired = infernix::testing::memory_exhausted_injections() > injected;
+            fired_aborts += fired ? 1U : 0U;
+            const std::string label = "abort fault at check " + std::to_string(count) + (fired ? " (fired)" : " (not reached)");
+            failures += check(error.empty() && result.finish_reason == FinishReason::Cancelled,
+                              label + ": the cancelled request ended cancelled" +
+                                  (error.empty() ? std::string() : " (error '" + error + "')"));
+            const Outcome after = run(engine, fresh, outputs, false);
+            failures += check(after.error.empty() && after.tokens == fresh_reference.tokens,
+                              label + ": a fresh request after it returned its reference");
+            std::printf("   %s: %llu device recoveries\n", label.c_str(),
+                        static_cast<unsigned long long>(engine.runtime_stats().device_memory_recoveries - recoveries));
+            std::string pinned;
+            const bool unpinned = nothing_pinned(engine, pinned);
+            failures += check(unpinned, label + ": once idle, no cached block stays pinned" +
+                                            (pinned.empty() ? std::string() : " (" + pinned + ")"));
+        }
+        if (cancel_aborts) {
+            failures += check(fired_aborts >= 1, "an abort fault fired (" + std::to_string(fired_aborts) + " of 3)");
+        } else {
+            std::printf("   abort faults fired: %u of 3 (cancellation releases the lane in the commit)\n", fired_aborts);
+        }
+    }
 
     std::printf("== decode sweep\n");
     {

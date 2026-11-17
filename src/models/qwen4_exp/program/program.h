@@ -287,12 +287,18 @@ struct FinishResult {
     // With the prefix cache: the prompt tokens past the reused prefix whose state this request's
     // snapshots made reusable (its deepest accepted capture within the prompt).
     std::optional<std::uint32_t> cache_created_prompt_tokens;
+    // A device failure while finishing (an out-of-memory synchronize, a failed publication): the lane was released
+    // in place without an endpoint (status Consumed), or could not be (not Consumed). The Engine completes the request
+    // when its lane was released, then raises this for the device's recovery.
+    std::exception_ptr device_error;
 };
 
 struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // As FinishResult::device_error, for a release that hit a device failure.
+    std::exception_ptr device_error;
 };
 
 struct ReplayProgress {

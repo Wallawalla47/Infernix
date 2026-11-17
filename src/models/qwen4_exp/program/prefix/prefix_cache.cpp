@@ -386,29 +386,53 @@ void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, cudaStream_t 
     std::vector<DeviceKVPageHandle> pages;
     std::vector<std::byte*> records;
     std::vector<std::uint32_t> groups;
-    for (const pc::NodeRef node : nodes) {
-        if (!index_->valid(node)) { continue; }
-        const pc::NodeView view = index_->node(node);
-        if (view.device != pc::CopyState::Resident || view.host != pc::CopyState::Absent) { continue; }
-        index_->pin_node(node);
-        const auto slab_id = index_->begin_host_fill(node);
-        if (!slab_id) {
+    // A batch that fails before it is pending gives its slabs and pins back (as HybridPrefixCache's writes do): a
+    // node left pinned with its Host fill begun would never become evictable (2026-11-17: an out-of-memory
+    // cudaStreamWaitEvent below, once the Engine survived a failed finish, left blocks pinned for good).
+    const auto abort_batch = [&]() noexcept {
+        for (const pc::NodeRef node : written) {
+            index_->abort_host_fill(node);
             index_->unpin_node(node);
-            break; // the Host tier cannot free a slab for anything worth less
         }
-        written.push_back(node);
-        pages.push_back(page(view.device_id));
-        records.push_back(slab(*slab_id));
-        groups.push_back(slab_group(*slab_id));
+        written.clear();
+    };
+    try {
+        for (const pc::NodeRef node : nodes) {
+            if (!index_->valid(node)) { continue; }
+            const pc::NodeView view = index_->node(node);
+            if (view.device != pc::CopyState::Resident || view.host != pc::CopyState::Absent) { continue; }
+            index_->pin_node(node);
+            const auto slab_id = index_->begin_host_fill(node);
+            if (!slab_id) {
+                index_->unpin_node(node);
+                break; // the Host tier cannot free a slab for anything worth less
+            }
+            written.push_back(node);
+            pages.push_back(page(view.device_id));
+            records.push_back(slab(*slab_id));
+            groups.push_back(slab_group(*slab_id));
+        }
+    } catch (...) {
+        abort_batch();
+        throw;
     }
     if (written.empty()) { return; }
-    cudaEvent_t start = take_event();
-    CUDA_CHECK(cudaEventRecord(start, producer));
-    CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
-    recycle(start);
-    pool_->copy_to_host_records(pages, records, groups, host_.page, transfer_);
-    cudaEvent_t done = take_event();
-    CUDA_CHECK(cudaEventRecord(done, transfer_));
+    cudaEvent_t start = nullptr, done = nullptr;
+    try {
+        start = take_event();
+        CUDA_CHECK(cudaEventRecord(start, producer));
+        CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
+        recycle(std::exchange(start, nullptr));
+        pool_->copy_to_host_records(pages, records, groups, host_.page, transfer_);
+        done = take_event();
+        CUDA_CHECK(cudaEventRecord(done, transfer_));
+    } catch (...) {
+        (void)cudaStreamSynchronize(transfer_); // copies already enqueued land before their slabs go back
+        if (start != nullptr) { recycle(start); }
+        if (done != nullptr) { recycle(done); }
+        abort_batch();
+        throw;
+    }
     counters_.host_block_writes += written.size();
     counters_.host_write_bytes += written.size() * host_.page.page_stride;
     writes_.push_back(PendingWrite{std::move(written), done});

@@ -3350,11 +3350,28 @@ public:
                 testing::count_held_finish();
             }
             out.status = runtime::ConsumeStatus::Consumed;
-        } catch (const std::exception& error) {
-            // The Engine fails a terminal sequence that does not finish; say why.
-            diagnostic(std::string("Qwen4Exp: finish failed: ") + error.what(), DiagnosticLevel::Error);
         } catch (...) {
-            diagnostic("Qwen4Exp: finish failed", DiagnosticLevel::Error);
+            // The reply is whole on the host; finishing failed (the device under the enqueued work, a publication).
+            // The lane is released (or held published) without more publication, the request completes, and the
+            // Engine then recovers the device with this error. A lane that cannot be released fails the Engine.
+            out.device_error = std::current_exception();
+            try {
+                const auto index = lane_of(sequence);
+                if (lanes_[index].phase == Phase::Finishable) {
+                    if (release_lane) {
+                        release(index);
+                    } else {
+                        lanes_[index].phase = Phase::Published;
+                        testing::count_held_finish();
+                    }
+                }
+                out.status = runtime::ConsumeStatus::Consumed;
+            } catch (const std::exception& error) {
+                diagnostic(std::string("Qwen4Exp: a lane whose finish failed could not be released: ") + error.what(),
+                           DiagnosticLevel::Error);
+            } catch (...) {
+                diagnostic("Qwen4Exp: a lane whose finish failed could not be released", DiagnosticLevel::Error);
+            }
         }
         return out;
     }
@@ -3374,7 +3391,16 @@ public:
             }
             release(index);
             out.status = runtime::ConsumeStatus::Consumed;
-        } catch (...) {}
+        } catch (...) {
+            // A device failure while the lane published its endpoint or was released: released here without one,
+            // and the Engine recovers the device once this request is answered (FinishResult::device_error).
+            out.device_error = std::current_exception();
+            try {
+                const auto index = lane_of(sequence);
+                if (lanes_[index].phase != Phase::Free) { release(index); }
+                out.status = runtime::ConsumeStatus::Consumed;
+            } catch (...) {}
+        }
         return out;
     }
 
