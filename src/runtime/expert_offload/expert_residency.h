@@ -55,6 +55,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace infernix::runtime::expert_offload {
@@ -192,6 +193,54 @@ public:
     // Returns a lease. The caller has ordered `compute` after every access to it; promotions into
     // its frames start after `compute` reaches this point.
     void give_back(FrameLease& lease, cudaStream_t compute);
+    // A lease taken in a scope that can still fail before its owner holds it: given back when the hold dies still
+    // holding it (a lease left lent stops every later resize), handed over by release(). The give-back issues
+    // loads; a failure there while another failure unwinds is dropped (the first one goes on to recovery).
+    class LeaseHold {
+    public:
+        LeaseHold() noexcept = default;
+        LeaseHold(ExpertResidency& residency, FrameLease lease, cudaStream_t compute) noexcept
+            : residency_(lease.valid() ? &residency : nullptr), lease_(lease), compute_(compute) {}
+        LeaseHold(LeaseHold&& other) noexcept
+            : residency_(std::exchange(other.residency_, nullptr)), lease_(std::exchange(other.lease_, {})),
+              compute_(other.compute_) {}
+        LeaseHold& operator=(LeaseHold&& other) noexcept {
+            if (this != &other) {
+                reset();
+                residency_ = std::exchange(other.residency_, nullptr);
+                lease_     = std::exchange(other.lease_, {});
+                compute_   = other.compute_;
+            }
+            return *this;
+        }
+        LeaseHold(const LeaseHold&)            = delete;
+        LeaseHold& operator=(const LeaseHold&) = delete;
+        ~LeaseHold() { reset(); }
+
+        [[nodiscard]] const FrameLease& get() const noexcept { return lease_; }
+        [[nodiscard]] FrameLease release() noexcept {
+            residency_ = nullptr;
+            return std::exchange(lease_, {});
+        }
+        // Gives the lease back now, failures included (a path that is not unwinding another failure).
+        void give_back() {
+            if (ExpertResidency* residency = std::exchange(residency_, nullptr)) { residency->give_back(lease_, compute_); }
+            lease_ = {};
+        }
+        void reset() noexcept {
+            if (ExpertResidency* residency = std::exchange(residency_, nullptr)) {
+                try {
+                    residency->give_back(lease_, compute_);
+                } catch (...) {}
+            }
+            lease_ = {};
+        }
+
+    private:
+        ExpertResidency* residency_ = nullptr;
+        FrameLease lease_;
+        cudaStream_t compute_ = nullptr;
+    };
 
     // SSD tier mode: records come from `tier` (owned by the caller, outliving this), not the banks.
     // Before the first round and before warm_start. `exclusive`: the exclusive RAM layout's tier (RAM holds what

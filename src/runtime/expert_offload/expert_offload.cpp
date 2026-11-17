@@ -1570,35 +1570,27 @@ bool ExpertOffload::lend_stream(std::int32_t width, std::uint64_t wide_bytes, st
         const std::uint32_t layers = std::max(1U, residency_->lease_layers(lease));
         return (lease.count + layers - 1) / layers;
     };
-    ExpertResidency::FrameLease wide, walk;
     // Leases taken here go back on every way out but the last: a lease left loaned would stop every later resize
     // of the cache (ExpertResidency::resize refuses while frames are loaned).
-    const auto give_back = [&] {
-        if (walk.valid()) { residency_->give_back(walk, compute); }
-        if (wide.valid()) { residency_->give_back(wide, compute); }
-    };
-    try {
-        if (wide_bytes > 0) {
-            if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
-            wide = residency_->lend(wide_bytes, compute, writers);
-        }
-        if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
-            walk = residency_->lend(walk_bytes, compute, writers);
-        }
-        const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide), per_layer(walk)));
-        const auto room_slots       = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
-        const std::uint32_t half    = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
-        if (half < kStreamHalfMin) {
-            give_back();
-            return false;
-        }
-        leases_.ring = residency_->lend((2ULL * half + 1) * slot, compute, writers);
-    } catch (...) {
-        give_back();
-        throw;
+    ExpertResidency::LeaseHold wide, walk;
+    if (wide_bytes > 0) {
+        if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
+        wide = ExpertResidency::LeaseHold(*residency_, residency_->lend(wide_bytes, compute, writers), compute);
     }
-    leases_.wide = wide;
-    leases_.walk = walk;
+    if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
+        walk = ExpertResidency::LeaseHold(*residency_, residency_->lend(walk_bytes, compute, writers), compute);
+    }
+    const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide.get()), per_layer(walk.get())));
+    const auto room_slots       = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
+    const std::uint32_t half    = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
+    if (half < kStreamHalfMin) {
+        walk.give_back();
+        wide.give_back();
+        return false;
+    }
+    leases_.ring     = residency_->lend((2ULL * half + 1) * slot, compute, writers);
+    leases_.wide     = wide.release();
+    leases_.walk     = walk.release();
     stream_at_lease_ = stream_->stats();
     return true;
 }
