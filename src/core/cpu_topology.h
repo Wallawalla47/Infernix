@@ -32,6 +32,25 @@ struct PhysicalCore {
 // mask (0 when unknown or when the change failed).
 std::uint64_t set_current_thread_cpus(std::uint64_t cpus) noexcept;
 
+// set_current_thread_cpus(cpus) for a scope: the thread's previous CPUs come back when it ends, on every way out (a
+// probe that throws part-way would otherwise leave the calling thread pinned to one CPU).
+class ScopedThreadCpus {
+public:
+    explicit ScopedThreadCpus(std::uint64_t cpus) noexcept : previous_(set_current_thread_cpus(cpus)) {}
+    ~ScopedThreadCpus() { restore(); }
+    ScopedThreadCpus(const ScopedThreadCpus&)            = delete;
+    ScopedThreadCpus& operator=(const ScopedThreadCpus&) = delete;
+    // The previous CPUs now (once).
+    void restore() noexcept {
+        if (!restored_) { (void)set_current_thread_cpus(previous_); }
+        restored_ = true;
+    }
+
+private:
+    std::uint64_t previous_;
+    bool restored_ = false;
+};
+
 // The logical CPUs of a hybrid CPU's slowest cores (its E-cores): where background threads run,
 // leaving the fast cores to the threads serving requests. 0 on a CPU of one class or without a
 // topology (set_current_thread_cpus then changes nothing).
