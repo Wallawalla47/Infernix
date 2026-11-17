@@ -5234,23 +5234,33 @@ private:
                 return (lease.count + layers - 1) / layers;
             };
             ExpertResidency::FrameLease wide, walk;
-            if (const std::size_t wide_bytes = pending_wide_bytes(width); wide_bytes > 0) {
-                if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
-                wide = residency_->lend(wide_bytes, device_.stream, writers);
-            }
-            if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
-                walk = residency_->lend(walk_bytes, device_.stream, writers);
-            }
-            const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide), per_layer(walk)));
-            // The ring as wide as the room left allows (at most 2 * half + 1 slots).
-            const auto room_slots = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
-            const std::uint32_t half = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
-            if (half < kStreamHalfMin) {
+            // The leases taken here go back on every way out but the last: one left loaned would keep the KV pool
+            // from growing into the cache (leases_returnable) and the cache from resizing.
+            const auto give_back = [&] {
                 if (walk.valid()) { residency_->give_back(walk, device_.stream); }
                 if (wide.valid()) { residency_->give_back(wide, device_.stream); }
-                return false;
+            };
+            try {
+                if (const std::size_t wide_bytes = pending_wide_bytes(width); wide_bytes > 0) {
+                    if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
+                    wide = residency_->lend(wide_bytes, device_.stream, writers);
+                }
+                if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
+                    walk = residency_->lend(walk_bytes, device_.stream, writers);
+                }
+                const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide), per_layer(walk)));
+                // The ring as wide as the room left allows (at most 2 * half + 1 slots).
+                const auto room_slots    = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
+                const std::uint32_t half = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
+                if (half < kStreamHalfMin) {
+                    give_back();
+                    return false;
+                }
+                stream_lease_ = residency_->lend((2ULL * half + 1) * slot, device_.stream, writers);
+            } catch (...) {
+                give_back();
+                throw;
             }
-            stream_lease_      = residency_->lend((2ULL * half + 1) * slot, device_.stream, writers);
             stream_wide_lease_ = wide;
             stream_walk_lease_ = walk;
             stream_ring_bytes_ = stream_lease_.memory.bytes;
