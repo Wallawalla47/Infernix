@@ -36,8 +36,11 @@ The console prints the addresses and the browser opens the web UI:
 | `--no-browser` | do not open the web UI |
 | `--ui-dir DIR` | serve the web UI from a folder (web UI development) |
 
-Ctrl+C (or closing the console) stops the loaded model in order, so it saves its prefix cache and
-expert-cache state, pauses running downloads and exits. Only the launcher's own events and server
+Ctrl+C stops the loaded model in order, so it saves its prefix cache and expert-cache state, pauses
+running downloads and exits. Closing the console window, signing out or shutting Windows down does
+the same, but Windows ends the launcher and the model about 5 seconds after it: a save not finished
+by then leaves the previous prefix-cache file in place (the launcher saves its own settings and usage
+first). Only the launcher's own events and server
 errors appear in its console; the web UI shows the server's full log. A console that holds its
 output (a QuickEdit selection) or a slow log folder never holds up the server: the launcher keeps
 reading its output and writes the console and `serve-logs/` from threads of their own. On Windows

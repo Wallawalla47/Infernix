@@ -514,6 +514,10 @@ void Launcher::stop() {
     if (stopped_) { return; }
     event("info", "launcher", "shutting down");
     stopping_ = true;
+    // Saved first as well: a closed console window, a sign-out or a shutdown ends the process about 5 s from now,
+    // whatever the model's stop below still waits for.
+    usage_.flush();
+    store_.update_settings([](Settings&) {});
     events_.close_all();
     model_events_.close_all();
     server_.stop();
