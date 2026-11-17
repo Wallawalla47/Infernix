@@ -3293,7 +3293,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const int pass_jobs = source.staging_slots > 0
                               ? std::min(source.one_pass ? static_cast<int>(max_jobs) : source.staging_slots, kMaxPassJobs)
                               : max_jobs;
-    const int half      = source.staging_slots / 2;
+    // An overlapped pass stages into the kernel's per-pass shared lists too: at most kMaxPassJobs jobs.
+    const int half      = std::min(source.staging_slots / 2, kMaxPassJobs);
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
     const bool use_wide = !ggml && !nvfp4_a8 && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
