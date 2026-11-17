@@ -245,6 +245,15 @@ int main() {
     const std::vector<std::string> rolled_lines = render_console_stats_panel(rolled);
     failures += check(rolled_lines.size() == 4 && contains(rolled_lines[3], "last 10"),
                       "a session beyond the window shows the recent row");
+    // A cancelled outcome counts as cancelled, as /metrics's totals count it, and adds nothing to the session's
+    // rates or first-token mean (audit 2026-11-17 SS-06).
+    GenerationOutcome cancelled = outcome(100, 0, 0, 0.0, 0.0, 0.0);
+    cancelled.finish_reason     = infernix::FinishReason::Cancelled;
+    panel.request_done(cancelled);
+    const ConsoleStatsSnapshot after = panel.snapshot();
+    failures += check(after.completed == 12 && after.cancelled == 2 && after.session.requests == 12 &&
+                          after.session.sum.ttft_seconds == rolled.session.sum.ttft_seconds,
+                      "a cancelled outcome counted as a completed request");
 
     // Terminal fitting counts visible columns only and never splits an escape sequence.
     using infernix::product::fit_terminal_line;

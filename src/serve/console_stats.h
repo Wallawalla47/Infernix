@@ -97,12 +97,22 @@ public:
     [[nodiscard]] ConsoleStatsSnapshot snapshot() const;
 
 private:
-    void publish_locked();
+    // Renders the panel under mutex_ and returns its lines with their sequence number; draw() writes them to the
+    // terminal outside mutex_, so snapshot() (/metrics?format=json) never waits on a stalled console.
+    struct Frame {
+        std::uint64_t sequence = 0;
+        std::vector<std::string> lines;
+    };
+    [[nodiscard]] Frame render_locked();
+    void draw(Frame frame);
 
     std::shared_ptr<product::TerminalPanel> panel_;
     mutable std::mutex mutex_;
     ConsoleStatsSnapshot state_;
     std::deque<ConsoleRequestSample> recent_;
+    std::uint64_t rendered_ = 0; // frames rendered (mutex_)
+    std::mutex draw_mutex_;      // one writer at a time; a frame older than the last drawn is dropped
+    std::uint64_t drawn_ = 0;    // the newest frame drawn (draw_mutex_)
 };
 
 } // namespace infernix::serve
