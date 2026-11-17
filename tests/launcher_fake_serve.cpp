@@ -873,7 +873,7 @@ int main(int argc, char** argv) {
         return port_refused();
     }
     if (!server.bind_to_port(host, port)) { return port_refused(); }
-    std::thread loader([load_ms, hog_mib, fail_load] {
+    std::thread loader([load_ms, hog_mib, fail_load, host, port] {
         std::vector<std::unique_ptr<char[]>> hog;
         log("INFO", "loading weights | 21.4 GiB");
         for (int taken = 0; taken < hog_mib; taken += 256) {
@@ -891,8 +891,13 @@ int main(int argc, char** argv) {
         }
         hog.clear();
         log("INFO", "engine ready | " + g_state.model + " | total 1.5s");
-        std::lock_guard lock(g_state.mutex);
-        g_state.ready = true;
+        {
+            std::lock_guard lock(g_state.mutex);
+            g_state.ready = true;
+        }
+        // The real server's ready line (OperationalLog::server_ready): the launcher takes /health only from a server
+        // that logged it.
+        log("INFO", "listening on http://" + host + ":" + std::to_string(port) + " | model " + g_state.model + " | auth none");
     });
     loader.detach();
     server.listen_after_bind();

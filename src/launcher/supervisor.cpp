@@ -133,6 +133,7 @@ void Supervisor::start(const LaunchSpec& spec) {
         state_.started_at = now_ms();
         state_.phase      = "starting infernix-serve";
         load_verdict_.reset();
+        listening_ = false;
         state_.argv       = {path_utf8(spec.executable)};
         state_.argv.insert(state_.argv.end(), spec.args.begin(), spec.args.end());
         stop_requested_   = false;
@@ -272,6 +273,8 @@ void Supervisor::monitor(std::uint32_t instance) {
     std::optional<std::uint64_t> progress;
     // The watchdog's verdict on this instance: its kind and the reason.
     std::optional<std::pair<std::string, std::string>> incident;
+    // When /health first answered 200 while this instance had not yet logged that it listens (its own line).
+    std::optional<Clock::time_point> health_unconfirmed_since;
 
     for (;;) {
         InstanceState state;
@@ -353,6 +356,22 @@ void Supervisor::monitor(std::uint32_t instance) {
                 continue;
             }
             if (auto response = client.Get("/health"); response && response->status == 200) {
+                // Ready only once this instance logged 'listening on': another program listening on a fixed child
+                // port answers /health too, long before infernix-serve fails to bind it (and exits). A server that
+                // never logs the line (an older build) is taken after 30 s of answers while it runs.
+                bool confirmed = false;
+                {
+                    std::lock_guard lock(mutex_);
+                    confirmed = listening_;
+                }
+                if (!confirmed) {
+                    if (!health_unconfirmed_since) { health_unconfirmed_since = Clock::now(); }
+                    if (Clock::now() - *health_unconfirmed_since < std::chrono::seconds(30)) {
+                        std::unique_lock lock(mutex_);
+                        cv_.wait_for(lock, kStartingPoll, [this] { return stop_requested_; });
+                        continue;
+                    }
+                }
                 {
                     std::lock_guard lock(mutex_);
                     if (state_.state == InstanceState::Starting) {
@@ -467,6 +486,7 @@ void Supervisor::observe(const LogRecord& record) {
         std::lock_guard lock(mutex_);
         if (record.instance != state_.instance) { return; }
         if (!serve_build_ && record.text.starts_with("build ")) { serve_build_ = record.text.substr(6); }
+        if (record.text.starts_with("listening on ")) { listening_ = true; } // OperationalLog::server_ready
         if (state_.state == InstanceState::Starting && record.level == "info") {
             std::string phase = record.text;
             if (phase.starts_with("engine | ")) { phase.erase(0, 9); }
