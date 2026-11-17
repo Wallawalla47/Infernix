@@ -395,10 +395,19 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     std::string snippet;
     if (const std::size_t marker = outcome.text.find("<tool_call>");
         marker != std::string::npos) {
-        snippet = outcome.text.substr(marker, kMarkupSnippetBytes);
-        if (outcome.text.size() - marker > kMarkupSnippetBytes) { snippet += "..."; }
+        // The model's bytes go to the operator's terminal and the log file: every control byte (an escape
+        // sequence would move the cursor or retitle the window) becomes a space, and the cut ends on a UTF-8
+        // character boundary.
+        std::size_t length = std::min(kMarkupSnippetBytes, outcome.text.size() - marker);
+        while (length > 0 && marker + length < outcome.text.size() &&
+               (static_cast<unsigned char>(outcome.text[marker + length]) & 0xC0U) == 0x80U) {
+            --length;
+        }
+        snippet = outcome.text.substr(marker, length);
+        if (outcome.text.size() - marker > length) { snippet += "..."; }
         for (char& byte : snippet) {
-            if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+            const auto value = static_cast<unsigned char>(byte);
+            if (value < 0x20U || value == 0x7FU) { byte = ' '; }
         }
     }
 
