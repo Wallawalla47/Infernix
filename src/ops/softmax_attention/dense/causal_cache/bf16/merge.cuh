@@ -108,9 +108,10 @@ __launch_bounds__(Schedule::kThreads) __global__
     }
 
     const int window             = causal_row_window(positions[0], tokens, visible_capacity);
+    // A dead row (no slots: positions[0] < 0, or no valid column) has no splits; its layout would divide by zero.
     const int active_split_count =
         MultiBatch && partition.proportional != 0
-            ? Bf16KvProportionalShares::layout(partition, window, proportional_count).splits
+            ? (proportional_count == 0 ? 0 : Bf16KvProportionalShares::layout(partition, window, proportional_count).splits)
             : partition.live(window).splits;
 
     __shared__ float weights[Schedule::kThreads], warp_sums[Schedule::kWarps], scalars[2];
