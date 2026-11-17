@@ -523,7 +523,8 @@ void CpuExpertTeam::work(int w) {
             xu[c] = shared ? xg[c] : &x_up_[xs_index(j, c)];
             hb[c] = &h_[h_index(j, c)];
         }
-        gate_up_units(isa_, job.rg16(), job.scales, xg, xu, job.ncols, u, u + 1, hb, prefetch_bytes_);
+        // Equal scales: the same array for both (gate_up_units compares the arrays, and then walks the rows once).
+        gate_up_units(isa_, job.rg16(), job.scales, xg, shared ? xg : xu, job.ncols, u, u + 1, hb, prefetch_bytes_);
         beat(w);
     }
     barrier();
