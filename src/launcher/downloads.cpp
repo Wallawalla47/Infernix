@@ -629,6 +629,7 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
     }
     PartFile out(part);
     if (!out.ok() || (!resumable && !out.resize(size))) {
+        std::lock_guard lock(mutex_); // list() reads it under the lock
         file.error = "cannot write " + path_utf8(part);
         return false;
     }
@@ -773,7 +774,10 @@ bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::f
     save_meta(true);
     const bool complete = std::all_of(done.begin(), done.end(), [](char flag) { return flag != 0; });
     if (complete) { out.finish(); }
-    if (!complete && !interrupt_) { file.error = failure.empty() ? "download failed" : failure; }
+    if (!complete && !interrupt_) {
+        std::lock_guard lock(mutex_); // list() reads it under the lock
+        file.error = failure.empty() ? "download failed" : failure;
+    }
     return complete && !interrupt_;
 }
 
