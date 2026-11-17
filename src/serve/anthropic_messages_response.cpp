@@ -4,6 +4,7 @@
 #include "serve/citations.h"
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
+#include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
 
@@ -411,6 +412,11 @@ std::optional<std::string> decode_thinking_signature(std::string_view signature)
         if (data_chars > 2) { out += static_cast<char>(group >> 8 & 255); }
         if (data_chars > 3) { out += static_cast<char>(group & 255); }
     }
+    // The reasoning a signature carries becomes prompt text (and is logged and echoed as JSON): bytes that are not
+    // UTF-8 are a malformed signature, not text.
+    try {
+        (void)text::unicode_internal::utf8_codepoints(out, "a hidden-reasoning signature");
+    } catch (const std::exception&) { throw malformed(); }
     return out;
 }
 
