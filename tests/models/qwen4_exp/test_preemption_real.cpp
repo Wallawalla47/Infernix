@@ -10,10 +10,17 @@
 //   exact    Both requests publish to the prefix cache: the pause publishes the younger one's
 //            state at its frontier and the resume restores it, so both outputs equal their solo
 //            runs (greedy) and the younger request reports a snapshot restore.
-//   replay   The younger request does not publish (allow_prefix_reuse = false): its resume replays
-//            the ledger from the root without sampling. Its output keeps every token committed
-//            before the pause, completes at full length and reports a replay restore; the tokens
-//            after the pause may differ from the solo run (prefill arithmetic), which is reported.
+//   replay   Neither request publishes (allow_prefix_reuse = false), so the paused one resumes by
+//            replaying its ledger from the root without sampling. Which one is paused is the turn's:
+//            the request first refused a unit owns it and pauses the other, the one whose pause
+//            recomputes the fewest tokens (both replay here; resource-scheduling, "Service turns"),
+//            and which lane is refused first depends on how its prefill and the other's rounds
+//            interleave in time. (With the older request publishing, the younger one was expected
+//            to be paused; when the younger one owned the turn the older one, whose pause recomputes
+//            nothing, was paused instead, and the replay went unexercised: 2026-11-17, 5 of 5 MTP runs.)
+//            The paused request's output keeps every token committed before the pause, completes at
+//            full length and reports a replay restore; the tokens after the pause may differ from the
+//            solo run (prefill arithmetic), which is reported. The other one equals its solo run.
 //
 // The DFlash2 mode (INFERNIX_QWEN4_DFLASH2 names the drafter companion) adds dflash2-pairs: the two
 // residents decode in two-row DFlash2 rounds until the pause, so the exact scenario also checks that
@@ -44,6 +51,7 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -168,27 +176,37 @@ int run_mode(const char* artifact, const char* ngram, Mode mode, const char* dra
         failures += check(rb.scheduling.preemptions == 0 || rb.scheduling.snapshot_restores >= 1,
                           "a paused publishing request resumes from its published state");
     }
-    // replay: B publishes nothing, so its resume replays the ledger from the root.
+    // replay: neither publishes, so the paused one's resume replays its ledger from the root.
     {
-        auto a = engine.submit(engine.prepare_tokens(prompt_a), greedy(true));
+        auto a = engine.submit(engine.prepare_tokens(prompt_a), greedy(false));
         auto b = engine.submit(engine.prepare_tokens(prompt_b), greedy(false));
         const infernix::GenerationResult ra = a.wait();
         const infernix::GenerationResult rb = b.wait();
-        const std::size_t kept = common_prefix(rb.generated_token_ids, solo_b);
-        std::printf("  replay: A preemptions %llu (snapshot restores %llu, replay restores %llu); B preemptions %llu, "
-                    "replay restores %llu, replayed tokens %llu, tokens equal to solo %zu of %zu\n",
+        std::printf("  replay: A preemptions %llu (replay restores %llu, replayed tokens %llu, tokens equal to solo %zu); "
+                    "B preemptions %llu (replay restores %llu, replayed tokens %llu, tokens equal to solo %zu)\n",
                     static_cast<unsigned long long>(ra.scheduling.preemptions),
-                    static_cast<unsigned long long>(ra.scheduling.snapshot_restores),
                     static_cast<unsigned long long>(ra.scheduling.replay_restores),
+                    static_cast<unsigned long long>(ra.scheduling.replayed_tokens),
+                    common_prefix(ra.generated_token_ids, solo_a),
                     static_cast<unsigned long long>(rb.scheduling.preemptions),
                     static_cast<unsigned long long>(rb.scheduling.replay_restores),
-                    static_cast<unsigned long long>(rb.scheduling.replayed_tokens), kept, rb.generated_token_ids.size());
-        failures += check(ra.generated_token_ids == solo_a, "A equals its solo run (first difference at " +
-                                                                std::to_string(common_prefix(ra.generated_token_ids, solo_a)) + ")");
-        failures += check(rb.scheduling.preemptions >= 1, "B is paused");
-        failures += check(rb.scheduling.replay_restores >= 1 && rb.scheduling.replayed_tokens >= kPrompt,
-                          "B resumes by replaying its ledger");
-        failures += check(rb.generated_token_ids.size() == kOutputs, "B completes every token");
+                    static_cast<unsigned long long>(rb.scheduling.replayed_tokens),
+                    common_prefix(rb.generated_token_ids, solo_b));
+        failures += check(ra.scheduling.preemptions + rb.scheduling.preemptions >= 1, "the shared pool forces a pause");
+        for (const auto& [label, result, solo] :
+             {std::tuple<const char*, const infernix::GenerationResult&, const std::vector<infernix::TokenId>&>{"A", ra, solo_a},
+              std::tuple<const char*, const infernix::GenerationResult&, const std::vector<infernix::TokenId>&>{"B", rb, solo_b}}) {
+            if (result.scheduling.preemptions >= 1) {
+                failures += check(result.scheduling.replay_restores >= 1 && result.scheduling.replayed_tokens >= kPrompt,
+                                  std::string(label) + ", paused, resumes by replaying its ledger");
+                failures += check(result.generated_token_ids.size() == kOutputs,
+                                  std::string(label) + ", paused, completes every token");
+            } else {
+                failures += check(result.generated_token_ids == solo,
+                                  std::string(label) + ", never paused, equals its solo run (first difference at " +
+                                      std::to_string(common_prefix(result.generated_token_ids, solo)) + ")");
+            }
+        }
     }
     return failures;
 }
