@@ -199,7 +199,7 @@
       "title": "Qwen3.8-Flash-Next NVIDIA NVFP4-QAD Dense8",
       "family": "qwen3.8-flash-next",
       "kind": "model",
-      "description": "NVIDIA's quantization-aware distillation (NVFP4 routed and shared experts, MXFP8 GDN and attention) bit-exact, its BF16 mixers, PLE projections and lm_head in 8 bits. Perplexity 3.4385 against FP4-Local's 3.5066 at the same 4-bit expert arithmetic. Needs Infernix main at eac2b3d8 or later.",
+      "description": "NVIDIA's quantization-aware distillation (NVFP4 routed and shared experts, MXFP8 GDN and attention) bit-exact, its BF16 mixers, PLE projections and lm_head in 8 bits. Perplexity 3.4385 against 3.5095 for NVIDIA NVFP4 Dense8 on the same build. Needs Infernix main at eac2b3d8 or later (a release after windows-2026.11.07).",
       "recommended": true,
       "source_repo": "nvidia/Qwen3.8-Flash-Next-NVFP4-QAD",
       "tags": [
@@ -247,7 +247,7 @@
       "title": "Qwen3.8-Flash-Next NVIDIA NVFP4-QAD (bit-exact)",
       "family": "qwen3.8-flash-next",
       "kind": "model",
-      "description": "NVIDIA's quantization-aware distillation with every weight exactly as NVIDIA stores it. Perplexity 3.4422 (3.4138 with --a16-activations). Needs Infernix main at eac2b3d8 or later.",
+      "description": "NVIDIA's quantization-aware distillation with every weight exactly as NVIDIA stores it. Perplexity 3.4422 (3.4138 with --a16-activations). Needs Infernix main at eac2b3d8 or later (a release after windows-2026.11.07).",
       "recommended": false,
       "source_repo": "nvidia/Qwen3.8-Flash-Next-NVFP4-QAD",
       "tags": [

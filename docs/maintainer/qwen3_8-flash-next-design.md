@@ -891,10 +891,16 @@ mixers and head are recipe B's kernels.
 layer's routed jobs had to take it (2026-11-17, found by the first measurements):
 - the SSD tier's fetch plan held `kMaxFetch` (512) jobs, so a call of 52+ columns on the tier (the exclusive layout's
   default) failed with "experts fetch channel is incomplete"; its per-job arrays hold `kMaxFetchJobs` (513) now, while
-  a request still names at most 512 experts (the shared job is resident, never fetched);
+  a request still names at most 512 experts (the shared job is resident, never fetched).
+  `test_offloaded_moe_layer`'s shared-fetch case routes all 512 experts of a 64-column call beside the shared job
+  through the fetch channel (64 and 3 staging slots) against the CPU engine and a zero-copy reference; without the
+  extra job it fails with that message;
 - Qwen4Exp's staging held `top_k x max_width` (80) records and the fork route needs every job within the slots, so
   every eight-column verification call lost the fork (and its landings): MTP decode after a 4K prompt was 14-16 %
-  behind FP4-Local in every mode until a shared bank's staging took one slot more (+16-19 %, level with FP4-Local);
+  behind FP4-Local in every mode until a shared bank's staging took one slot more (+16-19 %, level with FP4-Local).
+  The fork takes calls of at most eight columns, so it needs at most 81 slots and the 512-slot cap never binds. No
+  test guards the slot: a forked call is not observable apart from speed (the landed count stays above zero when
+  only the eight-column calls lose the fork), so the bench's MTP decode is its check;
 - the wide route's WarpTile64 rule reads the mean columns per job, which the shared job's T columns raised (the rule
   then switched at about 23,900 instead of 26,200 columns a call; the bits are the same either way); it reads the
   routed jobs' mean now.
