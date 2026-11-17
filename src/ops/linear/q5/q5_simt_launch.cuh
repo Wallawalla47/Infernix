@@ -12,6 +12,9 @@ template <class Schedule, bool Full, bool FullK, bool TriggerPdl, bool JoinPdl, 
           class Output, class Epilogue>
 void launch_q5_a16_simt_slice(const Q5LinearOperands& operands, Output output, Epilogue epilogue,
                               int token_begin, int tokens, cudaStream_t stream) {
+    // A programmatic launch of a staged SIMT kernel that does not join reads x (the producer's output) with no
+    // wait: it only waits at the end (JoinPdl). Its callers read x early by design only with JoinPdl.
+    static_assert(!Dependent || JoinPdl, "a Dependent staged SIMT launch must join (JoinPdl)");
     const dim3 grid(div_up(operands.rows, Schedule::kBlockRows),
                     div_up(tokens, Schedule::kBlockTokens));
     const dim3 block(Schedule::kThreads);
