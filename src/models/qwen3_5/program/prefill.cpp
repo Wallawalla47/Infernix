@@ -885,6 +885,19 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 schedule_state.pair_tap_frontier = -1;
                 schedule_state.pair_tap_slot     = -1;
                 std::optional<HybridPendingTap> pair_tap;
+                // A reservation the pass did not get to publish (it failed, or a step between the reservation and
+                // the pass did) gives its room back.
+                struct ReleasePairTap {
+                    ProgramImpl& program;
+                    SequenceState& sequence;
+                    std::optional<HybridPendingTap>& tap;
+                    ~ReleasePairTap() {
+                        if (!tap) { return; }
+                        try {
+                            program.hybrid_release_reserved(sequence, *tap);
+                        } catch (...) {} // the pass's own failure is the one that propagates
+                    }
+                } release_pair_tap{*this, sequence, pair_tap};
                 std::optional<HybridTapDue> pair_due;
                 if (hybrid_split && split_frontier == hybrid_split &&
                     pair_window(*hybrid_split, remaining, final_candidate)) {
@@ -912,18 +925,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         split_frontier.reset();
                     }
                 }
-                // A reservation the pass did not get to publish (it failed) gives its room back.
-                struct ReleasePairTap {
-                    ProgramImpl& program;
-                    SequenceState& sequence;
-                    std::optional<HybridPendingTap>& tap;
-                    ~ReleasePairTap() {
-                        if (!tap) { return; }
-                        try {
-                            program.hybrid_release_reserved(sequence, *tap);
-                        } catch (...) {} // the pass's own failure is the one that propagates
-                    }
-                } release_pair_tap{*this, sequence, pair_tap};
                 if (offload) {
                     std::uint32_t expected = std::min(idle_prefill_width, remaining);
                     if (split_frontier && *split_frontier > pass_begin) {
