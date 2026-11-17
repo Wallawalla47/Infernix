@@ -9042,12 +9042,16 @@ a 7,792 MiB arena). It is now the forward's own plan:
 - A walk's MoE groups are formed before its lease is taken, by a budget: what the cache can lend now beside the walk
   area and the ring, or on the reproducible route a figure fixed when the chunk is fitted, so a request's groups
   depend only on its calls. A span of chunks the static arena holds groups by that arena.
-- `infernix_qwen4_exp_wide_plan_real_test` checks every scope against its plan (six artifacts, every KV storage,
-  MTP, DFlash2, scoring, two lanes, the A4 and A8 routes, `--reproducible`, a pair call, a 32,768-column group, chunks
-  cut below the prefill chunk). Planned against peak, over the scopes that run their whole plan: 1.000-1.003 on
-  FP4-Local's default route; up to 1.03 where the projections' capacity queries cover f16-accumulate-prefill's scratch
-  that the call does not take (`--reproducible`, BF16 KV), a constant ~60 MiB on IQ3_S's `--a8-activations` (the GGUF
-  planes), 1.15-1.18 on Dense8 (an Op's capacity query past its route; not traced to the Op).
+- `infernix_qwen4_exp_wide_plan_real_test` checks every scope against its plan: every KV storage, MTP, DFlash2,
+  scoring, two lanes, the A4 and A8 routes, `--reproducible`, a pair call, a 32,768-column group and chunks cut below
+  the prefill chunk. On the final build (FP4-Local 21 scenarios, IQ3_S 17, Dense8 6, both NVFP4-QAD conversions 12;
+  the planner in shadow also on recipe A, recipe C and FP8) no scope peaked above its plan. Each scenario's heaviest
+  scope plans 1.00x its peak, except 1.02x on FP4-Local with BF16 KV (plain or packed: the projections' capacity
+  queries cover f16-accumulate-prefill's scratch that the call does not take) and 1.07x for IQ3_S's 139 MiB pair
+  call. Lighter scopes (peaking at half their plan or more) plan up to 1.52x on the 16,384-token scenarios, 1.66x on
+  the cut chunks and 1.79x on the 48,000-token prompt; they borrow within the lease the heaviest scope sizes. Dense8's mixer planned
+  319 MiB above its peak until the hyper-connection mix's workspace query left out the `u` that its up + collapse
+  route keeps on chip.
 
 | RTX 5090, INT8 KV, chunk 16384, plain decode | Arena or lease (MiB) | pp32768 (tok/s) | tg256 after it | pp4096 | tg256 after it |
 |---|---:|---:|---:|---:|---:|
@@ -11773,7 +11777,8 @@ corpus in 49,152-token windows at 8,192-token chunks (MoE groups of two chunks b
   7,009 MiB, more than the cache lends, so it prefills at 8,192): on Dense8, which lends a 16K
   arena, 16K chunks ran −0.6 % at 32K and −0.1 % at 64K tokens against 8K (two rounds), and the BF16
   dense tiles gain 1-4 % per column at 16K over 8K (the shared expert loses 5 %), about 1 µs per
-  token in all.
+  token in all. Built since by sizing each loan by the forward's plan (VRAM item 1, 2026-11-17): IQ3_S
+  prefills at 16,384.
 - The BF16 expert route over planes below 14,336 columns (above; superseded by the stage-decode
   tiles below).
 - A two-limb expert codec: not built once the BF16 tiles measured faster than the exact tiles from

@@ -471,9 +471,11 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. A long
   prompt's prefill workspace is lent from the expert cache (at most three quarters of the frames of
   its largest frame pool; a GGUF import keeps a pool per record size), which also gives its frames to
-  the KV pool as contexts grow. A chunk whose workspace the cache cannot lend is cut at startup to
-  the widest one it can (a multiple of 128 tokens), with a warning: 65,536 tokens under the SSD tier
-  wanted ~27 GiB, and the IQ3_S import's 16,384 does not fit on a 32 GB card. A prompt whose
+  the KV pool as contexts grow. Each call borrows what the forward's own plan of that call needs: on
+  an RTX 5090 with INT8 KV a 16,384-token FP4-Local call borrows 3.9 GiB (7.6 GiB before
+  2026-11-17), and the IQ3_S import's 16,384, cut to 13,440 before, fits. A chunk whose workspace
+  the cache cannot lend is cut at startup to the widest one it can (a multiple of 128 tokens), with
+  a warning. A prompt whose
   contexts have grown since runs its calls at the widest chunk the cache lends then. Calls of
   different widths can round differently, so the chunk can change a near-tie token.
   `--reproducible` keeps one chunk: the one the cache lends with every lane's context full (a lower
