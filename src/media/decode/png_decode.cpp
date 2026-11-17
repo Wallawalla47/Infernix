@@ -85,6 +85,24 @@ void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
             if (out.header.width <= 0 || out.header.height <= 0) {
                 throw std::invalid_argument("png dimensions are invalid");
             }
+            // The legal (colour type, bit depth) pairs (PNG specification, 11.2.2): every other depth would
+            // reach the sample reader's shifts and to8's divisor outside their domain.
+            const int depth   = out.header.bit_depth;
+            const bool legal  = [&] {
+                switch (out.header.color_type) {
+                case 0: return depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16;
+                case 3: return depth == 1 || depth == 2 || depth == 4 || depth == 8;
+                case 2:
+                case 4:
+                case 6: return depth == 8 || depth == 16;
+                default: return false;
+                }
+            }();
+            if (!legal) {
+                throw std::invalid_argument("png has an invalid colour type and bit depth (" +
+                                            std::to_string(out.header.color_type) + ", " + std::to_string(depth) +
+                                            ")");
+            }
         } else if (std::memcmp(tag, "PLTE", 4) == 0) {
             if (length % 3 != 0 || length == 0) {
                 throw std::invalid_argument("png has a malformed PLTE chunk");
