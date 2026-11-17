@@ -118,6 +118,9 @@ inline std::atomic<std::uint64_t>& memory_fault_request() noexcept {
     return request;
 }
 inline void request_memory_fault(std::uint64_t after) noexcept {
+    // A disarm reaches the worker's countdown at its next CUDA_CHECK, not only at its next iteration: an iteration
+    // already running when the swept request returned could admit the next request and fail it with what is left.
+    if (after == 0) { ::infernix::testing::disarm_memory_exhausted_everywhere(); }
     memory_fault_request().store(after == 0 ? kMemoryFaultDisarm : after);
 }
 // A device failure inside the Program's finish or abort call (a request's release): the Engine arms its thread just

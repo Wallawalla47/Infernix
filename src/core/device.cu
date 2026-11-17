@@ -124,8 +124,12 @@ void report_cuda_cleanup_failure(const char* op, cudaError_t err) noexcept {
 
 namespace {
 
-// testing::arm_memory_exhausted_here: this thread's countdown (0: disarmed).
+// testing::arm_memory_exhausted_here: this thread's countdown (0: disarmed), valid while the generation it was armed in
+// is current (testing::disarm_memory_exhausted_everywhere starts a new one). Read only while armed: production
+// threads, never armed, pay the one countdown test.
 thread_local std::uint64_t t_memory_fault_countdown = 0;
+thread_local std::uint64_t t_memory_fault_generation = 0;
+std::atomic<std::uint64_t> g_memory_fault_generation{0};
 std::atomic<std::uint64_t> g_memory_fault_injections{0};
 
 [[noreturn]] void throw_memory_exhausted(const char* expr, const char* file, int line, bool injected) {
@@ -139,7 +143,12 @@ std::atomic<std::uint64_t> g_memory_fault_injections{0};
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) {
-        if (t_memory_fault_countdown == 0 || --t_memory_fault_countdown != 0) { return; }
+        if (t_memory_fault_countdown == 0) { return; }
+        if (t_memory_fault_generation != g_memory_fault_generation.load(std::memory_order_acquire)) {
+            t_memory_fault_countdown = 0; // disarmed from another thread
+            return;
+        }
+        if (--t_memory_fault_countdown != 0) { return; }
         g_memory_fault_injections.fetch_add(1, std::memory_order_relaxed);
         throw_memory_exhausted(expr, file, line, true);
     }
@@ -168,7 +177,13 @@ bool settle_after_memory_exhausted() noexcept {
 }
 
 namespace testing {
-void arm_memory_exhausted_here(std::uint64_t after) noexcept { t_memory_fault_countdown = after; }
+void arm_memory_exhausted_here(std::uint64_t after) noexcept {
+    t_memory_fault_generation = g_memory_fault_generation.load(std::memory_order_acquire);
+    t_memory_fault_countdown  = after;
+}
+void disarm_memory_exhausted_everywhere() noexcept {
+    g_memory_fault_generation.fetch_add(1, std::memory_order_acq_rel);
+}
 std::uint64_t memory_exhausted_injections() noexcept {
     return g_memory_fault_injections.load(std::memory_order_relaxed);
 }

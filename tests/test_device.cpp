@@ -390,6 +390,23 @@ int check_memory_exhausted(const infernix::DeviceContext& ctx) {
         CUDA_CHECK(cudaMemsetAsync(word, 0, sizeof(int), ctx.stream));
     } catch (const infernix::DeviceMemoryExhausted&) { disarmed = false; }
     expect(disarmed, "arming 0 did not disarm the injection");
+    // Disarmed from another thread while this one is armed and counting (a test thread disarming the Engine's worker
+    // mid-iteration): this thread's next checks count no further, and an arming after it fires again.
+    infernix::testing::arm_memory_exhausted_here(3);
+    CUDA_CHECK(cudaMemsetAsync(word, 0, sizeof(int), ctx.stream)); // 2 left
+    std::thread disarmer([] { infernix::testing::disarm_memory_exhausted_everywhere(); });
+    disarmer.join();
+    bool disarmed_elsewhere = true;
+    try {
+        for (int i = 0; i < 4; ++i) { CUDA_CHECK(cudaMemsetAsync(word, 0, sizeof(int), ctx.stream)); }
+    } catch (const infernix::DeviceMemoryExhausted&) { disarmed_elsewhere = false; }
+    expect(disarmed_elsewhere, "a disarm from another thread left this thread's countdown armed");
+    infernix::testing::arm_memory_exhausted_here(2);
+    bool rearmed = false;
+    try {
+        for (int i = 0; i < 2; ++i) { CUDA_CHECK(cudaMemsetAsync(word, 0, sizeof(int), ctx.stream)); }
+    } catch (const infernix::DeviceMemoryExhausted&) { rearmed = true; }
+    expect(rearmed, "an arming after a disarm from another thread did not fire");
     ctx.synchronize();
     CUDA_CHECK(cudaFree(word));
     return failures;

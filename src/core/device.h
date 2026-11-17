@@ -34,6 +34,9 @@ namespace testing {
 // call's work stays enqueued, as a failed launch's neighbours do). 0 disarms. Other threads are never
 // affected, so a test arms the thread that runs the work it targets.
 void arm_memory_exhausted_here(std::uint64_t after) noexcept;
+// Disarms every thread's countdown at once, from any thread: each armed thread's next CUDA_CHECK sees it and counts no
+// further, so work that thread runs after the call is never failed by an earlier arming.
+void disarm_memory_exhausted_everywhere() noexcept;
 // DeviceMemoryExhausted thrown by that injection so far (all threads).
 [[nodiscard]] std::uint64_t memory_exhausted_injections() noexcept;
 } // namespace testing
