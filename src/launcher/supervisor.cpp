@@ -138,6 +138,7 @@ void Supervisor::start(const LaunchSpec& spec) {
         state_.alias        = spec.alias;
         state_.name       = spec.name;
         state_.port       = spec.port;
+        state_.port_retry = spec.port_retry;
         state_.started_at = now_ms();
         state_.phase      = "starting infernix-serve";
         load_verdict_.reset();

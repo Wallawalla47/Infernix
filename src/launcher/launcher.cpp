@@ -1261,18 +1261,16 @@ Router::Loaded Launcher::load_model(const std::string& key) {
         if (supported("--any-model-name")) { spec.args.push_back("--any-model-name"); }
         if (supported("--log-stats-panel")) { spec.args.insert(spec.args.end(), {"--log-stats-panel", "off"}); }
         if (supported("--log-colours")) { spec.args.insert(spec.args.end(), {"--log-colours", "off"}); }
-        port_retry_allowed_ = settings.child_port == 0 && attempt < kPortAttempts;
+        spec.port_retry = settings.child_port == 0 && attempt < kPortAttempts;
         if (router_ && router_->load_cancelled()) {
-            port_retry_allowed_ = false;
-            result.error        = alias + ": the load was cancelled from the launcher";
-            result.cancelled    = true;
+            result.error     = alias + ": the load was cancelled from the launcher";
+            result.cancelled = true;
             return result;
         }
         try {
             supervisor_->start(spec);
         } catch (const std::exception& failure) {
-            port_retry_allowed_ = false;
-            result.error        = failure.what();
+            result.error = failure.what();
             return result;
         }
         if (attempt == 1) { store_.set_last_model(key); }
@@ -1284,7 +1282,6 @@ Router::Loaded Launcher::load_model(const std::string& key) {
                   " was taken by another program before infernix-serve bound it; starting it on another port",
               {{"model_key", key}, {"port", port}});
     }
-    port_retry_allowed_ = false;
     if (!ready && router_ && router_->load_cancelled()) {
         if (snapshot.state == InstanceState::Starting) { supervisor_->stop(std::chrono::seconds(settings.stop_timeout_s)); }
         result.error     = alias + ": the load was cancelled from the launcher";
@@ -1476,7 +1473,7 @@ std::string Launcher::failure_detail(const InstanceSnapshot& snapshot) const {
 }
 
 bool Launcher::port_retry_due(const InstanceSnapshot& snapshot) const {
-    return port_retry_allowed_ && !snapshot.incident && classify_load_failure(failure_detail(snapshot)) == "port";
+    return snapshot.port_retry && !snapshot.incident && classify_load_failure(failure_detail(snapshot)) == "port";
 }
 
 void Launcher::handle_load_failure(const InstanceSnapshot& snapshot, const std::string& kind, const std::string& detail) {

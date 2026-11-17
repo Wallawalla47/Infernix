@@ -46,6 +46,9 @@ struct LaunchSpec {
     EnvOverlay env;
     std::filesystem::path working_dir;
     int port = 0;
+    // A failure to bind its (automatic) port is retried on another port: the launcher does not report it. Kept with
+    // the instance, so the report of one start is judged by that start's own attempt, not a later one's.
+    bool port_retry = false;
 };
 
 struct InstanceSnapshot {
@@ -67,6 +70,7 @@ struct InstanceSnapshot {
     // Failed while ready: "crash", "hang" or "stall" (the watchdog's incident).
     std::optional<std::string> incident;
     std::optional<ProcessUsage> usage;
+    bool port_retry = false; // LaunchSpec::port_retry of this instance
 };
 
 struct WatchdogConfig {

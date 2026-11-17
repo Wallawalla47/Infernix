@@ -318,8 +318,6 @@ private:
     std::unique_ptr<InfernixUpdate> infernix_update_;
 
     std::atomic<bool> restart_required_{false};
-    // load_model's current start may be retried on another port (an automatic port, attempts left).
-    std::atomic<bool> port_retry_allowed_{false};
     std::atomic<bool> stopping_{false};
     std::mutex stop_mutex_;
     bool stopped_ = false;
