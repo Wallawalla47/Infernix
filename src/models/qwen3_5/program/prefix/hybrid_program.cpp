@@ -44,6 +44,28 @@ namespace {
 
 constexpr std::uint32_t kBlock = pc::kBlockTokens;
 
+// Runs its (non-throwing) rollback on every way out of a scope but the one that dismisses it: a return as well as a
+// throw. run() rolls back at once, where what follows reads the rolled-back state.
+template <class F>
+class ScopeRollback {
+public:
+    explicit ScopeRollback(F rollback) noexcept : rollback_(std::move(rollback)) {}
+    ScopeRollback(const ScopeRollback&)            = delete;
+    ScopeRollback& operator=(const ScopeRollback&) = delete;
+    ~ScopeRollback() { run(); }
+    void run() noexcept {
+        if (armed_) {
+            armed_ = false;
+            rollback_();
+        }
+    }
+    void dismiss() noexcept { armed_ = false; }
+
+private:
+    F rollback_;
+    bool armed_ = true;
+};
+
 // Blocks one prefetch batch copies (§6.6): about 20 ms of PCIe for 27B INT8, the longest a quote
 // may wait for blocks it is about to resume over.
 constexpr std::uint32_t kPrefetchBatchBlocks = 256;
@@ -896,6 +918,20 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     auto& binding                = transaction.hybrid.emplace();
     binding.quote                = candidate.hybrid;
     binding.path_hash            = path_hash;
+    // Every way out before the transaction is the Program's (context_transaction_, below) unwinds it, a shortage
+    // return as well as a throw. Armed before plan_binding_units, which sets the lane's request: a throw after it
+    // would otherwise leave the lane Prefilling, refused by every later binding until a recovery swept it.
+    ScopeRollback unwind([&]() noexcept {
+        abort_hybrid_binding(transaction);
+        // The state slot reserved below goes back here: the transaction is not the Program's yet, so abort_context
+        // never sees it, and a staging failure (a vision encoder, an allocation, the prompt's copy) would otherwise
+        // lose a slot for good until admission reported a state-slot shortage.
+        if (transaction.reserved_state) {
+            (void)state_store->release(*transaction.reserved_state);
+            transaction.reserved_state.reset();
+        }
+        requests[lane] = {};
+    });
     plan_binding_units(transaction, base, resume, resume_kind, resume_tokens);
     const UnitDemand& demand = transaction.reservation_demand;
 
@@ -924,18 +960,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
         cache->pin_snapshot(quote.snapshot);
         binding.snapshot_pinned = true;
     }
-    const auto unwind = [&] {
-        abort_hybrid_binding(transaction);
-        // The state slot reserved below goes back here: the transaction is not the Program's yet (context_transaction_),
-        // so abort_context never sees it, and a staging failure (a vision encoder, an allocation, the prompt's copy)
-        // would otherwise lose a slot for good until admission reported a state-slot shortage.
-        if (transaction.reserved_state) {
-            (void)state_store->release(*transaction.reserved_state);
-            transaction.reserved_state.reset();
-        }
-        requests[lane] = {};
-    };
-    try {
+    {
         runtime::ContextResourceUsage shortage;
         // While another lane holds KV, a binding the pools cannot hold even with every evictable cached
         // Device block evicted and every transfer landed (hybrid_cache_room) makes no room: it would evict
@@ -969,7 +994,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             }
         }
         if (shortage.main_kv_pages || shortage.backend_kv_pages) {
-            unwind();
+            unwind.run(); // before the pools' usage is read
             // Waiting helps only when the binding fits the pools at all.
             const auto usage = physical_usage();
             const bool capacity_possible =
@@ -978,10 +1003,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             return {.capacity_possible = capacity_possible, .shortage = shortage, .reclaim_cache = possible};
         }
         transaction.reserved_state = state_store->reserve_destination();
-        if (!transaction.reserved_state) {
-            unwind();
-            return {.shortage = {.state_slots = 1}};
-        }
+        if (!transaction.reserved_state) { return {.shortage = {.state_slots = 1}}; }
         // The request's prefill state is staged only now that the binding has its room: an attempt that reports
         // a shortage, which the Engine repeats on later admission passes, copies no prompt and encodes no image.
         // A resumed request brings its own (install_binding), so it stages none.
@@ -994,12 +1016,10 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             // Offloaded experts: the replay's routes credit the cache from zero, as a prompt's do.
             offload->engine().clear_prompt_uses(lane);
         }
-    } catch (...) {
-        unwind();
-        throw;
     }
 
     context_transaction_.emplace(std::move(transaction));
+    unwind.dismiss();
     auto& tx = *context_transaction_;
     auto& hb = *tx.hybrid;
     try {
