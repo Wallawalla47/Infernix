@@ -1,7 +1,7 @@
 """The launcher against the stand-in server (no GPU): its features and its watchdog.
 
 python -I tools/launcher/launcher_check.py --launcher <infernix-launcher> --fake <infernix_launcher_fake_serve>
-    --models <dir> [--groups features,watchdog,windowless,autoload]
+    --models <dir> [--groups features,watchdog,windowless,autoload,cutoff]
 Runs on Windows and Linux. <dir> holds at least one supported artifact (only its header is read;
 nothing in it is changed). Each group starts its own launcher with its memory and logs in a fresh
 temporary folder (printed; removed afterwards unless --keep).
@@ -16,6 +16,8 @@ watchdog: crash, lock-up, stall, the restart limit, idle servers, loads that do 
           the request-content log (about three minutes).
 windowless: (Windows) a launcher started on a console without a window stops its server in order.
 autoload: the default model loads by itself after a slow first scan (about 20 s).
+cutoff: a server that crashes in the middle of a stream: the client's stream ends with an error event
+          (about 10 s).
 """
 
 from __future__ import annotations
@@ -902,6 +904,35 @@ def windowless(launcher: Launcher, port: int, data: Path) -> None:
     check("windowless: an orderly stop", code == 0, str(code))
 
 
+def cutoff(launcher: Launcher, port: int, data: Path) -> None:
+    """A server that crashes in the middle of an answer: the client's stream ends with the protocol's error event,
+    not as a complete answer (its own group: the crash counts toward the watchdog's restart limit)."""
+    model = first_model(port)
+    key, alias = model["key"], model["config"]["alias"]
+    call(port, "PUT", f"/launcher/api/models/{key}/config", {"args": list(model["config"]["default_args"]) +
+                                                              ["--fake-load-ms", "500"]})
+    status, _ = call(port, "POST", "/v1/chat/completions", chat(alias, 8))
+    check("cutoff: a request loads the model", status == 200, str(status))
+    before = instance(port)
+    cut: dict = {}
+    reader = threading.Thread(target=lambda: cut.update(
+        result=stream(port, "/v1/chat/completions", chat(alias, 4000, True))), daemon=True)
+    reader.start()
+    time.sleep(2.0)  # the stream is under way (a token every 6.7 ms)
+    try:
+        call(before["port"], "POST", "/fake/crash", {}, timeout=5)
+    except OSError:
+        pass
+    reader.join(60)
+    status, _, _, pieces = cut.get("result", (0, "", 0.0, []))
+    text = "".join(piece for _, piece in pieces)
+    check("cutoff: a stream the server's crash cut off ends with an error event, not [DONE]",
+          status == 200 and '"error"' in text and "ended the stream early" in text and "[DONE]" not in text,
+          f"{status} ...{text[-200:]!r}")
+    code = launcher.stop()
+    check("cutoff: an orderly stop", code == 0, str(code))
+
+
 def autoload(launcher: Launcher, port: int, data: Path) -> None:
     """With autoload on, the launcher loads the default model by itself once its first scan has found
     it, however long the server's --help takes before that scan (12 s here: a cold first start)."""
@@ -933,7 +964,7 @@ def main() -> int:
     parser.add_argument("--fake", required=True)
     parser.add_argument("--models", required=True)
     parser.add_argument("--port", type=int, default=1238)
-    parser.add_argument("--groups", default="features,watchdog,windowless,autoload")
+    parser.add_argument("--groups", default="features,watchdog,windowless,autoload,cutoff")
     parser.add_argument("--skip-ram", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the temporary folders")
     options = parser.parse_args()
@@ -948,6 +979,8 @@ def main() -> int:
         run_group("windowless", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, windowless, windowless=True)
     if "autoload" in groups:
         run_group("autoload", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, autoload)
+    if "cutoff" in groups:
+        run_group("cutoff", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, cutoff)
     failed = [r for r in results if not r[1]]
     log(f"SUMMARY: {len(results) - len(failed)} passed, {len(failed)} failed")
     for name, _, detail in failed:
