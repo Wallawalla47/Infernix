@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace infernix::models::qwen3_5::detail {
@@ -171,6 +172,42 @@ private:
     std::vector<Object> objects_;
     std::vector<std::uint32_t> free_objects_;
     std::uint32_t free_count_ = 0;
+};
+
+// A slot reserved in a scope that can still fail before its owner (a binding transaction, a pending tap) holds it:
+// released when the hold dies still holding it, handed over by release(). The prefix cache's holds
+// (runtime/prefix_cache/prefix_holds.h) are the same family.
+class StateSlotHold {
+public:
+    StateSlotHold() noexcept = default;
+    StateSlotHold(StateImageStore& store, StateImageHandle handle) noexcept : store_(&store), handle_(handle) {}
+    StateSlotHold(StateSlotHold&& other) noexcept
+        : store_(std::exchange(other.store_, nullptr)), handle_(other.handle_) {}
+    StateSlotHold& operator=(StateSlotHold&& other) noexcept {
+        if (this != &other) {
+            reset();
+            store_  = std::exchange(other.store_, nullptr);
+            handle_ = other.handle_;
+        }
+        return *this;
+    }
+    StateSlotHold(const StateSlotHold&)            = delete;
+    StateSlotHold& operator=(const StateSlotHold&) = delete;
+    ~StateSlotHold() { reset(); }
+
+    [[nodiscard]] bool held() const noexcept { return store_ != nullptr; }
+    [[nodiscard]] StateImageHandle get() const noexcept { return handle_; }
+    StateImageHandle release() noexcept {
+        store_ = nullptr;
+        return handle_;
+    }
+    void reset() noexcept {
+        if (StateImageStore* store = std::exchange(store_, nullptr)) { (void)store->release(handle_); }
+    }
+
+private:
+    StateImageStore* store_ = nullptr;
+    StateImageHandle handle_;
 };
 
 // A lane's state: execution reads and writes the same image.
