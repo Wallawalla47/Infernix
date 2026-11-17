@@ -693,8 +693,13 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace);
 
         if (tree_rows != nullptr) {
-            auto scope = workspace.scope();
-            gdn_input_proj(x, weight, conv_record, z, policy, workspace, stream);
+            // The projection over the call's columns as one matrix (rows of a batch side by side), then each
+            // column's window over its ancestors.
+            auto scope         = workspace.scope();
+            Tensor x_flat      = flatten_columns(x, x.ne[0], geometry);
+            Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
+            Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
+            gdn_input_proj(x_flat, weight, record_flat, z_flat, policy, workspace, stream);
             detail::gdn_projected_conv_record_tree_launch(conv_record, conv_weight, conv_states,
                                                           valid_columns, initial_state_slots,
                                                           *tree_rows, query, key, value, stream);
