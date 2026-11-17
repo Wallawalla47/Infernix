@@ -661,13 +661,16 @@ __device__ __forceinline__ float route_value(unsigned key) {
 // Every array index is a compile-time constant (unrolled loops), so the values stay in registers;
 // the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id. Each
 // selection's warp step is two hardware reductions (redux.sync) instead of a five-step shuffle tree:
-// the largest key, then the lowest id among the lanes holding it, which is the tree's winner (a lane's
-// candidate is never NaN: NaN logits are never selected, as before). A selected -0 is returned as +0,
-// which changes no weight. A lane's own arg-max is a depth-4 tree over its 16 candidates' keys (on a tie
-// the lower index, so the lower id, wins; NaN and e >= experts take key 0, below every candidate, and a
-// lane left with none offers -inf and id 0x7FFFFFFF): the 16-step compare chain it replaced took ~7,400
-// of the fused route kernel's ~24,000 cycles at decode widths (2026-10-29). Each lane computes its own
-// softmax term once; the sum still adds the terms in selection order.
+// the largest key, then the lowest id among the lanes holding it, which is the tree's winner. A NaN logit
+// ranks as -inf (key kNegInfKey: below every number, tied with -inf by id), so a column of NaN logits
+// (a blown-up hidden state) still selects top_k real experts, at NaN weights, and every id stays below
+// `experts`; a selected expert takes key 0 and is never selected again. Finite logits select as before.
+// A selected -0 is returned as +0, which changes no weight. A lane's own arg-max is a depth-4 tree over
+// its 16 candidates' keys (on a tie the lower index, so the lower id, wins; e >= experts and selected
+// experts take key 0, below every candidate, and a lane left with none offers -inf and id 0x7FFFFFFF,
+// which loses to any lane holding a candidate: top_k <= experts leaves one): the 16-step compare chain it
+// replaced took ~7,400 of the fused route kernel's ~24,000 cycles at decode widths (2026-10-29). Each
+// lane computes its own softmax term once; the sum still adds the terms in selection order.
 __device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                             bool bf16_logits, std::int32_t* __restrict__ ids,
                                             float* __restrict__ weights, float* __restrict__ shared_gate) {
@@ -686,7 +689,7 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
     unsigned key[kPerLane];
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
-        key[i] = lane + 32 * i < experts && !isnan(values[i]) ? route_key(values[i]) : 0U;
+        key[i] = lane + 32 * i >= experts ? 0U : isnan(values[i]) ? kNegInfKey : route_key(values[i]);
     }
     // Lane k keeps the k-th selection.
     float selected = -INFINITY;
@@ -720,7 +723,7 @@ __device__ __forceinline__ int route_column(const float* __restrict__ logits, in
         }
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { key[i] = kNegInfKey; }
+            if (lane + 32 * i == best_id) { key[i] = 0U; }
         }
     }
     // softmax over all experts then renormalized over the selected ones equals the softmax of the
@@ -750,7 +753,9 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
 // without a slot is cleared and skipped, so the restricted selection is the top_k experts with a slot in that
 // order, and its weights are route_column's arithmetic over them. Whether a pick has a slot comes from its
 // owner lane's bit mask (one shuffle; the table is read once, coalesced), and the selected experts' slots are
-// read after the walk. The first top_k picks, slot or not, are the column's demand.
+// read after the walk. The first top_k picks, slot or not, are the column's demand. As there, a NaN logit
+// ranks as -inf and a pick is never picked again (its value becomes NaN, which no comparison selects), so
+// every pick is a real expert: `experts` picks walk each expert once.
 __device__ __forceinline__ void route_pooled_column(const float* __restrict__ logits, int experts, int top_k, int t,
                                                     bool bf16_logits, const std::int32_t* __restrict__ slot_of,
                                                     std::int32_t* __restrict__ demand, std::int32_t* __restrict__ ids,
@@ -764,6 +769,7 @@ __device__ __forceinline__ void route_pooled_column(const float* __restrict__ lo
     for (int i = 0; i < kPerLane; ++i) {
         const int e = lane + 32 * i;
         values[i]   = e < experts ? router_logit(column[e], bf16_logits) : -INFINITY;
+        if (isnan(values[i])) { values[i] = -INFINITY; }
         if (e < experts && __ldg(slot_of + e) >= 0) { pooled |= 1U << i; }
     }
     const float score = lane == 0 ? router_logit(column[experts], bf16_logits) : 0.0F;
@@ -797,7 +803,7 @@ __device__ __forceinline__ void route_pooled_column(const float* __restrict__ lo
         }
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
+            if (lane + 32 * i == best_id) { values[i] = __int_as_float(0x7FC00000); }
         }
     }
     const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
