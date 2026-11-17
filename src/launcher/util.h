@@ -31,8 +31,12 @@ using Json = nlohmann::json;
 
 // Whole-file reads; nullopt when the file cannot be read.
 [[nodiscard]] std::optional<std::string> read_file(const std::filesystem::path& path);
-// Writes `path.tmp` and renames it over `path`, so a crash leaves the previous file whole.
-void write_file_atomic(const std::filesystem::path& path, std::string_view content);
+// Writes a temporary file beside `path` (a name unique to the call), makes its bytes durable (FlushFileBuffers /
+// fsync), then renames it over `path` (write-through on Windows; the folder synced on POSIX): a crash or a power
+// loss leaves either the previous file or the new one, whole. With `keep_backup` the previous file becomes
+// `backup_path(path)` first (read_file_or_backup reads it when `path` is missing or unreadable).
+void write_file_atomic(const std::filesystem::path& path, std::string_view content, bool keep_backup = false);
+[[nodiscard]] std::filesystem::path backup_path(const std::filesystem::path& path);
 
 // A file's last write time in Unix milliseconds (0 when unknown).
 [[nodiscard]] std::int64_t modified_ms(const std::filesystem::path& path);

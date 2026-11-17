@@ -30,22 +30,33 @@ std::filesystem::path home_dir() {
     return std::filesystem::current_path();
 }
 
+// The memory file, or (when it is missing or not valid JSON) the previous one each save keeps beside it
+// (write_file_atomic's backup), or defaults.
 Json read_json(const std::filesystem::path& path) {
-    const std::optional<std::string> text = read_file(path);
-    if (!text) { return Json::object(); }
-    try {
-        Json value = Json::parse(*text);
-        return value.is_object() ? value : Json::object();
-    } catch (const Json::exception&) {
-        // Keep the unreadable file for the user and start from defaults.
-        std::error_code ignored;
-        std::filesystem::path aside = path;
-        aside += ".unreadable";
-        std::filesystem::rename(path, aside, ignored);
-        std::fprintf(stderr, "launcher: %s was not valid JSON; moved aside, defaults used\n",
-                     path_utf8(path).c_str());
-        return Json::object();
+    if (const std::optional<std::string> text = read_file(path)) {
+        try {
+            Json value = Json::parse(*text);
+            return value.is_object() ? value : Json::object();
+        } catch (const Json::exception&) {
+            // Keep the unreadable file for the user.
+            std::error_code ignored;
+            std::filesystem::path aside = path;
+            aside += ".unreadable";
+            std::filesystem::rename(path, aside, ignored);
+            std::fprintf(stderr, "launcher: %s was not valid JSON; moved aside\n", path_utf8(path).c_str());
+        }
     }
+    const std::filesystem::path backup = backup_path(path);
+    if (const std::optional<std::string> text = read_file(backup)) {
+        try {
+            Json value = Json::parse(*text);
+            if (value.is_object()) {
+                std::fprintf(stderr, "launcher: %s used\n", path_utf8(backup).c_str());
+                return value;
+            }
+        } catch (const Json::exception&) {}
+    }
+    return Json::object();
 }
 
 int clamp_int(const Json& value, int low, int high, int fallback) {
@@ -465,7 +476,7 @@ void Store::save_locked() const {
                          {"last_model", last_model_ ? Json(*last_model_) : Json(nullptr)},
                          {"downloads", downloads_}};
     try {
-        write_file_atomic(memory_file(), memory.dump(2) + "\n");
+        write_file_atomic(memory_file(), memory.dump(2) + "\n", true);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "launcher: %s\n", error.what());
     }

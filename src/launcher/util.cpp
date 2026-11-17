@@ -1,12 +1,15 @@
 #include "launcher/util.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 
 #ifdef _WIN32
@@ -16,6 +19,7 @@
 #include <windows.h>
 #else
 #include <climits>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -113,22 +117,95 @@ std::optional<std::string> read_file(const std::filesystem::path& path) {
     return text.str();
 }
 
-void write_file_atomic(const std::filesystem::path& path, std::string_view content) {
+std::filesystem::path backup_path(const std::filesystem::path& path) {
+    std::filesystem::path out = path;
+    out += ".bak";
+    return out;
+}
+
+namespace {
+
+// The temporary file's bytes, durable before the rename publishes them (a rename is journaled, its data is not).
+void write_durable(const std::filesystem::path& temporary, std::string_view content) {
+#ifdef _WIN32
+    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                    nullptr);
+    if (file == INVALID_HANDLE_VALUE) { throw std::runtime_error("cannot write " + path_utf8(temporary)); }
+    bool ok = true;
+    for (std::size_t at = 0; ok && at < content.size();) {
+        const DWORD want = static_cast<DWORD>(std::min<std::size_t>(content.size() - at, 1U << 30));
+        DWORD wrote      = 0;
+        ok               = WriteFile(file, content.data() + at, want, &wrote, nullptr) != 0 && wrote == want;
+        at += wrote;
+    }
+    ok = ok && FlushFileBuffers(file) != 0;
+    ok = CloseHandle(file) != 0 && ok;
+#else
+    const int file = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (file < 0) { throw std::runtime_error("cannot write " + path_utf8(temporary)); }
+    bool ok = true;
+    for (std::size_t at = 0; ok && at < content.size();) {
+        const ssize_t wrote = ::write(file, content.data() + at, content.size() - at);
+        if (wrote < 0 && errno == EINTR) { continue; }
+        ok = wrote > 0;
+        if (ok) { at += static_cast<std::size_t>(wrote); }
+    }
+    ok = ok && ::fsync(file) == 0;
+    ok = ::close(file) == 0 && ok;
+#endif
+    if (!ok) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw std::runtime_error("cannot write " + path_utf8(temporary));
+    }
+}
+
+// Renames `from` over `to`, durably: write-through on Windows; the folder's entry synced on POSIX.
+bool rename_durable(const std::filesystem::path& from, const std::filesystem::path& to, std::string& error) {
+#ifdef _WIN32
+    if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+        error = std::system_category().message(static_cast<int>(GetLastError()));
+        return false;
+    }
+#else
+    if (::rename(from.c_str(), to.c_str()) != 0) {
+        error = std::system_category().message(errno);
+        return false;
+    }
+    const std::filesystem::path folder = to.has_parent_path() ? to.parent_path() : std::filesystem::path(".");
+    if (const int dir = ::open(folder.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dir >= 0) {
+        (void)::fsync(dir);
+        (void)::close(dir);
+    }
+#endif
+    return true;
+}
+
+} // namespace
+
+void write_file_atomic(const std::filesystem::path& path, std::string_view content, bool keep_backup) {
     std::error_code ignored;
     std::filesystem::create_directories(path.parent_path(), ignored);
+    // Unique to the call: two writers of one path never write one temporary file.
+    static std::atomic<std::uint64_t> sequence{0};
+#ifdef _WIN32
+    const unsigned long process = GetCurrentProcessId();
+#else
+    const unsigned long process = static_cast<unsigned long>(::getpid());
+#endif
     std::filesystem::path temporary = path;
-    temporary += ".tmp";
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) { throw std::runtime_error("cannot write " + path_utf8(temporary)); }
-        out.write(content.data(), static_cast<std::streamsize>(content.size()));
-        out.flush();
-        if (!out) { throw std::runtime_error("cannot write " + path_utf8(temporary)); }
+    temporary += ".tmp." + std::to_string(process) + "." + std::to_string(sequence.fetch_add(1) + 1);
+    write_durable(temporary, content);
+    std::string error;
+    // The previous file becomes the backup (it was made durable when it was written), then the new one replaces it:
+    // a crash between the two leaves the backup, which the reader takes when the file is missing.
+    if (keep_backup && std::filesystem::exists(path, ignored) && !rename_durable(path, backup_path(path), error)) {
+        std::filesystem::remove(temporary, ignored);
+        throw std::runtime_error("cannot keep " + path_utf8(backup_path(path)) + ": " + error);
     }
-    std::error_code error;
-    std::filesystem::rename(temporary, path, error);
-    if (error) {
-        throw std::runtime_error("cannot replace " + path_utf8(path) + ": " + error.message());
+    if (!rename_durable(temporary, path, error)) {
+        std::filesystem::remove(temporary, ignored);
+        throw std::runtime_error("cannot replace " + path_utf8(path) + ": " + error);
     }
 }
 

@@ -17,6 +17,7 @@
 #include "launcher/routing.h"
 #include "launcher/serve_help.h"
 #include "launcher/sha256.h"
+#include "launcher/store.h"
 #include "launcher/supervisor.h"
 #include "launcher/telemetry.h"
 #include "launcher/updates.h"
@@ -881,6 +882,43 @@ void test_chats() {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// The memory file survives a torn write (audit 2026-11-17 LN-01): each save keeps the previous file as its backup,
+// and a memory file that is not valid JSON (a power loss after the rename, before the data reached the disk) or is
+// missing (a crash between the backup's rename and the new file's) loads the backup instead of defaults. The
+// temporary files of the atomic write leave nothing behind.
+void test_store_durability() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-store";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    const std::filesystem::path memory = dir / Store::kMemoryFile;
+    {
+        Store store(dir);
+        store.set_last_model(std::string("first"));
+        store.set_last_model(std::string("second"));
+    }
+    check(std::filesystem::exists(backup_path(memory)), "a save keeps the previous memory file as its backup");
+    bool temporary_left = false;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        temporary_left = temporary_left || entry.path().filename().string().find(".tmp") != std::string::npos;
+    }
+    check(!temporary_left, "the atomic write leaves no temporary file");
+    {
+        std::ofstream torn(memory, std::ios::binary | std::ios::trunc);
+        torn << "{\"schema\": 1, \"last_mo";
+    }
+    {
+        Store store(dir);
+        check(store.last_model() == std::optional<std::string>("first"),
+              "a torn memory file loads the backup (the save before the last)");
+    }
+    std::filesystem::remove(memory, ignored);
+    {
+        Store store(dir);
+        check(store.last_model().has_value(), "a missing memory file loads the backup");
+    }
+    std::filesystem::remove_all(dir, ignored);
+}
+
 // With a second NVIDIA card the inference GPU is the one with the most VRAM, listed first (the
 // dashboard shows the first, default launch parameters and load advice size from it); the others
 // keep NVML's order, and equals keep it too.
@@ -1019,6 +1057,7 @@ int main(int argc, char** argv) {
     test_args();
     test_blob_ids();
     test_chats();
+    test_store_durability();
     test_records();
     test_help();
     test_help_cache();
