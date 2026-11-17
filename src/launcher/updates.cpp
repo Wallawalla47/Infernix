@@ -385,6 +385,7 @@ void InfernixUpdate::check_now() {
 void InfernixUpdate::download_now() {
     std::string url, name;
     std::optional<std::string> sha;
+    std::uint64_t listed = 0; // the asset's size by the release
     {
         std::lock_guard lock(mutex_);
         const Json asset = latest_["asset"];
@@ -394,6 +395,7 @@ void InfernixUpdate::download_now() {
         phase_ = "downloading";
         done_  = 0;
         total_ = asset.value("bytes", std::uint64_t{0});
+        listed = total_;
         error_.reset();
     }
     publish();
@@ -438,6 +440,14 @@ void InfernixUpdate::download_now() {
         const std::atomic<bool> never{false};
         const std::optional<std::string> digest = sha256_file(part, nullptr, never);
         if (!digest || *digest != *sha) { failure = "the download does not match the release's SHA-256"; }
+    } else if (failure.empty() && listed != 0) {
+        // No digest (an older release): at least the size the release lists, so a transfer cut short is not installed.
+        std::error_code size_error;
+        const std::uintmax_t got = std::filesystem::file_size(part, size_error);
+        if (size_error || got != listed) {
+            failure = "the download has " + std::to_string(size_error ? 0 : got) + " bytes, the release lists " +
+                      std::to_string(listed);
+        }
     }
     if (failure.empty()) {
         std::filesystem::rename(part, zip, ignored);
