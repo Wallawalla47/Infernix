@@ -535,6 +535,10 @@ void Launcher::stop() {
     scan_cv_.notify_all();
     if (scanner_.joinable()) { scanner_.join(); }
     if (autoloader_.joinable()) { autoloader_.join(); }
+    {
+        std::lock_guard lock(install_stopper_mutex_);
+        if (install_stopper_.joinable()) { install_stopper_.join(); }
+    }
     // The server's log file and the console get what is still queued.
     stop_flushing_ = true;
     if (log_flusher_.joinable()) { log_flusher_.join(); }
@@ -3160,11 +3164,15 @@ void Launcher::register_management_routes() {
                      event("info", "launcher", "installing the Infernix update: the launcher stops and starts again");
                      send_json(s, infernix_update_->state());
                      // The answer goes out first; then an orderly stop (the model saves its caches) ends
-                     // the process and the update script takes over.
-                     std::thread([this] {
-                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                         server_.stop();
-                     }).detach();
+                     // the process and the update script takes over. A member thread, joined by stop(), so a
+                     // stop that finishes first never leaves it to use a destroyed launcher.
+                     std::lock_guard lock(install_stopper_mutex_);
+                     if (!install_stopper_.joinable() && !stopping_) {
+                         install_stopper_ = std::thread([this] {
+                             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                             server_.stop();
+                         });
+                     }
                  }));
 
     // Disk: deleting an artifact's files, a drafter or an n-gram volume.

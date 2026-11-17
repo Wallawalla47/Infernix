@@ -325,6 +325,8 @@ private:
     std::thread autoloader_; // settings.autoload: loads the model once the first scan has found it
     std::mutex publish_instance_mutex_; // publish_instance (taken with no other launcher lock held)
     std::mutex publish_library_mutex_;  // publish_library (likewise)
+    std::mutex install_stopper_mutex_;
+    std::thread install_stopper_; // POST /infernix/install: stops the server after the answer went out
     std::thread log_flusher_;
     std::thread console_writer_;
     httplib::Server server_;
