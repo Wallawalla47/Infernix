@@ -494,6 +494,9 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
         write.nodes.clear();
     };
     try {
+        // A node pinned and filling is in write.nodes before anything else can throw (abort_batch undoes those):
+        // the push cannot allocate, and a failed begin_host_fill unpins its node itself.
+        write.nodes.reserve(nodes.size());
         for (const NodeRef node : nodes) {
             const NodeView view = index_->node(node);
             if (view.device != CopyState::Resident || view.host != CopyState::Absent) { continue; }
@@ -502,7 +505,13 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
             // until the dead-KV sweep (a prefill cancelled past its last tap, a generation that left no endpoint).
             if (view.live_snapshots_below == 0) { continue; }
             index_->pin_node(node);
-            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node);
+            std::optional<std::uint32_t> slab_id;
+            try {
+                slab_id = index_->begin_host_fill(node); // its slab allocation may evict, and allocate
+            } catch (...) {
+                index_->unpin_node(node);
+                throw;
+            }
             if (!slab_id) {
                 // Everything left on the Host tier is pinned or filling; retry at a later release.
                 index_->unpin_node(node);
