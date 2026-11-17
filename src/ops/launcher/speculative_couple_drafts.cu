@@ -176,9 +176,15 @@ void couple(const Logit* logits, std::int32_t valid_rows, std::int32_t physical_
 } // namespace
 
 std::size_t speculative_couple_drafts_workspace_exact_bytes(std::int32_t valid_rows, std::int32_t columns) {
-    return make_sampling_workspace_layout(valid_rows, std::min(columns, kSpeculativeSamplerMaxColumns),
-                                          kSpeculativeSamplerMaxColumns)
-        .bytes;
+    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(
+        valid_rows, std::min(columns, kSpeculativeSamplerMaxColumns), kSpeculativeSamplerMaxColumns);
+    // The kernels have only the multiblock form (no single-block fallback): a vocabulary past its group limit
+    // would bind an empty workspace and write through null pointers.
+    if (!layout.multiblock) {
+        throw std::invalid_argument("speculative_couple_drafts: " + std::to_string(valid_rows) +
+                                    " valid rows exceed the multiblock sampler's limit");
+    }
+    return layout.bytes;
 }
 
 void speculative_couple_drafts_launch(const Tensor& logits, std::int32_t valid_rows, const std::int32_t* token_ids,
