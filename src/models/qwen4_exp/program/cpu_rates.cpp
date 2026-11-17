@@ -91,6 +91,17 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
                              .nvfp4_a8   = cpu_narrow_a16() == moe::NarrowA16::kA8, // likewise
                              .cpus       = placement_.cpus});
     const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    // The probe's stream and the engine thread's CPUs come back on every way out (a CUDA error or a team failure
+    // throws from rate()): left pinned to the placement's first CPU, the engine thread would compete with the team.
+    cudaStream_t stream = nullptr;
+    struct Restore {
+        std::uint64_t cpus;
+        cudaStream_t& stream;
+        ~Restore() {
+            (void)set_current_thread_cpus(cpus);
+            if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+        }
+    } restore{caller_cpus, stream};
     std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * kNarrowColumns);
     std::vector<std::uint16_t> y(static_cast<std::size_t>(moe::kHidden) * kRateJobs * kNarrowColumns);
     for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
@@ -118,7 +129,6 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
             }
         }
     };
-    cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     const std::uint64_t source_stride = layers.front().moe.bank->planes.record_stride; // ≤ the staging pitch
     // Jobs per second at `columns` columns: the best of kRepeats timed batches, as the link probe
@@ -167,7 +177,7 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
         std::this_thread::sleep_for(kRetryPause);
     }
     (void)set_current_thread_cpus(caller_cpus);
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaStreamDestroy(std::exchange(stream, nullptr)));
     reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
     char share[160];
     if (attempts > 1) {
