@@ -200,6 +200,7 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
     // The first swept count that failed its request: the bound step's. (A shortage while a request binds can
     // leave it queued, so it binds again and completes; Flash-Next gives a failed binding back that way.)
     std::uint64_t failing_count = 0;
+    std::vector<std::uint64_t> failing_counts; // every swept count whose request failed with the shortage
     for (std::size_t i = 0; i < sweep.size(); ++i) {
         const std::uint64_t injected = infernix::testing::memory_exhausted_injections();
         testing::request_memory_fault(sweep[i]);
@@ -212,6 +213,7 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
         } else {
             ++failed;
             if (failing_count == 0 && out_of_memory(outcome)) { failing_count = sweep[i]; }
+            if (out_of_memory(outcome)) { failing_counts.push_back(sweep[i]); }
             failures += check(out_of_memory(outcome), label + ": failed with the out-of-memory error (got '" +
                                                           outcome.error + "')");
         }
@@ -407,14 +409,26 @@ inline int run_all(Engine& engine, std::uint32_t prompt_tokens, std::uint32_t ou
     {
         const Outcome before = run(engine, fresh, outputs, false); // a successful unit: the count starts at 0
         failures += check(before.error.empty(), "a request before the bound's failures completed");
+        // A count the sweep saw fail its request need not fail these: they reuse no prefix (the sweep's did) and the
+        // Engine's state has moved on, so the count can land in work the Engine absorbs (a binding Flash-Next gives
+        // back and binds again: QAD Dense8, 2026-11-18, counts 5 and 89). The sweep's failing counts are tried in
+        // order; a request that completes is a successful unit, so the eight in a row start again at the next count.
+        if (failing_counts.empty()) { failing_counts.push_back(1); }
         std::uint32_t refused = 0;
-        std::printf("   (injected at check %llu, the sweep's first failing count)\n",
-                    static_cast<unsigned long long>(failing_count));
-        for (int i = 0; i < 8; ++i) {
-            testing::request_memory_fault(failing_count != 0 ? failing_count : 1);
-            const Outcome outcome = run(engine, synthetic_tokens(prompt_tokens, 300U + static_cast<std::uint32_t>(i)),
-                                        outputs, false);
-            refused += out_of_memory(outcome) ? 1U : 0U;
+        std::uint32_t seed    = 300;
+        for (const std::uint64_t count : failing_counts) {
+            refused = 0;
+            for (int i = 0; i < 8; ++i) {
+                const std::uint64_t injected = infernix::testing::memory_exhausted_injections();
+                testing::request_memory_fault(count);
+                const Outcome outcome = run(engine, synthetic_tokens(prompt_tokens, seed++), outputs, false);
+                std::printf("   check %llu, request %d: %llu injected, %s\n", static_cast<unsigned long long>(count), i,
+                            static_cast<unsigned long long>(infernix::testing::memory_exhausted_injections() - injected),
+                            outcome.error.empty() ? "completed" : outcome.error.substr(0, 120).c_str());
+                if (!out_of_memory(outcome)) { break; }
+                ++refused;
+            }
+            if (refused == 8) { break; }
         }
         testing::request_memory_fault(0);
         failures += check(refused == 8, "eight requests in a row failed with the shortage (" + std::to_string(refused) + ")");
