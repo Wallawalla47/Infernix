@@ -230,6 +230,16 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         listen = call(port, "GET", "/launcher/api/state")[1].get("listen", {})
         check("the state names the address in use", listen == {"host": "127.0.0.1", "port": port}, str(listen))
 
+    with section("CORS preflight"):
+        # A page on another origin that sends an API key asks for Authorization in its preflight, and a wildcard
+        # Access-Control-Allow-Headers does not cover Authorization (Fetch), so it is named (audit 2026-11-18 F-2).
+        status, _, response = call(port, "OPTIONS", "/v1/chat/completions", full=True,
+                                   headers={"Origin": "http://example.com", "Access-Control-Request-Method": "POST",
+                                            "Access-Control-Request-Headers": "authorization, content-type"})
+        allowed = [h.strip().lower() for h in (response.getheader("Access-Control-Allow-Headers") or "").split(",")]
+        check("a preflight asking for Authorization and Content-Type is allowed both",
+              status == 204 and "authorization" in allowed and "content-type" in allowed, f"{status} {allowed}")
+
     with section("Model listing for coding tools"):
         # The fields other servers' clients read (llama.cpp, llama-swap, vLLM, LM Studio, OpenRouter).
         status, listed = call(port, "GET", "/v1/models")

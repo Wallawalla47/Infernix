@@ -4,6 +4,7 @@
 #include "launcher/hf_hub.h"
 #include "launcher/http_access.h"
 #include "launcher/launch_script.h"
+#include "serve/cors_headers.h"
 #include "launcher/load_advice.h"
 #include "launcher/model_defaults.h"
 #include "launcher/process.h"
@@ -2623,9 +2624,12 @@ void Launcher::register_routes() {
     server_.set_keep_alive_timeout(std::chrono::seconds(360));
     server_.set_keep_alive_timeout_buffer(10);
     if (settings.cors) {
-        server_.set_default_headers({{"Access-Control-Allow-Origin", "*"},
-                                     {"Access-Control-Allow-Headers", "*"},
-                                     {"Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"}});
+        // infernix-serve's headers and the launcher's own api-key named (a wildcard does not cover Authorization),
+        // then "*" for the rest of a page's headers.
+        server_.set_default_headers(
+            {{"Access-Control-Allow-Origin", "*"},
+             {"Access-Control-Allow-Headers", std::string(serve::kCorsAllowHeaders) + ", api-key, *"},
+             {"Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"}});
     }
     server_.Options(R"(.*)", [](const Request&, Response& response) { response.status = 204; });
     server_.set_exception_handler([](const Request&, Response& response, std::exception_ptr error) {

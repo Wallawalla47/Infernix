@@ -3,6 +3,7 @@
 #include "product/logging/logging.h"
 #include "product/speculative_options.h"
 #include "serve/anthropic_messages.h"
+#include "serve/cors_headers.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
@@ -507,9 +508,7 @@ void HttpServer::register_routes() {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
              {"Access-Control-Expose-Headers", "x-request-id, request-id"},
-             {"Access-Control-Allow-Headers",
-              "Authorization, Content-Type, X-API-Key, anthropic-version, anthropic-beta, "
-              "anthropic-user-profile-id"},
+             {"Access-Control-Allow-Headers", std::string(kCorsAllowHeaders)},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.

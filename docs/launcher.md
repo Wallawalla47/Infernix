@@ -533,7 +533,7 @@ says so.
 | Host, port | `127.0.0.1`, `1234` | listen address (applies after a restart) |
 | API keys | none | named keys; with any, `/v1` needs one ([API keys](#api-keys-and-remote-access)) |
 | Manage from other computers | off | the web UI from other computers; an Admin key once any key exists |
-| CORS | on | browser access headers on every answer (applies after a restart) |
+| CORS | on | browser access headers on every answer: any origin, and `infernix-serve`'s request headers (`Authorization` named, which a wildcard does not cover), `api-key` and the rest (applies after a restart) |
 | llama.cpp endpoints | off | `llama-server`'s router API for llama.cpp providers ([llama.cpp endpoints](#llamacpp-endpoints)) |
 | `infernix-serve` | beside the launcher | the server executable; its `--help` drives the option reference |
 | Server port | automatic | the loopback port of the managed server |
