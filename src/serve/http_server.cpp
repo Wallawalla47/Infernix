@@ -26,11 +26,7 @@ namespace infernix::serve {
 namespace {
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
-    ApiError error;
-    error.status  = 500;
-    error.type    = "internal_error";
-    error.message = ex.what();
-    write_openai_error(res, error);
+    write_openai_error(res, internal_server_error(ex));
 }
 
 bool is_anthropic_path(std::string_view path) {

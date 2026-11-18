@@ -78,10 +78,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         write_openai_error(res, exception.error());
         return;
     } catch (const std::exception& exception) {
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
+        const ApiError error = internal_server_error(exception);
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, error));
         write_openai_error(res, error);
@@ -105,11 +102,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             const RequestFailure failure =
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what());
             lifecycle->failure(failure);
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = exception.what();
-            write_openai_error(res, error);
+            write_openai_error(res, internal_server_error(exception));
             return;
         }
         lifecycle->done(outcome);
@@ -123,11 +116,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = exception.what();
-            write_openai_error(res, error);
+            write_openai_error(res, internal_server_error(exception));
         }
         return;
     }
@@ -148,11 +137,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
-        write_openai_error(res, error);
+        write_openai_error(res, internal_server_error(exception));
         return;
     }
 
@@ -245,22 +230,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 } catch (const ResponseRenderFailure& exception) {
                     lifecycle->failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
+                    return send_error(internal_server_error(exception));
                 } catch (const ApiException& exception) {
                     lifecycle->failure(make_generation_request_failure(exception.error()));
                     return send_error(exception.error());
                 } catch (const std::exception& exception) {
                     lifecycle->failure(make_internal_request_failure(
                         RequestFailurePhase::Generation, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
+                    return send_error(internal_server_error(exception));
                 }
 
                 lifecycle->done(outcome);
@@ -288,11 +265,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
+                    return send_error(internal_server_error(exception));
                 }
                 try {
                     transport.write(terminal);
@@ -314,11 +287,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
-        write_openai_error(res, error);
+        write_openai_error(res, internal_server_error(exception));
     }
 }
 

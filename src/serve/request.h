@@ -37,6 +37,17 @@ struct ApiError {
     std::uint32_t retry_after_seconds = 0;
 };
 
+// The 500 for an exception a request's handling did not expect, with its message. `type` is the protocol's name for
+// it: OpenAI Chat Completions' internal_error, the Responses API's server_error.
+[[nodiscard]] inline ApiError internal_server_error(const std::exception& exception,
+                                                    std::string type = "internal_error") {
+    ApiError error;
+    error.status  = 500;
+    error.type    = std::move(type);
+    error.message = exception.what();
+    return error;
+}
+
 class ApiException : public std::runtime_error {
 public:
     explicit ApiException(ApiError error)
