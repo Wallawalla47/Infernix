@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
 
 namespace infernix::models::qwen3_5::frontend {
@@ -84,6 +85,15 @@ struct MediaCacheStats {
     std::uint64_t oversize_bypasses  = 0;
 };
 
+// A single-flight waiter's flight failed for its producer's own reasons, not the media's: the producer's control
+// tripped (cancelled or expired) or its per-request vision budget was exceeded, or the build never started. The waiter
+// prepares the item again under its own control (begin_prepare with its own builder). A content error (undecodable
+// media, one item over Vision's capacity) is shared with every waiter instead.
+class MediaFlightAbandoned final : public std::runtime_error {
+public:
+    MediaFlightAbandoned() : std::runtime_error("the shared media preparation failed for its producer's own reasons") {}
+};
+
 class MediaPreprocessCache {
 public:
     using Builder = std::function<PreparedMedia()>;
@@ -101,11 +111,16 @@ public:
 
     [[nodiscard]] MediaPreparationPermit acquire_request(const PreparationControl& control) const;
 
+    // The producer's builder runs under `control` (its trips stop the build early); a build that finished is a result
+    // whatever the producer's control does afterwards.
     [[nodiscard]] PendingMedia begin_prepare(const MediaCacheKey& key,
                                              const PreparationControl& control, Builder builder);
+    // begin_prepare and await, preparing again (a copy of `builder`) when a flight it waited on was abandoned.
     [[nodiscard]] PreparedMedia get_or_prepare(const MediaCacheKey& key,
                                                const PreparationControl& control, Builder builder,
                                                MediaCacheRequestStats& request_stats);
+    // The flight's result, or its error: the producer gets its own; a waiter gets a content error, or
+    // MediaFlightAbandoned for one that was the producer's own.
     [[nodiscard]] PreparedMedia await(const PendingMedia& pending,
                                       const PreparationControl& control,
                                       MediaCacheRequestStats& request_stats) const;

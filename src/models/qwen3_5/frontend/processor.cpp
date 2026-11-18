@@ -1032,8 +1032,30 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
 
     std::vector<PendingMedia> pending_items;
     pending_items.reserve(parts.size());
+    // Each pending item's source, to prepare it again when the flight it waited on was abandoned.
+    struct MediaSource {
+        ChatPart* part = nullptr;
+        ChatPartKind kind{};
+        MediaCacheKey key;
+    };
+    std::vector<MediaSource> sources;
+    sources.reserve(parts.size());
     ConcurrentMediaBudget request_budget(options_);
     std::exception_ptr preparation_error;
+    // The builder closes over this request's stack (its policy, budget and worker control): every flight it starts is
+    // awaited below before this function returns, on every path.
+    const auto builder_for = [this, &policy, &request_budget, &worker_control](const MediaSource& source) {
+        return [this, part = source.part, kind = source.kind, digest = source.key.digest, &policy, &request_budget,
+                &worker_control]() {
+            Prepared built = kind == ChatPartKind::Image
+                                 ? prepare_image(part->media.bytes, options_, policy, *media_cache_, request_budget,
+                                                 worker_control)
+                                 : prepare_video(part->media.bytes, options_, policy, *media_cache_, request_budget,
+                                                 worker_control);
+            built.item.content_digest = digest;
+            return PreparedMedia{std::move(built.item), std::move(built.payload)};
+        };
+    };
     const auto media_phase_started = Clock::now();
     for (ChatPart* part : parts) {
         try {
@@ -1041,23 +1063,14 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             const auto digest =
                 sha256(part->media.bytes, [&control] { check_preparation_control(control); });
             const ChatPartKind kind = part->kind;
-            const MediaCacheKey key{
-                .digest   = digest,
-                .modality = kind == ChatPartKind::Image ? Modality::Image : Modality::Video,
+            const MediaSource source{
+                .part = part,
+                .kind = kind,
+                .key  = MediaCacheKey{.digest   = digest,
+                                      .modality = kind == ChatPartKind::Image ? Modality::Image : Modality::Video},
             };
-            PendingMedia pending = media_cache_->begin_prepare(
-                key, worker_control,
-                [this, part, kind, digest, &policy, &request_budget, &worker_control]() {
-                    Prepared built =
-                        kind == ChatPartKind::Image
-                            ? prepare_image(part->media.bytes, options_, policy, *media_cache_,
-                                            request_budget, worker_control)
-                            : prepare_video(part->media.bytes, options_, policy, *media_cache_,
-                                            request_budget, worker_control);
-                    built.item.content_digest = digest;
-                    return PreparedMedia{std::move(built.item), std::move(built.payload)};
-                });
-            pending_items.push_back(std::move(pending));
+            pending_items.push_back(media_cache_->begin_prepare(source.key, worker_control, builder_for(source)));
+            sources.push_back(source);
         } catch (...) {
             preparation_error = std::current_exception();
             stop_preparation.store(true, std::memory_order_relaxed);
@@ -1066,11 +1079,24 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     }
     MediaCacheRequestStats cache_stats;
     std::size_t patch_cursor = 0;
-    for (PendingMedia& pending : pending_items) {
+    for (std::size_t index = 0; index < pending_items.size(); ++index) {
+        PendingMedia& pending = pending_items[index];
         PreparedMedia media;
         try {
-            media = media_cache_->await(pending, preparation_error ? PreparationControl{} : control,
-                                        cache_stats);
+            for (;;) {
+                try {
+                    media = media_cache_->await(pending, preparation_error ? PreparationControl{} : control,
+                                                cache_stats);
+                    break;
+                } catch (const MediaFlightAbandoned&) {
+                    // Another request's flight failed for that request's own reasons: prepare it under this one's,
+                    // in place, so the drain below waits for the new flight too. Not once this request has failed:
+                    // it only drains then (and the flight may be its own, for media it holds twice).
+                    if (preparation_error) { break; }
+                    pending = media_cache_->begin_prepare(sources[index].key, worker_control,
+                                                          builder_for(sources[index]));
+                }
+            }
         } catch (...) {
             if (!preparation_error) {
                 preparation_error = std::current_exception();

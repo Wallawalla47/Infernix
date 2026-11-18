@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <iterator>
@@ -3920,6 +3921,136 @@ int test_media_cache_singleflight() {
                  "concurrent identical media did not collapse into one preprocessing flight");
 }
 
+// A single-flight waiter and its producer's own failure (audit 2026-11-18 F-3): the producer's builder fails with
+// `failure` once the waiter waits on its flight. `shared` failures (the media's) reach the waiter; the producer's own
+// (its control's trip, its per-request vision budget) do not: the waiter prepares the item again and gets it.
+int media_cache_producer_failure(const std::function<void()>& failure, bool shared, const char* what) {
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(1ULL << 20, 2ULL << 20);
+    fi::MediaCacheKey key;
+    key.digest.front() = 0x6b;
+    std::promise<void> producer_started;
+    std::future<void> started = producer_started.get_future();
+    std::promise<void> release_producer;
+    std::shared_future<void> release = release_producer.get_future().share();
+    std::atomic<int> producer_builds{0}, waiter_builds{0};
+    std::exception_ptr producer_error, waiter_error;
+    fi::PreparedMedia waiter_result;
+    const auto producer = [&] {
+        fi::MediaCacheRequestStats stats;
+        try {
+            (void)cache->get_or_prepare(key, {}, [&]() -> fi::PreparedMedia {
+                ++producer_builds;
+                producer_started.set_value();
+                release.wait();
+                failure();
+                throw std::logic_error("the failure did not throw");
+            }, stats);
+        } catch (...) { producer_error = std::current_exception(); }
+    };
+    const auto waiter = [&] {
+        fi::MediaCacheRequestStats stats;
+        try {
+            waiter_result = cache->get_or_prepare(key, {}, [&] {
+                ++waiter_builds;
+                auto payload                    = cache->allocate_payload(1536, {});
+                payload->mutable_span().front() = 7;
+                fi::VisionItem item;
+                item.grid = {1, 1, 1};
+                return fi::PreparedMedia{std::move(item), std::move(payload)};
+            }, stats);
+        } catch (...) { waiter_error = std::current_exception(); }
+    };
+    std::thread first(producer);
+    started.wait();
+    std::thread second(waiter);
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (cache->stats().singleflight_waits == 0 && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::yield();
+    }
+    release_producer.set_value();
+    first.join();
+    second.join();
+    const bool producer_failed = producer_error != nullptr && producer_builds == 1;
+    if (shared) {
+        return check(producer_failed && waiter_error != nullptr && waiter_builds == 0, what);
+    }
+    return check(producer_failed && !waiter_error && waiter_builds == 1 && waiter_result.payload &&
+                     waiter_result.payload->span().front() == 7,
+                 what);
+}
+
+int test_media_cache_producer_failures() {
+    int failures = 0;
+    failures += media_cache_producer_failure(
+        [] {
+            infernix::PreparationControl cancelled{.deadline = {},
+                                                   .cancellation = infernix::CancellationView([] { return true; })};
+            fi::check_preparation_control(cancelled);
+        },
+        false, "a waiter inherited its producer's cancellation instead of preparing the media itself");
+    failures += media_cache_producer_failure(
+        [] {
+            throw fi::ProcessorError(
+                infernix::ContextLengthDetails{.prompt_tokens = 8, .max_context = 5, .exact = false, .vision = true});
+        },
+        false, "a waiter inherited its producer's per-request vision budget instead of preparing the media itself");
+    failures += media_cache_producer_failure(
+        [] { throw fi::ProcessorError(fi::ProcessorErrorKind::InvalidMedia, "the image does not decode"); }, true,
+        "a waiter did not share its producer's content error");
+    return failures;
+}
+
+// The same through Processor (F-3): request A starts preparing a large image, request B with the same image waits on
+// A's flight, then A is cancelled, which stops A's build. B must prepare the image itself and succeed. Whether A's
+// build was still running when the cancellation reached it is timing, so the attempt repeats (each with its own image)
+// until B has had to prepare again (two misses); B failing in any attempt fails the test.
+int test_processor_waiter_survives_cancelled_producer() {
+    // Four requests may prepare media at once (production sizes its gate the same way, from the largest request).
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(infernix::kDefaultMediaCacheBytes,
+                                                            infernix::kDefaultMediaLiveBytes, 0,
+                                                            infernix::kDefaultMediaLiveBytes / 4);
+    const fi::MediaPreprocessCache& view = *cache;
+    fi::Processor processor(fixture_tokenizer(), thinking_toggle_template(), fi::ProcessorOptions{}, cache);
+    int failures = 0, exercised = 0;
+    for (int attempt = 0; attempt < 6 && exercised == 0; ++attempt) {
+        fi::ChatMessage message;
+        message.role = infernix::ChatRole::User;
+        message.parts.push_back(fi::ChatPart::image(fi::MediaData{
+            .bytes       = block_ppm(4096, 4096, static_cast<std::uint8_t>(40 + attempt)), // a slow build
+            .media_type  = "image/x-portable-pixmap",
+            .source_name = "shared.ppm"}));
+        const std::uint64_t misses_before = view.stats().misses;
+        const std::uint64_t waits_before  = view.stats().singleflight_waits;
+        std::atomic<bool> cancel_a{false};
+        std::exception_ptr error_a, error_b;
+        std::thread a([&] {
+            try {
+                (void)processor.process(std::vector<fi::ChatMessage>{message}, {},
+                                        infernix::PreparationControl{
+                                            .deadline     = {},
+                                            .cancellation = infernix::CancellationView([&] { return cancel_a.load(); })});
+            } catch (...) { error_a = std::current_exception(); }
+        });
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (view.stats().inflight == 0 && std::chrono::steady_clock::now() < limit) { std::this_thread::yield(); }
+        std::thread b([&] {
+            try {
+                (void)processor.process(std::vector<fi::ChatMessage>{message});
+            } catch (...) { error_b = std::current_exception(); }
+        });
+        while (view.stats().singleflight_waits == waits_before && view.stats().inflight != 0 &&
+               std::chrono::steady_clock::now() < limit) {
+            std::this_thread::yield();
+        }
+        cancel_a.store(true);
+        a.join();
+        b.join();
+        failures += check(!error_b, "a request waiting on a cancelled request's image failed with that request's error");
+        if (!error_b && view.stats().misses - misses_before == 2) { ++exercised; }
+    }
+    return failures + check(exercised > 0, "no attempt cancelled the producer while its waiter waited");
+}
+
 int test_media_cache_runs_independent_misses_in_parallel() {
     auto cache = std::make_shared<fi::MediaPreprocessCache>(1ULL << 20, 2ULL << 20, 4);
     std::array<fi::PendingMedia, 4> pending;
@@ -4578,6 +4709,8 @@ int main() try {
     failures += test_media_payload_outlives_frontend_cache();
     failures += test_media_live_bytes_follow_last_payload_reference();
     failures += test_media_cache_singleflight();
+    failures += test_media_cache_producer_failures();
+    failures += test_processor_waiter_survives_cancelled_producer();
     failures += test_media_cache_runs_independent_misses_in_parallel();
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();

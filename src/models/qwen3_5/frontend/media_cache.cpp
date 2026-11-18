@@ -86,7 +86,31 @@ struct MediaCacheFlight {
     Clock::time_point finished;
     std::size_t bytes = 0;
     bool done         = false;
+    // The error is the producer's own (its control or per-request budget, or no build at all): a waiter prepares again.
+    bool abandoned = false;
 };
+
+namespace {
+
+// Whether a failed build belongs to its producer rather than to the media: the producer's control had tripped by
+// then, or the error is a control trip or the producer's per-request vision budget. When unsure it is the producer's:
+// a waiter that prepares again pays a build, one that inherits a foreign error fails for nothing.
+bool producer_scoped(const std::exception_ptr& error, const PreparationControl& control) {
+    if (control.cancellation.requested() ||
+        (control.deadline != Clock::time_point{} && Clock::now() >= control.deadline)) {
+        return true;
+    }
+    try {
+        std::rethrow_exception(error);
+    } catch (const RequestError& failure) {
+        return failure.kind() == RequestErrorKind::Cancelled || failure.kind() == RequestErrorKind::QueueTimeout;
+    } catch (const ProcessorError& failure) {
+        return failure.kind() == ProcessorErrorKind::ContextLengthExceeded && failure.context_length() &&
+               failure.context_length()->vision;
+    } catch (...) { return false; }
+}
+
+} // namespace
 
 struct MediaPreparationGate {
     explicit MediaPreparationGate(std::size_t maximum_) : maximum(maximum_) {}
@@ -307,10 +331,12 @@ PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,
              flight = std::move(flight)]() mutable {
                 PreparedMedia built;
                 std::exception_ptr error;
+                bool abandoned  = false;
                 flight->started = Clock::now();
                 try {
+                    // A build that finished is the media's result: a trip of the producer's control after it
+                    // reaches the producer through its own await, not every waiter's.
                     built = builder();
-                    check_preparation_control(control);
                     const std::size_t bytes = payload_bytes(built);
                     {
                         std::lock_guard lock(state->mutex);
@@ -331,34 +357,42 @@ PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,
                         }
                     }
                     flight->bytes = bytes;
-                } catch (...) { error = std::current_exception(); }
-                const Clock::time_point finished = Clock::now();
-                {
-                    std::lock_guard lock(flight->mutex);
-                    flight->result   = std::move(built);
-                    flight->error    = error;
-                    flight->finished = finished;
-                    flight->done     = true;
+                } catch (...) {
+                    error     = std::current_exception();
+                    abandoned = producer_scoped(error, control);
                 }
+                const Clock::time_point finished = Clock::now();
+                // Out of `inflight` before it is done: a waiter that prepares again finds no dead flight to wait on.
                 {
                     std::lock_guard lock(state->mutex);
                     state->inflight.erase(key);
+                }
+                {
+                    std::lock_guard lock(flight->mutex);
+                    flight->result    = std::move(built);
+                    flight->error     = error;
+                    flight->abandoned = abandoned;
+                    flight->finished  = finished;
+                    flight->done      = true;
                 }
                 flight->changed.notify_all();
             },
             checkpoint);
     } catch (...) {
+        // The build never started (the producer's control tripped while it queued, or the pool refused it): no
+        // verdict on the media, so a waiter prepares again.
         const std::exception_ptr error = std::current_exception();
-        {
-            std::lock_guard lock(pending.flight->mutex);
-            pending.flight->error    = error;
-            pending.flight->started  = Clock::now();
-            pending.flight->finished = pending.flight->started;
-            pending.flight->done     = true;
-        }
         {
             std::lock_guard lock(impl_->state->mutex);
             impl_->state->inflight.erase(key);
+        }
+        {
+            std::lock_guard lock(pending.flight->mutex);
+            pending.flight->error     = error;
+            pending.flight->abandoned = true;
+            pending.flight->started   = Clock::now();
+            pending.flight->finished  = pending.flight->started;
+            pending.flight->done      = true;
         }
         pending.flight->changed.notify_all();
         std::rethrow_exception(error);
@@ -370,7 +404,12 @@ PreparedMedia MediaPreprocessCache::get_or_prepare(const MediaCacheKey& key,
                                                    const PreparationControl& control,
                                                    Builder builder,
                                                    MediaCacheRequestStats& request_stats) {
-    return await(begin_prepare(key, control, std::move(builder)), control, request_stats);
+    // Each attempt takes its own copy of the builder: a moved-from one would fail inside the worker as a shared error.
+    for (;;) {
+        try {
+            return await(begin_prepare(key, control, builder), control, request_stats);
+        } catch (const MediaFlightAbandoned&) {} // another request's flight failed for its own reasons: prepare again
+    }
 }
 
 PreparedMedia MediaPreprocessCache::await(const PendingMedia& pending,
@@ -388,7 +427,12 @@ PreparedMedia MediaPreprocessCache::await(const PendingMedia& pending,
         check_preparation_control(control);
         pending.flight->changed.wait_for(lock, std::chrono::milliseconds(10));
     }
-    if (pending.flight->error) { std::rethrow_exception(pending.flight->error); }
+    if (pending.flight->error) {
+        if (pending.flight->abandoned && pending.disposition == MediaCacheDisposition::SingleflightWaiter) {
+            throw MediaFlightAbandoned();
+        }
+        std::rethrow_exception(pending.flight->error);
+    }
     if (pending.disposition == MediaCacheDisposition::Producer) {
         ++request_stats.misses;
         request_stats.built_patch_bytes += pending.flight->bytes;
