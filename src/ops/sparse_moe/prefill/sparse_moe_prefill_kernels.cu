@@ -1527,7 +1527,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         if (ring) {
             sparse_moe_prefill_q4_gate_up_ring_kernel
                 <<<ring_gate_blocks, ExpertGateUpRing::kThreads,
-                   rowsplit_ring_reserve<sparse_moe_prefill_q4_gate_up_ring_kernel, ExpertGateUpRing::kSharedBytes>(),
+                   reserve_dynamic_shared<sparse_moe_prefill_q4_gate_up_ring_kernel, ExpertGateUpRing::kSharedBytes>(),
                    stream>>>(input, packed_token, offsets, route_job_experts, route_job_columns, route_job_count,
                              routed_gate_codes, routed_gate_scales, routed_activation);
             CUDA_CHECK(cudaGetLastError());
@@ -1583,7 +1583,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             if (ring) {
                 sparse_moe_prefill_qx_down_ring_kernel<Q5RingCodec>
                     <<<ring_down_blocks, ExpertDownRing::kThreads,
-                       rowsplit_ring_reserve<sparse_moe_prefill_qx_down_ring_kernel<Q5RingCodec>,
+                       reserve_dynamic_shared<sparse_moe_prefill_qx_down_ring_kernel<Q5RingCodec>,
                                              ExpertDownRing::kSharedBytes>(),
                        stream>>>(routed_activation, offsets, route_job_experts, route_job_columns, route_job_count,
                                  routed_down_codes, routed_down_high, routed_down_scales, grouped_io);
@@ -1610,7 +1610,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             if (ring) {
                 sparse_moe_prefill_qx_down_ring_kernel<Q6RingCodec>
                     <<<ring_down_blocks, ExpertDownRing::kThreads,
-                       rowsplit_ring_reserve<sparse_moe_prefill_qx_down_ring_kernel<Q6RingCodec>,
+                       reserve_dynamic_shared<sparse_moe_prefill_qx_down_ring_kernel<Q6RingCodec>,
                                              ExpertDownRing::kSharedBytes>(),
                        stream>>>(routed_activation, offsets, route_job_experts, route_job_columns, route_job_count,
                                  routed_down_codes, routed_down_high, routed_down_scales, grouped_io);

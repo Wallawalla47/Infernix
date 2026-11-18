@@ -350,7 +350,7 @@ void launch_fp8_a8_tma_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilog
                                                               RowPolicy, Scale, InPlace>;
                 constexpr int bytes =
                     fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<bytes, kernel, true>();
                 const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
                 kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
                     parameter, p, output, epilogue, row_policy, offset, count, plan, partials);

@@ -191,7 +191,7 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                 constexpr auto kernel = bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, InPlace>;
                 constexpr int bytes =
                     bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-                bf16_prepare_shared<bytes, kernel>();
+                prepare_dynamic_shared<bytes, kernel, true>();
                 kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
                     parameter, output, epilogue, p.rows, p.k, offset, count);
                 CUDA_CHECK(cudaGetLastError());

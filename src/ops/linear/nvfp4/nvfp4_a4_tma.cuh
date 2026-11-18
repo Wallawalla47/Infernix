@@ -547,7 +547,7 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
         // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
         static constexpr int bytes   = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
         static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows, InPlace>;
-        (void)nvfp4_prepare_shared<bytes, kernel, true>();
+        (void)prepare_dynamic_shared<bytes, kernel, true>();
         for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
             const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(parameter, p.alpha, epilogue, output,

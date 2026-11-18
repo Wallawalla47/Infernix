@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "ops/common/dynamic_shared.cuh"
 
 namespace infernix::ops::detail {
 template <int Bytes>
@@ -12,16 +13,5 @@ __device__ __forceinline__ unsigned char* q8_shared_storage() {
         __shared__ __align__(16) unsigned char storage[Bytes];
         return storage;
     }
-}
-
-template <int Bytes, auto Kernel>
-int q8_prepare_shared() {
-    if constexpr (Bytes > 48 * 1024) {
-        static const cudaError_t attribute =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        CUDA_CHECK(attribute);
-        return Bytes;
-    } else
-        return 0;
 }
 } // namespace infernix::ops::detail

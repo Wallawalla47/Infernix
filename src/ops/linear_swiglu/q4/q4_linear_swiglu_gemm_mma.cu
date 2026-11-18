@@ -72,7 +72,7 @@ void launch_ring(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
                         static_cast<unsigned>(div_up(count, Cfg::BN)));
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = q4_linear_swiglu_ring_kernel<Cfg, Stages, ProducerWarps, Full>;
-            kernel<<<grid, Layout::kThreads, rowsplit_ring_reserve<kernel, Layout::kSharedBytes>(), stream>>>(
+            kernel<<<grid, Layout::kThreads, reserve_dynamic_shared<kernel, Layout::kSharedBytes>(), stream>>>(
                 static_cast<const __nv_bfloat16*>(x_slice.data), static_cast<const std::uint8_t*>(weight.qdata),
                 static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out_slice.data),
                 out.ne[0], x.ne[0], count, weight.padded_shape[1]);

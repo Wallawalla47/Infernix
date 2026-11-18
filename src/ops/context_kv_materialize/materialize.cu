@@ -405,7 +405,7 @@ void launch_grouped(const Tensor& x, const Tensor& positions, const Tensor& coun
                     cudaStream_t stream) {
     constexpr auto kernel = context_kv_grouped_kernel<Hidden, Columns, KWarps>;
     const int shared =
-        q8_prepare_shared<GroupedSchedule<Hidden, Columns, KWarps>::kSharedBytes, kernel>();
+        prepare_dynamic_shared<GroupedSchedule<Hidden, Columns, KWarps>::kSharedBytes, kernel>();
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 2 * layers.count), dim3(KWarps * 32),
          static_cast<std::size_t>(shared), stream},

@@ -27,6 +27,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
+#include "ops/common/dynamic_shared.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -351,13 +352,5 @@ struct RowSplitRingSchedule {
     // BF16 elements of the scratch a tile epilogue receives (one stage).
     static constexpr int kScratchElements = Ring::kStageBytes / 2;
 };
-
-// One dynamic shared-memory reservation per ring kernel (kernels of one function type need one each).
-template <auto Kernel, int Bytes>
-int rowsplit_ring_reserve() {
-    static const auto status = cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-    CUDA_CHECK(status);
-    return Bytes;
-}
 
 } // namespace infernix::ops::detail

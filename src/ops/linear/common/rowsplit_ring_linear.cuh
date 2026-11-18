@@ -122,7 +122,7 @@ void launch_rowsplit_ring_linear(const __nv_bfloat16* x, typename Format::Weight
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel =
                 rowsplit_ring_linear_kernel<Format, Tile, Stages, ProducerWarps, Full, Output, Epilogue>;
-            kernel<<<grid, Ring::kThreads, rowsplit_ring_reserve<kernel, Ring::kSharedBytes>(), stream>>>(
+            kernel<<<grid, Ring::kThreads, reserve_dynamic_shared<kernel, Ring::kSharedBytes>(), stream>>>(
                 x + static_cast<std::int64_t>(offset) * k, weights, output, epilogue, rows, k, count, padded_k, offset);
             CUDA_CHECK(cudaGetLastError());
         };

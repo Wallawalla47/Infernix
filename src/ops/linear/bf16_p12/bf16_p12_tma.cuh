@@ -287,7 +287,7 @@ void launch_bf16_p12_tma(const Tensor& x, const Weight& w, Tensor& out, cudaStre
                 if (blocks > 2147483647LL) { throw std::invalid_argument("bf16_p12 TMA grid exceeds grid.x"); }
                 const auto launch = [&]<bool Full>() {
                     constexpr auto kernel = bf16_p12_tma_mma_kernel<S, Full, Output, InPlace>;
-                    bf16_prepare_shared<S::kSharedBytes, kernel>();
+                    prepare_dynamic_shared<S::kSharedBytes, kernel, true>();
                     kernel<<<static_cast<unsigned>(blocks), S::kThreads, S::kSharedBytes, stream>>>(
                         parameter, words, escapes, output, w.n, w.k, offset, count);
                     CUDA_CHECK(cudaGetLastError());

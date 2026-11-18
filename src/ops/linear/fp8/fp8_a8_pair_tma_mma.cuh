@@ -258,7 +258,7 @@ void launch_fp8_a8_pair_tma_mma(const Fp8A8Operands& p, const std::uint8_t* x_lo
                 constexpr auto kernel = fp8_a8_pair_tma_mma_kernel<Schedule, Full, InPlace>;
                 constexpr int bytes =
                     fp8_tma_scratch_bytes<Schedule, LinearIdentityEpilogue> + Schedule::kBarrierBytes;
-                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<bytes, kernel, true>();
                 kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(parameter, p, scales_lo, output,
                                                                         offset, count);
                 CUDA_CHECK(cudaGetLastError());
@@ -657,7 +657,7 @@ void launch_fp8_a8_pair_block32_tma_mma(const Fp8A8PairBlock32Operands& p, Outpu
                     fp8_a8_pair_block32_tma_mma_kernel<Schedule, Full, BlockScaledWeights, Output, InPlace>;
                 constexpr int bytes =
                     fp8_tma_scratch_bytes<Schedule, LinearIdentityEpilogue> + Schedule::kBarrierBytes;
-                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<bytes, kernel, true>();
                 kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(parameter, p, output, offset,
                                                                         count);
                 CUDA_CHECK(cudaGetLastError());

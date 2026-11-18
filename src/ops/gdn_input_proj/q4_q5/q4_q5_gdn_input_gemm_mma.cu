@@ -88,7 +88,7 @@ void launch_ring(const Tensor& x, const Weight& qk_weight, const Weight& value_z
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel =
                 rowsplit_grouped_ring_kernel<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps, Full, 4>;
-            kernel<<<grid, Ring::kThreads, rowsplit_ring_reserve<kernel, Ring::kSharedBytes>(), stream>>>(
+            kernel<<<grid, Ring::kThreads, reserve_dynamic_shared<kernel, Ring::kSharedBytes>(), stream>>>(
                 static_cast<const __nv_bfloat16*>(x_slice.data), qk, value, gate, empty, x.ne[0], count, x.ne[0]);
             CUDA_CHECK(cudaGetLastError());
         };

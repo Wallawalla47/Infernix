@@ -56,7 +56,7 @@ void launch_nvfp4_a16_mma(const Nvfp4A16Operands& p, Output output, Epilogue epi
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = nvfp4_a16_mma_kernel<Schedule, Full, Output, Epilogue, Rows>;
             const int bytes =
-                nvfp4_prepare_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
+                prepare_dynamic_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.codes, p.scales, p.alpha,
                                                                 output, epilogue, rows, p.rows, p.k,
                                                                 offset, count);
@@ -82,7 +82,7 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
             "NVFP4 sliced-K requires complete row/K tiles and matching tokens");
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
     static constexpr auto kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
-    const int bytes              = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
+    const int bytes              = prepare_dynamic_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
@@ -108,7 +108,7 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = nvfp4_a4_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
             const int bytes =
-                nvfp4_prepare_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+                prepare_dynamic_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel>();
             CUDA_CHECK(pdl::launch_with(
                 dependency,
                 {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel,

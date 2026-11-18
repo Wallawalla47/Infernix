@@ -191,7 +191,7 @@ void q4_q5_attn_input_mixed_ring_c128_launch_tiles(const Tensor& x, const Weight
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel =
                 rowsplit_grouped_ring_kernel<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps, Full, 4>;
-            kernel<<<grid, Ring::kThreads, rowsplit_ring_reserve<kernel, Ring::kSharedBytes>(), stream>>>(
+            kernel<<<grid, Ring::kThreads, reserve_dynamic_shared<kernel, Ring::kSharedBytes>(), stream>>>(
                 static_cast<const __nv_bfloat16*>(xs.data), make_job(w0, 0, 6144, qs), make_job(w0, 6144, 1024, ks),
                 make_job(w1, 0, 6144, gs), make_job(w1, 6144, 1024, vs), 5120, count, 5120);
             CUDA_CHECK(cudaGetLastError());

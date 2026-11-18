@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "ops/common/dynamic_shared.cuh"
 
 namespace infernix::ops::detail {
 template <int Bytes>
@@ -11,19 +12,6 @@ __device__ __forceinline__ unsigned char* nvfp4_shared_storage() {
     } else {
         __shared__ __align__(16) unsigned char shared_static[Bytes];
         return shared_static;
-    }
-}
-
-template <int Bytes, auto Kernel, bool Dynamic = false>
-int nvfp4_prepare_shared() {
-    static_assert(Bytes <= 99 * 1024);
-    if constexpr (Bytes > 48 * 1024) {
-        static const cudaError_t status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        CUDA_CHECK(status);
-        return Bytes;
-    } else {
-        return Dynamic ? Bytes : 0;
     }
 }
 

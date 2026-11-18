@@ -5,6 +5,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tiled_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/merge.cuh"
+#include "ops/common/dynamic_shared.cuh"
 #include <stdexcept>
 
 namespace infernix::ops::detail {
@@ -25,17 +26,6 @@ void validate_bf16_kv_operands(const CausalAttentionOperands& p,
         (cache.valid_columns && !cache.table_rows) || (cache.key_side == nullptr) != (cache.value_side == nullptr) ||
         (cache.key_side && (!aligned(cache.key_side) || !aligned(cache.value_side))))
         throw std::invalid_argument("BF16 KV template operands do not match its geometry/layout");
-}
-
-template <int Bytes, auto Kernel>
-int bf16_kv_dynamic_shared() {
-    static_assert(Bytes <= 99 * 1024);
-    if constexpr (Bytes > 48 * 1024) {
-        static const auto status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        CUDA_CHECK(status);
-    }
-    return Bytes;
 }
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable, class Input>
@@ -67,7 +57,7 @@ void launch_bf16_kv_grouped_mma(const CausalAttentionOperands& p, Bf16KvCacheVie
         // Packed instances add their producer warps.
         constexpr int threads = Packed ? T::kThreads + 32 * kBf16pProducerWarps<T> : T::kThreads;
         int dynamic           = 0;
-        if constexpr (bytes > 48 * 1024) dynamic = bf16_kv_dynamic_shared<bytes, kernel>();
+        if constexpr (bytes > 48 * 1024) dynamic = prepare_dynamic_shared<bytes, kernel, true>();
         const dim3 grid(G::KVHeads * div_up(p.width * G::GroupSize, T::kQueryRows),
                         partition.capacity, p.batch);
         // A programmatic dependent of the RoPE / append kernel before it (the kernel waits at entry): the Qwen3.5 decode
@@ -153,7 +143,7 @@ void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView c
         if (splits > 1) {
             constexpr auto kernel = bf16_kv_tiled_mma_kernel<Geometry, Schedule, Metadata, true, Segmented>;
             const int bytes =
-                bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel>();
+                prepare_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel, true>();
             const dim3 grid(div_up(p.width, Schedule::kQueryRows), Geometry::QHeads, splits);
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
                                                                 p.positions, p.scale, p.out, p.width,
@@ -168,7 +158,7 @@ void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView c
         }
         constexpr auto kernel = bf16_kv_tiled_mma_kernel<Geometry, Schedule, Metadata, false, Segmented>;
         const int bytes =
-            bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel>();
+            prepare_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel, true>();
         const dim3 grid(div_up(p.width, Schedule::kQueryRows), Geometry::QHeads);
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
                                                             p.positions, p.scale, p.out, p.width,

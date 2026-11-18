@@ -23,7 +23,7 @@ void launch_q8_a16_grouped_sliced_k_mma(const Q8LinearOperands& operands, Output
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel =
                 q8_a16_grouped_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue>;
-            const int shared = q8_prepare_shared<Schedule::kSharedBytes, kernel>();
+            const int shared = prepare_dynamic_shared<Schedule::kSharedBytes, kernel>();
             kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue, offset,
                                                                  count);
             CUDA_CHECK(cudaGetLastError());

@@ -25,7 +25,7 @@ void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue
         const auto launch = [&]<bool Full, bool FullK>() {
             constexpr auto kernel =
                 q8_a16_mma_kernel<Schedule, Full, FullK, Output, Epilogue, RowPolicy>;
-            const int shared = q8_prepare_shared<q8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+            const int shared = prepare_dynamic_shared<q8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
             kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
                                                                  row_policy, offset, count);
             CUDA_CHECK(cudaGetLastError());

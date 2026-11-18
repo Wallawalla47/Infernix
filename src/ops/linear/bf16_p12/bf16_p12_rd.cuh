@@ -269,7 +269,7 @@ void launch_bf16_p12_rd(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
         using Output       = decltype(output);
         const auto launch = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
             constexpr auto kernel = bf16_p12_rd_kernel<S, Output, InPlace>;
-            bf16_prepare_shared<S::kSharedBytes, kernel>();
+            prepare_dynamic_shared<S::kSharedBytes, kernel, true>();
             kernel<<<static_cast<unsigned>(blocks), S::kThreads, S::kSharedBytes, stream>>>(
                 parameter, words, escapes, output, w.n, w.k, x.ne[1]);
             CUDA_CHECK(cudaGetLastError());

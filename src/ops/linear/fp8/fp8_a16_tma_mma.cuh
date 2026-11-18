@@ -140,7 +140,7 @@ void launch_fp8_a16_tma_mma(const Fp8A16OperandsT<Scale>& p, Output output, Epil
                     fp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, Scale, InPlace>;
                 constexpr int bytes =
                     fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<bytes, kernel, true>();
                 kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(parameter, p, output, epilogue,
                                                                         offset, count);
                 CUDA_CHECK(cudaGetLastError());

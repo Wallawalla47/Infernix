@@ -398,7 +398,7 @@ void launch_mxfp8_a16_tma_mma(const Mxfp8Operands& p, Output output, Epilogue ep
             const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
             const auto launch = [&]<bool Full>() {
                 constexpr auto kernel = mxfp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue>;
-                const int dynamic     = fp8_prepare_shared<Mxfp8TmaLayout<Schedule>::kSharedBytes, kernel, true>();
+                const int dynamic     = prepare_dynamic_shared<Mxfp8TmaLayout<Schedule>::kSharedBytes, kernel, true>();
                 const pdl::LaunchConfig config{dim3(blocks), dim3(Schedule::kThreads),
                                                static_cast<std::size_t>(dynamic), stream};
 #ifdef _WIN32
@@ -434,7 +434,7 @@ void launch_mxfp8_a16_tma_mma(const Mxfp8Operands& p, Output output, Epilogue ep
                 const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
                 const auto launch = [&]<bool Full>() {
                     constexpr auto kernel = mxfp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, InPlace>;
-                    const int dynamic = fp8_prepare_shared<Mxfp8TmaLayout<Schedule>::kSharedBytes, kernel, true>();
+                    const int dynamic = prepare_dynamic_shared<Mxfp8TmaLayout<Schedule>::kSharedBytes, kernel, true>();
                     const pdl::LaunchConfig config{dim3(blocks), dim3(Schedule::kThreads),
                                                    static_cast<std::size_t>(dynamic), stream};
                     CUDA_CHECK(

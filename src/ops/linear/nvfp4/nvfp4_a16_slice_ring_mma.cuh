@@ -292,7 +292,7 @@ void launch_nvfp4_a16_slice_ring_mma(const Nvfp4A16Operands& p, Output output, E
         (Rows::kPaired && (p.rows / 2) % (Schedule::kBlockRows / 2)))
         throw std::invalid_argument("NVFP4 slice ring requires complete row and K-group tiles");
     static constexpr auto kernel = nvfp4_a16_slice_ring_mma_kernel<Schedule, Output, Epilogue, Rows>;
-    const int bytes              = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel, true>();
+    const int bytes              = prepare_dynamic_shared<Schedule::kSharedBytes, kernel, true>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         kernel<<<blocks, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset, count);

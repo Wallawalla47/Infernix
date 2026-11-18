@@ -4,6 +4,7 @@
 #include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/grouped_mma.cuh"
 #include "ops/softmax_attention/common/causal_merge.cuh"
+#include "ops/common/dynamic_shared.cuh"
 #include <stdexcept>
 
 namespace infernix::ops::detail {
@@ -34,11 +35,7 @@ void launch_nvfp4_kv_grouped_mma(const CausalAttentionOperands& p, Nvfp4KvCacheV
         constexpr auto kernel =
             nvfp4_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, Tree>;
         constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
-        if constexpr (S::kDynamicArena) {
-            static const auto status =
-                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-            CUDA_CHECK(status);
-        }
+        if constexpr (S::kDynamicArena) { (void)reserve_dynamic_shared<kernel, bytes>(); }
         const dim3 grid = grouped_attention_grid<MultiBatch>(
             G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
             partition.capacity, p.batch);

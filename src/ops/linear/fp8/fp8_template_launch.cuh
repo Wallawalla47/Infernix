@@ -60,7 +60,7 @@ void launch_fp8_a16_mma(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = fp8_a16_mma_kernel<Schedule, Full, Output, Epilogue, Rows, Scale>;
             const int bytes =
-                fp8_prepare_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
+                prepare_dynamic_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(
                 p.x, p.codes, p.scales, output, epilogue, rows, p.rows, p.k, offset, count);
             CUDA_CHECK(cudaGetLastError());
@@ -88,7 +88,7 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16OperandsT<Scale>& p, Output output,
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
     static constexpr auto kernel =
         fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows, Scale>;
-    const int bytes              = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
+    const int bytes              = prepare_dynamic_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
         CUDA_CHECK(pdl::launch_with(
@@ -116,7 +116,7 @@ void launch_fp8_a8_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilogue e
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = fp8_a8_mma_kernel<Schedule, Full, Epilogue, Output, Rows, Scale>;
             const int bytes =
-                fp8_prepare_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+                prepare_dynamic_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
             CUDA_CHECK(pdl::launch_with(
                 dependency,
                 {dim3(blocks), dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream},

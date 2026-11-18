@@ -303,7 +303,7 @@ void launch_bf16_p12_stream(const Tensor& x, const Weight& w, Tensor& out, cudaS
     const dim3 grid(static_cast<unsigned>(blocks));
     with_linear_output(out, w.n, [&](auto output) {
         constexpr auto kernel = bf16_p12_stream_kernel<S, decltype(output)>;
-        const int bytes       = bf16_prepare_shared<S::kSharedBytes, kernel>();
+        const int bytes       = prepare_dynamic_shared<S::kSharedBytes, kernel, true>();
         kernel<<<grid, S::kThreads, bytes, stream>>>(p, output);
         CUDA_CHECK(cudaGetLastError());
     });

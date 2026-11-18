@@ -572,7 +572,7 @@ void launch_f16acc_mma(const F16AccOperands<Scales, Scale>& p, Output output, Ep
                         checked = true;
                     }
                 }
-                const int dynamic = fp8_prepare_shared<F16AccLayout<Schedule, Scales>::kSharedBytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<F16AccLayout<Schedule, Scales>::kSharedBytes, kernel, true>();
                 kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(parameter, p, output, epilogue, offset, count);
                 CUDA_CHECK(cudaGetLastError());
             };

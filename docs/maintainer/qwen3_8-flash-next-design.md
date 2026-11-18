@@ -8455,7 +8455,7 @@ this section records the design decisions of F0 and F1. Results are recorded by 
   tensor-map construction (`nvfp4_make_tma_2d`), `nvfp4_tma_load_2d`, the Windows descriptor staging
   (`TmaDescriptorStaging`, one staging per layer call), the mbarrier helpers, the 64-byte-swizzled
   activation tiles with the dense kernel's `ldmatrix` A fragments and scale lanes,
-  `nvfp4_prepare_shared`, and the canonical arithmetic of `canonical_math.h`. From Qwen3.5's
+  `prepare_dynamic_shared`, and the canonical arithmetic of `canonical_math.h`. From Qwen3.5's
   `sparse_moe/prefill`: the device-built list of (expert, column tile) jobs and the grid-stride walk
   over jobs times row blocks, and packed rows grouped by expert instead of a gathered activation copy.
 - **Not reused, and why.**

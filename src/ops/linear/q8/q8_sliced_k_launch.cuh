@@ -34,7 +34,7 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel =
                 q8_a16_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
-            const int shared = q8_prepare_shared<Schedule::kSharedBytes, kernel>();
+            const int shared = prepare_dynamic_shared<Schedule::kSharedBytes, kernel>();
             CUDA_CHECK(pdl::launch_with(
                 dependency,
                 {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(shared), stream}, kernel,

@@ -21,7 +21,7 @@ void launch_q8_a16_stream(const Q8LinearOperands& operands, Output output, Epilo
         const auto* x = operands.x + static_cast<std::int64_t>(offset) * operands.k;
         const auto launch = [&]<bool FullRows>() {
             constexpr auto kernel = q8_a16_stream_kernel<Schedule, FullRows, Output, Epilogue>;
-            const int shared      = q8_prepare_shared<Schedule::kSharedBytes, kernel>();
+            const int shared      = prepare_dynamic_shared<Schedule::kSharedBytes, kernel>();
             CUDA_CHECK(pdl::launch_consumer({grid, dim3(Schedule::kThreads), static_cast<std::size_t>(shared), stream},
                                             kernel, x, operands.codes, operands.scales, output, epilogue,
                                             operands.rows, operands.padded_k, count, offset));

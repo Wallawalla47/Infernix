@@ -573,7 +573,7 @@ void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaS
         return true;
     }();
     (void)configured;
-    const int dynamic = detail::nvfp4_prepare_shared<bytes, kernel, true>();
+    const int dynamic = detail::prepare_dynamic_shared<bytes, kernel, true>();
 #ifdef _WIN32
     kernel<<<persistent_ctas(), S::kThreads, dynamic, stream>>>(static_cast<const Descriptors*>(call.descriptors),
                                                                  call, pass, epilogue);
