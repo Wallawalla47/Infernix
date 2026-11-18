@@ -1256,7 +1256,11 @@ Tensor Forward::attention_impl(A& ws, const AttentionParameters& p, const Tensor
     const std::int32_t QW = dim(a.query_width()), KW = dim(a.key_width()), D = dim(a.head_dim);
     const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
     const std::int32_t index_rows = IH * ID + ID;
-    if constexpr (kRuns<A>) { scan_input(x, scan_layer_, ActivationScan::Site::QsaInput); }
+    // The MTP block's K/V-only chunk (in a prefill chunk, after the last layer) is no layer's attention input:
+    // scan_layer_ still names the last layer.
+    if constexpr (kRuns<A>) {
+        if (!shape.kv_only) { scan_input(x, scan_layer_, ActivationScan::Site::QsaInput); }
+    }
     Tensor q = ws.alloc(DType::BF16, {D, dim(a.heads), T});
     Tensor gate = ws.alloc(DType::BF16, {QW, T});
     Tensor k = ws.alloc(DType::BF16, {D, dim(a.kv_heads), T});
