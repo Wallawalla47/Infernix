@@ -677,35 +677,48 @@ std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked, bool unheld_only) 
     return kNoId;
 }
 
+template <std::uint32_t PrefixCacheIndex::Node::*Prev, std::uint32_t PrefixCacheIndex::Node::*Next>
+void PrefixCacheIndex::list_unlink(std::uint32_t index, std::uint32_t& head, std::uint32_t& tail) noexcept {
+    Node& node = nodes_[index];
+    if (node.*Prev != kNoId) {
+        nodes_[node.*Prev].*Next = node.*Next;
+    } else {
+        head = node.*Next;
+    }
+    if (node.*Next != kNoId) {
+        nodes_[node.*Next].*Prev = node.*Prev;
+    } else {
+        tail = node.*Prev;
+    }
+    node.*Prev = kNoId;
+    node.*Next = kNoId;
+}
+
+template <std::uint32_t PrefixCacheIndex::Node::*Prev, std::uint32_t PrefixCacheIndex::Node::*Next>
+void PrefixCacheIndex::list_append(std::uint32_t index, std::uint32_t& head, std::uint32_t& tail) noexcept {
+    Node& node = nodes_[index];
+    node.*Prev = tail;
+    node.*Next = kNoId;
+    if (tail != kNoId) {
+        nodes_[tail].*Next = index;
+    } else {
+        head = index;
+    }
+    tail = index;
+}
+
 void PrefixCacheIndex::dead_remove(std::uint32_t index) {
     Node& node = nodes_[index];
     if (!node.in_dead) { return; }
-    if (node.dead_prev != kNoId) {
-        nodes_[node.dead_prev].dead_next = node.dead_next;
-    } else {
-        dead_head_ = node.dead_next;
-    }
-    if (node.dead_next != kNoId) {
-        nodes_[node.dead_next].dead_prev = node.dead_prev;
-    } else {
-        dead_tail_ = node.dead_prev;
-    }
-    node.dead_prev = kNoId;
-    node.dead_next = kNoId;
-    node.in_dead   = false;
+    list_unlink<&Node::dead_prev, &Node::dead_next>(index, dead_head_, dead_tail_);
+    node.in_dead = false;
     --dead_count_;
 }
 
+// Each append binds the node first: re-indexing nodes_ after the head and tail stores would reload its storage.
 void PrefixCacheIndex::dead_append(std::uint32_t index) {
-    Node& node     = nodes_[index];
-    node.dead_prev = dead_tail_;
-    node.dead_next = kNoId;
-    if (dead_tail_ != kNoId) {
-        nodes_[dead_tail_].dead_next = index;
-    } else {
-        dead_head_ = index;
-    }
-    dead_tail_   = index;
+    Node& node = nodes_[index];
+    list_append<&Node::dead_prev, &Node::dead_next>(index, dead_head_, dead_tail_);
     node.in_dead = true;
     ++dead_count_;
 }
@@ -713,32 +726,14 @@ void PrefixCacheIndex::dead_append(std::uint32_t index) {
 void PrefixCacheIndex::ssd_dead_remove(std::uint32_t index) {
     Node& node = nodes_[index];
     if (!node.in_ssd_dead) { return; }
-    if (node.ssd_dead_prev != kNoId) {
-        nodes_[node.ssd_dead_prev].ssd_dead_next = node.ssd_dead_next;
-    } else {
-        ssd_dead_head_ = node.ssd_dead_next;
-    }
-    if (node.ssd_dead_next != kNoId) {
-        nodes_[node.ssd_dead_next].ssd_dead_prev = node.ssd_dead_prev;
-    } else {
-        ssd_dead_tail_ = node.ssd_dead_prev;
-    }
-    node.ssd_dead_prev = kNoId;
-    node.ssd_dead_next = kNoId;
-    node.in_ssd_dead   = false;
+    list_unlink<&Node::ssd_dead_prev, &Node::ssd_dead_next>(index, ssd_dead_head_, ssd_dead_tail_);
+    node.in_ssd_dead = false;
     --ssd_dead_count_;
 }
 
 void PrefixCacheIndex::ssd_dead_append(std::uint32_t index) {
-    Node& node         = nodes_[index];
-    node.ssd_dead_prev = ssd_dead_tail_;
-    node.ssd_dead_next = kNoId;
-    if (ssd_dead_tail_ != kNoId) {
-        nodes_[ssd_dead_tail_].ssd_dead_next = index;
-    } else {
-        ssd_dead_head_ = index;
-    }
-    ssd_dead_tail_   = index;
+    Node& node = nodes_[index];
+    list_append<&Node::ssd_dead_prev, &Node::ssd_dead_next>(index, ssd_dead_head_, ssd_dead_tail_);
     node.in_ssd_dead = true;
     ++ssd_dead_count_;
 }
@@ -747,33 +742,15 @@ void PrefixCacheIndex::clean_remove(std::uint32_t index) {
     Node& node = nodes_[index];
     if (node.clean_list == kNoList) { return; }
     const std::uint8_t list = node.clean_list;
-    if (node.clean_prev != kNoId) {
-        nodes_[node.clean_prev].clean_next = node.clean_next;
-    } else {
-        clean_head_[list] = node.clean_next;
-    }
-    if (node.clean_next != kNoId) {
-        nodes_[node.clean_next].clean_prev = node.clean_prev;
-    } else {
-        clean_tail_[list] = node.clean_prev;
-    }
-    node.clean_prev = kNoId;
-    node.clean_next = kNoId;
+    list_unlink<&Node::clean_prev, &Node::clean_next>(index, clean_head_[list], clean_tail_[list]);
     node.clean_list = kNoList;
     --host_clean_listed_;
 }
 
 void PrefixCacheIndex::clean_append(std::uint32_t index, std::uint8_t list) {
-    Node& node      = nodes_[index];
-    node.clean_prev = clean_tail_[list];
-    node.clean_next = kNoId;
-    if (clean_tail_[list] != kNoId) {
-        nodes_[clean_tail_[list]].clean_next = index;
-    } else {
-        clean_head_[list] = index;
-    }
-    clean_tail_[list] = index;
-    node.clean_list   = list;
+    Node& node = nodes_[index];
+    list_append<&Node::clean_prev, &Node::clean_next>(index, clean_head_[list], clean_tail_[list]);
+    node.clean_list = list;
     ++host_clean_listed_;
 }
 

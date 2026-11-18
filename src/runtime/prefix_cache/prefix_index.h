@@ -838,6 +838,12 @@ private:
     // Recomputes every node's hold from holds_ and moves the affected LRU entries.
     void refresh_holds();
 
+    // The intrusive lists of nodes (dead, SSD dead, clean) through a Node's `Prev`/`Next` index members and the list's
+    // head and tail; membership flags and counts stay with each list's own remove and append (prefix_index.cpp).
+    template <std::uint32_t Node::*Prev, std::uint32_t Node::*Next>
+    void list_unlink(std::uint32_t node, std::uint32_t& head, std::uint32_t& tail) noexcept;
+    template <std::uint32_t Node::*Prev, std::uint32_t Node::*Next>
+    void list_append(std::uint32_t node, std::uint32_t& head, std::uint32_t& tail) noexcept;
     void dead_remove(std::uint32_t node);
     void dead_append(std::uint32_t node);
     void ssd_dead_remove(std::uint32_t node);
