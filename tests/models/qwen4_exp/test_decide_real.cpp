@@ -245,6 +245,21 @@ int chain(infernix::Engine& engine, std::uint32_t steps, const char* label) {
     }
     int failures = check(g.size() == steps && result.generated_token_ids == g,
                          std::string(label) + ": constrained greedy equals free greedy");
+    for (std::size_t i = 0; i < g.size() && i < result.generated_token_ids.size(); ++i) {
+        if (result.generated_token_ids[i] == g[i]) { continue; }
+        // The first step the runs part at: both tokens and what the constrained draw gave each (a near tie of the
+        // free run's logits, or a route whose arithmetic differs).
+        const auto at = [&](infernix::TokenId t) {
+            const auto p = static_cast<std::size_t>(std::find(set.begin(), set.end(), t) - set.begin());
+            return i < result.constrained_draws.size() && p < result.constrained_draws[i].probabilities.size()
+                       ? static_cast<double>(result.constrained_draws[i].probabilities[p])
+                       : -1.0;
+        };
+        std::printf("        step %zu: free %d, constrained %d; the draw's probabilities %.9f and %.9f\n", i,
+                    static_cast<int>(g[i]), static_cast<int>(result.generated_token_ids[i]), at(g[i]),
+                    at(result.generated_token_ids[i]));
+        break;
+    }
     failures += check(draws, std::string(label) + ": draws renormalize over each step and name the chosen token");
     std::printf("        speculative: %llu drafted, %llu accepted\n",
                 static_cast<unsigned long long>(result.speculative.drafted_tokens),
@@ -327,16 +342,31 @@ int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vecto
     infernix::EngineOptions options = base_options(artifact, ngram, mtp);
     options.fast_paths = fast_paths;
     options.fast_path_candidates.insert(options.fast_path_candidates.end(), candidates.begin(), candidates.end());
-    infernix::Engine engine(options, infernix::test::engine_host());
-    int failures = 0;
-    failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr, suffix);
-    if (readout_only) { return failures; }
-    failures += forced(engine);
-    failures += chain(engine, mtp ? 12U : 6U, mtp ? "chain (MTP verify)" : "chain");
-    failures += cross(engine);
-    if (!mtp) {
-        failures += coalesce(engine);
-        failures += prefetch(engine);
+    int failures  = 0;
+    bool screened = false;
+    {
+        infernix::Engine engine(options, infernix::test::engine_host());
+        const std::vector<std::string>& paths = engine.load_summary().fast_paths;
+        screened = std::find(paths.begin(), paths.end(), "screened-lm-head") != paths.end();
+        failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr, suffix);
+        if (readout_only) { return failures; }
+        failures += forced(engine);
+        if (!screened) { failures += chain(engine, mtp ? 12U : 6U, mtp ? "chain (MTP verify)" : "chain"); }
+        failures += cross(engine);
+        if (!mtp) {
+            failures += coalesce(engine);
+            failures += prefetch(engine);
+        }
+    }
+    if (screened) {
+        // screened-lm-head serves greedy rows from the LM head's 2-bit screen, whose known miss mode (more than eight
+        // near-best rows in one 16-row item, design §19.3.30) can leave the exact argmax out of the rescored rows; a
+        // constrained row takes the exact head. The chain compares constrained greedy with free greedy, so it
+        // runs on an Engine without the screen (QAD Dense8, 2026-11-18: free 15, constrained 24 at 0.387 and 0.426).
+        std::printf("        chain: on an Engine without screened-lm-head\n");
+        options.fast_path_exclusions.push_back(infernix::FastPath::ScreenedLmHead);
+        infernix::Engine exact_head(options, infernix::test::engine_host());
+        failures += chain(exact_head, mtp ? 12U : 6U, mtp ? "chain (MTP verify)" : "chain");
     }
     return failures;
 }

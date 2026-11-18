@@ -521,6 +521,10 @@ constexpr std::array kQualified{
     // 117.3 -> 125.0 tok/s (+6.6 %, 2 of 2), the struct fixture 378.3 -> 386.9 (+2.3 %, 3 of 3, the same text and
     // rounds: 20.24 -> 19.79 ms a round); without it the exact BF16 head took 706 us of a 9.5 ms round after a 16K
     // prompt (the screen 135 us). The formats below INT8's precision by the owner's rule above.
+    // NVIDIA's NVFP4-QAD Dense8 has this configuration with an 8-bit head (q8_g32_fp16, whose rescore reads its rows by
+    // warps) and its screen: measured faster there too (RTX 5090, 2026-11-18, INT8 KV, pp2048 + tg128, on-off-off-on x 2,
+    // against --no-fast-path screened-lm-head): plain decode 151.4-152.3 -> 153.5-154.7 tok/s (+1.43 %), DFlash2 with
+    // automatic draft lengths 221.1-222.1 -> 224.4-225.2 (+1.46 %), prefill level (+0.41 % and -0.10 %, overlapping).
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
