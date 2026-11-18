@@ -101,10 +101,10 @@ def main() -> int:
     args = parser.parse_args()
     text = render(train())
     if args.check:
-        same = args.out.read_text().replace("\r\n", "\n") == text
+        same = args.out.read_text(encoding="utf-8").replace("\r\n", "\n") == text
         print("codebook matches" if same else "codebook differs")
         return 0 if same else 1
-    args.out.write_text(text, newline="\n")
+    args.out.write_text(text, encoding="utf-8", newline="\n")
     return 0
 
 

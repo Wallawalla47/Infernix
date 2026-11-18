@@ -47,7 +47,7 @@ class SafetensorsSource:
         self.root = self.path if self.path.is_dir() else self.path.parent
         config_path = self.root / "config.json"
         self.config = (
-            json.loads(config_path.read_text()) if config_path.is_file() else {}
+            json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
         )
         self._headers: dict[Path, dict[str, TensorInfo]] = {}
         self._fds: OrderedDict[Path, int] = OrderedDict()
@@ -65,7 +65,7 @@ class SafetensorsSource:
                 else self.root / "model.safetensors.index.json"
             )
             if index.is_file():
-                data = json.loads(index.read_text())
+                data = json.loads(index.read_text(encoding="utf-8"))
                 self.weight_map = {
                     name: index.parent / file
                     for name, file in data["weight_map"].items()

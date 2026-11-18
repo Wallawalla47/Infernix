@@ -187,7 +187,7 @@ def main() -> int:
     report["seconds"] = time.time() - start
     print(json.dumps(report, indent=2))
     if args.report:
-        args.report.write_text(json.dumps(report, indent=2) + "\n")
+        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     ok = (not report["expert_mismatches"] and not report["tensor_mismatches"] and not report.get("ngram_row_mismatches")
           and not report.get("vision_reference_mismatches"))
     return 0 if ok else 1

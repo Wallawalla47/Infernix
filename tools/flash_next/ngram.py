@@ -126,7 +126,7 @@ def write_fixture(path: Path) -> None:
         for p, row in enumerate(row_ids(c, layer, history, len(history) - (c.ngram_size - 1))):
             lines.append(f"R {layer} {p} " + " ".join(map(str, row)))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> int:

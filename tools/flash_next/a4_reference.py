@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{r['mismatching_blocks']:>6} (outside guard {r['mismatching_blocks_outside_guard']})"
               + (f"  rule-vs-kernel elements {r['modelopt_rule_vs_kernel_mismatching_elements']}" if use_kernel else ""))
     if args.json:
-        args.json.write_text(json.dumps(results, indent=1) + "\n")
+        args.json.write_text(json.dumps(results, indent=1) + "\n", encoding="utf-8")
     return 0
 
 

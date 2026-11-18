@@ -26,7 +26,7 @@ def read_logpos(path: Path) -> list[list[dict]]:
     """Strata rows grouped by request: each request's positions start again at 0."""
     groups: list[list[dict]] = []
     last = None
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         f = line.split("\t")
         pos = int(f[0])
         if last is None or pos <= last:
@@ -99,7 +99,7 @@ def main() -> int:
           f"{'top1 N':>8}{'top1 S':>8}{'agree':>7}{'KL mean':>9}{'KL p50':>8}{'KL p99':>8}")
     all_n, all_s = [], []
     for name, strata in zip(names, groups):
-        ids = [int(x) for x in (args.texts / f"{name}.ids").read_text().split(",") if x]
+        ids = [int(x) for x in (args.texts / f"{name}.ids").read_text(encoding="utf-8").split(",") if x]
         r = compare(ids, infernix_rows(args.texts / f"infernix-{name}.bin"), strata)
         all_n.append(r["nll_infernix"])
         all_s.append(r["nll_strata"])

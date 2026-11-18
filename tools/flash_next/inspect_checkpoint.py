@@ -69,7 +69,7 @@ def _is_power_of_two(word: int) -> bool:
 def _quant_config(root: Path, config: dict) -> dict:
     path = root / "hf_quant_config.json"
     if path.is_file():
-        return {"source": "hf_quant_config.json", **json.loads(path.read_text())}
+        return {"source": "hf_quant_config.json", **json.loads(path.read_text(encoding="utf-8"))}
     for owner in (config, config.get("text_config", {})):
         if "quantization_config" in owner:
             return {"source": "config.json", "quantization": owner["quantization_config"]}
@@ -254,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     facts = inspect(args.checkpoint)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(facts, indent=1) + "\n")
+        args.json.write_text(json.dumps(facts, indent=1) + "\n", encoding="utf-8")
     print(_summary(facts))
     return 0
 

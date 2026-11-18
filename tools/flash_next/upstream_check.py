@@ -33,7 +33,7 @@ from tools.flash_next.reference import F64, Reference
 
 class Checkpoint:
     def __init__(self, root: Path):
-        index = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
+        index = json.loads((root / "model.safetensors.index.json").read_text(encoding="utf-8"))["weight_map"]
         self.root, self.index = root, index
 
     def load(self, module: torch.nn.Module, prefix: str) -> torch.nn.Module:
@@ -55,7 +55,7 @@ def main() -> int:
     parser.add_argument("--layers", help="comma-separated layer indices (default: all)")
     args = parser.parse_args()
     ref = Reference(args.model)
-    raw = json.loads((args.model / "config.json").read_text())["text_config"]
+    raw = json.loads((args.model / "config.json").read_text(encoding="utf-8"))["text_config"]
     config = Qwen4ExpTextConfig(**raw)
     config._attn_implementation = "eager"
     ckpt = Checkpoint(args.model)

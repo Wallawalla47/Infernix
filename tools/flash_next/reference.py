@@ -479,7 +479,9 @@ def main() -> int:
     arrays["routed"] = np.stack(record["routed"])
     arrays["layer_residuals"] = np.stack(record["layer_residuals"])
     np.savez(args.out, **arrays)
-    Path(str(args.out) + ".json").write_text(json.dumps({"layer_residual_rms": record["layer_residual_rms"]}))
+    Path(str(args.out) + ".json").write_text(
+        json.dumps({"layer_residual_rms": record["layer_residual_rms"]}), encoding="utf-8"
+    )
     return 0
 
 
