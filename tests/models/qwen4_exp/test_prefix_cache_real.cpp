@@ -411,9 +411,15 @@ int run_write_through(const char* artifact, const char* ngram) {
     const std::uint64_t taps_before      = hooks::tap_block_writes();
     const infernix::RuntimeStats before  = engine.runtime_stats();
     (void)generate(engine, a, 8, true);
-    const std::uint64_t at_taps          = hooks::tap_block_writes() - taps_before;
-    const infernix::RuntimeStats after   = engine.runtime_stats();
-    const std::uint64_t written          = after.hybrid_host_block_writes - before.hybrid_host_block_writes;
+    // The release's writes are enqueued in A's finish, but the Engine publishes its RuntimeStats after the cycle's
+    // completions, so a read as soon as the result arrives can still see the cycle before: polled up to 2 s.
+    std::uint64_t written = 0;
+    for (int i = 0; i < 200; ++i) {
+        written = engine.runtime_stats().hybrid_host_block_writes - before.hybrid_host_block_writes;
+        if (written >= (1500 + 8) / 64) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const std::uint64_t at_taps = hooks::tap_block_writes() - taps_before;
     const Run resumed                    = generate(engine, b, 8, true);
     std::printf("        %llu blocks written at taps, %llu in all; B resumed at %u\n",
                 static_cast<unsigned long long>(at_taps), static_cast<unsigned long long>(written), resumed.reused);
