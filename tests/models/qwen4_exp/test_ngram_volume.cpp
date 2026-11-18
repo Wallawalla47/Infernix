@@ -106,7 +106,7 @@ std::uint64_t distinct_blocks(const std::vector<std::uint32_t>& rows) {
 void write_header(const std::filesystem::path& path, std::uint64_t rows, std::uint32_t row_bytes, std::uint8_t id,
                   std::uint16_t scale = 0, std::uint16_t tag = 0, std::uint32_t multiplier = 0) {
     std::vector<std::byte> header(4096);
-    const std::uint32_t per_block = kBlockBytes / row_bytes;
+    const std::uint32_t per_block = row_bytes == 0 ? 1 : kBlockBytes / row_bytes; // 0: a corrupt header
     std::memcpy(header.data(), "NINFERNG", 8);
     put<std::uint32_t>(header, 8, 1);
     put<std::uint32_t>(header, 12, 4096);
@@ -216,6 +216,32 @@ void test_resolve(const std::filesystem::path& path) {
         check(refused(), name + "an infinite recorded scale is refused");
         write_header(path, rows, 200, 0x55);
         check(refused(), name + "a row size of no known format is refused");
+    }
+}
+
+// A corrupt header recording rows of 0 bytes, for a head width (150) no block format divides, where
+// IQ4_NL's and NVFP4's row size is 0 too: refused, tagged or not, for another volume and for the artifact's
+// own id, instead of dividing the block by its row size.
+void test_zero_row_bytes(const std::filesystem::path& path) {
+    q4::PleConfig ple;
+    ple.embed_dim             = 2400;
+    ple.ngram.ngram_size      = 3;
+    ple.ngram.heads_per_ngram = 8; // 16 heads of 150
+    ple.table.format          = q4::NgramRowFormat::Fp8E4m3;
+    ple.table.rows            = 100'003;
+    ple.table.row_bytes       = 150;
+    ple.table.volume_id.fill(0xAA);
+    check(ple.head_width() == 150, "the corrupt-header table has heads of 150");
+    for (const std::uint16_t tag : {std::uint16_t{0}, std::uint16_t{2}, std::uint16_t{4}}) {
+        for (const std::uint8_t id : {std::uint8_t{0x55}, std::uint8_t{0xAA}}) {
+            write_header(path, ple.table.rows, 0, id, 0, tag, 0x380B6B3CU);
+            bool refused = false;
+            try {
+                (void)q4::resolve_ngram_volume(path, ple);
+            } catch (const std::runtime_error&) { refused = true; }
+            check(refused, "a header of 0-byte rows (tag " + std::to_string(tag) + ", id " + std::to_string(id) +
+                               ") is refused");
+        }
     }
 }
 
@@ -347,6 +373,7 @@ int main() {
         check(threw, "a volume of the wrong size is refused at open");
         const auto headers = infernix::test::unique_temp_path("infernix_ngram_resolve_test.ngram");
         test_resolve(headers); // its own file: the volume above holds `path` without write sharing
+        test_zero_row_bytes(headers);
         std::error_code removed;
         std::filesystem::remove(headers, removed);
     } catch (const std::exception& error) {

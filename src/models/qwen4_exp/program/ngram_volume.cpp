@@ -300,6 +300,8 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
     out.block_bytes    = read_le<std::uint32_t>(p + 32);
     out.blocks         = read_le<std::uint64_t>(p + 36);
     std::memcpy(out.volume_id.data(), p + 44, 16);
+    // A corrupt header's empty rows would match a format this head width cannot hold (row_bytes_of's 0).
+    if (out.row_bytes == 0) { fail("the n-gram volume header records rows of 0 bytes"); }
     // The row format: the header's tag, or for a volume written before the tag, the row size: head_width
     // FP8 codes, IQ4_NL blocks of 32 (18 bytes each) or head_width BF16 values. NVFP4 rows (head_width / 2
     // code bytes and head_width / 16 scales) have IQ4_NL's size, so they always carry the tag.
