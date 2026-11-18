@@ -511,7 +511,7 @@ no cached prefix that external requests could hit.
 | Responsibility | Main location |
 |---|---|
 | Public Engine facade | `include/infernix/engine.h`, `src/runtime/engine/engine.cpp` |
-| Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
+| Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl`, `next_turn_prefill.inl` |
 | Instance construction | `src/runtime/engine/model_instance.*` |
 | Engine connection to the prefix cache | `src/runtime/engine/context_cache/` |
 | Model-agnostic prefix index, tap planner and cost model | `src/runtime/prefix_cache/` |
