@@ -12,6 +12,7 @@
 #include "infernix/ops/speculative_tree.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -22,6 +23,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace infernix::models::qwen3_5::execution {
@@ -144,6 +146,129 @@ void one_hot_proposal(TokenId draft, std::span<TokenId> candidates, std::span<fl
         }
         q[slot] = slot == 0 ? 1.0F : 0.0F;
     }
+}
+
+// A copy round's n-gram trees: each copy row whose sources continue differently within its limits gets its tree in
+// `trees`, unless its request's tree rounds have not gained over its copies (ngram_tree_wanted). True when a row has
+// one.
+bool choose_ngram_trees(ProgramImpl& program, std::span<const std::uint32_t> lanes,
+                        std::span<const runtime::RoundBudget> budgets, std::span<const NgramProposer::Match> matches,
+                        std::array<NgramTree, kMaximumConcurrency>& trees) {
+    bool any = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        if (matches[row].tokens.empty()) { continue; }
+        const NgramTreeLimits limits =
+            program.ngram_tree_limits(program.active_sequence(lanes[row]).execution_frontier, budgets[row]);
+        if (limits.depth == 0 || limits.nodes < limits.depth + 2U) { continue; }
+        NgramTree tree = program.ngram_tree(lanes[row], matches[row], limits);
+        // A request whose tree rounds have not gained over its copies verifies them as chains (probing now and then).
+        if (tree.tree() && !ngram_tree_wanted(program.requests[lanes[row]])) { continue; }
+        if (tree.tree()) {
+            trees[row] = std::move(tree);
+            any        = true;
+        }
+    }
+    return any;
+}
+
+// The round's constraint rows, one per lane in batch order, staged for `width` columns a row.
+std::array<ProgramImpl::ConstraintRow, kMaximumConcurrency>
+stage_round_constraints(ProgramImpl& program, std::span<const std::uint32_t> lanes, std::uint32_t width) {
+    std::array<ProgramImpl::ConstraintRow, kMaximumConcurrency> rows{};
+    for (std::size_t row = 0; row < lanes.size(); ++row) { rows[row] = program.constraint_row(lanes[row]); }
+    program.stage_constraint_columns(std::span<const ProgramImpl::ConstraintRow>(rows.data(), lanes.size()), width);
+    return rows;
+}
+
+// A decode round's wait for the device, timed as its wait (`range` names it in a trace).
+void wait_for_round(ProgramImpl& program, runtime::ExecutionTimingRecorder& timing, nvtx::Name range,
+                    std::size_t rows) {
+    timing.begin_wait();
+    {
+        nvtx::ScopedRange wait_range(range, nvtx::Category::Control, static_cast<std::uint64_t>(rows));
+        program.device.synchronize();
+    }
+    timing.end_wait();
+}
+
+// A decode round that failed once it began: it waits for what it submitted (a failure there is not the one that
+// propagates), drops its offloaded-expert round and clears its lanes. The caller rethrows.
+void abandon_round(ProgramImpl& program, runtime::ExecutionTimingRecorder& timing, nvtx::Name range,
+                   std::span<const std::uint32_t> lanes) {
+    timing.begin_wait();
+    try {
+        nvtx::ScopedRange wait_range(range, nvtx::Category::Control, static_cast<std::uint64_t>(lanes.size()));
+        program.device.synchronize();
+    } catch (...) {}
+    timing.end_wait();
+    if (program.offload) { program.offload->drop_round(); }
+    program.clear_execution_failure_lanes(lanes);
+}
+
+// A speculative row's round in its request's counters: a row that verified no draft took a fallback step; one that
+// did counts its drafts (`copy`: an n-gram copy), its accepted drafts by position and the round's step. True when it
+// verified a draft.
+bool count_speculative_round(SpeculativeStats& stats, std::uint32_t drafted, std::int32_t accepted, bool copy) {
+    if (drafted == 0) {
+        stats.fallback_steps += 1;
+        return false;
+    }
+    stats.rounds += 1;
+    stats.drafted_tokens += drafted;
+    stats.accepted_tokens += static_cast<std::uint32_t>(accepted);
+    for (std::int32_t i = 0; i < accepted; ++i) { stats.accepted_per_position[static_cast<std::size_t>(i)] += 1; }
+    stats.round_steps.push_back({.drafted  = static_cast<std::uint16_t>(drafted),
+                                 .accepted = static_cast<std::uint16_t>(accepted),
+                                 .ngram    = copy});
+    return true;
+}
+
+// A copy row's round in its request's n-gram counters, and in the archive's when its copy came from the archive.
+void count_ngram_round(SpeculativeStats& stats, const NgramProposer::Match& match, std::uint32_t drafted,
+                       std::int32_t accepted) {
+    if (match.tokens.empty()) { return; }
+    stats.ngram_rounds += 1;
+    stats.ngram_drafted_tokens += drafted;
+    stats.ngram_accepted_tokens += accepted;
+    if (match.archived) {
+        stats.ngram_archive_rounds += 1;
+        stats.ngram_archive_drafted_tokens += drafted;
+        stats.ngram_archive_accepted_tokens += accepted;
+    }
+}
+
+// A row that verified its round's draft tree: the width controller learns its accepted path (the `accepted` + 1 of
+// the round's `width` columns from `path`), and a path that left the main chain at column `branch` (> 0) counts its
+// side tokens. A branch past the accepted path is invalid metadata (`invalid`, the backend's message).
+void count_tree_row(SpeculativeStats& stats, std::optional<TreeWidthController>& controller, const std::int32_t* path,
+                    std::int32_t branch, std::int32_t accepted, std::uint32_t width, const char* invalid) {
+    if (controller) {
+        controller->observe_tree_row(std::span<const std::int32_t>(path, static_cast<std::size_t>(accepted) + 1U),
+                                     width);
+    }
+    stats.tree_rounds += 1;
+    if (branch > 0) {
+        if (branch > accepted) { throw std::runtime_error(invalid); }
+        stats.tree_side_rounds += 1;
+        stats.tree_side_accepted_tokens += static_cast<std::uint32_t>(accepted - branch + 1);
+    }
+}
+
+// The row's round, pending its commit: `produced` tokens from the execution and ledger frontiers it began at. The
+// round's time is the row's decode time (`share`: the row's part of the batch's).
+void pend_speculative_round(RequestControl& request, std::uint32_t base_E, std::uint32_t base_S,
+                            std::int32_t produced, std::uint32_t verify_drafts, double seconds, double share) {
+    request.pending   = PendingCandidate{
+          .kind          = PendingKind::Speculative,
+          .base_E        = base_E,
+          .base_S        = base_S,
+          .prompt_tokens = 0,
+          .produced      = static_cast<std::uint32_t>(produced),
+          .verify_drafts = verify_drafts,
+    };
+    request.lifecycle = Lifecycle::Pending;
+    request.timings.decode_seconds += seconds;
+    request.timings.decode_share_seconds += share;
 }
 
 } // namespace
@@ -411,12 +536,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             *ordinary_host_egress,
             state_images->continuation_hidden_store()};
 
-        std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            constraint_rows[row] = constraint_row(lanes[row]);
-        }
-        stage_constraint_columns(
-            std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), 1);
+        const std::array<ConstraintRow, kMaximumConcurrency> constraint_rows =
+            stage_round_constraints(*this, lanes, 1);
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         // A one-row round's context sets plain decode's one-column divisor where it applies.
@@ -425,13 +546,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                                          envelope, executable);
         if (offload) { offload->enqueue_routes(device.stream, static_cast<std::int32_t>(lanes.size())); }
         submit_range.reset();
-        timing.begin_wait();
-        {
-            nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
-                                         static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
-        }
-        timing.end_wait();
+        wait_for_round(*this, timing, nvtx::Name::DecodeOrdinaryWait, lanes.size());
         // Offloaded experts: the error check, then the cache update deferred past the commit.
         if (offload) { offload->end_round(lanes, 1, 1, {}, parameters.model.info().name); }
 
@@ -470,15 +585,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             .timing = timing.finish(),
         };
     } catch (...) {
-        timing.begin_wait();
-        try {
-            nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
-                                         static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
-        } catch (...) {}
-        timing.end_wait();
-        if (offload) { offload->drop_round(); }
-        clear_execution_failure_lanes(lanes);
+        abandon_round(*this, timing, nvtx::Name::DecodeOrdinaryWait, lanes);
         throw;
     }
 }
@@ -666,22 +773,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
     // N-gram trees: as for DFlash, a copy round in which some row's copy sources continue differently
     // verifies at the n-gram tree width, that row its sources' tree and every other row its chain.
     std::array<NgramTree, kMaximumConcurrency> ngram_trees{};
-    bool ngram_tree_round = false;
-    if (ngram_tree_nodes != 0 && any_ngram && !fixed_width && !constrained) {
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (matches[row].tokens.empty()) { continue; }
-            const NgramTreeLimits limits =
-                ngram_tree_limits(active_sequence(lanes[row]).execution_frontier, budgets[row]);
-            if (limits.depth == 0 || limits.nodes < limits.depth + 2U) { continue; }
-            NgramTree tree = ngram_tree(lanes[row], matches[row], limits);
-            // A request whose tree rounds have not gained over its copies verifies them as chains (probing now and then).
-            if (tree.tree() && !ngram_tree_wanted(requests[lanes[row]])) { continue; }
-            if (tree.tree()) {
-                ngram_trees[row] = std::move(tree);
-                ngram_tree_round = true;
-            }
-        }
-    }
+    const bool ngram_tree_round = ngram_tree_nodes != 0 && any_ngram && !fixed_width && !constrained &&
+                                  choose_ngram_trees(*this, lanes, budgets, matches, ngram_trees);
     std::uint32_t tree_nodes =
         tree_eligible && !tree_controller ? tree_widths.fixed[lanes.size() - 1U] : 0U;
     const bool policy_round = !fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram &&
@@ -938,12 +1031,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                       std::min(capacity, frontier + extent + mtp_ar_depth));
         }
 
-        std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            constraint_rows[row] = constraint_row(lanes[row]);
-        }
-        stage_constraint_columns(
-            std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), width);
+        const std::array<ConstraintRow, kMaximumConcurrency> constraint_rows =
+            stage_round_constraints(*this, lanes, width);
 
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, *state_images, round_replay_records(verify_drafts),
@@ -976,13 +1065,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                     execution::SpeculativePhase::Finish);
         if (offload) { offload->enqueue_routes(device.stream, batch * static_cast<std::int32_t>(width)); }
         submit_range.reset();
-        timing.begin_wait();
-        {
-            nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
-                                         static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
-        }
-        timing.end_wait();
+        wait_for_round(*this, timing, nvtx::Name::DecodeMtpWait, lanes.size());
         // Offloaded experts: the committed columns of each row are the round's uses; in an n-gram tree
         // round a row's every verified column (its accepted path is not a prefix of the round's columns).
         if (offload) {
@@ -1022,20 +1105,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             }
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
-            if (pcur == 0) {
-                request.speculative_stats.fallback_steps += 1;
-            } else {
-                request.speculative_stats.rounds += 1;
-                request.speculative_stats.drafted_tokens += pcur;
-                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
-                }
-                request.speculative_stats.round_steps.push_back(
-                    {.drafted  = static_cast<std::uint16_t>(pcur),
-                     .accepted = static_cast<std::uint16_t>(accepted_i),
-                     .ngram    = !matches[row].tokens.empty()});
+            if (count_speculative_round(request.speculative_stats, pcur, accepted_i, !matches[row].tokens.empty())) {
                 std::vector<std::uint64_t>& by_length =
                     request.speculative_stats.rounds_by_draft_length;
                 if (family.shape.kind == SpeculativeRoundKind::Neural &&
@@ -1049,22 +1119,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                                           static_cast<std::uint32_t>(accepted_i));
                 }
                 if (tree_round && pcur == verify_drafts) {
-                    if (tree_controller) {
-                        tree_controller->observe_tree_row(
-                            std::span<const std::int32_t>(mtp_host_egress->accepted_path.data() + row * width,
-                                                          static_cast<std::size_t>(accepted_i) + 1U),
-                            width);
-                    }
-                    request.speculative_stats.tree_rounds += 1;
-                    const std::int32_t branch = mtp_host_egress->accepted_branch[row];
-                    if (branch > 0) {
-                        if (branch > accepted_i) {
-                            throw std::runtime_error("MTP batch returned invalid row metadata");
-                        }
-                        request.speculative_stats.tree_side_rounds += 1;
-                        request.speculative_stats.tree_side_accepted_tokens +=
-                            static_cast<std::uint32_t>(accepted_i - branch + 1);
-                    }
+                    count_tree_row(request.speculative_stats, tree_controller,
+                                   mtp_host_egress->accepted_path.data() + row * width,
+                                   mtp_host_egress->accepted_branch[row], accepted_i, width,
+                                   "MTP batch returned invalid row metadata");
                 }
                 // The verified drafts' probabilities (still this round's: the commit follows).
                 if (mtp_confidence && matches[row].tokens.empty()) {
@@ -1090,27 +1148,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                       static_cast<std::uint32_t>(ngram_trees[row].row.main_depth),
                                       static_cast<std::uint32_t>(matches[row].tokens.size()));
             }
-            if (!matches[row].tokens.empty()) {
-                request.speculative_stats.ngram_rounds += 1;
-                request.speculative_stats.ngram_drafted_tokens += pcur;
-                request.speculative_stats.ngram_accepted_tokens += accepted_i;
-                if (matches[row].archived) {
-                    request.speculative_stats.ngram_archive_rounds += 1;
-                    request.speculative_stats.ngram_archive_drafted_tokens += pcur;
-                    request.speculative_stats.ngram_archive_accepted_tokens += accepted_i;
-                }
-            }
-            request.pending = PendingCandidate{
-                .kind          = PendingKind::Speculative,
-                .base_E        = base_E,
-                .base_S        = base_S,
-                .prompt_tokens = 0,
-                .produced      = static_cast<std::uint32_t>(count_i),
-                .verify_drafts = verify_drafts,
-            };
-            request.lifecycle = Lifecycle::Pending;
-            request.timings.decode_seconds += seconds;
-            request.timings.decode_share_seconds += share;
+            count_ngram_round(request.speculative_stats, matches[row], pcur, accepted_i);
+            pend_speculative_round(request, base_E, base_S, count_i, verify_drafts, seconds, share);
         }
         // Automatic trees time every all-neural round at its width: a tree, or the window's chain.
         if (tree_controller && !any_ngram && (tree_round || width == neural_draft_window + 1U)) {
@@ -1126,15 +1165,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             .timing     = timing.finish(),
         };
     } catch (...) {
-        timing.begin_wait();
-        try {
-            nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
-                                         static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
-        } catch (...) {}
-        timing.end_wait();
-        if (offload) { offload->drop_round(); }
-        clear_execution_failure_lanes(lanes);
+        abandon_round(*this, timing, nvtx::Name::DecodeMtpWait, lanes);
         throw;
     }
 }
@@ -1210,22 +1241,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     // tree's depth verifies at the n-gram tree width, that row its sources' tree and every other row its
     // chain (a copy within the width, or the neural proposal). Grammar masks follow one chain.
     std::array<NgramTree, kMaximumConcurrency> ngram_trees{};
-    bool ngram_tree_round = false;
-    if (ngram_tree_nodes != 0 && any_ngram && !fixed_width && !constrained) {
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (matches[row].tokens.empty()) { continue; }
-            const NgramTreeLimits limits =
-                ngram_tree_limits(active_sequence(lanes[row]).execution_frontier, budgets[row]);
-            if (limits.depth == 0 || limits.nodes < limits.depth + 2U) { continue; }
-            NgramTree tree = ngram_tree(lanes[row], matches[row], limits);
-            // A request whose tree rounds have not gained over its copies verifies them as chains (probing now and then).
-            if (tree.tree() && !ngram_tree_wanted(requests[lanes[row]])) { continue; }
-            if (tree.tree()) {
-                ngram_trees[row] = std::move(tree);
-                ngram_tree_round = true;
-            }
-        }
-    }
+    const bool ngram_tree_round = ngram_tree_nodes != 0 && any_ngram && !fixed_width && !constrained &&
+                                  choose_ngram_trees(*this, lanes, budgets, matches, ngram_trees);
     // (Choosing an automatic round's width after its proposal, from its own draft probabilities,
     // measured flat: 27B DFlash2 1.0002x; removed 2026-10-28.)
     std::uint32_t tree_nodes = 0;
@@ -1495,12 +1512,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                       std::min(verified, limits[row]), false, sequence.rope_delta);
             }
         }
-        std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            constraint_rows[row] = constraint_row(lanes[row]);
-        }
-        stage_constraint_columns(
-            std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), width);
+        const std::array<ConstraintRow, kMaximumConcurrency> constraint_rows =
+            stage_round_constraints(*this, lanes, width);
 
         auto schedule_state = round_state(verify_drafts);
         execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
@@ -1530,13 +1543,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                        execution::SpeculativePhase::Finish);
         if (offload) { offload->enqueue_routes(device.stream, batch * static_cast<std::int32_t>(width)); }
         submit_range.reset();
-        timing.begin_wait();
-        {
-            nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
-                                         static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
-        }
-        timing.end_wait();
+        wait_for_round(*this, timing, nvtx::Name::DecodeDFlashWait, lanes.size());
         // Offloaded experts: a chain row's committed columns are its uses; in a tree round a row's
         // every verified column (its accepted path is not a prefix of the round's columns), not the
         // masked padding past them, which routed no expert.
@@ -1577,26 +1584,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 request.constraint_round = read_constraint_draws(
                     *constrained.plan, constrained.first_step, row * width, row_tokens);
             }
-            if (extent == 0) {
-                request.speculative_stats.fallback_steps += 1;
-            } else {
-                request.speculative_stats.rounds += 1;
-                request.speculative_stats.drafted_tokens += extent;
-                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
-                }
-                // A neural chain row's verified length.
-                const bool copy_row = any_ngram && !matches[row].tokens.empty();
-                request.speculative_stats.round_steps.push_back(
-                    {.drafted  = static_cast<std::uint16_t>(extent),
-                     .accepted = static_cast<std::uint16_t>(accepted_i),
-                     .ngram    = copy_row});
-                if (!copy_row && !(tree_round && extent == verify_drafts) &&
-                    extent <= request.speculative_stats.rounds_by_draft_length.size()) {
-                    request.speculative_stats.rounds_by_draft_length[extent - 1U] += 1;
-                }
+            // A neural chain row's verified length.
+            const bool copy_row = any_ngram && !matches[row].tokens.empty();
+            if (count_speculative_round(request.speculative_stats, extent, accepted_i, copy_row) && !copy_row &&
+                !(tree_round && extent == verify_drafts) &&
+                extent <= request.speculative_stats.rounds_by_draft_length.size()) {
+                request.speculative_stats.rounds_by_draft_length[extent - 1U] += 1;
             }
             if (block_round) {
                 dflash_width_policy->learn(
@@ -1604,52 +1597,20 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     std::span<const float>(probabilities[row].data(), neural_draft_window), extent,
                     static_cast<std::uint32_t>(accepted_i));
             }
-            if (any_ngram && !matches[row].tokens.empty()) {
-                request.speculative_stats.ngram_rounds += 1;
-                request.speculative_stats.ngram_drafted_tokens += extent;
-                request.speculative_stats.ngram_accepted_tokens += accepted_i;
-                if (matches[row].archived) {
-                    request.speculative_stats.ngram_archive_rounds += 1;
-                    request.speculative_stats.ngram_archive_drafted_tokens += extent;
-                    request.speculative_stats.ngram_archive_accepted_tokens += accepted_i;
-                }
-            }
+            count_ngram_round(request.speculative_stats, matches[row], extent, accepted_i);
             if (ngram_trees[row].tree()) {
                 record_ngram_tree_row(request, dflash_host_egress->accepted_branch[row], accepted_i,
                                       static_cast<std::uint32_t>(ngram_trees[row].row.main_depth),
                                       static_cast<std::uint32_t>(matches[row].tokens.size()));
             }
             if (tree_round && extent == verify_drafts) {
-                if (tree_controller) {
-                    tree_controller->observe_tree_row(
-                        std::span<const std::int32_t>(dflash_host_egress->accepted_path.data() +
-                                                          row * width,
-                                                      static_cast<std::size_t>(accepted_i) + 1U),
-                        width);
-                }
-                request.speculative_stats.tree_rounds += 1;
-                const std::int32_t branch = dflash_host_egress->accepted_branch[row];
-                if (branch > 0) {
-                    if (branch > accepted_i) {
-                        throw std::runtime_error("DFlash batch returned invalid row metadata");
-                    }
-                    request.speculative_stats.tree_side_rounds += 1;
-                    request.speculative_stats.tree_side_accepted_tokens +=
-                        static_cast<std::uint32_t>(accepted_i - branch + 1);
-                }
+                count_tree_row(request.speculative_stats, tree_controller,
+                               dflash_host_egress->accepted_path.data() + row * width,
+                               dflash_host_egress->accepted_branch[row], accepted_i, width,
+                               "DFlash batch returned invalid row metadata");
             }
             sequence.dflash_context_frontier = base_E;
-            request.pending                  = PendingCandidate{
-                                 .kind          = PendingKind::Speculative,
-                                 .base_E        = base_E,
-                                 .base_S        = base_S,
-                                 .prompt_tokens = 0,
-                                 .produced      = static_cast<std::uint32_t>(count_i),
-                                 .verify_drafts = verify_drafts,
-            };
-            request.lifecycle = Lifecycle::Pending;
-            request.timings.decode_seconds += seconds;
-            request.timings.decode_share_seconds += share;
+            pend_speculative_round(request, base_E, base_S, count_i, verify_drafts, seconds, share);
         }
         // A block round's time is the chain's only at the chain's width; a plain batch round's
         // never is (its chain is the batch length).
@@ -1666,15 +1627,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             .timing     = timing.finish(),
         };
     } catch (...) {
-        timing.begin_wait();
-        try {
-            nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
-                                         static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
-        } catch (...) {}
-        timing.end_wait();
-        if (offload) { offload->drop_round(); }
-        clear_execution_failure_lanes(lanes);
+        abandon_round(*this, timing, nvtx::Name::DecodeDFlashWait, lanes);
         throw;
     }
 }
