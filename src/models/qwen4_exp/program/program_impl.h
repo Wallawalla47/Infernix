@@ -2891,9 +2891,13 @@ public:
             return out;
         }
         // The Engine counts the prompt past the frontier it was told of: a lane resumed below it
-        // reports nothing until its walk passes it again.
-        out.processed_prompt_tokens = lane.state_tokens > lane.counted_tokens ? lane.state_tokens - lane.counted_tokens : 0U;
-        lane.counted_tokens         = std::max(lane.counted_tokens, lane.state_tokens);
+        // reports nothing until its walk passes it again. A replay's calls are all recomputation, which
+        // the Engine counts as replayed tokens, every call's (only its last call counted when they ran
+        // chunk-major: 317 of 1,341 tokens, FP8 Flash-Next, 2026-11-18).
+        if (!lane.replay) {
+            out.processed_prompt_tokens = lane.state_tokens > lane.counted_tokens ? lane.state_tokens - lane.counted_tokens : 0U;
+            lane.counted_tokens         = std::max(lane.counted_tokens, lane.state_tokens);
+        }
         if (last) {
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
