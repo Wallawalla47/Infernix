@@ -7,6 +7,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/digest.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/processor.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/media_cache.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/frontend/markdown_code_tracker.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_call_parser.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_contract.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_grammar.cpp"
