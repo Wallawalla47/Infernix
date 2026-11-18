@@ -2112,23 +2112,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
     if (!automatic_ttl) { return; }
     request.allow_engine_automatic_shared_prefixes = false;
 
-    std::optional<CacheBoundary>* automatic_target = nullptr;
-    for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
-        // Calls and loaded tool definitions render after the turn's content parts.
-        if (!turn->tool_calls.empty() || !turn->loaded_tools.empty()) {
-            automatic_target = &turn->cache_boundary_after;
-            break;
-        }
-        if (!turn->content.empty()) {
-            automatic_target = &turn->content.back().cache_boundary_after;
-            break;
-        }
-    }
-    if (automatic_target == nullptr) {
-        if (ToolDefinition* listed = request.last_listed_tool()) {
-            automatic_target = &listed->cache_boundary_after;
-        }
-    }
+    std::optional<CacheBoundary>* const automatic_target = request.automatic_cache_boundary_target();
     if (automatic_target == nullptr) { return; }
 
     if (*automatic_target) {

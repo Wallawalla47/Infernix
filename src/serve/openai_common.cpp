@@ -180,23 +180,7 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
         }
     }
 
-    std::optional<CacheBoundary>* automatic_target = nullptr;
-    for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
-        // Calls and loaded tool definitions render after the turn's content parts.
-        if (!turn->tool_calls.empty() || !turn->loaded_tools.empty()) {
-            automatic_target = &turn->cache_boundary_after;
-            break;
-        }
-        if (!turn->content.empty()) {
-            automatic_target = &turn->content.back().cache_boundary_after;
-            break;
-        }
-    }
-    if (automatic_target == nullptr) {
-        if (ToolDefinition* listed = request.last_listed_tool()) {
-            automatic_target = &listed->cache_boundary_after;
-        }
-    }
+    std::optional<CacheBoundary>* const automatic_target = request.automatic_cache_boundary_target();
 
     const bool automatic_enabled =
         policy.automatic != OpenAIPromptCacheAutomatic::Disabled && automatic_target != nullptr &&

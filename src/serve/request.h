@@ -339,6 +339,18 @@ struct GenerationRequest {
         }
         return nullptr;
     }
+
+    // Where a request-level (automatic) prompt-cache boundary goes, or nullptr: after the last turn that has tool
+    // calls or loaded tools, else after the last turn's last content part, else after the last listed tool.
+    [[nodiscard]] std::optional<CacheBoundary>* automatic_cache_boundary_target() noexcept {
+        for (auto turn = messages.rbegin(); turn != messages.rend(); ++turn) {
+            // Calls and loaded tool definitions render after the turn's content parts.
+            if (!turn->tool_calls.empty() || !turn->loaded_tools.empty()) { return &turn->cache_boundary_after; }
+            if (!turn->content.empty()) { return &turn->content.back().cache_boundary_after; }
+        }
+        if (ToolDefinition* listed = last_listed_tool()) { return &listed->cache_boundary_after; }
+        return nullptr;
+    }
 };
 
 } // namespace infernix::serve
