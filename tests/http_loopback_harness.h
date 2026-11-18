@@ -79,18 +79,22 @@ private:
 
 class LoopbackServer {
 public:
-    // `configure` sets the options a test needs beyond the loopback address (a server switch).
+    // `configure` sets the options a test needs beyond the loopback address (a server switch); `logger`
+    // receives the server's operational log (discarded when null).
     explicit LoopbackServer(GenerationBackend& backend,
                             std::chrono::seconds client_timeout = std::chrono::seconds(30),
-                            const std::function<void(ServeOptions&)>& configure = {}) {
+                            const std::function<void(ServeOptions&)>& configure = {},
+                            std::shared_ptr<spdlog::logger> logger = nullptr) {
         ServeOptions options;
         if (configure) { configure(options); }
         options.host                  = "127.0.0.1";
         options.port                  = free_loopback_port();
         options.log_stats_interval_ms = 0;
         options.log_stats_panel       = false;
-        auto logger                   = std::make_shared<spdlog::logger>(
-            "http-loopback", std::make_shared<spdlog::sinks::null_sink_mt>());
+        if (!logger) {
+            logger = std::make_shared<spdlog::logger>("http-loopback",
+                                                      std::make_shared<spdlog::sinks::null_sink_mt>());
+        }
         server_ = std::make_unique<HttpServer>(options, std::move(logger));
         if (options.port <= 0 || !server_->bind()) {
             throw std::runtime_error("the test server could not bind a loopback port");

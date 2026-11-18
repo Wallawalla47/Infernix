@@ -156,6 +156,12 @@ infernix_add_test(infernix_http_stream_refusals_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_refusals.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 
+# How the streaming routes end a stream that fails or is cut (an API error, an exception, a refused event, terminal
+# output contradicting the stream, a cancelled generation), over loopback HTTP against a scripted backend.
+infernix_add_test(infernix_http_stream_failures_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_failures.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
 # The server-side tool loops (Anthropic tool search, Responses hosted tool_search) over loopback HTTP against a
 # scripted backend: every way a loop ends, and one streamed answer per API.
 infernix_add_test(infernix_http_server_tool_rounds_test
