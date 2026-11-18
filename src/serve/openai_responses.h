@@ -36,6 +36,14 @@ struct OpenAIResponsesFunctionIdentity {
     bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
 };
 
+// A function's wire identity in a request's canonical item or a response Item: its client-side name, and its
+// namespace when it has one.
+template <class JsonObject>
+void add_wire_function_identity(JsonObject& object, const OpenAIResponsesFunctionIdentity& identity) {
+    object["name"] = identity.name;
+    if (identity.wire_namespace) { object["namespace"] = *identity.wire_namespace; }
+}
+
 // The Engine-side parameter that carries a custom tool's free-form input.
 inline constexpr const char* kCustomToolInputParameter = "input";
 // The Engine-side function name of the `tool_search` tool.

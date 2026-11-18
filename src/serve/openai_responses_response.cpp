@@ -69,8 +69,7 @@ void add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest
         object["name"] = engine_name;
         return;
     }
-    object["name"] = position->second.name;
-    if (position->second.wire_namespace) { object["namespace"] = *position->second.wire_namespace; }
+    serve::add_wire_function_identity(object, position->second);
 }
 
 bool is_custom_tool(const OpenAIResponsesCreateRequest& request, std::string_view engine_name) {

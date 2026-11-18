@@ -108,11 +108,6 @@ std::string lower_function_identity(
     return engine_name;
 }
 
-void add_wire_function_identity(Json& object, const OpenAIResponsesFunctionIdentity& identity) {
-    object["name"] = identity.name;
-    if (identity.wire_namespace) { object["namespace"] = *identity.wire_namespace; }
-}
-
 std::string item_id(const Json& item, const char* prefix) {
     if (!item.contains("id") || item.at("id").is_null()) {
         return new_openai_response_item_id(prefix);
@@ -121,6 +116,20 @@ std::string item_id(const Json& item, const char* prefix) {
         bad_request("input Item id must be a non-empty string", "input");
     }
     return item.at("id").get<std::string>();
+}
+
+// A media part's source: a data URI or an HTTP(S) URL; anything else is refused naming `field`.
+infernix::product::media_acquire::Source media_source(std::string value, const char* field) {
+    infernix::product::media_acquire::Source source;
+    source.value = std::move(value);
+    if (source.value.starts_with("data:")) {
+        source.kind = infernix::product::media_acquire::SourceKind::Data;
+    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
+        source.kind = infernix::product::media_acquire::SourceKind::Url;
+    } else {
+        bad_request(std::string(field) + " must use HTTP(S) or a data URI", "input");
+    }
+    return source;
 }
 
 infernix::product::media_acquire::Source parse_image_source(const Json& part) {
@@ -144,17 +153,7 @@ infernix::product::media_acquire::Source parse_image_source(const Json& part) {
                         "image_detail_not_supported");
         }
     }
-
-    infernix::product::media_acquire::Source source;
-    source.value = part.at("image_url").get<std::string>();
-    if (source.value.starts_with("data:")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Data;
-    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Url;
-    } else {
-        bad_request("input_image.image_url must use HTTP(S) or a data URI", "input");
-    }
-    return source;
+    return media_source(part.at("image_url").get<std::string>(), "input_image.image_url");
 }
 
 infernix::product::media_acquire::Source parse_video_source(const Json& part) {
@@ -162,16 +161,7 @@ infernix::product::media_acquire::Source parse_video_source(const Json& part) {
         part.at("video_url").get_ref<const std::string&>().empty()) {
         bad_request("input_video must contain a non-empty video_url", "input");
     }
-    infernix::product::media_acquire::Source source;
-    source.value = part.at("video_url").get<std::string>();
-    if (source.value.starts_with("data:")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Data;
-    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Url;
-    } else {
-        bad_request("input_video.video_url must use HTTP(S) or a data URI", "input");
-    }
-    return source;
+    return media_source(part.at("video_url").get<std::string>(), "input_video.video_url");
 }
 
 void apply_shared_breakpoint(ContentPart& part, const Json& wire, std::size_t& breakpoint_count) {
@@ -1558,7 +1548,6 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_text(body, out.prompt.generation);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
-    parse_openai_thinking_budget(body, out.prompt.generation);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
     return out;
 }
@@ -1677,6 +1666,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
     ParsedPromptFields parsed  = parse_prompt_fields(body, limits);
+    parse_openai_thinking_budget(body, parsed.prompt.generation);
     parsed.prompt.cache_policy = cache_policy;
     OpenAIResponsesCreateRequest out;
     out.prompt = std::move(parsed.prompt);
