@@ -347,8 +347,12 @@ public:
     // ForwardBatch::trim_last_layer's width for a call (or a layer walk's chunk) of `columns` columns: 0 when the last
     // layer runs whole (the lossless route, a DFlash2 target layer, the activation scan, or no column to save), else
     // the trailing columns its MoE runs over: kRouterMmaMinColumns where the full call's router takes its MMA form
-    // (router-mma), 1 otherwise. Every MoE step acts column by column and the router keeps its form, so the kept
-    // columns' outputs are the untrimmed call's bit for bit.
+    // (router-mma), else 17 past 16 columns where the last layer's dense shared expert is Q8 or GGUF (its wide routes
+    // from there), else 1; a dense shared expert of another format (BF16 and row-scaled FP8: width-dependent with no
+    // class to keep) runs whole.
+    // The routed experts act column by column, and the router and the shared expert keep the routes the full call
+    // gives them, so the kept columns' outputs are the untrimmed call's bit for bit (infernix_qwen4_exp_forward_real_test
+    // --trim-last-layer: 9 to 16,384 columns on the exact routes and router-mma, six artifacts, 2026-11-18).
     [[nodiscard]] std::int32_t last_layer_kept(std::int32_t columns) const noexcept;
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
     // A pair call (design §19.3.1, the zero-split tap): two consecutive chunks of one lane, `head` then

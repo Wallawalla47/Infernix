@@ -8,6 +8,7 @@
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --decode-widths [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --trim-last-layer [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --screened-heads [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
@@ -20,7 +21,8 @@
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
 // bit for bit (check_cpu_columns). With --decode-widths it checks that a decode row's bits do not
 // depend on how many rows share the call, 1 to 8, in every block and the logits
-// (check_decode_widths).
+// (check_decode_widths). With --trim-last-layer it checks that a prefill's trimmed last layer
+// (YC-01) gives the untrimmed call's logits bit for bit (check_trim_last_layer).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -195,7 +197,7 @@ private:
 // the layer's records read into a pinned buffer before the layer runs).
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
-            std::int32_t rows, KvCacheStorage storage)
+            std::int32_t rows, KvCacheStorage storage, q4::execution::ForwardFastPaths fast = {})
         : config(parameters.model.config().text) {
         const auto& c = config;
         LayoutBuilder builder;
@@ -312,8 +314,7 @@ struct Harness {
         kv_view       = kv;
         experts_view  = experts;
         forward = std::make_unique<q4::execution::Forward>(parameters, device, *work, std::move(state), std::move(kv),
-                                                           std::move(experts), context,
-                                                           q4::execution::ForwardFastPaths{});
+                                                           std::move(experts), context, fast);
     }
 
     // Another Forward over the same state, KV and workspace, with other expert sources.
@@ -560,6 +561,59 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     cudaStreamDestroy(overlap);
     std::printf(ok ? "CPU-served calls equal the GPU route bit for bit\n"
                    : "FAIL: CPU-served calls differ from the GPU route\n");
+    return ok;
+}
+
+// --trim-last-layer: YC-01's trim (ForwardBatch::trim_last_layer: a prefill's last layer runs its MoE over the
+// trailing columns alone, Forward::last_layer_kept) gives the logit column the untrimmed call's bits. Prefills of
+// 9 to 16,384 columns of the text (each on a fresh harness), trimmed and untrimmed, with router-mma off and on (on,
+// a call of 256 columns or more keeps 256), on the exact routes: the logits compared bit for bit.
+bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceContext& device,
+                           const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv) {
+    const auto& c     = parameters.model.config().text;
+    const auto n      = static_cast<std::int32_t>(tokens.size());
+    const auto vocab  = static_cast<std::int32_t>(c.vocab_size);
+    bool ok           = true;
+    int compared      = 0;
+    for (const bool router_mma : {false, true}) {
+        q4::execution::ForwardFastPaths fast{};
+        fast.router_mma = router_mma;
+        // Both sides of every width where a route of the last layer's MoE may change, to the default prefill chunk.
+        for (const std::int32_t width : {9, 16, 17, 18, 32, 33, 64, 65, 96, 97, 128, 129, 200, 255, 256, 257, 300, 512,
+                                         1000, 4096, 16384}) {
+            if (width > n) { continue; }
+            const std::int32_t context = std::max<std::int32_t>(256, (width + 63) / 64 * 64);
+            std::vector<float> rows[2];
+            std::int32_t kept = 0; // the trimmed call's (0: the last layer runs whole, so the check holds trivially)
+            for (const int trim : {0, 1}) {
+                Harness harness(parameters, device, context, width, 1, kv, fast);
+                if (trim == 1) { kept = harness.forward->last_layer_kept(width); }
+                auto call                  = make_call(c, volume, {tokens}, 0, width, {0}, {0});
+                call.batch.trim_last_layer = trim == 1;
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run(call.batch, out);
+                device.synchronize();
+                rows[trim] = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            std::int32_t differing = 0;
+            double largest         = 0.0;
+            for (std::int32_t v = 0; v < vocab; ++v) {
+                if (std::memcmp(&rows[0][v], &rows[1][v], sizeof(float)) != 0) {
+                    ++differing;
+                    largest = std::max(largest, std::fabs(static_cast<double>(rows[0][v]) - rows[1][v]));
+                }
+            }
+            std::printf("router-mma %s, %d columns (%d kept): trimmed logits %s (%d of %d differ, largest %.3g)\n",
+                        router_mma ? "on" : "off", width, kept, differing == 0 ? "equal" : "DIFFER", differing, vocab,
+                        largest);
+            ok = ok && differing == 0;
+            ++compared;
+        }
+    }
+    if (compared == 0) { throw std::invalid_argument("--trim-last-layer needs at least 9 tokens"); }
+    std::printf(ok ? "trimmed last layers give the untrimmed logits bit for bit\n"
+                   : "FAIL: a trimmed last layer changes the logits\n");
     return ok;
 }
 
@@ -834,6 +888,7 @@ int main(int argc, char** argv) {
         bool cpu_columns    = false;
         bool decode_widths  = false;
         bool screened_heads = false;
+        bool trim_last      = false;
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
@@ -869,6 +924,11 @@ int main(int argc, char** argv) {
             if (arg == "--decode-widths") {
                 if (jobs.empty()) { throw std::invalid_argument("--decode-widths needs a token list before it"); }
                 jobs.back().decode_widths = true;
+                continue;
+            }
+            if (arg == "--trim-last-layer") {
+                if (jobs.empty()) { throw std::invalid_argument("--trim-last-layer needs a token list before it"); }
+                jobs.back().trim_last = true;
                 continue;
             }
             if (arg == "--screened-heads") {
@@ -1024,6 +1084,10 @@ int main(int argc, char** argv) {
             return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
         if (job.decode_widths) { return check_decode_widths(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
+        if (job.trim_last) {
+            if (load.stream_experts) { throw std::invalid_argument("--trim-last-layer runs whole calls: not with --stream-experts"); }
+            return check_trim_last_layer(parameters, device, volume, tokens, job.kv) ? 0 : 1;
+        }
         if (job.screened_heads) { return check_screened_heads(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
         Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));

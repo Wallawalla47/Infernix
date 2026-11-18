@@ -50,6 +50,28 @@ std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
 // rescored exactly (Basalt's screened draft head: the exact head's pick in 99.93 % of 1,500 real inputs).
 constexpr ops::ScreenedHeadPolicy kScreenedHeadPolicy{.margin = 5.0F, .rescored = 64};
 
+// How a dense shared-expert projection's routes give a column its bits as the call's width changes
+// (Forward::last_layer_kept; infernix_qwen4_exp_forward_real_test --trim-last-layer, 9 to 16,384 columns, 2026-11-18):
+//   Invariant         the same at every width: MXFP8 (FP4-Local's shared experts), nvfp4_rg16_v1 (exact sums).
+//   NarrowThenWide    one column's to kSharedNarrowColumns columns, then the same wide route's at every wider width:
+//                     Q8 (NVIDIA Dense8, IQ3_S's down) and GGUF (IQ3_S's q4_k / q5_k gate and up; its routes follow
+//                     the call's K and width, not the quant type).
+//   Unmeasured        anything else, and these two, by width with no class to keep: BF16 (recipe A, the official FP8
+//                     artifact) changed a column's bits at 9 columns against one and at 129, 200 and 1,000 against 17;
+//                     row-scaled FP8 (recipe C) at 300 against one.
+enum class SharedWidthRoutes : std::uint8_t { Invariant, NarrowThenWide, Unmeasured };
+constexpr std::int32_t kSharedNarrowColumns = 16;
+
+SharedWidthRoutes shared_width_routes(const LinearParameters& p) noexcept {
+    if (p.is_ggml()) { return SharedWidthRoutes::NarrowThenWide; }
+    switch (p.weight.qtype) {
+    case QType::FP8_E4M3FN_G32_E8M0:
+    case QType::NVFP4_MUL: return SharedWidthRoutes::Invariant;
+    case QType::Q8_G32_FP16: return SharedWidthRoutes::NarrowThenWide;
+    default: return SharedWidthRoutes::Unmeasured;
+    }
+}
+
 ops::offloaded_moe::ExpertActivation expert_activation(const TextConfig& c) {
     return c.moe.a16_experts ? ops::offloaded_moe::ExpertActivation::kA16 : ops::offloaded_moe::ExpertActivation::kA4;
 }
@@ -797,7 +819,21 @@ std::int32_t Forward::last_layer_kept(std::int32_t columns) const noexcept {
     if (config_.lossless || scan_ != nullptr || std::find(draft_taps_.begin(), draft_taps_.end(), last) != draft_taps_.end()) {
         return 0;
     }
-    const std::int32_t kept = fast_.router_mma && columns >= kRouterMmaMinColumns ? kRouterMmaMinColumns : 1;
+    // The router keeps its form: its MMA form needs kRouterMmaMinColumns columns.
+    std::int32_t kept = fast_.router_mma && columns >= kRouterMmaMinColumns ? kRouterMmaMinColumns : 1;
+    // A dense shared expert (not the routed bank's last job) takes its projections' routes by the call's width
+    // (shared_width_routes). Keeping one column moved the first token's logits by up to 0.023 on NVIDIA Dense8 and
+    // IQ3_S and 0.038 on recipe A at 17 to 1,000 columns until 2026-11-18; the kept columns now take the full call's
+    // routes, or nothing trims.
+    if (const MoeParameters& moe = parameters_.layers[last].moe; moe.shared_bank == nullptr) {
+        const SharedWidthRoutes gate_up = shared_width_routes(moe.shared_gate_up);
+        const SharedWidthRoutes down    = shared_width_routes(moe.shared_down);
+        if (gate_up == SharedWidthRoutes::Unmeasured || down == SharedWidthRoutes::Unmeasured) { return 0; }
+        if ((gate_up == SharedWidthRoutes::NarrowThenWide || down == SharedWidthRoutes::NarrowThenWide) &&
+            columns > kSharedNarrowColumns) {
+            kept = std::max(kept, kSharedNarrowColumns + 1);
+        }
+    }
     return kept < columns ? kept : 0;
 }
 
