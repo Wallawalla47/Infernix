@@ -295,7 +295,13 @@ std::size_t Forward::memoized(int kind, std::int32_t a, std::int32_t b, std::int
     const auto key = std::make_tuple(kind, a, b, c);
     if (const auto it = plans_.find(key); it != plans_.end()) { return it->second; }
     if (config_.lossless) { throw std::logic_error("Qwen4Exp forward: the lossless route keeps its workspace formula"); }
-    eager_chunk_ = true; // prefill steps (dense_routes adds the prefill routes)
+    // The plan places prefill steps (dense_routes adds the prefill routes); the forward's own flag comes back after it,
+    // whatever the plan throws.
+    struct EagerScope {
+        bool& flag;
+        bool saved;
+        ~EagerScope() { flag = saved; }
+    } eager{eager_chunk_, std::exchange(eager_chunk_, true)};
     WorkspaceLayoutBuilder layout;
     plan(layout);
     return plans_[key] = layout.peak_bytes();
@@ -407,6 +413,11 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 }
 
 void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
+    eager_chunk_ = check_call(batch, logits);
+    work_.reset();
+}
+
+bool Forward::check_call(const ForwardBatch& batch, const Tensor* logits) const {
     const std::int32_t T = batch.ids.ne[0];
     if (batch.verify != nullptr && (batch.width < 2 || batch.verify->gdn.spec.width != batch.width ||
                                     batch.verify->gdn.spec.record_capacity < batch.batch)) {
@@ -430,8 +441,7 @@ void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
     // streamed call is a prefill chunk at any width: a layer walk's one-token chunk run as a decode call
     // took its experts beside the span's stream ring and read 2.6-12 nats off its cold prefill
     // (candidates SA-12; the walk keeps a one-token last call on its own for coalescing).
-    eager_chunk_ = batch.verify == nullptr && (batch.width > 1 || batch.stream);
-    work_.reset();
+    return batch.verify == nullptr && (batch.width > 1 || batch.stream);
 }
 
 void Forward::wait_layer(const ForwardBatch& batch, std::size_t entry) {
@@ -480,14 +490,14 @@ void Forward::run_split(const ForwardBatch& head, const ForwardBatch& tail, Tens
             throw std::invalid_argument("Qwen4Exp forward: a pair call takes two plain one-row prefill chunks");
         }
     }
-    // Each chunk's steps run as its own call's: eager or not by its own width (begin_call).
-    begin_call(head, nullptr);
-    const bool head_eager = eager_chunk_;
-    begin_call(tail, &logits);
-    const bool tail_eager = eager_chunk_;
+    // Each chunk's steps run as its own call's would: eager or not by its own width (check_call).
+    const bool head_eager = check_call(head, nullptr);
+    const bool tail_eager = check_call(tail, &logits);
     if (!head_eager || !tail_eager) {
         throw std::invalid_argument("Qwen4Exp forward: a pair call's chunks are prefill chunks of two or more columns");
     }
+    eager_chunk_ = true;
+    work_.reset();
     run_split_impl(work_, &head, &tail, call_shape(head), call_shape(tail), logits, draft_features, &at_split);
 }
 
@@ -961,13 +971,14 @@ Tensor Forward::ple_embedding_impl(A& a, const PleParameters& p, const ForwardBa
         if constexpr (kRuns<A>) {
             // BF16 rows are the embedding itself: rows [W, heads] of a column are e[h * W + j] (ple_embed's
             // order), so the rows are read in place.
+            // Checked before the gated upload is enqueued: a refused call leaves nothing on the stream.
+            if (batch->ngram_rows.ne[0] != 2 * dim(config_.ple.head_width())) {
+                throw std::invalid_argument("Qwen4Exp forward: BF16 n-gram rows must be 2 x head width bytes");
+            }
             if (const NgramRowGate* gate = batch->ngram_gate) {
                 const DeviceFault fault{.word = experts_.error, .value = config_.ple.layer << 16U | kErrorRowGateTimeout};
                 upload_pinned_when(batch->ngram_rows.data, gate->pinned_rows, batch->ngram_rows.bytes(), gate->ready,
                                    gate->expected, gate->wait_stats, gate->wait_row, fault, device_.stream);
-            }
-            if (batch->ngram_rows.ne[0] != 2 * dim(config_.ple.head_width())) {
-                throw std::invalid_argument("Qwen4Exp forward: BF16 n-gram rows must be 2 x head width bytes");
             }
             return Tensor(batch->ngram_rows.data, DType::BF16, {dim(config_.ple.embed_dim), T});
         } else {
@@ -1959,7 +1970,8 @@ void Forward::run_mtp(const MtpCall& call) {
         throw std::logic_error("Qwen4Exp forward: the MTP drafter is not loaded");
     }
     if (call.batch <= 0 || call.width <= 0 || call.ids.numel() != call.batch * call.width ||
-        call.residuals.ne[1] != call.batch * call.width || (!call.kv_only && call.width != 1) ||
+        call.residuals.ne[0] != dim(config_.residual_width()) || call.residuals.ne[1] != call.batch * call.width ||
+        (!call.kv_only && call.width != 1) ||
         call.rope_positions.ne[0] != call.batch * call.width || call.rope_positions.ne[1] != 3 ||
         call.block_start_rope.ne[0] != call.batch || call.block_start_rope.ne[1] != 3) {
         throw std::invalid_argument("Qwen4Exp forward: MTP call geometry is invalid");

@@ -337,6 +337,9 @@ public:
     // LM head. Outputs are run()'s bit for bit: every step's kernels, inputs and order within the
     // chunk are the same.
     void begin_call(const ForwardBatch& batch, const Tensor* logits);
+    // Throws unless `batch` (with `logits`, when set) is a valid call; whether its steps run eagerly (a prefill
+    // chunk or forced tokens) rather than as a capturable decode or verification round.
+    [[nodiscard]] bool check_call(const ForwardBatch& batch, const Tensor* logits) const;
     void embed(const ForwardBatch& batch, Tensor& residual);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
     // layer() in two halves, for a walk whose MoE runs once over several chunks' columns (the router, routed
