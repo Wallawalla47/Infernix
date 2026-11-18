@@ -285,7 +285,7 @@ Json list_folder(const std::string& path_text) {
         }
         dirs.emplace_back(name, entry.path());
     }
-    if (error) { out["error"] = error.message(); }
+    if (error) { out["error"] = error_text(error); }
     std::sort(dirs.begin(), dirs.end(), [](const auto& a, const auto& b) { return lower(a.first) < lower(b.first); });
     for (const auto& [name, dir] : dirs) { entries.push_back({{"name", name}, {"path", path_utf8(dir)}, {"kind", "dir"}}); }
     out["entries"] = entries;
@@ -3190,7 +3190,7 @@ void Launcher::register_management_routes() {
             if (std::filesystem::remove(file, error)) {
                 freed += size;
             } else {
-                failed.push_back(path_utf8(file) + (error ? " (" + error.message() + ")" : ""));
+                failed.push_back(path_utf8(file) + (error ? " (" + error_text(error) + ")" : ""));
             }
         }
         event(failed.empty() ? "info" : "warn", "settings",
@@ -3383,7 +3383,7 @@ void Launcher::register_management_routes() {
                      if (path.empty()) { throw std::invalid_argument("no folder given"); }
                      std::error_code error;
                      std::filesystem::create_directories(utf8_path(path), error);
-                     if (error) { throw std::invalid_argument("cannot create " + path + ": " + error.message()); }
+                     if (error) { throw std::invalid_argument("cannot create " + path + ": " + error_text(error)); }
                      send_json(s, list_folder(path));
                  }));
 

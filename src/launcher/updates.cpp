@@ -459,7 +459,7 @@ void InfernixUpdate::download_now() {
     }
     if (failure.empty()) {
         std::filesystem::rename(part, zip, ignored);
-        if (ignored) { failure = "cannot rename " + path_utf8(part) + ": " + ignored.message(); }
+        if (ignored) { failure = "cannot rename " + path_utf8(part) + ": " + error_text(ignored); }
     } else {
         std::filesystem::remove(part, ignored);
     }

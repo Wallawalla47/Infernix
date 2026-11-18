@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace infernix::launcher {
@@ -25,6 +26,10 @@ using Json = nlohmann::json;
 // A path that stays inside the folder it is joined to: relative, no drive, no ".." part (a file a repository listing
 // or an artifact header names).
 [[nodiscard]] bool safe_relative(std::string_view path);
+
+// An OS error's message as UTF-8: std::error_code::message() gives a Windows system error in the system code page,
+// which JSON and the event log cannot carry.
+[[nodiscard]] std::string error_text(const std::error_code& error);
 
 [[nodiscard]] std::string lower(std::string_view text);
 [[nodiscard]] bool iequals(std::string_view a, std::string_view b);

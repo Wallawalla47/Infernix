@@ -1068,6 +1068,25 @@ void test_router_cancel() {
     check(!router.load_cancelled(), "a forced load of the loaded model cancels nothing");
 }
 
+// A download error in the system's code page (audit 2026-11-18 F-6: std::error_code::message() on a non-English
+// Windows) is not valid UTF-8; the job holding it must not stop every later save of the memory file.
+void test_store_invalid_utf8() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-utf8";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    {
+        Store store(dir);
+        store.set_downloads(Json::array({{{"id", "job"}, {"state", "failed"},
+                                          {"error", std::string("cannot rename x: Zugriff verweigert \xE4")}}}));
+        store.set_last_model(std::string("after"));
+        check(!store.take_save_failure().has_value(), "a download error that is not UTF-8 failed the save");
+    }
+    Store store(dir);
+    check(store.last_model() == std::optional<std::string>("after"),
+          "a change saved after a download error that is not UTF-8 was lost");
+    std::filesystem::remove_all(dir, ignored);
+}
+
 // The memory file survives a torn write (audit 2026-11-17 LN-01): each save keeps the previous file as its backup,
 // and a memory file that is not valid JSON (a power loss after the rename, before the data reached the disk) or is
 // missing (a crash between the backup's rename and the new file's) loads the backup instead of defaults. The
@@ -1271,6 +1290,7 @@ int main(int argc, char** argv) {
     test_blob_ids();
     test_chats();
     test_store_durability();
+    test_store_invalid_utf8();
     test_records();
     test_help();
     test_help_cache();

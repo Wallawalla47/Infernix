@@ -496,7 +496,7 @@ void Downloads::run_job(DownloadJob& job) {
     std::error_code error;
     std::filesystem::create_directories(job.target_dir, error);
     if (error) {
-        fail(nullptr, "cannot create " + path_utf8(job.target_dir) + ": " + error.message());
+        fail(nullptr, "cannot create " + path_utf8(job.target_dir) + ": " + error_text(error));
         return;
     }
     for (const auto& file_ptr : job.files) {
@@ -567,7 +567,7 @@ void Downloads::run_job(DownloadJob& job) {
         }
         std::filesystem::rename(part, final_path, error);
         if (error) {
-            fail(&file, "cannot rename " + path_utf8(part) + ": " + error.message());
+            fail(&file, "cannot rename " + path_utf8(part) + ": " + error_text(error));
             return;
         }
         std::filesystem::path meta = part;

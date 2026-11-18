@@ -468,14 +468,14 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             dir.total_bytes = space.capacity;
         }
         if (!dir.exists) {
-            dir.error = error ? error.message() : "folder not found";
+            dir.error = error ? error_text(error) : "folder not found";
             scan.dirs.push_back(std::move(dir));
             continue;
         }
         const auto options = std::filesystem::directory_options::skip_permission_denied;
         std::filesystem::recursive_directory_iterator it(root, options, error);
         if (error) {
-            dir.error = error.message();
+            dir.error = error_text(error);
             scan.dirs.push_back(std::move(dir));
             continue;
         }
@@ -565,7 +565,7 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
                 }
             }
         }
-        if (error) { dir.error = "scanned only in part: " + error.message(); }
+        if (error) { dir.error = "scanned only in part: " + error_text(error); }
         scan.dirs.push_back(std::move(dir));
     }
     // Forget files no longer present.

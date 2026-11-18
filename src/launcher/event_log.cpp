@@ -88,7 +88,7 @@ bool EventLog::set_dir(const std::filesystem::path& dir, std::string& error) {
     std::error_code code;
     std::filesystem::create_directories(file_dir_, code);
     if (code || !std::filesystem::is_directory(file_dir_, code)) {
-        error          = "cannot create " + path_utf8(file_dir_) + (code ? ": " + code.message() : std::string());
+        error          = "cannot create " + path_utf8(file_dir_) + (code ? ": " + error_text(code) : std::string());
         events_.failed = requests_.failed = true;
         return false;
     }

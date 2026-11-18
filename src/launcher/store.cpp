@@ -485,7 +485,9 @@ void Store::save(std::unique_lock<std::mutex>& lock) const {
     };
     std::string text;
     try {
-        text = memory.dump(2) + "\n";
+        // A string that is not UTF-8 (an OS error message in the system code page) is written with U+FFFD
+        // rather than failing every later save.
+        text = memory.dump(2, ' ', false, Json::error_handler_t::replace) + "\n";
     } catch (const std::exception& error) {
         failed(error);
         lock.unlock();

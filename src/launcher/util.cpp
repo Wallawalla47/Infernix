@@ -70,6 +70,22 @@ std::string path_utf8(const std::filesystem::path& path) {
     return {reinterpret_cast<const char*>(text.data()), text.size()};
 }
 
+std::string error_text(const std::error_code& error) {
+#ifdef _WIN32
+    if (error.category() == std::system_category()) {
+        wchar_t* buffer    = nullptr;
+        const DWORD length = FormatMessageW(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+            static_cast<DWORD>(error.value()), 0, reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+        std::string text;
+        if (length != 0 && buffer != nullptr) { text = trim(path_utf8(std::filesystem::path(std::wstring(buffer, length)))); }
+        if (buffer != nullptr) { LocalFree(buffer); }
+        if (!text.empty()) { return text; }
+    }
+#endif
+    return error.message();
+}
+
 std::filesystem::path utf8_path(std::string_view text) {
     return std::filesystem::path(
         std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
@@ -232,7 +248,7 @@ bool rename_durable(const std::filesystem::path& from, const std::filesystem::pa
 #ifdef _WIN32
     if (posix_rename(from, to)) { return true; }
     if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
-        error = std::system_category().message(static_cast<int>(GetLastError()));
+        error = error_text(std::error_code(static_cast<int>(GetLastError()), std::system_category()));
         return false;
     }
 #else
