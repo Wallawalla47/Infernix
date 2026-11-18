@@ -459,6 +459,12 @@ def test_engine_log_parser_reads_the_expert_cache_lines(tmp_path):
     log.write_text('CPU expert team: 6 workers; decode misses kept on the link: 85/256 (INFERNIX_TMP_LINK_SHARE; '
                    'the divisor rule\'s 1/3)\n')
     assert (ei.read_engine_log(log).link_share, ei.read_engine_log(log).link_divisor) == (85, 0)
+    # Flash-Next's NVFP4 W4A16 banks log their default share form, the Qwen3.5-122B-A10B's split its C t.
+    log.write_text('decode misses kept on the link: 59/256 (the share form; the divisor rule\'s 1/3), 51/256 from 8 '
+                   'columns\n')
+    assert (ei.read_engine_log(log).link_share, ei.read_engine_log(log).link_divisor) == (59, 0)
+    log.write_text('CPU expert team: 6 workers; decode misses kept on the link: 72/256 (C t 1.84)\n')
+    assert (ei.read_engine_log(log).link_share, ei.read_engine_log(log).link_divisor) == (72, 0)
 
 
 def test_validate_compares_the_engine_arm_with_the_engine_log(tmp_path, capsys):

@@ -142,8 +142,11 @@ def read_pools(path, layers):
 # Program::report_cache and ExpertOffload::request_report, one per finished request (Debug).
 CACHE_LINE = re.compile(r'expert cache: (\d+) frames; request ([0-9.]+)% of (\d+) routed experts hit, (\d+) promotions, '
                         r'(\d+) landed, (\d+) misses CPU-served; since start ([0-9.]+)%')
-# The CPU team's rates line: decode misses kept on the link, M / d or (M x share) >> 8.
-LINK_LINE = re.compile(r'decode misses kept on the link: (?:(\d+)/256 \(INFERNIX_TMP_LINK_SHARE|1/(\d+))')
+# The CPU team's rates line: decode misses kept on the link, M / d or (M x share) >> 8 (INFERNIX_TMP_LINK_SHARE's,
+# Flash-Next's share form for NVFP4 W4A16 banks, or the Qwen3.5-122B-A10B's split from C t). Only the one-column
+# split: a wide share ("51/256 from 8 columns") is not read.
+LINK_LINE = re.compile(
+    r'decode misses kept on the link: (?:(\d+)/256 \((?:INFERNIX_TMP_LINK_SHARE|the share form|C t )|1/(\d+))')
 # The warm start (warm_start_frames): a saved state, the calibrated order, or none.
 SEED_LINES = ((re.compile(r'expert cache: restored the (\d+) most-used experts'), 'saved'),
               (re.compile(r'expert cache: no saved state yet, so it starts with the (\d+) highest-ranked'), 'calibrated'),
