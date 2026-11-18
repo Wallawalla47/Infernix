@@ -25,6 +25,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/cpu_rates.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/constraint.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/score.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/elastic_kv.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_window.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/call_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/state_image.cpp"
