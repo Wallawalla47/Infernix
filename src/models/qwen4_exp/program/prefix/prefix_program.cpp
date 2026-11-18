@@ -29,7 +29,18 @@ std::atomic<std::uint64_t> held_finish_count{0};
 std::atomic<bool> wide_recording{false};
 std::mutex wide_mutex;
 std::vector<WideScope> recorded_wide_scopes;
+std::atomic<std::int32_t> noted_staging_slots{0};
+std::atomic<bool> noted_full_tier{false};
 } // namespace
+
+void note_staging(std::int32_t slots, bool full_tier) noexcept {
+    noted_full_tier.store(full_tier);
+    noted_staging_slots.store(slots);
+}
+
+std::int32_t staging_slots() noexcept { return noted_staging_slots.load(); }
+
+bool staging_full_tier() noexcept { return noted_full_tier.load(); }
 
 void record_wide_scopes(bool enabled) {
     const std::lock_guard lock(wide_mutex);

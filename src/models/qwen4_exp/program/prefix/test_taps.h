@@ -73,4 +73,12 @@ void record_wide_scopes(bool enabled);
 [[nodiscard]] std::vector<WideScope> wide_scopes();
 void note_wide_scope(const WideScope& scope);
 
+// The staging slots of the last Program started, and whether its experts are all in RAM or VRAM (no record read from
+// the artifact on use: every expert in RAM, or the exclusive layout's tier). A start short of RAM reads the rest from
+// the artifact and keeps 64 slots by design (infernix_qwen4_exp_fork_route_real_test skips such a start). note_staging
+// is the Program's (a test may clear it with 0 slots). For tests only.
+void note_staging(std::int32_t slots, bool full_tier) noexcept;
+[[nodiscard]] std::int32_t staging_slots() noexcept;
+[[nodiscard]] bool staging_full_tier() noexcept;
+
 } // namespace infernix::models::qwen4_exp::testing

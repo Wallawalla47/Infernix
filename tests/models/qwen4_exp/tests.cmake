@@ -218,6 +218,14 @@ infernix_add_test(infernix_qwen4_exp_startup_capture_real_test
   ARGS plain mtp dflash2)
 set_tests_properties(infernix_qwen4_exp_startup_capture_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The decode and verification expert calls' fork route at every width up to eight columns, MTP and DFlash2
+# (INFERNIX_QWEN4_DFLASH2): no call offered it may lose it to the staging slots (NVFP4-QAD's shared job, design §6.1.3).
+infernix_add_test(infernix_qwen4_exp_fork_route_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fork_route_real.cpp"
+  LIBRARIES infernix_engine infernix_ops
+  ARGS mtp dflash2)
+set_tests_properties(infernix_qwen4_exp_fork_route_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # A long prompt's layer walk while another lane decodes, with SSD-only experts (issue #5): both
 # requests complete with their solo ids and no call reports a silent host.
 infernix_add_test(infernix_qwen4_exp_walk_interleave_real_test

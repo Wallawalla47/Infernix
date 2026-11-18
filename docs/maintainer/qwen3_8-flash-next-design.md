@@ -898,9 +898,13 @@ layer's routed jobs had to take it (2026-11-17, found by the first measurements)
 - Qwen4Exp's staging held `top_k x max_width` (80) records and the fork route needs every job within the slots, so
   every eight-column verification call lost the fork (and its landings): MTP decode after a 4K prompt was 14-16 %
   behind FP4-Local in every mode until a shared bank's staging took one slot more (+16-19 %, level with FP4-Local).
-  The fork takes calls of at most eight columns, so it needs at most 81 slots and the 512-slot cap never binds. No
-  test guards the slot: a forked call is not observable apart from speed (the landed count stays above zero when
-  only the eight-column calls lose the fork), so the bench's MTP decode is its check;
+  The fork takes calls of at most eight columns, so it needs at most 81 slots and the 512-slot cap never binds. Its
+  outputs are the same either way, so `ops::moe_experts` counts the calls offered the fork (a fork stream, staging,
+  at most eight columns) per width that took it and that lost it (`ops::testing::moe_forked_calls` /
+  `moe_lost_forks`), and `infernix_qwen4_exp_fork_route_real_test` requires none lost and an eight-column call forked
+  with seven MTP or DFlash2 drafts on the default layout; it fails with `INFERNIX_TMP_STAGING_SLOTS=80` on NVFP4-QAD
+  (the eight-column calls lose the fork, 2026-11-18). A start short of RAM reads part of the experts from the artifact
+  and keeps 64 slots by design (its seven- and eight-column calls lose the fork); the test skips such a start;
 - the wide route's WarpTile64 rule reads the mean columns per job, which the shared job's T columns raised (the rule
   then switched at about 23,900 instead of 26,200 columns a call; the bits are the same either way); it reads the
   routed jobs' mean now.

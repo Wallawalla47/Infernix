@@ -1622,6 +1622,8 @@ public:
         // A GGUF import's records are computed by the ggml CPU route (ops/offloaded_sparse_moe/cpu/ggml_expert.h).
         // What the offload switches resolved to (their values are in the startup log's temporary switches line).
         {
+            // Every expert in RAM (no SSD tier) or the exclusive layout's tier: the staging rule's own case (plan).
+            testing::note_staging(plan_.staging_slots, options_.expert_ram_bytes == 0 || options_.expert_ram_exclusive);
             std::string line = "expert offload (temporary switches resolved): staging slots " +
                                std::to_string(plan_.staging_slots);
             if (one_column_divisor() != 0) {

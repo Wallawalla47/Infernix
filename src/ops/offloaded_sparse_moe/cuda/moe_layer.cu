@@ -38,6 +38,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -179,6 +180,9 @@ bool forked(const MoeExpertSource& source, std::int32_t max_jobs, std::int32_t c
     return source.fork_stream != nullptr && source.staging_slots > 0 &&
            max_jobs <= std::min(source.staging_slots, 512) && columns <= moe::kMaxColumns;
 }
+
+// testing::moe_forked_calls and moe_lost_forks, by column count.
+std::atomic<std::uint64_t> g_forked_calls[moe::kMaxColumns + 1] = {}, g_lost_forks[moe::kMaxColumns + 1] = {};
 
 // Which jobs a pass launch computes: all of them, only those resident in frames (their record is
 // resolved directly, so they need not wait for the stage kernel), or only the others.
@@ -3349,7 +3353,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
-    if (forked(source, max_jobs, x.ne[1])) {
+    const bool fork = forked(source, max_jobs, x.ne[1]);
+    if (source.fork_stream != nullptr && source.staging_slots > 0 && x.ne[1] <= moe::kMaxColumns) {
+        (fork ? g_forked_calls : g_lost_forks)[x.ne[1]].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (fork) {
         // One pass: the misses are staged and then computed on the fork stream while this stream
         // computes the resident experts; both write disjoint outputs and h blocks, and every
         // expert's arithmetic is the same as in a serial pass.
@@ -3420,6 +3428,15 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
 }
+
+namespace testing {
+std::uint64_t moe_forked_calls(std::int32_t columns) noexcept {
+    return columns >= 1 && columns <= moe::kMaxColumns ? g_forked_calls[columns].load(std::memory_order_relaxed) : 0;
+}
+std::uint64_t moe_lost_forks(std::int32_t columns) noexcept {
+    return columns >= 1 && columns <= moe::kMaxColumns ? g_lost_forks[columns].load(std::memory_order_relaxed) : 0;
+}
+} // namespace testing
 
 namespace offloaded_moe::wide {
 

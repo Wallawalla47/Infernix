@@ -389,6 +389,15 @@ reproducible route the ids must be equal; on both routes no graph may be capture
 prints each Engine's construction time and free VRAM. It reads `INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM`,
 `INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it) and `INFERNIX_QWEN4_KV`.
 
+`infernix_qwen4_exp_fork_route_real_test` (arguments `mtp dflash2`) starts an Engine per drafter with seven drafts and
+two lanes on the default expert layout and runs a code prompt alone and two together: at every width every decode or
+verification expert call of at most eight columns that has the fork route's side stream must take it (its jobs within
+the staging slots), and an eight-column call must have. It prints the counts per width. The rule needs every routed
+expert in RAM or VRAM: a drafter whose start was short of RAM (the rest read from the artifact, 64 staging slots by
+design) is skipped and reported, so give it the RAM of an exclusive-layout start (about 60 GiB free). It reads
+`INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM` and `INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it); run it on
+a shared-bank artifact (NVFP4-QAD) and a dense-shared one.
+
 The entries above compare requests inside one Engine. `tools/reproducible_digest.py` compares two processes: it
 starts `infernix-serve --reproducible` twice with launch arguments of your choice (`--a`, `--b`: fewer expert frames
 through `--vram-headroom-mib`, another `--ram-free-mib`, `--max-concurrency`), sends process B other requests first

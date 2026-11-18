@@ -448,4 +448,13 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
                         const Tensor& inject, Tensor& residual, cudaStream_t stream);
 
+namespace testing {
+/// Process-wide counts of moe_experts calls of `columns` columns (1..8; 0 outside) offered the fork route (a fork
+/// stream and staging slots, off the lossless route), counted when enqueued or captured into a graph: those that took
+/// it, and those that lost it because their jobs did not fit the staging slots. Engine-level tests of a Program's
+/// staging rule.
+[[nodiscard]] std::uint64_t moe_forked_calls(std::int32_t columns) noexcept;
+[[nodiscard]] std::uint64_t moe_lost_forks(std::int32_t columns) noexcept;
+} // namespace testing
+
 } // namespace infernix::ops
