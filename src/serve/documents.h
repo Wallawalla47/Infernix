@@ -76,6 +76,12 @@ public:
                                                    std::span<const media::pdf::RenderRequest> pages,
                                                    const std::function<void()>& checkpoint = {});
 
+    // The bytes the cache counts against its capacity (the PDFs and their text and images).
+    [[nodiscard]] std::size_t retained_bytes() {
+        const std::lock_guard lock(mutex_);
+        return bytes_;
+    }
+
 private:
     struct Entry {
         std::uint64_t hash = 0;

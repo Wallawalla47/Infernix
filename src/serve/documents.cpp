@@ -256,22 +256,32 @@ std::vector<PdfPageImage> PdfCache::images(std::span<const std::uint8_t> bytes,
     }
     if (missing.empty()) { return out; }
     std::vector<media::pdf::RenderedPage> rendered = media::pdf::render(bytes, missing, checkpoint);
-    std::size_t added = 0;
     for (std::size_t index = 0; index < rendered.size(); ++index) {
         media::pdf::RenderedPage& page = rendered[index];
-        auto image = std::make_shared<const std::vector<std::uint8_t>>(
+        out[missing_positions[index]]  = std::make_shared<const std::vector<std::uint8_t>>(
             media::decode::encode_raw_rgb(page.width, page.height, page.rgb));
-        added += image->size();
-        out[missing_positions[index]] = std::move(image);
     }
     const std::lock_guard lock(mutex_);
     Entry* entry = find(hash, bytes);
-    if (entry == nullptr || entry->cost + added > capacity_bytes_ / 2U) { return out; }
+    if (entry == nullptr) { return out; }
+    // A concurrent request may have cached some of the same (page, size) renders meanwhile: only the others are
+    // added, and only their bytes are counted (audit 2026-11-18 F-16: duplicates inflated the cost and the cache
+    // evicted early).
+    std::size_t kept = 0;
+    std::vector<std::size_t> fresh;
+    fresh.reserve(missing.size());
     for (std::size_t index = 0; index < missing.size(); ++index) {
-        entry->images.emplace_back(missing[index], out[missing_positions[index]]);
+        const bool cached = std::any_of(entry->images.begin(), entry->images.end(), [&](const auto& image) {
+            return same_request(image.first, missing[index]);
+        });
+        if (cached) { continue; }
+        fresh.push_back(index);
+        kept += out[missing_positions[index]]->size();
     }
-    entry->cost += added;
-    bytes_ += added;
+    if (fresh.empty() || entry->cost + kept > capacity_bytes_ / 2U) { return out; }
+    for (const std::size_t index : fresh) { entry->images.emplace_back(missing[index], out[missing_positions[index]]); }
+    entry->cost += kept;
+    bytes_ += kept;
     trim();
     return out;
 }

@@ -12,6 +12,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <iostream>
@@ -528,6 +531,37 @@ std::vector<const ContentPart*> images_of(const GenerationRequest& request) {
     return images;
 }
 
+// Two requests rendering the same page at once (audit 2026-11-18 F-16): the page is cached and counted once, whichever
+// stores it first (the second appended a duplicate and counted its bytes again, so the cache evicted early). Each
+// render waits in its first checkpoint until both have missed the cache.
+int test_pdf_cache_concurrent_render() {
+    if (!infernix::media::pdf::available()) { return 0; }
+    infernix::serve::PdfCache cache(64ULL << 20);
+    const std::vector<std::uint8_t> pdf = make_pdf({"One page."});
+    (void)cache.text(pdf);
+    const std::size_t text_bytes = cache.retained_bytes();
+    const std::vector<infernix::media::pdf::RenderRequest> page{{.number = 1, .size = {.width = 64, .height = 64}}};
+    std::atomic<int> arrived{0};
+    const std::function<void()> checkpoint = [&] {
+        thread_local bool counted = false;
+        if (counted) { return; }
+        counted = true;
+        ++arrived;
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (arrived.load() < 2 && std::chrono::steady_clock::now() < limit) { std::this_thread::yield(); }
+    };
+    std::array<std::vector<infernix::serve::PdfPageImage>, 2> images;
+    std::thread first([&] { images[0] = cache.images(pdf, page, checkpoint); });
+    std::thread second([&] { images[1] = cache.images(pdf, page, checkpoint); });
+    first.join();
+    second.join();
+    const std::size_t image_bytes = images[0].empty() || !images[0][0] ? 0 : images[0][0]->size();
+    return check(arrived.load() == 2 && image_bytes != 0 && cache.retained_bytes() == text_bytes + image_bytes,
+                 "a page two requests rendered at once was cached twice (retained " +
+                     std::to_string(cache.retained_bytes() - text_bytes) + " bytes for a " +
+                     std::to_string(image_bytes) + "-byte image)");
+}
+
 int test_pdf() {
     if (!infernix::media::pdf::available()) {
         std::cout << "SKIP: built without PDFium\n";
@@ -722,6 +756,7 @@ int main() {
     failures += test_response_blocks();
     failures += test_history_identity();
     failures += test_pdf();
+    failures += test_pdf_cache_concurrent_render();
     if (failures != 0) {
         std::cerr << failures << " citation check(s) failed\n";
         return 1;
