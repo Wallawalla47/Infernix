@@ -113,10 +113,14 @@ Json tool_call_item(const OpenAIResponsesCreateRequest& request, const infernix:
     return item;
 }
 
+// A call's kind by its name, the rule the stream decides by when the call opens (streamed_kind), so a hosted search
+// the turn did not run (a cancelled stream, audit 2026-11-18 F-21) keeps the kind it streamed as.
 CallKind call_kind(const OpenAIResponsesCreateRequest& request, const OpenAIResponsesRound& round,
                    std::size_t index) {
-    if (hosted_search(round, index) != nullptr) { return CallKind::HostedSearch; }
     const std::string& name = round.outcome->tool_calls[index].name;
+    if (request.prompt.tool_search && request.prompt.tool_search->server && name == kToolSearchFunctionName) {
+        return CallKind::HostedSearch;
+    }
     const auto position     = request.tool_identities.find(name);
     if (position != request.tool_identities.end() && position->second.tool_search) {
         return CallKind::ClientSearch;
@@ -150,9 +154,14 @@ void complete_call_ids(ItemIds& ids, const OpenAIResponsesCreateRequest& request
         const std::string given =
             index < round.call_ids.size() ? round.call_ids[index] : std::string();
         if (kind == CallKind::HostedSearch) {
-            if (given.empty()) { throw std::logic_error("hosted search call has no identifier"); }
-            ids.function_calls[index] = given;
-            ids.call_ids[index]       = given;
+            // A search the turn ran has the identifier of its result turn; one it did not run (cancelled) keeps the
+            // Item id it streamed with, or takes a new one.
+            const std::string id = !given.empty()                       ? given
+                                   : !ids.function_calls[index].empty() ? ids.function_calls[index]
+                                                                        : new_openai_response_item_id(
+                                                                              call_item_prefix(kind));
+            ids.function_calls[index] = id;
+            ids.call_ids[index]       = id;
             if (ids.search_outputs[index].empty()) {
                 ids.search_outputs[index] = new_openai_response_item_id("tso");
             }
@@ -177,13 +186,17 @@ Json call_item(const OpenAIResponsesCreateRequest& request, const OpenAIResponse
                std::size_t index, const ItemIds& ids, const char* status, bool empty) {
     const infernix::GeneratedToolCall& call = round.outcome->tool_calls[index];
     switch (call_kind(request, round, index)) {
-    case CallKind::HostedSearch:
+    case CallKind::HostedSearch: {
+        const OpenAIToolSearchExecution* search = hosted_search(round, index);
         return Json{{"id", ids.function_calls[index]},
                     {"type", "tool_search_call"},
                     {"execution", "server"},
                     {"call_id", nullptr},
                     {"status", status},
-                    {"arguments", empty ? Json::object() : hosted_search(round, index)->arguments}};
+                    {"arguments", empty    ? Json::object()
+                                  : search ? search->arguments
+                                           : search_arguments(call.arguments_json)}};
+    }
     case CallKind::ClientSearch:
         return Json{{"id", ids.function_calls[index]},
                     {"type", "tool_search_call"},

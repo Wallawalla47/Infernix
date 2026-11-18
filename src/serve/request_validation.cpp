@@ -109,6 +109,16 @@ void parse_json_output_format(const RequestJson& format, GenerationRequest& requ
                    schema_param + ".schema");
 }
 
+void validate_declared_tool_choice(const GenerationRequest& request) {
+    if (request.tool_choice.allowed_names)
+        for (const auto& name : *request.tool_choice.allowed_names)
+            if (std::none_of(request.tools.begin(), request.tools.end(),
+                             [&](const auto& tool) { return tool.name == name; }))
+                bad_request("tool choice refers to undeclared tool: " + name, "tool_choice");
+    if (request.tool_choice.mode == ToolChoiceMode::Required && !request.uses_tools())
+        bad_request("required tool choice has no callable tools", "tool_choice");
+}
+
 void parse_structured_outputs(const RequestJson& body, GenerationRequest& request) {
     if (body.contains("tool_constraints") && !body["tool_constraints"].is_null()) {
         if (!body["tool_constraints"].is_string())
@@ -121,13 +131,7 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
         else
             bad_request("tool_constraints must be auto or basic", "tool_constraints");
     }
-    if (request.tool_choice.allowed_names)
-        for (const auto& name : *request.tool_choice.allowed_names)
-            if (std::none_of(request.tools.begin(), request.tools.end(),
-                             [&](const auto& tool) { return tool.name == name; }))
-                bad_request("tool choice refers to undeclared tool: " + name, "tool_choice");
-    if (request.tool_choice.mode == ToolChoiceMode::Required && !request.uses_tools())
-        bad_request("required tool choice has no callable tools", "tool_choice");
+    validate_declared_tool_choice(request);
     for (const char* alias :
          {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
         if (body.contains(alias) && !body[alias].is_null())

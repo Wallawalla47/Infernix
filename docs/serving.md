@@ -643,7 +643,8 @@ The three protocols share one constrained tool implementation:
 | Anthropic named `tool` | One or more calls to that tool |
 | OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
 
-OpenAI `allowed_tools` supports `auto` and `required`. Selection changes generation permissions,
+OpenAI `allowed_tools` supports `auto` and `required`; an entry naming a tool as the other kind (a
+declared function as `custom`, or the reverse) is a 400 `invalid_tool_choice`. Selection changes generation permissions,
 while all declarations retain their original order in the prompt. Requests with tools enable
 **basic structural constraints by default**, including ordinary `auto` calls without `strict`.
 The model can answer normally or start a tool call; a call must use the model's tool framing and a
@@ -1172,7 +1173,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
+| `include` | omitted, null, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -1282,7 +1283,8 @@ sends its result back as a `custom_tool_call_output` Item.
 
 Functions and custom tools, top-level or in a namespace, accept `defer_loading:true` together with a
 `tool_search` tool; `tool_search_call`, `tool_search_output` and `additional_tools` Items are accepted
-as input. See [Deferred tools and tool search](#deferred-tools-and-tool-search). A hosted
+as input (a loaded namespace's `description` is a string or null, else a 400 `input`). See
+[Deferred tools and tool search](#deferred-tools-and-tool-search). A hosted
 `web_search` declaration (`{"type":"web_search", ...}`, which Codex sends on every turn unless its
 configuration sets `web_search = "disabled"`) is accepted and echoed in the response's `tools`, but
 the model is not offered it, since Infernix runs no search; a `tool_choice` naming it is a 400.
@@ -1425,7 +1427,8 @@ larger `--response-store-max-mib`.
 It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function tools and
 tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
 call-ID normalization, template rendering, and media expansion are therefore identical to the
-corresponding Create request:
+corresponding Create request, and so is the tool choice check: a choice Create refuses (an undeclared
+tool, `required` without a callable tool) is a 400 `tool_choice` here too:
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \

@@ -271,6 +271,14 @@ int test_reasoning_encrypted_content_request() {
                            .include_reasoning_encrypted_content,
                       "empty include retains the omitted behavior");
 
+    // Nullable, like the other optional fields (audit 2026-11-18 F-19).
+    body["include"] = nullptr;
+    bool null_accepted = false;
+    try {
+        null_accepted = !parse_openai_responses_create_request(body, limits()).include_reasoning_encrypted_content;
+    } catch (const std::exception&) {}
+    failures += check(null_accepted, "include null was refused instead of read as omitted");
+
     body["include"] = Json::array({"reasoning.encrypted_content",
                                     "reasoning.encrypted_content"});
     failures += check(parse_openai_responses_create_request(body, limits())
@@ -297,13 +305,6 @@ int test_reasoning_encrypted_content_request() {
     failures += check(invalid_shape.status == 400 && invalid_shape.param == "include" &&
                           invalid_shape.message == "include must be an array",
                       "include rejects a non-array value");
-
-    body["include"] = nullptr;
-    const ApiError null_shape =
-        api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
-    failures += check(null_shape.status == 400 && null_shape.param == "include" &&
-                          null_shape.message == "include must be an array",
-                      "include rejects null when the field is present");
     return failures;
 }
 
@@ -1232,6 +1233,34 @@ Json hosted_search_body() {
                                                          "Shipping ETA for an order.")})}};
 }
 
+// A stream cancelled after it streamed a hosted search call (audit 2026-11-18 F-21): the turn did not run the search,
+// and the terminal output keeps the call's streamed kind (a server tool_search_call) instead of throwing
+// "streamed tool calls do not match terminal output" (the terminal side decided by the executed search alone).
+int test_cancelled_stream_after_hosted_search_call() {
+    Json body                                   = hosted_search_body();
+    body["stream"]                              = true;
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(body, limits());
+    OpenAIResponsesEventStream stream("resp_cancelled_search", 1, request, {});
+    (void)stream.start();
+    (void)stream.tool_call_delta({.index = 0, .name = "tool_search", .arguments = R"({"paths":["crm"]})",
+                                  .complete = true});
+    GenerationOutcome outcome;
+    outcome.finish_reason = infernix::FinishReason::Cancelled;
+    outcome.tool_calls    = {{.name = "tool_search", .arguments_json = R"({"paths":["crm"]})"}};
+    std::string error;
+    nlohmann::json output;
+    try {
+        const OpenAIResponsesStreamFinish finish = stream.finish(outcome);
+        output = parse_event(stream.terminal(finish.response)).at("response").at("output");
+    } catch (const std::exception& failure) { error = failure.what(); }
+    bool search_call = false;
+    for (const nlohmann::json& item : output) {
+        search_call = search_call || (item.value("type", "") == "tool_search_call" && item.value("execution", "") == "server");
+    }
+    return check(error.empty() && search_call,
+                 "a cancelled stream after a hosted search call failed or changed its kind (" + error + ")");
+}
+
 int test_deferred_tools_and_hosted_search() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(hosted_search_body(), limits());
@@ -1985,6 +2014,52 @@ int test_failed_before_generation_stream() {
     return failures;
 }
 
+// audit 2026-11-18 F-23: an allowed_tools entry naming a declared function as a custom tool is a wrong tool choice
+// (invalid_tool_choice, it was duplicate_tool_name), and a loaded namespace whose description is not a string is
+// refused as in the tools array (it was ignored).
+int test_tool_choice_kind_and_loaded_namespace() {
+    Json choice = {{"model", "m"},
+                   {"input", "x"},
+                   {"tools", Json::array({{{"type", "function"}, {"name", "lookup"},
+                                           {"parameters", {{"type", "object"}}}}})},
+                   {"tool_choice", {{"type", "allowed_tools"}, {"mode", "auto"},
+                                    {"tools", Json::array({{{"type", "custom"}, {"name", "lookup"}}})}}}};
+    const ApiError kind = api_error([&] { (void)parse_openai_responses_create_request(choice, limits()); });
+    Json loaded = {{"model", "m"},
+                   {"input", Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "x"}},
+                                          Json{{"type", "additional_tools"},
+                                               {"role", "developer"},
+                                               {"tools", Json::array({{{"type", "namespace"},
+                                                                       {"name", "crm"},
+                                                                       {"description", 5},
+                                                                       {"tools", Json::array()}}})}}})}};
+    const ApiError described = api_error([&] { (void)parse_openai_responses_create_request(loaded, limits()); });
+    int failures = check(kind.status == 400 && kind.code == "invalid_tool_choice",
+                         "allowed_tools naming a function as custom was not invalid_tool_choice (" + kind.code + ")");
+    failures += check(described.status == 400 && described.param == "input",
+                      "a loaded namespace with a description that is not a string was accepted");
+    return failures;
+}
+
+// /input_tokens refuses the tool choices create refuses (audit 2026-11-18 F-20): one naming an undeclared tool, and
+// `required` with no callable tool (it returned a count while create returned 400).
+int test_input_tokens_validates_tool_choice() {
+    const Json base = {{"model", "m"},
+                       {"input", "next"},
+                       {"tools", Json::array({{{"type", "function"}, {"name", "lookup"},
+                                               {"parameters", {{"type", "object"}}}}})}};
+    Json undeclared           = base;
+    undeclared["tool_choice"] = {{"type", "function"}, {"name", "missing"}};
+    Json required             = Json{{"model", "m"}, {"input", "next"}, {"tool_choice", "required"}};
+    const ApiError named      = api_error([&] { (void)parse_openai_responses_input_tokens_request(undeclared, limits()); });
+    const ApiError empty      = api_error([&] { (void)parse_openai_responses_input_tokens_request(required, limits()); });
+    int failures = check(named.status == 400 && named.param == "tool_choice",
+                         "input_tokens counted a tool choice naming an undeclared tool");
+    failures += check(empty.status == 400 && empty.param == "tool_choice",
+                      "input_tokens counted a required tool choice with no callable tools");
+    return failures;
+}
+
 int test_input_tokens_uses_shared_state_path() {
     OpenAIResponsesStore store(8, 1ULL << 20);
     store.put(stored_parent(
@@ -2103,6 +2178,7 @@ int main() try {
     failures += test_explicit_rejections();
     failures += test_input_file_documents();
     failures += test_deferred_tools_and_hosted_search();
+    failures += test_cancelled_stream_after_hosted_search_call();
     failures += test_client_tool_search_and_additional_tools();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
@@ -2111,6 +2187,8 @@ int main() try {
     failures += test_streamed_function_calls();
     failures += test_stream_keep_alive();
     failures += test_input_tokens_uses_shared_state_path();
+    failures += test_input_tokens_validates_tool_choice();
+    failures += test_tool_choice_kind_and_loaded_namespace();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 } catch (const ApiException& error) {

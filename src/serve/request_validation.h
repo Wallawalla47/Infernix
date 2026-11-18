@@ -30,6 +30,9 @@ void parse_json_output_format(const RequestJson& format, GenerationRequest& requ
                               const std::string& param, JsonFormatProtocol protocol);
 
 void parse_structured_outputs(const RequestJson& body, GenerationRequest& request);
+// The tool choice names only declared tools, and `required` has a callable tool (parse_structured_outputs runs it;
+// a route that counts a prompt without generating runs it alone).
+void validate_declared_tool_choice(const GenerationRequest& request);
 
 // Chat Completions and Responses: the per-request thinking budget under the names other servers'
 // clients send (thinking_budget_tokens, thinking_token_budget, thinking_budget,
