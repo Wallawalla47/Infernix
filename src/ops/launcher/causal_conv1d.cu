@@ -85,15 +85,14 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                                 Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+// The small-T kernel writing through `out_map`: one contiguous output, or a projection split in three.
+template <class OutputMap>
+void smallt_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in, Tensor& conv_state_out,
+                   const OutputMap& out_map, cudaStream_t stream) {
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
     const int grid = grid_for(C, kCausalConvChannelTile, "small-T");
-
-    const CausalConvContiguousOutput<__nv_bfloat16> out_map{static_cast<__nv_bfloat16*>(out.data),
-                                                            C};
     causal_conv1d_smallt_kernel<<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
         static_cast<const __nv_bfloat16*>(conv_state_in.data),
@@ -101,26 +100,24 @@ void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Te
     CUDA_CHECK(cudaGetLastError());
 }
 
+void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                                 Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+    const CausalConvContiguousOutput<__nv_bfloat16> out_map{static_cast<__nv_bfloat16*>(out.data),
+                                                            x.ne[0]};
+    smallt_launch(x, weight, conv_state_in, conv_state_out, out_map, stream);
+}
+
 template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
 void smallt_split_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                          Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
                          cudaStream_t stream) {
-    const std::int32_t C = x.ne[0];
-    const std::int32_t T = x.ne[1];
-    if (Rows0 + Rows1 + Rows2 != C) {
+    if (Rows0 + Rows1 + Rows2 != x.ne[0]) {
         throw std::invalid_argument("causal_conv1d: split geometry does not cover the channels");
     }
-    const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
-    const int grid = grid_for(C, kCausalConvChannelTile, "small-T");
-
     const CausalConvSplitOutput3<__nv_bfloat16, Rows0, Rows1, Rows2> out_map{
         static_cast<__nv_bfloat16*>(out0.data), static_cast<__nv_bfloat16*>(out1.data),
         static_cast<__nv_bfloat16*>(out2.data)};
-    causal_conv1d_smallt_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<const __nv_bfloat16*>(conv_state_in.data),
-        static_cast<__nv_bfloat16*>(conv_state_out.data), out_map, C, T);
-    CUDA_CHECK(cudaGetLastError());
+    smallt_launch(x, weight, conv_state_in, conv_state_out, out_map, stream);
 }
 
 void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
