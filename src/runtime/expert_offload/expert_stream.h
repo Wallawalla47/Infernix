@@ -187,6 +187,9 @@ public:
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
+    // Waits for the streams and destroys every stream and event created so far (the destructor's, and a constructor's
+    // that throws part-way, for which no destructor runs).
+    void release() noexcept;
     // Copies the layer's planned records whose slot lies at or past `first` in its half.
     void enqueue(std::uint32_t layer, std::uint32_t first = 0);
     // Requests the stream reads of `layer` (once per chunk).

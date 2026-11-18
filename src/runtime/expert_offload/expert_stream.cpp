@@ -36,15 +36,20 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
         throw std::invalid_argument("expert stream: a bank's record stride exceeds the ring's slots");
     }
     tables_host_ = PinnedHostBuffer(static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaEventCreateWithFlags(&start_, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&uploaded_, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&drained_, cudaEventDisableTiming));
-    landed_.resize(layers_);
-    consumed_.resize(layers_);
-    for (std::uint32_t l = 0; l < layers_; ++l) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&landed_[l], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&consumed_[l], cudaEventDisableTiming));
+    try {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&start_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&uploaded_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&drained_, cudaEventDisableTiming));
+        landed_.resize(layers_);
+        consumed_.resize(layers_);
+        for (std::uint32_t l = 0; l < layers_; ++l) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&landed_[l], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&consumed_[l], cudaEventDisableTiming));
+        }
+    } catch (...) {
+        release();
+        throw;
     }
     streams_.assign(layers_, 0);
     complete_.assign(layers_, 0);
@@ -52,7 +57,9 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
     ahead_.assign(layers_, 0);
 }
 
-ExpertStream::~ExpertStream() {
+ExpertStream::~ExpertStream() { release(); }
+
+void ExpertStream::release() noexcept {
     if (stream_ != nullptr) { (void)cudaStreamSynchronize(stream_); }
     if (expand_stream_ != nullptr) {
         (void)cudaStreamSynchronize(expand_stream_);
@@ -64,8 +71,12 @@ ExpertStream::~ExpertStream() {
     for (auto event : bounced_) {
         if (event != nullptr) { (void)cudaEventDestroy(event); }
     }
-    for (auto event : landed_) { (void)cudaEventDestroy(event); }
-    for (auto event : consumed_) { (void)cudaEventDestroy(event); }
+    for (auto event : landed_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
+    for (auto event : consumed_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
     if (uploaded_ != nullptr) { (void)cudaEventDestroy(uploaded_); }
     if (start_ != nullptr) { (void)cudaEventDestroy(start_); }
     if (stream_ != nullptr) { (void)cudaStreamDestroy(stream_); }
