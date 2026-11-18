@@ -8,6 +8,7 @@
 #include "launcher/chats.h"
 #include "launcher/event_log.h"
 #include "launcher/events.h"
+#include "launcher/http_access.h"
 #include "launcher/launch_script.h"
 #include "launcher/launcher.h"
 #include "launcher/load_advice.h"
@@ -98,6 +99,29 @@ void test_args() {
     // The first argument's inner quote leaves cmd in its quotes at each later opening one.
     check(batch_command_line({"a\"b&c", "R&D", "x|y"}) == "\"a\\\"b^&c\" \"R^&D\" \"x^|y\"",
           "metacharacters the line's quotes leave outside cmd's are escaped");
+}
+
+// Host and Origin checks of the management API (audit 2026-11-18 F-1): a DNS name that begins "127." is not this
+// computer, so a DNS-rebound page on 127.evil.com is refused in Host and in Origin.
+void test_http_access() {
+    check(!loopback_host("127.evil.com"), "127.evil.com is not loopback");
+    check(!loopback_host("127.0.0.1.evil.com"), "a dotted name past an address is not loopback");
+    check(loopback_host("127.0.0.1") && loopback_host("127.1.2.3") && loopback_host("localhost") &&
+              loopback_host("a.localhost") && loopback_host("::1") && loopback_host("::ffff:127.0.0.1"),
+          "numeric 127/8, localhost and its subdomains, ::1 and mapped 127 are loopback");
+    check(authority_host("127.evil.com:8000") == "127.evil.com" && authority_host("[::1]:80") == "::1",
+          "authority_host drops the port and the brackets");
+    check(page_refusal("127.evil.com:8000", "", false).has_value(), "Host 127.evil.com is refused");
+    check(page_refusal("127.0.0.1:8000", "http://127.evil.com:8000", false).has_value(),
+          "Origin 127.evil.com is refused beside a numeric Host");
+    check(!page_refusal("127.0.0.1:8000", "http://127.0.0.1:8000", false) &&
+              !page_refusal("localhost:8000", "http://localhost:8000", false) &&
+              !page_refusal("[::1]:8000", "", false),
+          "the launcher's own page by address or localhost is allowed");
+    check(!page_refusal("box.lan:8000", "", true) && page_refusal("box.lan:8000", "", false).has_value(),
+          "a DNS Host needs an admin key");
+    check(page_refusal("127.0.0.1:8000", "http://evil.example", true).has_value(),
+          "another page's Origin is refused even with an admin key");
 }
 
 void test_records() {
@@ -1206,6 +1230,7 @@ int main(int argc, char** argv) {
     test_models_list_body();
     test_json_nesting();
     test_args();
+    test_http_access();
     test_blob_ids();
     test_chats();
     test_store_durability();

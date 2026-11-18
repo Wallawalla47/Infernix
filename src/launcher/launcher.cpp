@@ -2,6 +2,7 @@
 
 #include "launcher/assets.h"
 #include "launcher/hf_hub.h"
+#include "launcher/http_access.h"
 #include "launcher/launch_script.h"
 #include "launcher/load_advice.h"
 #include "launcher/model_defaults.h"
@@ -136,37 +137,6 @@ std::uint64_t default_output_tokens(const Args& args, std::uint64_t context) {
         } catch (const std::exception&) {}
     }
     return std::min(max_output, context);
-}
-
-bool is_loopback(const std::string& address) {
-    return address == "::1" || address.starts_with("127.") || address.starts_with("::ffff:127.") ||
-           address == "localhost";
-}
-
-// The host of a Host header or an origin's authority: lower case, without the port or brackets.
-std::string authority_host(std::string_view authority) {
-    if (authority.starts_with('[')) {
-        const std::size_t close = authority.find(']');
-        return lower(authority.substr(1, close == std::string_view::npos ? std::string_view::npos : close - 1));
-    }
-    return lower(authority.substr(0, authority.find(':')));
-}
-
-bool ip_literal(const std::string& host) {
-    if (host.find(':') != std::string::npos) { return true; } // IPv6
-    int dots = 0;
-    for (const char c : host) {
-        if (c == '.') {
-            ++dots;
-        } else if (c < '0' || c > '9') {
-            return false;
-        }
-    }
-    return dots == 3;
-}
-
-bool loopback_host(const std::string& host) {
-    return host == "localhost" || host.ends_with(".localhost") || host == "::1" || host.starts_with("127.");
 }
 
 // Claude Code's gateway model discovery lists only ids that contain "claude" or "anthropic", so it
@@ -1993,30 +1963,12 @@ void Launcher::download_finished(const std::filesystem::path& dest_dir, const st
 
 bool Launcher::page_checks(const Request& request, Response* response, bool has_key) const {
     // Web pages the user opens elsewhere must not drive this API (the public routes send
-    // `Access-Control-Allow-Origin: *`). A page's requests carry its Origin, refused unless it is this
-    // page's own or a loopback one; a DNS-rebinding page names its own domain in Host, refused unless
-    // Host is an IP address or localhost (or the request carries an admin key).
-    const std::string host      = request.get_header_value("Host");
-    const std::string host_name = authority_host(host);
-    if (!has_key && !host_name.empty() && !ip_literal(host_name) && !loopback_host(host_name)) {
-        if (response) {
-            send_error(*response, 403, "forbidden",
-                       "open the launcher by IP address or localhost (not " + host_name + "), or send an admin key");
-        }
-        return false;
-    }
-    const std::string origin = request.get_header_value("Origin");
-    if (!origin.empty()) {
-        const std::size_t scheme    = origin.find("://");
-        const std::string authority = scheme == std::string::npos ? std::string() : origin.substr(scheme + 3);
-        if (authority.empty() || (!iequals(authority, host) && !loopback_host(authority_host(authority)))) {
-            if (response) {
-                send_error(*response, 403, "forbidden", "the launcher's management API does not answer other web pages");
-            }
-            return false;
-        }
-    }
-    return true;
+    // `Access-Control-Allow-Origin: *`): http_access.h's page_refusal.
+    const std::optional<std::string> refusal =
+        page_refusal(request.get_header_value("Host"), request.get_header_value("Origin"), has_key);
+    if (!refusal) { return true; }
+    if (response) { send_error(*response, 403, "forbidden", *refusal); }
+    return false;
 }
 
 std::optional<ApiKey> Launcher::admin_key(const Request& request) {

@@ -27,6 +27,7 @@ add_library(infernix_launcher STATIC
   event_log.cpp
   events.cpp
   hf_hub.cpp
+  http_access.cpp
   launch_script.cpp
   launcher.cpp
   load_advice.cpp
