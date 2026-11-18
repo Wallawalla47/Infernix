@@ -186,8 +186,24 @@ private:
 
     // HTTP.
     void register_routes();
-    void register_management_routes();
     void register_public_routes();
+    // The management API (/launcher/api, management_routes.cpp): one registrar per area, called in this order
+    // (httplib answers a request with the first route that matches it).
+    void register_management_routes();
+    void register_settings_routes(const std::string& api);
+    void register_config_routes(const std::string& api);
+    void register_status_routes(const std::string& api);
+    void register_download_routes(const std::string& api);
+    void register_update_routes(const std::string& api);
+    void register_disk_routes(const std::string& api);
+    void register_key_routes(const std::string& api);
+    void register_chat_routes(const std::string& api);
+    void register_usage_routes(const std::string& api);
+    void register_fs_routes(const std::string& api);
+    void register_event_routes(const std::string& api);
+    // A management route's handler behind admin_allowed, its exceptions answered as JSON errors (400 for an
+    // invalid argument or invalid JSON, 502 for any other failure).
+    [[nodiscard]] httplib::Server::Handler admin(httplib::Server::Handler handler);
     // The management API: this computer, or (remote management on) anyone while no key exists and
     // an admin key or its sign-in once one does; always after page_checks. Otherwise the error is written (401 "sign_in" when signing in helps).
     bool admin_allowed(const httplib::Request& request, httplib::Response& response);
