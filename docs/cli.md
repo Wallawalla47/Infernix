@@ -428,7 +428,13 @@ the 64-token page size. `--kv-capacity auto` loads the selected weights, measure
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, unified workspace,
 and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
+unallocated. On Windows the budget it measures can leave out other programs' VRAM (on an RTX 5090 it
+ignored another process's 3 GiB, though it did count 6 GiB); when NVML shows other programs holding
+more than the headroom (by over 256 MiB), startup first maps the space in 64 MiB steps,
+stops where Windows lowers the budget, and sizes the pool to that, so those programs keep their memory
+(about 0.3 s more at startup). An explicit `--max-context` still gets one whole request's context, and
+Windows pages the other programs out for the rest, as before. The pool never shrinks after startup or
+at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 `infernix-serve ... --plan FILE` runs this sizing for a server's options without loading the model

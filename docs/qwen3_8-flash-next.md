@@ -942,8 +942,9 @@ startup
   under WSL2, this process's shared system memory use, which a real spill raises. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
-- **Other programs' VRAM.** On Windows neither the per-process budget nor free VRAM counts memory
-  another program holds, so the cache is sized as if the card were empty. As it grows into that memory,
+- **Other programs' VRAM.** On Windows the per-process budget and free VRAM can leave out memory
+  another program holds (on an RTX 5090 they ignored another process's 3 GiB), so the cache can be
+  sized as if the card were empty. As it grows into that memory,
   Windows lowers the budget; the engine reads free VRAM before each 64 MiB chunk and stops once the next
   chunk would not leave the headroom and reserve, logging `free VRAM went while the expert cache grew
   … starts with N of M frames`. With another process holding 3 GiB on an RTX 5090 the cache started

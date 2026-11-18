@@ -7619,7 +7619,8 @@ measured results are under "Status" at the end of this section.
   shrinking before VidMm contention (device free is the primary signal; budget and `Demoted` are
   secondary). Infernix never changes driver settings; the docs mention "Prefer No Sysmem Fallback" as
   optional.
-- **Other processes' memory** (issue #68, 2026-11-17): neither the budget nor cudaMemGetInfo sees it.
+- **Other processes' memory** (issue #68, 2026-11-17): the budget and cudaMemGetInfo need not see it (they
+  ignored a 3 GiB holder below; a 6 GiB one later cut the budget to 24,882 MiB before loading).
   RTX 5090, no display, a probe process holding 3 GiB: the DXGI budget (31,419 MiB) and free memory
   stayed as on an empty card while NVML's free fell by 3.5 GiB, so FP4-Local sized 9,108 frames (as on
   the empty card), Windows cut the budget as the card filled (to 27,527 MiB) and the grow mapped past it:

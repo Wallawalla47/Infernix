@@ -186,7 +186,7 @@ struct GrowthLimit {
 };
 // The bytes a grow may still map at `snapshot`: size_expert_frames' room with nothing left to allocate,
 // min(F - headroom, B - 64 MiB) - reserve. ExpertResidency::resize maps a chunk only while this covers it, so memory
-// that went since sizing stops a grow cleanly. Under WDDM neither F nor B sees another process's memory: with a
+// that went since sizing stops a grow cleanly. Under WDDM F and B need not see another process's memory: with a
 // 3 GiB holder in another process the sizing planned as on an empty card, Windows lowered the budget as the card
 // filled, and the grow mapped past it until a chunk read as placed in system memory (RTX 5090, 2026-11-17, #68).
 [[nodiscard]] std::int64_t growth_room(const VramSnapshot& snapshot, const GrowthLimit& limit) noexcept;

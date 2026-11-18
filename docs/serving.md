@@ -89,7 +89,10 @@ weight into VRAM or pinned RAM, and allocates no KV cache, workspace, expert cac
 weights are bound at their planned offsets in reserved, inaccessible address space, so the planner
 sees the shapes and formats a loaded model has). From the artifact it reads the directory, the
 resources and the few scale words the binding needs, and it logs the Engine's diagnostics (its RAM
-plan) as a start does. It writes one JSON object to `FILE` and exits:
+plan) as a start does. Since it allocates nothing, it cannot run the start's 64 MiB-step probe: while
+other programs hold more VRAM than the headroom, a resident model's automatic KV capacity and
+`--max-context auto` plan larger than the start then gives them ([`--kv-capacity`](cli.md)). It writes
+one JSON object to `FILE` and exits:
 
 | Exit | Meaning |
 |---:|---|

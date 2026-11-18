@@ -256,6 +256,47 @@ std::size_t current_free_device_bytes(int device, bool past_budget) {
     return free_device_bytes(open_vram_budget_source(device, past_budget)->query());
 }
 
+// What stepped growth maps on `device` now, up to `max_bytes`: 64 MiB VMM chunks as the expert frames grow, each
+// mapped only while growth_room covers it and kept only while free memory dropped by it, all released after. Under
+// WDDM the OS budget and free memory need not see another process's VRAM, so a resident model's automatic KV sized
+// from them was one allocation that made Windows evict the other process: the 27B NVFP4 at --max-context auto beside
+// a 3 GiB holder resolved 370,304 tokens as on an empty card and the holder's VRAM fell from 3,504 to 416 MiB (RTX
+// 5090, 2026-11-17, issue #68), while the frames' stepped growth stopped where Windows lowered the budget and the
+// holder kept its memory.
+struct GrowthProbe {
+    std::uint64_t bytes = 0;     // what it mapped (max_bytes when nothing stopped it)
+    bool stopped        = false; // growth_room, a refused chunk or a spill stopped it short of max_bytes
+    double milliseconds = 0.0;
+};
+
+GrowthProbe probe_growth(int device, VramBudgetSource& source, const expert_offload::GrowthLimit& limit,
+                         std::uint64_t max_bytes) {
+    GrowthProbe out;
+    const auto start        = std::chrono::steady_clock::now();
+    const std::size_t chunk = expert_offload::ExpertResidency::kChunkBytes;
+    const auto chunk_signed = static_cast<std::int64_t>(chunk);
+    VmmArena arena(device, static_cast<std::size_t>(max_bytes), chunk);
+    SpillGuard guard(source);
+    while (arena.mapped_bytes() + chunk <= max_bytes) {
+        guard.begin();
+        if (expert_offload::growth_room(guard.before(), limit) < chunk_signed || !arena.map_chunk()) {
+            out.stopped = true;
+            break;
+        }
+        CUDA_CHECK(cudaMemset(static_cast<std::byte*>(arena.base()) + arena.mapped_bytes() - chunk, 0, chunk));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (guard.end(chunk) != 0) {
+            arena.unmap_chunk();
+            out.stopped = true;
+            break;
+        }
+    }
+    out.bytes = out.stopped ? arena.mapped_bytes() : max_bytes;
+    while (arena.mapped_bytes() != 0) { arena.unmap_chunk(); }
+    out.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return out;
+}
+
 // Offloaded experts: an estimate of the expert frames beside `sequence`. A start sizes them from a live
 // reading once the Program's allocations exist (ExpertOffload::size_frames); here they take what the
 // Program's reservation less its CUDA Graph allowance (with the elastic text KV region whole, as when
@@ -1173,22 +1214,68 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             retry_headroom;
         const std::size_t sizing_now = kv_sizing_bytes(
             vram_now, !expert_ram && kv_policy.mode == KvCapacityMode::Automatic, sizing_headroom, retry_headroom);
-        const std::size_t free_bytes =
+        std::size_t free_bytes =
             plan_only ? planned_free_after_weights(sizing_now, planned_weights,
                                                    planned_beside_weights + instance->parameters.planned_device_bytes)
                       : sizing_now;
+        // Other processes' VRAM by NVML, which counts every process (the OS budget does not): its device-wide use
+        // less this process's; 0 without NVML. On the RTX 5090 it read ~200 MiB on a quiet card (the desktop
+        // window manager's) and ~3,700 MiB beside a 3 GiB holder (2026-11-17).
+        const std::uint64_t others_bytes =
+            vram_now.physical_used > vram_now.local_usage ? vram_now.physical_used - vram_now.local_usage : 0U;
         if (vram_now.has_budget) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
-                               "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used)",
+                               "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used; NVML: "
+                               "every process uses %llu MiB, other processes %llu)",
                                free_now >> 20, vram_now.device_free >> 20,
                                static_cast<unsigned long long>(vram_now.local_budget >> 20),
-                               static_cast<unsigned long long>(vram_now.local_usage >> 20));
+                               static_cast<unsigned long long>(vram_now.local_usage >> 20),
+                               static_cast<unsigned long long>(vram_now.physical_used >> 20),
+                               static_cast<unsigned long long>(others_bytes >> 20));
         }
         // An automatic KV capacity leaves the offloaded models' display headroom (256 MiB with no display on
         // the GPU, 1 GiB with one or when unknown). Measured headless on the 27B and 35B at 4 x 65,536 (RTX
         // 5090, 2026-11-03): the earlier fixed 1 GiB stayed free, and long prefills, decode at four lanes
         // and a constrained tool call took 2 MiB more after startup.
         const std::size_t headroom = sizing_headroom;
+        // A resident model's automatic capacity under an OS budget (Windows), while other processes hold more VRAM
+        // than the headroom leaves them, takes only what stepped growth maps at startup (probe_growth), so the
+        // memory they hold stays theirs. The capacity is fixed from then on: it never shrinks after startup.
+        //  - The probe costs ~270 ms (11.8 GiB in 64 MiB steps), so it runs only past the headroom by
+        //    kOthersSlackBytes, which covers NVML's and the budget's differing accounts: a quiet card or the
+        //    desktop alone pay nothing and size as before.
+        //  - An explicit --max-context keeps one request's whole context: below it the probe gives way and Windows
+        //    pages the other program out, as before. --max-context auto takes what fits.
+        //  - Engine::plan cannot allocate, so it keeps the budget's figure: the two differ while the probe acts.
+        constexpr std::uint64_t kOthersSlackBytes = 256ULL << 20;
+        if (!plan_only && !expert_ram && kv_policy.mode == KvCapacityMode::Automatic && vram_now.has_budget &&
+            vram_now.physical_used != 0 && others_bytes > headroom + kOthersSlackBytes && free_bytes > headroom &&
+            VmmArena::supported(device.device)) {
+            const auto source       = open_vram_budget_source(device.device, options.vram_past_budget);
+            const GrowthProbe probe = probe_growth(device.device, *source, expert_offload::GrowthLimit{headroom, 0},
+                                                   free_bytes - headroom);
+            std::size_t probed = static_cast<std::size_t>(probe.bytes) + headroom;
+            if (probe.stopped && !options.max_context_auto) {
+                const auto curve =
+                    models::qwen3_5::make_sequence_planner(instance->parameters, device, options, offload).capacity_curve();
+                const std::uint64_t pages = std::clamp<std::uint64_t>(
+                    (static_cast<std::uint64_t>(options.max_context) + curve.main_page_tokens - 1U) / curve.main_page_tokens,
+                    curve.minimum_main_page_groups, curve.maximum_main_page_groups);
+                probed = std::max(probed, curve.reservation_bytes(static_cast<std::uint32_t>(pages)) + headroom);
+            }
+            if (probe.stopped && probed < free_bytes) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "other programs hold %llu MiB of VRAM the OS budget does not show: the automatic KV "
+                                   "capacity takes %zu MiB instead of %zu, so they keep it",
+                                   static_cast<unsigned long long>(others_bytes >> 20), (probed - headroom) >> 20,
+                                   (free_bytes - headroom) >> 20);
+                free_bytes = probed;
+            }
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                               "KV room probe: %zu MiB mapped in 64 MiB steps in %.0f ms%s",
+                               static_cast<std::size_t>(probe.bytes >> 20), probe.milliseconds,
+                               probe.stopped ? ", stopped short" : "");
+        }
         // The sequence plan of `trial` (these options at another prefill chunk, for the fit below) with its
         // KV capacity resolved; none when Engine::plan finds no capacity that fits.
         const auto plan_sequence = [&](const EngineOptions& trial)
