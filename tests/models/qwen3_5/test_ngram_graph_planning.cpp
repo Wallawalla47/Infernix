@@ -110,7 +110,7 @@ std::size_t expected_allowance(unsigned capacity, unsigned neural, unsigned ngra
         }
         executables += family_executables(capacity, ngram, neural);
     }
-    return (64ULL << 20) + 2 * executables * (4ULL << 20);
+    return (16ULL << 20) + 2 * executables * (2ULL << 20); // the planner's 16 MiB plus 2 MiB an executable
 }
 
 void verify_real_plan(const char* artifact) {
