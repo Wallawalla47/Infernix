@@ -171,6 +171,25 @@ Json read_meta(const std::filesystem::path& path) {
     } catch (const Json::exception&) { return Json::object(); }
 }
 
+// A file's partial download beside its final path, and the partial's chunk record.
+struct PartPaths {
+    std::filesystem::path part, meta;
+};
+PartPaths part_paths(const std::filesystem::path& final_path) {
+    PartPaths out{final_path, {}};
+    out.part += ".part";
+    out.meta = out.part;
+    out.meta += ".json";
+    return out;
+}
+// Removes a file's partial download and its chunk record (a cancelled job's, or one whose checksum failed).
+void remove_partial(const std::filesystem::path& final_path) {
+    const PartPaths paths = part_paths(final_path);
+    std::error_code ignored;
+    std::filesystem::remove(paths.part, ignored);
+    std::filesystem::remove(paths.meta, ignored);
+}
+
 } // namespace
 
 Downloads::Downloads(Hooks hooks) : hooks_(std::move(hooks)) {
@@ -325,9 +344,7 @@ Json Downloads::create(const Json& request) {
         const bool present = std::filesystem::file_size(final_path, error) == it->size && !error;
         if (job->replace || !present) {
             // A resumable partial file has its finished chunks on disk already.
-            std::filesystem::path meta = final_path;
-            meta += ".part.json";
-            const Json chunks       = read_meta(meta).value("done", Json::array());
+            const Json chunks       = read_meta(part_paths(final_path).meta).value("done", Json::array());
             const std::uint64_t got = std::min<std::uint64_t>(chunks.size() * kChunkBytes, it->size);
             needed += it->size - got;
         }
@@ -404,20 +421,12 @@ void Downloads::cancel(const std::string& id) {
         } else {
             for (const auto& file : job->files) {
                 if (file->state == "done" || file->state == "skipped") { continue; }
-                std::filesystem::path part = job->target_dir / utf8_path(file->path);
-                part += ".part";
-                leftovers.push_back(part);
+                leftovers.push_back(job->target_dir / utf8_path(file->path));
             }
         }
         save_locked();
     }
-    for (const std::filesystem::path& part : leftovers) {
-        std::error_code ignored;
-        std::filesystem::remove(part, ignored);
-        std::filesystem::path meta = part;
-        meta += ".json";
-        std::filesystem::remove(meta, ignored);
-    }
+    for (const std::filesystem::path& final_path : leftovers) { remove_partial(final_path); }
     cv_.notify_all();
     notify();
 }
@@ -464,13 +473,7 @@ void Downloads::run() {
         if (next->state == "cancelled") {
             for (const auto& file : next->files) {
                 if (file->state == "done" || file->state == "skipped") { continue; }
-                std::error_code ignored;
-                std::filesystem::path part = next->target_dir / utf8_path(file->path);
-                part += ".part";
-                std::filesystem::remove(part, ignored);
-                std::filesystem::path meta = part;
-                meta += ".json";
-                std::filesystem::remove(meta, ignored);
+                remove_partial(next->target_dir / utf8_path(file->path));
             }
         }
         save_locked();
@@ -481,17 +484,23 @@ void Downloads::run() {
 }
 
 void Downloads::run_job(DownloadJob& job) {
+    // A failure changes the job only while it runs: a cancel or pause set meanwhile stays (as the done transition
+    // below), so a cancelled job keeps its state and has its partial files removed (run()).
     const auto fail = [&](DownloadFile* file, const std::string& message) {
+        bool failed = false;
         {
             std::lock_guard lock(mutex_);
             if (file != nullptr) {
                 file->state = "failed";
                 file->error = message;
             }
-            job.state = "failed";
-            job.error = message;
+            if (job.state == "running" || job.state == "verifying") {
+                job.state = "failed";
+                job.error = message;
+                failed    = true;
+            }
         }
-        if (hooks_.failed) { hooks_.failed(job.repo, message); }
+        if (failed && hooks_.failed) { hooks_.failed(job.repo, message); }
     };
     std::error_code error;
     std::filesystem::create_directories(job.target_dir, error);
@@ -532,8 +541,8 @@ void Downloads::run_job(DownloadJob& job) {
             fail(&file, file.error.value_or("download failed"));
             return;
         }
-        std::filesystem::path part = final_path;
-        part += ".part";
+        const PartPaths partial     = part_paths(final_path);
+        const std::filesystem::path& part = partial.part;
         if ((file.sha256 || file.git_blob) && (!hooks_.verify || hooks_.verify())) {
             {
                 std::lock_guard lock(mutex_);
@@ -555,10 +564,7 @@ void Downloads::run_job(DownloadJob& job) {
                 if (job.state == "verifying") { job.state = "running"; }
             }
             if (!digest || *digest != expected) {
-                std::filesystem::remove(part, error);
-                std::filesystem::path meta = part;
-                meta += ".json";
-                std::filesystem::remove(meta, error);
+                remove_partial(final_path);
                 file.done = 0;
                 fail(&file, digest ? "checksum mismatch: the file was deleted; resume to download it again"
                                    : "cannot read the downloaded file to check it");
@@ -570,9 +576,7 @@ void Downloads::run_job(DownloadJob& job) {
             fail(&file, "cannot rename " + path_utf8(part) + ": " + error_text(error));
             return;
         }
-        std::filesystem::path meta = part;
-        meta += ".json";
-        std::filesystem::remove(meta, error);
+        std::filesystem::remove(partial.meta, error);
         {
             std::lock_guard lock(mutex_);
             file.state = "done";
@@ -593,10 +597,9 @@ void Downloads::run_job(DownloadJob& job) {
 }
 
 bool Downloads::download_file(DownloadJob& job, DownloadFile& file, const std::filesystem::path& final_path) {
-    std::filesystem::path part = final_path;
-    part += ".part";
-    std::filesystem::path meta_path = part;
-    meta_path += ".json";
+    const PartPaths partial               = part_paths(final_path);
+    const std::filesystem::path& part      = partial.part;
+    const std::filesystem::path& meta_path = partial.meta;
     const std::uint64_t size   = file.bytes;
     const std::uint64_t chunks = size == 0 ? 0 : (size + kChunkBytes - 1) / kChunkBytes;
 

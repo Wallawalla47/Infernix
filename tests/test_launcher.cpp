@@ -6,6 +6,7 @@
 #include "launcher/args.h"
 #include "launcher/artifact_scan.h"
 #include "launcher/chats.h"
+#include "launcher/downloads.h"
 #include "launcher/event_log.h"
 #include "launcher/events.h"
 #include "launcher/http_access.h"
@@ -1068,6 +1069,52 @@ void test_router_cancel() {
     check(!router.load_cancelled(), "a forced load of the loaded model cancels nothing");
 }
 
+// A cancel that races a failure (audit 2026-11-18 F-7): the job the user cancelled stays cancelled (and is not
+// reported failed), whatever failure the worker meets after the cancel. Here the job's folder cannot be created (it
+// lies under a file) and the cancel lands as the job starts, before run_job fails it.
+void test_download_cancel_race() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-cancel";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    std::filesystem::create_directories(dir);
+    { std::ofstream(dir / "blocker") << "a file, so no folder under it"; }
+    std::atomic<Downloads*> self{nullptr};
+    std::atomic<bool> cancelled{false};
+    std::atomic<int> failures_reported{0};
+    Downloads::Hooks hooks;
+    hooks.load_state = [&] {
+        return Json::array({{{"id", "job"}, {"repo", "org/model"}, {"state", "queued"},
+                             {"target_dir", path_utf8(dir / "blocker" / "model")},
+                             {"files", Json::array({{{"path", "weights.bin"}, {"bytes", 1}}})}}});
+    };
+    hooks.failed  = [&](const std::string&, const std::string&) { ++failures_reported; };
+    hooks.changed = [&](const Json& jobs) {
+        for (const Json& job : jobs) {
+            if (job.value("id", "") != "job" || job.value("state", "") != "running" || cancelled.exchange(true)) {
+                continue;
+            }
+            const auto limit = std::chrono::steady_clock::now() + 10s;
+            while (self.load() == nullptr && std::chrono::steady_clock::now() < limit) { std::this_thread::yield(); }
+            if (Downloads* downloads = self.load()) { downloads->cancel("job"); }
+        }
+    };
+    std::string state;
+    {
+        Downloads downloads(hooks);
+        self.store(&downloads);
+        const auto limit = std::chrono::steady_clock::now() + 10s;
+        do {
+            std::this_thread::sleep_for(20ms);
+            const Json jobs = downloads.list();
+            state           = jobs.empty() ? std::string() : jobs[0].value("state", "");
+        } while ((state == "queued" || state == "running" || !cancelled.load()) && std::chrono::steady_clock::now() < limit);
+        downloads.shutdown();
+    }
+    check(cancelled.load() && state == "cancelled" && failures_reported.load() == 0,
+          ("a cancel racing a failure left the job " + state).c_str());
+    std::filesystem::remove_all(dir, ignored);
+}
+
 // A download error in the system's code page (audit 2026-11-18 F-6: std::error_code::message() on a non-English
 // Windows) is not valid UTF-8; the job holding it must not stop every later save of the memory file.
 void test_store_invalid_utf8() {
@@ -1291,6 +1338,7 @@ int main(int argc, char** argv) {
     test_chats();
     test_store_durability();
     test_store_invalid_utf8();
+    test_download_cancel_race();
     test_records();
     test_help();
     test_help_cache();
