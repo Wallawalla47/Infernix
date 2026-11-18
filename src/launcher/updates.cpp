@@ -552,8 +552,8 @@ void InfernixUpdate::install() {
     try {
         write_file_atomic(script_path, script);
     } catch (const std::exception& error) { fail(error.what()); }
-    if (!spawn_detached(std::filesystem::path(std::wstring(system, length)) / L"cmd.exe",
-                        {"/c", path_utf8(script_path)})) {
+    const std::filesystem::path cmd = std::filesystem::path(std::wstring(system, length)) / L"cmd.exe";
+    if (!spawn_detached_command_line(cmd, cmd_batch_command_line(path_utf8(cmd), path_utf8(script_path)))) {
         fail("cannot start the update script");
     }
 #endif

@@ -79,6 +79,10 @@ struct CaptureResult {
 
 // Starts a process that outlives the launcher (no pipe, no job object, its own process group).
 bool spawn_detached(const std::filesystem::path& executable, const std::vector<std::string>& args);
+#ifdef _WIN32
+// The same with its command line given whole (cmd_batch_command_line's, which quoting each argument cannot spell).
+bool spawn_detached_command_line(const std::filesystem::path& executable, const std::string& command_line);
+#endif
 
 // Opens a URL in the user's browser.
 void open_in_browser(const std::string& url);

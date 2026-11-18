@@ -14,6 +14,7 @@
 #include "launcher/load_advice.h"
 #include "launcher/log_buffer.h"
 #include "launcher/model_defaults.h"
+#include "launcher/process.h"
 #include "launcher/router.h"
 #include "launcher/routing.h"
 #include "launcher/serve_help.h"
@@ -99,6 +100,41 @@ void test_args() {
     // The first argument's inner quote leaves cmd in its quotes at each later opening one.
     check(batch_command_line({"a\"b&c", "R&D", "x|y"}) == "\"a\\\"b^&c\" \"R^&D\" \"x^|y\"",
           "metacharacters the line's quotes leave outside cmd's are escaped");
+}
+
+// The update hand-over's command line (audit 2026-11-18 F-5): cmd /d /s /c ""script"" runs a batch file from a folder
+// whose name holds a space, parentheses and & (a plain /c "script" split it at the first space and ran nothing).
+void test_batch_spawn() {
+    check(windows_command_line("C:\\Program Files\\x.exe", {"a b", "c"}) == "\"C:\\Program Files\\x.exe\" \"a b\" c",
+          "windows_command_line quotes the program and each argument");
+    const std::string script = "C:\\Users\\Jo Bloggs (work) & co\\Infernix\\apply-update.bat";
+    check(cmd_batch_command_line("C:\\Windows\\System32\\cmd.exe", script) ==
+              "C:\\Windows\\System32\\cmd.exe /d /s /c \"\"" + script + "\"\"",
+          "cmd_batch_command_line wraps the script in one outer quote pair for /s");
+#ifdef _WIN32
+    const std::filesystem::path folder =
+        std::filesystem::temp_directory_path() / ("infernix launcher (spawn) & test " + std::to_string(GetCurrentProcessId()));
+    std::filesystem::remove_all(folder);
+    std::filesystem::create_directories(folder);
+    const std::filesystem::path marker = folder / "ran.txt";
+    {
+        std::ofstream bat(folder / "apply-update.bat", std::ios::binary);
+        bat << "@echo off\r\necho ran> \"%~dp0ran.txt\"\r\n";
+    }
+    wchar_t system[MAX_PATH] = {};
+    const UINT length        = GetSystemDirectoryW(system, MAX_PATH);
+    const std::filesystem::path cmd = std::filesystem::path(std::wstring(system, length)) / L"cmd.exe";
+    const bool spawned = spawn_detached_command_line(
+        cmd, cmd_batch_command_line(path_utf8(cmd), path_utf8(folder / "apply-update.bat")));
+    const auto limit = std::chrono::steady_clock::now() + 10s;
+    while (spawned && !std::filesystem::exists(marker) && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(20ms);
+    }
+    check(spawned && std::filesystem::exists(marker), "a batch file in a folder with ( ) & did not run");
+    std::this_thread::sleep_for(200ms); // cmd has closed the file
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+#endif
 }
 
 // Host and Origin checks of the management API (audit 2026-11-18 F-1): a DNS name that begins "127." is not this
@@ -1231,6 +1267,7 @@ int main(int argc, char** argv) {
     test_json_nesting();
     test_args();
     test_http_access();
+    test_batch_spawn();
     test_blob_ids();
     test_chats();
     test_store_durability();

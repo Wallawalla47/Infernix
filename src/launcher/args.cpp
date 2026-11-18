@@ -129,6 +129,16 @@ std::string windows_quote(std::string_view arg) {
     return windows_quoted(arg);
 }
 
+std::string windows_command_line(std::string_view program, const std::vector<std::string>& args) {
+    std::string command = windows_quote(program);
+    for (const std::string& arg : args) { command += " " + windows_quote(arg); }
+    return command;
+}
+
+std::string cmd_batch_command_line(std::string_view cmd, std::string_view script) {
+    return windows_quote(cmd) + " /d /s /c \"\"" + std::string(script) + "\"\"";
+}
+
 std::string batch_command_line(const std::vector<std::string>& argv) {
     constexpr std::string_view kMetacharacters = "&|<>^()";
     std::string out;

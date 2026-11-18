@@ -49,6 +49,12 @@ std::vector<std::string> strip_managed_flags(Args& args, const TakesValue& takes
 // be, windows_quoted always quoted.
 [[nodiscard]] std::string windows_quote(std::string_view arg);
 [[nodiscard]] std::string windows_quoted(std::string_view arg);
+// A whole command line: the program and each argument windows_quote'd.
+[[nodiscard]] std::string windows_command_line(std::string_view program, const std::vector<std::string>& args);
+// cmd.exe running one batch file, whatever its path holds: `cmd /d /s /c ""script""`. With /s cmd strips only the
+// outer quote pair and runs the path still quoted; a plain /c "script" keeps its quotes only for a path with none of
+// & < > ( ) @ ^ |, and splits any other at its first space (a data folder under "C:\Users\Jo Bloggs (work)").
+[[nodiscard]] std::string cmd_batch_command_line(std::string_view cmd, std::string_view script);
 // A command line cmd.exe reads before the program does (a batch file): each argument
 // windows_quote'd, and quoted whenever it holds one of cmd's metacharacters; those the line's
 // inner quotes leave outside cmd's own quote state are caret-escaped. A batch file doubles % itself.

@@ -200,9 +200,7 @@ std::unique_ptr<ChildProcess> ChildProcess::start(const std::filesystem::path& e
     startup.StartupInfo.hStdError  = write_end.value;
     startup.lpAttributeList        = list;
 
-    std::string command = windows_quote(path_utf8(executable));
-    for (const std::string& arg : args) { command += " " + windows_quote(arg); }
-    std::wstring command_wide = wide(command);
+    std::wstring command_wide = wide(windows_command_line(path_utf8(executable), args));
     const std::wstring directory = working_dir.wstring();
 
     // The launcher's console is shared, with or without a window (a program may start the launcher on
@@ -301,9 +299,11 @@ void open_in_browser(const std::string& url) {
 }
 
 bool spawn_detached(const std::filesystem::path& executable, const std::vector<std::string>& args) {
-    std::string command = windows_quote(path_utf8(executable));
-    for (const std::string& arg : args) { command += " " + windows_quote(arg); }
-    std::wstring command_wide = wide(command);
+    return spawn_detached_command_line(executable, windows_command_line(path_utf8(executable), args));
+}
+
+bool spawn_detached_command_line(const std::filesystem::path& executable, const std::string& command_line) {
+    const std::wstring command_wide = wide(command_line);
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION info{};
