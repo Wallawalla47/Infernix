@@ -814,6 +814,19 @@ int main(int argc, char** argv) {
                                      "application/json");
                 return;
             }
+            // As infernix-serve: a negative output limit is a request error (the launcher's checks use it to have
+            // the server refuse a request that streams).
+            const auto limit = body.find("max_tokens");
+            if (limit != body.end() && limit->is_number_integer() && limit->get<long long>() < 0) {
+                response.status = 400;
+                response.set_content(protocol == "anthropic"
+                                         ? R"({"type":"error","error":{"type":"invalid_request_error",)"
+                                           R"("message":"max_tokens must be at least 1"}})"
+                                         : R"({"error":{"message":"max_tokens must be at least 1",)"
+                                           R"("type":"invalid_request_error","param":"max_tokens","code":null}})",
+                                     "application/json");
+                return;
+            }
             generate(protocol, body, request.get_header_value("X-Infernix-Request-Label"), response);
         };
     };

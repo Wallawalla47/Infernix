@@ -347,7 +347,10 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
   and proxies with idle timeouts do not give up; once the model is ready the server's stream follows
   in the same response. A load that fails, or an error answer from the server, then arrives as one
   error event in the client's protocol (OpenAI `{"error": ...}`, Anthropic `event: error`) instead of
-  an HTTP error status. A non-streaming request receives no bytes until its model is ready.
+  an HTTP error status, as does a whole-body success answer the stream cannot carry
+  (`upstream_not_a_stream`). A non-streaming request receives no bytes until its model is ready, and
+  so does a request to a route that never streams (`count_tokens`, `input_tokens`, `compact`, `decide`,
+  `systemone`), whatever its `stream` says: it gets the server's own JSON answer and status.
 - **Pooled connections** stay open 6 minutes after a response (advertised as `Keep-Alive:
   timeout=360`, closed 10 s after that), as `infernix-serve`'s `--keep-alive-timeout-sec` default
   ([serving](serving.md)): longer than Bun's 5-minute `fetch` idle timeout, so opencode, whose

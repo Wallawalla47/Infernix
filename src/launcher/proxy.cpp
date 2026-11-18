@@ -470,6 +470,18 @@ void forward_after_load(const httplib::Request& request, httplib::Response& resp
                     sink.done();
                     return true;
                 }
+                // A 200 that is not an event stream cannot continue the stream this answer started (pump_stream relays
+                // only stream chunks): one error event says so instead of an empty stream.
+                if (bridge->whole) {
+                    bridge->outcome.status = 502;
+                    bridge->outcome.error  = "infernix-serve answered a streamed request with a whole body";
+                    lock.unlock();
+                    const std::string event = error_event(dialect, "upstream_not_a_stream", bridge->outcome.error);
+                    bridge->delivered(event);
+                    sink.write(event.data(), event.size());
+                    sink.done();
+                    return true;
+                }
             }
             return pump_stream(bridge, sink, dialect);
         },

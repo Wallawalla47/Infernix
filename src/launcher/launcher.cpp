@@ -219,6 +219,14 @@ std::string rfc3339(std::int64_t ms) {
     return buffer;
 }
 
+// Whether a public route's answer can be an event stream (the generation routes), not JSON only.
+bool route_streams(std::string_view path) {
+    for (const std::string_view json_only : {"/count_tokens", "/input_tokens", "/compact", "/decide", "/systemone"}) {
+        if (path.ends_with(json_only)) { return false; }
+    }
+    return true;
+}
+
 std::string json_body_model(const std::string& body, bool& stream, bool& parsed) {
     parsed = false;
     stream = false;
@@ -2398,7 +2406,10 @@ void Launcher::handle_generation(const Request& request, Response& response, Api
     }
     bool stream = false, parsed = false;
     const std::string name = json_body_model(request.body, stream, parsed);
-    call.stream            = stream;
+    // Only the generation routes stream: count_tokens, input_tokens, compact and decide answer JSON whatever
+    // `stream` says, so they wait for a load and relay that JSON instead of starting an event stream for it.
+    stream      = stream && route_streams(request.path);
+    call.stream = stream;
     if (!name.empty()) { call.model = name; }
     if (!parsed) {
         call.error = "the body is not a JSON object";
