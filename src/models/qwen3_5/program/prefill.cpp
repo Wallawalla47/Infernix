@@ -253,6 +253,109 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
             prompt.positions[2 * tokens + token]};
 }
 
+// QK-02, the pair window: a prompt's last pass whose exact tap leaves a short tail (the generation opener's: the next
+// turn re-renders the history after it) runs as one pass instead of two, the tap's state written inside it
+// (TextContext::set_prefill_pair_tap). The tap the head pass would realize (hybrid_tap_due; the drafter ring's floor
+// already planned for it) takes its room here, before the pass that writes it, and is published after it. With
+// nothing due there the pass runs whole (a split that captures nothing is a pass for nothing). Without room now (a
+// slot the previous request's snapshots still hold while their Host copies land) the pass is cut as before, and the
+// capture after its head pass tries again and counts what it finds.
+//
+// One prefill pass's pair window, from before the pass to the publication after it. A reservation the pass did not
+// get to publish (it failed, or a step between the reservation and the pass did) gives its room back when the window
+// ends: the guard holds from before anything is reserved.
+class PairWindow {
+public:
+    // A pass starts without a pair tap.
+    PairWindow(ProgramImpl& program, SequenceState& sequence, execution::PrefillContext& schedule)
+        : program_(program), sequence_(sequence), schedule_(schedule) {
+        schedule_.pair_tap_frontier = -1;
+        schedule_.pair_tap_slot     = -1;
+    }
+
+    ~PairWindow() {
+        if (!tap_) { return; }
+        try {
+            program_.hybrid_release_reserved(sequence_, *tap_);
+        } catch (...) {} // the pass's own failure is the one that propagates
+    }
+
+    PairWindow(const PairWindow&)            = delete;
+    PairWindow& operator=(const PairWindow&) = delete;
+
+    // The pass of `width` tokens from staged.cursor (reaching the prompt end when `final_candidate`) is cut at the
+    // lane's exact tap `tap` (`split_frontier`). As a pair window it runs whole (`split_frontier` reset), writing the
+    // state of the tap due there into the room reserved for it, or with nothing due there; without room it stays cut.
+    void plan(const HybridLaneState& lane, const RequestControl::Prefill& staged, std::uint32_t tap,
+              std::uint32_t width, bool final_candidate, std::optional<std::uint32_t>& split_frontier) {
+        if (!qualifies(lane, staged, tap, width, final_candidate)) { return; }
+        const std::optional<ProgramImpl::HybridTapDue> due =
+            program_.hybrid_tap_due(sequence_, tap, staged.prompt_tokens, false);
+        if (!due) {
+            (void)program_.hybrid_tap_due(sequence_, tap, staged.prompt_tokens); // the cut's bookkeeping
+            split_frontier.reset();
+            return;
+        }
+        bool no_room = false;
+        tap_         = program_.hybrid_reserve_tap(sequence_, tap, due->boundary, true, no_room);
+        // Every slot may still hold one of the previous request's snapshots whose Host copy is landing (none may give
+        // its Device copy up yet): the copies that landed are published (non-blocking) and the room asked for again
+        // (2026-11-17, 27B: without it 13 of 48 opener turns found no room at once and fell back to the cut).
+        if (!tap_ && no_room) {
+            program_.hybrid_->poll();
+            tap_ = program_.hybrid_reserve_tap(sequence_, tap, due->boundary, true, no_room);
+        }
+        if (tap_) {
+            (void)program_.hybrid_tap_due(sequence_, tap, staged.prompt_tokens); // its bookkeeping
+            due_ = due;
+            split_frontier.reset();
+            schedule_.pair_tap_frontier = tap;
+            schedule_.pair_tap_slot     = program_.state_store->physical_slot(tap_->image);
+        }
+    }
+
+    // After the pass, which wrote the reserved tap's image: it is published as the cut's capture after its head pass
+    // would be (hybrid_capture_tap's checks, then hybrid_after_prefill_chunk's retry bookkeeping).
+    void publish() {
+        if (!tap_) { return; }
+        const HybridPendingTap reserved = *tap_;
+        tap_.reset();
+        program_.hybrid_lanes_[sequence_.lane].tap_retry = false;
+        if (reserved.frontier <= sequence_.text_kv_valid && program_.dflash_ring_whole(sequence_, reserved.frontier)) {
+            program_.hybrid_publish_reserved(sequence_, reserved, due_->retry_only);
+        } else {
+            program_.hybrid_release_reserved(sequence_, reserved);
+            if (!due_->retry_only) { ++program_.hybrid_->counters().taps_skipped; }
+        }
+    }
+
+private:
+    // Whether the pass may run as a pair window at `tap`: a tail of 2-8 tokens past it (the generation opener's), a
+    // head of two or more, no other exact tap in the tail, one text window (no Vision), no KV window to cut.
+    [[nodiscard]] bool qualifies(const HybridLaneState& lane, const RequestControl::Prefill& staged, std::uint32_t tap,
+                                 std::uint32_t width, bool final_candidate) const {
+        if (!testing::pair_windows() || !final_candidate || staged.vision || program_.state_images->has_kv_window() ||
+            width > program_.idle_prefill_width || tap <= staged.cursor + 1U || tap + 2U > staged.prompt_tokens ||
+            staged.prompt_tokens - tap > kPairTailTokens) {
+            return false;
+        }
+        for (std::size_t i = lane.next_tap; i < lane.taps.size(); ++i) {
+            const runtime::prefix_cache::PlannedTap& planned = lane.taps[i];
+            if (planned.placement == runtime::prefix_cache::TapPlacement::Exact && planned.position > tap &&
+                planned.position < staged.prompt_tokens) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ProgramImpl& program_;
+    SequenceState& sequence_;
+    execution::PrefillContext& schedule_;
+    std::optional<HybridPendingTap> tap_;
+    std::optional<ProgramImpl::HybridTapDue> due_;
+};
+
 } // namespace
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
@@ -699,25 +802,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
             return std::nullopt;
         };
-        // QK-02: whether a pass of `width` tokens that reaches the prompt end (`final_candidate`) runs as a pair
-        // window at its exact tap `tap`: a tail of 2-8 tokens past it (the generation opener's), a head of two or
-        // more, no other exact tap in the tail, one text window (no Vision), no KV window to cut.
-        const auto pair_window = [&](std::uint32_t tap, std::uint32_t width, bool final_candidate) {
-            if (!testing::pair_windows() || !final_candidate || staged.vision ||
-                state_images->has_kv_window() ||
-                width > idle_prefill_width || tap <= staged.cursor + 1U || tap + 2U > staged.prompt_tokens ||
-                staged.prompt_tokens - tap > kPairTailTokens) {
-                return false;
-            }
-            for (std::size_t i = hybrid_lane->next_tap; i < hybrid_lane->taps.size(); ++i) {
-                const runtime::prefix_cache::PlannedTap& planned = hybrid_lane->taps[i];
-                if (planned.placement == runtime::prefix_cache::TapPlacement::Exact && planned.position > tap &&
-                    planned.position < staged.prompt_tokens) {
-                    return false;
-                }
-            }
-            return true;
-        };
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
         if (hybrid_taps_left()) {
@@ -874,56 +958,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     if (rewrite_split != rewrite_frontiers.end()) { consider(*rewrite_split); }
                     schedule_state.dflash_context_floor = static_cast<std::int64_t>(read > window ? read - window : 0U);
                 }
-                // QK-02, the pair window: a prompt's last pass whose exact tap leaves a short tail (the generation
-                // opener's: the next turn re-renders the history after it) runs as one pass instead of two, the tap's
-                // state written inside it (TextContext::set_prefill_pair_tap). The tap the head pass would realize
-                // (hybrid_tap_due; the floor above already planned the drafter's ring for it) takes its room here,
-                // before the pass that writes it, and is published after it. With nothing due there the pass runs
-                // whole (a split that captures nothing is a pass for nothing). Without room now (a slot the previous
-                // request's snapshots still hold while their Host copies land) the pass is cut as before, and the
-                // capture after its head pass tries again and counts what it finds.
-                schedule_state.pair_tap_frontier = -1;
-                schedule_state.pair_tap_slot     = -1;
-                std::optional<HybridPendingTap> pair_tap;
-                // A reservation the pass did not get to publish (it failed, or a step between the reservation and
-                // the pass did) gives its room back.
-                struct ReleasePairTap {
-                    ProgramImpl& program;
-                    SequenceState& sequence;
-                    std::optional<HybridPendingTap>& tap;
-                    ~ReleasePairTap() {
-                        if (!tap) { return; }
-                        try {
-                            program.hybrid_release_reserved(sequence, *tap);
-                        } catch (...) {} // the pass's own failure is the one that propagates
-                    }
-                } release_pair_tap{*this, sequence, pair_tap};
-                std::optional<HybridTapDue> pair_due;
-                if (hybrid_split && split_frontier == hybrid_split &&
-                    pair_window(*hybrid_split, remaining, final_candidate)) {
-                    if (const std::optional<HybridTapDue> due =
-                            hybrid_tap_due(sequence, *hybrid_split, staged.prompt_tokens, false)) {
-                        bool no_room = false;
-                        pair_tap = hybrid_reserve_tap(sequence, *hybrid_split, due->boundary, true, no_room);
-                        // Every slot may still hold one of the previous request's snapshots whose Host copy is landing
-                        // (none may give its Device copy up yet): the copies that landed are published (non-blocking)
-                        // and the room asked for again (2026-11-17, 27B: without it 13 of 48 opener turns found no
-                        // room at once and fell back to the cut).
-                        if (!pair_tap && no_room) {
-                            hybrid_->poll();
-                            pair_tap = hybrid_reserve_tap(sequence, *hybrid_split, due->boundary, true, no_room);
-                        }
-                        if (pair_tap) {
-                            (void)hybrid_tap_due(sequence, *hybrid_split, staged.prompt_tokens); // its bookkeeping
-                            pair_due = due;
-                            split_frontier.reset();
-                            schedule_state.pair_tap_frontier = *hybrid_split;
-                            schedule_state.pair_tap_slot     = state_store->physical_slot(pair_tap->image);
-                        }
-                    } else {
-                        (void)hybrid_tap_due(sequence, *hybrid_split, staged.prompt_tokens); // the cut's bookkeeping
-                        split_frontier.reset();
-                    }
+                // QK-02's pair window: a prompt's last pass cut at its exact tap may run whole, writing the tap's
+                // state inside it (PairWindow).
+                PairWindow pair_window(*this, sequence, schedule_state);
+                if (hybrid_split && split_frontier == hybrid_split) {
+                    pair_window.plan(*hybrid_lane, staged, *hybrid_split, remaining, final_candidate, split_frontier);
                 }
                 if (offload) {
                     std::uint32_t expected = std::min(idle_prefill_width, remaining);
@@ -987,19 +1026,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
                 sequence.tail_hidden_valid = true;
-                if (pair_tap) {
-                    // The pass wrote the tap's image: it is published as the cut's capture after its head pass would
-                    // be (hybrid_capture_tap's checks, then hybrid_after_prefill_chunk's retry bookkeeping).
-                    const HybridPendingTap reserved = *pair_tap;
-                    pair_tap.reset();
-                    hybrid_lanes_[sequence.lane].tap_retry = false;
-                    if (reserved.frontier <= sequence.text_kv_valid && dflash_ring_whole(sequence, reserved.frontier)) {
-                        hybrid_publish_reserved(sequence, reserved, pair_due->retry_only);
-                    } else {
-                        hybrid_release_reserved(sequence, reserved);
-                        if (!pair_due->retry_only) { ++hybrid_->counters().taps_skipped; }
-                    }
-                }
+                pair_window.publish();
                 if (hybrid_lane != nullptr && !result.finalized) {
                     hybrid_after_prefill_chunk(sequence, staged.cursor, staged.prompt_tokens);
                 }
