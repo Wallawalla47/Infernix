@@ -4,6 +4,7 @@
 // service's role) including a straddling record, a resident key served without a read, duplicate
 // demands sharing a ticket, admission of hot landings at the next boundary (the victims lose their
 // host copy, the dirty set names both), ring exhaustion reusing finished slots, a failed read,
+// fill reads that time out (scatter runs and single records), a failed stream read and refill,
 // destruction with reads in flight, unpinned records (a refused pin chunk becoming unpinned
 // records, their startup fill, CPU demands served in place and never admitted), a RAM resize
 // (pinned chunks and unpinned records given back and taken again, refilled from the file), and an
@@ -1208,6 +1209,111 @@ void test_fill_timeout(const ExpertStore& store) {
     tier.controller().check();
 }
 
+// The read agent's single reads at their edges. A fill read of a record of its own (keys 0, 2 and 4 do not follow each
+// other, and the straddling record has two segments: five reads) that times out is read again, each segment once: its
+// first read and the queue's own retry stalled (ten issues), the fill lands; with the agent's reads stalled too (twenty
+// issues), a segment is not read a third time and the fill fails. A stream read and a refill of an unreadable record
+// fail on their own (the next ones land).
+void test_agent_read_edges(const ExpertStore& store) {
+    const std::vector<std::uint32_t> singles{0, 2, 4, kStraddle};
+    for (const std::uint32_t stalled : {10U, 20U}) {
+        auto o                  = options();
+        o.io.timeout            = std::chrono::milliseconds(250);
+        o.io_faults.stall_read  = 1;
+        o.io_faults.stall_count = stalled;
+        HostExpertTier tier(store, o);
+        std::uint32_t filled = 0;
+        bool threw           = false;
+        try {
+            filled = tier.prefill(singles);
+        } catch (const std::runtime_error&) { threw = true; }
+        if (stalled == 10) {
+            bool exact = !threw;
+            for (const std::uint32_t k : singles) { exact = exact && matches(tier.record(k), k); }
+            check(!threw && filled == 4 && exact, "single fill timeout: every record lands, read again");
+            check(tier.stats().fill_retries == 5 && tier.stats().fills_undone == 0,
+                  "single fill timeout: each segment (the straddler's two) was read again once");
+        } else {
+            check(threw && tier.stats().fills_undone == 1, "single fill timeout: a segment timing out again fails the fill");
+            // The next fill (no read stalls now) lands, and its statistics count the failed fill's five reads again:
+            // none was read a third time.
+            const std::vector<std::uint32_t> next{10, 11, 12};
+            check(tier.prefill(next) == 3 && matches(tier.record(10), 10) && matches(tier.record(12), 12) &&
+                      tier.stats().fill_retries == 5,
+                  "single fill timeout: no segment is read a third time, and the next fill lands");
+        }
+        tier.controller().check();
+    }
+    {
+        auto o   = options();
+        o.stream = 4;
+        HostExpertTier tier(store, o);
+        std::vector<std::uint32_t> ranked(kKeys);
+        for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+        check(tier.prefill(ranked) == 50 && tier.lend_stream(4) == 4, "stream edges: four stream slots");
+        const std::int32_t bad = tier.stream_read(kKeys - 1);
+        check(bad >= 0 && tier.stream_wait(bad) == nullptr, "stream edges: an unreadable record's stream read fails");
+        tier.stream_release(bad);
+        // Neighbours in file B: read as one scatter run when the agent takes them together, which depends on when it
+        // wakes; the batch is read again (up to 50 times) until one did, every record checked each time.
+        // The statistics are the agent's counts as the last boundary read them.
+        const auto boundary = [&] {
+            tier.begin_round(32);
+            tier.end_round();
+        };
+        const std::uint32_t keys[] = {61, 62, 63, 64};
+        std::uint64_t reads = 1, tries = 0;
+        bool all = true, ran = false;
+        while (!ran && tries < 50) {
+            boundary();
+            const std::uint64_t runs = tier.stats().run_reads;
+            std::int32_t slots[4];
+            for (int i = 0; i < 4; ++i) { slots[i] = tier.stream_read(keys[i]); }
+            for (int i = 0; i < 4; ++i) { all = all && slots[i] >= 0 && matches(tier.stream_wait(slots[i]), keys[i]); }
+            for (const std::int32_t s : slots) { tier.stream_release(s); }
+            reads += 4;
+            ++tries;
+            boundary(); // a run is counted when it is issued, before its records land
+            ran = tier.stats().run_reads > runs;
+        }
+        // A read's state is published before the agent counts it: boundaries until the count catches up (2 s at most).
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (tier.stats().stream_reads != reads && std::chrono::steady_clock::now() < until) { boundary(); }
+        check(all && tier.stats().stream_reads == reads, "stream edges: the next stream reads land");
+        std::cout << "stream edges: four neighbouring stream reads " << (ran ? "took a scatter run" : "never took a scatter run")
+                  << " after " << tries << " batch(es)\n";
+        tier.return_stream();
+        tier.controller().check();
+    }
+    {
+        HostExpertTier tier(store, options());
+        auto& host = tier.controller();
+        {
+            const std::vector<std::uint32_t> hot{kKeys - 1, 60};
+            tier.record_uses(1, hot, 1000.0);
+        }
+        std::uint32_t target = 0;
+        check(host.vram_evicted(kKeys - 1, true, target) == expert_cache::VramEviction::kDemote, "refill edges: a demotion");
+        const std::uint32_t id = tier.refill(kKeys - 1, target);
+        check(id != HostExpertTier::kNoRefill, "refill edges: its refill is queued");
+        while (tier.refill_state(id) == 0) { std::this_thread::yield(); }
+        check(tier.refill_state(id) == 2, "refill edges: an unreadable record's refill fails");
+        tier.refill_release(id);
+        host.demotion_failed(kKeys - 1, target);
+        check(tier.record(kKeys - 1) == nullptr, "refill edges: the failed refill's key keeps no host copy");
+        std::uint32_t next = 0;
+        check(host.vram_evicted(60, true, next) == expert_cache::VramEviction::kDemote, "refill edges: a second demotion");
+        const std::uint32_t again = tier.refill(60, next);
+        check(again != HostExpertTier::kNoRefill, "refill edges: the next refill is queued");
+        while (tier.refill_state(again) == 0) { std::this_thread::yield(); }
+        check(tier.refill_state(again) == 1, "refill edges: the next refill lands");
+        tier.refill_release(again);
+        host.demotion_completed(60, next, false);
+        check(matches(tier.record(60), 60), "refill edges: the refilled record is in RAM");
+        host.check();
+    }
+}
+
 // The idle refill in pieces: a growth's room is filled at most max_bytes a call, best-ranked first, and stays
 // unfilled until the last piece.
 void test_fill_room_pieces(const ExpertStore& store) {
@@ -1940,6 +2046,7 @@ int main(int argc, char** argv) {
         test_record_fills(store);
         test_failed_fill(store);
         test_fill_timeout(store);
+        test_agent_read_edges(store);
         test_fill_room_pieces(store);
         test_resize_queued_record(store);
         test_agent_stop(store);
