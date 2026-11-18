@@ -92,8 +92,9 @@ struct Shape {
 constexpr Shape kFlashNext{2560, 640, 10};
 constexpr Shape kQwen3_5_122B{3072, 1024, 8};
 
+// `checked`: the routed entries (column * top_k + rank) the oracle checks; empty checks every entry.
 void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint32_t seed,
-              Shape shape = kFlashNext) {
+              Shape shape = kFlashNext, const std::vector<std::int64_t>& checked = {}) {
     const std::int32_t H = shape.hidden, I = shape.intermediate, K = shape.top_k;
     const auto gate_up = qw::make_patterned_weight(qtype, experts * 2 * I, H, seed,
                                                    {qw::RowSplitScalePattern::Small, qw::RowSplitCodePattern::Hashed});
@@ -137,8 +138,14 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
     const Decoder gu{gate_up, qtype}, dn{down, qtype};
     long bad = 0;
     double worst = 0;
-    for (std::int32_t t = 0; t < columns; ++t) {
-        for (std::int32_t j = 0; j < K; ++j) {
+    std::vector<std::int64_t> entries = checked;
+    if (entries.empty()) {
+        entries.resize(static_cast<std::size_t>(K) * columns);
+        std::iota(entries.begin(), entries.end(), std::int64_t{0});
+    }
+    for (const std::int64_t entry : entries) {
+        {
+            const std::int32_t t = static_cast<std::int32_t>(entry / K), j = static_cast<std::int32_t>(entry % K);
             const std::int64_t e = ids[static_cast<std::size_t>(t) * K + j];
             std::vector<double> h(I);
             for (std::int32_t r = 0; r < I; ++r) {
@@ -167,7 +174,8 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
     }
     const std::string tag = std::string(qtype == QType::Q8_G32_FP16 ? "q8" : qtype == QType::Q2_G64_FP16 ? "q2" : "q4") +
                             " H=" + std::to_string(H) + " I=" + std::to_string(I) + " E=" + std::to_string(experts) +
-                            " T=" + std::to_string(columns);
+                            " T=" + std::to_string(columns) +
+                            (checked.empty() ? std::string() : " (" + std::to_string(entries.size()) + " entries)");
     std::cout << tag << ": worst error " << worst << " of the bound, " << bad << " outside\n";
     check(bad == 0, tag + " within the bound");
     cudaFree(gu_payload);
@@ -195,6 +203,19 @@ INFERNIX_OP_TEST(resident_moe) {
         run_case(QType::Q4_G64_FP16, 10, 1, 15, kQwen3_5_122B);
         run_case(QType::Q4_G64_FP16, 12, 4, 17, kQwen3_5_122B);
         run_case(QType::Q8_G32_FP16, 9, 2, 19, kQwen3_5_122B);
+        // A call of more than 65,535 entries (8,200 columns at the 122B drafter's top-8: 65,600), whose grid rows
+        // wrap: every entry of the second pass over the rows (65,535..65,599), the first pass's entries of the
+        // rows that run twice (0..64: a second pass must not overwrite them), and entries spread over the rest of
+        // the first pass, its last included.
+        {
+            constexpr std::int64_t kRows = 65'535, kEntries = 8'200LL * 8;
+            std::vector<std::int64_t> wrapped;
+            for (std::int64_t entry = 0; entry < kEntries - kRows; ++entry) { wrapped.push_back(entry); }
+            for (std::int64_t entry = kRows; entry < kEntries; ++entry) { wrapped.push_back(entry); }
+            for (std::int64_t entry = kEntries - kRows + 4'681; entry < kRows; entry += 4'681) { wrapped.push_back(entry); }
+            wrapped.push_back(kRows - 1);
+            run_case(QType::Q4_G64_FP16, 12, 8'200, 21, kQwen3_5_122B, wrapped);
+        }
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;
