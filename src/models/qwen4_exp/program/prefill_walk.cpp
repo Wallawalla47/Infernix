@@ -10,7 +10,10 @@
 // after chunks 0..c-1), so every output bit equals the chunk-major prefill's. Only placement
 // differs (resident, streamed or staged experts), which the MoE's arithmetic does not see. A
 // layer's MoE runs once per group of consecutive chunks (walk_.groups, up to kWalkMoeColumns
-// columns): every MoE step acts column by column, so grouping changes no bit either.
+// columns): its router, routed experts and combine act column by column, and its dense shared
+// expert, whose projections pick their routes by width, gave each chunk's bits over a group of
+// streamed chunks in every walk infernix_qwen4_exp_forward_real_test --trim-last-layer runs, so
+// grouping changes no bit either.
 //
 // The span's residual stream (BF16 [S*H, tokens]) and every chunk's staged io image live in the
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
@@ -453,20 +456,24 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
     // the route log keeps that chunk's columns, the span's last as walk_step downloads them.
     const execution::ForwardBatch fb = walk_batch(end - 1);
     // YC-01 (forward_call's trim): the last layer's MoE only over the span's last chunk's trailing columns, as that
-    // chunk's chunk-major call runs it (Forward::last_layer_kept of its width); no other final residual is read, so
-    // earlier groups run no MoE in the last layer. The span's last chunk still opens the layer's stream release.
+    // chunk's chunk-major call runs it (Forward::last_layer_kept of its width; its dense shared expert over the whole
+    // chunk); no other final residual is read, so earlier groups run no MoE in the last layer. The span's last chunk
+    // still opens the layer's stream release.
     const std::int32_t last_width = walk_.widths.back();
     const std::int32_t kept       = l + 1 == L && trims_last_layer() ? forward_->last_layer_kept(last_width) : 0;
     if (kept > 0) {
         if (end == walk_.widths.size()) {
-            const std::int32_t at = walk_.offsets[end - 1] - walk_.offsets[first] + last_width - kept;
+            const std::int32_t chunk = walk_.offsets[end - 1] - walk_.offsets[first];
+            const std::int32_t at    = chunk + last_width - kept;
+            const Tensor xm_chunk(moe + static_cast<std::size_t>(chunk) * 2ULL * H, DType::BF16, {H, last_width});
             Tensor xm_kept(moe + static_cast<std::size_t>(at) * 2ULL * H, DType::BF16, {H, kept});
             Tensor inject_kept(moe + walk_align(static_cast<std::size_t>(kWalkMoeColumns) * 2ULL * H) +
                                    static_cast<std::size_t>(at) * 4ULL * S,
                                DType::FP32, {S, kept});
             Tensor residual_kept = walk_residual(end - 1, end).slice(1, last_width - kept, kept);
             forward_->begin_call(fb, nullptr);
-            forward_->layer_moe(l, fb, xm_kept, inject_kept, residual_kept, last_width, last_width - kept);
+            forward_->layer_moe(l, fb, xm_kept, inject_kept, residual_kept, last_width, last_width - kept, 0,
+                                execution::SharedCalls{.x = &xm_chunk});
         }
     } else {
         forward_->begin_call(fb, nullptr);

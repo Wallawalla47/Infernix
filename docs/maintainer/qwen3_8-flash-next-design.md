@@ -2374,36 +2374,37 @@ format from the volume header's format tag (byte 62, written since 2026-10-19: 1
   per cold 4K chunk, −87 to −148 ms). Reading chunk i+1's rows while chunk i computes (gated
   prefill, S4d) is parked (§19.3.4).
 - **MTP KV for the prompt** is built in batch from the chunk residuals.
-- **The last layer's MoE over the read columns** (2026-11-08, candidates YC-01). A prefill call's or forced
-  tokens' final residuals are read only for the logits of its last column when no MTP cells take them
-  (`--spec dflash2`, `off` or n-gram: the MTP block is not bound), no causal scoring exports them and no DFlash2
-  target is the last layer (FP4-Local's companion taps layers 5, 15, 25, 35 and 45 of 48). The last layer then
-  runs its attention half and its MLP-half mix over every column (keys, values, pooled keys, GDN state and the
-  mix as before), and its MoE (router, routed and shared experts, the inject) over the call's trailing
-  `Forward::last_layer_kept` columns only: 256 where the whole call's router takes its MMA form (`router-mma`,
-  256+ columns), else 17 past 16 columns where the last layer's dense shared expert is Q8 or GGUF, else one; a
-  dense shared expert of another format (BF16: recipe A and the official FP8 artifact; row-scaled FP8: recipe C)
-  runs the last layer whole. A
-  layer walk runs no last-layer MoE for its earlier groups and the span's last chunk's trailing columns for the
-  last (that call still releases the layer's ring half); the route log holds -1 for the skipped columns, which the
-  residency and the prompt seed skip. A gated call plans no copy-ahead for a trimmed last layer. The routed experts
-  act column by column (the walk's grouping relies on it), and the router and the shared expert keep the routes
-  the whole call gives them, so the kept columns keep their bits: `infernix_qwen4_exp_forward_real_test
-  --trim-last-layer` compares the logits of prefills of 9 to 16,384 columns trimmed and untrimmed, on the exact
-  routes with `router-mma` off and on (2026-11-18: equal on NVFP4-QAD, NVFP4-QAD Dense8, NVIDIA Dense8, IQ3_S,
-  FP4-Local and recipe A; the FP8 artifact's 114 GiB of pinned weights do not load there). Until 2026-11-18 a
-  dense shared expert kept one column too: its projections take wide routes from 17 columns (Q8 and GGUF) or by
-  width with no class to keep (BF16, row-scaled FP8: keeping 17 still moved recipe A's at 129, 200 and 1,000), so
-  the first token's logits moved by up to 0.023 on NVIDIA Dense8 and IQ3_S and by up to 0.038 on recipe A at 17 to
-  1,000 columns (recipe A also at 9), and by 0.001 on recipe C at 300. The fix changed the first token's bits of
-  those artifacts' prompts back to the untrimmed call's, on the reproducible route and on the default route (IQ3_S's
-  default `ggml-bf16-prefill` acts on its GGUF gate and up and was not compared). FP4-Local's MXFP8
-  shared experts and NVFP4-QAD's routed-bank shared expert were
-  unaffected: FP4-Local's greedy output had been identical with and without the trim at 150-, 2,000- and
-  17,266-token prompts. The fast paths beside `router-mma` were not part of that comparison: `q8-sliced-k` has no
-  entry for the shared expert's shapes, `ggml-bf16-prefill` does act on GGUF shared experts.
-  FP4-Local prefill (INT8 KV, ABBA x3, 12 of 12 blocks ahead): pp512 +1.66 to +1.97 %, pp2048 +1.77 to
-  +1.83 %, pp16384 +0.49 to +0.63 %, pp32768 +0.68 to +0.72 %.
+- **The last layer's MoE over the read columns** (2026-11-08, candidates YC-01; the shared expert 2026-11-18). A
+  prefill call's or forced tokens' final residuals are read only for the logits of its last column when no MTP cells
+  take them (`--spec dflash2`, `off` or n-gram: the MTP block is not bound), no causal scoring exports them and no
+  DFlash2 target is the last layer (FP4-Local's companion taps layers 5, 15, 25, 35 and 45 of 48). The last layer
+  then runs its attention half and its MLP-half mix over every column (keys, values, pooled keys, GDN state and the
+  mix as before), and its router, routed experts and inject over the call's trailing `Forward::last_layer_kept`
+  columns only: 256 where the whole call's router takes its MMA form (`router-mma`, 256+ columns), else one. A dense
+  shared expert still runs over the whole call (`SharedCalls`) and the inject takes its trailing columns: its
+  projections pick their routes by width, and over the kept columns alone they moved the first token's logits by up
+  to 0.023 on NVIDIA Dense8 and IQ3_S (Q8; GGUF gate and up) and 0.038 on recipe A (BF16) at 17 to 1,000 columns, and
+  by 0.001 on recipe C (row-scaled FP8) at 300. A shared expert in the routed bank (NVFP4-QAD) is the routed call's
+  last job and acts column by column. A pair call's tail trims as its own call would, its shared expert over the tail
+  chunk. A layer walk runs no last-layer MoE for its earlier groups and the span's last chunk's trailing columns for
+  the last, its shared expert over that chunk (that call still releases the layer's ring half); the route log holds
+  -1 for the skipped columns, which the residency and the prompt seed skip. A gated call plans no copy-ahead for a
+  trimmed last layer. `infernix_qwen4_exp_forward_real_test --trim-last-layer` checks it, printing each call's kept
+  columns: plain calls of 9 to 16,384 columns and pair calls, trimmed against untrimmed, and walks of two chunks
+  (1,024 + 1,000, 4,096 + 300 and 3,072 + 4,096 columns), trimmed and untrimmed, against the chunk-major calls, on the
+  exact routes with `router-mma` off and on. All equal (2026-11-18) on NVFP4-QAD Dense8, NVIDIA Dense8, IQ3_S,
+  FP4-Local, recipe A and recipe C; the FP8 artifact's 114 GiB of pinned weights do not load there. The fast paths
+  beside `router-mma` were not compared: `q8-sliced-k` has no entry for the shared expert's shapes, and
+  `ggml-bf16-prefill` acts on a GGUF shared expert, which now takes the untrimmed call's width.
+  History: until 2026-11-18 the shared expert ran over the kept columns too. 824d757c then kept 17 columns for Q8 and
+  GGUF shared experts and turned the trim off for every other dense format; the shared expert over the whole call
+  restored it on those with the same bits on the exact routes (both give the untrimmed call's). RTX 5090, default
+  route, INT8 KV, infernix_bench -r 5, a discarded warm-up run and two A-B-B-A blocks (2026-11-18): recipe A pp2048
+  +1.87 % and pp100
+  +1.17 % against 824d757c, and -0.04 % / +0.21 % against the one-column trim before it; NVIDIA Dense8 pp2048 +0.07 %
+  (one column kept instead of 17); FP4-Local pp2048 +0.13 % (its shared expert now runs whole; not a gain of this
+  change). FP4-Local prefill when the trim landed (INT8 KV, ABBA x3, 12 of 12 blocks ahead): pp512 +1.66 to +1.97 %,
+  pp2048 +1.77 to +1.83 %, pp16384 +0.49 to +0.63 %, pp32768 +0.68 to +0.72 %.
 
 ---
 
@@ -8723,7 +8724,10 @@ the drive's knee) remains open.
     since 2026-10-19, 16,384 before, and as far as the group's plan, `Forward::plan_walk_moe`, fits the walk's
     budget: what the expert cache can lend now beside the walk area and the ring, or on the reproducible route a
     figure fixed when the chunk is fitted; the span's wide arena is lent for its groups, §19.3.7).
-    Every MoE step acts column by column, so the outputs are the chunk-major ones; the expert calls
+    The router, routed experts and combine act column by column, and the dense shared expert, whose projections pick
+    their routes by width, gave each chunk's bits over the group in every walk `infernix_qwen4_exp_forward_real_test
+    --trim-last-layer` runs (two chunks of 1,024 + 1,000, 4,096 + 300 and 3,072 + 4,096 columns on six
+    configurations, 2026-11-18), so the outputs are the chunk-major ones; the expert calls
     see 2-8x the columns (the IQ3_S expert tiles run 33-50 % more effective TOPS at 16,384 tokens
     than at 4,096, and 7-14 % more again at 32,768; §19.3.29). The route log keeps the group's last
     chunk (`route_columns`), the span's last as before.

@@ -308,6 +308,15 @@ struct ForwardTap {
 // The QSA geometry of the configuration.
 [[nodiscard]] ops::QsaGeometry qsa_geometry(const TextConfig& config);
 
+// The call a layer's dense shared expert runs as when it is wider than the MoE's columns: a trimmed last layer's whole
+// call (YC-01), whose trailing columns the MoE takes. Its projections pick their routes by the columns they are given
+// (a Q8 projection SIMT at decode widths and tensor-core beyond, BF16's tuned GEMM by width), so over the kept columns
+// alone they gave other bits (Forward::last_layer_kept). `x`: its input (null: the MoE's). A shared expert in the
+// routed bank acts column by column and takes none.
+struct SharedCalls {
+    const Tensor* x = nullptr;
+};
+
 class Forward {
 public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
@@ -330,8 +339,10 @@ public:
     void begin_call(const ForwardBatch& batch, const Tensor* logits);
     void embed(const ForwardBatch& batch, Tensor& residual);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
-    // layer() in two halves, for a walk whose MoE runs once over several chunks' columns (every
-    // step of both halves acts column by column, so the outputs are layer()'s bit for bit).
+    // layer() in two halves, for a walk whose MoE runs once over several chunks' columns (the router, routed
+    // experts and combine act column by column, and the dense shared expert over a group of walked chunks gave each
+    // chunk's bits in every walk infernix_qwen4_exp_forward_real_test --trim-last-layer runs, so the outputs are
+    // layer()'s bit for bit).
     // layer_mixer runs everything before the MoE and writes its input xm (BF16 [H, T]) and its
     // inject weights (FP32 [S, T]) into the caller's tensors; layer_moe runs the MoE over xm (any
     // T, after begin_call of any of its chunks) and injects its output into `residual` (the same
@@ -340,19 +351,17 @@ public:
     // `route_skipped`: columns before the call's own that the route log holds as -1 (a trimmed last layer's call
     // over the trailing columns of a wider one, ForwardBatch::trim_last_layer).
     // `chunk_columns` (run_split's pair call): the first chunk's columns, when xm holds two chunks; the router and
-    // the shared expert then run per chunk (moe).
+    // the shared expert then run per chunk (moe). `shared`: the call the dense shared expert runs as (SharedCalls).
     void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
                    Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped = 0,
-                   std::int32_t chunk_columns = 0);
+                   std::int32_t chunk_columns = 0, SharedCalls shared = {});
     // ForwardBatch::trim_last_layer's width for a call (or a layer walk's chunk) of `columns` columns: 0 when the last
     // layer runs whole (the lossless route, a DFlash2 target layer, the activation scan, or no column to save), else
-    // the trailing columns its MoE runs over: kRouterMmaMinColumns where the full call's router takes its MMA form
-    // (router-mma), else 17 past 16 columns where the last layer's dense shared expert is Q8 or GGUF (its wide routes
-    // from there), else 1; a dense shared expert of another format (BF16 and row-scaled FP8: width-dependent with no
-    // class to keep) runs whole.
-    // The routed experts act column by column, and the router and the shared expert keep the routes the full call
-    // gives them, so the kept columns' outputs are the untrimmed call's bit for bit (infernix_qwen4_exp_forward_real_test
-    // --trim-last-layer: 9 to 16,384 columns on the exact routes and router-mma, six artifacts, 2026-11-18).
+    // the trailing columns its router, routed experts and combine run over: kRouterMmaMinColumns where the full call's
+    // router takes its MMA form (router-mma), else 1. A dense shared expert still runs over the whole call
+    // (SharedCalls::x), whose routes go by width. Those steps act column by column and the router keeps its form, so the
+    // kept columns' outputs are the untrimmed call's bit for bit (infernix_qwen4_exp_forward_real_test --trim-last-layer:
+    // plain and pair calls of 9 to 16,384 columns on the exact routes and router-mma).
     [[nodiscard]] std::int32_t last_layer_kept(std::int32_t columns) const noexcept;
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
     // A pair call (design §19.3.1, the zero-split tap): two consecutive chunks of one lane, `head` then
@@ -465,7 +474,8 @@ private:
                                              Tensor& residual, Tensor& xm, Tensor& inject);
     template <class A> void layer_moe_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
                                            const Tensor& xm, const Tensor& inject, Tensor& residual,
-                                           std::int32_t route_columns, std::int32_t route_skipped, std::int32_t chunk_columns);
+                                           std::int32_t route_columns, std::int32_t route_skipped, std::int32_t chunk_columns,
+                                           SharedCalls shared = {});
     template <class A> void finish_impl(A& a, const ForwardBatch* batch, const FinishShape& shape, Tensor& residual,
                                         Tensor* logits);
     template <class A> void ple_impl(A& a, const PleParameters& p, Tensor& residual, const ForwardBatch* batch,
@@ -488,7 +498,8 @@ private:
     template <class A> Tensor moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uint32_t layer,
                                        Tensor* route_tap, const ForwardBatch* batch, const CallShape& shape,
                                        std::int32_t route_columns, const Tensor* inject, Tensor* residual,
-                                       std::int32_t route_skipped, const Tensor* streams, std::int32_t chunk_columns);
+                                       std::int32_t route_skipped, const Tensor* streams, std::int32_t chunk_columns,
+                                       SharedCalls shared = {});
     template <class A> void mtp_block_impl(A& a, const MtpCall* call, std::int32_t columns, bool kv_only, Tensor& rows);
     // A memoized plan (`kind` names the plan function).
     template <class F> std::size_t memoized(int kind, std::int32_t a, std::int32_t b, std::int32_t c, const F& plan);

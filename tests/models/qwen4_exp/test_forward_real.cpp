@@ -22,7 +22,8 @@
 // bit for bit (check_cpu_columns). With --decode-widths it checks that a decode row's bits do not
 // depend on how many rows share the call, 1 to 8, in every block and the logits
 // (check_decode_widths). With --trim-last-layer it checks that a prefill's trimmed last layer
-// (YC-01) gives the untrimmed call's logits bit for bit (check_trim_last_layer).
+// (YC-01) gives the untrimmed call's logits bit for bit, in plain and pair calls, and that a layer
+// walk of two chunks, trimmed or not, gives the chunk-major calls' (check_trim_last_layer).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -77,6 +78,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -564,10 +566,65 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     return ok;
 }
 
-// --trim-last-layer: YC-01's trim (ForwardBatch::trim_last_layer: a prefill's last layer runs its MoE over the
-// trailing columns alone, Forward::last_layer_kept) gives the logit column the untrimmed call's bits. Prefills of
-// 9 to 16,384 columns of the text (each on a fresh harness), trimmed and untrimmed, with router-mma off and on (on,
-// a call of 256 columns or more keeps 256), on the exact routes: the logits compared bit for bit.
+// A layer walk of two chunks as ProgramImpl::walk_step / walk_moe run it (prefill_walk.cpp), on Forward's public steps:
+// each chunk's embedding and every layer's mixer chunk by chunk, every layer's MoE once over both chunks, the last
+// layer's over the last chunk's trailing columns when `trim` (its dense shared expert over that chunk); the last chunk's
+// logits.
+std::vector<float> walk_logits(const q4::execution::Parameters& parameters, DeviceContext& device,
+                               const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv,
+                               q4::execution::ForwardFastPaths fast, std::int32_t w0, std::int32_t w1, bool trim,
+                               std::int32_t& kept) {
+    const auto& c     = parameters.model.config().text;
+    const auto vocab  = static_cast<std::int32_t>(c.vocab_size);
+    const std::int32_t W = w0 + w1, H = static_cast<std::int32_t>(c.hidden_size);
+    const auto S = static_cast<std::int32_t>(c.hc.streams), R = static_cast<std::int32_t>(c.residual_width());
+    Harness harness(parameters, device, std::max<std::int32_t>(256, (W + 63) / 64 * 64), W, 1, kv, fast);
+    auto& f    = *harness.forward;
+    auto call0 = make_call(c, volume, {tokens}, 0, w0, {0}, {0});
+    auto call1 = make_call(c, volume, {tokens}, w0, w1, {0}, {0});
+    call1.batch.trim_last_layer = trim;
+    DeviceBuffer residual_buffer(2ULL * R * W), xm_buffer(2ULL * H * W), inject_buffer(4ULL * S * W);
+    Tensor residual(residual_buffer.p, DType::BF16, {R, W}), xm(xm_buffer.p, DType::BF16, {H, W});
+    Tensor inject(inject_buffer.p, DType::FP32, {S, W});
+    Tensor residual0 = residual.slice(1, 0, w0), residual1 = residual.slice(1, w0, w1);
+    Tensor xm0 = xm.slice(1, 0, w0), xm1 = xm.slice(1, w0, w1);
+    Tensor inject0 = inject.slice(1, 0, w0), inject1 = inject.slice(1, w0, w1);
+    f.begin_call(call0.batch, nullptr);
+    f.embed(call0.batch, residual0);
+    f.begin_call(call1.batch, nullptr);
+    f.embed(call1.batch, residual1);
+    const std::uint32_t L       = c.num_hidden_layers;
+    kept                        = trim ? f.last_layer_kept(w1) : 0;
+    for (std::uint32_t l = 0; l < L; ++l) {
+        f.begin_call(call0.batch, nullptr);
+        f.layer_mixer(l, call0.batch, residual0, xm0, inject0);
+        f.begin_call(call1.batch, nullptr);
+        f.layer_mixer(l, call1.batch, residual1, xm1, inject1);
+        f.begin_call(call1.batch, nullptr);
+        if (l + 1 == L && kept > 0) {
+            const Tensor xm_kept     = xm.slice(1, W - kept, kept);
+            const Tensor inject_kept = inject.slice(1, W - kept, kept);
+            Tensor residual_kept     = residual.slice(1, W - kept, kept);
+            f.layer_moe(l, call1.batch, xm_kept, inject_kept, residual_kept, w1, w1 - kept, 0,
+                        q4::execution::SharedCalls{.x = &xm1});
+        } else {
+            f.layer_moe(l, call1.batch, xm, inject, residual, w1);
+        }
+    }
+    DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+    Tensor out(logits.p, DType::FP32, {vocab, 1});
+    f.begin_call(call1.batch, &out);
+    f.finish(call1.batch, residual1, &out);
+    device.synchronize();
+    return to_float(logits, static_cast<std::size_t>(vocab));
+}
+
+// --trim-last-layer: YC-01's trim (ForwardBatch::trim_last_layer: a prefill's last layer runs its router, routed
+// experts and combine over the trailing columns alone, Forward::last_layer_kept, and its dense shared expert over the
+// whole call) gives the logit column the untrimmed call's bits. Prefills of 9 to 16,384 columns of the text, and pair
+// calls (run_split) whose tail trims (each on a fresh harness), trimmed and untrimmed, with router-mma off and on (on,
+// a call of 256 columns or more keeps 256), on the exact routes: the logits compared bit for bit. Each line prints
+// the kept columns (0: nothing trims, so the line holds trivially).
 bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceContext& device,
                            const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv) {
     const auto& c     = parameters.model.config().text;
@@ -575,9 +632,24 @@ bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceCo
     const auto vocab  = static_cast<std::int32_t>(c.vocab_size);
     bool ok           = true;
     int compared      = 0;
+    const auto compare = [&](const std::string& label, const std::vector<float> (&rows)[2], std::int32_t kept) {
+        std::int32_t differing = 0;
+        double largest         = 0.0;
+        for (std::int32_t v = 0; v < vocab; ++v) {
+            if (std::memcmp(&rows[0][v], &rows[1][v], sizeof(float)) != 0) {
+                ++differing;
+                largest = std::max(largest, std::fabs(static_cast<double>(rows[0][v]) - rows[1][v]));
+            }
+        }
+        std::printf("%s (%d kept): trimmed logits %s (%d of %d differ, largest %.3g)\n", label.c_str(), kept,
+                    differing == 0 ? "equal" : "DIFFER", differing, vocab, largest);
+        ok = ok && differing == 0;
+        ++compared;
+    };
     for (const bool router_mma : {false, true}) {
         q4::execution::ForwardFastPaths fast{};
         fast.router_mma = router_mma;
+        const std::string mode = std::string("router-mma ") + (router_mma ? "on" : "off");
         // Both sides of every width where a route of the last layer's MoE may change, to the default prefill chunk.
         for (const std::int32_t width : {9, 16, 17, 18, 32, 33, 64, 65, 96, 97, 128, 129, 200, 255, 256, 257, 300, 512,
                                          1000, 4096, 16384}) {
@@ -596,19 +668,54 @@ bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceCo
                 device.synchronize();
                 rows[trim] = to_float(logits, static_cast<std::size_t>(vocab));
             }
-            std::int32_t differing = 0;
-            double largest         = 0.0;
-            for (std::int32_t v = 0; v < vocab; ++v) {
-                if (std::memcmp(&rows[0][v], &rows[1][v], sizeof(float)) != 0) {
-                    ++differing;
-                    largest = std::max(largest, std::fabs(static_cast<double>(rows[0][v]) - rows[1][v]));
-                }
+            compare(mode + ", " + std::to_string(width) + " columns", rows, kept);
+        }
+        // Pair calls (the zero-split tap): a head chunk, then a tail that trims as its own call would; the tail's
+        // dense shared expert runs over the tail alone.
+        for (const auto [head, tail] : {std::pair{95, 5}, std::pair{500, 17}, std::pair{1000, 200}, std::pair{3000, 300}}) {
+            if (head + tail > n) { continue; }
+            const std::int32_t context = std::max<std::int32_t>(256, (head + tail + 63) / 64 * 64);
+            std::vector<float> rows[2];
+            std::int32_t kept = 0;
+            for (const int trim : {0, 1}) {
+                Harness harness(parameters, device, context, head + tail, 1, kv, fast);
+                if (trim == 1) { kept = harness.forward->last_layer_kept(tail); }
+                auto head_call                  = make_call(c, volume, {tokens}, 0, head, {0}, {0});
+                auto tail_call                  = make_call(c, volume, {tokens}, head, tail, {0}, {0});
+                tail_call.batch.trim_last_layer = trim == 1;
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run_split(head_call.batch, tail_call.batch, out, Tensor{}, [](std::uint32_t) {});
+                device.synchronize();
+                rows[trim] = to_float(logits, static_cast<std::size_t>(vocab));
             }
-            std::printf("router-mma %s, %d columns (%d kept): trimmed logits %s (%d of %d differ, largest %.3g)\n",
-                        router_mma ? "on" : "off", width, kept, differing == 0 ? "equal" : "DIFFER", differing, vocab,
-                        largest);
-            ok = ok && differing == 0;
-            ++compared;
+            compare(mode + ", pair " + std::to_string(head) + " + " + std::to_string(tail) + " columns", rows, kept);
+        }
+        // Layer walks of two chunks against the chunk-major calls: untrimmed (every layer's MoE once over both chunks)
+        // and with the last layer trimmed.
+        for (const auto [w0, w1] : {std::pair{1024, 1000}, std::pair{4096, 300}, std::pair{3072, 4096}}) {
+            if (w0 + w1 > n) { continue; }
+            std::vector<float> chunk_major;
+            {
+                Harness harness(parameters, device, std::max<std::int32_t>(256, (w0 + w1 + 63) / 64 * 64), w0 + w1, 1, kv,
+                                fast);
+                auto call0 = make_call(c, volume, {tokens}, 0, w0, {0}, {0});
+                auto call1 = make_call(c, volume, {tokens}, w0, w1, {0}, {0});
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run(call0.batch, out);
+                harness.forward->run(call1.batch, out);
+                device.synchronize();
+                chunk_major = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            const std::string label = mode + ", walk " + std::to_string(w0) + " + " + std::to_string(w1) + " columns";
+            std::int32_t kept = 0;
+            for (const bool trim : {false, true}) {
+                std::vector<float> rows[2] = {chunk_major, walk_logits(parameters, device, volume, tokens, kv, fast, w0,
+                                                                       w1, trim, kept)};
+                compare(label + (trim ? ", last layer trimmed, against chunk-major" : ", against chunk-major"), rows,
+                        kept);
+            }
         }
     }
     if (compared == 0) { throw std::invalid_argument("--trim-last-layer needs at least 9 tokens"); }
