@@ -94,7 +94,9 @@ def test_numbered_names_every_file_as_a_shard(tmp_path):
     assert report["files"] == names
 
 
-@pytest.mark.parametrize("blocker", ["model.infernix", "model.infernix.part-0002"])
+@pytest.mark.parametrize(
+    "blocker", ["model.infernix", "model.infernix.part-0002", "model.infernix.conversion.json"]
+)
 def test_existing_target_leaves_the_set_unchanged(tmp_path, blocker):
     old = tmp_path / "model.ninfer"
     _sharded(old)

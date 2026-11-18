@@ -89,7 +89,12 @@ def _plan(
         + bytes(payload_offset - HEADER.size - new_json_bytes)
     )
     new_entry = entry.parent / names[0]
-    for target in [new for _, new in renames] + [new_entry]:
+    targets = [new for _, new in renames] + [new_entry]
+    if entry.with_name(entry.name + REPORT_SUFFIX).exists():
+        # The report follows the files (_rename_report): a stale report at its new name must refuse the rename
+        # before anything moves.
+        targets.append(new_entry.with_name(new_entry.name + REPORT_SUFFIX))
+    for target in targets:
         if target.exists():
             raise ArtifactError(f"{target} already exists")
     return new_entry, renames, old_region, new_region

@@ -99,7 +99,7 @@ def compare_artifacts(first: Artifact, second: Artifact) -> dict:
     for key in sorted(set(ua) & set(ub)):
         x, y = ua[key], ub[key]
         xa, ya = x.get("auxiliaries", {}), y.get("auxiliaries", {})
-        if x["activation_policy"] != y["activation_policy"] or set(xa) != set(ya) or not all(
+        if x.get("activation_policy") != y.get("activation_policy") or set(xa) != set(ya) or not all(
             comparison.same_reference(xa[role], ya[role]) for role in xa
         ):
             differing_uses.append(key)

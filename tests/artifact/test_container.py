@@ -284,3 +284,28 @@ def test_compare_matches_bindings_by_name_and_bytes(tmp_path):
     assert report["components_equal"] and report["metadata_equal"]
     assert report["differing_uses"] == [] and report["differing_resources"] == []
     assert report["resources_only_in_one"] == []
+
+
+def test_compare_uses_without_activation_policy(tmp_path):
+    # activation_policy is optional in a use: --compare reads an absent one as absent, equal to another
+    # absent one and different from a present one.
+    from tools.artifact.inspect import compare_artifacts
+
+    def write(path: Path, policy: str | None) -> None:
+        specs = [TensorSpec("a", (2, 2), "bf16", "contiguous_le_v1"), ResourceSpec("template", 5)]
+        components = {"text": {"config": {"hidden_size": 2}, "resources": {"chat_template.jinja": "template"}}}
+        use = {"parameter": "text/a", "input": "text/input"}
+        if policy is not None:
+            use["activation_policy"] = policy
+        with ArtifactWriter(path, specs, components=components, bindings={"text/a": {"object": "a"}}, uses=[use]) as writer:
+            writer.write_object("a", struct.pack("<4H", 1, 2, 3, 4))
+            writer.write_object("template", b"hello")
+
+    write(tmp_path / "bare.infernix", None)
+    write(tmp_path / "bare2.infernix", None)
+    write(tmp_path / "policy.infernix", "A16Only")
+    with Artifact(tmp_path / "bare.infernix") as bare, Artifact(tmp_path / "bare2.infernix") as bare2:
+        assert compare_artifacts(bare, bare2)["differing_uses"] == []
+    with Artifact(tmp_path / "bare.infernix") as bare, Artifact(tmp_path / "policy.infernix") as policy:
+        assert compare_artifacts(bare, policy)["differing_uses"] == ["text/a@text/input"]
+        assert compare_artifacts(policy, bare)["differing_uses"] == ["text/a@text/input"]

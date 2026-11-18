@@ -30,7 +30,7 @@ def test_recipe_parts_keeps_path_colons():
     )
 
 
-def test_cli_custom_sources_method_template_and_shards(tmp_path):
+def _tiny_qwen3_5_source(tmp_path: Path) -> Path:
     source = tmp_path / "source"
     source.mkdir()
     config = {
@@ -53,6 +53,47 @@ def test_cli_custom_sources_method_template_and_shards(tmp_path):
         "generation_config.json": {},
     }.items():
         (source / name).write_text(json.dumps(value))
+    return source
+
+
+def _convert(arguments: list[str]) -> subprocess.CompletedProcess:
+    root = Path(__file__).resolve().parents[2]
+    return subprocess.run(
+        [sys.executable, "-B", "-m", "tools.convert", *arguments],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+
+def test_cli_ngram_reuse_refused_for_qwen3_5(tmp_path):
+    # --ngram-reuse binds a Qwen4Exp n-gram volume; a Qwen3.5 source refuses it, as it refuses --ngram-out,
+    # instead of converting without it.
+    source = _tiny_qwen3_5_source(tmp_path)
+    volume = tmp_path / "table.ngram"
+    volume.write_bytes(b"")
+    recipe = tmp_path / "recipe.py"
+    recipe.write_text(
+        "import torch\n"
+        "from tools.convert.sources.logical import array_source\n\n"
+        "def configure(model, recipe, sources):\n"
+        "    for name, parameter in model.parameters.items():\n"
+        "        recipe.assign(name, source=array_source(torch.ones(parameter.shape, dtype=torch.bfloat16), 'ones'))\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out.infernix"
+    result = _convert(
+        ["--model", str(source), "--recipe", str(recipe), "--out", str(output), "--device", "cpu",
+         "--ngram-reuse", str(volume)]
+    )
+    assert result.returncode != 0
+    assert "--ngram-reuse applies only to Qwen4Exp sources" in result.stderr, result.stderr
+    assert not output.exists()
+
+
+def test_cli_custom_sources_method_template_and_shards(tmp_path):
+    source = _tiny_qwen3_5_source(tmp_path)
     template = tmp_path / "template.jinja"
     template.write_text("custom {{ messages }}")
     recipe = tmp_path / "recipe.py"
@@ -71,11 +112,7 @@ def configure(model, recipe, sources):
         recipe.assign("text/layers/0/attention/" + role, format=format, method="grouped_absmax")
 """)
     output = tmp_path / "custom.ninfer"
-    command = [
-        sys.executable,
-        "-B",
-        "-m",
-        "tools.convert",
+    arguments = [
         "--model",
         str(source),
         "--recipe",
@@ -95,14 +132,7 @@ def configure(model, recipe, sources):
         "--rows-per-chunk",
         "3",
     ]
-    root = Path(__file__).resolve().parents[2]
-    result = subprocess.run(
-        command,
-        cwd=root,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-    )
+    result = _convert(arguments)
     assert result.returncode == 0, result.stderr
     with Artifact(output) as artifact:
         assert set(artifact.directory.components) == {"text"}

@@ -278,6 +278,8 @@ def main(argv=None):
         else:
             if args.ngram_out is not None:
                 raise ValueError("--ngram-out applies only to Qwen4Exp sources")
+            if args.ngram_reuse is not None:
+                raise ValueError("--ngram-reuse applies only to Qwen4Exp sources")
             if gguf_store is not None:
                 from . import qwen3_5_gguf
 
