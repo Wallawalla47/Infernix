@@ -26,10 +26,17 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr std::uint64_t kDemandTag     = 0;
-constexpr std::uint64_t kPrefillTag    = 1;
-constexpr std::uint64_t kDemandRunTag  = 2; // index: a run of tickets
-constexpr std::uint64_t kPrefillRunTag = 3; // index: a run of prefill entries
+// The read agent's reads, copies and compressions carry their kind in their tag (tag_of), so each completes by its
+// kind's own rules (only a fill's read is read again after a timeout).
+enum class ReadKind : std::uint64_t {
+    kDemand,     // index: a ticket (a CPU demand, a fetch request's record or a read-ahead)
+    kDemandRun,  // index: a run of tickets
+    kPrefill,    // index: a fill entry (prefill, prefill_shadows, fill_unpinned, fill_room: prefill_jobs_)
+    kPrefillRun, // index: a run of fill entries
+    kStream,     // index: a stream entry (a read into a lent stream slot: stream_jobs_)
+    kStreamRun,  // index: a run of stream entries
+    kRefill,     // index: a refill id (a demotion's read into its slot: refill_jobs_)
+};
 // Records that follow each other in a file are read as one scatter read (Strata 0.1.41's batched
 // file-tier reads): on this machine's NVMe drive (Samsung 990 PRO), unbuffered 33 MB reads of
 // neighbouring records reached 7.1 GB/s, against 6.7 GB/s for separate 2.6 MB record reads at
@@ -52,8 +59,17 @@ std::uint64_t now_ns() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
 }
 
-std::uint64_t tag_of(std::uint64_t kind, std::uint64_t index, std::uint64_t segment) {
-    return (kind << 62U) | (index << 8U) | segment;
+// A tag: the kind in the top three bits, the index, the segment (submit adds it) in the low eight.
+constexpr unsigned kKindShift = 61;
+
+std::uint64_t tag_of(ReadKind kind, std::uint64_t index, std::uint64_t segment) {
+    return (static_cast<std::uint64_t>(kind) << kKindShift) | (index << 8U) | segment;
+}
+
+ReadKind kind_of(std::uint64_t tag) { return static_cast<ReadKind>(tag >> kKindShift); }
+
+std::uint32_t index_of(std::uint64_t tag) {
+    return static_cast<std::uint32_t>((tag >> 8U) & ((1ULL << (kKindShift - 8U)) - 1U));
 }
 
 void relax() {
@@ -1906,36 +1922,41 @@ void HostExpertTier::done(std::uint32_t t) noexcept {
 }
 
 void HostExpertTier::agent_loop() {
-    struct PrefillEntry {
-        std::uint32_t key, remaining;
-        bool failed;
-        std::uint8_t* destination;
-        std::uint8_t retried = 0; // per segment (bit): read again after it timed out (retry_fill)
-    };
+    // The reads in flight of each kind but the demands (a demand's state is its Ticket), by the index its tags carry.
+    // Prefill reads (ReadKind::kPrefill, kPrefillRun): nothing waits for one but its fill, which ends with the last.
+    struct PrefillReads {
+        struct Entry {
+            std::uint32_t key, remaining;
+            bool failed;
+            std::uint8_t* destination;
+            std::uint8_t retried = 0; // per segment (bit): read again after it timed out (retry_fill)
+        };
+        std::vector<Entry> entries;
+        std::uint32_t left = 0; // records not finished
+    } prefilling;
+    // Stream reads (kStream, kStreamRun): (stream slot, segments left, failed), published by stream_state_.
+    struct StreamReads {
+        struct Entry {
+            std::uint32_t slot, remaining;
+            bool failed;
+        };
+        std::vector<Entry> entries;
+        std::uint32_t left = 0; // records not landed
+    } streaming;
+    // Refill reads (kRefill), by refill id: (segments left, slot, failed), published by refill_state_.
+    struct RefillReads {
+        struct Entry {
+            std::uint32_t remaining = 0, slot = 0;
+            bool failed             = false;
+        };
+        std::vector<Entry> entries;
+    } refilling;
+    refilling.entries.resize(kRefills);
     std::vector<std::uint32_t> demands;
     std::vector<std::pair<std::uint32_t, std::uint8_t*>> prefills;
-    std::vector<PrefillEntry> prefill_entries;
-    std::uint32_t prefill_left = 0;
-    // Stream reads in flight: (stream slot, segments left, failed), tagged as prefill reads whose
-    // index (or run member) carries kStreamEntry.
-    struct StreamEntry {
-        std::uint32_t slot, remaining;
-        bool failed;
-    };
-    constexpr std::uint32_t kStreamEntry = 0x80000000U;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> streams;
-    std::vector<StreamEntry> stream_entries;
-    std::uint32_t stream_left = 0;
-    // Refill reads in flight, by refill id (segments left, failed), tagged as prefill reads whose index carries
-    // kRefillEntry.
-    struct RefillEntry {
-        std::uint32_t remaining = 0, slot = 0;
-        bool failed             = false;
-    };
-    constexpr std::uint32_t kRefillEntry = 0x40000000U;
     std::vector<RefillJob> refills;
-    std::vector<RefillEntry> refill_entries(kRefills);
-    // The members of each scatter read in flight (tickets or prefill entries), by tag index.
+    // The members of each scatter read in flight (tickets, fill entries or stream entries), by tag index.
     std::vector<std::vector<std::uint32_t>> runs;
     std::vector<DirectReadQueue::Completion> done;
     std::vector<std::uint64_t> copied, compressed;
@@ -2140,7 +2161,7 @@ void HostExpertTier::agent_loop() {
                     std::lock_guard<std::mutex> lock(copy_mutex_);
                     copies_.push_back({.destination = const_cast<std::uint8_t*>(slot_bytes(ticket.slot)),
                                        .source      = ticket.copy_from,
-                                       .tag         = tag_of(kDemandTag, t, 0),
+                                       .tag         = tag_of(ReadKind::kDemand, t, 0),
                                        .kind        = ticket.expand ? Copy::Kind::kExpand : Copy::Kind::kCopy});
                 }
                 copy_wake_.notify_one();
@@ -2169,7 +2190,7 @@ void HostExpertTier::agent_loop() {
                 bytes += store_.record_bytes();
             }
             if (run.size() == 1) {
-                submit(ticket.key, const_cast<std::uint8_t*>(slot_bytes(ticket.slot)), tag_of(kDemandTag, t, 0));
+                submit(ticket.key, const_cast<std::uint8_t*>(slot_bytes(ticket.slot)), tag_of(ReadKind::kDemand, t, 0));
                 outstanding += ticket.remaining;
             } else {
                 std::vector<std::pair<std::uint32_t, std::uint8_t*>> records;
@@ -2178,7 +2199,7 @@ void HostExpertTier::agent_loop() {
                 }
                 const auto index = static_cast<std::uint32_t>(runs.size());
                 runs.push_back(std::move(run));
-                submit_run(records, tag_of(kDemandRunTag, index, 0));
+                submit_run(records, tag_of(ReadKind::kDemandRun, index, 0));
                 ++outstanding;
             }
             last_work = Clock::now();
@@ -2202,23 +2223,23 @@ void HostExpertTier::agent_loop() {
                 }
                 if (end - i == 1) {
                     const auto [key, destination] = prefills[i];
-                    const auto index              = static_cast<std::uint32_t>(prefill_entries.size());
+                    const auto index              = static_cast<std::uint32_t>(prefilling.entries.size());
                     const auto n = static_cast<std::uint32_t>(store_.segments(key / store_.experts(), key % store_.experts()).size());
-                    prefill_entries.push_back({key, n, false, destination});
-                    submit(key, destination, tag_of(kPrefillTag, index, 0));
+                    prefilling.entries.push_back({key, n, false, destination});
+                    submit(key, destination, tag_of(ReadKind::kPrefill, index, 0));
                     outstanding += n;
                 } else {
                     std::vector<std::uint32_t> members;
                     for (std::size_t k = i; k < end; ++k) {
-                        members.push_back(static_cast<std::uint32_t>(prefill_entries.size()));
-                        prefill_entries.push_back({prefills[k].first, 1, false, prefills[k].second});
+                        members.push_back(static_cast<std::uint32_t>(prefilling.entries.size()));
+                        prefilling.entries.push_back({prefills[k].first, 1, false, prefills[k].second});
                     }
                     const auto index = static_cast<std::uint32_t>(runs.size());
                     runs.push_back(std::move(members));
-                    submit_run(std::span(prefills).subspan(i, end - i), tag_of(kPrefillRunTag, index, 0));
+                    submit_run(std::span(prefills).subspan(i, end - i), tag_of(ReadKind::kPrefillRun, index, 0));
                     ++outstanding;
                 }
-                prefill_left += static_cast<std::uint32_t>(end - i);
+                prefilling.left += static_cast<std::uint32_t>(end - i);
                 i = end;
             }
         }
@@ -2235,33 +2256,33 @@ void HostExpertTier::agent_loop() {
             }
             if (end - i == 1) {
                 const auto [key, slot] = streams[i];
-                const auto index       = static_cast<std::uint32_t>(stream_entries.size());
+                const auto index       = static_cast<std::uint32_t>(streaming.entries.size());
                 const auto n = static_cast<std::uint32_t>(store_.segments(key / store_.experts(), key % store_.experts()).size());
-                stream_entries.push_back({slot, n, false});
-                submit(key, const_cast<std::uint8_t*>(slot_bytes(stream_slot_[slot])), tag_of(kPrefillTag, index | kStreamEntry, 0));
+                streaming.entries.push_back({slot, n, false});
+                submit(key, const_cast<std::uint8_t*>(slot_bytes(stream_slot_[slot])), tag_of(ReadKind::kStream, index, 0));
                 outstanding += n;
             } else {
                 std::vector<std::uint32_t> members;
                 std::vector<std::pair<std::uint32_t, std::uint8_t*>> records;
                 for (std::size_t k = i; k < end; ++k) {
-                    members.push_back(static_cast<std::uint32_t>(stream_entries.size()) | kStreamEntry);
-                    stream_entries.push_back({streams[k].second, 1, false});
+                    members.push_back(static_cast<std::uint32_t>(streaming.entries.size()));
+                    streaming.entries.push_back({streams[k].second, 1, false});
                     records.emplace_back(streams[k].first, const_cast<std::uint8_t*>(slot_bytes(stream_slot_[streams[k].second])));
                 }
                 const auto index = static_cast<std::uint32_t>(runs.size());
                 runs.push_back(std::move(members));
-                submit_run(records, tag_of(kPrefillRunTag, index, 0));
+                submit_run(records, tag_of(ReadKind::kStreamRun, index, 0));
                 ++outstanding;
             }
-            stream_left += static_cast<std::uint32_t>(end - i);
+            streaming.left += static_cast<std::uint32_t>(end - i);
             i = end;
         }
         streams.clear();
         // Refills: one read each, into the demotion slot the boundary chose (behind the demands submitted above).
         for (const RefillJob& job : refills) {
             const auto n = static_cast<std::uint32_t>(store_.segments(job.key / store_.experts(), job.key % store_.experts()).size());
-            refill_entries[job.id] = {n, job.slot, false};
-            submit(job.key, const_cast<std::uint8_t*>(slot_bytes(job.slot)), tag_of(kPrefillTag, job.id | kRefillEntry, 0),
+            refilling.entries[job.id] = {n, job.slot, false};
+            submit(job.key, const_cast<std::uint8_t*>(slot_bytes(job.slot)), tag_of(ReadKind::kRefill, job.id, 0),
                    DirectReadQueue::Priority::Restore);
             outstanding += n;
         }
@@ -2288,8 +2309,8 @@ void HostExpertTier::agent_loop() {
         };
         const auto prefill_finished = [&](bool failed) {
             if (failed) { ++prefill_failures_; }
-            if (--prefill_left == 0) {
-                prefill_entries.clear();
+            if (--prefilling.left == 0) {
+                prefilling.entries.clear();
                 std::lock_guard<std::mutex> lock(mutex_);
                 prefill_pending_ = 0;
                 prefill_done_.notify_all();
@@ -2306,54 +2327,43 @@ void HostExpertTier::agent_loop() {
             }
         };
         const auto prefill_read = [&](std::uint32_t index, bool ok) {
-            PrefillEntry& entry = prefill_entries[index];
-            entry.failed        = entry.failed || !ok;
+            PrefillReads::Entry& entry = prefilling.entries[index];
+            entry.failed               = entry.failed || !ok;
             if (--entry.remaining != 0) { return; }
             if (!entry.failed && slot_csf_) {
                 if (const std::int64_t slot = slot_at(entry.destination); slot >= 0) { // not an unpinned record
-                    compress(entry.destination, static_cast<std::uint32_t>(slot), tag_of(kPrefillTag, index, 0));
+                    compress(entry.destination, static_cast<std::uint32_t>(slot), tag_of(ReadKind::kPrefill, index, 0));
                     return;
                 }
             }
             prefill_finished(entry.failed);
         };
         const auto stream_done = [&](std::uint32_t index, bool ok) {
-            StreamEntry& entry = stream_entries[index];
-            entry.failed       = entry.failed || !ok;
+            StreamReads::Entry& entry = streaming.entries[index];
+            entry.failed              = entry.failed || !ok;
             if (--entry.remaining == 0) {
                 stream_state_[entry.slot].store(entry.failed ? 2 : 1, std::memory_order_release);
                 agent_stream_reads_.fetch_add(1, std::memory_order_relaxed);
-                if (--stream_left == 0) { stream_entries.clear(); }
+                if (--streaming.left == 0) { streaming.entries.clear(); }
             }
         };
         const auto refill_done = [&](std::uint32_t id, bool ok) {
-            RefillEntry& entry = refill_entries[id];
-            entry.failed       = entry.failed || !ok;
+            RefillReads::Entry& entry = refilling.entries[id];
+            entry.failed              = entry.failed || !ok;
             if (--entry.remaining != 0) { return; }
             if (!entry.failed && slot_csf_) {
-                compress(const_cast<std::uint8_t*>(slot_bytes(entry.slot)), entry.slot, tag_of(kPrefillTag, id | kRefillEntry, 0));
+                compress(const_cast<std::uint8_t*>(slot_bytes(entry.slot)), entry.slot, tag_of(ReadKind::kRefill, id, 0));
                 return;
             }
             refill_state_[id].store(entry.failed ? 2 : 1, std::memory_order_release);
-        };
-        // A prefill-kind index or run member is a stream read's when it carries kStreamEntry, a refill's when it
-        // carries kRefillEntry.
-        const auto fill_read = [&](std::uint32_t index, bool ok) {
-            if ((index & kStreamEntry) != 0) {
-                stream_done(index & ~kStreamEntry, ok);
-            } else if ((index & kRefillEntry) != 0) {
-                refill_done(index & ~kRefillEntry, ok);
-            } else {
-                prefill_read(index, ok);
-            }
         };
         // A fill's read (prefill, fill_unpinned, fill_room: nothing waits for it but the fill) that timed out is read
         // once more, each record on its own: the queue's timeout bounds one read in flight whatever its size, so a
         // run of records at the queue's depth on a slow or briefly stalled drive (below about 170 MB/s for 32 MiB
         // runs) timed out twice and failed the start, where a record's own read lands. Whether it was resubmitted.
+        // Stream reads and refills are not read again: a stream read or a demotion waits for them.
         const auto retry_fill = [&](std::uint32_t index, std::uint32_t segment) {
-            if ((index & (kStreamEntry | kRefillEntry)) != 0) { return false; }
-            PrefillEntry& entry     = prefill_entries[index];
+            PrefillReads::Entry& entry = prefilling.entries[index];
             const std::uint8_t bit = static_cast<std::uint8_t>(1U << (segment & 7U));
             if ((entry.retried & bit) != 0) { return false; }
             const auto segments = store_.segments(entry.key / store_.experts(), entry.key % store_.experts());
@@ -2361,43 +2371,54 @@ void HostExpertTier::agent_loop() {
             entry.retried |= bit;
             const auto& s = segments[segment];
             queue_->submit({files_[s.file], s.offset, s.bytes, entry.destination + s.at, DirectReadQueue::Priority::Demand,
-                            tag_of(kPrefillTag, index, segment)});
+                            tag_of(ReadKind::kPrefill, index, segment)});
             ++outstanding;
             agent_fill_retries_.fetch_add(1, std::memory_order_relaxed);
             return true;
         };
         for (const auto& c : done) {
             --outstanding;
-            const std::uint64_t kind = c.tag >> 62U;
-            const auto index         = static_cast<std::uint32_t>((c.tag >> 8U) & ((1ULL << 54U) - 1U));
-            const bool ok            = c.status == DirectReadQueue::Status::Ok;
-            const bool timed_out     = c.status == DirectReadQueue::Status::TimedOut;
-            if (kind == kDemandTag) {
+            const auto index     = index_of(c.tag);
+            const bool ok        = c.status == DirectReadQueue::Status::Ok;
+            const bool timed_out = c.status == DirectReadQueue::Status::TimedOut;
+            switch (kind_of(c.tag)) {
+            case ReadKind::kDemand:
                 ticket_read(index, ok);
-            } else if (kind == kPrefillTag) {
-                if (timed_out && retry_fill(index, static_cast<std::uint32_t>(c.tag & 0xFFU))) { continue; }
-                fill_read(index, ok);
-            } else {
+                break;
+            case ReadKind::kDemandRun:
+                for (const std::uint32_t member : runs[index]) { ticket_read(member, ok); }
+                runs[index].clear();
+                break;
+            case ReadKind::kPrefill:
+                if (!(timed_out && retry_fill(index, static_cast<std::uint32_t>(c.tag & 0xFFU)))) { prefill_read(index, ok); }
+                break;
+            case ReadKind::kPrefillRun:
                 for (const std::uint32_t member : runs[index]) {
-                    if (kind == kDemandRunTag) {
-                        ticket_read(member, ok);
-                    } else if (!(timed_out && retry_fill(member, 0))) {
-                        fill_read(member, ok);
-                    }
+                    if (!(timed_out && retry_fill(member, 0))) { prefill_read(member, ok); }
                 }
                 runs[index].clear();
+                break;
+            case ReadKind::kStream:
+                stream_done(index, ok);
+                break;
+            case ReadKind::kStreamRun:
+                for (const std::uint32_t member : runs[index]) { stream_done(member, ok); }
+                runs[index].clear();
+                break;
+            case ReadKind::kRefill:
+                refill_done(index, ok);
+                break;
             }
         }
         for (const std::uint64_t tag : copied) { // not reads: the read statistics leave them out
             --outstanding;
-            const auto t = static_cast<std::uint32_t>((tag >> 8U) & ((1ULL << 54U) - 1U));
+            const std::uint32_t t = index_of(tag);
             finish_ticket(tickets_[t], t, false);
         }
         for (const std::uint64_t tag : compressed) { // a fill's or a refill's record, now in its final form
             --outstanding;
-            const auto index = static_cast<std::uint32_t>((tag >> 8U) & ((1ULL << 54U) - 1U));
-            if ((index & kRefillEntry) != 0) {
-                refill_state_[index & ~kRefillEntry].store(1, std::memory_order_release);
+            if (kind_of(tag) == ReadKind::kRefill) {
+                refill_state_[index_of(tag)].store(1, std::memory_order_release);
             } else {
                 prefill_finished(false);
             }
