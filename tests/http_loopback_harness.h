@@ -79,9 +79,12 @@ private:
 
 class LoopbackServer {
 public:
+    // `configure` sets the options a test needs beyond the loopback address (a server switch).
     explicit LoopbackServer(GenerationBackend& backend,
-                            std::chrono::seconds client_timeout = std::chrono::seconds(30)) {
+                            std::chrono::seconds client_timeout = std::chrono::seconds(30),
+                            const std::function<void(ServeOptions&)>& configure = {}) {
         ServeOptions options;
+        if (configure) { configure(options); }
         options.host                  = "127.0.0.1";
         options.port                  = free_loopback_port();
         options.log_stats_interval_ms = 0;
