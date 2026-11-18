@@ -1,5 +1,6 @@
 #pragma once
 
+#include "infernix/types.h"
 #include "runtime/contract/resources.h"
 
 #include <cstddef>
@@ -37,5 +38,9 @@ resolve_kv_capacity_beside(const KvCapacityPolicy& policy, const SequenceCapacit
                            std::size_t available_runtime_bytes,
                            std::size_t automatic_headroom_bytes,
                            const KvCapacityResolution& ordinary, std::uint64_t lane_page_groups);
+
+// A Program's MemorySummary with the KV capacity its engine's startup resolved (Engine::memory_summary, for the
+// generation and the causal-scoring engines alike).
+[[nodiscard]] MemorySummary with_kv_capacity(MemorySummary summary, const KvCapacityResolution& resolution);
 
 } // namespace infernix::runtime

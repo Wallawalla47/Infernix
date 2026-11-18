@@ -180,4 +180,18 @@ resolve_kv_capacity_beside(const KvCapacityPolicy& policy, const SequenceCapacit
     return grown;
 }
 
+MemorySummary with_kv_capacity(MemorySummary summary, const KvCapacityResolution& resolution) {
+    summary.kv_capacity_mode                  = resolution.mode;
+    summary.kv_capacity_page_groups           = resolution.main_page_groups;
+    summary.kv_capacity_max_page_groups       = resolution.maximum_main_page_groups;
+    summary.minimum_runtime_reservation_bytes = resolution.minimum_runtime_reservation_bytes;
+    summary.kv_capacity_increment_bytes       = resolution.bytes_per_additional_main_page_group;
+    summary.runtime_reservation_bytes         = resolution.runtime_reservation_bytes;
+    summary.available_after_weights_bytes     = resolution.available_after_weights_bytes;
+    summary.available_after_startup_bytes     = resolution.available_after_startup_bytes;
+    summary.vram_headroom_bytes               = resolution.automatic_headroom_bytes;
+    summary.planned_slack_bytes               = resolution.planned_slack_bytes;
+    return summary;
+}
+
 } // namespace infernix::runtime
