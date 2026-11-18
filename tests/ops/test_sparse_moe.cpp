@@ -17,6 +17,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -721,12 +722,338 @@ int run_profile(DeviceExecutionView execution, const CodecProfile& profile) {
     return failures;
 }
 
+// Routes chosen per token over every expert (T-2). Each expert e has a direction d_e (random, unit length
+// near enough; near-orthogonal in 2,048 dimensions) as its router row; a token's input is the sum of its eight
+// experts' directions with random strengths plus noise, so its BF16 router logits put exactly those eight first
+// by a wide margin (the oracle checks it). The router weights and shared gate vary with the strengths.
+// The A16 profile's bound at this fixture's scale: the same relative L2; the pointwise term relative to the largest
+// reference (the patterned fixture's 4e-3 is about 1.6 % of its largest outputs, ~0.25), since BF16 rounding alone
+// grows with the outputs (this fixture's reach ~1).
+constexpr ReductionCriterion kRoutedTolerance{
+    /*relative_l2*/ 1.2e-2,
+    /*gross_absolute*/ 0.0,
+    /*gross_relative_to_max_reference*/ 1.6e-2,
+};
+
+struct RouteCase {
+    std::string name;
+    std::int32_t tokens;
+    std::vector<std::array<int, kTopK>> routes; // per token, its eight distinct experts
+};
+
+// Random routes: each token's eight experts drawn from the first `pool` experts.
+RouteCase random_routes(std::string name, std::int32_t tokens, int pool, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    RouteCase out{std::move(name), tokens, {}};
+    std::vector<int> order(static_cast<std::size_t>(pool));
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        std::iota(order.begin(), order.end(), 0);
+        std::shuffle(order.begin(), order.end(), rng);
+        std::array<int, kTopK> route{};
+        std::copy_n(order.begin(), kTopK, route.begin());
+        out.routes.push_back(route);
+    }
+    return out;
+}
+
+// Per-expert token counts covering every residue of a `tile`-column job (0 .. tile, one expert unrouted), the
+// rest of the 8T entries added a whole tile at a time (keeping residues) and a last remainder; tokens take the
+// entries round-robin, so no token routes one expert twice (every count is at most T).
+RouteCase residue_routes(std::string name, std::int32_t tokens, int tile, std::uint32_t seed) {
+    std::vector<int> counts(kExperts);
+    long total = 0;
+    for (int e = 0; e < kExperts; ++e) {
+        counts[static_cast<std::size_t>(e)] = e % (tile + 1);
+        total += counts[static_cast<std::size_t>(e)];
+    }
+    long remaining = static_cast<long>(tokens) * kTopK - total;
+    if (remaining < 0) { throw std::logic_error("residue routes: too few tokens for the tile's residues"); }
+    for (int e = 0; remaining >= tile; e = (e + 1) % kExperts) {
+        if (counts[static_cast<std::size_t>(e)] + tile <= tokens) {
+            counts[static_cast<std::size_t>(e)] += tile;
+            remaining -= tile;
+        }
+    }
+    for (int e = kExperts - 1; remaining > 0; --e) {
+        const long room = std::min<long>(remaining, tokens - counts[static_cast<std::size_t>(e)]);
+        counts[static_cast<std::size_t>(e)] += static_cast<int>(room);
+        remaining -= room;
+    }
+    std::vector<int> entries;
+    for (int e = 0; e < kExperts; ++e) { entries.insert(entries.end(), counts[static_cast<std::size_t>(e)], e); }
+    // Experts in a random order, so a token's eight are not adjacent ids.
+    std::mt19937 rng(seed);
+    std::vector<int> relabel(kExperts);
+    std::iota(relabel.begin(), relabel.end(), 0);
+    std::shuffle(relabel.begin(), relabel.end(), rng);
+    RouteCase out{std::move(name), tokens, std::vector<std::array<int, kTopK>>(static_cast<std::size_t>(tokens))};
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        out.routes[i % static_cast<std::size_t>(tokens)][i / static_cast<std::size_t>(tokens)] =
+            relabel[static_cast<std::size_t>(entries[i])];
+    }
+    return out;
+}
+
+class RoutedMoeFixture {
+public:
+    RoutedMoeFixture(const CodecProfile& profile, std::vector<RouteCase> cases)
+        : profile_(profile), cases_(std::move(cases)),
+          routed_gate_(profile.routed_gate_up, kRoutedGateRows, kHidden),
+          routed_down_(profile.routed_down, kRoutedDownRows, kIntermediate),
+          shared_gate_(QType::Q8_G32_FP16, kSharedGateRows, kHidden),
+          shared_down_(QType::Q8_G32_FP16, kHidden, kIntermediate) {
+        std::mt19937 rng(0x7202U);
+        std::normal_distribution<float> normal(0.0F, 1.0F);
+        // Directions d_e of unit-variance components. A token's input is kInput * sum(a_e d_e) + noise (components
+        // about 0.3, so the experts' outputs, about 0.3, dominate a residual of 0.02); router row e is kRouter * d_e,
+        // so a routed expert's logit is about a_e (0.6..1.0) and another's about 0.05 (at most ~0.16 of 248).
+        constexpr float kInput = 0.13F, kRouter = 1.0F / (static_cast<float>(kHidden) * kInput);
+        std::vector<float> direction(static_cast<std::size_t>(kExperts) * kHidden);
+        for (float& v : direction) { v = normal(rng); }
+        router_.resize(static_cast<std::size_t>(kExperts + 1) * kHidden);
+        for (std::size_t i = 0; i < direction.size(); ++i) { router_[i] = kRouter * direction[i]; }
+        for (int i = 0; i < kHidden; ++i) { // the shared gate: a logit near 0 (a scale near 0.5)
+            router_[static_cast<std::size_t>(kExperts) * kHidden + i] = 0.002F * normal(rng);
+        }
+        round_to_bf16(router_);
+        router_bits_   = bf16_bits(router_);
+        device_router_ = to_device(router_bits_);
+
+        // Each case's inputs, residuals and routes (checked against the BF16 router logits).
+        std::uniform_real_distribution<float> strength(0.6F, 1.0F);
+        for (const RouteCase& c : cases_) {
+            CaseData data;
+            data.input.resize(static_cast<std::size_t>(kHidden) * c.tokens);
+            data.residual.resize(data.input.size());
+            data.reference.assign(data.input.size(), 0.0);
+            data.weight.resize(static_cast<std::size_t>(c.tokens));
+            data.shared_scale.resize(static_cast<std::size_t>(c.tokens));
+            for (std::int32_t t = 0; t < c.tokens; ++t) {
+                float* x = data.input.data() + static_cast<std::size_t>(t) * kHidden;
+                for (int i = 0; i < kHidden; ++i) { x[i] = 0.05F * normal(rng); }
+                for (const int e : c.routes[static_cast<std::size_t>(t)]) {
+                    const float a = kInput * strength(rng);
+                    const float* d = direction.data() + static_cast<std::size_t>(e) * kHidden;
+                    for (int i = 0; i < kHidden; ++i) { x[i] += a * d[i]; }
+                }
+                float* r = data.residual.data() + static_cast<std::size_t>(t) * kHidden;
+                for (int i = 0; i < kHidden; ++i) { r[i] = 0.02F * normal(rng); }
+            }
+            round_to_bf16(data.input);
+            round_to_bf16(data.residual);
+            // A token without a clear margin is reported after the workers join (a throw inside one terminates).
+            std::vector<std::uint8_t> clear(static_cast<std::size_t>(c.tokens), 1);
+            parallel_rows(c.tokens, [&](std::int32_t t) { clear[static_cast<std::size_t>(t)] = route_token(c, data, t); });
+            for (std::int32_t t = 0; t < c.tokens; ++t) {
+                if (clear[static_cast<std::size_t>(t)] == 0) {
+                    throw std::logic_error("sparse_moe routed fixture: token " + std::to_string(t) + " of " + c.name +
+                                           " is not routed to its experts by a clear margin");
+                }
+            }
+            for (std::size_t i = 0; i < data.residual.size(); ++i) { data.reference[i] = data.residual[i]; }
+            data_.push_back(std::move(data));
+        }
+
+        // The shared expert, then every expert some case routes: packed, copied to the device banks, and its
+        // contribution to every routed token added in FP64 from its independently decoded weights; one expert's
+        // decoded weights are held at a time.
+        const auto shared_gate_up = quantized_weight::pack_q8_g32_row_split(
+            make_gate_up(kSharedGateRows, kHidden, 0x512U, 0.93f), kSharedGateRows, kHidden);
+        const auto shared_down = quantized_weight::pack_q8_g32_row_split(
+            make_down(kHidden, kIntermediate, 0x731U, 0.87f), kHidden, kIntermediate);
+        shared_gate_.copy_rows(shared_gate_up, 0);
+        shared_down_.copy_rows(shared_down, 0);
+        for (std::size_t c = 0; c < cases_.size(); ++c) {
+            add_expert(c, -1, shared_gate_up, shared_down);
+        }
+        for (int e = 0; e < kExperts; ++e) {
+            bool routed = false;
+            for (const RouteCase& c : cases_) {
+                for (const auto& route : c.routes) {
+                    routed = routed || std::find(route.begin(), route.end(), e) != route.end();
+                }
+            }
+            if (!routed) { continue; }
+            const float factor = 0.8f + static_cast<float>((e * 3) % 11) * 0.045f;
+            const auto gate_up = quantized_weight::pack_row_split_lowbit(
+                make_gate_up(kExpertGateRows, kHidden, 100U + static_cast<std::uint32_t>(e), factor), kExpertGateRows,
+                kHidden, profile.routed_gate_up);
+            const auto down = quantized_weight::pack_row_split_lowbit(
+                make_down(kHidden, kIntermediate, 300U + static_cast<std::uint32_t>(e), factor), kHidden, kIntermediate,
+                profile.routed_down);
+            routed_gate_.copy_rows(gate_up, e * kExpertGateRows);
+            routed_down_.copy_rows(down, e * kHidden);
+            for (std::size_t c = 0; c < cases_.size(); ++c) { add_expert(c, e, gate_up, down); }
+        }
+    }
+
+    int run(DeviceExecutionView execution) {
+        int failures = 0;
+        for (std::size_t c = 0; c < cases_.size(); ++c) {
+            const RouteCase& route_case = cases_[c];
+            const CaseData& data        = data_[c];
+            const std::int32_t tokens   = route_case.tokens;
+            const std::string label     = std::string(profile_.name) + " " + route_case.name + " T=" +
+                                      std::to_string(tokens) + " (" + std::to_string(distinct_experts(route_case)) +
+                                      " experts)";
+            const std::vector<std::uint16_t> input_bits = bf16_bits(data.input);
+            DeviceBuffer device_input                   = to_device(input_bits);
+            DeviceBuffer residual_seed                  = to_device(bf16_bits(data.residual));
+            GuardedBf16Output destination_storage(data.residual.size());
+            cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p, residual_seed.bytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "seed SparseMoe destination");
+            cuda_check(cudaStreamSynchronize(nullptr), "settle SparseMoe destination seed");
+            const ops::SparseMoeWeights weights{
+                dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),
+                routed_gate_.weight(),
+                routed_down_.weight(),
+                shared_gate_.weight(),
+                shared_down_.weight(),
+            };
+            Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
+            Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
+            const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
+                weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
+            WorkspaceArena workspace(workspace_bytes);
+            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace, execution);
+            cuda_synchronize();
+            failures += verify_reduction(label, destination_storage.values(), data.reference, kRoutedTolerance);
+            failures += destination_storage.verify_guards(label);
+            failures += verify_exact((label + " input preservation").c_str(),
+                                     from_device<std::uint16_t>(device_input, input_bits.size()), input_bits);
+        }
+        return failures;
+    }
+
+private:
+    struct CaseData {
+        std::vector<float> input, residual;
+        std::vector<double> reference;
+        std::vector<std::array<double, kTopK>> weight; // per token, its experts' router weights (route order)
+        std::vector<double> shared_scale;
+    };
+
+    static int distinct_experts(const RouteCase& c) {
+        std::vector<bool> seen(kExperts, false);
+        int count = 0;
+        for (const auto& route : c.routes) {
+            for (const int e : route) {
+                count += seen[static_cast<std::size_t>(e)] ? 0 : 1;
+                seen[static_cast<std::size_t>(e)] = true;
+            }
+        }
+        return count;
+    }
+
+    // The token's BF16 router logits (FP64 dot of the represented values, rounded at the model's logit boundary):
+    // its eight experts first by a margin no accumulation order can cross (false when they are not), then their
+    // softmax weights.
+    std::uint8_t route_token(const RouteCase& c, CaseData& data, std::int32_t t) const {
+        const std::vector<double> x(data.input.begin() + static_cast<std::ptrdiff_t>(t) * kHidden,
+                                    data.input.begin() + static_cast<std::ptrdiff_t>(t + 1) * kHidden);
+        std::vector<double> scores(kExperts + 1);
+        for (int row = 0; row <= kExperts; ++row) {
+            scores[static_cast<std::size_t>(row)] =
+                bf16_to_f32(f32_to_bf16(static_cast<float>(dot_fp64(router_, row, kHidden, x))));
+        }
+        const auto& route = c.routes[static_cast<std::size_t>(t)];
+        double lowest_routed = 1e300, highest_other = -1e300;
+        for (int e = 0; e < kExperts; ++e) {
+            const bool routed = std::find(route.begin(), route.end(), e) != route.end();
+            const double s    = scores[static_cast<std::size_t>(e)];
+            if (routed) {
+                lowest_routed = std::min(lowest_routed, s);
+            } else {
+                highest_other = std::max(highest_other, s);
+            }
+        }
+        if (!(lowest_routed - highest_other > 0.1)) { return 0; }
+        double top = -1e300;
+        for (const int e : route) { top = std::max(top, scores[static_cast<std::size_t>(e)]); }
+        double denominator = 0.0;
+        auto& weight       = data.weight[static_cast<std::size_t>(t)];
+        for (int k = 0; k < kTopK; ++k) {
+            weight[static_cast<std::size_t>(k)] = std::exp(scores[static_cast<std::size_t>(route[static_cast<std::size_t>(k)])] - top);
+            denominator += weight[static_cast<std::size_t>(k)];
+        }
+        for (double& w : weight) { w /= denominator; }
+        data.shared_scale[static_cast<std::size_t>(t)] = 1.0 / (1.0 + std::exp(-scores[kExperts]));
+        return 1;
+    }
+
+    // Adds expert `e`'s output (the shared expert when e < 0) to every token of case `c` it serves.
+    void add_expert(std::size_t c, int e, const quantized_weight::PackedWeight& gate_up,
+                    const quantized_weight::PackedWeight& down) {
+        const RouteCase& route_case = cases_[c];
+        CaseData& data              = data_[c];
+        std::vector<std::pair<std::int32_t, double>> served; // token, its weight for this expert
+        for (std::int32_t t = 0; t < route_case.tokens; ++t) {
+            if (e < 0) {
+                served.emplace_back(t, data.shared_scale[static_cast<std::size_t>(t)]);
+                continue;
+            }
+            const auto& route = route_case.routes[static_cast<std::size_t>(t)];
+            for (int k = 0; k < kTopK; ++k) {
+                if (route[static_cast<std::size_t>(k)] == e) {
+                    served.emplace_back(t, data.weight[static_cast<std::size_t>(t)][static_cast<std::size_t>(k)]);
+                }
+            }
+        }
+        parallel_rows(static_cast<std::int32_t>(served.size()), [&](std::int32_t i) {
+            const auto [t, w] = served[static_cast<std::size_t>(i)];
+            const std::vector<double> x(data.input.begin() + static_cast<std::ptrdiff_t>(t) * kHidden,
+                                        data.input.begin() + static_cast<std::ptrdiff_t>(t + 1) * kHidden);
+            std::vector<double> activation(kIntermediate);
+            for (std::int32_t row = 0; row < kIntermediate; ++row) {
+                const double gate = dot_fp64(gate_up.dequant, row, kHidden, x);
+                const double up   = dot_fp64(gate_up.dequant, kIntermediate + row, kHidden, x);
+                activation[static_cast<std::size_t>(row)] = (gate / (1.0 + std::exp(-gate))) * up;
+            }
+            double* out = data.reference.data() + static_cast<std::size_t>(t) * kHidden;
+            for (std::int32_t row = 0; row < kHidden; ++row) {
+                out[row] += w * dot_fp64(down.dequant, row, kIntermediate, activation);
+            }
+        });
+    }
+
+    const CodecProfile& profile_;
+    std::vector<RouteCase> cases_;
+    std::vector<CaseData> data_;
+    std::vector<float> router_;
+    std::vector<std::uint16_t> router_bits_;
+    DeviceBuffer device_router_;
+    DeviceRowSplit routed_gate_;
+    DeviceRowSplit routed_down_;
+    DeviceRowSplit shared_gate_;
+    DeviceRowSplit shared_down_;
+};
+
+// The cases of one profile: around the token-oriented prefill route (Q5 down at 47..51 tokens, Q6 at 47..52,
+// when the grouped jobs exceed 3.5 a token: random routes over every expert give about 200) on both sides of
+// its token range, below its job threshold (40 experts), and per-expert counts covering every tail residue of
+// the 32-, 64- and (Q4 with Q5/Q6 down, from 2,880 tokens) 128-column job tiles.
+std::vector<RouteCase> routed_cases(const CodecProfile& profile) {
+    std::vector<RouteCase> cases;
+    for (const std::int32_t tokens : {46, 47, 51, 52, 53}) {
+        cases.push_back(random_routes("random routes", tokens, kExperts, 0x4600U + static_cast<std::uint32_t>(tokens)));
+    }
+    cases.push_back(random_routes("random routes of 40 experts", 50, 40, 0x5040U));
+    cases.push_back(residue_routes("32-column residues", 600, 32, 0x600U));
+    cases.push_back(residue_routes("64-column residues", 1024, 64, 0x1024U));
+    const bool ring = profile.routed_gate_up == QType::Q4_G64_FP16 &&
+                      (profile.routed_down == QType::Q5_G64_FP16 || profile.routed_down == QType::Q6_G64_FP16);
+    if (ring) { cases.push_back(residue_routes("128-column residues", 3072, 128, 0x3072U)); }
+    return cases;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(sparse_moe) {
-    const bool wide_only = argc == 2 && std::string_view(argv[1]) == "--wide-only";
-    if (argc != 1 && !wide_only) {
-        std::cerr << "usage: " << argv[0] << " [--wide-only]\n";
+    const bool wide_only   = argc == 2 && std::string_view(argv[1]) == "--wide-only";
+    const bool routed_only = argc == 2 && std::string_view(argv[1]) == "--routed-only";
+    if (argc != 1 && !wide_only && !routed_only) {
+        std::cerr << "usage: " << argv[0] << " [--wide-only | --routed-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -741,12 +1068,13 @@ INFERNIX_OP_TEST(sparse_moe) {
     constexpr std::array<std::int32_t, 35> kQ4Q5Tokens{
         {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,  17,  18,
          19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 2880, 4097}};
-    constexpr std::array<std::int32_t, 34> kQ4Q6Tokens{
-        {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,  17,
-         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 2880}};
-    constexpr std::array<std::int32_t, 33> kW8W8Tokens{
-        {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
-         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768}};
+    // Q6 down and W8 also cross the 4096-token slice; W8 also runs a wide prefill.
+    constexpr std::array<std::int32_t, 35> kQ4Q6Tokens{
+        {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,  17,  18,
+         19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 2880, 4097}};
+    constexpr std::array<std::int32_t, 35> kW8W8Tokens{
+        {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,  17,  18,
+         19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 2880, 4097}};
     constexpr std::array<std::int32_t, 7> kWideTokens{{32, 33, 46, 47, 48, 63, 64}};
     std::array<CodecProfile, 3> profiles{{
         {"sparse_moe q4+q5 a16", QType::Q4_G64_FP16, QType::Q5_G64_FP16, kQ4Q5Tokens, true},
@@ -761,7 +1089,15 @@ INFERNIX_OP_TEST(sparse_moe) {
     // Fixture copies use the default stream; preserve their ordering with the eager call.
     const DeviceExecutionView execution = context.execution_view().on_stream(nullptr);
     int failures                        = 0;
-    for (const CodecProfile& profile : profiles) { failures += run_profile(execution, profile); }
+    for (const CodecProfile& profile : profiles) {
+        if (routed_only) {
+            // Routes over every expert, per-token inputs and every job-tile residue (one fixture a profile).
+            RoutedMoeFixture fixture(profile, routed_cases(profile));
+            failures += fixture.run(execution);
+        } else {
+            failures += run_profile(execution, profile);
+        }
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
     return failures == 0 ? 0 : 1;
 }
