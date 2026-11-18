@@ -10,6 +10,11 @@ GenerationOutcome combine_round_outcomes(std::span<const ServerToolRound> rounds
     if (rounds.empty()) { return final_round; }
     GenerationOutcome total = std::move(final_round);
     std::vector<infernix::TokenId> generated;
+    std::vector<infernix::SpeculativeStats::RoundStep> steps; // the earlier generations' rounds, in order
+    const auto add_counts = [](std::vector<std::uint64_t>& into, const std::vector<std::uint64_t>& from) {
+        if (into.size() < from.size()) { into.resize(from.size()); }
+        for (std::size_t i = 0; i < from.size(); ++i) { into[i] += from[i]; }
+    };
     for (const ServerToolRound& round : rounds) {
         const GenerationOutcome& earlier = round.outcome;
         total.prompt_tokens += earlier.prompt_tokens;
@@ -51,12 +56,35 @@ GenerationOutcome combine_round_outcomes(std::span<const ServerToolRound> rounds
         total.speculative.ngram_rounds += earlier.speculative.ngram_rounds;
         total.speculative.ngram_drafted_tokens += earlier.speculative.ngram_drafted_tokens;
         total.speculative.ngram_accepted_tokens += earlier.speculative.ngram_accepted_tokens;
+        total.speculative.ngram_archive_rounds += earlier.speculative.ngram_archive_rounds;
+        total.speculative.ngram_archive_drafted_tokens += earlier.speculative.ngram_archive_drafted_tokens;
+        total.speculative.ngram_archive_accepted_tokens += earlier.speculative.ngram_archive_accepted_tokens;
+        total.speculative.tree_rounds += earlier.speculative.tree_rounds;
+        total.speculative.tree_side_rounds += earlier.speculative.tree_side_rounds;
+        total.speculative.tree_side_accepted_tokens += earlier.speculative.tree_side_accepted_tokens;
+        total.speculative.ngram_tree_rounds += earlier.speculative.ngram_tree_rounds;
+        total.speculative.ngram_tree_side_rounds += earlier.speculative.ngram_tree_side_rounds;
+        total.speculative.ngram_tree_side_accepted_tokens += earlier.speculative.ngram_tree_side_accepted_tokens;
+        add_counts(total.speculative.accepted_per_position, earlier.speculative.accepted_per_position);
+        add_counts(total.speculative.rounds_by_draft_length, earlier.speculative.rounds_by_draft_length);
+        steps.insert(steps.end(), earlier.speculative.round_steps.begin(), earlier.speculative.round_steps.end());
+        // Per-request counters (ExpertCacheStats), so the response's are the generations' sum.
+        if (earlier.expert_cache) {
+            infernix::ExpertCacheStats& cache = total.expert_cache.emplace(total.expert_cache.value_or(
+                infernix::ExpertCacheStats{}));
+            cache.routed += earlier.expert_cache->routed;
+            cache.hits += earlier.expert_cache->hits;
+            cache.decode_routed += earlier.expert_cache->decode_routed;
+            cache.decode_hits += earlier.expert_cache->decode_hits;
+        }
     }
     // The response's first token came from the first generation.
     total.timings.first_token_seconds = rounds.front().outcome.timings.first_token_seconds;
     generated.insert(generated.end(), total.generated_token_ids.begin(),
                      total.generated_token_ids.end());
     total.generated_token_ids = std::move(generated);
+    steps.insert(steps.end(), total.speculative.round_steps.begin(), total.speculative.round_steps.end());
+    total.speculative.round_steps = std::move(steps);
     return total;
 }
 
