@@ -2,6 +2,7 @@
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
 #include "core/device.h"
+#include "core/grid_rows.h"
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/common/output.cuh"
@@ -97,6 +98,10 @@ const std::array<Launch, 11>& tiled_launchers(int rows, int input_rows) {
 template <int Rows>
 void finish(const Tensor& projected, const Tensor& base, const Tensor& delta, Tensor& residual,
             int width, int tokens, cudaStream_t stream) {
+    // One block row a token: the drafter's blocks (its width times the lanes) stay far below the grid's limit.
+    if (tokens > kMaxGridRows) {
+        throw std::invalid_argument("linear dynamic grouped conv add: more than 65,535 tokens in one call");
+    }
     const dim3 grid((Rows + 255) / 256, tokens);
     CUDA_CHECK(pdl::launch_consumer({grid, dim3(256), 0, stream}, finish_kernel<Rows>,
                                     static_cast<const __nv_bfloat16*>(projected.data),

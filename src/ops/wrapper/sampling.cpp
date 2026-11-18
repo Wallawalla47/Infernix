@@ -2,6 +2,7 @@
 #include "infernix/ops/sampling.h"
 
 #include "ops/common/sampling_workspace.h"
+#include "core/grid_rows.h"
 #include "ops/launcher/sampling.h" // detail::sample_batch_launch
 
 #include <algorithm>
@@ -45,6 +46,8 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
         throw std::invalid_argument("sample: logical_positions must be I32 [logits.ne[1]]");
     }
     if (logits.ne[1] <= 0) { throw std::invalid_argument("sample: B must be positive"); }
+    // One block row a sequence (the launcher's partial and group grids).
+    if (logits.ne[1] > kMaxGridRows) { throw std::invalid_argument("sample: B must be at most 65,535"); }
     if (!logits.is_contiguous() || !out.is_contiguous() || !logical_positions.is_contiguous()) {
         throw std::invalid_argument("sample: logits/out/logical_positions must be contiguous");
     }
