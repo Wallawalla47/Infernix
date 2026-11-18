@@ -567,22 +567,46 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             source.compare(placeholder.bytes.begin, needle.size(), needle) != 0) {
             throw std::logic_error("rendered media placeholder metadata does not match its text");
         }
-        expanded.append(source, source_cursor, placeholder.bytes.begin - source_cursor);
+        // An image's pad is replaced by its pads. A video's per-frame groups replace the template's whole
+        // <|vision_start|><|video_pad|><|vision_end|>, each group carrying its own pair, as the reference processor
+        // (Qwen3VLProcessor) expands it; replacing the pad alone left an outer pair (two more tokens a video, and
+        // every position after them moved). The layout guarantees the wrapper (prompt_layout.cpp).
+        std::size_t replace_begin = placeholder.bytes.begin;
+        std::size_t replace_end   = placeholder.bytes.end;
+        if (item.modality == Modality::Video) {
+            if (replace_begin < source_cursor + kVisionStart.size() ||
+                source.compare(replace_begin - kVisionStart.size(), kVisionStart.size(), kVisionStart) != 0 ||
+                source.compare(replace_end, kVisionEnd.size(), kVisionEnd) != 0) {
+                throw std::logic_error("rendered video placeholder lacks its vision wrapper");
+            }
+            replace_begin -= kVisionStart.size();
+            replace_end += kVisionEnd.size();
+        }
+        expanded.append(source, source_cursor, replace_begin - source_cursor);
         append_placeholder(expanded, item, index, rendered.media_token_runs);
-        const std::size_t source_end = placeholder.bytes.end;
-        expansions.push_back(PlaceholderExpansion{.source_begin = placeholder.bytes.begin,
-                                                  .source_end   = source_end,
+        expansions.push_back(PlaceholderExpansion{.source_begin = replace_begin,
+                                                  .source_end   = replace_end,
                                                   .rendered_end = expanded.size()});
-        source_cursor = source_end;
+        source_cursor = replace_end;
     }
     expanded.append(source, source_cursor, source.size() - source_cursor);
 
     const auto map_boundary = [&](std::size_t boundary, std::string_view kind) {
         return map_expanded_boundary(boundary, source.size(), expansions, kind);
     };
+    // A literal span edge inside a replaced video wrapper (a template that writes its pieces apart) moves to the
+    // wrapper's edge, so the span covers the whole expansion, which the template's markers alone produce.
+    const auto outside_expansion = [&](std::size_t boundary, bool begin) {
+        for (const PlaceholderExpansion& expansion : expansions) {
+            if (expansion.source_begin < boundary && boundary < expansion.source_end) {
+                return begin ? expansion.source_begin : expansion.source_end;
+            }
+        }
+        return boundary;
+    };
     for (auto& span : rendered.literal_spans) {
-        span.begin = map_boundary(span.begin, "literal span");
-        span.end   = map_boundary(span.end, "literal span");
+        span.begin = map_boundary(outside_expansion(span.begin, true), "literal span");
+        span.end   = map_boundary(outside_expansion(span.end, false), "literal span");
     }
     if (rendered.rewrite_checkpoint) {
         rendered.rewrite_checkpoint->offset =

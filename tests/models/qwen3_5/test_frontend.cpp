@@ -2278,6 +2278,18 @@ int test_video_prepare(const Frontend& frontend) {
     int failures = check(prepared_data.vision_items.size() == 1 && prepared_data.has_media() &&
                              prepared_data.token_ids.size() == counted,
                          "video token counting and preparation geometry diverged");
+    // As the reference processor (Qwen3VLProcessor) expands it: the template's whole
+    // <|vision_start|><|video_pad|><|vision_end|> becomes `<0.0 seconds><|vision_start|>pads<|vision_end|>` per frame,
+    // so a one-frame video holds one pair and no outer one before its timestamp (audit 2026-11-18 V-1).
+    {
+        const std::vector<infernix::TokenId>& ids = prepared_data.token_ids;
+        const auto count = [&](infernix::TokenId id) { return std::count(ids.begin(), ids.end(), id); };
+        const auto stamp = std::find(ids.begin(), ids.end(), infernix::TokenId{7});
+        failures += check(count(248053) == 1 && count(248054) == 1 && stamp != ids.end() &&
+                              (stamp == ids.begin() || *std::prev(stamp) != 248053) && std::next(stamp) != ids.end() &&
+                              *std::next(stamp) == 248053,
+                          "a one-frame video was not expanded as <t seconds><|vision_start|>pads<|vision_end|> alone");
+    }
     failures += check(after_count.entries == before_count.entries &&
                           after_count.live_bytes == before_count.live_bytes &&
                           after_count.hits == before_count.hits &&
