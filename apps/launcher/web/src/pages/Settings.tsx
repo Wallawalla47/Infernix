@@ -137,7 +137,8 @@ function NumberSetting({
   label: string;
   help: string;
   value: number;
-  onSave: (value: number) => void;
+  /** A promise that rejects when the save is refused (the box then shows the saved value again). */
+  onSave: (value: number) => unknown;
   min?: number;
   max?: number;
   suffix?: string;
@@ -157,9 +158,9 @@ function NumberSetting({
             const next = Number(text);
             if (text.length === 0 || !Number.isFinite(next)) {
               toast.error(`${label}: enter a number`);
-              return;
+              return false;
             }
-            onSave(next);
+            return onSave(next);
           }}
         />
         {suffix ? <span className="shrink-0 text-xs text-muted-foreground">{suffix}</span> : null}
@@ -217,6 +218,8 @@ export function SettingsPage() {
   }
 
   const patch = (value: SettingsPatch) => save.mutate(value);
+  // For a text box: the save's promise (its refusal is toasted by the mutation cache; the box shows the saved value).
+  const commitPatch = (value: SettingsPatch) => save.mutateAsync(value);
   const dirInfo = (path: string) => library?.dirs.find((dir) => dir.path === path) ?? null;
   const system = state?.system ?? null;
   const logs = state?.logs ?? null;
@@ -308,7 +311,7 @@ export function SettingsPage() {
                   ariaLabel="Scan depth"
                   onCommit={(text) => {
                     const next = Number(text);
-                    if (Number.isInteger(next) && next >= 0) patch({ scan_depth: next });
+                    return Number.isInteger(next) && next >= 0 ? commitPatch({ scan_depth: next }) : false;
                   }}
                 />
               </div>
@@ -330,7 +333,7 @@ export function SettingsPage() {
                 value={settings.serve_executable}
                 placeholder="infernix-serve beside the launcher"
                 ariaLabel="infernix-serve executable"
-                onCommit={(text) => patch({ serve_executable: text })}
+                onCommit={(text) => commitPatch({ serve_executable: text })}
               />
             </FieldRow>
             <div className="flex items-start gap-2.5 py-3 text-sm">
@@ -360,7 +363,7 @@ export function SettingsPage() {
               value={settings.child_port}
               min={0}
               max={65535}
-              onSave={(value) => patch({ child_port: value })}
+              onSave={(value) => commitPatch({ child_port: value })}
             />
           </CardContent>
         </Card>
@@ -374,7 +377,7 @@ export function SettingsPage() {
           </CardHeader>
           <CardContent className="divide-y">
             <FieldRow label="Listen address" help="127.0.0.1 keeps it on this computer; 0.0.0.0 serves the network (create an API key first). Restart to apply.">
-              <CommitInput mono value={settings.host} ariaLabel="Listen address" onCommit={(text) => text.length > 0 && patch({ host: text })} />
+              <CommitInput mono value={settings.host} ariaLabel="Listen address" onCommit={(text) => text.length > 0 && commitPatch({ host: text })} />
             </FieldRow>
             <NumberSetting
               label="Port"
@@ -382,7 +385,7 @@ export function SettingsPage() {
               value={settings.port}
               min={1}
               max={65535}
-              onSave={(value) => patch({ port: value })}
+              onSave={(value) => commitPatch({ port: value })}
             />
             <FieldRow label="Browser access from other origins (CORS)" help="Lets web apps on other origins call the API.">
               <div className="flex sm:justify-end">
@@ -481,7 +484,7 @@ export function SettingsPage() {
               value={settings.drain_timeout_s}
               min={0}
               suffix="s"
-              onSave={(value) => patch({ drain_timeout_s: value })}
+              onSave={(value) => commitPatch({ drain_timeout_s: value })}
             />
             <NumberSetting
               label="Load timeout"
@@ -489,7 +492,7 @@ export function SettingsPage() {
               value={settings.load_timeout_s}
               min={10}
               suffix="s"
-              onSave={(value) => patch({ load_timeout_s: value })}
+              onSave={(value) => commitPatch({ load_timeout_s: value })}
             />
             <NumberSetting
               label="Stop timeout"
@@ -497,7 +500,7 @@ export function SettingsPage() {
               value={settings.stop_timeout_s}
               min={5}
               suffix="s"
-              onSave={(value) => patch({ stop_timeout_s: value })}
+              onSave={(value) => commitPatch({ stop_timeout_s: value })}
             />
             <NumberSetting
               label="Unload when idle"
@@ -505,7 +508,7 @@ export function SettingsPage() {
               value={settings.idle_unload_min}
               min={0}
               suffix="min"
-              onSave={(value) => patch({ idle_unload_min: value })}
+              onSave={(value) => commitPatch({ idle_unload_min: value })}
             />
           </CardContent>
         </Card>
@@ -525,7 +528,7 @@ export function SettingsPage() {
                   value={settings.download_dir}
                   placeholder="Choose a folder"
                   ariaLabel="Default download folder"
-                  onCommit={(text) => patch({ download_dir: text })}
+                  onCommit={(text) => commitPatch({ download_dir: text })}
                 />
                 <Button variant="outline" onClick={() => setDownloadPicker(true)}>
                   <FolderOpen />
@@ -539,7 +542,7 @@ export function SettingsPage() {
               value={settings.download_connections}
               min={1}
               max={32}
-              onSave={(value) => patch({ download_connections: value })}
+              onSave={(value) => commitPatch({ download_connections: value })}
             />
             <FieldRow label="Verify checksums" help="Check each finished file's SHA-256 against Hugging Face's record.">
               <div className="flex sm:justify-end">
@@ -594,7 +597,7 @@ export function SettingsPage() {
                     value={settings.log_dir}
                     placeholder={logs?.dir ?? "The launcher's folder"}
                     ariaLabel="Log folder"
-                    onCommit={(text) => patch({ log_dir: text })}
+                    onCommit={(text) => commitPatch({ log_dir: text })}
                   />
                   <Button variant="outline" onClick={() => setLogPicker(true)}>
                     <FolderOpen />
@@ -700,7 +703,7 @@ export function SettingsPage() {
               max={3600}
               suffix="s"
               disabled={!watching}
-              onSave={(value) => patch({ hang_timeout_s: value })}
+              onSave={(value) => commitPatch({ hang_timeout_s: value })}
             />
             <NumberSetting
               label="Stall timeout"
@@ -710,7 +713,7 @@ export function SettingsPage() {
               max={86400}
               suffix="s"
               disabled={!watching}
-              onSave={(value) => patch({ stall_timeout_s: value })}
+              onSave={(value) => commitPatch({ stall_timeout_s: value })}
             />
             <NumberSetting
               label="Stop a load when free RAM falls below"
@@ -720,7 +723,7 @@ export function SettingsPage() {
               max={262144}
               suffix="MiB"
               disabled={!watching}
-              onSave={(value) => patch({ load_ram_floor_mib: value })}
+              onSave={(value) => commitPatch({ load_ram_floor_mib: value })}
             />
           </CardContent>
         </Card>

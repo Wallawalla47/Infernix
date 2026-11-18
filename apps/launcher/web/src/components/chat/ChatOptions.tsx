@@ -24,6 +24,15 @@ function parseField(text: string, { integer, min, max }: { integer: boolean; min
 const TEMPERATURE = { integer: false, min: 0, max: 2 };
 const MAX_TOKENS = { integer: true, min: 1, max: 16_777_216 };
 
+/** Under a field whose text is no valid value: the accepted range and the value requests still use. */
+function InvalidHint({ id, range, used }: { id: string; range: string; used: number | null }) {
+  return (
+    <div id={id} className="text-xs text-critical">
+      {range}; requests use {used === null ? "the default" : used} until then
+    </div>
+  );
+}
+
 function OptionsForm({ chat, onChange }: { chat: Chat; onChange: (patch: ChatSettingsPatch) => void }) {
   const [system, setSystem] = useState(chat.system_prompt);
   const [temperature, setTemperature] = useState(chat.options.temperature === null ? "" : String(chat.options.temperature));
@@ -60,12 +69,16 @@ function OptionsForm({ chat, onChange }: { chat: Chat; onChange: (patch: ChatSet
             placeholder="Default"
             value={temperature}
             aria-invalid={temperatureValue === undefined}
+            aria-describedby={temperatureValue === undefined ? "chat-temperature-hint" : undefined}
             onChange={(event) => {
               setTemperature(event.target.value);
               const value = parseField(event.target.value, TEMPERATURE);
               if (value !== undefined) onChange({ options: { ...chat.options, temperature: value } });
             }}
           />
+          {temperatureValue === undefined ? (
+            <InvalidHint id="chat-temperature-hint" range="0 to 2" used={chat.options.temperature} />
+          ) : null}
         </div>
         <div className="grid gap-1.5">
           <Label htmlFor="chat-max-tokens">Max tokens</Label>
@@ -78,12 +91,16 @@ function OptionsForm({ chat, onChange }: { chat: Chat; onChange: (patch: ChatSet
             placeholder="Default"
             value={maxTokens}
             aria-invalid={maxTokensValue === undefined}
+            aria-describedby={maxTokensValue === undefined ? "chat-max-tokens-hint" : undefined}
             onChange={(event) => {
               setMaxTokens(event.target.value);
               const value = parseField(event.target.value, MAX_TOKENS);
               if (value !== undefined) onChange({ options: { ...chat.options, max_tokens: value } });
             }}
           />
+          {maxTokensValue === undefined ? (
+            <InvalidHint id="chat-max-tokens-hint" range="A whole number of at least 1" used={chat.options.max_tokens} />
+          ) : null}
         </div>
       </div>
       <div className="flex items-start justify-between gap-4">

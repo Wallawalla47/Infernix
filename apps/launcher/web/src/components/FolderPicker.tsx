@@ -237,7 +237,8 @@ export function FolderPicker({
               Cancel
             </Button>
             <Button
-              disabled={current.length === 0}
+              // A folder that could not be listed (missing, unreadable) is not offered.
+              disabled={current.length === 0 || listing.isLoading || listing.isError || Boolean(data?.error)}
               onClick={() => {
                 onSelect(current);
                 onOpenChange(false);

@@ -85,7 +85,8 @@ export function parseRepo(input: string): string | null {
   const text = input.trim();
   if (text.length === 0) return null;
   const url = text.match(/^(?:https?:\/\/)?(?:www\.)?(?:huggingface\.co|hf\.co)\/([^/\s]+)\/([^/\s?#]+)/i);
-  if (url) return `${url[1]}/${url[2]}`;
+  // A dataset's or Space's page (and the models/ prefix) is no model repository's "owner/name".
+  if (url) return /^(?:datasets|spaces|models)$/i.test(url[1]) ? null : `${url[1]}/${url[2]}`;
   const plain = text.match(/^([A-Za-z0-9][\w.-]*)\/([\w.-]+)$/);
   return plain ? `${plain[1]}/${plain[2]}` : null;
 }

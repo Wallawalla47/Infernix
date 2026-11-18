@@ -64,7 +64,7 @@ export function IdleUnloadField({
               ariaLabel="Minutes without requests"
               onCommit={(text) => {
                 const minutes = Math.round(Number(text));
-                if (text.length === 0 || !Number.isFinite(minutes) || minutes < 0) return;
+                if (text.length === 0 || !Number.isFinite(minutes) || minutes < 0) return false;
                 if (minutes > 0) setLastMinutes(minutes);
                 onChange(minutes);
               }}

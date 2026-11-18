@@ -2,7 +2,7 @@
 // array, which stays the single source of truth (unknown flags pass through untouched). The
 // options themselves, grouped into the form's sections, are in options.ts.
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { CircleHelp } from "lucide-react";
 
 import { Input } from "@/components/ui/input";
@@ -70,7 +70,10 @@ function Row({
   );
 }
 
-/** A text box that commits its value on blur or Enter, so typing does not rewrite args per key. */
+/** A text box that commits its value on blur or Enter, so typing does not rewrite args per key. `onCommit`
+ * returns false when it ignores the text, or a promise that rejects when the save is refused: the box then shows
+ * the saved value again (an unchanged value prop would not reset it). Text equal to the value, or already being
+ * committed (Enter, then blur), is not committed again. */
 export function CommitInput({
   value,
   onCommit,
@@ -85,7 +88,7 @@ export function CommitInput({
   disabled = false,
 }: {
   value: string;
-  onCommit: (value: string) => void;
+  onCommit: (value: string) => unknown;
   placeholder?: string;
   mono?: boolean;
   type?: "text" | "number";
@@ -98,6 +101,39 @@ export function CommitInput({
 }) {
   const [local, setLocal] = useState(value);
   useEffect(() => setLocal(value), [value]);
+  const latest = useRef(value);
+  latest.current = value;
+  const committing = useRef<string | null>(null);
+  const commit = () => {
+    const text = local.trim();
+    if (text === value) {
+      if (local !== value) setLocal(value);
+      return;
+    }
+    if (text === committing.current) return;
+    committing.current = text;
+    const settle = (accepted: boolean) => {
+      committing.current = null;
+      if (!accepted) setLocal(latest.current);
+    };
+    let result: unknown;
+    try {
+      result = onCommit(text);
+    } catch {
+      settle(false);
+      return;
+    }
+    if (result === false) {
+      settle(false);
+    } else if (result instanceof Promise) {
+      result.then(
+        () => settle(true),
+        () => settle(false),
+      );
+    } else {
+      settle(true);
+    }
+  };
   return (
     <Input
       value={local}
@@ -111,13 +147,11 @@ export function CommitInput({
       spellCheck={false}
       className={cn(mono && "font-mono text-xs", className)}
       onChange={(event) => setLocal(event.target.value)}
-      onBlur={() => {
-        if (local !== value) onCommit(local.trim());
-      }}
+      onBlur={commit}
       onKeyDown={(event) => {
         if (event.key === "Enter") {
           event.preventDefault();
-          if (local !== value) onCommit(local.trim());
+          commit();
         }
       }}
     />

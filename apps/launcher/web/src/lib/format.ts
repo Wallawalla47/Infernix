@@ -55,11 +55,14 @@ export function formatSeconds(seconds: Maybe): string {
   if (seconds < 0) return DASH;
   if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
   if (seconds < 10) return `${seconds.toFixed(2)} s`;
-  if (seconds < 60) return `${seconds.toFixed(1)} s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${String(Math.round(seconds % 60)).padStart(2, "0")}s`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
+  if (seconds < 59.95) return `${seconds.toFixed(1)} s`;
+  // Whole seconds first, then minutes and hours of them, so 119.6 s is 2m 00s, never 1m 60s.
+  const whole = Math.round(seconds);
+  const minutes = Math.floor(whole / 60);
+  if (minutes < 60) return `${minutes}m ${String(whole % 60).padStart(2, "0")}s`;
+  const totalMinutes = Math.round(seconds / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  return `${hours}h ${String(totalMinutes % 60).padStart(2, "0")}m`;
 }
 
 export function formatMs(ms: Maybe): string {

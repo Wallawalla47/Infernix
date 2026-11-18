@@ -69,14 +69,34 @@ export function daysBetween(range: DayRange): string[] {
   return days;
 }
 
-/** Whether a request's `model` matches a route pattern: case-insensitive, `*` matches any run of
- * characters (none included), everything else literally. */
+/** Whether a request's `model` matches a route pattern: case-insensitive (ASCII), `*` matches any run of
+ * characters (none included), everything else literally. The launcher's own matcher (src/launcher/routing.cpp
+ * wildcard_match): one backtrack point, so a pattern of many `*` stays linear while it is typed. */
 export function matchesPattern(pattern: string, name: string): boolean {
-  const escaped = pattern
-    .split("*")
-    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
-    .join(".*");
-  return new RegExp(`^${escaped}$`, "is").test(name);
+  const lower = (code: number) => (code >= 65 && code <= 90 ? code + 32 : code);
+  const star = 42;
+  let p = 0;
+  let t = 0;
+  let lastStar = -1;
+  let resume = 0;
+  while (t < name.length) {
+    if (p < pattern.length && pattern.charCodeAt(p) === star) {
+      lastStar = p;
+      p += 1;
+      resume = t;
+    } else if (p < pattern.length && lower(pattern.charCodeAt(p)) === lower(name.charCodeAt(t))) {
+      p += 1;
+      t += 1;
+    } else if (lastStar >= 0) {
+      p = lastStar + 1;
+      resume += 1;
+      t = resume;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.length && pattern.charCodeAt(p) === star) p += 1;
+  return p === pattern.length;
 }
 
 /** The first route whose pattern matches `name` (first match wins), with its position. */

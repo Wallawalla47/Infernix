@@ -1,7 +1,7 @@
 // Settings: the launcher's named API keys. The secret of a new key is shown once (the launcher keeps
 // only its SHA-256); revoking one stops every tool that sends it at once.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Plus, ShieldCheck, ShieldOff, Trash2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
@@ -55,6 +55,12 @@ function CreateKeyDialog({
 }) {
   const [name, setName] = useState("");
   const [scope, setScope] = useState<ApiKeyScope>("api");
+  // Each opening starts empty: a name typed and then cancelled does not come back.
+  useEffect(() => {
+    if (!open) return;
+    setName("");
+    setScope("api");
+  }, [open]);
   const create = useMutation({
     mutationFn: () => api.createApiKey(name.trim(), scope),
     onSuccess: (created) => {

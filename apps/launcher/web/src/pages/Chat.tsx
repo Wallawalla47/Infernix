@@ -55,9 +55,16 @@ export function ChatPage() {
   const [dragging, setDragging] = useState(false);
   const dragDepth = useRef(0);
 
+  // One draft for a visit without a chat id, however often the effect runs before the id lands (StrictMode runs it
+  // twice in development).
+  const visitDraft = useRef<string | null>(null);
   useEffect(() => {
-    if (id === null) setParams({ id: lastOpenChat() ?? createDraft() }, { replace: true });
-    else void openChat(id);
+    if (id === null) {
+      setParams({ id: lastOpenChat() ?? (visitDraft.current ??= createDraft()) }, { replace: true });
+    } else {
+      visitDraft.current = null;
+      void openChat(id);
+    }
   }, [id, setParams]);
 
   const chatModel = entry ? entry.chat.model : null;

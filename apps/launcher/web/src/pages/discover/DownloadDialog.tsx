@@ -139,6 +139,12 @@ export function DownloadDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, repo]);
 
+  // Settings that load after the dialog opened still give it the download folder (a folder typed meanwhile stays).
+  const downloadDir = settings?.download_dir ?? "";
+  useEffect(() => {
+    if (open && downloadDir.length > 0) setDest((old) => (old.length > 0 ? old : downloadDir));
+  }, [open, downloadDir]);
+
   useEffect(() => {
     if (!listing.data) return;
     setSelected(
@@ -194,16 +200,31 @@ export function DownloadDialog({
     const list = requests();
     if (list.length === 0 || dest.length === 0) return;
     setSubmitting(true);
+    // The requests start one by one: once one is queued the dialog closes whatever follows, so a retry never
+    // queues it twice, and a failure says which were queued.
+    const queued: DownloadRequest[] = [];
     try {
       for (const request of list) {
         await api.startDownload(request);
+        queued.push(request);
       }
       toast.success(list.length === 1 ? `Downloading ${repoName(list[0].repo)}` : `Queued ${list.length} downloads`);
+    } catch (error) {
+      if (queued.length === 0) {
+        toast.error(errorMessage(error));
+        setSubmitting(false);
+        return;
+      }
+      const failed = list[queued.length];
+      toast.error(
+        `Queued ${queued.map((request) => repoName(request.repo)).join(", ")}; ` +
+          `${repoName(failed.repo)} was not queued: ${errorMessage(error)}`,
+      );
+    }
+    try {
       await queryClient.invalidateQueries({ queryKey: ["downloads"] });
       onQueued();
       onOpenChange(false);
-    } catch (error) {
-      toast.error(errorMessage(error));
     } finally {
       setSubmitting(false);
     }
