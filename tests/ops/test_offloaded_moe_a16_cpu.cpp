@@ -11,12 +11,14 @@
 #include "ops/op_family.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 #include "ops/offloaded_moe_fixtures.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 namespace canon    = infernix::ops::canon;
@@ -339,6 +341,33 @@ void test_golden() {
     }
 }
 
+// The walks' row-group scratch holds 192 units (csf::kMaxChunkUnits): a matrix with 192 units a row (K 3,072, the
+// 122B's gate/up) is walked on every ISA and column count, the grouped calls (6-8 columns on AVX2 / AVX-VNNI) too; one
+// with 193 is refused before any walk (it wrote past the scratch: rg16_linear's 269- and 288-unit vision rows).
+void test_unit_bound() {
+    constexpr int kWidest = moe::csf::kMaxChunkUnits;
+    std::vector<std::uint8_t> units(static_cast<std::size_t>(kWidest + 1) * moe::kUnitBytes, 0);
+    std::vector<canon::A16Block> blocks(static_cast<std::size_t>(moe::kMaxColumns) * (kWidest + 1));
+    std::vector<const canon::A16Block*> acts(moe::kMaxColumns);
+    for (int c = 0; c < moe::kMaxColumns; ++c) { acts[c] = &blocks[static_cast<std::size_t>(c) * (kWidest + 1)]; }
+    std::vector<std::int64_t> out(16 * moe::kMaxColumns, -1);
+    for (moe::CpuIsa isa : {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+        if (!moe::cpu_isa_supported(isa)) { continue; }
+        for (const int ncols : {1, 6, 8}) {
+            bool walked = true, refused = false;
+            try {
+                moe::rg16_row_sums_a16(isa, {units.data(), kWidest}, 0, 1, acts.data(), ncols, out.data());
+            } catch (const std::invalid_argument&) { walked = false; }
+            walked = walked && std::all_of(out.begin(), out.begin() + 16 * ncols, [](std::int64_t s) { return s == 0; });
+            try {
+                moe::rg16_row_sums_a16(isa, {units.data(), kWidest + 1}, 0, 1, acts.data(), ncols, out.data());
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(walked, "a matrix of 192 units a row is walked (zero sums of zero units)");
+            check(refused, "a matrix of 193 units a row is refused");
+        }
+    }
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(offloaded_moe_a16_cpu) {
@@ -352,6 +381,7 @@ INFERNIX_OP_TEST(offloaded_moe_a16_cpu) {
         test_non_finite(shape);
     }
     test_golden();
+    test_unit_bound();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

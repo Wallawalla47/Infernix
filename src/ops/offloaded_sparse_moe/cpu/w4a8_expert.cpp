@@ -344,6 +344,7 @@ void rg16_rows_a8(CpuIsa isa, const Rg16Matrix& matrix, int partials, int rg_beg
                   const CpuW4A8Slice* const* acts, int ncols, float* out, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_moe: unsupported CPU ISA"); }
+    csf::require_cpu_walk_units(matrix.blocks);
     const int blocks = matrix.blocks;
     if (blocks < 2 || blocks % 2 != 0 || partials < 1 || partials > kMaxPartials || (partials & (partials - 1)) != 0 ||
         blocks / 2 < partials) {

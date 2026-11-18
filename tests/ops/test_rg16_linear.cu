@@ -32,6 +32,7 @@
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
+#include "ops/offloaded_sparse_moe/csf_record.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -145,12 +146,24 @@ std::vector<float> exact_oracle(const Matrix& m, const std::vector<std::uint16_t
             moe::encode_a16(&x[static_cast<std::size_t>(c) * m.k], m.k, &blocks[static_cast<std::size_t>(c) * m.blocks()]);
         acts[static_cast<std::size_t>(c)] = &blocks[static_cast<std::size_t>(c) * m.blocks()];
     }
+    // The CPU engine walks at most csf::kMaxChunkUnits units a row (every expert geometry): a wider K (the vision fc2's
+    // 4304, the merger's 4608) is summed in slices of that many blocks, one row group at a time, so a slice is the
+    // group's units from its first block on. Each slice's sums are exact int64, so their sum is the row's exactly.
+    constexpr int kSlice = moe::csf::kMaxChunkUnits;
     parallel(m.groups(), [&](int g) {
-        std::vector<std::int64_t> s(16 * moe::kMaxColumns);
+        std::vector<std::int64_t> s(16 * moe::kMaxColumns), part(16 * moe::kMaxColumns);
+        const std::uint8_t* group = m.units.data() + static_cast<std::size_t>(g) * m.blocks() * moe::kUnitBytes;
         for (int c0 = 0; c0 < columns; c0 += moe::kMaxColumns) {
             const int n = std::min(moe::kMaxColumns, columns - c0);
-            moe::rg16_row_sums_a16(moe::best_cpu_isa(), {m.units.data(), m.blocks()}, g, g + 1,
-                                   &acts[static_cast<std::size_t>(c0)], n, s.data());
+            std::fill(s.begin(), s.end(), 0);
+            for (int b0 = 0; b0 < m.blocks(); b0 += kSlice) {
+                const int count = std::min(kSlice, m.blocks() - b0);
+                const canon::A16Block* sliced[moe::kMaxColumns];
+                for (int c = 0; c < n; ++c) { sliced[c] = acts[static_cast<std::size_t>(c0 + c)] + b0; }
+                moe::rg16_row_sums_a16(moe::best_cpu_isa(), {group + static_cast<std::size_t>(b0) * moe::kUnitBytes, count},
+                                       0, 1, sliced, n, part.data());
+                for (std::size_t i = 0; i < static_cast<std::size_t>(16) * n; ++i) { s[i] += part[i]; }
+            }
             for (int r = 0; r < 16; ++r) {
                 for (int c = 0; c < n; ++c) {
                     y[static_cast<std::size_t>(c0 + c) * m.rows + static_cast<std::size_t>(g) * 16 + r] =

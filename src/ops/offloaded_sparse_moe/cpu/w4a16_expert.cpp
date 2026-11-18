@@ -477,6 +477,7 @@ void rg16_row_sums_a16(CpuIsa isa, const Rg16Matrix& matrix, int rg_begin, int r
                        const canon::A16Block* const* acts, int ncols, std::int64_t* out, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_moe: unsupported CPU ISA"); }
+    csf::require_cpu_walk_units(matrix.blocks);
 #if defined(INFERNIX_MOE_X86)
     if ((isa == CpuIsa::kAvxVnni || isa == CpuIsa::kAvx2) && ncols >= kGroupedColumns) {
         const int first = (ncols + 1) / 2;

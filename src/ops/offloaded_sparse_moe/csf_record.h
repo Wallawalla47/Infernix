@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #if defined(__CUDACC__)
 #    define INFERNIX_CSF_HD __host__ __device__
@@ -75,6 +76,14 @@ struct Geometry {
 // The most units and row groups of a GPU chunk at any registered geometry (the 122B's 192-unit gate/up row groups,
 // Flash-Next's four 40-unit down row groups), and its most bytes (raw regions).
 inline constexpr int kMaxChunkUnits = 192;
+// The CPU walks' row-group scratch (GroupScales, the A16 grouped calls' multipliers, the inline-scale decodes) holds
+// kMaxChunkUnits units, so they take matrices of at most that many units a row (K up to 3,072: every registered expert
+// geometry) and refuse a wider one instead of writing past it.
+inline void require_cpu_walk_units(int blocks) {
+    if (blocks < 1 || blocks > kMaxChunkUnits) {
+        throw std::invalid_argument("offloaded_moe: a CPU walk takes 1-192 units a row (K up to 3,072)");
+    }
+}
 inline constexpr int kMaxChunkRgs   = 4;
 inline constexpr int kMaxChunkBytes = kMaxChunkUnits * static_cast<int>(kUnitBytes);
 // The most table words at any registered geometry (the 122B's: 2 * 1024 / 16 gate/up and 3072 / 16 down row groups).
