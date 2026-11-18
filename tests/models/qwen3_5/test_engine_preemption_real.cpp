@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -296,6 +297,71 @@ void settled(const infernix::RuntimeStats& stats, bool prefix_cache = false) {
                 (stats.device_state_occupied_slots == 0 && stats.device_main_kv_occupied_pages == 0 &&
                  stats.device_backend_kv_occupied_pages == 0),
             "completed recovery retained physical resources with history disabled");
+}
+
+// An orderly stop while a request is paused (audit 2026-11-18 F-4): the Engine answers every client, the paused one
+// included, before the Program's shutdown cleanup (an attached prefix cache file's save, seconds for a large Host
+// tier). The cleanup hook waits up to 5 s for both clients' answers: a paused client answered only after the cleanup
+// cannot have its answer while the hook holds the worker.
+std::atomic<int> g_clients_answered{0};
+std::atomic<int> g_answered_at_cleanup{-1};
+
+void record_answered_at_cleanup() {
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (g_clients_answered.load() < 2 && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    g_answered_at_cleanup.store(g_clients_answered.load());
+}
+
+void shutdown_paused(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected) {
+    std::cout << "shutdown with a paused request\n";
+    auto engine = std::make_unique<infernix::Engine>(engine_options(artifact, selected));
+    // As in exercise(): both prompts fit together, their growth does not, so one request is paused.
+    std::vector<infernix::TokenId> first_prompt(kPromptTokens, 198), second_prompt(kPromptTokens, 198);
+    first_prompt.front()  = 1000;
+    second_prompt.front() = 1001;
+    g_clients_answered.store(0);
+    g_answered_at_cleanup.store(-1);
+    std::vector<std::thread> clients;
+    std::string outcomes[2];
+    const auto started = std::chrono::steady_clock::now();
+    const auto since   = [&] {
+        return std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()) + " s";
+    };
+    for (std::size_t row = 0; row < 2; ++row) {
+        auto* prompt = row == 0 ? &first_prompt : &second_prompt;
+        auto handle  = std::make_shared<infernix::GenerationHandle>(
+            engine->submit(engine->prepare_tokens(std::move(*prompt)), request(kOutputTokens)));
+        clients.emplace_back([handle, row, &outcomes, &since] {
+            try {
+                const infernix::GenerationResult result = handle->wait();
+                outcomes[row] = "completed " + std::to_string(result.generated_token_ids.size()) + " tokens, " +
+                                std::to_string(result.scheduling.preemptions) + " pauses";
+            } catch (const std::exception& error) { outcomes[row] = std::string("error: ") + error.what(); }
+            outcomes[row] += " at " + since();
+            ++g_clients_answered;
+        });
+    }
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (engine->runtime_stats().paused_requests == 0 && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool paused = engine->runtime_stats().paused_requests != 0;
+    std::cout << "stop at " << since() << " (paused requests published: " << paused << ")\n";
+    // The handles keep the Engine alive (destroying it would wait for both requests to finish): stop() ends them
+    // within one unit and runs the cleanup, whose hook returns once both clients have their answers (or after 5 s).
+    infernix::runtime::testing::shutdown_cleanup_hook().store(&record_answered_at_cleanup);
+    engine->stop();
+    for (std::thread& client : clients) { client.join(); }
+    engine.reset();
+    infernix::runtime::testing::shutdown_cleanup_hook().store(nullptr);
+    std::cout << "client 0: " << outcomes[0] << "\nclient 1: " << outcomes[1] << '\n';
+    require(paused, "no request was paused before the stop");
+    const std::string answered = "an orderly stop answered " + std::to_string(g_answered_at_cleanup.load()) +
+                                 " of 2 clients before its shutdown cleanup (-1: the cleanup never ran)";
+    std::cout << answered << '\n';
+    require(g_answered_at_cleanup.load() == 2, answered.c_str());
 }
 
 void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
@@ -749,9 +815,10 @@ int main() {
         const auto scenario     = setting("INFERNIX_PREEMPTION_REAL_SCENARIO", "all");
         require(scenario == "all" || scenario == "replay" || scenario == "cancel-paused" ||
                     scenario == "cancel-replay" || scenario == "cache-replay" || scenario == "fairness" ||
-                    scenario == "cache-fairness" || scenario == "conversations",
+                    scenario == "cache-fairness" || scenario == "conversations" || scenario == "shutdown-paused",
                 "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, cancel-paused, "
-                "cancel-replay, cache-replay, fairness, cache-fairness or conversations");
+                "cancel-replay, cache-replay, fairness, cache-fairness, conversations or shutdown-paused");
+        if (scenario == "all" || scenario == "shutdown-paused") { shutdown_paused(artifact, selected); }
         if (scenario == "all" || scenario == "replay") { exercise(artifact, selected, backend_name); }
         if (scenario == "all" || scenario == "cancel-paused") {
             exercise(artifact, selected, backend_name, CancelStage::Paused);

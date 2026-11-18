@@ -2764,6 +2764,14 @@ private:
         scheduler_ = Scheduling{};
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
+        // Every client is answered whatever throws on the way (an allocation, or the Program's queries in
+        // publish_runtime_stats after a device failure): this function is noexcept, so a throw would end the
+        // process instead. A completion that throws still answers its client.
+        const auto complete = [&](const std::shared_ptr<Request>& request) noexcept {
+            try {
+                complete_error(request, error);
+            } catch (...) { answer_error(request, error); }
+        };
         // An orderly stop saves the prefix cache during the Program cleanup, which takes seconds
         // for a large Host tier: answer every request first rather than after the save.
         if (shutdown) {
@@ -2771,11 +2779,14 @@ private:
                 if (slots_[lane] != nullptr) { answer_error(slots_[lane], error); }
             }
             if (materializing_request != nullptr) { answer_error(materializing_request, error); }
-            for (const auto& request : pending) { complete_error(request, error); }
+            // A paused request's client waits too; its suspended state is released after the cleanup, below.
+            for (const auto& request : paused_) { answer_error(request, error); }
+            for (const auto& request : pending) { complete(request); }
             pending.clear();
         }
         // An orderly stop also saves an attached prefix cache file.
         if (shutdown) {
+            if (const auto hook = testing::shutdown_cleanup_hook().load()) { hook(); }
             instance_.program->shutdown_cleanup();
         } else {
             instance_.program->fail_all_cleanup();
@@ -2785,18 +2796,20 @@ private:
         context_owner_.reset();
         for (auto& request : paused_) {
             request->suspended.reset();
-            complete_error(request, error);
+            complete(request);
         }
         paused_.clear();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
-                complete_error(slots_[lane], error);
+                complete(slots_[lane]);
                 slots_[lane].reset();
             }
         }
-        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-        for (const auto& request : pending) { complete_error(request, error); }
-        publish_runtime_stats();
+        if (materializing_request != nullptr) { complete(materializing_request); }
+        for (const auto& request : pending) { complete(request); }
+        try {
+            publish_runtime_stats();
+        } catch (...) {} // the statistics stay as last published
     }
 
     // The periodic Host-tier save (HybridPrefixCacheOptions::persistent_save_interval): at the first

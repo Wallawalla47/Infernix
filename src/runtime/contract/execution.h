@@ -136,6 +136,12 @@ inline std::atomic<std::uint64_t>& abort_fault_request() noexcept {
 }
 inline void request_finish_fault(std::uint64_t after) noexcept { finish_fault_request().store(after); }
 inline void request_abort_fault(std::uint64_t after) noexcept { abort_fault_request().store(after); }
+// Called on the worker as an orderly stop enters the Program's shutdown cleanup (an attached prefix cache file's save),
+// for a test of what was answered before it. Null: none. Process-wide.
+inline std::atomic<void (*)()>& shutdown_cleanup_hook() noexcept {
+    static std::atomic<void (*)()> hook{nullptr};
+    return hook;
+}
 } // namespace testing
 
 // Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.
