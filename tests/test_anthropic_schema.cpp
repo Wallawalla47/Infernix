@@ -411,6 +411,15 @@ int test_claude_code_prompt() {
                           interactive_text.find("Claude") == std::string::npos,
                       "the interactive Claude Code prompt was not rewritten section by section");
 
+    // A heading quoted in a code fence is text: an Environment heading there, with another heading after it inside the
+    // fence, is not an empty Environment section.
+    const std::string fenced = "\n\n# Plan mode\nAn example:\n```markdown\n# Environment\n\n# Example\n```\n"
+                               "Plan before you edit.";
+    const std::string quoted =
+        system_text(parse_with(claude_code_request({identity + fenced}), ClaudeCodePrompt::Local).generation);
+    failures += check(quoted.starts_with(opening) && quoted.ends_with(fenced),
+                      "the local rewrite removed an Environment heading quoted in a code fence");
+
     // Anything without both the attribution block and the identity line stays as sent.
     const auto unchanged = [&](const Json& request_body, const std::string& message) {
         const std::string sent = system_text(parse(request_body).generation);

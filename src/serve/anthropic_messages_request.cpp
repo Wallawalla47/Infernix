@@ -819,11 +819,14 @@ std::string drop_claude_bullets(std::string_view text) {
     return result;
 }
 
-// Removes an Environment heading left with nothing before the next heading or the end.
+// Removes an Environment heading left with nothing before the next heading or the end. A heading quoted in a code
+// fence is text, as next_top_level_heading reads it.
 std::string drop_empty_environment(std::string text) {
+    bool fenced = false;
     for (std::size_t line = 0; line < text.size();) {
         const std::string_view rest = std::string_view(text).substr(line);
-        if (rest.starts_with(kEnvironmentHeading)) {
+        if (rest.starts_with("```")) { fenced = !fenced; }
+        if (!fenced && rest.starts_with(kEnvironmentHeading)) {
             std::size_t end = line + kEnvironmentHeading.size();
             while (end < text.size() && text[end] == '\n') { ++end; }
             if (end == text.size() || std::string_view(text).substr(end).starts_with("# ")) {
