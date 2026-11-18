@@ -2948,6 +2948,7 @@ bool masked_call(const MoeColumnMask& mask, int columns, bool shared_job) {
 
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
                   std::int32_t* route_log, cudaStream_t stream, bool shared_job) {
+    require(contiguous(routing.ids, DType::I32), "dispatch requires contiguous I32 routed ids");
     const int routed = static_cast<int>(routing.ids.numel()), columns = routing.ids.ne[1];
     const int top_k  = routing.ids.ne[0];
     // A shared job is expert E with one entry per column after the routed ones.
@@ -3430,11 +3431,14 @@ std::size_t lossless_experts_bytes(const ExpertShape& shape, std::int32_t max_jo
 
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream) {
-    require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16),
-            "combine requires contiguous BF16 tensors");
+    require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "combine requires contiguous BF16 tensors and FP32 routing weights");
     const int hidden = y.ne[0], columns = y.ne[1], top_k = routing.weights.ne[0];
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && shared.ne[0] == hidden &&
-                shared.ne[1] == columns && routing.weights.ne[1] == columns,
+                shared.ne[1] == columns && routing.weights.ne[1] == columns &&
+                routing.weights.numel() == static_cast<std::int64_t>(top_k) * columns &&
+                routing.shared_gate.numel() == columns,
             "combine shapes disagree");
     // The dispatch checked the mask's rows and shared job; the combine needs only its rows.
     const bool masked = routing.mask.valid != nullptr;
@@ -3458,14 +3462,17 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
                         const Tensor& inject, Tensor& residual, cudaStream_t stream) {
     require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) &&
-                contiguous(residual, DType::BF16) && contiguous(inject, DType::FP32),
-            "combine inject requires contiguous BF16 tensors and FP32 inject");
+                contiguous(residual, DType::BF16) && contiguous(inject, DType::FP32) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "combine inject requires contiguous BF16 tensors and FP32 inject and routing weights");
     require(routing.mask.valid == nullptr, "combine inject takes no column mask");
     const int hidden = shared.ne[0], columns = shared.ne[1], top_k = routing.weights.ne[0];
     const int streams = inject.ne[0];
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && routing.weights.ne[1] == columns &&
-                inject.ne[1] == columns && streams > 0 && streams <= kCombineInjectMaxStreams && top_k > 0 &&
-                top_k <= kCombineInjectMaxTopK && residual.ne[0] == streams * hidden && residual.ne[1] == columns,
+                routing.weights.numel() == static_cast<std::int64_t>(top_k) * columns &&
+                routing.shared_gate.numel() == columns && inject.ne[1] == columns && streams > 0 &&
+                streams <= kCombineInjectMaxStreams && top_k > 0 && top_k <= kCombineInjectMaxTopK &&
+                residual.ne[0] == streams * hidden && residual.ne[1] == columns,
             "combine inject shapes disagree (at most 4 streams and top-16)");
     CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, grid_rows(columns)),
                                      dim3(kThreads), 0, stream},

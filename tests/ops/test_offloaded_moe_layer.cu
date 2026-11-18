@@ -1328,6 +1328,69 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
 
 // moe_combine_inject against moe_combine followed by hyper_connection_inject (each qualified against
 // its own oracle): the residual streams bit-equal.
+// The dispatch and both combines refuse routing tensors of another type, layout or size before any launch: a
+// shared gate shorter than the call's columns (or BF16 ids, or a weights tensor of extra rows) was read as given.
+void test_routing_refused() {
+    constexpr int hidden = moe::kHidden, columns = 4, top_k = 2, experts = 8;
+    const std::vector<std::uint16_t> wide(static_cast<std::size_t>(hidden) * columns * top_k);
+    const std::vector<float> floats(static_cast<std::size_t>(top_k) * columns * 2);
+    auto* d_outputs  = device_copy(wide);
+    auto* d_shared   = device_copy(wide);
+    auto* d_y        = device_copy(wide);
+    auto* d_residual = device_copy(wide);
+    auto* d_weights  = device_copy(floats);
+    auto* d_gate     = device_copy(floats);
+    auto* d_inject   = device_copy(floats);
+    const Tensor outputs(d_outputs, DType::BF16, {hidden, columns * top_k});
+    const Tensor shared(d_shared, DType::BF16, {hidden, columns});
+    const Tensor inject(d_inject, DType::FP32, {1, columns});
+    Tensor y(d_y, DType::BF16, {hidden, columns});
+    Tensor residual(d_residual, DType::BF16, {hidden, columns});
+    const Tensor weights(d_weights, DType::FP32, {top_k, columns});
+    const auto refused = [](const auto& call) {
+        try {
+            call();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    const auto combines_refuse = [&](const infernix::ops::MoeRouting& routing) {
+        return refused([&] { infernix::ops::moe_combine(outputs, routing, shared, y, nullptr); }) &&
+               refused([&] { infernix::ops::moe_combine_inject(outputs, routing, shared, inject, residual, nullptr); });
+    };
+    check(combines_refuse({Tensor{}, weights, Tensor(d_gate, DType::FP32, {columns - 1})}),
+          "the combines refuse a shared gate shorter than the columns");
+    check(combines_refuse({Tensor{}, weights, Tensor(d_gate, DType::BF16, {columns})}),
+          "the combines refuse a BF16 shared gate");
+    check(combines_refuse({Tensor{}, Tensor(d_weights, DType::BF16, {top_k, columns}), Tensor(d_gate, DType::FP32, {columns})}),
+          "the combines refuse BF16 routing weights");
+    check(combines_refuse({Tensor{}, Tensor(d_weights, DType::FP32, {top_k, columns, 2}), Tensor(d_gate, DType::FP32, {columns})}),
+          "the combines refuse routing weights of extra rows");
+    // The valid routing still combines (the checks do not refuse the shapes the layer uses).
+    infernix::ops::moe_combine(outputs, {Tensor{}, weights, Tensor(d_gate, DType::FP32, {columns})}, shared, y, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "combine with valid routing");
+
+    std::int32_t* d_ids  = nullptr;
+    std::int32_t* d_log  = nullptr;
+    void* d_dispatch     = nullptr;
+    const int entries    = top_k * columns;
+    const std::size_t bytes = infernix::ops::moe_dispatch_bytes(experts, entries);
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * entries), "cudaMalloc");
+    cuda_check(cudaMemset(d_ids, 0, sizeof(std::int32_t) * entries), "cudaMemset");
+    cuda_check(cudaMalloc(&d_log, sizeof(std::int32_t) * entries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_dispatch, bytes), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, entries);
+    const infernix::ops::MoeRouting bf16_ids{Tensor(d_ids, DType::BF16, {top_k, columns}), Tensor{}, Tensor{}};
+    check(refused([&] { infernix::ops::moe_dispatch(bf16_ids, experts, dispatch, d_log, nullptr, false); }),
+          "the dispatch refuses BF16 routed ids");
+    cuda_check(cudaDeviceSynchronize(), "refused dispatch");
+    for (void* p : {static_cast<void*>(d_outputs), static_cast<void*>(d_shared), static_cast<void*>(d_y),
+                    static_cast<void*>(d_residual), static_cast<void*>(d_weights), static_cast<void*>(d_gate),
+                    static_cast<void*>(d_inject), static_cast<void*>(d_ids), static_cast<void*>(d_log), d_dispatch}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
+    std::printf("routing tensors of another type, layout or size refused\n");
+}
+
 void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed) {
     constexpr int hidden = moe::kHidden;
     std::mt19937 rng(seed);
@@ -2164,6 +2227,7 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_route_nan(512, 10, 128, 281);
             test_route_nan(256, 8, 64, 283);
             for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
+            test_routing_refused();
             test_combine_wide(94080, 8, 4, 96, 311); // the 122B's fitted 94,592-token chunk at INT8 KV's waves
             test_service_column_bound();
             test_service_failure_reported();
