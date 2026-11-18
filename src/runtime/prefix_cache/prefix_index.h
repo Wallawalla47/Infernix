@@ -4,6 +4,7 @@
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/ssd_stats.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -629,7 +630,9 @@ public:
     // `stream_slabs` image SSD slabs (fewer than it reserved); the rest return to the SSD tier.
     void pack_ssd_write(SsdJob& job, std::uint32_t stream_slabs);
     // Image slabs an SSD copy keeps raw, or encodes when packed (PrefixIndexConfig::ssd_image_slabs).
-    [[nodiscard]] std::uint32_t ssd_image_slab_count() const noexcept;
+    [[nodiscard]] std::uint32_t ssd_image_slab_count() const noexcept {
+        return config_.ssd_image_slabs == 0 ? config_.image_slabs : std::min(config_.ssd_image_slabs, config_.image_slabs);
+    }
     // The write failed: the SSD slabs are freed and the entries stay as they were.
     void abort_ssd_write(SsdJob& job);
     // Starts reading the parts of `snapshot` that are only on the SSD (path blocks, image, tail)
@@ -651,8 +654,14 @@ public:
 
     // ---- views
     // ------------------------------------------------------------------------------------
-    [[nodiscard]] bool valid(NodeRef node) const noexcept;
-    [[nodiscard]] bool valid(SnapshotRef snapshot) const noexcept;
+    [[nodiscard]] bool valid(NodeRef node) const noexcept {
+        return node.index < nodes_.size() && nodes_[node.index].occupied &&
+               nodes_[node.index].generation == node.generation;
+    }
+    [[nodiscard]] bool valid(SnapshotRef snapshot) const noexcept {
+        return snapshot.index < snapshots_.size() && snapshots_[snapshot.index].occupied &&
+               snapshots_[snapshot.index].generation == snapshot.generation;
+    }
     [[nodiscard]] NodeView node(NodeRef node) const;
     [[nodiscard]] SnapshotView snapshot(SnapshotRef snapshot) const;
     [[nodiscard]] std::optional<SnapshotRef> slot_owner(std::uint32_t slot) const;
@@ -776,16 +785,18 @@ private:
         std::uint32_t count = 0;
     };
 
-    [[nodiscard]] Node& require(NodeRef node);
-    [[nodiscard]] const Node& require(NodeRef node) const;
-    [[nodiscard]] Snapshot& require(SnapshotRef snapshot);
-    [[nodiscard]] const Snapshot& require(SnapshotRef snapshot) const;
-    [[nodiscard]] NodeRef ref_of_node(std::uint32_t index) const noexcept;
-    [[nodiscard]] SnapshotRef ref_of_snapshot(std::uint32_t index) const noexcept;
-    [[nodiscard]] static std::uint64_t child_key(std::uint32_t parent,
-                                                 std::uint64_t lookup_hash) noexcept;
+    // The members declared inline here and below are defined in prefix_index_internal.h, private to the
+    // prefix_index*.cpp files that implement this class.
+    [[nodiscard]] inline Node& require(NodeRef node);
+    [[nodiscard]] inline const Node& require(NodeRef node) const;
+    [[nodiscard]] inline Snapshot& require(SnapshotRef snapshot);
+    [[nodiscard]] inline const Snapshot& require(SnapshotRef snapshot) const;
+    [[nodiscard]] inline NodeRef ref_of_node(std::uint32_t index) const noexcept;
+    [[nodiscard]] inline SnapshotRef ref_of_snapshot(std::uint32_t index) const noexcept;
+    [[nodiscard]] static inline std::uint64_t child_key(std::uint32_t parent,
+                                                        std::uint64_t lookup_hash) noexcept;
 
-    [[nodiscard]] bool snapshot_valid(const Snapshot& snapshot) const noexcept;
+    [[nodiscard]] inline bool snapshot_valid(const Snapshot& snapshot) const noexcept;
     [[nodiscard]] bool tail_matches(const Snapshot& snapshot,
                                     std::span<const TokenId> prompt) const noexcept;
 
@@ -837,10 +848,15 @@ private:
 
     // ---- SSD tier helpers (§5.7)
     // A copy outside the Device: Host or SSD Resident (the Device LRU's "backed").
-    [[nodiscard]] static bool node_backed(const Node& node) noexcept;
-    [[nodiscard]] bool tail_backed(const Snapshot& snapshot) const noexcept;
+    // Defined here: device_evictable and node_lru_list, above, call it in every file that includes this header.
+    [[nodiscard]] static bool node_backed(const Node& node) noexcept {
+        return node.host == CopyState::Resident || node.ssd == CopyState::Resident;
+    }
+    [[nodiscard]] inline bool tail_backed(const Snapshot& snapshot) const noexcept;
     // An image copy outside the Device (a Device slot owner that is not Device-only, §9.2).
-    [[nodiscard]] static bool image_backed(const Snapshot& snapshot) noexcept;
+    [[nodiscard]] static bool image_backed(const Snapshot& snapshot) noexcept {
+        return snapshot.host == CopyState::Resident || snapshot.ssd == CopyState::Resident;
+    }
     // Recounts the snapshot's warmth (anchor path warm_below) and clean image slabs.
     void sync_snapshot(std::uint32_t snapshot);
     void adjust_warm(std::uint32_t anchor, int delta);
@@ -850,7 +866,7 @@ private:
     void drop_snapshot_ssd_copy(std::uint32_t snapshot);
     // An open SSD promotion's Host slabs freed and its snapshot unpinned (cancel and abort both).
     void release_ssd_promotion(SsdJob& job);
-    void free_ssd_slab(std::uint32_t slab);
+    inline void free_ssd_slab(std::uint32_t slab);
     // One eviction freeing SSD slabs for a write-back worth `claim` (its snapshot's priority), never
     // touching `protect`: dead blocks' copies, superseded SSD-only snapshots, backups of images
     // worth more than the claim (the Host keeps those longer), then SSD-only snapshots worth at most
@@ -862,11 +878,11 @@ private:
     [[nodiscard]] std::uint64_t ssd_room_for(std::uint32_t protect, double claim) const;
     [[nodiscard]] bool allocate_ssd_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                           std::uint32_t protect, double claim);
-    [[nodiscard]] std::uint32_t snapshot_slab_count(const Snapshot& snapshot) const noexcept;
+    [[nodiscard]] inline std::uint32_t snapshot_slab_count(const Snapshot& snapshot) const noexcept;
     // An SSD copy's slabs with the tail's (PrefixIndexConfig::ssd_image_slabs).
-    [[nodiscard]] std::uint32_t ssd_snapshot_slab_count(const Snapshot& snapshot) const noexcept;
+    [[nodiscard]] inline std::uint32_t ssd_snapshot_slab_count(const Snapshot& snapshot) const noexcept;
     // The Host slab position (in Snapshot::host_slabs) of an SSD copy's slab k.
-    [[nodiscard]] std::size_t ssd_to_host_position(std::size_t k) const noexcept;
+    [[nodiscard]] inline std::size_t ssd_to_host_position(std::size_t k) const noexcept;
     [[nodiscard]] SsdKindStats& kind_stats(const Snapshot& snapshot) noexcept {
         return counters_.ssd_by_kind[static_cast<std::size_t>(snapshot.kind)];
     }
@@ -884,7 +900,7 @@ private:
         return host_room(count, protect_snapshot, claim) >= count;
     }
     // Whether evicting the snapshot's Host copy frees a slab an allocation can take (always, outside a shrink).
-    [[nodiscard]] bool yields_host_room(const Snapshot& snapshot) const noexcept;
+    [[nodiscard]] inline bool yields_host_room(const Snapshot& snapshot) const noexcept;
     // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`
     // slabs are free, but no retained snapshot with a priority above `claim` when the allocation began
     // (an eviction revalues the victim's dependents, and one that was claimable stays so: taken before
@@ -897,9 +913,9 @@ private:
     // `claim`) can yield. `for_moves` (a shrink making room for its moves) also takes a snapshot whose slabs all
     // lie past the ceiling: its eviction is one move less.
     [[nodiscard]] bool evict_for_slabs(std::uint32_t protect_snapshot, double claim, bool for_moves = false);
-    void free_slab(std::uint32_t slab);
+    inline void free_slab(std::uint32_t slab);
     // A node's Host slab, recorded in node_of_slab_ (kNoId clears it).
-    void set_node_slab(std::uint32_t node, std::uint32_t slab) noexcept;
+    inline void set_node_slab(std::uint32_t node, std::uint32_t slab) noexcept;
 
     // The publication shared by publish_snapshot and publish_host_snapshot: exactly one of
     // `device_slot` (a staging slot) and `host_slabs` (reserved slabs, already unmarked) holds the

@@ -7,6 +7,10 @@ add_library(infernix_runtime_support STATIC
   prefix_cache/host_slab_store.cpp
   prefix_cache/persist_file.cpp
   prefix_cache/prefix_index.cpp
+  prefix_cache/prefix_index_host.cpp
+  prefix_cache/prefix_index_invariants.cpp
+  prefix_cache/prefix_index_persist.cpp
+  prefix_cache/prefix_index_ssd.cpp
   prefix_cache/ssd_tier.cpp
   prefix_cache/ssd_write_budget.cpp
   prefix_cache/fp32_row_codec.cpp
