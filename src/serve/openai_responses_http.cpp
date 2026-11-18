@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
@@ -575,34 +576,17 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 SseTransport transport(sink, stream->cancelled);
                 transport.set_heartbeat([&] { return stream->encoder->keep_alive(); });
                 const auto send_failed = [&](const ApiError& error) {
-                    try {
+                    return end_stream_with_error(sink, *lifecycle, [&] {
                         render_and_write(transport, [&] { return stream->encoder->failed(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
+                    });
                 };
-                try {
-                    render_and_write(transport, [&] { return stream->encoder->start(); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    const ApiError error = internal_server_error(exception, "server_error");
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
-                }
+                const auto server_error = [](const std::exception& exception) {
+                    return internal_server_error(exception, "server_error");
+                };
 
                 try {
+                    // The Response's created and in_progress events, before the generation.
+                    render_and_write(transport, [&] { return stream->encoder->start(); });
                     StreamSink output;
                     output.on_reasoning = [&](const std::string& text) {
                         render_and_write(transport,
@@ -627,34 +611,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                              [&] { return stream->encoder->round(round); });
                         },
                         [&](std::size_t index) { return stream->encoder->hosted_search_id(index); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    const ApiError error = internal_server_error(exception, "server_error");
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
-                } catch (const ApiException& exception) {
-                    const ApiError error = responses_error(exception.error());
-                    lifecycle->failure(make_generation_request_failure(error));
-                    return send_failed(error);
-                } catch (const std::exception& exception) {
-                    const ApiError error = internal_server_error(exception, "server_error");
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    return send_failed(error);
+                } catch (...) {
+                    return end_failed_stream_generation(*lifecycle, responses_error, server_error, send_failed);
                 }
 
                 const GenerationOutcome outcome = stream->rounds.totals();
-                lifecycle->done(outcome);
-                if (stream->rounds.final_outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                if (!record_stream_generation(*lifecycle, outcome, stream->cancelled)) { return false; }
                 std::optional<OpenAIResponsesStreamFinish> finished;
                 try {
                     const std::vector<OpenAIResponsesRound> all = stream->rounds.all();
@@ -665,10 +627,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         make_request_failure(RequestFailurePhase::ResponseRender, error));
                     return send_failed(error);
                 } catch (const std::exception& exception) {
-                    const ApiError error = internal_server_error(exception, "server_error");
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
+                    return send_failed(server_error(exception));
                 }
 
                 try {
@@ -682,10 +643,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         make_request_failure(RequestFailurePhase::ResponseStore, error));
                     return send_failed(error);
                 } catch (const std::exception& exception) {
-                    const ApiError error = internal_server_error(exception, "server_error");
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseStore, exception.what()));
-                    return send_failed(error);
+                    return send_failed(server_error(exception));
                 }
 
                 std::string terminal;
@@ -697,29 +657,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         terminal.insert(0, comment);
                     }
                 } catch (const std::exception& exception) {
-                    const ApiError error = internal_server_error(exception, "server_error");
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
+                    return send_failed(server_error(exception));
                 }
-                try {
-                    transport.write(finished->events_before_terminal);
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                return write_stream_terminal(transport, sink, *lifecycle, finished->events_before_terminal,
+                                             terminal);
             },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
+            stream_release(stream, lifecycle));
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));

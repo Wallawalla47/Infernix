@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
@@ -161,19 +162,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 SseTransport transport(sink, stream->cancelled);
                 transport.set_heartbeat([&] { return encoder->keep_alive(); });
                 const auto send_error = [&](const ApiError& error) {
-                    try {
+                    return end_stream_with_error(sink, *lifecycle, [&] {
                         render_and_write(transport, [&] { return sse_error_event(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
+                    });
                 };
                 // The assistant-role chunk opens the stream with its first event (prompt progress, the
                 // first output delta or the finish), not at admission, so a client's time to its first
@@ -223,30 +214,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     output.is_cancelled = [&] { return transport.poll(); };
 
                     outcome = service_->run(stream->prepared, &output);
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_error(internal_server_error(exception));
-                } catch (const ApiException& exception) {
-                    lifecycle->failure(make_generation_request_failure(exception.error()));
-                    return send_error(exception.error());
-                } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    return send_error(internal_server_error(exception));
+                } catch (...) {
+                    return end_failed_stream_generation(
+                        *lifecycle, [](const ApiError& error) -> const ApiError& { return error; },
+                        [](const std::exception& exception) { return internal_server_error(exception); },
+                        send_error);
                 }
 
-                lifecycle->done(outcome);
-                if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                if (!record_stream_generation(*lifecycle, outcome, stream->cancelled)) { return false; }
                 std::vector<std::string> terminal;
                 try {
                     // An answer with no streamed delta (an empty one, or tool calls sent whole) opens here.
@@ -267,23 +242,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         RequestFailurePhase::ResponseRender, exception.what()));
                     return send_error(internal_server_error(exception));
                 }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                return write_stream_terminal(transport, sink, *lifecycle, terminal);
             },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
+            stream_release(stream, lifecycle));
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));

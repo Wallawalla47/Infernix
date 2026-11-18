@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "serve/anthropic_messages.h"
+#include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
 #include "serve/server_tools.h"
 
@@ -18,6 +19,15 @@
 
 namespace infernix::serve {
 namespace {
+
+// The 500 for an exception a request's handling did not expect, with its message (rendering names its Anthropic
+// type, api_error).
+ApiError anthropic_internal_error(const std::exception& exception) {
+    ApiError error;
+    error.status  = 500;
+    error.message = exception.what();
+    return error;
+}
 
 // One Messages response. A request that declares tool search tools may run several generations:
 // each that ends in searches only is followed by the searches' results and another generation,
@@ -142,10 +152,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         operational_log_.http_failure(
             "anthropic_count_tokens",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
     }
 }
 
@@ -168,10 +175,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         operational_log_.http_failure(
             "anthropic_messages",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
         return;
     }
     const AnthropicMessagesRequest& request = state->request;
@@ -251,10 +255,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         } catch (const std::exception& exception) {
             lifecycle->failure(
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
+            write_anthropic_error(res, anthropic_internal_error(exception), request_id);
             return;
         }
         const GenerationOutcome totals = state->totals();
@@ -288,10 +289,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
+            write_anthropic_error(res, anthropic_internal_error(exception), request_id);
         }
         return;
     }
@@ -312,10 +310,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
         return;
     }
 
@@ -341,22 +336,12 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 SseTransport transport(sink, stream->cancelled);
                 transport.set_heartbeat([&] { return encoder->ping(); });
                 const auto send_error = [&](const ApiError& error) {
-                    try {
+                    return end_stream_with_error(sink, *lifecycle, [&] {
                         if (!encoder->started()) {
                             render_and_write(transport, [&] { return encoder->start(); });
                         }
                         render_and_write(transport, [&] { return encoder->error(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
+                    });
                 };
 
                 try {
@@ -386,38 +371,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                             render_and_write(transport, [&] { return encoder->segment(segment); });
                         },
                         [&](const GenerationOutcome& outcome) { return encoder->identify_calls(outcome); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                } catch (const ApiException& exception) {
-                    const ApiError error = normalize_anthropic_error(exception.error());
-                    lifecycle->failure(make_generation_request_failure(error));
-                    return send_error(error);
-                } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
+                } catch (...) {
+                    return end_failed_stream_generation(*lifecycle, normalize_anthropic_error,
+                                                        anthropic_internal_error, send_error);
                 }
 
                 const GenerationOutcome totals = state->totals();
-                lifecycle->done(totals);
-                if (state->final_outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                if (!record_stream_generation(*lifecycle, totals, stream->cancelled)) { return false; }
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(state->final_segment(), totals, state->stop_reason);
@@ -428,35 +388,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
+                    return send_error(anthropic_internal_error(exception));
                 }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                return write_stream_terminal(transport, sink, *lifecycle, terminal);
             },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
+            stream_release(stream, lifecycle));
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
     }
 }
 
