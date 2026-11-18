@@ -251,8 +251,11 @@ std::uint64_t maximum_main_page_groups(std::uint32_t concurrency, std::uint32_t 
 // drafting (72 MiB at 2) and MTP verifying a 15-wide n-gram window (182 MiB for 136 executables at
 // 4). The 2026-09-26 calibration measured 2.2-4.1 MiB on the graphs of then, and the 4 MiB and
 // 64 MiB it kept left 66-426 MiB of these configurations free above the headroom, KV capacity
-// automatic sizing never used. The allowance keeps 2 MiB per executable (a third above the largest
-// measured) plus 16 MiB; serve warns at startup when the graphs took more. Column-invariant decode (the
+// automatic sizing never used. The allowance keeps 2 MiB per executable plus 16 MiB; serve warns at
+// startup when the graphs took more. DFlash2 tree verification (2026-11-18, the same 27B at max concurrency
+// 1-4, every KV format, which changes nothing): the table 16,12,12,10 took 18, 38 and 80 MiB against 36, 56 and
+// 96 allowed, automatic widths 28, 58 and 124 against 46, 76 and 136, the largest share 1.8 MiB an executable
+// past the 16 MiB, so the margin there is 12 MiB. Column-invariant decode (the
 // reproducible route, without batched-decode) launches each column's kernels apart, so its executables carry
 // more nodes: 2026-11-16, the same 27B with DFlash2 and n-gram drafting at max concurrency 4 took 76 MiB for 28
 // executables on --reproducible (2.1 MiB each past the 16 MiB, past the 72 MiB allowed: serve warned), against

@@ -2152,10 +2152,12 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
-    // Device memory CUDA Graph preparation actually took at startup (free memory before minus
-    // after instantiating, uploading and launching every executable), in the driver's allocation
-    // granularity: 0 without CUDA Graphs, and also when the graphs fit in memory the driver already
-    // held (StartupPhase::CudaGraphPrepare reports the preparation itself).
+    // Device memory CUDA Graph preparation actually took at startup (instantiating, uploading and
+    // launching every executable), in the driver's allocation granularity: Qwen3.5 reads this
+    // process's own device memory where the OS reports it (Windows, WSL2) and free memory before
+    // minus after elsewhere; Qwen3.8-Flash-Next reads free memory. 0 without CUDA Graphs, and also
+    // when the graphs fit in memory the driver already held (StartupPhase::CudaGraphPrepare reports
+    // the preparation itself).
     std::size_t cuda_graph_measured_bytes         = 0;
     // The graphs past cuda_graph_allowance_bytes take device memory back from an elastic expert-frame pool (Qwen3.8-
     // Flash-Next: a fixed 128 MiB reserve, the frames shrinking by chunks for the rest, by design), so a measured

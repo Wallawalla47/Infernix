@@ -118,6 +118,8 @@ int main(int argc, char** argv) {
                 "Engine did not select the requested KV dtype");
         if (graph) {
             const infernix::MemorySummary memory = engine.memory_summary();
+            std::cout << "CUDA Graph memory " << memory.cuda_graph_measured_bytes << " of its allowance "
+                      << memory.cuda_graph_allowance_bytes << " bytes\n";
             require(memory.cuda_graph_measured_bytes != 0 &&
                         memory.cuda_graph_measured_bytes <= memory.cuda_graph_allowance_bytes,
                     ("CUDA Graph memory " + std::to_string(memory.cuda_graph_measured_bytes) +

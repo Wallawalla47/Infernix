@@ -465,7 +465,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (offload) { offload->engine().check_error(parameters.model.info().name + " (graph preparation)"); }
         const VramSnapshot after     = graph_vram->query();
         const std::size_t free_after = after.device_free;
-        graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
+        // This process's own device memory where the OS reports it (DXGI's local usage on Windows, DXCore's under
+        // WSL2), else the drop in free memory. Under WDDM cudaMemGetInfo's free figure is device-wide, so another
+        // program's allocation during the preparation counted as graph memory: 2026-11-18, four consecutive real
+        // tests read 44,810,240 B more than the same configurations ever did again (not a 2 MiB multiple); on a
+        // quiet card the two readings agree to the byte (24 windows, 8-124 MiB). Every allocation of this process
+        // still counts, so an overrun of the graphs' own is never hidden.
+        const bool own_usage = before.has_local_usage && after.has_local_usage;
+        graph_measured_bytes =
+            own_usage ? static_cast<std::size_t>(after.local_usage > before.local_usage ? after.local_usage - before.local_usage : 0)
+                      : (free_before > free_after ? free_before - free_after : 0);
         // Under the Windows sysmem fallback the driver never reports the shortage: executables past the free
         // device memory land in shared system memory, where every replay reads them over the link, and the drop
         // in free memory misses them. This process's shared system memory use shows them (nothing here
