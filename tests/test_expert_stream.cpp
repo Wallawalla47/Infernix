@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ops/offloaded_sparse_moe/csf_record.h"
+#include "runtime/contract/execution.h"
 #include "runtime/expert_offload/expert_stream.h"
 
 #include <algorithm>
@@ -321,6 +322,64 @@ void csf_chunks() {
     }
 }
 
+// An ungated chunk whose first enqueue fails (layer 0's SSD-only expert 5, whose stream read fails) throws the
+// recoverable read error and ends the chunk itself: the stream is not left streaming, every read slot it took
+// goes back, and the next chunk begins and streams the record.
+void failed_first_enqueue() {
+    infernix::PinnedHostBuffer records{kLayers * kExperts * kStride};
+    std::vector<std::uint8_t> landed(kStride);
+    for (std::uint64_t i = 0; i < kStride; ++i) { landed[i] = record_byte(0, 5, i); }
+    bool read_fails = true;
+    int reads = 0, releases = 0;
+    ExpertStream::SsdReads ssd{
+        .read      = [&](std::uint32_t, std::uint32_t) { return static_cast<std::int32_t>(reads++); },
+        .wait      = [&](std::int32_t) -> const std::uint8_t* { return read_fails ? nullptr : landed.data(); },
+        .release   = [&](std::int32_t) { ++releases; },
+        .layer_cap = [](std::uint32_t) { return 4U; }};
+    ExpertStream stream(
+        kLayers, kExperts, kStride,
+        [&](std::uint32_t l, std::uint32_t e) -> const std::uint8_t* {
+            if (l == 0 && e == 5) { return nullptr; } // SSD-only
+            return static_cast<const std::uint8_t*>(records.data()) + (static_cast<std::size_t>(l) * kExperts + e) * kStride;
+        },
+        /*one_allocation=*/true, {}, {}, ssd);
+    std::vector<std::int32_t> residency(kLayers * kExperts, 0); // every expert resident but layer 0's expert 5
+    residency[5] = -1;
+    const std::size_t tables = (kLayers * kExperts * sizeof(std::int32_t) + 255) / 256 * 256;
+    infernix::DeviceBuffer ring(tables + 2 * kHalf * kStride);
+    cudaStream_t compute = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));
+    bool threw = false;
+    try {
+        stream.begin({ring.p, ring.bytes}, residency.data(), compute, /*gated=*/false, /*ssd=*/true);
+    } catch (const infernix::runtime::RecoverableExecutionError&) { threw = true; }
+    check(threw, "failed first enqueue: the failed stream read did not throw the recoverable read error");
+    check(!stream.active(), "failed first enqueue: the stream is left streaming");
+    check(reads == 1 && releases == reads,
+          "failed first enqueue: " + std::to_string(releases) + " of " + std::to_string(reads) + " read slots released");
+    read_fails = false;
+    try {
+        stream.begin({ring.p, ring.bytes}, residency.data(), compute, /*gated=*/false, /*ssd=*/true);
+        stream.before_experts(0, compute);
+        CUDA_CHECK(cudaStreamSynchronize(compute));
+        std::vector<std::int32_t> row(kExperts);
+        CUDA_CHECK(cudaMemcpy(row.data(), stream.slots(0), kExperts * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        std::vector<std::uint8_t> slot(kStride);
+        if (row[5] >= 0) {
+            CUDA_CHECK(cudaMemcpy(slot.data(), stream.base() + static_cast<std::size_t>(row[5]) * stream.pitch(), kStride,
+                                  cudaMemcpyDeviceToHost));
+        }
+        check(row[5] >= 0 && slot == landed, "failed first enqueue: the next chunk did not stream the record");
+        for (std::uint32_t l = 0; l < kLayers; ++l) { stream.after_experts(l, compute); }
+        stream.end(compute);
+    } catch (const std::exception& error) {
+        check(false, std::string("failed first enqueue: the next chunk did not begin: ") + error.what());
+        stream.end(compute);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(compute));
+    CUDA_CHECK(cudaStreamDestroy(compute));
+}
+
 } // namespace
 
 int main() {
@@ -334,6 +393,7 @@ int main() {
     ungated_refuses();
     abandoned_chunk();
     csf_chunks();
+    failed_first_enqueue();
     CUDA_CHECK(cudaDeviceSynchronize());
     std::cout << (failures == 0 ? "expert stream checks passed\n" : "expert stream checks failed\n");
     return failures == 0 ? 0 : 1;

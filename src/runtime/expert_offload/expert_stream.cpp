@@ -199,8 +199,15 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     CUDA_CHECK(cudaEventRecord(start_, compute));
     CUDA_CHECK(cudaStreamWaitEvent(stream_, start_, 0));
     active_ = true;
-    enqueue(0);
-    if (layers_ > 1) { enqueue(1); }
+    // A failed first enqueue (a read request, a copy) ends the chunk here: the caller's span is not active yet,
+    // so it would not end it, and the next chunk would find the stream still streaming.
+    try {
+        enqueue(0);
+        if (layers_ > 1) { enqueue(1); }
+    } catch (...) {
+        end(compute);
+        throw;
+    }
 }
 
 std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
