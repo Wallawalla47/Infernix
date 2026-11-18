@@ -97,6 +97,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--device"},
     ServeOptionArity{"--ram-free-mib"},
     ServeOptionArity{"--ram-resize"},
+    ServeOptionArity{"--cpu-rates"},
     ServeOptionArity{"--expert-ram-mib"},
     ServeOptionArity{"--expert-ram-layout"},
     ServeOptionArity{"--expert-pin-mib"},
@@ -493,6 +494,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             available, until --ram-free-mib is, and take it\n"
            "                             back once --ram-free-mib plus 1 GiB stays free;\n"
            "                             off keeps their startup sizes\n"
+           "  --cpu-rates saved|measure  Offloaded experts: saved (default) takes the CPU\n"
+           "                             expert team's rates from the saved quiet settle\n"
+           "                             beside the expert state when there is one, with\n"
+           "                             no readings at startup; measure reads them at\n"
+           "                             every start (each reading waits up to 20 s for a\n"
+           "                             quiet CPU)\n"
            "  --expert-ram-mib N|auto    Offloaded experts: Host RAM in MiB for the routed\n"
            "                             experts (auto: what --ram-free-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
@@ -893,6 +900,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             return arguments[i].c_str();
         };
         if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + arg); }
+        // Options parsed outside the chain below: MSVC refuses an if/else-if chain nested more than 128 deep (C1061).
+        if (arg == "--cpu-rates") {
+            const std::string mode = require_value("--cpu-rates");
+            if (mode != "saved" && mode != "measure") { throw std::invalid_argument("--cpu-rates must be saved or measure"); }
+            options.cpu_rates_saved = mode == "saved";
+            continue;
+        }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {

@@ -135,6 +135,7 @@ struct ServeOptions {
     std::uint64_t ram_free_bytes           = kDefaultRamFreeBytes;
     bool ram_resize                        = true; // --ram-resize auto|off (infernix::EngineOptions::ram_resize)
     bool ram_resize_explicit               = false; // --ram-resize given (refuse_unsupported_options)
+    bool cpu_rates_saved                   = true; // --cpu-rates saved|measure (infernix::EngineOptions::cpu_rates_saved)
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
     bool expert_csf = false;                          // --expert-csf

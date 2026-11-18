@@ -217,7 +217,20 @@ void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
         const std::string reference_key = runtime::expert_offload::cpu_rate_machine_key() + " | " + pool_key;
         std::optional<runtime::expert_offload::CpuRateReference> reference;
         if (!reference_path.empty()) { reference = runtime::expert_offload::load_cpu_rate_reference(reference_path, reference_key); }
-        rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); }, {}, reference ? &*reference : nullptr);
+        if (reference && options_.cpu_rates_saved) {
+            // A saved quiet settle of this machine and configuration stands without readings (--cpu-rates saved, the
+            // default). Each reading waits up to kRetryBudget for a quiet CPU; on a machine whose other work keeps the
+            // CPU about a quarter busy (the htpc beside its agent sessions, 2026-11-13..16) every start paid that wait,
+            // Flash-Next 73-147 s to listening against 28-32 s with the saved rates. `--cpu-rates measure`, or deleting
+            // the file, measures again. A confirmed reading records nothing (save_cpu_rate_reference).
+            rates.experts   = reference->experts;
+            rates.columns   = reference->columns;
+            rates.readings  = {reference->experts};
+            rates.note      = "saved from a quiet start on " + reference->when + " (" + reference_path.filename().string() + ")";
+            rates.confirmed = *reference;
+        } else {
+            rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); }, {}, reference ? &*reference : nullptr);
+        }
         if (!reference_path.empty()) { runtime::expert_offload::save_cpu_rate_reference(reference_path, reference_key, rates); }
         if (options_.expert_slot_pool && !rates.readings.empty() && rates.busy_share < 0.0) {
             options_.expert_slot_pool->note_cpu_rates(pool_key, {.experts = rates.experts,
