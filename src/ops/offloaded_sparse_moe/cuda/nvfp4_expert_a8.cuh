@@ -346,13 +346,12 @@ void launch_expert_pass_nvfp4_a8(const MoeDispatch& dispatch, const MoeExpertSou
     // The largest carveout, as the A16 narrow kernels take: three CTAs of either kernel per SM (two of the 122B's
     // down CTAs), and the passes' CTAs may share SMs with the other NVFP4 narrow kernels.
     static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_nvfp4_a8<G>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_nvfp4_a8<G>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
+        return cudaFuncSetAttribute(gate_up_kernel_nvfp4_a8<G>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_nvfp4_a8<G>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess;
     }();
-    (void)configured;
+    if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the NVFP4 A8 narrow kernels' carveout"); }
     if (part != PassPart::Down) {
         gate_up_kernel_nvfp4_a8<G><<<dim3(G::kGateUpRowGroups, jobs), kNvfp4A8Threads, 0, stream>>>(
             x_rows, dispatch, source, top_k, job_records, flags, base, h_plane, phase, narrow_max);

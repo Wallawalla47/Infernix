@@ -1383,17 +1383,16 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                         canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
                         PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
     static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpShared)));
-        cudaFuncSetAttribute(down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownShared)));
-        cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
+        return cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(GateUpShared))) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(DownShared))) == cudaSuccess &&
+               cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess;
     }();
-    (void)configured;
+    if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the W4A4 narrow kernels' shared memory"); }
     if (part != PassPart::Down) {
         gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
             x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
@@ -1724,16 +1723,16 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
     static_assert(kGateUpBytes <= 99 * 1024 && kDownBytes <= 99 * 1024, "an A16 CTA must fit an SM");
     static_assert(G::kGateUpRowGroups / kGateUpGroups == G::kHBlocks, "a gate/up CTA produces one h block");
     static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             kGateUpBytes);
-        cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize, kDownBytes);
-        cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
+        return cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kGateUpBytes) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kDownBytes) == cudaSuccess &&
+               cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess;
     }();
-    (void)configured;
+    if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the A16 narrow kernels' shared memory"); }
     if (part != PassPart::Down) {
         CUDA_CHECK(pdl::launch_with(
             pdl::Dependency::Serialized,
@@ -2012,17 +2011,16 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
                             std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase,
                             PassPart part) {
     static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpSharedA4r)));
-        cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownSharedA4r)));
-        cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
+        return cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(GateUpSharedA4r))) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(DownSharedA4r))) == cudaSuccess &&
+               cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess;
     }();
-    (void)configured;
+    if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the two-term narrow kernels' shared memory"); }
     if (part != PassPart::Down) {
         gate_up_kernel_a4r<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpSharedA4r), stream>>>(
             x, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
