@@ -78,67 +78,52 @@ void run_anthropic_response(GenerationBackend& service, AnthropicResponseState& 
                             const std::function<bool()>& is_cancelled,
                             const ContinuationPreparer& prepare_next,
                             const SegmentWriter& on_segment, const CallIdentifier& identify) {
-    for (;;) {
-        GenerationOutcome outcome   = service.run(prepared, sink, is_cancelled);
-        std::vector<ToolCall> calls = identify(outcome);
-        std::vector<std::optional<RequestJson>> results(calls.size());
-        std::vector<ChatTurn> result_turns;
-        bool client_calls = false;
-        if (outcome.finish_reason != infernix::FinishReason::Cancelled) {
-            for (std::size_t index = 0; index < calls.size(); ++index) {
-                if (state.executor.search_tool(calls[index].name) == nullptr) {
-                    client_calls = true;
+    // The protocol's part of run_server_tool_rounds: the searches the executor knows run, any other call is the
+    // client's, and each generation keeps its searches' result content for its segment.
+    struct Protocol {
+        AnthropicResponseState& state;
+        const SegmentWriter& on_segment;
+        const CallIdentifier& identify;
+        std::vector<std::optional<RequestJson>> results; // the current generation's, by call
+
+        ServerRoundCalls calls(const GenerationOutcome& outcome) {
+            ServerRoundCalls out;
+            out.calls = identify(outcome);
+            results.assign(out.calls.size(), std::nullopt);
+            if (outcome.finish_reason == infernix::FinishReason::Cancelled) { return out; }
+            for (std::size_t index = 0; index < out.calls.size(); ++index) {
+                if (state.executor.search_tool(out.calls[index].name) == nullptr) {
+                    out.client_calls = true;
                     continue;
                 }
-                AnthropicToolSearchResult executed = state.executor.execute(calls[index]);
+                AnthropicToolSearchResult executed = state.executor.execute(out.calls[index]);
                 results[index] = std::move(executed.content);
-                result_turns.push_back(std::move(executed.turn));
+                out.results.push_back(std::move(executed.turn));
             }
+            return out;
         }
-        // A generation continues only when its turn ended in searches alone; a search in a turn
-        // that also calls a client tool, or that the output limit cut, still runs, so the history
-        // the client sends back carries its result.
-        const bool turn_ended = outcome.finish_reason == infernix::FinishReason::StopToken ||
-                                outcome.finish_reason == infernix::FinishReason::None;
-        bool continues = !result_turns.empty() && !client_calls && turn_ended;
-        std::optional<std::string_view> stop_reason;
-        if (continues && state.rounds.size() + 1U >= kMaximumServerToolRounds) {
-            continues   = false;
-            stop_reason = "pause_turn";
+
+        [[nodiscard]] bool limit_reached() const noexcept { return false; }
+
+        void keep() {
+            state.round_results.push_back(std::move(results));
+            if (on_segment) { on_segment(state.round_segment(state.rounds.size() - 1U)); }
         }
-        ServerToolRound round{.outcome = std::move(outcome),
-                              .calls   = std::move(calls),
-                              .results = std::move(result_turns)};
-        std::optional<PreparedRequest> next;
-        if (continues) {
-            GenerationRequest extended = state.continuation;
-            append_server_round(extended, round, state.executor.names());
-            if (extended.max_tokens <= 0) {
-                continues   = false;
-                stop_reason = "max_tokens";
-            } else {
-                try {
-                    next.emplace(prepare_next(extended));
-                    state.continuation = std::move(extended);
-                } catch (const ApiException& error) {
-                    if (error.error().code != "context_length_exceeded") { throw; }
-                    continues   = false;
-                    stop_reason = "model_context_window_exceeded";
-                }
-            }
-        }
-        if (!continues) {
+
+        void end(ServerToolRound&& round, ServerRoundsEnd end) {
             state.final_outcome = std::move(round.outcome);
             state.final_calls   = std::move(round.calls);
             state.final_results = std::move(results);
-            state.stop_reason   = stop_reason;
-            return;
+            switch (end) {
+            case ServerRoundsEnd::Finished: state.stop_reason = std::nullopt; break;
+            case ServerRoundsEnd::RoundLimit: state.stop_reason = "pause_turn"; break;
+            case ServerRoundsEnd::OutputLimit: state.stop_reason = "max_tokens"; break;
+            case ServerRoundsEnd::ContextWindow: state.stop_reason = "model_context_window_exceeded"; break;
+            }
         }
-        state.rounds.push_back(std::move(round));
-        state.round_results.push_back(std::move(results));
-        if (on_segment) { on_segment(state.round_segment(state.rounds.size() - 1U)); }
-        prepared = std::move(*next);
-    }
+    } protocol{.state = state, .on_segment = on_segment, .identify = identify};
+    run_server_tool_rounds(service, prepared, sink, is_cancelled, prepare_next, state.continuation, state.rounds,
+                           state.executor.names(), protocol);
 }
 
 } // namespace

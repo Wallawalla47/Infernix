@@ -86,71 +86,72 @@ void run_openai_response(GenerationBackend& service, const OpenAIResponsesCreate
                          const std::function<bool()>& is_cancelled,
                          const ContinuationPreparer& prepare_next, const RoundWriter& on_round,
                          const HostedSearchId& hosted_search_id) {
-    const bool hosted = request.prompt.tool_search && request.prompt.tool_search->server;
-    const std::string search_name(kToolSearchFunctionName);
-    for (;;) {
-        GenerationOutcome outcome = service.run(prepared, sink, is_cancelled);
-        const std::size_t count   = outcome.tool_calls.size();
-        std::vector<std::string> call_ids(count);
-        std::vector<std::optional<OpenAIToolSearchExecution>> searches(count);
-        std::vector<ToolCall> calls(count);
-        std::vector<ChatTurn> result_turns;
-        bool client_calls = false;
-        for (std::size_t index = 0; index < count; ++index) {
-            const infernix::GeneratedToolCall& call = outcome.tool_calls[index];
-            calls[index] = ToolCall{.name = call.name, .arguments_json = call.arguments_json};
-            if (!hosted || call.name != search_name ||
-                outcome.finish_reason == infernix::FinishReason::Cancelled) {
-                client_calls = true;
-                continue;
-            }
-            call_ids[index]  = hosted_search_id(index);
-            calls[index].id  = call_ids[index];
-            searches[index]  = execute_openai_tool_search(request, calls[index]);
-            result_turns.push_back(searches[index]->turn);
-            ++state.hosted_calls;
-        }
-        const bool turn_ended = outcome.finish_reason == infernix::FinishReason::StopToken ||
-                                outcome.finish_reason == infernix::FinishReason::None;
-        bool continues = !result_turns.empty() && !client_calls && turn_ended &&
-                         state.rounds.size() + 1U < kMaximumServerToolRounds &&
-                         (!request.max_tool_calls ||
-                          state.hosted_calls < static_cast<std::size_t>(*request.max_tool_calls));
-        std::optional<infernix::FinishReason> finish;
-        ServerToolRound round{.outcome = std::move(outcome),
-                              .calls   = std::move(calls),
-                              .results = std::move(result_turns)};
-        std::optional<PreparedRequest> next;
-        if (continues) {
-            GenerationRequest extended = state.continuation;
-            append_server_round(extended, round, std::span(&search_name, 1));
-            if (extended.max_tokens <= 0) {
-                continues = false;
-                finish    = infernix::FinishReason::OutputLimit;
-            } else {
-                try {
-                    next.emplace(prepare_next(extended));
-                    state.continuation = std::move(extended);
-                } catch (const ApiException& error) {
-                    if (error.error().code != "context_length_exceeded") { throw; }
-                    continues = false;
-                    finish    = infernix::FinishReason::ContextCapacity;
+    // The protocol's part of run_server_tool_rounds: a hosted tool_search runs (counted against max_tool_calls),
+    // any other call is the client's, and each generation keeps its searches' Item ids and results.
+    struct Protocol {
+        const OpenAIResponsesCreateRequest& request;
+        ResponseRounds& state;
+        const RoundWriter& on_round;
+        const HostedSearchId& hosted_search_id;
+        const bool hosted;
+        const std::string& search_name;
+        std::vector<std::string> call_ids;                               // the current generation's, by call
+        std::vector<std::optional<OpenAIToolSearchExecution>> searches; // likewise
+
+        ServerRoundCalls calls(const GenerationOutcome& outcome) {
+            const std::size_t count = outcome.tool_calls.size();
+            call_ids.assign(count, std::string());
+            searches.assign(count, std::nullopt);
+            ServerRoundCalls out;
+            out.calls.resize(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                const infernix::GeneratedToolCall& call = outcome.tool_calls[index];
+                out.calls[index] = ToolCall{.name = call.name, .arguments_json = call.arguments_json};
+                if (!hosted || call.name != search_name ||
+                    outcome.finish_reason == infernix::FinishReason::Cancelled) {
+                    out.client_calls = true;
+                    continue;
                 }
+                call_ids[index]     = hosted_search_id(index);
+                out.calls[index].id = call_ids[index];
+                searches[index]     = execute_openai_tool_search(request, out.calls[index]);
+                out.results.push_back(searches[index]->turn);
+                ++state.hosted_calls;
             }
+            return out;
         }
-        if (!continues) {
+
+        [[nodiscard]] bool limit_reached() const noexcept {
+            return request.max_tool_calls && state.hosted_calls >= static_cast<std::size_t>(*request.max_tool_calls);
+        }
+
+        void keep() {
+            state.round_call_ids.push_back(std::move(call_ids));
+            state.round_searches.push_back(std::move(searches));
+            if (on_round) { on_round(state.round(state.rounds.size() - 1U)); }
+        }
+
+        void end(ServerToolRound&& round, ServerRoundsEnd end) {
             state.final_outcome  = std::move(round.outcome);
             state.final_call_ids = std::move(call_ids);
             state.final_searches = std::move(searches);
-            state.finish         = finish;
-            return;
+            switch (end) {
+            case ServerRoundsEnd::Finished:
+            case ServerRoundsEnd::RoundLimit: state.finish = std::nullopt; break;
+            case ServerRoundsEnd::OutputLimit: state.finish = infernix::FinishReason::OutputLimit; break;
+            case ServerRoundsEnd::ContextWindow: state.finish = infernix::FinishReason::ContextCapacity; break;
+            }
         }
-        state.rounds.push_back(std::move(round));
-        state.round_call_ids.push_back(std::move(call_ids));
-        state.round_searches.push_back(std::move(searches));
-        if (on_round) { on_round(state.round(state.rounds.size() - 1U)); }
-        prepared = std::move(*next);
-    }
+    };
+    const std::string search_name(kToolSearchFunctionName);
+    Protocol protocol{.request          = request,
+                      .state            = state,
+                      .on_round         = on_round,
+                      .hosted_search_id = hosted_search_id,
+                      .hosted           = request.prompt.tool_search && request.prompt.tool_search->server,
+                      .search_name      = search_name};
+    run_server_tool_rounds(service, prepared, sink, is_cancelled, prepare_next, state.continuation, state.rounds,
+                           std::span(&search_name, 1), protocol);
 }
 
 struct StreamingResponse {
