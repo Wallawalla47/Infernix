@@ -547,8 +547,7 @@ set_tests_properties(infernix_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)
 # beside other GPU tests the same call's time ranged 40-75 ms and the check failed five times
 # (2026-10-22), so they run alone; the rest of the layer test runs beside other tests.
 add_test(NAME infernix_offloaded_moe_layer_idle_test COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --idle-only)
-# Its idle waits alone take about 890 s (2026-11-17: 891 s, then a run cut off at the 900 s default): twice that.
-set_tests_properties(infernix_offloaded_moe_layer_idle_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 1800)
+set_tests_properties(infernix_offloaded_moe_layer_idle_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

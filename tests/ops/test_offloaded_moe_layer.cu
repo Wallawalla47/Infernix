@@ -705,6 +705,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             (g_idle_checks == IdleChecks::kOnly && config.idle == 0)) {
             continue;
         }
+        // The long-quiet modes (3, 4: five calls after 1.2 s each) test the service's long waits, which no layer
+        // shape changes: they run on each route's decode call (one column). On all 41 shapes they took ~750 s.
+        if (config.idle >= 3 && columns != 1) { continue; }
         const int slots = config.slots;
         // A fresh dispatch: a fetch call reorders its jobs (fetch-served last).
         infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
