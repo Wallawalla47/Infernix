@@ -406,9 +406,13 @@ void HttpServer::run_stats_reporter() {
     // runtime_stats, and an exception leaving this thread would terminate the server.
     infernix::GpuTelemetrySample gpu_previous;
     infernix::RuntimeStats previous;
+    // Whether `previous` holds a real sample: until one is taken, an interval only takes it (reporting the
+    // cumulative counters as one interval's would show a rate spike).
+    bool have_previous = false;
     try {
-        gpu_previous = telemetry.sample();
-        previous     = service_->runtime_stats();
+        gpu_previous  = telemetry.sample();
+        previous      = service_->runtime_stats();
+        have_previous = true;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[infernix-serve] throughput report failed: %s; reporting continues\n", error.what());
     } catch (...) {
@@ -438,14 +442,19 @@ void HttpServer::run_stats_reporter() {
         try {
             const infernix::RuntimeStats current = service_->runtime_stats();
             const Clock::time_point now        = Clock::now();
-            ThroughputReport report            = make_throughput_report(
-                previous, current, std::chrono::duration<double>(now - previous_time).count());
-            report.gpu_previous = gpu_previous;
-            report.gpu_current  = telemetry.sample();
-            gpu_previous        = report.gpu_current;
+            if (have_previous) {
+                ThroughputReport report = make_throughput_report(
+                    previous, current, std::chrono::duration<double>(now - previous_time).count());
+                report.gpu_previous = gpu_previous;
+                report.gpu_current  = telemetry.sample();
+                gpu_previous        = report.gpu_current;
+                if (report_has_activity(report)) { record_throughput(report); }
+            } else {
+                gpu_previous = telemetry.sample(); // the first sample: the next interval reports from here
+            }
             previous      = current;
             previous_time = now;
-            if (report_has_activity(report)) { record_throughput(report); }
+            have_previous = true;
             if (console_stats_) { console_stats_->runtime(current); }
         } catch (const std::exception& error) {
             note_failure(error.what());
@@ -457,6 +466,7 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
+    if (!have_previous) { return; } // no sample to measure the tail from
     try {
         const infernix::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
@@ -499,7 +509,8 @@ void HttpServer::register_routes() {
     // (--max-http-clients), not by the window.
     server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
     server_.set_keep_alive_timeout_buffer(kKeepAliveBufferSec);
-    // A response write waits up to kWriteTimeoutSec for a client that stops reading (5 s by default).
+    // A response write waits up to kWriteTimeoutSec (60 s) for a client that stops reading (cpp-httplib's own default
+    // is 5 s).
     server_.set_write_timeout(static_cast<time_t>(kWriteTimeoutSec));
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
