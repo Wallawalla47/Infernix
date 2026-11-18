@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <exception>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,11 +50,14 @@ std::vector<infernix::TokenId> synthetic_tokens(std::size_t count, std::uint32_t
     return tokens;
 }
 
+// Every request runs its kOutputs tokens: the model's stop tokens do not end it (a synthetic prompt's greedy reply
+// opened with one on Dense8, so the held request ended at its first token, before any output to wait for).
 infernix::RequestOptions greedy(bool reuse) {
     infernix::RequestOptions options;
     options.execution.requested_output_tokens = kOutputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = reuse;
+    options.stop.include_model_defaults       = false;
     return options;
 }
 
@@ -85,6 +89,10 @@ infernix::EngineOptions engine_options(const char* artifact, const char* ngram, 
     return options;
 }
 
+std::string ms(Clock::duration d) {
+    return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(d).count()) + " ms";
+}
+
 // The `held` request decodes while the `other` request's binding is held open for kHold.
 struct Beside {
     infernix::GenerationResult held;
@@ -101,16 +109,33 @@ Beside beside(infernix::Engine& engine, const std::vector<infernix::TokenId>& he
     infernix::GenerationHandle held_handle =
         engine.submit(engine.prepare_tokens(held_prompt), greedy(held_reuse), infernix::OutputConsumerMode::Streaming);
     std::optional<Clock::time_point> held_done;
+    const Clock::time_point begin = Clock::now();
+    const auto stage = [&](const char* what) {
+        std::printf("        %s at %s\n", what, ms(Clock::now() - begin).c_str());
+    };
+    std::atomic<bool> returned{false};
     std::thread consumer([&] {
         out.held  = held_handle.wait(&held_watch);
         held_done = Clock::now();
+        returned.store(true);
+        stage("the held request returned");
     });
-    while (!held_watch.output.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    // Until its first output, or its return without one (then there is nothing to finish beside the binding).
+    while (!held_watch.output.load() && !returned.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    if (!held_watch.output.load()) {
+        consumer.join();
+        throw std::runtime_error("the held request returned before any output (" +
+                                 std::to_string(out.held.generated_token_ids.size()) + " tokens, finish reason " +
+                                 std::to_string(static_cast<int>(out.held.finish_reason)) + ")");
+    }
+    stage("the held request's first output");
     testing::set_binding_hold(kHold);
     Watch other_watch;
     infernix::GenerationHandle other_handle =
         engine.submit(engine.prepare_tokens(other_prompt), greedy(false), infernix::OutputConsumerMode::Streaming);
+    stage("the other request submitted (its binding held)");
     out.other = other_handle.wait(&other_watch);
+    stage("the other request returned");
     consumer.join();
     testing::set_binding_hold(std::chrono::milliseconds(0));
     out.held_finishes = testing::held_finishes() - before;
@@ -123,10 +148,6 @@ std::vector<infernix::TokenId> next_turn(std::vector<infernix::TokenId> prompt, 
     const auto more = synthetic_tokens(64, 99);
     prompt.insert(prompt.end(), more.begin(), more.end());
     return prompt;
-}
-
-std::string ms(Clock::duration d) {
-    return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(d).count()) + " ms";
 }
 
 } // namespace
