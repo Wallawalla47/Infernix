@@ -1299,6 +1299,14 @@ Router::Loaded Launcher::load_model(const std::string& key) {
             result.error = failure.what();
             return result;
         }
+        // start() first joins the previous instance's monitor (which can sit in a 20 s plan run): an Unload or another
+        // load in that window found the supervisor idle and stopped nothing, so the new instance stops here.
+        if (router_ && router_->load_cancelled()) {
+            supervisor_->stop(std::chrono::seconds(settings.stop_timeout_s));
+            result.error     = alias + ": the load was cancelled from the launcher";
+            result.cancelled = true;
+            return result;
+        }
         if (attempt == 1) { store_.set_last_model(key); }
         ready    = supervisor_->wait_ready(started + std::chrono::seconds(settings.load_timeout_s));
         snapshot = supervisor_->snapshot();
