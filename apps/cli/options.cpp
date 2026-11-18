@@ -511,10 +511,7 @@ Options parse_options(int argc, char** argv) {
                 options.vram_headroom_bytes = static_cast<std::size_t>(mib) << 20;
             }
         } else if (arg == "--prefill-chunk") {
-            options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
-            if (options.prefill_chunk == 0) {
-                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
-            }
+            options.prefill_chunk = parse_u32(value(arg), "prefill-chunk"); // parse_u32 refuses 0
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
         } else if (arg == "--ram-free-mib") {
