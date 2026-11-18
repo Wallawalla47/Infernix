@@ -3,6 +3,7 @@
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q4/q4_a16_simt.cuh"
+#include "ops/linear/common/simt_dispatch.cuh"
 #include "ops/linear/q4/q4_operands.h"
 
 namespace infernix::ops::detail {
@@ -43,18 +44,10 @@ void launch_q4_a16_simt(const Q4LinearOperands& operands, Output output, Epilogu
     for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const bool full = !Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&
                           count % Schedule::kBlockTokens == 0;
-        if (full && full_k)
-            launch_q4_a16_simt_slice<Schedule, true, true, TriggerPdl, JoinPdl, Dependent>(
+        dispatch_simt_tiles(full, full_k, [&]<bool Full, bool FullK>() {
+            launch_q4_a16_simt_slice<Schedule, Full, FullK, TriggerPdl, JoinPdl, Dependent>(
                 operands, output, epilogue, offset, count, stream);
-        else if (full)
-            launch_q4_a16_simt_slice<Schedule, true, false, TriggerPdl, JoinPdl, Dependent>(
-                operands, output, epilogue, offset, count, stream);
-        else if (full_k)
-            launch_q4_a16_simt_slice<Schedule, false, true, TriggerPdl, JoinPdl, Dependent>(
-                operands, output, epilogue, offset, count, stream);
-        else
-            launch_q4_a16_simt_slice<Schedule, false, false, TriggerPdl, JoinPdl, Dependent>(
-                operands, output, epilogue, offset, count, stream);
+        });
     });
 }
 } // namespace infernix::ops::detail
