@@ -1,10 +1,8 @@
-// GPU narrow route of offloaded_sparse_moe against the CPU engine
-// (docs/maintainer/qwen3_8-flash-next-design.md §16.2, §19 M3 "placement invariance").
+// The canonical arithmetic of offloaded_sparse_moe on the GPU (docs/maintainer/qwen3_8-flash-next-design.md §16.2):
+// the narrow kernels' scalar functions and decoders, against the same header on the CPU. The narrow kernels
+// themselves are qualified against the CPU engine by test_offloaded_moe_layer.cu.
 //
 // Oracles:
-//   - the pinned golden output hashes that every CPU ISA reproduces (exact);
-//   - the CPU engine's output for random experts, column counts 1-8, split and shared input scales,
-//     records in device memory (cache frame) and in mapped host memory (zero-copy), bit for bit;
 //   - the canonical scalar functions (E4M3/E2M1 encoders, exp_c, silu_c) on the GPU against the
 //     same header on the CPU: exhaustively over BF16 for exp/SiLU, and over every FP32 word near
 //     each encoder rounding boundary plus a strided sweep of all FP32 words;
@@ -13,22 +11,15 @@
 
 #include "ops/op_family.h"
 #include "ops/common/canonical_math.h"
-#include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
-#include "ops/offloaded_sparse_moe/cuda/narrow_expert.h"
-#include "ops/offloaded_moe_fixtures.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <random>
 #include <vector>
 
-namespace canon    = infernix::ops::canon;
-namespace moe      = infernix::ops::offloaded_moe;
-namespace fixtures = infernix::test::offloaded_moe;
+namespace canon = infernix::ops::canon;
 using infernix::test::cuda_check;
 
 namespace {
@@ -47,110 +38,6 @@ template <class T> T* device_copy(const std::vector<T>& v) {
     cuda_check(cudaMalloc(&p, v.size() * sizeof(T)), "cudaMalloc");
     cuda_check(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "cudaMemcpy");
     return p;
-}
-
-std::vector<std::uint16_t> cpu_expert(const fixtures::Expert& e, const std::vector<std::uint16_t>& x, int ncols) {
-    std::vector<std::uint16_t> y(static_cast<std::size_t>(ncols) * moe::kHidden);
-    const std::uint16_t* xp[moe::kMaxColumns];
-    std::uint16_t* yp[moe::kMaxColumns];
-    for (int c = 0; c < ncols; ++c) {
-        xp[c] = &x[static_cast<std::size_t>(c) * moe::kHidden];
-        yp[c] = &y[static_cast<std::size_t>(c) * moe::kHidden];
-    }
-    moe::expert_forward(moe::best_cpu_isa(), e.record.data(), e.scales, ncols, xp, yp);
-    return y;
-}
-
-struct Case {
-    fixtures::Expert expert;
-    std::vector<std::uint16_t> x;
-    int ncols;
-    bool mapped; // record read zero-copy from mapped pinned host memory
-};
-
-// Runs every case as one launch (one job each) and returns the GPU outputs.
-std::vector<std::vector<std::uint16_t>> gpu_experts(const std::vector<Case>& cases) {
-    std::vector<moe::NarrowJob> jobs;
-    std::vector<void*> device_allocs, host_allocs;
-    std::vector<std::uint16_t*> outputs;
-    for (const Case& c : cases) {
-        moe::NarrowJob job{};
-        if (c.mapped) {
-            void* h = nullptr;
-            cuda_check(cudaHostAlloc(&h, moe::kRecordBytes, cudaHostAllocMapped), "cudaHostAlloc");
-            std::memcpy(h, c.expert.record.data(), moe::kRecordBytes);
-            void* d = nullptr;
-            cuda_check(cudaHostGetDevicePointer(&d, h, 0), "cudaHostGetDevicePointer");
-            job.record = static_cast<const std::uint8_t*>(d);
-            host_allocs.push_back(h);
-        } else {
-            auto* d = device_copy(c.expert.record);
-            job.record = d;
-            device_allocs.push_back(d);
-        }
-        auto* x = device_copy(c.x);
-        device_allocs.push_back(x);
-        std::uint16_t* y = nullptr;
-        cuda_check(cudaMalloc(&y, c.x.size() * sizeof(std::uint16_t)), "cudaMalloc");
-        cuda_check(cudaMemset(y, 0xFF, c.x.size() * sizeof(std::uint16_t)), "cudaMemset");
-        device_allocs.push_back(y);
-        outputs.push_back(y);
-        job.scales = c.expert.scales;
-        job.x      = x;
-        job.y      = y;
-        job.ncols  = c.ncols;
-        jobs.push_back(job);
-    }
-    auto* d_jobs = device_copy(jobs);
-    void* workspace = nullptr;
-    cuda_check(cudaMalloc(&workspace, moe::narrow_workspace_bytes(static_cast<int>(jobs.size()))), "cudaMalloc");
-    moe::launch_narrow_experts(d_jobs, static_cast<int>(jobs.size()), workspace, nullptr);
-    cuda_check(cudaDeviceSynchronize(), "narrow experts");
-    std::vector<std::vector<std::uint16_t>> result;
-    for (std::size_t i = 0; i < cases.size(); ++i) {
-        std::vector<std::uint16_t> y(cases[i].x.size());
-        cuda_check(cudaMemcpy(y.data(), outputs[i], y.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
-        result.push_back(std::move(y));
-    }
-    for (void* p : device_allocs) { cudaFree(p); }
-    for (void* p : host_allocs) { cudaFreeHost(p); }
-    cudaFree(d_jobs);
-    cudaFree(workspace);
-    return result;
-}
-
-void test_golden() {
-    std::vector<Case> cases;
-    for (int n : {1, 4}) {
-        auto g = fixtures::golden_case(n);
-        cases.push_back({std::move(g.expert), std::move(g.x), n, false});
-    }
-    const auto y  = gpu_experts(cases);
-    const auto h1 = fixtures::output_hash(y[0]), h4 = fixtures::output_hash(y[1]);
-    if (h1 != fixtures::kGolden1 || h4 != fixtures::kGolden4) {
-        std::fprintf(stderr, "golden gpu: %016llx %016llx\n", static_cast<unsigned long long>(h1),
-                     static_cast<unsigned long long>(h4));
-    }
-    check(h1 == fixtures::kGolden1 && h4 == fixtures::kGolden4, "GPU reproduces the golden expert output hashes");
-}
-
-void test_cpu_equality() {
-    std::mt19937 rng(91);
-    std::vector<Case> cases;
-    for (int i = 0; i < 16; ++i) {
-        const int n = 1 + i % moe::kMaxColumns;
-        auto e      = fixtures::random_expert(rng, i % 3 == 0);
-        auto x      = fixtures::random_activations(rng, n);
-        cases.push_back({std::move(e), std::move(x), n, i % 4 == 1});
-    }
-    const auto y = gpu_experts(cases);
-    long mismatches = 0;
-    for (std::size_t i = 0; i < cases.size(); ++i) {
-        const auto ref = cpu_expert(cases[i].expert, cases[i].x, cases[i].ncols);
-        for (std::size_t k = 0; k < ref.size(); ++k) { mismatches += ref[k] != y[i][k]; }
-    }
-    std::printf("GPU vs CPU: %zu jobs in one launch, %ld mismatching outputs\n", cases.size(), mismatches);
-    check(mismatches == 0, "GPU narrow route equals the CPU engine bit for bit");
 }
 
 // ---------------------------------------------------------------------------- scalar functions
@@ -283,8 +170,6 @@ INFERNIX_OP_TEST(offloaded_moe_cuda) {
     try {
         test_scalar_functions();
         test_e2m1_decode();
-        test_golden();
-        test_cpu_equality();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

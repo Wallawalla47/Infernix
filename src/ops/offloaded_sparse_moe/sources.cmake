@@ -19,8 +19,6 @@ endif()
 target_link_libraries(infernix_offloaded_moe_cpu PUBLIC Threads::Threads)
 target_link_libraries(infernix_ops PUBLIC infernix_offloaded_moe_cpu)
 
-# GPU narrow route: the same canonical arithmetic, compiled for the device.
-target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/narrow_expert.cu")
 # A whole MoE layer: routing, device-side dispatch, the exact expert kernels and the combine.
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/moe_layer.cu")
 # CSF host records' in-place expansion after copy-engine landings (csf_record.h).

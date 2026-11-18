@@ -504,7 +504,7 @@ infernix_add_family_op_test(infernix_offloaded_moe_team_test FAMILY offloaded_mo
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_team.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
-# The GPU narrow route against the golden hashes and the CPU engine, bit for bit.
+# The narrow route's canonical scalar functions and E2M1 decoders on the GPU against the CPU header.
 infernix_add_family_op_test(infernix_offloaded_moe_cuda_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cuda.cu"
   LIBRARIES infernix_ops)
