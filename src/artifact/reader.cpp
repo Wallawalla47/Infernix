@@ -28,8 +28,8 @@ struct Reader::Impl {
                 header[kEntryMagic.size() - 1] == std::byte{2}) {
                 throw ArtifactError(
                     entry.string() +
-                    ": NInfer v2 artifact is not supported. Upgrade to v3 with: "
-                    "python3 tools/upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer");
+                    ": NInfer v2 artifact is not supported. Upgrade to v3 with Python 3.11 (Windows: py -3.11, "
+                    "Linux: python3.11): tools/upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer");
             }
             throw ArtifactError(entry.string() + ": expected Infernix v3 entry magic");
         }
