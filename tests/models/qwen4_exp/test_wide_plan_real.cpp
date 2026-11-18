@@ -17,8 +17,9 @@
 //             cut (a system block and a user message of about 10K tokens each with prefix reuse: a walk whose chunks
 //             the structural tap cuts below the prefill chunk, grouped past the widest, which must run)
 // Every scope must carry the forward's plan (none on the lossless route, which keeps its formula).
-// Skips (77) without INFERNIX_QWEN4_ARTIFACT (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram), or
-// for dflash2 without INFERNIX_QWEN4_DFLASH2.
+// Skips (77) without INFERNIX_QWEN4_ARTIFACT (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram), for
+// dflash2 without INFERNIX_QWEN4_DFLASH2, and for a4* on an artifact whose experts do not offer 4-bit activations as an
+// option (every one but FP4-Local).
 
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/prefix/test_taps.h"
@@ -153,6 +154,21 @@ int check_scopes(const std::string& scenario) {
     return failures;
 }
 
+// Whether the artifact's routed experts offer 4-bit activations as an option (FP4-Local), which the a4 scenarios need:
+// a plan with --expert-a4-activations starts on such an artifact and is refused on any other (its config check). Any
+// other refusal is not this one and fails the scenario.
+bool offers_optional_a4(infernix::EngineOptions options) {
+    options.expert_a4_activations = true;
+    options.fast_path_candidates.clear();
+    try {
+        (void)infernix::Engine::plan(std::move(options));
+        return true;
+    } catch (const std::runtime_error& error) { // the config check's ArtifactError
+        if (std::string_view(error.what()).find("--expert-a4-activations needs") == std::string_view::npos) { throw; }
+        return false;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -214,6 +230,11 @@ int main(int argc, char** argv) {
             options.prefill_chunk = 9000;
         }
         if (scenario == "long") { options.max_context = 65536; }
+        if (scenario.starts_with("a4") && !offers_optional_a4(options)) {
+            std::printf("skip: %s needs an artifact whose routed experts offer 4-bit activations as an option "
+                        "(FP4-Local); this one refuses --expert-a4-activations\n", scenario.c_str());
+            return 77;
+        }
         infernix::Engine engine(options);
         q4t::record_wide_scopes(true);
         if (scenario == "scoring") {
