@@ -14,7 +14,9 @@
 namespace infernix::ops::detail {
 
 // RowMap: the weight row (in the codes' row order) of a tile's local row, or a negative value for a row without
-// weights (a tile past the matrix).
+// weights (a tile past the matrix). Every k_tile of a row holds weights: row-split Q4 storage pads K to 128
+// (core/weight_view.cpp), the Q4 operands require K % 128 == 0, and the launch requires K == padded K
+// (launch_q4_a16_wide_t128), so no group past K is read.
 template <class RowMap>
 struct Q4RingCodec {
     const std::uint8_t* codes;

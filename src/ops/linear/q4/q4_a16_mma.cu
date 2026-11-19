@@ -48,6 +48,11 @@ void launch_q4_a16_wide_t128(const Tensor& x, const Weight& w, Tensor& out, cuda
     // [6144, 5120] at 1,024-4,096 -3.0 / -3.4 / -2.9 % (2026-11-10).
     const Q4LinearOperands p = q4_linear_operands(x, w);
     validate_q4_operands(p);
+    // Q4RingCodec decodes every stored group of a row (no bound at K, unlike the Q5 / Q8 codecs): a padded group
+    // past K would be multiplied by zero activations, and a non-finite padding scale would make that NaN.
+    if (p.k != p.padded_k) {
+        throw std::invalid_argument("the Q4 ring linear requires K equal to the stored row's padded K");
+    }
     launch_rowsplit_ring_linear<Q4RingFormat, RowSplitRingTile128, kRowSplitRingStages,
                                 kRowSplitRingProducerWarps>(
         p.x, Q4RingFormat::Weights{p.codes, p.scales}, p.rows, p.k, p.padded_k, p.tokens,
