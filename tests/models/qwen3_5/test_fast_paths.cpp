@@ -223,14 +223,13 @@ int main() {
                                     KvCacheStorage::Q4KeyVq2Value}) {
         const q::FastPathConfiguration a8_27b{24, ActivationClass::A8, kv};
         for (const FastPath path : {FastPath::IdleWidePrefill, FastPath::GdnF16Accumulate, FastPath::Fp16GdnState,
-                                    FastPath::AdaptiveSpeculation, FastPath::AdaptiveDFlash, FastPath::FreeCacheResume,
-                                    FastPath::Preemption}) {
+                                    FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
             failures += check(q::fast_path_qualified(path, a8_27b),
                               std::string(infernix::fast_path_name(path)) + " is qualified under --a8-activations");
         }
         for (const FastPath path : {FastPath::BatchedDecode, FastPath::SingleColumnDecode,
                                     FastPath::BatchSplitAttention, FastPath::PromptPv8, FastPath::AdaptiveMtp,
-                                    FastPath::GumbelSampling, FastPath::BatchedA8Decode,
+                                    FastPath::AdaptiveDFlash, FastPath::GumbelSampling, FastPath::BatchedA8Decode,
                                     FastPath::BatchedA8ResidualDecode}) {
             failures += check(!q::fast_path_qualified(path, a8_27b),
                               std::string(infernix::fast_path_name(path)) + " stays off under --a8-activations");
@@ -250,13 +249,13 @@ int main() {
             const q::FastPathConfiguration a16_27b{24, ActivationClass::A16, kv};
             for (const FastPath path : {FastPath::BatchedDecode, FastPath::Fp16GdnState, FastPath::IdleWidePrefill,
                                         FastPath::GdnF16Accumulate, FastPath::AdaptiveSpeculation,
-                                        FastPath::AdaptiveDFlash, FastPath::FreeCacheResume, FastPath::Preemption}) {
+                                        FastPath::FreeCacheResume, FastPath::Preemption}) {
                 failures += check(q::fast_path_qualified(path, a16_27b),
                                   std::string(infernix::fast_path_name(path)) + " is qualified for the NVFP4 27B under "
                                                                       "--a16-activations");
             }
             for (const FastPath path : {FastPath::SingleColumnDecode, FastPath::BatchSplitAttention,
-                                        FastPath::AdaptiveMtp, FastPath::GumbelSampling}) {
+                                        FastPath::AdaptiveMtp, FastPath::AdaptiveDFlash, FastPath::GumbelSampling}) {
                 failures += check(!q::fast_path_qualified(path, a16_27b),
                                   std::string(infernix::fast_path_name(path)) + " was not faster for the NVFP4 27B under "
                                                                       "--a16-activations");

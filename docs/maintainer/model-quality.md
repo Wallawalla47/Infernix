@@ -517,7 +517,7 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below); its route runs under the `--a8-activations` opt-in only |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B, 35B-A3B and the NVFP4 27B under `--a16-activations` or `--a8-activations`, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
-| `adaptive-dflash` | Qwen3.8-27B / Qwen3.6-35B-A3B with DFlash or DFlash2 and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format (2026-10-22, below); the NVFP4 27B under `--a16-activations` or `--a8-activations` with the NVFP4 27B's round costs, every format (2026-11-19, below); not the groupwise 27B |
+| `adaptive-dflash` | Qwen3.8-27B / Qwen3.6-35B-A3B with DFlash or DFlash2 and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format (2026-10-22, below); not the groupwise 27B, nor the NVFP4 27B under `--a16-activations` or `--a8-activations` (slower than seven fixed drafts on real prompts, 2026-11-19, below) |
 | `gdn-tree-closed-form` | tree rounds' GDN records of at most 16 columns (wider rows walk) | NVFP4 27B and 35B-A3B, every format, by the owner's decision (2026-10-25) ahead of its gate, where measured faster (ABBA, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2 decode +1.19 % (6 of 6, at least +1.01 %), 35B-A3B DFlash rounds 1.0-1.7 % shorter in 6 of 6 (decode +1.6 % where the greedy text matched); its kernel 0.65-0.93 of the walk's time at 1-4 rows (`gdn_replay_bench --component tree`) |
 | `gumbel-sampling` | sampled requests of Qwen3.5 engines drafting with MTP (Gumbel-max draws, drafts verified by equality and drawn under the same keys; not DFlash2 or DFlash, below) | 24 heads, 4-bit activations, INT8 KV and (2026-11-19, the owner's rule of 2026-11-01: sampling reads no KV) FP8, NVFP4, K8V4, VQ2 and K4V2 KV, MTP rounds (the NVFP4 27B with `--spec mtp`), by my decision (2026-11-16) ahead of its distribution test, where it was timed faster: timed 2026-11-16 against the default route (sampled 0.7, 6 conversations x 4 turns x 200 tokens, one lane, INT8 KV, ABBAABBA; texts differ by seed): NVFP4 27B `--spec mtp` +8.5 % (4 of 4), NVFP4 27B DFlash2 (`auto`) -3.6 % (4 of 4: equality accepts 2.08-2.25 drafts a round where rejection sampling accepts 2.23-2.39, at the same round time), 35B-A3B MTP (`auto`) -0.6 % (3 of 4); its distribution test (`iqs_e2e.py specdist`, 2026-11-16: the NVFP4 27B, INT8 KV, `--spec mtp --draft-tokens auto` against `--spec off`, 400 four-token samples a prompt at temperature 1, eight lanes, gumbel-sampling in the MTP arm's startup list) passed: p 0.408, 0.042, 1 and 0.342 against 0.00025, with 2, 1, 0 and 1 degrees of freedom, so it has little power (the third prompt's samples fell into one category) |
 | `block-verification` | sampled chain rounds (DFlash2, sampled MTP) | none: re-timed after its keys were made round-unique (2026-10-25, ABBA, sampled, 6 blocks): Dense8 MTP no resolved difference (median +1.9 %, worst -14.9 %), Dense8 DFlash2 `auto` -14.2 % (6 of 6 worse), NVFP4 27B DFlash2 7 no resolved difference (median -0.1 %, worst -4.8 %) |
@@ -1776,7 +1776,7 @@ five): the best case for long drafts, so the speculative verdicts were re-decide
 | `batch-split-attention` | beside `batched-decode`, 4 requests | -0.2 / -0.04 % | no |
 | `idle-wide-prefill`, `gdn-f16-accumulate`, `prompt-pv8` | pp16384 (pp4096) | +4.6 / +4.7 % (+3.7 / +3.9), +0.9 / +1.1 % (+0.6 / +0.8), +0.22 / +0.22 % (level) | yes |
 | `adaptive-speculation` | DFlash2 auto, 1 / 2 requests | +2.0 / +2.0 %, +3.2 / +3.2 % | yes |
-| `adaptive-dflash` (the NVFP4 27B's round costs) | beside it, 1 / 2 requests | +38 % against seven fixed drafts, +4.9 % | yes |
+| `adaptive-dflash` (the NVFP4 27B's round costs) | beside it, 1 / 2 requests | +38 % against seven fixed drafts, +4.9 % | no (real prompts, below) |
 | `adaptive-mtp` | MTP, 1 / 4 requests, against five fixed drafts | -2.8 %, -1.6 % | no |
 | `gumbel-sampling` | sampled MTP (0.7) | -0.5 to -2.0 % | no |
 | `free-cache-resume` | `infernix-serve`, three 7-22K-token conversations, continuing-turn TTFT | 0.13-0.33 s -> 0.04-0.06 s (every conversation, ABBA) | yes |
@@ -1796,13 +1796,41 @@ Under `--a8-activations` (the same conversion and workloads; every NVFP4 and FP8
 `idle-wide-prefill` pp4096 +5.7 / +6.0 % and pp16384 +6.4 / +6.7 %, `gdn-f16-accumulate` +0.6 / +1.3 % and +0.7 /
 +1.1 %, `fp16-gdn-state` plain decode +0.40 / +0.44 %, `decode-split64` (alone +0.08 / +0.14 %, within the
 spread; jointly +0.6 % at one request, +1.7 %
-at four), `adaptive-speculation` DFlash2 +1.7 / +1.8 % and +2.9 / +2.9 % (one and two requests), `adaptive-dflash`
-beside it +43 % against seven fixed drafts and +5.6 %, `free-cache-resume` continuing-turn TTFT 0.05-0.14 s -> 0.04-0.06 s
-(every conversation ahead), `preemption` wall 5.00-5.04 -> 4.72-4.73 s (the replies differ by arm: the flag withdraws
-request invariance; 2,277 against 2,254 characters): registered on every format (`decode-split64` INT8). Not registered:
-`batched-decode` and `single-column-decode` (-0.1 to +0.1 %: the 8-bit projections keep their route at every width),
-`batch-split-attention` (-0.1 %), `prompt-pv8` (level), `adaptive-mtp` (-4.2 % and -1.5 % against five fixed drafts),
-`gumbel-sampling` (-0.4 %); five MTP drafts are +35 % against three, so `--draft-tokens auto` drafts five there too.
+at four), `adaptive-speculation` DFlash2 +1.7 / +1.8 % and +2.9 / +2.9 % (one and two requests), `free-cache-resume`
+continuing-turn TTFT 0.05-0.14 s -> 0.04-0.06 s (every conversation ahead), `preemption` wall 5.00-5.04 -> 4.72-4.73 s
+(the replies differ by arm: the flag withdraws request invariance; 2,277 against 2,254 characters): registered on every
+format (`decode-split64` INT8). Not registered: `batched-decode` and `single-column-decode` (-0.1 to +0.1 %: the 8-bit
+projections keep their route at every width), `batch-split-attention` (-0.1 %), `prompt-pv8` (level), `adaptive-mtp`
+(-4.2 % and -1.5 % against five fixed drafts), `gumbel-sampling` (-0.4 %), `adaptive-dflash` (+43 % against seven fixed
+drafts and +5.6 % on the bench text, but slower on real prompts, below); five MTP drafts are +35 % against three, so
+`--draft-tokens auto` drafts five there too.
+
+The speculative verdicts on real prompts (the same conversion, INT8 KV, the CLI with the proposal head, five chat
+prompts of 1.9-3.3K tokens (prose, tables, code, a serving question, a short question), greedy, 256 tokens, 2026-11-19).
+MTP, one run an arm, decode tok/s summed over the five: under `--a16-activations` five fixed drafts 1,245.7,
+`adaptive-mtp` 1,193.9 (ahead only on the serving question), three fixed drafts 1,073.3; under `--a8-activations` 1,104.2,
+1,074.4 and 941.5: five fixed drafts stay `auto`'s length. DFlash2 `--draft-tokens auto` with `adaptive-dflash` (A)
+against `--no-fast-path adaptive-dflash`, the fixed seven drafts (B), ABBA (the two rounds within 0.1 %, the arms'
+texts identical on nine of the ten prompt pairs, so the policy alone differs):
+
+| Activations | Prose | Tables | Code | Serving | Question | Summed |
+|---|---:|---:|---:|---:|---:|---:|
+| `--a16-activations`, A tok/s | 210.2 | 354.2 | 282.4 | 198.3 | 450.2 | 1,495.2 |
+| B / A | 1.206 | 1.018 | 1.119 | 1.086 | 0.884 | 1.032 |
+| `--a8-activations`, A tok/s | 223.6 | 272.4 | 280.9 | 211.7 | 281.6 | 1,270.0 |
+| B / A | 1.025 | 1.301 | 0.932 | 0.894 | 1.575 (texts differ) | 1.164 |
+
+On `adaptive-dflash`'s qualification workload (`infernix_decode_quality_gen`, 24 slices of 1,280 tokens of Infernix's
+code continued greedily and of its docs sampled at temperature 1, 384 tokens each, one request, ABBA) the fixed seven
+were -2.2 % (code) and +3.9 % (docs) under `--a16-activations`, -3.5 % and -2.8 % under `--a8-activations` (wall
+tok/s; the rounds within 0.1 %). `adaptive-dflash` was decided on the real prompts, the criterion set before these
+runs, and is not registered under either flag: its losses there reach -17 to -37 % (the largest where the texts diverged), the fixed length's -11.6 %, and a
+policy whose sign changes with the workload is not measured faster. `--draft-tokens auto` with DFlash2 verifies seven
+drafts there (`auto_fixed_draft_tokens`); its round costs stay the NVFP4 27B's for a forced `--fast-path
+adaptive-dflash`. Open: the policy's round costs measured under each flag (the 8-bit code and docs wins suggest they
+differ from the 4-bit route's). The default route on the same five prompts, for the record and not re-decided (its
+qualification is the 2026-10-22 code and docs runs above): the fixed seven +1.6 % summed, ahead on three (prose
+-2.7 %, tables +8.4 %, code +7.0 %, serving +2.9 %, question -7.5 %, where the arms' texts diverged).
 
 ### 6.8 Exact-route numerics changes
 
