@@ -55,13 +55,17 @@ std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t input_rows,
                               : fp8_gdn_input_partial_capacity_bytes(max_tokens);
 }
 
-std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
+std::size_t fp8_gdn_input_workspace_capacity_bytes(QType qtype, LinearPolicy policy, std::int32_t input_rows,
                                                    std::int32_t min_tokens,
                                                    std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 gdn_input_proj workspace: invalid token interval");
     }
-    (void)resolve_route(policy, min_tokens);
+    for (const std::int32_t tokens : {min_tokens, max_tokens}) {
+        if (qtype == QType::FP8_E4M3FN_ROW_F32 && resolve_route(policy, tokens) == Fp8GdnInputRoute::A8Residual) {
+            throw std::invalid_argument("fp8 gdn_input_proj: a static input scale has no A8 residual route");
+        }
+    }
     switch (resolve_route(policy, max_tokens)) {
     case Fp8GdnInputRoute::A8:
         return fp8_a8_workspace_capacity_bytes(

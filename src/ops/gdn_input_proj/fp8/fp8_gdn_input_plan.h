@@ -13,16 +13,19 @@
 
 namespace infernix::ops::detail {
 
-// Two registered parents: fp8_e4m3fn_row_bf16 [16384,5120] (q/k/v 10240, z 6144) and the
-// Qwen3.5-122B-A10B static-scale fp8_e4m3fn_row_f32 [20480,3072] (q/k/v 12288, z 8192), told apart
-// by K. The latter's A8 route encodes with the parent's input scale and has no residual profile.
+// Two registered parents, told apart by K: [16384,5120] (q/k/v 10240, z 6144) in fp8_e4m3fn_row_bf16, or in
+// static-scale fp8_e4m3fn_row_f32 (NVIDIA's NVFP4-QAD 27B), and the Qwen3.5-122B-A10B's static-scale
+// fp8_e4m3fn_row_f32 [20480,3072] (q/k/v 12288, z 8192). A static scale's A8 route encodes with the parent's input
+// scale and has no residual profile.
 [[nodiscard]] std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens);
 [[nodiscard]] std::size_t fp8_gdn_input_n20480_partial_capacity_bytes(std::int32_t max_tokens);
 // The A8 partials of the parent with this K.
 [[nodiscard]] std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t input_rows,
                                                                std::int32_t max_tokens);
 
-[[nodiscard]] std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy,
+// The workspace of a call of [min_tokens, max_tokens] columns. A static input scale (fp8_e4m3fn_row_f32, either
+// parent) has no residual route: an interval that reaches it is refused here, as the dispatch refuses it.
+[[nodiscard]] std::size_t fp8_gdn_input_workspace_capacity_bytes(QType qtype, LinearPolicy policy,
                                                                  std::int32_t input_rows,
                                                                  std::int32_t min_tokens,
                                                                  std::int32_t max_tokens);

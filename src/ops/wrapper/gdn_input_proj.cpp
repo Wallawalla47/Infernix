@@ -880,7 +880,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         if (!fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
-        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, input_rows, min_tokens,
+        return detail::fp8_gdn_input_workspace_capacity_bytes(parent_qtype, policy, input_rows, min_tokens,
                                                               max_tokens);
     }
     if (parent_qtype == QType::FP8_E4M3FN_G32_E8M0 && parent_rows == 16384 && input_rows == 2560) {

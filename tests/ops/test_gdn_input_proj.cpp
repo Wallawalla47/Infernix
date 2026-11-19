@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -856,6 +857,23 @@ int run_fp8() {
         hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0) {
         std::cerr << "FP8 gdn input workspace interval contract mismatch\n";
         ++failures;
+    }
+    // A static input scale (fp8_e4m3fn_row_f32, NVIDIA's NVFP4-QAD 27B at this shape) has no residual route: the query
+    // refuses an interval that reaches it, as the dispatch does, and keeps its one-term A8 route.
+    {
+        bool refused = false;
+        try {
+            (void)ops::gdn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_F32, kRows, kHidden,
+                                                               ops::LinearPolicy::AllowA8Residual, 1, 64);
+        } catch (const std::invalid_argument&) { refused = true; }
+        const std::size_t static_a8 = ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_F32, kRows, kHidden, ops::LinearPolicy::AllowA8, 48, 48);
+        const std::size_t dynamic_residual = ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, ops::LinearPolicy::AllowA8Residual, 1, 64);
+        if (!refused || static_a8 == 0 || dynamic_residual == 0) {
+            std::cerr << "FP8 gdn input workspace: a static input scale must refuse the A8 residual route only\n";
+            ++failures;
+        }
     }
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
