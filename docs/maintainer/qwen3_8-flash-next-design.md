@@ -1490,7 +1490,7 @@ calibration), with their own LFRU in the transfer agent. The drafter never waits
 ### 9.2 Lending reserved memory, the key to sharing VRAM with KV
 
 Infernix's admission invariant requires an Active request to hold its **complete** KV growth
-reservation ([engine architecture §1](engine-architecture.md#1-产品执行模型)). In other engines, a
+reservation ([engine architecture §1](engine-architecture.md#1-product-execution-model)). In other engines, a
 long-context reservation removes expert slots even while those KV pages are empty. ninfer-ext lost
 19% at C=8 that way.
 
@@ -1812,8 +1812,9 @@ This design adopts the same idea in Infernix's paged-KV terms, for every KV prof
 
 - **Index-key plane: always fully device-resident.** At 256K it is 0.22 GB (BF16, §8.10).
 - **K/V pages:**
-  - The authoritative copy lives in a pinned host arena, using the existing host-replica machinery
-    ([paged KV §5.3](paged-kv-cache.md#53-host-replica)). At 256K it is 3.6 GB with the primary
+  - The authoritative copy lives in a pinned host arena, using the existing Host-copy machinery
+    ([paged KV §3.5](paged-kv-cache.md#35-host-capacity) and
+    [§5.3](paged-kv-cache.md#53-transfer-destinations-and-source-pins)). At 256K it is 3.6 GB with the primary
     `int8` profile, 7.0 GB with `bf16`, 3.5 GB with `fp8`, 2.0 GB with `nvfp4` and 0.9 GB with
     `vq2`.
   - The device holds a page cache of hot 4-token blocks: CLOCK replacement, residency resolved in

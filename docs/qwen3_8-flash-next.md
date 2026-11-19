@@ -529,7 +529,7 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     drafts (as MTP's do without `adaptive-speculation`), except under the default fast path
     `dflash2-pairs`: rounds of two requests share one proposal and verify up to two drafts each (with
     `auto`, the number both requests' calibrated drafts make fastest). It is on by the owner's decision
-    ahead of its quality gate; `--disable-fast-paths` or `--reproducible` turns it off.
+    ahead of its quality gate; `--no-fast-path dflash2-pairs` or `--reproducible` turns it off.
 - `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
   - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
     worthwhile (down to none on text it predicts poorly). A one-request round of argmax drafts

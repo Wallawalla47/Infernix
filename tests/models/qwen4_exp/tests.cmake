@@ -209,7 +209,7 @@ infernix_add_test(infernix_qwen4_exp_prefill_width_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_prefill_width_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
-# TEMPORARY with INFERNIX_TMP_STARTUP_CAPTURE (candidates §23 NU-04): the graph set captured at startup against
+# Startup capture (candidates §23 NU-04; tests turn it off through testing::set_startup_capture): the graph set captured at startup against
 # capture at first use, plain, MTP and DFlash2 (INFERNIX_QWEN4_DFLASH2): reproducible-route ids equal, and no graph
 # captured after startup on either route.
 infernix_add_test(infernix_qwen4_exp_startup_capture_real_test

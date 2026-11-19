@@ -394,8 +394,8 @@ takes 4-bit activations and its decode path 16 (the test's comment has the measu
 Run directly, these entries and the startup-capture one need their arguments: with none they fail (exit 2), and
 when every named case is skipped they report a skip (77), never a pass with nothing checked.
 
-`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; TEMPORARY with
-`INFERNIX_TMP_STARTUP_CAPTURE`, Flash-Next design §19.3.37) runs two prompts, alone and then together, through an
+`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; Flash-Next design §19.3.37; the
+first-use Engine turns startup capture off through `testing::set_startup_capture`) runs two prompts, alone and then together, through an
 Engine that captures each CUDA graph at its first use and one that captures the graph set at startup: on the
 reproducible route the ids must be equal; on both routes no graph may be captured after the startup capture. It
 prints each Engine's construction time and free VRAM. It reads `INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM`,

@@ -47,7 +47,9 @@ struct RowsShape {
 // Whether a call's W4A16 jobs take these kernels (moe_experts' prepare and launch_pass decide it identically). Their x
 // rows are the workspace's x limb rows as A16Act blocks, so a call with jobs on the exact wide route (a trimmed call on
 // a wider call's routes, moe::route_width), which reads those rows as its limbs, keeps the tensor-core kernels: their
-// prepare writes the wide route's limbs, and their outputs are these kernels' bits.
+// prepare writes the wide route's limbs, and their outputs are these kernels' bits. The product never builds that
+// call (Qwen4Exp sets a reference width only where ops::moe_routes_by_width holds, never on a bank whose narrow and
+// wide routes are both exact; only the op tests set one there): the check keeps the Op correct for any reference width.
 inline bool a16_rows_call(const MoeExpertSource& source, int columns, const moe::wide::ExpertsWorkspace& layout) {
     return columns <= kA16RowsMaxColumns && a16_nmma_call(source, columns, layout) &&
            !(source.wide_a16 == moe::WideA16::kExact && moe::route_width(source, columns) > moe::kMaxColumns);

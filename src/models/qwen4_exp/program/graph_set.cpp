@@ -24,7 +24,7 @@ namespace infernix::models::qwen4_exp {
 
 namespace testing {
 namespace {
-std::atomic<int> startup_capture_override{-1}; // -1: the switch decides
+std::atomic<int> startup_capture_override{-1}; // -1: none (startup capture is on)
 } // namespace
 
 void set_startup_capture(std::optional<bool> capture) noexcept {
