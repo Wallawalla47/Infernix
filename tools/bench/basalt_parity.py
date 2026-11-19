@@ -27,7 +27,8 @@ Usage:
                    [--ngram-volume PATH] [--draft-model PATH] [--route-trace-arm mtp]
                    [--timeout 2400] [--extra-arg=ARG ...]
 Writes DIR/runs/*.{json,log,ids}, DIR/summary.json and DIR/report.md (Basalt's published figures beside
-ours, with the review's comparability caveats).
+ours, with the review's comparability caveats). Exits 1 when nothing ran or any process failed or wrote no
+measurement; a struct text that differs from Basalt's is listed under Problems only.
 """
 
 from __future__ import annotations
@@ -218,6 +219,8 @@ def run_bench(args: argparse.Namespace, suite: str, arm: str, name: str, seed: i
     run = Run(suite, arm, name, seed, report, code, time.time() - start)
     if code != 0:
         run.problems.append(f"exit {code} (see {log_path.name})")
+    if test_of(report) is None:
+        run.problems.append(f"no measurement in {report_path.name}")
     if name == "struct" and (figures(run).get("generated_tokens") or 0) != STRUCT_EXPECTED_TOKENS:
         run.problems.append(f"struct generated {figures(run).get('generated_tokens')} tokens, Basalt "
                             f"{STRUCT_EXPECTED_TOKENS}: the texts differ")
@@ -328,7 +331,14 @@ def main(argv: list[str] | None = None) -> int:
                                                       indent=2), encoding="utf-8")
     write_report(args.out, summary)
     print(f"[basalt_parity] wrote {args.out / 'report.md'}")
-    return 0 if all(run.returncode == 0 for run in runs) else 1
+    return exit_code(runs)
+
+
+def exit_code(runs: list[Run]) -> int:
+    """0 only when there were runs and each exited 0 with a measurement. A greedy struct text that differs from
+    Basalt's stays a note in the report: another quantization than Basalt's gives another text, so it would fail
+    every run."""
+    return 0 if runs and all(run.returncode == 0 and test_of(run.report) is not None for run in runs) else 1
 
 
 if __name__ == "__main__":

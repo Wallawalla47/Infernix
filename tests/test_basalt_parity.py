@@ -48,6 +48,20 @@ def test_plan_runs_greedy_struct_once_and_fits_the_chart_context(tmp_path: Path)
             assert len(job[4]) + job[5] <= parity.CHART_MAX_CONTEXT
 
 
+def test_exit_code_fails_on_nothing_measured() -> None:
+    def run(report: dict | None, code: int = 0, problems: list[str] | None = None) -> parity.Run:
+        return parity.Run("community", "mtp", "struct", 0, report, code, 1.0, problems or [])
+
+    measured = {"tests": [{"decode_output_tok_s_mean": 100.0}]}
+    assert parity.exit_code([run(measured), run(measured)]) == 0
+    # A struct text that differs from Basalt's (another quantization) is a note, not a failure.
+    assert parity.exit_code([run(measured, problems=["struct generated 7000 tokens, Basalt 7230: the texts differ"])]) == 0
+    # A process that exited 0 without writing its measurement, a failed process, or no runs at all: nothing certified.
+    assert parity.exit_code([run(measured), run(None)]) == 1
+    assert parity.exit_code([run(measured), run(measured, code=3)]) == 1
+    assert parity.exit_code([]) == 1
+
+
 def test_community_decode_tps_is_token_weighted_per_seed() -> None:
     def run(name: str, seed: int, tokens: int, seconds: float) -> parity.Run:
         report = {"tests": [{"decode_output_tok_s_mean": (tokens - 1) / seconds, "decode_seconds_mean": seconds,
