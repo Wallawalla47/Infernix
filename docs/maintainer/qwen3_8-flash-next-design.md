@@ -12141,10 +12141,12 @@ NVIDIA's NVFP4-QAD 27B bit-exact conversion, INT8 KV): prefill pp4096 3,769 and 
 2,857, the default 17,110 and 15,486), plain decode 85.1 tok/s (16-bit with `batched-decode`'s routes 89.4, the
 default 90.2), quick-corpus perplexity 4.2868 (16-bit 4.2869, the default 4.3373), each before the flags' fast paths
 were registered (model-quality.md 6.7); with them pp4096 4,046 (16-bit 3,059), pp16384 3,956 (3,002), plain decode
-86.1 (90.4). Until 2026-11-19 the decode and
-verification calls ran the 16-bit column-invariant route instead (the invariant copy replaced A8Only), and with a
-forced `batched-decode` the FP8 GDN snapshot sized no workspace for the 8-bit route at 1-3 columns (both fixed;
-`infernix_gdn_input_proj_conv_snapshot_test` covers A8Only from one column). Tests: (4)'s and (7)'s kernel tests, `infernix_linear_fp8_a8_test` (MXFP8 block32 against the FP64
+86.1 (90.4), perplexity 4.2871 (4.2869; paired +0.00004 nats per token, 95 % -0.0003 to +0.0004). Until 2026-11-19
+the decode and verification calls ran the 16-bit column-invariant route instead (the invariant copy replaced
+A8Only), with a forced `batched-decode` the FP8 GDN snapshot sized no workspace for the 8-bit route at 1-3 columns,
+and the FP8 gate/up (`linear_swiglu`: the official NVFP4 27B import's MLP) admitted no A8Only, so the flag refused
+that artifact at startup (all fixed; `infernix_gdn_input_proj_conv_snapshot_test` and `infernix_linear_swiglu_fp8_test`
+cover A8Only from one column). Tests: (4)'s and (7)'s kernel tests, `infernix_linear_fp8_a8_test` (MXFP8 block32 against the FP64
 oracle, and the GDN input projection's and QSA group's rows against linear's), `infernix_linear_swiglu_q4_w4a8_test`,
 and the routes' selection in `infernix_qwen4_exp_fast_paths_test` and `infernix_qwen3_5_fast_paths_test`.
 

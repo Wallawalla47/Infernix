@@ -21,6 +21,9 @@ enum class ActivationCompute : std::uint8_t {
     A4Residual,
     // LinearPolicy::AllowA8Residual: A16 up to 16 columns, then two E4M3 terms.
     A8Residual,
+    // LinearPolicy::A8Only (`--a8-activations`): one E4M3 term at every width (the FP8 profile here; NVFP4's
+    // int8 codec is tests/ops/linear/test_nvfp4_a8.cpp's).
+    A8Only,
 };
 
 enum class ActivationPattern : std::uint8_t {
