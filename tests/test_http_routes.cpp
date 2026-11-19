@@ -1,11 +1,14 @@
+#include "http_loopback_harness.h"
 #include "serve/http_server.h"
 
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -250,6 +253,31 @@ int main() {
             created = true;
         } catch (const std::exception&) {}
         failures += check(created, "a --max-http-clients below admission must be raised, not rejected");
+    }
+
+    // --cors: a preflight allows any request header a page's client adds (the official JavaScript SDKs send their own),
+    // and names Authorization, which "*" does not cover.
+    {
+        // A preflight reaches no route: the backend never runs.
+        struct PreflightBackend : infernix::serve::test::LoopbackBackend {
+            using LoopbackBackend::LoopbackBackend;
+            infernix::serve::GenerationOutcome run(infernix::serve::PreparedRequest&, const infernix::serve::StreamSink*,
+                                                   std::function<bool()>) override {
+                throw std::logic_error("a preflight ran a generation");
+            }
+        } backend("cors-model");
+        const infernix::serve::test::LoopbackServer cors(
+            backend, std::chrono::seconds(30), [](infernix::serve::ServeOptions& serve) { serve.enable_cors = true; });
+        httplib::Client client("127.0.0.1", cors.port());
+        const httplib::Headers preflight{
+            {"Origin", "http://page.test"},
+            {"Access-Control-Request-Method", "POST"},
+            {"Access-Control-Request-Headers", "content-type, x-stainless-os, anthropic-dangerous-direct-browser-access"}};
+        const auto answer         = client.Options("/v1/messages", preflight);
+        const std::string allowed = answer ? ", " + answer->get_header_value("Access-Control-Allow-Headers") + "," : "";
+        failures += check(answer && answer->status == 204 && allowed.find(", *,") != std::string::npos &&
+                              allowed.find(", Authorization,") != std::string::npos,
+                          "a --cors preflight must allow a page's other headers by \"*\" and name Authorization");
     }
 
     if (failures == 0) { std::cout << "http routes tests passed\n"; }

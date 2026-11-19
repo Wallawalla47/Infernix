@@ -1399,11 +1399,11 @@ void Launcher::register_routes() {
     server_.set_keep_alive_timeout(std::chrono::seconds(360));
     server_.set_keep_alive_timeout_buffer(10);
     if (settings.cors) {
-        // infernix-serve's headers and the launcher's own api-key named (a wildcard does not cover Authorization),
-        // then "*" for the rest of a page's headers.
+        // infernix-serve's headers (Authorization named, "*" for the rest of a page's headers) and the launcher's own
+        // api-key.
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
-             {"Access-Control-Allow-Headers", std::string(serve::kCorsAllowHeaders) + ", api-key, *"},
+             {"Access-Control-Allow-Headers", std::string(serve::kCorsAllowHeaders) + ", api-key"},
              {"Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"}});
     }
     server_.Options(R"(.*)", [](const Request&, Response& response) { response.status = 204; });

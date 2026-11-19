@@ -141,7 +141,7 @@ infernix_add_test(infernix_http_error_handler_test
 
 infernix_add_test(infernix_http_routes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_routes.cpp"
-  LIBRARIES infernix_serve)
+  LIBRARIES infernix_serve infernix_product_logging)
 
 # --restore-reasoning over loopback HTTP through the Chat Completions route: replies' reasoning is
 # remembered (aggregate and streamed), echoed answers and tool calls reach the backend with it only
