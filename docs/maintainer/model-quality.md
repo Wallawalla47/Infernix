@@ -1805,12 +1805,12 @@ projections keep their route at every width), `batch-split-attention` (-0.1 %), 
 drafts and +5.6 % on the bench text, but slower on real prompts, below); five MTP drafts are +35 % against three, so
 `--draft-tokens auto` drafts five there too.
 
-The speculative verdicts on real prompts (the same conversion, INT8 KV, the CLI with the proposal head, five chat
-prompts of 1.9-3.3K tokens (prose, tables, code, a serving question, a short question), greedy, 256 tokens, 2026-11-19).
-MTP, one run an arm, decode tok/s summed over the five: under `--a16-activations` five fixed drafts 1,245.7,
-`adaptive-mtp` 1,193.9 (ahead only on the serving question), three fixed drafts 1,073.3; under `--a8-activations` 1,104.2,
-1,074.4 and 941.5: five fixed drafts stay `auto`'s length. DFlash2 `--draft-tokens auto` with `adaptive-dflash` (A)
-against `--no-fast-path adaptive-dflash`, the fixed seven drafts (B), ABBA (the two rounds within 0.1 %, the arms'
+The speculative verdicts on real prompts (the same conversion, INT8 KV, the CLI, five chat prompts: prose, tables, code
+and a serving question of 1,763-2,491 tokens, and a 72-token question; greedy, 256 tokens, 2026-11-19). MTP, one run an
+arm, decode tok/s summed over the five: under `--a16-activations` five fixed drafts 1,245.7, `adaptive-mtp` 1,193.9
+(ahead only on the serving question), three fixed drafts 1,073.3; under `--a8-activations` 1,104.2, 1,074.4 and 941.5:
+five fixed drafts stay `auto`'s length. DFlash2 `--draft-tokens auto` with the proposal head (`--lm-head-draft`) and
+`adaptive-dflash` (A) against `--no-fast-path adaptive-dflash`, the fixed seven drafts (B), ABBA (the two rounds within 0.1 %, the arms'
 texts identical on nine of the ten prompt pairs, so the policy alone differs):
 
 | Activations | Prose | Tables | Code | Serving | Question | Summed |
