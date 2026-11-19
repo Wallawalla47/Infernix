@@ -19,138 +19,143 @@ struct Qualification {
     FastPathConfiguration configuration;
 };
 
+// The gate/up formats the rows below were measured on: the NVFP4 27Bs' and the groupwise Q4 27B's (the 35B-A3B
+// and the offloaded 122Bs have no dense MLP: GateUpFormat::Other).
+constexpr GateUpFormat kNvfp4 = GateUpFormat::Nvfp4;
+constexpr GateUpFormat kQ4    = GateUpFormat::GroupwiseQ4;
+
 // Every configuration a fast path passed the acceptance gate in; the evidence is in
 // docs/maintainer/model-quality.md section 6.7. A path runs only in a listed configuration.
 constexpr std::array kQualified{
-    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // The request-coupling paths, qualified jointly per KV format at concurrency 8, DFlash2 with
     // n-gram copies at concurrency 4, and off-grid and endpoint cache resumes (2026-10-14).
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
     Qualification{FastPath::BatchSplitAttention,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
     Qualification{FastPath::AdaptiveSpeculation,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // Two-term A4 residual MLP activations in wide rounds, jointly with the coupling paths above
     // (DFlash2 with n-gram copies at concurrency 4, 2026-10-14).
     Qualification{FastPath::BatchedA4ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+                  {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
     Qualification{FastPath::BatchedA4ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
     Qualification{FastPath::BatchedA4ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
     Qualification{FastPath::BatchedA4ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+                  {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // Two-term A8 residual activations in the FP8 input projections' wide rounds: gated on INT8
     // and NVFP4 KV (the least headroom), K8V4 and K4V2 by their bounds plus INT8's increment
     // (2026-10-15).
     Qualification{FastPath::BatchedA8ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+                  {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
     Qualification{FastPath::BatchedA8ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
     Qualification{FastPath::BatchedA8ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
     Qualification{FastPath::BatchedA8ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+                  {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // Wider prefill steps while no lane waits to decode: the idle width (3,584) against 896- and
     // 1,792-token chunks, prefill gate, quick corpus (2026-10-15; BF16, FP8 and VQ2 2026-10-16).
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // Preemption with Replay under a two-lane pool at concurrency 8 (2026-10-14).
-    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // VQ2 KV: every request-coupling path and both residual profiles, jointly in the plain, spec,
     // cache and preemption arms (2026-10-15).
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::BatchedA4ResidualDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::BatchedA8ResidualDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::BatchedA4ResidualDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::BatchedA8ResidualDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
     // BF16 and FP8 KV: the same paths, jointly in the spec, cache and preemption arms at 512
     // segments (the preemption arm also covers eight requests per round; 2026-10-15).
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
     Qualification{FastPath::BatchedA4ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+                  {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
     Qualification{FastPath::BatchedA8ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+                  {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
     Qualification{FastPath::BatchSplitAttention,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
     Qualification{FastPath::AdaptiveSpeculation,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
     Qualification{FastPath::BatchedA4ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
     Qualification{FastPath::BatchedA8ResidualDecode,
-                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
     // FP16-accumulate chunked GDN, jointly with the paths above: prefill gate (quick corpus, 896
     // and 1,792) on every KV format, decode (plain, 256 segments) on INT8 and BF16 (2026-10-17).
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // The groupwise Qwen3.8-27B (24 heads, 16-bit activations, groupwise Q4 gate/up) by composition
     // (model-quality.md 6.1, 2026-10-18): prompt-pv8 changes only the prompt attention kernels it
     // shares, at the same 24-head shapes and with no added cost, with the NVFP4 27B, whose gates it
     // passed with a clear prefill gain (+1.6-5.7 %), so it takes that verdict and timing.
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
     // The groupwise 27B, its own evidence (2026-10-18). idle-wide-prefill with prompt-pv8 and gdn-f16-accumulate:
     // prefill gate (quick corpus, INT8, 896/1,792 against 3,584) passes; pp16384 +3.31 % and +0.12 %,
     // every run ahead; the other KV formats take the NVFP4 27B's per-format verdicts (6.1). decode-split64:
     // the NVFP4 27B's kernel and shapes, +0.25 % at 512-token prompts here, level at 4,096.
-    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
     // Qwen3.6-35B-A3B (16 heads, 16-bit activations), its own evidence
     // (2026-10-18): the same prefill gate passes; idle-wide-prefill pp16384 +16.9 % (other KV formats
     // from the NVFP4 27B's verdicts), prompt-pv8 +0.24 % on INT8 KV (its 16-head shapes are its own,
@@ -175,37 +180,37 @@ constexpr std::array kQualified{
     // TTFT -95.6 % and -58.8 %, preemption +203 % and +109 % aggregate, adaptive-speculation +1.18 % and
     // +7.96 % with MTP), then gated jointly per KV format (concurrency 4, prefix reuse, a 16,640-token pool,
     // DFlash2 with n-gram copies and MTP, 256 segments against the lossless decode references).
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
     // The groupwise 27B's one-column rounds on batched-decode's routes (2026-10-22): one request decodes
     // +14.5 % (end to end +13.9 %), four +0.05 % (ABBA, INT8, pp512 + tg512), gated per KV format on plain
     // one-request decode (every round one column), 256 segments against the lossless decode reference.
-    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
     Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
     Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
@@ -234,13 +239,13 @@ constexpr std::array kQualified{
     // concurrency 1, 2 and 4, sampled CLI text and (35B) the exact route: +2.1 % and +2.0 %; the
     // exceptions are in model-quality.md 6.7. The KV format changes only the round cost the policy
     // learns, so every format takes the INT8 timing.
-    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
     Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
@@ -254,13 +259,13 @@ constexpr std::array kQualified{
     // fixed length (NVFP4 27B DFlash2 7, 35B-A3B DFlash 3) at concurrency 1, 2 and 4 on code and
     // sampled docs, geometric means +1.6 % and +6.1 % (model-quality.md 6.7, with the exceptions).
     // The KV format changes only the round's absolute time, so every format takes the INT8 timing.
-    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
     Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
@@ -271,13 +276,13 @@ constexpr std::array kQualified{
     // batched-a8-decode (wide rounds' FP8 projections at the artifact's single-term 8-bit activations,
     // ahead of the two-term residual profile) by the owner's decision (2026-10-24), although it failed its
     // decode gate in the speculative arm on INT8 (model-quality.md 6.7): every KV format.
-    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // On by the owner's decision of 2026-10-25 (a new path measured faster goes on by default before its
     // quality gate; the owner may turn it off once the gating regime is settled), in the configuration
     // measured, each against the default route (ABBA, RTX 5090, 2026-10-25, MTP 3, pp1280+tg256):
@@ -286,36 +291,36 @@ constexpr std::array kQualified{
     // decode +0.7 % (3 of 3, at least +0.67 %), pp8192 neutral. Not the 35B-A3B (fp16-gdn-state one block
     // -3 %, q5-ksplit-mma neutral). The KV formats below INT8's precision (FP8, NVFP4, K8V4, VQ2, K4V2) take them
     // too by the owner's decision of 2026-11-01: neither path's kernels read the KV cache.
-    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kQ4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kQ4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kQ4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kQ4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Vq2, kQ4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kQ4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // gdn-tree-closed-form by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate), where
     // measured (ABBA, RTX 5090, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2
     // decode +1.19 % (6 of 6, at least +1.01 %; rounds 1.0-1.3 % shorter), 35B-A3B DFlash rounds 1.0-1.7 % shorter in
     // 6 of 6 (decode +1.6 % where the greedy text matched; elsewhere the changed text moved the round count). Only
     // the GDN record changes, so every KV format.
-    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
@@ -327,47 +332,48 @@ constexpr std::array kQualified{
     // by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate): Ornith-1.5-122B MTP
     // decode +2.0 % (ABBA, RTX 5090, 2026-10-28, 4 of 4 pairs, worst +1.69 %). Only the experts' wide calls change,
     // so every KV format.
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::BFloat16, false, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, false, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::Other, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::Other, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
     // free-cache-resume on the Qwen3.5-122B-A10B by the same rule: infernix-serve, Ornith-1.5-122B, INT8 KV, a
     // 15,027-token first turn and a short continuing one (2026-11-03, two servers an arm, ABBA): continuing-turn TTFT
     // 1.69 / 1.65 / 1.69 / 1.65 s (the 16,384-token grid holds no point below the first turn: 0 % reused) -> 0.44 /
     // 0.35 / 0.44 / 0.37 s (99.1 % reused). Where a cache resumes does not depend on the KV format, so every format.
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::BFloat16, false, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, false, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::Other, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::Other, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
     // preemption by the same rule: infernix-serve, Ornith-1.5-122B, INT8 KV, a 16,640-token pool, four concurrent
     // 3,027-token prompts reserving 4,096 output tokens and answering in 98-152 (2026-11-03, two servers an arm,
     // ABBA, the same replies): wall 9.25 / 9.28 s -> 8.88 / 8.95 s (+3.8 % aggregate), the third and fourth
     // requests' TTFT 5.4 / 7.0 s -> 3.1 / 4.2 s (held extents let two in at once). Where a request is admitted does
     // not depend on the KV format, so every format.
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::BFloat16, false, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, false, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::Other, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::Other, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
     // prompt-pv8 at the 122B's GQA group of 16, by the same rule: Ornith-1.5-122B, pp65536 from one expert state, two
     // rotated runs a format, every run ahead (2026-11-03): INT8 KV 6,588.0 -> 6,678.0 tok/s (+1.37 %), NVFP4 6,810.4
     // -> 6,971.6 (+2.37 %), K8V4 6,750.3 -> 6,934.2 (+2.73 %), VQ2 6,406.4 -> 6,448.7 (+0.66 %), K4V2 6,365.7 ->
     // 6,421.6 (+0.88 %); runs of one arm within 0.1 %. gdn-f16-accumulate was level there (+0.01 %): not registered.
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, false, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, false, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
-    // NVIDIA's NVFP4 Qwen3.8-27B artifacts under --a16-activations (24 heads, 16-bit activations, no groupwise Q4
-    // gate/up: no other artifact has this configuration), by the owner's rule of 2026-11-19 (a fast path enabled
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
+    // NVIDIA's NVFP4 Qwen3.8-27B artifacts under --a16-activations (24 heads, 16-bit activations, NVFP4 gate/up: a
+    // 16-bit 27B of another gate/up format, such as the Q6 gate/up recipe or a Q8_0 GGUF import, is not this
+    // configuration and none of these was measured on one), by the owner's rule of 2026-11-19 (a fast path enabled
     // elsewhere goes on wherever it measures faster, ahead of its gate), measured on NVIDIA's NVFP4-QAD bit-exact
     // conversion (RTX 5090, INT8 KV, two rotated rounds against the configuration without the path, model-quality.md
     // 6.7): batched-decode plain decode +14.5/+14.8 % at one request and +12.1/+12.4 % at four, decode-split64 +0.5 %
@@ -381,70 +387,69 @@ constexpr std::array kQualified{
     // and +4.9 % against seven fixed drafts on the bench's repeating text, but on five real prompts (greedy, 256
     // tokens, ABBA) the fixed seven were faster on four, +3.2 % summed (the worst prompt -11.6 %), and on the code and
     // docs slices that qualified it on the default route -2.2 % and +3.9 %).
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // BF16 KV, by the same rule where timed faster (2026-11-19, ABBA, pp2048 + tg256): fp16-gdn-state on the NVFP4 27B
     // plain decode +0.81/+0.32 % and MTP +0.64/+0.68 %, on the groupwise 27B +0.42/+0.60 %; q5-ksplit-mma on the
     // groupwise 27B's MTP decode +0.12/+0.09 % (prefill beside it +0.5 %). gumbel-sampling was slower on the groupwise
     // 27B (-0.31/-0.31 %): not registered there.
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
-    // The NVFP4 27B under --a8-activations (24 heads, 8-bit activations at every width; no other local artifact has
-    // this configuration), by the same rule and on the same conversion and workloads (2026-11-19): idle-wide-prefill
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::BFloat16, kQ4}},
+    // The NVFP4 27B under --a8-activations (24 heads, 8-bit activations at every width, NVFP4 gate/up), by the same rule and on the same conversion and workloads (2026-11-19): idle-wide-prefill
     // pp16384 +6.4/+6.7 %, gdn-f16-accumulate +0.7/+1.1 %, fp16-gdn-state plain decode +0.4 %, decode-split64 (alone
     // +0.08/+0.14 %, within the spread; jointly with fp16-gdn-state +0.6 % at one request and +1.7 % at four; the same
     // attention kernels as under --a16-activations, +0.5 % there), adaptive-speculation DFlash2 +1.8 % (one request) and +2.9 % (two),
@@ -455,66 +460,73 @@ constexpr std::array kQualified{
     // real prompts the fixed seven drafts were faster on three, +16.4 % summed (+4.6 % without the one prompt whose
     // texts diverged; the worst -10.7 %), against -3.5 % and -2.8 % on the code and docs slices). fp16-gdn-state's
     // BF16 KV by its BF16 timings above (its kernels do not read the KV cache).
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
-    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
-    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
-    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
-    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
-    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
-    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::BFloat16, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
+    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, kNvfp4}},
     // gumbel-sampling below INT8's precision, by the owner's decision of 2026-11-01 (a path registered on INT8 KV runs
     // on every format below its precision when its kernels do not read the KV cache: sampling does not).
-    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
-    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256, kNvfp4}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, kNvfp4}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value, kNvfp4}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Vq2, kNvfp4}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value, kNvfp4}},
     // Gumbel-max sampling on the NVFP4 27B's MTP rounds (2026-11-16, the owner's registration where it was timed
     // faster: +8.5 %; model-quality.md 6.7 holds the timing and that its distribution test is still to run).
-    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
 };
+// Every resident 24-head row names the gate/up format it was measured on: an unkeyed row would match a 27B of a
+// format nobody measured (Qwen3.5's 24-head models are the dense 27Bs).
+static_assert(std::none_of(kQualified.begin(), kQualified.end(), [](const Qualification& entry) {
+    return entry.configuration.query_heads == 24 && !entry.configuration.offloaded_experts &&
+           entry.configuration.gate_up == GateUpFormat::Other;
+}));
 
-// The NVFP4 Qwen3.8-27B artifacts (24 heads, no groupwise Q4 gate/up), whatever activation precision a flag gives
-// them (--a16-activations, --a8-activations): the same drafters and target shapes, so adaptive drafting takes their
-// round costs.
+// The NVFP4 Qwen3.8-27B artifacts (24 heads, NVFP4 gate/up), whatever activation precision a flag gives them
+// (--a16-activations, --a8-activations): the same drafters and target shapes, so adaptive drafting takes their
+// round costs. A 27B of another gate/up format keeps the generic constants.
 bool nvfp4_27b(const FastPathConfiguration& configuration) {
-    return configuration.query_heads == 24 && !configuration.q4_gate_up && !configuration.offloaded_experts;
+    return configuration.query_heads == 24 && configuration.gate_up == GateUpFormat::Nvfp4 &&
+           !configuration.offloaded_experts;
 }
 
 const char* kv_name(KvCacheStorage kv) {
@@ -543,17 +555,29 @@ const char* activation_name(ActivationClass activations) {
 } // namespace
 
 std::string describe(const FastPathConfiguration& configuration) {
+    const char* gate_up = configuration.gate_up == GateUpFormat::GroupwiseQ4 ? ", Q4 gate/up"
+                          : configuration.gate_up == GateUpFormat::Nvfp4     ? ", NVFP4 gate/up"
+                                                                             : "";
     return std::to_string(configuration.query_heads) + " heads, " +
            activation_name(configuration.activations) + " activations, " +
-           kv_name(configuration.kv) + " KV" + (configuration.q4_gate_up ? ", Q4 gate/up" : "") +
+           kv_name(configuration.kv) + " KV" + gate_up +
            (configuration.offloaded_experts ? ", offloaded experts" : "");
 }
 
 FastPathConfiguration fast_path_configuration(const Model& model, const EngineOptions& options) {
+    const auto& attention = model.config().text.attention;
+    return fast_path_configuration(model.weight_data(), model.weights().text,
+                                   attention ? static_cast<std::uint32_t>(attention->num_attention_heads) : 0U,
+                                   model.offloaded_experts(), options);
+}
+
+FastPathConfiguration fast_path_configuration(std::span<const BoundWeight> bound, const TextWeights& text,
+                                              std::uint32_t query_heads, bool offloaded_experts,
+                                              const EngineOptions& options) {
     ActivationClass activations = ActivationClass::A16;
     // Text-decoder weights only: drafter and vision weights change proposals and encodings, not
     // the precision of the decoder's own arithmetic.
-    for (const BoundWeight& weight : model.weight_data()) {
+    for (const BoundWeight& weight : bound) {
         if (!std::string_view(weight.name).starts_with("text/")) { continue; }
         for (const WeightUse& use : weight.uses) {
             if (ops::allows_a4(use.policy)) {
@@ -564,30 +588,39 @@ FastPathConfiguration fast_path_configuration(const Model& model, const EngineOp
             }
         }
     }
-    // A text layer whose dense MLP gate and up are both RowSplit Q4_G64_FP16 (the groupwise recipes).
-    const auto groupwise_q4 = [&](WeightId id) {
-        const WeightView& view = model.weight(id).view;
-        return !view.parts.empty() &&
-               std::all_of(view.parts.begin(), view.parts.end(), [](const WeightRegion& part) {
-                   return part.parent != nullptr &&
-                          part.parent->geometry.format == QType::Q4_G64_FP16 &&
-                          part.parent->geometry.layout == QuantLayout::RowSplit;
+    // Whether every part of a weight's view lies in a parent the predicate accepts.
+    const auto stored_as = [&](WeightId id, auto&& accepts) {
+        const WeightView& view = bound[id.index].view;
+        return !view.parts.empty() && std::all_of(view.parts.begin(), view.parts.end(), [&](const WeightRegion& part) {
+                   return part.parent != nullptr && accepts(part.parent->geometry);
                });
     };
-    bool q4_gate_up = false;
-    for (const BlockWeights& layer : model.weights().text.layers) {
+    // The groupwise recipes: RowSplit Q4_G64_FP16.
+    const auto groupwise_q4 = [](const WeightGeometry& geometry) {
+        return geometry.format == QType::Q4_G64_FP16 && geometry.layout == QuantLayout::RowSplit;
+    };
+    // NVFP4, with a divisor or ModelOpt's multiplier, in any layout.
+    const auto nvfp4 = [](const WeightGeometry& geometry) {
+        return geometry.format == QType::NVFP4 || geometry.format == QType::NVFP4_MUL;
+    };
+    // A text layer whose dense MLP gate and up are both in the format decides it (orcarouter's NVFP4 27B keeps FP8 in
+    // its last eight MLPs).
+    bool q4_gate_up = false, nvfp4_gate_up = false;
+    for (const BlockWeights& layer : text.layers) {
         if (const auto* dense = std::get_if<DenseWeights>(&layer.ffn)) {
-            q4_gate_up = q4_gate_up || (groupwise_q4(dense->gate) && groupwise_q4(dense->up));
+            q4_gate_up    = q4_gate_up || (stored_as(dense->gate, groupwise_q4) && stored_as(dense->up, groupwise_q4));
+            nvfp4_gate_up = nvfp4_gate_up || (stored_as(dense->gate, nvfp4) && stored_as(dense->up, nvfp4));
         }
     }
-    const auto& attention = model.config().text.attention;
-    return {.query_heads       = attention ? static_cast<std::uint32_t>(attention->num_attention_heads) : 0U,
+    return {.query_heads       = query_heads,
             .activations       = activations,
             // Packed BF16 KV gives attention bf16's K and V bits: it is qualified as bf16.
             .kv                = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16
                                                                                  : options.kv_cache,
-            .q4_gate_up        = q4_gate_up,
-            .offloaded_experts = model.offloaded_experts()};
+            .gate_up           = q4_gate_up      ? GateUpFormat::GroupwiseQ4
+                                 : nvfp4_gate_up ? GateUpFormat::Nvfp4
+                                                 : GateUpFormat::Other,
+            .offloaded_experts = offloaded_experts};
 }
 
 bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
@@ -639,7 +672,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Fp8A8Pair:
     case FastPath::Fp8A8PairBlock32: return false;
     // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
-    case FastPath::Q4W4A8: return configuration.q4_gate_up;
+    case FastPath::Q4W4A8: return configuration.gate_up == GateUpFormat::GroupwiseQ4;
     // The offloaded experts' wide calls (Qwen3.5-122B-A10B: every offloaded bank is NVFP4 W4A16, its
     // shared expert one more job of the call). Two terms are registered on the 122B (kQualified); three
     // run only as a --fast-path candidate.
@@ -827,7 +860,7 @@ NgramSettings auto_ngram_settings(const FastPathConfiguration& configuration, Sp
     // -1.6, -1.8 %; a copy rewrite beside a code slice -0.6 %), within the run-to-run spread over the workloads:
     // the owner kept 31 (model-quality.md 6.7, adaptive-dflash).
     // The 4-bit class only: the copy windows were not timed under --a16-activations or --a8-activations.
-    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4 &&
+    if (nvfp4_27b(configuration) && configuration.activations == ActivationClass::A4 &&
         backend == SpeculativeBackend::DFlash2 && adaptive_drafts) {
         return {.window = 63, .batch_window = 31, .min_match = 12};
     }
@@ -880,7 +913,7 @@ A8Routes a8_activation_routes(const FastPathConfiguration& configuration) noexce
     // Prefill: the experts' wide calls on the 8-bit tiles (beside their narrow route); not yet measured end to end.
     out.experts_prefill = out.experts;
     // Prefill: the groupwise Qwen3.8-27B, INT8 KV, pp4096 +11.7 %, pp16384 +11.5 % (q4-w4a8, 2026-10-15).
-    out.q4_gate_up = configuration.q4_gate_up;
+    out.q4_gate_up = configuration.gate_up == GateUpFormat::GroupwiseQ4;
     return out;
 }
 

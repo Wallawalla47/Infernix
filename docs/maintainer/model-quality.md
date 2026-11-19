@@ -484,18 +484,21 @@ standard error, which set the caps at 1e-2. Spec arms were scored against the ex
 their configuration in plain decode, which the request-invariant exact route makes the same
 tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored in their entries.
 
-The configurations by the artifacts that have them: **NVFP4 27B** (24 heads, 4-bit activations:
+The configurations by the artifacts that have them: **NVFP4 27B** (24 heads, 4-bit activations, NVFP4 gate/up:
 the official, NVIDIA, quasar and uncensored Qwen3.8-27B NVFP4 artifacts), **groupwise 27B** (24
 heads, 16-bit activations, Q4 gate/up), **35B-A3B** (16 heads, 16-bit activations), **the NVFP4 27B under
-`--a16-activations`** (24 heads, 16-bit activations, no Q4 gate/up: no artifact has it natively) and **under
-`--a8-activations`** (24 heads, 8-bit activations); for
+`--a16-activations`** (24 heads, 16-bit activations, NVFP4 gate/up: no artifact has it natively) and **under
+`--a8-activations`** (24 heads, 8-bit activations, NVFP4 gate/up); for
 Qwen3.8-Flash-Next **Dense8** (Q8 dense, 4-bit experts: NVIDIA, uncensored and Swift NVFP4
 Dense8), **IQ3_S** (GGUF dense, 16-bit experts: every GGUF import), **FP8** (BF16 dense, 16-bit
 experts: the official FP8 import), **recipe A** (BF16 dense, 4-bit experts) and **recipe C** (FP8
 dense, 16-bit experts). "Every format" is BF16, INT8, FP8, NVFP4, K8V4, VQ2 and K4V2 KV. The
 groupwise 27B and the 35B-A3B became request-invariant on the reproducible route in 2026-10 (6.1), so
 their request-coupling paths are listed like the others (since 2026-10-22). The NVFP4 27B variants select identical paths (each startup's
-`fast paths |` line, 2026-10-18).
+`fast paths |` line, 2026-10-18). The text MLP's gate/up format is part of the configuration (`GateUpFormat`): a 27B
+of another gate/up format (the `qwen3_8_27b_q6` recipe's Q6, a Q8_0 GGUF import) has the heads and precision of the
+NVFP4 27B under `--a16-activations` but none of its paths or drafting constants, which were not measured there
+(2026-11-19 audit, WA-1; until then the flag's rows reached those artifacts by default).
 
 | Fast path | Kernels run with | Qualified configurations |
 |---|---|---|
@@ -1759,7 +1762,7 @@ NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
 
 **`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**
 - **Selected by:** `--fast-path q4-w4a8` on artifacts whose text MLP gate/up is RowSplit
-  `Q4_G64_FP16` (the official Qwen3.8-27B groupwise recipe; `FastPathConfiguration::q4_gate_up`),
+  `Q4_G64_FP16` (the official Qwen3.8-27B groupwise recipe; `GateUpFormat::GroupwiseQ4`),
   through `ExecutionSchedule::linear_routes` to `ops::linear_swiglu` with `LinearRoutes::Q4W4A8`.
 - **What changes:** calls of at least 256 columns (prefill chunks; decode and verification stay
   narrower and keep their bits) quantize each token's activation to int8 against its own absmax and

@@ -5,6 +5,7 @@
 #include "infernix/types.h"
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -13,15 +14,23 @@ namespace infernix::models::qwen3_5 {
 // The narrowest activation precision any text-decoder linear computes with.
 enum class ActivationClass : std::uint8_t { A4, A8, A16 };
 
+// The format of the text MLP's dense gate/up weights, which tells apart the dense 27B artifacts the registry
+// measured: GroupwiseQ4 (RowSplit Q4_G64_FP16, the official groupwise recipes, the format the q4-w4a8 kernels run
+// on) and Nvfp4 (NVFP4 or ModelOpt's NVFP4 with a multiplier: NVIDIA's, NInfer's and the other NVFP4 27Bs, whose
+// other projections may be FP8). Other: anything else (a Q6 or Q8 gate/up recipe, a Q8_0 GGUF import) and the
+// MoE models, which have no dense MLP. A layer decides it when both its gate and up are in the format; groupwise
+// Q4 first.
+enum class GateUpFormat : std::uint8_t { Other, GroupwiseQ4, Nvfp4 };
+
 // What a fast path is qualified by: the precision that sets the default route's noise floor
-// (activations and KV format), the attention geometry the kernels run in, and whether the text MLP
-// gate/up weights are groupwise Q4, the format the q4-w4a8 kernels run on
-// (docs/maintainer/model-quality.md section 6).
+// (activations and KV format), the attention geometry the kernels run in, and the text MLP's gate/up
+// format, which separates artifacts of the same geometry and precision (docs/maintainer/model-quality.md
+// section 6).
 struct FastPathConfiguration {
     std::uint32_t query_heads   = 0;
     ActivationClass activations = ActivationClass::A16;
     KvCacheStorage kv           = KvCacheStorage::BFloat16;
-    bool q4_gate_up             = false;
+    GateUpFormat gate_up        = GateUpFormat::Other;
     // Routed experts held outside device memory (Qwen3.5-122B-A10B): a verified draft column brings
     // its own expert misses, which prices speculation differently.
     bool offloaded_experts = false;
@@ -29,11 +38,17 @@ struct FastPathConfiguration {
     bool operator==(const FastPathConfiguration&) const = default;
 };
 
-// For example "24 heads, 4-bit activations, int8 KV" (", Q4 gate/up" appended when set).
+// For example "24 heads, 4-bit activations, int8 KV, NVFP4 gate/up" (", Q4 gate/up" or ", NVFP4 gate/up"
+// appended for those formats, ", offloaded experts" when set).
 [[nodiscard]] std::string describe(const FastPathConfiguration& configuration);
 
 [[nodiscard]] FastPathConfiguration fast_path_configuration(const Model& model,
                                                             const EngineOptions& options);
+// The same from the parts of the Model it reads: the bound weights, the text decoder's layers, its query heads
+// and whether its routed experts are offloaded.
+[[nodiscard]] FastPathConfiguration fast_path_configuration(std::span<const BoundWeight> bound,
+                                                            const TextWeights& text, std::uint32_t query_heads,
+                                                            bool offloaded_experts, const EngineOptions& options);
 
 // Whether the path's kernels run in this configuration at all. The request-coupling paths give up a
 // part of the exact route's invariance, which every artifact has (every decode projection runs a

@@ -16,6 +16,7 @@ using infernix::FastPath;
 using infernix::KvCacheStorage;
 using infernix::models::qwen3_5::ActivationClass;
 using infernix::models::qwen3_5::FastPathConfiguration;
+using infernix::models::qwen3_5::GateUpFormat;
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
@@ -31,7 +32,7 @@ int main() {
     const infernix::EngineOptions options;
 
     // decode-split64: INT8 KV with 24 query heads only.
-    const FastPathConfiguration int8_24{24, ActivationClass::A4, KvCacheStorage::Int8Group64};
+    const FastPathConfiguration int8_24{24, ActivationClass::A4, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4};
     failures += check(q::fast_path_applies(FastPath::DecodeSplit64, int8_24, options),
                       "decode-split64 must apply to 24 heads with INT8 KV");
     failures += check(!q::fast_path_applies(FastPath::DecodeSplit64,
@@ -39,18 +40,18 @@ int main() {
                       "decode-split64 must not apply to 16 heads");
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(!q::fast_path_applies(FastPath::DecodeSplit64, {24, ActivationClass::A4, kv}, options),
+        failures += check(!q::fast_path_applies(FastPath::DecodeSplit64, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}, options),
                           "decode-split64 must apply to INT8 KV only");
     }
 
     // prompt-pv8: the KV formats whose prompt kernel has an 8-bit P*V form.
     for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv}, options),
+        failures += check(q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}, options),
                           "prompt-pv8 must apply where an 8-bit P*V form exists");
     }
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256}) {
-        failures += check(!q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv}, options),
+        failures += check(!q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}, options),
                           "prompt-pv8 must not apply to BF16 or FP8 KV");
     }
     infernix::EngineOptions original = options;
@@ -60,7 +61,7 @@ int main() {
     original                                = options;
     original.original_nvfp4_prefill_kernel  = true;
     failures += check(!q::fast_path_applies(FastPath::PromptPv8,
-                                            {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}, original),
+                                            {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, GateUpFormat::Nvfp4}, original),
                       "prompt-pv8 needs the fast NVFP4 prompt kernel");
 
     // The request-coupling paths apply on every artifact (every one has the exact route's invariant
@@ -78,7 +79,7 @@ int main() {
     for (const FastPath path : {FastPath::BatchedA8Decode, FastPath::BatchedA8SubsetDecode, FastPath::BatchedA4Decode,
                                 FastPath::BatchedA4ResidualDecode, FastPath::BatchedA8ResidualDecode}) {
         failures += check(!q::fast_path_applies(path,
-                                                {24, ActivationClass::A16, KvCacheStorage::Int8Group64},
+                                                {24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4},
                                                 options),
                           std::string(infernix::fast_path_name(path)) +
                               " must not apply at 16-bit activations");
@@ -88,7 +89,7 @@ int main() {
     }
     for (const FastPath path : {FastPath::BatchedA4Decode, FastPath::BatchedA4ResidualDecode}) {
         failures += check(!q::fast_path_applies(
-                              path, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}, options),
+                              path, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4}, options),
                           std::string(infernix::fast_path_name(path)) +
                               " must not apply at 8-bit activations");
     }
@@ -131,15 +132,15 @@ int main() {
              {FastPath::BatchedDecode, FastPath::BatchedA4ResidualDecode,
               FastPath::BatchedA8ResidualDecode, FastPath::BatchSplitAttention,
               FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
-            failures += check(q::fast_path_qualified(path, {24, ActivationClass::A4, kv}),
+            failures += check(q::fast_path_qualified(path, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                               std::string(infernix::fast_path_name(path)) + " is qualified");
         }
         for (const FastPath path : {FastPath::BatchedA4Decode, FastPath::BatchedA8SubsetDecode}) {
-            failures += check(!q::fast_path_qualified(path, {24, ActivationClass::A4, kv}),
+            failures += check(!q::fast_path_qualified(path, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                               std::string(infernix::fast_path_name(path)) + " is not qualified");
         }
         // batched-a8-decode by the owner's decision (2026-10-24), although it failed its decode gate.
-        failures += check(q::fast_path_qualified(FastPath::BatchedA8Decode, {24, ActivationClass::A4, kv}),
+        failures += check(q::fast_path_qualified(FastPath::BatchedA8Decode, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "batched-a8-decode is registered");
     }
     failures += check(!q::fast_path_qualified(FastPath::BatchedDecode,
@@ -152,7 +153,7 @@ int main() {
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value,
                           KvCacheStorage::Vq2}) {
         for (const q::FastPathConfiguration config :
-             {q::FastPathConfiguration{24, ActivationClass::A16, kv, true}, q::FastPathConfiguration{16, ActivationClass::A16, kv}}) {
+             {q::FastPathConfiguration{24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}, q::FastPathConfiguration{16, ActivationClass::A16, kv}}) {
             for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
                 failures += check(q::fast_path_qualified(path, config),
                                   std::string(infernix::fast_path_name(path)) + " is qualified for " + q::describe(config));
@@ -163,9 +164,9 @@ int main() {
             }
         }
         // single-column-decode: the groupwise 27B only (the 35B-A3B was 1 % slower at four requests).
-        failures += check(q::fast_path_qualified(FastPath::SingleColumnDecode, {24, ActivationClass::A16, kv, true}) &&
+        failures += check(q::fast_path_qualified(FastPath::SingleColumnDecode, {24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}) &&
                               !q::fast_path_qualified(FastPath::SingleColumnDecode, {16, ActivationClass::A16, kv}) &&
-                              !q::fast_path_qualified(FastPath::SingleColumnDecode, {24, ActivationClass::A4, kv}),
+                              !q::fast_path_qualified(FastPath::SingleColumnDecode, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "single-column-decode is qualified for the groupwise 27B only");
     }
 
@@ -186,13 +187,13 @@ int main() {
                       "decode-split64 is not qualified on 16 heads");
     for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv}),
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "prompt-pv8 is qualified for 24 heads and 4-bit activations on these KV formats");
-        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv}) &&
-                              !q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A8, kv}),
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv, GateUpFormat::Nvfp4}) &&
+                              !q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A8, kv, GateUpFormat::Nvfp4}),
                           "prompt-pv8 is qualified for the NVFP4 27B under --a16-activations, not at 8 bits");
     }
-    failures += check(q::describe(int8_24) == "24 heads, 4-bit activations, int8 KV",
+    failures += check(q::describe(int8_24) == "24 heads, 4-bit activations, int8 KV, NVFP4 gate/up",
                       "configuration description changed");
 
     failures += check(q::fast_path_applies(FastPath::IdleWidePrefill, int8_24, options),
@@ -201,9 +202,9 @@ int main() {
                                     KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A4, kv}),
+        failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "idle-wide-prefill is qualified where it passed its gate");
-        failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, {24, ActivationClass::A4, kv}),
+        failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "gdn-f16-accumulate is qualified where it passed its gate");
     }
     failures += check(q::fast_path_applies(FastPath::GdnF16Accumulate, int8_24, options) &&
@@ -213,7 +214,7 @@ int main() {
                           !q::couples_requests(FastPath::Fp16GdnState) &&
                           q::fast_path_qualified(FastPath::Fp16GdnState, int8_24) &&
                           q::fast_path_qualified(FastPath::Fp16GdnState,
-                                                 {24, ActivationClass::A4, KvCacheStorage::BFloat16}),
+                                                 {24, ActivationClass::A4, KvCacheStorage::BFloat16, GateUpFormat::Nvfp4}),
                       "fp16-gdn-state applies everywhere, keeps a request invariant and is qualified where it "
                       "was measured faster (the 27Bs, BF16 KV included since 2026-11-19)");
     // The NVFP4 27B under --a8-activations (24 heads, 8-bit activations at every width), where measured faster.
@@ -221,7 +222,7 @@ int main() {
                                     KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value}) {
-        const q::FastPathConfiguration a8_27b{24, ActivationClass::A8, kv};
+        const q::FastPathConfiguration a8_27b{24, ActivationClass::A8, kv, GateUpFormat::Nvfp4};
         for (const FastPath path : {FastPath::IdleWidePrefill, FastPath::GdnF16Accumulate, FastPath::Fp16GdnState,
                                     FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
             failures += check(q::fast_path_qualified(path, a8_27b),
@@ -235,18 +236,18 @@ int main() {
                               std::string(infernix::fast_path_name(path)) + " stays off under --a8-activations");
         }
     }
-    failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}) &&
-                          q::auto_fixed_draft_tokens({24, ActivationClass::A8, KvCacheStorage::Int8Group64},
+    failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, {24, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4}) &&
+                          q::auto_fixed_draft_tokens({24, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4},
                                                      infernix::SpeculativeBackend::Mtp) == 5,
                       "decode-split64 and five MTP drafts under --a8-activations");
-    // NVIDIA's NVFP4 27B under --a16-activations (24 heads, 16-bit activations, no Q4 gate/up), registered where each
+    // NVIDIA's NVFP4 27B under --a16-activations (24 heads, 16-bit activations, NVFP4 gate/up), registered where each
     // path was measured faster (2026-11-19); the paths that were not stay off.
     {
         for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                                         KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                         KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                         KvCacheStorage::Q4KeyVq2Value}) {
-            const q::FastPathConfiguration a16_27b{24, ActivationClass::A16, kv};
+            const q::FastPathConfiguration a16_27b{24, ActivationClass::A16, kv, GateUpFormat::Nvfp4};
             for (const FastPath path : {FastPath::BatchedDecode, FastPath::Fp16GdnState, FastPath::IdleWidePrefill,
                                         FastPath::GdnF16Accumulate, FastPath::AdaptiveSpeculation,
                                         FastPath::FreeCacheResume, FastPath::Preemption}) {
@@ -261,7 +262,7 @@ int main() {
                                                                       "--a16-activations");
             }
         }
-        const q::FastPathConfiguration a16_27b{24, ActivationClass::A16, KvCacheStorage::Int8Group64};
+        const q::FastPathConfiguration a16_27b{24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4};
         failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, a16_27b), "decode-split64 under --a16");
         // Adaptive drafting takes the NVFP4 27B's round costs and batch length at any activation precision, its MTP
         // fixed length five; the n-gram copy windows stay on the 4-bit class (not timed elsewhere).
@@ -278,7 +279,7 @@ int main() {
                                     KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value}) {
-        const q::FastPathConfiguration offloaded{32, ActivationClass::A8, kv, false, true};
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A8, kv, GateUpFormat::Other, true};
         for (const FastPath path : {FastPath::ExpertA4Residual, FastPath::ExpertA4Residual3}) {
             failures += check(q::fast_path_applies(path, offloaded, options),
                               "expert-a4-residual applies to the 122B's offloaded experts");
@@ -295,7 +296,7 @@ int main() {
     }
     for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {32, ActivationClass::A8, kv, false, true}),
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {32, ActivationClass::A8, kv, GateUpFormat::Other, true}),
                           "prompt-pv8 is registered on the 122B on every format its kernel serves (measured faster)");
     }
     failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, int8_24, options) &&
@@ -315,10 +316,10 @@ int main() {
     // Where adaptive-mtp does not run, auto drafts the configuration's fastest fixed length.
     using infernix::SpeculativeBackend;
     failures += check(q::auto_fixed_draft_tokens(int8_24, SpeculativeBackend::Mtp) == 5 &&
-                          q::auto_fixed_draft_tokens({24, ActivationClass::A4, KvCacheStorage::Vq2},
+                          q::auto_fixed_draft_tokens({24, ActivationClass::A4, KvCacheStorage::Vq2, GateUpFormat::Nvfp4},
                                                      SpeculativeBackend::Mtp) == 5,
                       "auto drafts five on the NVFP4 27B");
-    failures += check(q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, true},
+    failures += check(q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::GroupwiseQ4},
                                                  SpeculativeBackend::Mtp) == 3 &&
                           q::auto_fixed_draft_tokens({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
                                                      SpeculativeBackend::Mtp) == 3,
@@ -339,7 +340,7 @@ int main() {
     failures += check(!q::fast_path_applies(FastPath::AdaptiveDFlash, int8_24, mtp),
                       "adaptive-dflash needs a block drafter");
     failures += check(q::auto_fixed_draft_tokens(int8_24, SpeculativeBackend::DFlash2) == 7 &&
-                          q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, true},
+                          q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::GroupwiseQ4},
                                                      SpeculativeBackend::DFlash2) == 7 &&
                           q::auto_fixed_draft_tokens({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
                                                      SpeculativeBackend::DFlash) == 3,
@@ -347,7 +348,7 @@ int main() {
     // Offloaded experts (the 122B-A10B) price a verified draft by its expert misses, keyed on the
     // offload, not on its 32 query heads.
     {
-        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, KvCacheStorage::BFloat16, false, true};
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, KvCacheStorage::BFloat16, GateUpFormat::Other, true};
         const q::FastPathConfiguration resident32{32, ActivationClass::A16, KvCacheStorage::BFloat16};
         failures += check(q::auto_fixed_draft_tokens(offloaded, SpeculativeBackend::DFlash2) == 1 &&
                               q::auto_fixed_draft_tokens(resident32, SpeculativeBackend::DFlash2) == 3,
@@ -404,8 +405,8 @@ int main() {
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                           KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv, true}) ==
-                              q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv}),
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}) ==
+                              q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "the groupwise 27B takes prompt-pv8 where the NVFP4 27B has it");
     }
 
@@ -416,29 +417,29 @@ int main() {
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                           KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A16, kv, true}) &&
-                              q::fast_path_qualified(FastPath::GdnF16Accumulate, {24, ActivationClass::A16, kv, true}) &&
+        failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}) &&
+                              q::fast_path_qualified(FastPath::GdnF16Accumulate, {24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}) &&
                               q::fast_path_qualified(FastPath::IdleWidePrefill, {16, ActivationClass::A16, kv}) &&
                               !q::fast_path_qualified(FastPath::GdnF16Accumulate, {16, ActivationClass::A16, kv}),
                           "the groupwise 27B and 35B prefill paths");
         failures += check(q::fast_path_qualified(FastPath::PromptPv8, {16, ActivationClass::A16, kv}) ==
-                              q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv}),
+                              q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "the 35B's prompt-pv8 on every format the kernel serves");
-        failures += check(q::fast_path_qualified(FastPath::AdaptiveMtp, {24, ActivationClass::A4, kv}) &&
+        failures += check(q::fast_path_qualified(FastPath::AdaptiveMtp, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}) &&
                               q::fast_path_qualified(FastPath::AdaptiveMtp, {16, ActivationClass::A16, kv}),
                           "adaptive-mtp on the NVFP4 27B and the 35B");
-        failures += check(q::fast_path_qualified(FastPath::AdaptiveDFlash, {24, ActivationClass::A4, kv}) &&
+        failures += check(q::fast_path_qualified(FastPath::AdaptiveDFlash, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}) &&
                               q::fast_path_qualified(FastPath::AdaptiveDFlash, {16, ActivationClass::A16, kv}) &&
                               !q::fast_path_qualified(FastPath::AdaptiveDFlash,
-                                                      {24, ActivationClass::A16, kv, true}),
+                                                      {24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}),
                           "adaptive-dflash on the NVFP4 27B and the 35B, not the groupwise 27B");
     }
-    failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}) &&
+    failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::GroupwiseQ4}) &&
                           q::fast_path_qualified(FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}),
                       "the groupwise 27B's decode-split64 and the 35B's prompt-pv8 on INT8 KV");
 
     // q4-w4a8: only where the text MLP gate/up is groupwise Q4; it fails its gate, so nowhere qualified.
-    const FastPathConfiguration groupwise{24, ActivationClass::A16, KvCacheStorage::Int8Group64, true};
+    const FastPathConfiguration groupwise{24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::GroupwiseQ4};
     failures += check(q::fast_path_applies(FastPath::Q4W4A8, groupwise, options),
                       "q4-w4a8 must apply to a groupwise Q4 gate/up");
     failures += check(!q::fast_path_applies(FastPath::Q4W4A8, int8_24, options),
@@ -487,7 +488,7 @@ int main() {
                           !q::fast_path_applies(FastPath::SampledMtpDrafts, offloaded, mtp),
                       "sampled-mtp-drafts applies to resident MTP rounds without copies only");
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16}) {
-        failures += check(!q::fast_path_qualified(FastPath::SampledMtpDrafts, {24, ActivationClass::A4, kv}) &&
+        failures += check(!q::fast_path_qualified(FastPath::SampledMtpDrafts, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}) &&
                               !q::fast_path_qualified(FastPath::SampledMtpDrafts, {16, ActivationClass::A16, kv}),
                           "sampled-mtp-drafts is not qualified on Qwen3.5");
     }
@@ -522,11 +523,11 @@ int main() {
                           !q::couples_requests(FastPath::GumbelSampling) &&
                           q::fast_path_qualified(FastPath::GumbelSampling, int8_24) &&
                           q::fast_path_qualified(FastPath::GumbelSampling,
-                                                 {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}) &&
+                                                 {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16, GateUpFormat::Nvfp4}) &&
                           !q::fast_path_qualified(FastPath::GumbelSampling,
-                                                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}) &&
+                                                  {24, ActivationClass::A4, KvCacheStorage::BFloat16, GateUpFormat::Nvfp4}) &&
                           !q::fast_path_qualified(FastPath::GumbelSampling,
-                                                  {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}) &&
+                                                  {24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::GroupwiseQ4}) &&
                           !q::fast_path_qualified(FastPath::GumbelSampling,
                                                   {16, ActivationClass::A16, KvCacheStorage::Int8Group64}) &&
                           infernix::parse_fast_path("gumbel-sampling") == FastPath::GumbelSampling,
@@ -571,24 +572,24 @@ int main() {
     failures += check(q::fast_path_applies(FastPath::Q5KSplitMma, groupwise, options),
                       "q5-ksplit-mma must apply to the groupwise configuration");
     failures += check(!q::fast_path_applies(FastPath::Q5KSplitMma,
-                                            {24, ActivationClass::A4, KvCacheStorage::Int8Group64}, options),
+                                            {24, ActivationClass::A4, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4}, options),
                       "q5-ksplit-mma must not apply to 4-bit-activation artifacts");
     // Both run on the KV formats below INT8's precision too (the owner's decision, 2026-11-01), and on BF16 where timed
     // faster (2026-11-19).
     failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, groupwise) &&
                           q::fast_path_qualified(FastPath::Q5KSplitMma,
-                                                 {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}) &&
+                                                 {24, ActivationClass::A16, KvCacheStorage::BFloat16, GateUpFormat::GroupwiseQ4}) &&
                           q::fast_path_qualified(FastPath::Fp16GdnState,
-                                                 {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}),
+                                                 {24, ActivationClass::A16, KvCacheStorage::BFloat16, GateUpFormat::GroupwiseQ4}),
                       "q5-ksplit-mma and fp16-gdn-state are qualified on the groupwise 27B with BF16 KV (timed faster)");
     failures += check(q::fast_path_qualified(FastPath::Fp16GdnState, groupwise),
                       "fp16-gdn-state is qualified on the groupwise 27B with INT8 KV");
     for (const KvCacheStorage kv : {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, {24, ActivationClass::A16, kv, true}) &&
-                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A16, kv, true}) &&
-                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A4, kv}),
+        failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, {24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}) &&
+                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A16, kv, GateUpFormat::GroupwiseQ4}) &&
+                              q::fast_path_qualified(FastPath::Fp16GdnState, {24, ActivationClass::A4, kv, GateUpFormat::Nvfp4}),
                           "q5-ksplit-mma and fp16-gdn-state are qualified on the KV formats below INT8's precision");
     }
     failures += check(!q::fast_path_qualified(FastPath::Fp16GdnState, {16, ActivationClass::A16, KvCacheStorage::Vq2}),
@@ -620,6 +621,93 @@ int main() {
                               d.down.policy == P::A16ColumnInvariant &&
                               invariant.output_head.policy == P::A16ColumnInvariant,
                           "the column-invariant decode copy keeps A8Only and makes the other projections invariant");
+    }
+
+    // The configuration of bound weights (fast_path_configuration's Model-free form). The gate/up format tells the NVFP4
+    // 27B under --a16-activations, on which its rows and drafting constants were measured, from 16-bit 27Bs of the same
+    // heads with another gate/up format (the Q6 gate/up recipe, a Q8_0 GGUF import): those get none of them.
+    {
+        using infernix::QType;
+        using infernix::QuantLayout;
+        using P = infernix::ops::LinearPolicy;
+        const auto parent = [](QType format, QuantLayout layout) {
+            infernix::WeightParent out;
+            out.geometry.format = format;
+            out.geometry.layout = layout;
+            return out;
+        };
+        const infernix::WeightParent q4 = parent(QType::Q4_G64_FP16, QuantLayout::RowSplit),
+                                     q5 = parent(QType::Q5_G64_FP16, QuantLayout::RowSplit),
+                                     q6 = parent(QType::Q6_G64_FP16, QuantLayout::RowSplit),
+                                     q8 = parent(QType::Q8_G32_FP16, QuantLayout::RowSplit),
+                                     nvfp4 = parent(QType::NVFP4, QuantLayout::Contiguous),
+                                     nvfp4_mul = parent(QType::NVFP4_MUL, QuantLayout::Contiguous),
+                                     fp8 = parent(QType::FP8_E4M3FN_ROW_BF16, QuantLayout::Contiguous);
+        const auto bind = [](std::string name, const infernix::WeightParent& weights, P policy) {
+            return q::BoundWeight{.name = std::move(name),
+                                  .view = {.shape = {1, 1}, .parts = {{&weights, 0, 1}}},
+                                  .uses = {{.input = "x", .policy = policy}}};
+        };
+        infernix::EngineOptions int8 = options;
+        int8.kv_cache                = KvCacheStorage::Int8Group64;
+        // Text layers of an attention projection and an MLP (gate/up from `gate_up[layer]`, down like the projection).
+        const auto configuration = [&](const infernix::WeightParent& projection,
+                                       std::initializer_list<const infernix::WeightParent*> gate_up, P projection_policy,
+                                       P mlp_policy) {
+            std::vector<q::BoundWeight> bound;
+            q::TextWeights text;
+            std::size_t layer = 0;
+            for (const infernix::WeightParent* mlp : gate_up) {
+                const std::string prefix = "text/layers/" + std::to_string(layer++) + "/";
+                const std::size_t first  = bound.size();
+                bound.push_back(bind(prefix + "attention/query", projection, projection_policy));
+                bound.push_back(bind(prefix + "mlp/gate", *mlp, mlp_policy));
+                bound.push_back(bind(prefix + "mlp/up", *mlp, mlp_policy));
+                bound.push_back(bind(prefix + "mlp/down", projection, mlp_policy));
+                text.layers.push_back(q::BlockWeights{
+                    .ffn = q::DenseWeights{q::WeightId{first + 1}, q::WeightId{first + 2}, q::WeightId{first + 3}}});
+            }
+            return q::fast_path_configuration(bound, text, 24, false, int8);
+        };
+        // NVIDIA's NVFP4 27B (NVFP4 with a multiplier beside FP8 projections) and NInfer's (NVFP4 with a divisor);
+        // --a16-activations binds every Use A16Only.
+        const FastPathConfiguration nvidia    = configuration(fp8, {&nvfp4_mul}, P::AllowA8, P::AllowA4);
+        const FastPathConfiguration nvidia_16 = configuration(fp8, {&nvfp4_mul}, P::A16Only, P::A16Only);
+        const FastPathConfiguration ninfer_16 = configuration(fp8, {&nvfp4}, P::A16Only, P::A16Only);
+        // orcarouter's NVFP4 27B: FP8 in its last MLPs.
+        const FastPathConfiguration orcarouter = configuration(fp8, {&nvfp4, &fp8}, P::AllowA8, P::AllowA4);
+        const FastPathConfiguration q6_recipe  = configuration(q5, {&q6}, P::A16Only, P::A16Only);
+        const FastPathConfiguration gguf_q8_0  = configuration(q8, {&q8}, P::A16Only, P::A16Only);
+        const FastPathConfiguration groupwise_recipe = configuration(q5, {&q4}, P::A16Only, P::A16Only);
+        const FastPathConfiguration nvfp4_16{24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::Nvfp4};
+        const FastPathConfiguration other_16{24, ActivationClass::A16, KvCacheStorage::Int8Group64, GateUpFormat::Other};
+        failures += check(nvidia == FastPathConfiguration{24, ActivationClass::A4, KvCacheStorage::Int8Group64,
+                                                          GateUpFormat::Nvfp4} &&
+                              orcarouter == nvidia && nvidia_16 == nvfp4_16 && ninfer_16 == nvfp4_16,
+                          "the NVFP4 27Bs are configurations of NVFP4 gate/up");
+        failures += check(q6_recipe == other_16 && gguf_q8_0 == other_16,
+                          "a 16-bit 27B of a Q6 or Q8 gate/up is not the NVFP4 27B's configuration");
+        failures += check(groupwise_recipe == FastPathConfiguration{24, ActivationClass::A16, KvCacheStorage::Int8Group64,
+                                                                    GateUpFormat::GroupwiseQ4},
+                          "the groupwise recipe is a configuration of Q4 gate/up");
+        failures += check(q::describe(nvidia_16) == "24 heads, 16-bit activations, int8 KV, NVFP4 gate/up" &&
+                              q::describe(q6_recipe) == "24 heads, 16-bit activations, int8 KV",
+                          "the gate/up format is described");
+        for (const FastPath path : {FastPath::BatchedDecode, FastPath::Fp16GdnState, FastPath::IdleWidePrefill,
+                                    FastPath::GdnF16Accumulate, FastPath::PromptPv8, FastPath::AdaptiveSpeculation,
+                                    FastPath::FreeCacheResume, FastPath::Preemption, FastPath::DecodeSplit64}) {
+            failures += check(q::fast_path_qualified(path, nvidia_16) && !q::fast_path_qualified(path, q6_recipe) &&
+                                  !q::fast_path_qualified(path, gguf_q8_0),
+                              std::string(infernix::fast_path_name(path)) +
+                                  " is registered for the NVFP4 27B under --a16-activations only, not a Q6 or Q8 "
+                                  "gate/up 27B");
+        }
+        failures += check(q::auto_fixed_draft_tokens(nvidia_16, SpeculativeBackend::Mtp) == 5 &&
+                              q::auto_fixed_draft_tokens(q6_recipe, SpeculativeBackend::Mtp) == 3 &&
+                              q::dflash_width_costs(q6_recipe, SpeculativeBackend::DFlash2).proposal == 0.69 &&
+                              q::dflash_batch_drafts(q6_recipe, SpeculativeBackend::DFlash2) == 0 &&
+                              q::dflash_batch_drafts(nvidia_16, SpeculativeBackend::DFlash2) == 7,
+                          "a Q6 gate/up 27B keeps the generic drafting constants, not the NVFP4 27B's");
     }
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " fast-path selection\n";
