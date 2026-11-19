@@ -225,7 +225,10 @@ def compressed_matrix_source(
         (lambda: divisor(nvfp4_names()[2], nvfp4_names()[3]))
         if format == "nvfp4"
         else None,
-        input_scale if format == "fp8_e4m3fn_row_f32" and store.has(f"{prefix}.input_scale") else None,
+        # A static FP8 A8 input's scale, or an nvfp4_mul W4A4 matrix's (ModelOpt input_scale, as stored).
+        input_scale
+        if format in ("fp8_e4m3fn_row_f32", "nvfp4_mul") and store.has(f"{prefix}.input_scale")
+        else None,
     )
 
 
@@ -288,6 +291,6 @@ def matrix_source(
         lambda: divisor("input_divisor"),
         # A static activation scale only where the matrix stores one (a per-channel export has none).
         (lambda: divisor("input_scale"))
-        if format == "fp8_e4m3fn_row_f32" and store.has(prefix + ".input_scale")
+        if format in ("fp8_e4m3fn_row_f32", "nvfp4_mul") and store.has(prefix + ".input_scale")
         else None,
     )

@@ -961,13 +961,42 @@ class _Builder:
                 )
 
 
+class _Unread:
+    """The store of parameters whose names, shapes and inputs are wanted but whose values are never read
+    (the builder's sources are lazy)."""
+
+    path = "(unread)"
+    config: dict = {}
+
+
+def draft_parameters(config: dict, target: dict, backend: str) -> dict[str, Parameter]:
+    """The logical parameters (names, shapes and inputs) of a drafter with this normalized config over
+    this target, without sources: what a grafted component's bindings and Uses must cover."""
+    scratch = Model({"text": {"config": target}, backend: {"config": config, "target": "text"}})
+    _Builder(scratch).draft(_Unread(), config, target, backend)
+    return scratch.parameters
+
+
+def _grafted_record(record: dict, target: dict, backend: str) -> dict:
+    """A drafter record copied from another artifact, checked against this target: the same normalized
+    config draft_config gives (its target layers and mask token inside this model)."""
+    if not isinstance(record, dict) or set(record) != {"config", "target"} or record["target"] != "text":
+        raise ValueError(f"grafted {backend}: expected a component record targeting text")
+    if draft_config(record["config"], target, backend) != record["config"]:
+        raise ValueError(f"grafted {backend}: its config is not the normalized form this target gives")
+    return {"config": record["config"], "target": "text"}
+
+
 def build_model(
     base: SafetensorsSource,
     *,
     components: tuple[str, ...] = ("text",),
     companions: Mapping[str, SafetensorsSource] | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
+    grafted: Mapping[str, dict] | None = None,
 ) -> Model:
+    """``grafted``: drafter records (dflash, dflash2) whose objects are copied from another artifact
+    (tools/convert/graft.py); the heads read their final hidden states as a selected drafter's."""
     selected = set(components)
     if "text" not in selected or selected - {
         "text",
@@ -978,6 +1007,9 @@ def build_model(
     }:
         raise ValueError("select text and supported optional components")
     companions = {} if companions is None else companions
+    grafted = {} if grafted is None else dict(grafted)
+    if set(grafted) - {"dflash", "dflash2"} or set(grafted) & selected:
+        raise ValueError("graft only drafters (dflash, dflash2) that are not also converted")
     config = text_config(base.config, mtp="mtp" in selected)
     records = {"text": {"config": config}}
     if "vision" in selected:
@@ -996,6 +1028,8 @@ def build_model(
                 "config": draft_config(companions[backend].config, config, backend),
                 "target": "text",
             }
+        elif backend in grafted:
+            records[backend] = _grafted_record(grafted[backend], config, backend)
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
@@ -1005,8 +1039,17 @@ def build_model(
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
     model = Model(
-        records, resources=resources, token_count=count, special_token_ids=special
+        records,
+        resources=resources,
+        token_count=count,
+        special_token_ids=special,
+        grafted=tuple(b for b in ("dflash", "dflash2") if b in grafted),
     )
+    if (
+        "dflash2" in grafted
+        and records["dflash2"]["config"]["dflash_config"]["selector_top_k"] > count
+    ):
+        raise ValueError("DFlash2 selector_top_k exceeds public token domain")
     builder = _Builder(model)
     h, r = config["hidden_size"], config["vocab_size"]
     text_prefix = "model.language_model." if "text_config" in base.config else "model."
@@ -1019,7 +1062,7 @@ def build_model(
         else "lm_head.weight"
     )
     head_inputs = ("text/final_hidden",) + tuple(
-        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2") if c in selected
+        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2") if c in selected or c in grafted
     )
     builder.add("text/output_head", base, head_source, (r, h), inputs=head_inputs)
     builder.add("text/final_norm", base, text_prefix + "norm.weight", (h,))

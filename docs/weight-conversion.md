@@ -66,7 +66,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
-| `qwen3_8_27b_nvfp4_nvidia` | NVIDIA ModelOpt layout: imported NVFP4 MLP and FP8 attention/GDN projections, FP8 embedding from BF16, FP8 vocabulary weights re-quantized from the NVFP4 head; a selected DFlash2 drafter stores its MLP gate/up as NVFP4 (`nvfp4_mse`, A16) and the rest as Q8 | `quantized` |
+| `qwen3_8_27b_nvfp4_nvidia` | NVIDIA's ModelOpt mixed NVFP4/FP8 27B exports (`nvidia/Qwen3.8-27B-NVFP4`, and `-NVFP4-QAD`, whose GDN projections are NVFP4 in 38 of 48 layers) in the formats of NInfer's official 27B artifacts: every text projection imported in its stored encoding, NVFP4 (A4 permitted) or per-tensor FP8 (A8 permitted), their FP32 scales as a divisor and BF16 row scales (below); FP8 embedding from BF16, Q8 vocabulary weights (A16) re-quantized from the NVFP4 head; an MTP stem the checkpoint lacks from `mtp` (below); a selected DFlash2 drafter stores its MLP gate/up as NVFP4 (`nvfp4_mse`, A16) and the rest as Q8 | `quantized`; `mtp` when the checkpoint has no MTP stem |
+| `qwen3_8_27b_nvfp4_nvidia_exact` | The same exports bit-exact (below): NVFP4 as `nvfp4_mul` with NVIDIA's multiplier and input scale (W4A4), FP8 as `fp8_e4m3fn_row_f32` with its static input scale (W8A8), the NVFP4 head as `nvfp4_mul`, every BF16 tensor (embedding, vision) kept; only the drafters re-quantized | `quantized`; `mtp` when the checkpoint has no MTP stem |
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter GPTQ layout: imported NVFP4 MLP for layers 0–55, imported FP8 for the last eight layers' MLP and every attention/GDN projection, FP8 embedding and vocabulary weights from BF16 | `quantized` |
 | `qwen3_8_flash_next_nvfp4` | Qwen3.8-Flash-Next recipe A: every tensor as NVIDIA stores it (routed experts as exact `nvfp4_mul` banks, the FP8 n-gram table in its own volume); only the MTP drafter re-quantized (Q8 projections, Q4 experts) ([guide](qwen3_8-flash-next.md)) | None |
 | `qwen3_8_flash_next_nvfp4_dense8` | Recipe B (Dense8): recipe A plus Q8 for the dense projection classes that dominate per-token weight reads (GDN, QSA output, shared experts, hyper-connection mixers, PLE projections, `lm_head`) | None |
@@ -123,6 +124,48 @@ MTP and Vision use the main source. DFlash and DFlash2 use the corresponding nam
 as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
+
+A drafter can instead be copied byte for byte from an existing artifact of the same target
+geometry: `--graft dflash2=ARTIFACT` (or `dflash=`) keeps that artifact's stored objects, bindings
+and Uses, and the new artifact's own heads read the drafter's final hidden state, as a converted
+drafter's. The copy is refused unless its bindings and Uses are exactly those of a drafter of its
+config over the new target. A grafted drafter is not also named in `--components` or `--source`.
+For NVIDIA's QAD 27B, whose export keeps the MTP decoder layer but omits its stem (`mtp.fc` and the
+three MTP norms; the layer is byte for byte `nvidia/Qwen3.8-27B-NVFP4`'s), the stem comes from a
+Safetensors file holding those four tensors. Its bit-exact conversion:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B-NVFP4-QAD \
+  --recipe qwen3_8_27b_nvfp4_nvidia_exact \
+  --source quantized=/path/to/Qwen3.8-27B-NVFP4-QAD \
+  --source mtp=/path/to/mtp-stem.safetensors \
+  --graft dflash2=/path/to/qwen3_8_27b_nvfp4-nvidia.ninfer \
+  --components text,vision,mtp \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --device cpu --workers 8 \
+  --name qwen3.8-27b-nvidia-nvfp4-qad \
+  --out models/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix.infernix
+```
+
+`qwen3_8_27b_nvfp4_nvidia_exact` keeps every word and FP32 scale NVIDIA stores: NVFP4 as `nvfp4_mul` in
+`block_scale_k16_m128x4_v1` (its `weight_scale_2` the multiplier, its `input_scale` the A4 inputs'
+activation scale), per-tensor FP8 as `fp8_e4m3fn_row_f32` (`weight_scale` in every row, `input_scale`
+the static A8 scale), the NVFP4 head likewise, and the BF16 embedding and vision tower as stored; only
+the drafters are re-quantized. The engine runs these with NVIDIA's served arithmetic: 4-bit NVFP4 and
+static 8-bit FP8 prompt activations (fl32(1 / `input_scale`) encodes, fl32(`input_scale` ×
+`weight_scale_2`) scales an NVFP4 product), 16-bit decode, and `--a16-activations` for 16-bit
+everywhere. Its artifact is Infernix-only: NInfer has neither form at these shapes.
+
+`qwen3_8_27b_nvfp4_nvidia` writes the formats of NInfer's official 27B artifacts instead. Its NVFP4 and FP8 words are imported as
+stored, but two of their FP32 scales are not: an NVFP4 matrix keeps the FP32-rounded reciprocal of
+`weight_scale_2` as its divisor, and an FP8 matrix its per-tensor `weight_scale` rounded to BF16 in
+every row (on the QAD checkpoint only 2 of 306 NVFP4 global scales are powers of two, and BF16
+rounding rescales 89 of its 94 FP8 matrices, by up to 0.33 %), and it re-quantizes the head to Q8
+(16-bit activations: NInfer serves the vocabulary projection in Q8, Q6 or FP8, and Q8 scored 0.0026
+nats/token closer to the exact head than row-scaled FP8 on the QAD's quick corpus, for 0.5 % of NInfer's
+decode), the embedding to row-scaled FP8 and the vision tower to grouped formats.
 
 A Qwen3.8-Flash-Next DFlash2 drafter is converted on its own, into a companion artifact that runs
 beside any Flash-Next artifact (`--spec dflash2 --draft-model FILE`): `--components dflash2` alone,

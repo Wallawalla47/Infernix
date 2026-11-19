@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import time
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 
@@ -15,6 +15,7 @@ from tools.artifact.schema import ResourceSpec
 from tools.artifact.tensor_output import TensorOutput
 from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
 
+from .graft import Graft
 from .model import Model
 from .recipe import Recipe, WeightJob
 
@@ -102,7 +103,10 @@ def convert(
     workers: int = 1,
     max_buffered_bytes: int = DEFAULT_MAX_BUFFERED_BYTES,
     progress: Callable[[int, int, WeightJob], None] | None = None,
+    grafts: Sequence[Graft] = (),
 ) -> dict:
+    """``grafts``: components copied byte for byte from other artifacts (tools/convert/graft.py), after
+    the prepared objects."""
     path = Path(output)
     report_path = Path(str(path) + ".conversion.json")
     if path.exists() or report_path.exists():
@@ -131,6 +135,32 @@ def convert(
         + [job.spec for job in prepared.weights]
         + [spec for spec, _ in prepared.auxiliaries]
     )
+    bindings = dict(prepared.bindings)
+    uses = list(prepared.uses)
+    copies = []
+    graft_reports = []
+    for graft in grafts:
+        graft.check(model)
+        graft_specs, graft_bindings, graft_uses, graft_copies = graft.place(
+            len(prepared.weights) + len(copies)
+        )
+        if set(graft_bindings) & set(bindings):
+            raise ValueError(f"grafted {graft.component}: its parameters are also converted")
+        specs += graft_specs
+        bindings.update(graft_bindings)
+        uses += graft_uses
+        copies += [(graft, new, old) for new, old in graft_copies]
+        graft_reports.append(
+            {
+                "component": graft.component,
+                **graft.provenance(),
+                "objects": [
+                    {"object": spec.id, "source_object": old, "format": spec.format, "layout": spec.layout,
+                     "shape": spec.shape}
+                    for spec, (_, old) in zip(graft_specs, graft_copies)
+                ],
+            }
+        )
     report = {
         "components": model.components,
         "name": name,
@@ -160,14 +190,15 @@ def convert(
             }
             for job in prepared.weights
         ],
+        "grafts": graft_reports,
     }
     json.dumps(report, allow_nan=False, default=_json_default)
     with ArtifactWriter(
         path,
         specs,
         components=model.components,
-        bindings=prepared.bindings,
-        uses=prepared.uses,
+        bindings=bindings,
+        uses=uses,
         metadata=metadata,
         provenance=provenance,
         max_file_bytes=max_file_bytes,
@@ -233,6 +264,8 @@ def convert(
                     fill()
         for spec, data in prepared.auxiliaries:
             writer.write_object(spec.id, data)
+        for graft, new, old in copies:
+            writer.write_object(new, graft.artifact.iter_object(old))
         report["artifact_id"] = writer.artifact_id.hex()
         report["files"] = [
             {

@@ -1,4 +1,6 @@
-"""Exact NVFP4 codes, scale swizzling, and the stored FP32 weight divisor."""
+"""Exact NVFP4 codes, scale swizzling, and the stored FP32 matrix coefficient of block_scale_k16_m128x4_v1:
+nvfp4's divisor, or nvfp4_mul's multiplier (ModelOpt weight_scale_2). The two formats share the planes, so these
+functions serve both; the caller knows which the word is."""
 
 from __future__ import annotations
 

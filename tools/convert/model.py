@@ -38,6 +38,9 @@ class Model:
     # to at load, and the Uses it declares for parameters the target binds.
     target: dict | None = None
     external_uses: tuple[tuple[str, str], ...] = ()
+    # Components copied whole from an existing artifact (tools/convert/graft.py): their records are
+    # here and the heads read their final hidden states, but they have no logical parameters.
+    grafted: tuple[str, ...] = ()
 
     @property
     def config(self) -> dict:
