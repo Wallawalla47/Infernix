@@ -727,6 +727,9 @@ bool FastPathSelection::request_invariant() const noexcept {
         // between requests. ggml-bf16-prefill routes a prompt's GGUF projections by its calls' widths, whose
         // boundaries prefix-cache resumes move; f16-accumulate-prefill likewise its FP8 and MXFP8 projections,
         // and router-mma the router. screened-lm-head screens a round only when every row of it may be screened.
+        // gdn-f16-accumulate couples nothing: without free-cache-resume a prompt's calls start on the prefill chunk
+        // grid, and the chunked GDN gives the same bits for calls cut there (64-token multiples) as for one call, in
+        // either arithmetic (test_gated_delta_net split_bits_case, the Flash-Next and 27B geometries).
         return path == FastPath::AdaptiveSpeculation || path == FastPath::DFlash2Pairs ||
                path == FastPath::FreeCacheResume || path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
                path == FastPath::ExpertA4Residual || path == FastPath::ExpertA4Residual3 ||
