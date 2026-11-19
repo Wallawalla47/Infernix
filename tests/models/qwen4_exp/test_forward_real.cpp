@@ -9,7 +9,7 @@
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --decode-widths [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --trim-last-layer [--default-fast-paths [--drop-fast-path NAME]...]
-//       [--kv KV]
+//       [--kv KV] [--expert-a16-activations | --a8-activations]
 //   infernix_qwen4_exp_forward_real_test TOKENS --screened-heads [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
@@ -609,7 +609,7 @@ std::vector<float> walk_logits(const q4::execution::Parameters& parameters, Devi
             const Tensor inject_kept = inject.slice(1, W - kept, kept);
             Tensor residual_kept     = residual.slice(1, W - kept, kept);
             f.layer_moe(l, call1.batch, xm_kept, inject_kept, residual_kept, w1, w1 - kept, 0,
-                        q4::execution::SharedCalls{.x = &xm1});
+                        q4::execution::TrimmedCall{.shared = &xm, .routes = &xm});
         } else {
             f.layer_moe(l, call1.batch, xm, inject, residual, w1);
         }
@@ -691,12 +691,25 @@ bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceCo
             mode = std::string("default fast paths (router-mma ") + (fast.router_mma ? "on)" : "off)");
         }
         // Both sides of every width where a route of the last layer's MoE may change, to the default prefill chunk.
-        for (const std::int32_t width : {9, 16, 17, 18, 32, 33, 64, 65, 96, 97, 128, 129, 200, 255, 256, 257, 300, 512,
-                                         1000, 4096, 16384}) {
+        for (const std::int32_t width : {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 32, 33, 64, 65, 96, 97, 128, 129, 200, 255,
+                                         256, 257, 300, 512, 1000, 4096, 16384}) {
             if (width > n) { continue; }
             const std::int32_t context = std::max<std::int32_t>(256, (width + 63) / 64 * 64);
             std::vector<float> rows[2];
             std::int32_t kept = 0; // the trimmed call's (0: the last layer runs whole, so the check holds trivially)
+            // On the selected paths the untrimmed call taps its routes (a tap leaves the routing, the experts and their
+            // routes as they are): how many of the call's columns chose each of the last column's experts, the entry
+            // counts that send a job to an expert's wide route (more than 8).
+            const auto K = static_cast<std::int32_t>(c.moe.top_k), L = static_cast<std::int32_t>(c.num_hidden_layers);
+            DeviceBuffer route_buffer(selected ? static_cast<std::size_t>(L) * K * width * sizeof(std::int32_t) : 0);
+            std::vector<Tensor> route_taps;
+            for (std::int32_t l = 0; selected && l < L; ++l) {
+                route_taps.emplace_back(static_cast<std::byte*>(route_buffer.p) +
+                                            static_cast<std::size_t>(l) * K * width * sizeof(std::int32_t),
+                                        DType::I32, std::initializer_list<std::int32_t>{K, width});
+            }
+            q4::execution::ForwardTap route_tap{};
+            route_tap.routes = &route_taps;
             for (const int trim : {0, 1}) {
                 Harness harness(parameters, device, context, width, 1, kv, fast);
                 if (trim == 1) { kept = harness.forward->last_layer_kept(width); }
@@ -704,9 +717,27 @@ bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceCo
                 call.batch.trim_last_layer = trim == 1;
                 DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
                 Tensor out(logits.p, DType::FP32, {vocab, 1});
-                harness.forward->run(call.batch, out);
+                harness.forward->run(call.batch, out, selected && trim == 0 ? &route_tap : nullptr);
                 device.synchronize();
                 rows[trim] = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            if (selected) {
+                std::vector<std::int32_t> ids(static_cast<std::size_t>(K) * width);
+                if (cudaMemcpy(ids.data(), route_taps.back().data, ids.size() * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    throw std::runtime_error("route tap download failed");
+                }
+                std::vector<std::int32_t> count(static_cast<std::size_t>(c.moe.experts), 0);
+                for (const std::int32_t e : ids) { ++count.at(static_cast<std::size_t>(e)); }
+                std::string counts;
+                int wide = 0;
+                for (std::int32_t k = 0; k < K; ++k) {
+                    const std::int32_t e = ids[static_cast<std::size_t>(width - 1) * K + k];
+                    counts += (k == 0 ? "" : " ") + std::to_string(count[static_cast<std::size_t>(e)]);
+                    wide += count[static_cast<std::size_t>(e)] > 8;
+                }
+                std::printf("%s, %d columns: the last column's experts hold %s of the call's columns (%d of %d more "
+                            "than 8)\n", mode.c_str(), width, counts.c_str(), wide, K);
             }
             compare(mode + ", " + std::to_string(width) + " columns", rows, kept);
         }
@@ -1061,6 +1092,7 @@ int main(int argc, char** argv) {
         // Anywhere: --rope-yarn-factor F (the model's YaRN factor) and --expert-a4-activations (NVIDIA
         // FP4-Local's optional 4-bit expert activations).
         models::LoadOptions load;
+        bool a8_activations = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--rope-yarn-factor") {
@@ -1070,6 +1102,15 @@ int main(int argc, char** argv) {
             }
             if (arg == "--expert-a4-activations") {
                 load.expert_a4_activations = true;
+                continue;
+            }
+            if (arg == "--expert-a16-activations") { // a W4A4 checkpoint's banks (NVFP4-QAD) with 16-bit activations
+                load.expert_a16_activations = true;
+                continue;
+            }
+            if (arg == "--a8-activations") { // --default-fast-paths with --a8-activations' routes (16-bit banks)
+                load.expert_a16_activations = true;
+                a8_activations              = true;
                 continue;
             }
             if (arg == "--stream-experts") {
@@ -1270,7 +1311,8 @@ int main(int argc, char** argv) {
                 // The paths a server qualifies by default for this artifact and KV storage (no drafter, no
                 // --fast-path candidates); only their Forward flags matter here.
                 EngineOptions options;
-                options.kv_cache = job.kv;
+                options.kv_cache       = job.kv;
+                options.a8_activations = a8_activations;
                 q4::FastPathSelection selection = q4::select_fast_paths(model->config(), false, options);
                 for (const FastPath path : job.dropped) {
                     selection.paths.erase(std::remove(selection.paths.begin(), selection.paths.end(), path),
@@ -1281,6 +1323,12 @@ int main(int argc, char** argv) {
                 for (const FastPath path : selection.paths) { names += std::string(names.empty() ? "" : ", ") + fast_path_name(path); }
                 std::printf("default fast paths at this KV storage: %s\n", names.empty() ? "none" : names.c_str());
                 selected = selection.forward();
+                if (a8_activations) {
+                    const q4::A8Routes a8 = q4::a8_activation_routes(model->config(), selection);
+                    if (!a8.any()) { throw std::invalid_argument("--a8-activations: no 8-bit route applies to this artifact"); }
+                    a8.apply(*selected);
+                    std::printf("--a8-activations: %s\n", a8.describe().c_str());
+                }
             }
             return check_trim_last_layer(parameters, device, volume, tokens, job.kv, selected) ? 0 : 1;
         }

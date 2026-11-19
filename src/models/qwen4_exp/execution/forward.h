@@ -308,13 +308,20 @@ struct ForwardTap {
 // The QSA geometry of the configuration.
 [[nodiscard]] ops::QsaGeometry qsa_geometry(const TextConfig& config);
 
-// The call a layer's dense shared expert runs as when it is wider than the MoE's columns: a trimmed last layer's whole
-// call (YC-01), whose trailing columns the MoE takes. Its projections pick their routes by the columns they are given
-// (a Q8 projection SIMT at decode widths and tensor-core beyond, BF16's tuned GEMM by width), so over the kept columns
-// alone they gave other bits (Forward::last_layer_kept). `x`: its input (null: the MoE's). A shared expert in the
-// routed bank acts column by column and takes none.
-struct SharedCalls {
-    const Tensor* x = nullptr;
+// A trimmed last layer's MoE (YC-01) over the trailing columns of a wider call: the calls its parts run as, so the kept
+// columns get that call's bits (Forward::last_layer_kept).
+// `shared`: the dense shared expert's input. Its projections pick their routes by the columns they are given (a Q8
+// projection SIMT at decode widths and tensor-core beyond, BF16's tuned GEMM by width), so over the kept columns alone
+// they gave other bits. Null: the MoE's own columns. A shared expert in the routed bank is a job of the routed call.
+// `routes`: the untrimmed call's MoE input (the kept columns are its trailing ones), `routes_chunk` its first chunk's
+// columns when it holds a pair call's two chunks. Its router and dispatch choose each kept entry's expert route: a
+// routed expert job of more than 8 columns takes its bank's wide arithmetic, which on some routes is not the narrow
+// kernels' (Forward::trimmed_routes), so a kept entry runs it whenever the untrimmed call's job would. Null: the kept
+// columns' own routes.
+struct TrimmedCall {
+    const Tensor* shared = nullptr;
+    const Tensor* routes = nullptr;
+    std::int32_t routes_chunk = 0;
 };
 
 class Forward {
@@ -354,24 +361,26 @@ public:
     // `route_skipped`: columns before the call's own that the route log holds as -1 (a trimmed last layer's call
     // over the trailing columns of a wider one, ForwardBatch::trim_last_layer).
     // `chunk_columns` (run_split's pair call): the first chunk's columns, when xm holds two chunks; the router and
-    // the shared expert then run per chunk (moe). `shared`: the call the dense shared expert runs as (SharedCalls).
+    // the shared expert then run per chunk (moe). `trimmed`: a trimmed last layer's calls (TrimmedCall).
     void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
                    Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped = 0,
-                   std::int32_t chunk_columns = 0, SharedCalls shared = {});
+                   std::int32_t chunk_columns = 0, TrimmedCall trimmed = {});
     // ForwardBatch::trim_last_layer's width for a call (or a layer walk's chunk) of `columns` columns: 0 when the last
     // layer runs whole (the lossless route, a DFlash2 target layer, the activation scan, or no column to save), else
     // the trailing columns its router, routed experts and combine run over: kRouterMmaMinColumns where the full call's
     // router takes its MMA form (router-mma), else 1. A dense shared expert still runs over the whole call
-    // (SharedCalls::x), whose routes go by width. On the exact routes those steps act column by column and the router
-    // keeps its form, so the kept columns' outputs are the untrimmed call's bit for bit
-    // (infernix_qwen4_exp_forward_real_test --trim-last-layer: plain and pair calls of 9 to 16,384 columns and walks, on
-    // the exact routes and router-mma). A fast path that routes expert jobs by their width in the call does not keep
-    // them: ggml-bf16-prefill runs a GGUF bank's jobs of more than 8 columns in calls of 512 or more on BF16 tiles, the
-    // trimmed one-column call the kept column's jobs on the narrow kernels (IQ3_S: up to 3.1e-3 in some calls of 512+
-    // columns); expert-a4-residual changes FP4-Local's kept column from 16 columns (up to 0.052; 9 columns equal, which
-    // a per-job rule of more than 8 columns does not explain: not traced). 2026-11-19, --default-fast-paths; leaving
-    // out that one path restores every case.
+    // (TrimmedCall::shared), whose routes go by width. Those steps act column by column and the router keeps its form;
+    // a routed expert job's route goes by its entry count in the call, so where the bank's wide arithmetic is not the
+    // narrow kernels' (trimmed_routes) the kept entries take the untrimmed call's routes (TrimmedCall::routes). So the
+    // kept columns' outputs are the untrimmed call's bit for bit on every route (infernix_qwen4_exp_forward_real_test
+    // --trim-last-layer, also with --default-fast-paths).
     [[nodiscard]] std::int32_t last_layer_kept(std::int32_t columns) const noexcept;
+    // Whether a trimmed last layer's routed experts must follow the untrimmed call's routes (TrimmedCall::routes) when
+    // that call has `columns` columns: where a job of more than 8 entries takes arithmetic other than the narrow
+    // kernels' (expert-a4-residual's terms, W4A4's FP32 sums, ggml-bf16-prefill's BF16 tiles from 512 columns) or a
+    // call of more than 128 columns leaves the 8-bit routes (--a8-activations). The exact wide routes (W4A16, GGUF
+    // and block-FP8 integer tiles) give the narrow kernels' bits.
+    [[nodiscard]] bool trimmed_routes(const MoeParameters& p, std::int32_t columns) const;
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
     // A pair call (design §19.3.1, the zero-split tap): two consecutive chunks of one lane, `head` then
     // `tail`, as one call whose prefix tap between them costs no second pass. Per layer the mixers run
@@ -469,6 +478,7 @@ private:
     };
     // The routed experts' wide route for this layer's bank (moe's, one expression for run and plan).
     [[nodiscard]] ops::offloaded_moe::WideA16 expert_wide_a16(const MoeParameters& p) const;
+    [[nodiscard]] ops::offloaded_moe::NarrowA16 expert_narrow_a16(const MoeParameters& p) const;
     // The steps on an allocator A: WorkspaceArena runs them, WorkspaceLayoutBuilder plans their allocations (a plan
     // passes no batch, call or tap and launches nothing).
     template <class A> void run_impl(A& a, const ForwardBatch* batch, const CallShape& shape, const FinishShape& finish,
@@ -484,7 +494,7 @@ private:
     template <class A> void layer_moe_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
                                            const Tensor& xm, const Tensor& inject, Tensor& residual,
                                            std::int32_t route_columns, std::int32_t route_skipped, std::int32_t chunk_columns,
-                                           SharedCalls shared = {});
+                                           TrimmedCall trimmed = {});
     template <class A> void finish_impl(A& a, const ForwardBatch* batch, const FinishShape& shape, Tensor& residual,
                                         Tensor* logits);
     template <class A> void ple_impl(A& a, const PleParameters& p, Tensor& residual, const ForwardBatch* batch,
@@ -508,7 +518,7 @@ private:
                                        Tensor* route_tap, const ForwardBatch* batch, const CallShape& shape,
                                        std::int32_t route_columns, const Tensor* inject, Tensor* residual,
                                        std::int32_t route_skipped, const Tensor* streams, std::int32_t chunk_columns,
-                                       SharedCalls shared = {});
+                                       TrimmedCall trimmed = {});
     template <class A> void mtp_block_impl(A& a, const MtpCall* call, std::int32_t columns, bool kv_only, Tensor& rows);
     // A memoized plan (`kind` names the plan function).
     template <class F> std::size_t memoized(int kind, std::int32_t a, std::int32_t b, std::int32_t c, const F& plan);

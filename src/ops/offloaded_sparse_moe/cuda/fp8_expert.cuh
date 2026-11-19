@@ -108,7 +108,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
     const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
     if (record == nullptr) { return; }
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (count > narrow_max) { return; } // a wide job: its tiles compute it
+    if (moe::route_count(dispatch, expert) > narrow_max) { return; } // a wide job: its tiles compute it
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int part = lane % 16, up = lane / 16;
     const int i    = blockIdx.x * kGgmlGateUpUnits + warp; // intermediate
@@ -173,12 +173,14 @@ __global__ void __launch_bounds__(kGgmlThreads)
         expert = dispatch.jobs[job];
         record = pass_record(phase, source, expert, job_records, job);
     }
+    int route = 0; // moe::route_count: the entries that choose the job's route
     if (record != nullptr) {
         first = dispatch.offsets[expert];
         count = dispatch.offsets[expert + 1] - first;
+        route = moe::route_count(dispatch, expert);
     }
     pdl::wait_for_dependencies();
-    if (record == nullptr || count > narrow_max) { return; }
+    if (record == nullptr || route > narrow_max) { return; }
     __shared__ std::uint32_t digits[256];
     load_fp8_digits(digits); // the first pass's barrier orders it before any read
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;

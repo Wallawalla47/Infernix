@@ -660,6 +660,78 @@ void run_stage_decode(QType gu, QType down, std::mt19937& rng) {
     for (const int width : {4096, 8192, 12288}) { compare(call(width, 0), reference, width, "a prefix call"); }
     std::printf("info ggml stage-decode experts (%d, %d): the same bits at 4,096 / 8,192 / 12,288 / 16,384 columns and in staged passes\n",
                 static_cast<int>(gu), static_cast<int>(down));
+    // Calls over the reference call's trailing columns on its routes (MoeDispatch::route_offsets, route_columns: a
+    // trimmed last layer) give their entries its bits: a job the reference computes on the stage-decode tiles runs
+    // there for one entry too, resident, zero-copy or staged. On their own routes (information) those jobs take
+    // the exact narrow kernels or tiles.
+    {
+        infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}), Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                          Tensor(d_gate, DType::FP32, {columns})};
+        infernix::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, columns}), top_k, routing, nullptr);
+        void* d_reference = nullptr;
+        cuda_check(cudaMalloc(&d_reference, infernix::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
+        auto wide = infernix::ops::carve_moe_dispatch(d_reference, experts, top_k * columns);
+        infernix::ops::moe_dispatch(routing, experts, wide, nullptr, nullptr);
+        constexpr int kMaxKept = 300;
+        std::int32_t* d_kept_ids = nullptr;
+        float *d_kept_weights = nullptr, *d_kept_gate = nullptr;
+        cuda_check(cudaMalloc(&d_kept_ids, sizeof(std::int32_t) * top_k * kMaxKept), "cudaMalloc");
+        cuda_check(cudaMalloc(&d_kept_weights, sizeof(float) * top_k * kMaxKept), "cudaMalloc");
+        cuda_check(cudaMalloc(&d_kept_gate, sizeof(float) * kMaxKept), "cudaMalloc");
+        bool engaged = false;
+        for (const int kept : {1, 8, kMaxKept}) {
+            for (const int slots : {0, 24}) {
+                for (const bool routes : {true, false}) {
+                    const int first = columns - kept;
+                    infernix::ops::MoeRouting own{Tensor(d_kept_ids, DType::I32, {top_k, kept}),
+                                                  Tensor(d_kept_weights, DType::FP32, {top_k, kept}),
+                                                  Tensor(d_kept_gate, DType::FP32, {kept})};
+                    infernix::ops::moe_route(Tensor(d_logits + static_cast<std::size_t>(first) * (experts + 1), DType::FP32,
+                                                    {experts + 1, kept}),
+                                             top_k, own, nullptr);
+                    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, top_k * kept);
+                    infernix::ops::moe_dispatch(own, experts, dispatch, nullptr, nullptr);
+                    if (routes) { dispatch.route_offsets = wide.offsets; }
+                    const std::size_t count = static_cast<std::size_t>(H) * top_k * kept;
+                    cuda_check(cudaMemset(d_out, 0xFF, count * sizeof(std::uint16_t)), "cudaMemset");
+                    infernix::ops::MoeExpertSource source{.frame_base = d_frames_base, .frames = d_frames, .host_records = host_device,
+                                                          .record_stride = stride, .scales = d_scales,
+                                                          .staging_base = slots > 0 ? d_staging : nullptr, .staging_slots = slots};
+                    source.activation    = moe::ExpertActivation::kA16;
+                    source.wide_a16      = moe::WideA16::kGgmlBf16;
+                    source.frame_stride  = stride;
+                    source.route_columns = routes ? columns : 0;
+                    source.ggml          = {.gate_up_format = gu, .down_format = down, .gate_row_bytes = gr,
+                                            .down_row_bytes = dr, .record_bytes = record};
+                    Tensor tx(d_x + static_cast<std::size_t>(first) * H, DType::BF16, {H, kept});
+                    Tensor out(d_out, DType::BF16, {H, top_k * kept});
+                    infernix::ops::moe_experts(tx, dispatch, source, top_k, std::min(experts, top_k * kept), d_workspace, out,
+                                               nullptr);
+                    cuda_check(cudaDeviceSynchronize(), "moe_experts (trailing call)");
+                    std::vector<std::uint16_t> got(count);
+                    cuda_check(cudaMemcpy(got.data(), d_out, count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+                    std::size_t bad = 0;
+                    for (std::size_t i = 0; i < count; ++i) {
+                        bad += got[i] != reference[static_cast<std::size_t>(first) * top_k * H + i];
+                    }
+                    std::printf("info ggml stage-decode experts (%d, %d): trailing %d of %d columns, %d staging slots, %s: %zu of "
+                                "%zu outputs differ from the reference call's\n",
+                                static_cast<int>(gu), static_cast<int>(down), kept, columns, slots,
+                                routes ? "on its routes" : "on their own routes", bad, count);
+                    if (routes) {
+                        check(bad == 0, "a trailing call on the reference call's routes gives its entries the stage-decode bits");
+                    } else {
+                        engaged = engaged || bad != 0;
+                    }
+                }
+            }
+        }
+        check(engaged, "a trailing call on its own routes differs somewhere (the check engages the stage-decode tiles)");
+        cudaFree(d_kept_gate);
+        cudaFree(d_kept_weights);
+        cudaFree(d_kept_ids);
+        cudaFree(d_reference);
+    }
     cudaFree(d_out);
     cudaFree(d_scales);
     cudaFree(d_workspace);

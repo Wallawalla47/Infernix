@@ -37,13 +37,14 @@ static_assert(kGgmlDownLanes == a8::kDownPartials, "a down row's lanes are its p
 
 // Whether a call takes the 8-bit route (moe_experts, the CPU plan and launch_pass decide it identically): every
 // call of at most kA8MaxCallColumns columns, and with WideA16::kA8 every wider one.
+// `columns`: the call's; the route follows moe::route_width.
 __host__ __device__ __forceinline__ bool a8_call(const MoeExpertSource& source, int columns) {
-    return source.ggml.a8 && (columns <= kA8MaxCallColumns || source.wide_a16 == moe::WideA16::kA8);
+    return source.ggml.a8 && (moe::route_width(source, columns) <= kA8MaxCallColumns || source.wide_a16 == moe::WideA16::kA8);
 }
 
 // Whether an 8-bit call runs its wide jobs (more than moe::kMaxColumns columns) on the wide tiles.
 __host__ __device__ __forceinline__ bool a8_wide_call(const MoeExpertSource& source, int columns) {
-    return a8_call(source, columns) && columns > kA8MaxCallColumns;
+    return a8_call(source, columns) && moe::route_width(source, columns) > kA8MaxCallColumns;
 }
 
 // The 8-bit codes, scale and code sum of 32 BF16 values at `v` (16-byte aligned): codes into four words
@@ -148,7 +149,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
     const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
     if (record == nullptr) { return; }
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (count > narrow_max) { return; } // a wide job: the wide tiles compute it
+    if (moe::route_count(dispatch, expert) > narrow_max) { return; } // a wide job: the wide tiles compute it
     const int i0 = static_cast<int>(blockIdx.x) * kGgmlGateUpUnits;
     a8_copy_rows<kGgmlThreads>(rows[0], record + static_cast<std::size_t>(i0) * kRowBytes, kRows);
     a8_copy_rows<kGgmlThreads>(rows[1], record + static_cast<std::size_t>(moe::kIntermediate + i0) * kRowBytes, kRows);
@@ -228,7 +229,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
         first = dispatch.offsets[expert];
         count = dispatch.offsets[expert + 1] - first;
     }
-    const bool runs = record != nullptr && count <= narrow_max;
+    const bool runs = record != nullptr && moe::route_count(dispatch, expert) <= narrow_max;
     if (runs) { // the record's bytes are the pass's input, not the gate/up pass's output
         a8_copy_rows<kGgmlThreads>(rows,
                                    record + 2 * static_cast<std::size_t>(moe::kIntermediate) * source.ggml.gate_row_bytes +

@@ -114,6 +114,12 @@ struct MoeDispatch {
     // (shared_first = k*T); the arrays are then sized for E + 1 experts and k*T + T entries.
     // Set by the dispatch call; 0x7FFFFFFF without a shared job.
     std::int32_t shared_first = 0x7FFFFFFF;
+    // The offsets [E + 1 (+ 1 with a shared job)] of a reference call's dispatch whose entry counts choose each job's
+    // route (wide or narrow) instead of this call's: a trimmed last layer's call over the reference call's trailing
+    // columns (MoeExpertSource::route_columns), so each of its entries takes the arithmetic the reference call gives it
+    // (every wide route computes an entry from its own column alone). Null: this call's counts. Jobs still compute
+    // only this call's entries.
+    const std::int32_t* route_offsets = nullptr;
 };
 
 [[nodiscard]] std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries);
@@ -311,6 +317,10 @@ struct MoeExpertSource {
     // wide route). The workspace is
     // the one wide_a16 sizes; a CPU channel must carry the same choice. W4A4 experts ignore it.
     offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;
+    // The reference call's column count (with MoeDispatch::route_offsets): every route choice made from the call's
+    // width (a wide call, ggml-bf16-prefill's BF16 tiles, the 8-bit wide route) takes it instead of this call's. The
+    // narrow kernels, the workspace and the CPU channel's width stay this call's. 0: this call's.
+    std::int32_t route_columns = 0;
     // With kLossless: the design reference's expert activations (offloaded_moe::LosslessExpertDesign).
     offloaded_moe::LosslessExpertDesign lossless_design = offloaded_moe::LosslessExpertDesign::kNone;
     // W4A4 banks whose every expert shares its gate and up input scales (every NVIDIA export): their narrow jobs
@@ -399,6 +409,15 @@ struct MoeExpertSource {
                                                       std::int32_t entries, std::int32_t columns,
                                                       offloaded_moe::ExpertActivation activation,
                                                       offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact);
+
+/// Whether a call of `columns` columns of this source's arithmetic (its bank kind, activation, ggml.a8, wide_a16 and
+/// narrow_a16; the rest is ignored) can give an entry other bits than a call of at most 8 columns would: a job of more
+/// than 8 entries on a wide route that is not the narrow kernels' arithmetic (A4 residual terms, W4A4's FP32 sums,
+/// ggml-bf16-prefill's BF16 tiles from 512 columns, the 8-bit tiles), or a call of more than 128 columns leaving the
+/// 8-bit routes. A call over such a call's trailing columns then takes its routes (MoeDispatch::route_offsets,
+/// MoeExpertSource::route_columns) to give its entries the same bits. The exact wide routes (W4A16's limbs, the GGUF
+/// and block-FP8 integer tiles) give the narrow kernels' bits.
+[[nodiscard]] bool moe_routes_by_width(const MoeExpertSource& source, std::int32_t columns);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).

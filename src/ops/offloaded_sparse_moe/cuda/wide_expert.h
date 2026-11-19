@@ -52,6 +52,20 @@ INFERNIX_WIDE_HD bool wide_route(int columns, const ExpertScales& scales) {
     return columns > kMaxColumns && scales.input_gate == scales.input_up;
 }
 
+// The entry count that chooses expert `expert`'s route in this call (wide_route, a GGUF or FP8 job's narrow_max):
+// the reference call's (MoeDispatch::route_offsets, a trimmed last layer) or this call's. Every such choice reads
+// it; the jobs iterate their own entries.
+INFERNIX_WIDE_HD int route_count(const MoeDispatch& dispatch, int expert) {
+    const std::int32_t* offsets = dispatch.route_offsets != nullptr ? dispatch.route_offsets : dispatch.offsets;
+    return offsets[expert + 1] - offsets[expert];
+}
+
+// The column count that chooses this call's width-dependent routes (MoeExpertSource::route_columns): a wide call,
+// ggml-bf16-prefill's BF16 tiles, the 8-bit routes. The narrow kernels and the workspace take the call's own.
+INFERNIX_WIDE_HD int route_width(const MoeExpertSource& source, int columns) {
+    return source.route_columns > 0 ? source.route_columns : columns;
+}
+
 namespace wide {
 
 inline constexpr int kTileColumns = 64; // columns (routed entries of one expert) per work tile

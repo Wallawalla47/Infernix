@@ -145,7 +145,7 @@ __global__ void __launch_bounds__(G::kHidden / 16) encode_nmma4_kernel(Nmma4Args
     if (pass_record(a.phase, a.source, expert, a.job_records, job) == nullptr) { return; } // another pass's job
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (c >= count || moe::wide_route(count, scales)) { return; }
+    if (c >= count || moe::wide_route(moe::route_count(dispatch, expert), scales)) { return; }
     const int token = moe::wide::entry_column(dispatch.entries[first + c], a.top_k, dispatch.shared_first);
     nmma4_encode_block<G>(a.x + static_cast<std::size_t>(token) * G::kHidden, scales.input_gate, static_cast<int>(threadIdx.x),
                           a.x_rows + static_cast<std::size_t>(first + c) * Nmma4Shape<G>::kXRowBytes);
@@ -204,7 +204,7 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
     if (record == nullptr) { return idle(); }
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return idle(); }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return idle(); }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;
     const int rg = warp % kNmma4Warps, k_half = warp / kNmma4Warps; // this warp's row group in the CTA and K half
@@ -339,7 +339,7 @@ __global__ void __launch_bounds__(kNmma4Threads) down_nmma4_kernel(Nmma4Args a) 
         scales = a.source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;

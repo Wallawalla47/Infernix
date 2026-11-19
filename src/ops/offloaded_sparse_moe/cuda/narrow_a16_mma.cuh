@@ -224,7 +224,7 @@ __global__ void __launch_bounds__(Nmma16GateUpWarps<KSplit>::kThreads) gate_up_n
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return; }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;
     // This warp's row group in the CTA and its part of K (blocks [part, part + 1) * kPartStages * kNmma16StageUnits).
@@ -376,7 +376,7 @@ __global__ void __launch_bounds__(kNmma16Threads) down_nmma16_kernel(Nmma16Args 
         scales = a.source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;

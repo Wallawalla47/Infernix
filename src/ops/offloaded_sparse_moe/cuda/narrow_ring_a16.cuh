@@ -115,7 +115,7 @@ __device__ bool resolve_ring_task(const RingArgs& a, std::uint32_t i, int jobs, 
     t.scales = a.source.scales[expert];
     t.first  = a.dispatch.offsets[expert];
     t.count  = a.dispatch.offsets[expert + 1] - t.first;
-    if (moe::wide_route(t.count, t.scales)) { return false; }
+    if (moe::wide_route(moe::route_count(a.dispatch, expert), t.scales)) { return false; }
     t.job    = job;
     t.rg     = local % per;
     t.down   = down ? 1 : 0;

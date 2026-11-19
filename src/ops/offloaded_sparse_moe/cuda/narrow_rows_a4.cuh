@@ -114,7 +114,7 @@ __global__ void __launch_bounds__(kThreads, kRowsMinCtas) gate_up_rows4_kernel(R
     if (record == nullptr) { return pdl::wait_for_dependencies(); }
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return pdl::wait_for_dependencies(); }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return pdl::wait_for_dependencies(); }
     const int g    = static_cast<int>(blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     UnitRows w[kRowsWarpSteps];
@@ -192,7 +192,7 @@ __global__ void __launch_bounds__(kThreads, kRowsMinCtas) down_rows4_kernel(Rows
         scales = a.source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     const int group = kRowsDownGroups * tile + warp / 2, base = (warp % 2) * kRowsWarpUnits;
     UnitRows w[kRowsWarpSteps];

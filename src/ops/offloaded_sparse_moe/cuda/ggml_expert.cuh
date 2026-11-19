@@ -190,7 +190,7 @@ __device__ __forceinline__ void gate_up_nmma_task(NmmaGateUpShared<GU>& sm, cons
     const std::uint8_t* record = pass_record(a.phase, source, expert, a.job_records, job);
     if (record == nullptr) { return; }
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (count > a.narrow_max) { return; } // a wide job: its tiles compute it
+    if (moe::route_count(dispatch, expert) > a.narrow_max) { return; } // a wide job: its tiles compute it
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int i0   = bx * 4 * W + 4 * warp;
     const std::size_t row_bytes = source.ggml.gate_row_bytes;
@@ -317,7 +317,7 @@ __device__ __forceinline__ void down_nmma_task(NmmaDownShared<D>& sm, const Nmma
     if (record != nullptr) {
         first = dispatch.offsets[expert];
         count = dispatch.offsets[expert + 1] - first;
-        if (count > narrow_max) { record = nullptr; }
+        if (moe::route_count(dispatch, expert) > narrow_max) { record = nullptr; }
     }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int r0   = bx * kNmmaDownRows + 8 * warp;
@@ -433,7 +433,9 @@ __global__ void __launch_bounds__(kGgmlPlanThreads)
         if (job < jobs) {
             const int expert  = dispatch.jobs[job];
             const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            if (columns > moe::kMaxColumns) { n = (columns + kGgmlTileColumns - 1) / kGgmlTileColumns; }
+            if (moe::route_count(dispatch, expert) > moe::kMaxColumns) {
+                n = (columns + kGgmlTileColumns - 1) / kGgmlTileColumns;
+            }
         }
         scan[tid] = n;
         __syncthreads();
@@ -691,7 +693,7 @@ __device__ __forceinline__ bool bf16_job(const MoeDispatch& dispatch, const std:
                                          const std::uint8_t* const* job_records, int job) {
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return false; }
     const int expert = dispatch.jobs[job];
-    return dispatch.offsets[expert + 1] - dispatch.offsets[expert] > moe::kMaxColumns && job_records[job] != nullptr;
+    return moe::route_count(dispatch, expert) > moe::kMaxColumns && job_records[job] != nullptr;
 }
 
 // The 128-entry tiles of the BF16 jobs among [base, base + jobs) (1 <= jobs <= kBf16PlanThreads):
@@ -981,7 +983,8 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
                                 down_nmma_ggml<D>, args));
     check_launch("ggml down");
     if (entries == 0) { return; }
-    if (source.wide_a16 == moe::WideA16::kGgmlBf16 && columns >= moe::wide::kGgmlStageDecodeMinColumns) {
+    if (source.wide_a16 == moe::WideA16::kGgmlBf16 &&
+        moe::route_width(source, columns) >= moe::wide::kGgmlStageDecodeMinColumns) {
         launch_decode_pass_ggml<GU, D>(reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags,
                                        base, jobs, layout, outputs, stream);
         return;

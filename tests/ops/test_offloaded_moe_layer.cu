@@ -199,6 +199,77 @@ private:
     std::thread thread_;
 };
 
+// A call over a wide call's trailing `kept` columns that takes the wide call's routes (MoeDispatch::route_offsets,
+// MoeExpertSource::route_columns: a trimmed last layer, Qwen4Exp's TrimmedCall::routes) gives those columns'
+// entries the wide call's bits on the same placement, staging and CPU share: an expert the wide call computes on its
+// wide route is computed there for one entry too, and never offered to the CPU. `got`: the wide call's outputs.
+// Without the routes the call is printed for information (its experts then take the narrow kernels).
+void check_trailing_calls(int experts, int columns, int top_k, const float* d_logits, const std::uint16_t* d_x,
+                          const infernix::ops::MoeDispatch& wide_dispatch, const infernix::ops::MoeExpertSource& source,
+                          void* d_workspace, std::uint32_t* error_host, const std::vector<std::uint16_t>& got) {
+    for (const int kept : {1, std::min(columns - 1, moe::kMaxColumns)}) {
+        const int first = columns - kept, max_jobs = std::min(experts, top_k * kept);
+        std::int32_t* d_ids = nullptr;
+        float *d_weights = nullptr, *d_gate = nullptr;
+        void* d_dispatch    = nullptr;
+        std::uint16_t* d_out = nullptr;
+        const std::size_t count = static_cast<std::size_t>(moe::kHidden) * top_k * kept;
+        cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * top_k * kept), "cudaMalloc");
+        cuda_check(cudaMalloc(&d_weights, sizeof(float) * top_k * kept), "cudaMalloc");
+        cuda_check(cudaMalloc(&d_gate, sizeof(float) * kept), "cudaMalloc");
+        cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, top_k * kept)), "cudaMalloc");
+        cuda_check(cudaMalloc(&d_out, count * sizeof(std::uint16_t)), "cudaMalloc");
+        const Tensor logits(const_cast<float*>(d_logits) + static_cast<std::size_t>(first) * (experts + 1), DType::FP32,
+                            {experts + 1, kept});
+        const Tensor tx(const_cast<std::uint16_t*>(d_x) + static_cast<std::size_t>(first) * moe::kHidden, DType::BF16,
+                        {moe::kHidden, kept});
+        for (const bool routes : {true, false}) {
+            infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, kept}),
+                                              Tensor(d_weights, DType::FP32, {top_k, kept}), Tensor(d_gate, DType::FP32, {kept})};
+            auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, top_k * kept);
+            infernix::ops::MoeExpertSource own = source;
+            if (routes) {
+                dispatch.route_offsets = wide_dispatch.offsets;
+                own.route_columns      = columns;
+            }
+            Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * kept});
+            cuda_check(cudaMemset(d_out, 0xFF, count * sizeof(std::uint16_t)), "cudaMemset");
+            *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+            // As the wide call: a served call routes through moe_route_dispatch_plan (which plans its CPU jobs, or
+            // routes and dispatches alone), another through the route and the dispatch.
+            bool planned = false;
+            if (own.cpu.request != nullptr) {
+                planned = infernix::ops::moe_route_dispatch_plan(logits, top_k, routing, dispatch, nullptr, tx, own, max_jobs,
+                                                                 d_workspace, out, nullptr);
+            } else {
+                infernix::ops::moe_route(logits, top_k, routing, nullptr);
+                infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+            }
+            infernix::ops::moe_experts(tx, dispatch, own, top_k, max_jobs, d_workspace, out, nullptr, true, planned);
+            cuda_check(cudaDeviceSynchronize(), "moe_experts (trailing call)");
+            const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
+            std::vector<std::uint16_t> mine(count);
+            cuda_check(cudaMemcpy(mine.data(), d_out, count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+            long differ = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                differ += mine[i] != got[static_cast<std::size_t>(first) * top_k * moe::kHidden + i];
+            }
+            std::printf("  trailing %d of %d columns, %s: %ld of %zu outputs differ from the wide call's%s\n", kept, columns,
+                        routes ? "on the wide call's routes" : "on their own routes (information)", differ, count,
+                        error != 0 ? " (error word set)" : "");
+            if (routes) {
+                check(error == 0, "a trailing call on the wide call's routes serves every expert");
+                check(differ == 0, "a trailing call on the wide call's routes gives its entries the wide call's bits");
+            }
+        }
+        cudaFree(d_out);
+        cudaFree(d_dispatch);
+        cudaFree(d_gate);
+        cudaFree(d_weights);
+        cudaFree(d_ids);
+    }
+}
+
 // With narrow == kA4Residual (W4A16 only; expert-a4-residual-decode) the GPU narrow kernels and every
 // CPU service compute experts of at most eight columns with the two-term arithmetic, so those outputs
 // equal expert_forward_a4r's for every placement, staging pass and CPU share (the wide ones stay exact).
@@ -958,6 +1029,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                     mismatches, moved, got.size());
         check(mismatches == 0, "the narrow route equals the CPU engine for every placement and staging pass");
         check(moved == 0, "no placement or staging pass changes an output bit");
+        if (columns > moe::kMaxColumns && !config.land && !config.fetched && config.ssd == 0) {
+            check_trailing_calls(experts, columns, top_k, d_logits, d_x, dispatch, source, d_workspace, error_host, got);
+        }
         if (config.land) {
             // Oracle: the staged misses in job order (resident and CPU-served jobs excluded); landing slot n
             // receives the n-th of them on the forked route, and nothing on the other routes.

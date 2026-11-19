@@ -54,16 +54,18 @@ struct Nvfp4A8Shape {
 
 // Whether an NVFP4 W4A16 bank's call takes these kernels for every job (moe_experts, the CPU plan and launch_pass
 // decide it identically).
+// `columns`: the call's; the route follows moe::route_width.
 __host__ __device__ __forceinline__ bool nvfp4_a8_call(const MoeExpertSource& source, int columns) {
     return source.narrow_a16 == moe::NarrowA16::kA8 && source.activation == moe::ExpertActivation::kA16 &&
-           !ggml_bank(source) && columns <= kA8MaxCallColumns;
+           !ggml_bank(source) && moe::route_width(source, columns) <= kA8MaxCallColumns;
 }
 
 // Whether a wider call stays on 8-bit activations (WideA16::kA8): its jobs of at most moe::kMaxColumns columns on
 // these kernels, its wider jobs on the wide route's 8-bit grouped GEMM (wide_expert_a8.cuh).
 __host__ __device__ __forceinline__ bool nvfp4_a8_wide_call(const MoeExpertSource& source, int columns) {
     return source.narrow_a16 == moe::NarrowA16::kA8 && source.wide_a16 == moe::WideA16::kA8 &&
-           source.activation == moe::ExpertActivation::kA16 && !ggml_bank(source) && columns > kA8MaxCallColumns;
+           source.activation == moe::ExpertActivation::kA16 && !ggml_bank(source) &&
+           moe::route_width(source, columns) > kA8MaxCallColumns;
 }
 
 // Whether a call takes the 8-bit activation route on either bank kind (MissRequest::a8): its CPU-served misses
@@ -145,7 +147,7 @@ __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
     const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
     if (record == nullptr) { return; }
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (count > narrow_max) { return; } // a wide job (nvfp4_a8_wide_call): the wide route computes it
+    if (moe::route_count(dispatch, expert) > narrow_max) { return; } // a wide job (nvfp4_a8_wide_call): the wide route computes it
     const int group = static_cast<int>(blockIdx.x); // rows 16 group .. 16 group + 15: intermediates 8 group .. + 7
     stage_async(record + static_cast<std::size_t>(group) * S::kGateUpStageBytes, stage, S::kGateUpStageBytes);
     const moe::ExpertScales scales = source.scales[expert];
@@ -258,17 +260,19 @@ __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
         record = pass_record(phase, source, expert, job_records, job);
     }
     float m = 0.0F;
+    int route = 0; // moe::route_count: the entries that choose the job's route
     if (record != nullptr) {
         first = dispatch.offsets[expert];
         count = dispatch.offsets[expert + 1] - first;
+        route = moe::route_count(dispatch, expert);
         m     = source.scales[expert].alpha_down;
-        if (count <= narrow_max) { // a wide job's CTAs copy nothing and exit after the wait
+        if (route <= narrow_max) { // a wide job's CTAs copy nothing and exit after the wait
             stage_async(record + G::kGateUpBytes + static_cast<std::size_t>(tile) * S::kDownStageBytes, stage,
                         S::kDownStageBytes);
         }
     }
     pdl::wait_for_dependencies();
-    if (record == nullptr || count > narrow_max) { return; }
+    if (record == nullptr || route > narrow_max) { return; }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int i = lane & 7, part = lane >> 3;
     const int group          = kNvfp4A8Warps * tile + warp; // output rows 16 group .. 16 group + 15

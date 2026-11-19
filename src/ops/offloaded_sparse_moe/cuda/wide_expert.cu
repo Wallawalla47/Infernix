@@ -46,7 +46,7 @@ __global__ void __launch_bounds__(kPlanThreads)
         if (job < jobs) {
             const int expert  = dispatch.jobs[job];
             const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            if (wide_route(columns, scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
+            if (wide_route(route_count(dispatch, expert), scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
         }
         scan[tid] = n;
         __syncthreads();

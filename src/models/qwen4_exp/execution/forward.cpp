@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/execution/forward.h"
 
 #include "core/layout.h"
+#include "core/temporary_switches.h"
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/embedding.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -290,6 +291,40 @@ ops::offloaded_moe::WideA16 Forward::expert_wide_a16(const MoeParameters& p) con
                : ops::offloaded_moe::WideA16::kExact;
 }
 
+ops::offloaded_moe::NarrowA16 Forward::expert_narrow_a16(const MoeParameters& p) const {
+    // expert-a4-residual-decode, else --a8-activations' 8-bit route (calls of at most 128 columns): an NVFP4 W4A16
+    // bank's narrow jobs (the CPU service was created with the same choice, which moe_experts checks).
+    const bool nvfp4_a16 = p.bank->activation == ops::offloaded_moe::ExpertActivation::kA16 &&
+                           p.bank->planes.gate_up_format == QType::NVFP4_MUL;
+    return nvfp4_a16 && fast_.expert_a4_narrow ? ops::offloaded_moe::NarrowA16::kA4Residual
+           : nvfp4_a16 && fast_.a8_experts     ? ops::offloaded_moe::NarrowA16::kA8
+                                               : ops::offloaded_moe::NarrowA16::kExact;
+}
+
+bool Forward::trimmed_routes(const MoeParameters& p, std::int32_t columns) const {
+    // INFERNIX_TMP_TRIM_ROUTES=own: the A/B arm of the trim on the kept columns' own routes (=off: no trim, the Program's).
+    static const bool own_routes = [] {
+        const auto arm = temporary_switches::value("INFERNIX_TMP_TRIM_ROUTES");
+        if (arm && *arm != "own" && *arm != "off") {
+            throw std::invalid_argument("INFERNIX_TMP_TRIM_ROUTES=" + *arm + ": own or off");
+        }
+        return arm && *arm == "own";
+    }();
+    if (own_routes) { return false; }
+    // The op decides from the bank's arithmetic in this call (expert_source's bank kind, expert_wide_a16,
+    // expert_narrow_a16, the GGUF 8-bit flag).
+    ops::MoeExpertSource arithmetic{};
+    arithmetic.activation = p.bank->activation;
+    const QType format    = p.bank->planes.gate_up_format;
+    if (format != QType::NVFP4_MUL) {
+        arithmetic.ggml.gate_up_format = format;
+        arithmetic.ggml.a8             = fast_.a8_experts && format != QType::FP8_E4M3FN_B128;
+    }
+    arithmetic.wide_a16   = expert_wide_a16(p);
+    arithmetic.narrow_a16 = expert_narrow_a16(p);
+    return ops::moe_routes_by_width(arithmetic, columns);
+}
+
 template <class F>
 std::size_t Forward::memoized(int kind, std::int32_t a, std::int32_t b, std::int32_t c, const F& plan) {
     const auto key = std::make_tuple(kind, a, b, c);
@@ -532,7 +567,7 @@ void Forward::run_split_impl(A& a, const ForwardBatch* head, const ForwardBatch*
             const Tensor inject_kept = inject.slice(1, T - kept, kept);
             Tensor residual_kept     = residual.slice(1, T - kept, kept);
             layer_moe_impl(a, l, tail, tail_shape, xm_kept, inject_kept, residual_kept, -1, T - kept, 0,
-                           SharedCalls{.x = &xm_tail});
+                           TrimmedCall{.shared = &xm_tail, .routes = &xm, .routes_chunk = T0});
         } else {
             layer_moe_impl(a, l, tail, tail_shape, xm, inject, residual, -1, 0, T0);
         }
@@ -619,7 +654,7 @@ void Forward::layer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, c
             Tensor residual_kept = residual.slice(1, T - kept, kept);
             // The dense shared expert over the whole call, as the untrimmed call runs it.
             (void)moe_impl(a, block.moe, xm_kept, layer, nullptr, batch, shape, -1, &inject_kept, &residual_kept, T - kept,
-                           nullptr, 0, SharedCalls{.x = &xm});
+                           nullptr, 0, TrimmedCall{.shared = &xm, .routes = &xm});
         } else {
             // The combine injects its output directly unless a tap records it.
             const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
@@ -786,19 +821,19 @@ void Forward::layer_mixer_impl(A& a, std::uint32_t layer, const ForwardBatch* ba
 
 void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
                         Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped,
-                        std::int32_t chunk_columns, SharedCalls shared) {
+                        std::int32_t chunk_columns, TrimmedCall trimmed) {
     layer_moe_impl(work_, layer, &batch, call_shape(batch), xm, inject, residual, route_columns, route_skipped,
-                   chunk_columns, shared);
+                   chunk_columns, trimmed);
 }
 
 template <class A>
 void Forward::layer_moe_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
                              const Tensor& xm, const Tensor& inject, Tensor& residual, std::int32_t route_columns,
-                             std::int32_t route_skipped, std::int32_t chunk_columns, SharedCalls shared) {
+                             std::int32_t route_skipped, std::int32_t chunk_columns, TrimmedCall trimmed) {
     try {
         auto scope = a.scope();
         Tensor ym  = moe_impl(a, parameters_.layers[layer].moe, xm, layer, nullptr, batch, shape, route_columns, nullptr,
-                              nullptr, route_skipped, &residual, chunk_columns, shared);
+                              nullptr, route_skipped, &residual, chunk_columns, trimmed);
         if constexpr (kRuns<A>) { ops::hyper_connection_inject(ym, inject, residual, device_.stream); }
     } catch (const std::exception&) {
         runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");
@@ -811,8 +846,11 @@ std::int32_t Forward::last_layer_kept(std::int32_t columns) const noexcept {
         return 0;
     }
     // The router keeps its form: its MMA form needs kRouterMmaMinColumns columns. A dense shared expert runs over the
-    // whole call (the callers' SharedCalls::x): keeping it to these columns moved the first token's logits by up to
-    // 0.038 at 17 to 1,000 columns (NVIDIA Dense8 and IQ3_S's Q8 and GGUF, recipe A's BF16; 2026-11-18).
+    // whole call (the callers' TrimmedCall::shared): keeping it to these columns moved the first token's logits by up
+    // to 0.038 at 17 to 1,000 columns (NVIDIA Dense8 and IQ3_S's Q8 and GGUF, recipe A's BF16; 2026-11-18). The routed
+    // experts follow the whole call's routes where they go by width (TrimmedCall::routes, trimmed_routes): without
+    // that, ggml-bf16-prefill moved IQ3_S's logits by up to 3.1e-3 and expert-a4-residual FP4-Local's by up to 0.052
+    // (2026-11-19).
     const std::int32_t kept = fast_.router_mma && columns >= kRouterMmaMinColumns ? kRouterMmaMinColumns : 1;
     return kept < columns ? kept : 0;
 }
@@ -1471,7 +1509,7 @@ template <class A>
 Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                          const ForwardBatch* batch, const CallShape& shape, std::int32_t route_columns,
                          const Tensor* inject, Tensor* residual, std::int32_t route_skipped, const Tensor* streams,
-                         std::int32_t chunk_columns, SharedCalls shared_calls) {
+                         std::int32_t chunk_columns, TrimmedCall trimmed) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -1507,6 +1545,24 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
     const std::int32_t SJ = shared_job ? 1 : 0;
     const DeviceSpan dispatch_bytes = a.alloc_bytes(ops::moe_dispatch_bytes(E + SJ, (K + SJ) * T));
     ops::MoeDispatch dispatch{};
+    // A trimmed last layer whose experts follow the untrimmed call's routes (TrimmedCall::routes, trimmed_routes): that
+    // call's router and dispatch over its R columns (x is their trailing T), in plans and runs alike.
+    const std::int32_t R = trimmed.routes != nullptr && trimmed_routes(p, trimmed.routes->ne[1]) ? trimmed.routes->ne[1] : 0;
+    if (R > 0 && (R < T || trimmed.routes_chunk < 0 || trimmed.routes_chunk >= R ||
+                  (kRuns<A> && static_cast<const std::byte*>(trimmed.routes->data) +
+                                       static_cast<std::size_t>(R - T) * H * sizeof(std::uint16_t) !=
+                                   static_cast<const std::byte*>(x.data)))) {
+        throw std::invalid_argument("Qwen4Exp MoE: a trimmed call's columns must be its reference call's trailing ones");
+    }
+    Tensor route_logits;
+    ops::MoeRouting route_routing{};
+    DeviceSpan route_dispatch_bytes{};
+    ops::MoeDispatch route_dispatch{};
+    if (R > 0) {
+        route_logits         = a.alloc(DType::FP32, {E + 1, R});
+        route_routing        = {a.alloc(DType::I32, {K, R}), a.alloc(DType::FP32, {K, R}), a.alloc(DType::FP32, {R})};
+        route_dispatch_bytes = a.alloc_bytes(ops::moe_dispatch_bytes(E + SJ, (K + SJ) * R));
+    }
     bool streamed_chunk = false, route_plans = true;
     ops::MoeExpertSource source = {};
     if constexpr (!kRuns<A>) {
@@ -1514,12 +1570,17 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
         if (!eager_chunk_) { throw std::logic_error("Qwen4Exp forward: a plan covers prefill calls"); }
     } else {
     dispatch = ops::carve_moe_dispatch(dispatch_bytes.data, E + SJ, (K + SJ) * T);
+    if (R > 0) {
+        route_dispatch         = ops::carve_moe_dispatch(route_dispatch_bytes.data, E + SJ, (K + SJ) * R);
+        dispatch.route_offsets = route_dispatch.offsets;
+    }
     // Without a route tap or a streamed prefill chunk (whose host-side split reads the dispatch), the
     // route waits until the experts' source is known, so its kernel also plans the CPU-served misses.
     streamed_chunk = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
                      experts_.stream->active();
     route_plans    = route_tap == nullptr && !streamed_chunk;
     source         = expert_source(p, layer);
+    source.route_columns = R; // 0: the call's own (MoeExpertSource::route_columns)
     // --expert-tail-skip acts in generation rounds only; prefill, forced and scored tokens stay exact.
     if (batch != nullptr && batch->decode_round) { source.tail_skip_rank = experts_.tail_skip_rank; }
     // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
@@ -1643,30 +1704,23 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
     Tensor outputs = a.alloc(DType::BF16, {H, (K + SJ) * T});
     const std::int32_t max_jobs = std::min(E, K * T) + SJ;
     // The bank's wide route (expert_wide_a16, the plan's too) and narrow route.
-    const QType bank_format = p.bank->planes.gate_up_format; // expert_source's source.ggml.gate_up_format
-    const bool nvfp4_a16    = p.bank->activation == ops::offloaded_moe::ExpertActivation::kA16 &&
-                           bank_format == QType::NVFP4_MUL;
-    source.wide_a16 = expert_wide_a16(p);
-    // expert-a4-residual-decode, else --a8-activations' 8-bit route (calls of at most 128 columns): the same
-    // NVFP4 W4A16 banks' narrow jobs (the CPU service was created with the same choice, which moe_experts checks).
-    source.narrow_a16 = nvfp4_a16 && fast_.expert_a4_narrow ? ops::offloaded_moe::NarrowA16::kA4Residual
-                        : nvfp4_a16 && fast_.a8_experts ? ops::offloaded_moe::NarrowA16::kA8
-                                                        : ops::offloaded_moe::NarrowA16::kExact;
+    source.wide_a16   = expert_wide_a16(p);
+    source.narrow_a16 = expert_narrow_a16(p);
     // expert_source keeps MoeExpertSource's shape; a plan's source is the default too.
     const DeviceSpan expert_ws = a.alloc_bytes(ops::moe_experts_workspace_bytes(source.shape, max_jobs, (K + SJ) * T, T,
                                                                                 p.bank->activation, source.wide_a16));
     const std::int32_t I = dim(m.shared_intermediate);
     // The dense shared expert's input and calls: x, as one call or a pair call's two chunks, else a trimmed last
-    // layer's whole call (SharedCalls::x), whose trailing T columns are x.
-    const Tensor& sx      = shared_calls.x != nullptr ? *shared_calls.x : x;
+    // layer's whole call (TrimmedCall::shared), whose trailing T columns are x.
+    const Tensor& sx      = trimmed.shared != nullptr ? *trimmed.shared : x;
     const std::int32_t SW = sx.ne[1];
     std::vector<std::pair<std::int32_t, std::int32_t>> shared_chunks;
-    if (shared_calls.x == nullptr && chunk_columns > 0) {
+    if (trimmed.shared == nullptr && chunk_columns > 0) {
         shared_chunks = {{0, chunk_columns}, {chunk_columns, T - chunk_columns}};
     } else {
         shared_chunks = {{0, SW}};
     }
-    if (SW < T || (shared_calls.x != nullptr && sx.dtype != DType::BF16)) {
+    if (SW < T || (trimmed.shared != nullptr && sx.dtype != DType::BF16)) {
         throw std::invalid_argument("Qwen4Exp MoE: the shared expert's input must hold the MoE's columns");
     }
     // The dense shared expert's product and output (over its input), and the trailing T columns the combine reads; a
@@ -1737,14 +1791,29 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
     } else {
     (void)shape;
     const Tensor* rows[] = {&p.router, &p.shared_score};
-    for (const auto [from, n] : chunks) {
-        if (n == 0) { continue; }
-        const Tensor x_chunk = x.slice(1, from, n);
-        Tensor logits_chunk  = logits.slice(1, from, n);
+    const auto route = [&](const Tensor& input, Tensor& out, std::int32_t from, std::int32_t n) {
+        const Tensor input_chunk = input.slice(1, from, n);
+        Tensor out_chunk         = out.slice(1, from, n);
         if (fast_.router_mma && n >= kRouterMmaMinColumns) {
-            ops::projection_fp32_router_mma(x_chunk, rows, logits_chunk, s);
+            ops::projection_fp32_router_mma(input_chunk, rows, out_chunk, s);
         } else {
-            ops::projection_fp32(x_chunk, rows, logits_chunk, s);
+            ops::projection_fp32(input_chunk, rows, out_chunk, s);
+        }
+    };
+    if (R > 0) {
+        // The reference call's router, per chunk as that call runs it, and its dispatch: each kept entry's route goes by
+        // its expert's entry count there (MoeDispatch::route_offsets, the shared job's R included). The kept columns'
+        // logits are its trailing T, so their routing is its own bit for bit.
+        const std::int32_t first = trimmed.routes_chunk > 0 ? trimmed.routes_chunk : R;
+        route(*trimmed.routes, route_logits, 0, first);
+        if (first < R) { route(*trimmed.routes, route_logits, first, R - first); }
+        ops::moe_route_dispatch(route_logits, K, route_routing, route_dispatch, nullptr, s, ops::RouterLogits::kFp32,
+                                shared_job);
+        CUDA_CHECK(cudaMemcpyAsync(logits.data, route_logits.slice(1, R - T, T).data, logits.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+    } else {
+        for (const auto [from, n] : chunks) {
+            if (n > 0) { route(x, logits, from, n); }
         }
     }
     if (!route_plans) {
@@ -1793,9 +1862,26 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
             CUDA_CHECK(cudaMemcpyAsync(offsets + E + 1, guessed.offsets, (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, s));
         }
+        // A trimmed call following its reference's routes (R > 0, which copies nothing ahead): the reference's
+        // offsets, after this call's.
+        if (R > 0) {
+            if (ahead) { throw std::logic_error("Qwen4Exp MoE: a trimmed last layer copies nothing ahead"); }
+            CUDA_CHECK(cudaMemcpyAsync(offsets + E + 1, route_dispatch.offsets,
+                                       (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t), cudaMemcpyDeviceToHost, s));
+        }
         CUDA_CHECK(cudaEventRecord(split_ready_, s));
         CUDA_CHECK(cudaEventSynchronize(split_ready_));
         for (std::int32_t e = 0; e < E; ++e) { split_columns_[static_cast<std::size_t>(e)] = offsets[e + 1] - offsets[e]; }
+        if (R > 0) {
+            // An expert of this call that its reference makes wide is wide here too (the CPU computes narrow jobs only):
+            // the split prices it at the reference's columns, and only the link takes it.
+            const std::int32_t* reference = offsets + E + 1;
+            for (std::int32_t e = 0; e < E; ++e) {
+                const std::int32_t columns = reference[e + 1] - reference[e];
+                auto& own                  = split_columns_[static_cast<std::size_t>(e)];
+                if (own > 0 && columns > ops::offloaded_moe::kMaxColumns) { own = columns; }
+            }
+        }
         std::fill(split_cpu_.begin(), split_cpu_.end(), std::uint8_t{0});
         // Experts copied ahead for this layer are on their way: the CPU split neither takes nor prices them.
         std::copy(split_columns_.begin(), split_columns_.end(), split_priced_.begin());

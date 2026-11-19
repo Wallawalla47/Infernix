@@ -178,7 +178,7 @@ __device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource
 // identically.
 bool forked(const MoeExpertSource& source, std::int32_t max_jobs, std::int32_t columns) {
     return source.fork_stream != nullptr && source.staging_slots > 0 &&
-           max_jobs <= std::min(source.staging_slots, 512) && columns <= moe::kMaxColumns;
+           max_jobs <= std::min(source.staging_slots, 512) && moe::route_width(source, columns) <= moe::kMaxColumns;
 }
 
 // testing::moe_forked_calls and moe_lost_forks, by column count.
@@ -1267,7 +1267,7 @@ __global__ void __launch_bounds__(kThreads, 2)
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const bool split_input = scales.input_up != scales.input_gate;
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
@@ -1342,7 +1342,7 @@ __global__ void __launch_bounds__(kThreads)
         scales = source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     if (record != nullptr) {
         stage_async(record + moe::kGateUpBytes +
@@ -1582,7 +1582,7 @@ __device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * G::kGateUpBlocks * moe::kUnitBytes,
                 sm.stage, kGateUpSliceBytesOf<G>);
@@ -1669,7 +1669,7 @@ __global__ void __launch_bounds__(kThreads)
         scales = source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     if (record != nullptr) {
         stage_async(record + G::kGateUpBytes +
@@ -1902,7 +1902,7 @@ __global__ void __launch_bounds__(kThreads, 2)
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
                 sm.stage, kGateUpSliceBytes);
@@ -1970,7 +1970,7 @@ __global__ void __launch_bounds__(kThreads)
         scales = source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     if (record != nullptr) {
         stage_async(record + moe::kGateUpBytes +
@@ -2064,8 +2064,8 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
                  PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
-    // Wide calls (more than kMaxColumns columns) were planned by moe_experts.
-    const bool wide = columns > moe::kMaxColumns;
+    // Wide calls (more than kMaxColumns columns, moe::route_width) were planned by moe_experts.
+    const bool wide = moe::route_width(source, columns) > moe::kMaxColumns;
     if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
         launch_expert_pass_fp8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
                                wide ? columns_out : 0, part);
@@ -2258,7 +2258,11 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
                 } else {
                     const bool ssd = source.host_table != nullptr && source.host_table[expert] == nullptr;
                     host_miss      = !ssd;
-                    cat            = count <= max_width ? (ssd ? 0 : kWidths) + count : 0;
+                    // A job whose reference count sends it to the wide route (moe::route_count) is never offered:
+                    // the CPU computes the narrow route only, and the GPU's wide plan takes the job.
+                    cat = count <= max_width && moe::route_count(dispatch, expert) <= moe::kMaxColumns
+                              ? (ssd ? 0 : kWidths) + count
+                              : 0;
                 }
             }
         }
@@ -3205,6 +3209,21 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
     check_launch("cpu wait");
 }
 
+bool moe_routes_by_width(const MoeExpertSource& source, std::int32_t columns) {
+    MoeExpertSource own = source;
+    own.route_columns   = 0; // the predicates below read `columns` itself
+    if (columns <= moe::kMaxColumns || own.wide_a16 == moe::WideA16::kLossless) { return false; } // no wide job
+    const bool ggml = ggml_bank(own);
+    // Every job of a call of at most 128 columns on the 8-bit kernels, a narrower call's too.
+    if (nvfp4_a8_call(own, columns) || (ggml && a8_call(own, columns) && !a8_wide_call(own, columns))) { return false; }
+    if (own.ggml.gate_up_format == QType::FP8_E4M3FN_B128) { return false; } // exact int8 tiles and narrow kernels
+    if (ggml) {
+        return own.ggml.a8 || (own.wide_a16 == moe::WideA16::kGgmlBf16 && columns >= moe::wide::kGgmlStageDecodeMinColumns);
+    }
+    return own.activation == moe::ExpertActivation::kA4 || own.wide_a16 != moe::WideA16::kExact ||
+           own.narrow_a16 != moe::NarrowA16::kExact;
+}
+
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
                  cudaStream_t stream, bool wait_for_cpu, bool cpu_planned, bool x_prepared) {
@@ -3301,7 +3320,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const bool nvfp4_a8 = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));
     // Encoded here unless the caller ran moe_experts_prepare on a stream ordered before this one.
     if (!x_prepared) { prepare_x(x, source, max_jobs, layout, stream); }
-    if (ggml && !a8_call(source, static_cast<int>(x.ne[1])) && x.ne[1] > moe::kMaxColumns) {
+    const int route_columns = moe::route_width(source, static_cast<int>(x.ne[1]));
+    if (ggml && !a8_call(source, static_cast<int>(x.ne[1])) && route_columns > moe::kMaxColumns) {
         launch_plan_ggml(dispatch, max_jobs, layout, stream);
     }
     // Passes of at most staging_slots jobs (one pass covering every job without staging, or with one_pass).
@@ -3312,7 +3332,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const int half      = std::min(source.staging_slots / 2, kMaxPassJobs);
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = !ggml && !nvfp4_a8 && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    const bool use_wide = !ggml && !nvfp4_a8 && route_columns > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
