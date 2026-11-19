@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/pack.mjs && node scripts/licenses.mjs",
     "typecheck": "tsc -b",
+    "test": "node scripts/test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

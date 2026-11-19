@@ -1,7 +1,7 @@
 """Word-equality qualification of a Qwen3.8-Flash-Next artifact against its checkpoint (design §6.1, §16.3).
 
     python -m tools.flash_next.verify_artifact --model CHECKPOINT --artifact OUT.infernix \
-        [--ngram OUT.ngram] [--ngram-rows all|N]
+        (--ngram OUT.ngram [--ngram-rows all|N] | --no-ngram)
 
 Every logical parameter the recipe stores as the checkpoint has it must equal the checkpoint's words:
 
@@ -251,13 +251,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--artifact", type=Path, required=True)
-    parser.add_argument("--ngram", type=Path)
+    volume = parser.add_mutually_exclusive_group(required=True)
+    volume.add_argument("--ngram", type=Path, help="the artifact's n-gram volume, checked row by row")
+    volume.add_argument("--no-ngram", action="store_true",
+                        help="leave the n-gram volume unchecked (the report says so); the artifact is then not "
+                             "qualified as a whole")
     parser.add_argument("--ngram-rows", default="200000", help="'all' or a sample size")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     start = time.time()
     report = {"experts": 0, "expert_mismatches": 0, "tensors": 0, "tensor_mismatches": [],
-              "input_scale_mismatches": 0, "requantized": {}, "rounded": {}}
+              "input_scale_mismatches": 0, "requantized": {}, "rounded": {},
+              "ngram": "not checked (--no-ngram)" if args.no_ngram else str(args.ngram)}
     with SafetensorsSource(args.model) as store, Artifact(args.artifact) as artifact:
         text = artifact.directory.components["text"]["config"]
         components = tuple(artifact.directory.components)
@@ -329,7 +334,10 @@ def main() -> int:
     print(json.dumps(report, indent=2))
     if args.report:
         args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    ok = (not report["expert_mismatches"] and not report["tensor_mismatches"]
+    # Something must have been compared: an artifact with no expert or tensor, or a volume with no row read, is not
+    # qualified by an empty comparison.
+    compared = report["experts"] + report["tensors"] > 0 and (args.no_ngram or report.get("ngram_rows_checked", 0) > 0)
+    ok = (compared and not report["expert_mismatches"] and not report["tensor_mismatches"]
           and not report["input_scale_mismatches"] and not report.get("ngram_row_mismatches"))
     return 0 if ok else 1
 

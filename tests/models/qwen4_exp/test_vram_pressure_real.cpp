@@ -98,6 +98,15 @@ int main() {
         // The real source first, then the fake that every engine source becomes.
         auto real = infernix::open_vram_budget_source(0);
         std::atomic<std::uint64_t> taken{0};
+        // The fake source (it reads `real` and `taken`) and the short grow delay last until the Engine below has
+        // ended, on every path: the guard is declared after what the source reads and before the Engine.
+        struct Hooks {
+            double grow_delay = infernix::runtime::expert_offload::testing::vram_grow_delay();
+            ~Hooks() {
+                infernix::testing::set_vram_budget_source({});
+                infernix::runtime::expert_offload::testing::set_vram_grow_delay(grow_delay);
+            }
+        } hooks;
         infernix::testing::set_vram_budget_source([&] {
             infernix::VramSnapshot s = real->query();
             const std::uint64_t t  = taken.load();
@@ -126,7 +135,8 @@ int main() {
         // The monitor samples once a second, so the cache grows back by about 4 s (sample, grow delay,
         // round boundary); the generation must still be running then, and is checked to be.
         const std::size_t mark = diagnostics.size();
-        std::thread squeeze([&] {
+        // A jthread joins itself if generate() throws (a joinable std::thread would terminate the process).
+        std::jthread squeeze([&] {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             taken = 2 * kGiB;
             std::this_thread::sleep_for(std::chrono::milliseconds(1500));
@@ -188,7 +198,6 @@ int main() {
               "an idle engine grows the cache back");
         const auto after = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(after == baseline, "ids after the idle resizes equal the undisturbed run");
-        infernix::testing::set_vram_budget_source({});
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

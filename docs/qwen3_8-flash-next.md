@@ -108,7 +108,8 @@ opens part 1. `--resource` stores the maintained Qwen3.8 template, as for Qwen3.
   the [design notes](maintainer/qwen3_8-flash-next-design.md) (§6.1.1, §16.2.1).
 - **Verification.** `python -m tools.flash_next.verify_artifact --model <checkpoint> --artifact
   <part 1> --ngram <volume>` compares every stored tensor, expert and n-gram row with the
-  checkpoint and lists the re-quantized parameters per component.
+  checkpoint and lists the re-quantized parameters per component. The volume is required; `--no-ngram`
+  skips it explicitly, and the report then says the volume was not checked.
 - **Second artifact of the same checkpoint.** It can share an existing n-gram volume: pass
   `--ngram-reuse <volume>` instead of `--ngram-out`. The converter checks the volume's geometry and
   512 of its rows against the checkpoint, so a volume of another checkpoint is refused.
@@ -935,11 +936,14 @@ startup
   it stops with the largest terms and what to lower (`--max-context`, `--max-concurrency`,
   `--prefill-chunk`, `--kv-dtype int8`). Below 2,048 expert frames it warns that decode will be slow.
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
-  system memory without an error, which slows everything down. The engine checks that every startup
-  allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. The error
-  prints the readings it compared: free VRAM before and after the allocations and, on Windows and
-  under WSL2, this process's shared system memory use, which a real spill raises. Setting the
+  system memory without an error, which slows everything down. The engine checks every startup
+  allocation: dense weights or fixed buffers that spilled stop startup; expert frames that spilled
+  are given back once and the cache starts smaller. On Windows and under WSL2 an expert-frame chunk
+  counts as spilled only when this process's own device-memory use did not rise by it, so a budget
+  Windows moves during the step (as on a GPU that drives a display) is not taken for a spill;
+  elsewhere the drop in free VRAM decides. The error prints the readings it
+  compared, and with `--log-level debug` the expert frames' warning is followed by them: free VRAM,
+  the OS budget, this process's device and shared system memory use, and NVML's free memory. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
 - **Other programs' VRAM.** On Windows the per-process budget and free VRAM can leave out memory

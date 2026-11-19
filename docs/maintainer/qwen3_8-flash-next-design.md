@@ -2393,9 +2393,21 @@ format from the volume header's format tag (byte 62, written since 2026-10-19: 1
   columns: plain calls of 9 to 16,384 columns and pair calls, trimmed against untrimmed, and walks of two chunks
   (1,024 + 1,000, 4,096 + 300 and 3,072 + 4,096 columns), trimmed and untrimmed, against the chunk-major calls, on the
   exact routes with `router-mma` off and on. All equal (2026-11-18) on NVFP4-QAD Dense8, NVIDIA Dense8, IQ3_S,
-  FP4-Local, recipe A and recipe C; the FP8 artifact's 114 GiB of pinned weights do not load there. The fast paths
-  beside `router-mma` were not compared: `q8-sliced-k` has no entry for the shared expert's shapes, and
-  `ggml-bf16-prefill` acts on a GGUF shared expert, which now takes the untrimmed call's width.
+  FP4-Local, recipe A and recipe C; the FP8 artifact's 114 GiB of pinned weights do not load there. **On the default
+  fast paths the trim changes the logits** where a path routes expert jobs by their width in the call (2026-11-19,
+  `--trim-last-layer --default-fast-paths`, router-mma off, the same cases). IQ3_S (`ggml-bf16-prefill`: BF16
+  stage-decode tiles for a GGUF bank's jobs of more than 8 columns in calls of 512 or more, where the trimmed
+  one-column call keeps the kept column's jobs on the narrow kernels) differs on every KV format in some calls of 512+ columns and in none below (largest 3.1e-3; INT8 KV: 1,000
+  columns; presumably the BF16 tiles' FP32 sums round to the exact kernels' BF16 in most outputs, so which wide calls
+  differ scatters by format: not traced). FP4-Local on INT8 KV (`expert-a4-residual`) differs in every call from 16
+  columns (largest 0.052) and not at 9; its wide route takes jobs of more than 8 columns in calls of more than 8,
+  which would leave most 16-column calls' kept column on the narrow kernels, so what it changes there is not traced.
+  Each artifact's untrimmed call repeats bit for bit, and leaving out that one path (`--drop-fast-path`) makes every case
+  equal again (`f16-accumulate-prefill` and `gdn-f16-accumulate` change no trimmed bit). Recipe C (`expert-a4-residual`)
+  and `--a8-activations` (8-bit wide tiles) are expected to differ the same way (not run). The reproducible and
+  lossless routes are unaffected. Open: whether the trim stays on these paths (it moves the logit column's last-layer
+  experts to the narrow route, by reading the code the exact kernels on these default paths) or stops where they
+  engage.
   History: until 2026-11-18 the shared expert ran over the kept columns too. 824d757c then kept 17 columns for Q8 and
   GGUF shared experts and turned the trim off for every other dense format; the shared expert over the whole call
   restored it on those with the same bits on the exact routes (both give the untrimmed call's). RTX 5090, default
@@ -7655,6 +7667,23 @@ measured results are under "Status" at the end of this section.
   figures and the budget's differ by a few hundred MiB either way (at idle 198 MiB in use beyond the one
   process's budget usage; after startup 362 MiB free against the engine's 161), so it stays a diagnostic
   until a physically full card is measured.
+- **The spill check of a device-only step** (issue #68, 2026-11-19): the reporter's build had the
+  `growth_room` stop and still warned "64 MiB … placed in system memory" on every start, with NVML
+  counting 2.7 GiB free, while the elastic pool grew the same cache to 8,519 frames 30 s later; with the
+  display moved to the other card (two NVIDIA cards: free memory is the DXGI budget less this
+  process's LOCAL use) the warning went. A whole chunk missing means free memory did not drop at all
+  across the step: the budget moved with it. The frames' chunks and the Qwen3.5 KV room probe
+  (`SpillGuard::end(bytes)`) now read the spill from this process's LOCAL use where the source has it
+  (Windows through DXGI, WSL2 through dxcore: untested there), and the free drop elsewhere. Measured on this RTX 5090 (headless) with
+  `.local/issue68/vram68 spillgrow`, 64 MiB pieces grown with no room check to the card's end: every
+  piece raised LOCAL use by exactly 64 MiB and NON_LOCAL use by 0, and ran at VRAM speed (memset
+  0.028 ms); the free drop read the last 10 as spilled (usage past the 31,419 MiB budget clamps free
+  memory at 0), and the driver refused the pieces past the card (494 pieces, VMM and `cudaMalloc`
+  alike) rather than placing them in system memory, so no real spill could be produced to test
+  against; a LOCAL-only rule catches every spill the free drop caught. A device free of this process
+  during a step still reads as a spill under both rules. The warning is followed by a Debug line with
+  every reading (`SpillGuard::readings`), and the sizing line is logged at Debug. Not reproduced: a
+  display-attached card.
 
 #### Feature 2: the SSD expert tier
 

@@ -9,6 +9,7 @@ shadcn/ui-style components on Radix, Recharts, TanStack Query and react-router (
 npm ci
 npm run dev        # http://localhost:5173, API forwarded to a launcher on 127.0.0.1:1234
 npm run build      # type-check, bundle, write ../assets/index.html.gz
+npm test           # the pure helpers' checks in tests/*.test.ts (no browser)
 ```
 
 `INFERNIX_LAUNCHER_URL` points the dev server at a launcher elsewhere. The API contract is

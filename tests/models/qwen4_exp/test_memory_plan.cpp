@@ -406,6 +406,117 @@ private:
     std::deque<std::uint64_t> nonlocal_;
 };
 
+// Whole snapshots per query, as a Windows source reads them: free memory is the OS budget less this
+// process's LOCAL use, beside its shared-system (NON_LOCAL) use.
+class SnapshotSource final : public VramBudgetSource {
+public:
+    explicit SnapshotSource(std::deque<VramSnapshot> readings) : readings_(std::move(readings)) {}
+    VramSnapshot query() override {
+        VramSnapshot s = readings_.front();
+        if (readings_.size() > 1) { readings_.pop_front(); }
+        return s;
+    }
+
+private:
+    std::deque<VramSnapshot> readings_;
+};
+
+VramSnapshot windows_reading(std::uint64_t budget, std::uint64_t local, std::uint64_t nonlocal,
+                             std::uint64_t physical_free = 0) {
+    VramSnapshot s;
+    s.has_budget      = true;
+    s.has_local_usage = true;
+    s.local_budget    = budget;
+    s.local_usage     = local;
+    s.device_free     = budget > local ? budget - local : 0;
+    s.shared_system   = 76 * kGiB;
+    s.nonlocal_usage  = nonlocal;
+    s.physical_free   = physical_free;
+    return s;
+}
+
+// SpillGuard::end(bytes), a device-only step (the expert frames' chunks, the KV room probe): where the source reads
+// this process's LOCAL use, a spill is that use's rise short of the step.
+void test_device_step_spill() {
+    const std::uint64_t n = 64 * kMiB, budget = 30 * kGiB, local = 20 * kGiB, nonlocal = 900 * kMiB;
+    {
+        // Issue #68's shape: the OS raised the budget during the step, so free memory did not drop at all, but the
+        // chunk is in device memory (LOCAL use rose by it). The free-memory drop read the whole chunk as spilled.
+        const auto before = windows_reading(budget, local, nonlocal);
+        const auto after  = windows_reading(budget + n, local + n, nonlocal);
+        require(after.device_free == before.device_free, "the scripted budget rise hides the chunk from free memory");
+        require(spill_shortfall(before.device_free, after.device_free, n) == n, "the free drop reads a spill");
+        SnapshotSource source({before, after, after});
+        SpillGuard guard(source);
+        guard.begin();
+        require(guard.end(n) == 0, "a budget the OS raised during the step is not a spill");
+    }
+    {
+        // A real sysmem fallback: LOCAL use flat, NON_LOCAL use up by the chunk.
+        SnapshotSource source({windows_reading(budget, local, nonlocal), windows_reading(budget, local, nonlocal + n),
+                               windows_reading(budget, local, nonlocal + n)});
+        SpillGuard guard(source);
+        guard.begin();
+        require(guard.end(n) == n, "a chunk placed in system memory is a spill");
+        // Half of an earlier allocation of this process evicted to make room for the chunk: also a spill.
+        SnapshotSource evicted({windows_reading(budget, local, nonlocal),
+                                windows_reading(budget, local + n - 48 * kMiB, nonlocal + 48 * kMiB),
+                                windows_reading(budget, local + n - 48 * kMiB, nonlocal + 48 * kMiB)});
+        SpillGuard by_eviction(evicted);
+        by_eviction.begin();
+        require(by_eviction.end(n) == 48 * kMiB, "this process's memory moved to system memory by the step is a spill");
+    }
+    {
+        // Past the OS budget the free figure clamps at 0, so a resident chunk's free drop reads short (RTX 5090,
+        // 2026-11-19: 10 of 494 pieces); LOCAL use rose by it.
+        SnapshotSource clamped({windows_reading(budget, budget + 40 * kMiB, nonlocal),
+                                windows_reading(budget, budget + 40 * kMiB + n, nonlocal)});
+        SpillGuard past(clamped);
+        past.begin();
+        require(past.end(n) == 0, "a resident chunk past the budget is not a spill");
+        // Another thread page-locked 1 GiB during the step while the chunk went to device memory.
+        SnapshotSource pinned({windows_reading(budget, local, nonlocal), windows_reading(budget, local + n, nonlocal + kGiB),
+                               windows_reading(budget, local + n, nonlocal + kGiB)});
+        SpillGuard by_pins(pinned);
+        by_pins.begin();
+        require(by_pins.end(n) == 0, "a page-lock beside a resident step is not a spill");
+    }
+    {
+        // A spill on the first reading only is re-read.
+        SnapshotSource transient({windows_reading(budget, local, nonlocal), windows_reading(budget, local, nonlocal + n),
+                                  windows_reading(budget, local + n, nonlocal)});
+        SpillGuard guard(transient);
+        guard.begin();
+        require(guard.end(n) == 0, "a second reading clears a transient spill");
+    }
+    {
+        // LOCAL use readable without the shared-system reading (a WSL2 adapter without it): the same rule.
+        auto before = windows_reading(budget, local, nonlocal);
+        auto after  = windows_reading(budget + n, local, nonlocal);
+        before.shared_system = after.shared_system = 0;
+        SnapshotSource source({before, after, after});
+        SpillGuard guard(source);
+        guard.begin();
+        require(guard.end(n) == n, "LOCAL use short of the step is a spill without the shared-system reading");
+    }
+    {
+        // The readings name every figure the source has, and where free memory comes from.
+        auto before = windows_reading(budget, local, nonlocal, 2775 * kMiB);
+        auto after  = windows_reading(budget + n, local + n, nonlocal, 2711 * kMiB);
+        before.free_from_budget = after.free_from_budget = true;
+        SnapshotSource source({before, after});
+        SpillGuard guard(source);
+        guard.begin();
+        (void)guard.end(n);
+        require(guard.readings(n) ==
+                    "free device memory 10240 MiB before and 10240 MiB after 64 MiB of allocations (the OS budget less "
+                    "this process's use); OS budget 30720 MiB before and 30784 MiB after; this process's device memory "
+                    "use 20480 MiB before and 20544 MiB after; this process's shared system memory use 900 MiB before "
+                    "and 900 MiB after; free over every process 2775 MiB before and 2711 MiB after (NVML)",
+                "the readings: " + guard.readings(n));
+    }
+}
+
 void test_spill() {
     const std::uint64_t n = 1 * kGiB;
     require(spill_shortfall(10 * kGiB, 9 * kGiB, n) == 0, "a resident step");
@@ -423,7 +534,8 @@ void test_spill() {
     SpillGuard confirm(spilled);
     confirm.begin();
     require(confirm.end(n) == n - 100 * kMiB, "a confirmed shortfall is reported");
-    require(confirm.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations",
+    require(confirm.readings(n) ==
+                "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations (cudaMemGetInfo)",
             "the failure names the free-memory readings it compared");
     // Where the source reads this process's shared system memory use (Windows, WSL2), the readings
     // carry it: a real sysmem fallback raises it, a misread free-memory figure does not.
@@ -432,8 +544,9 @@ void test_spill() {
     SpillGuard fallback(shared);
     fallback.begin();
     require(fallback.end(n) == n - 100 * kMiB, "a shortfall with shared-memory readings is reported");
-    require(fallback.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations; "
-                                    "this process's shared system memory use 200 MiB before and 1124 MiB after",
+    require(fallback.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations "
+                                    "(cudaMemGetInfo); this process's shared system memory use 200 MiB before and "
+                                    "1124 MiB after",
             "the failure names the shared system memory readings where the source has them");
 
     // A caller that names what it page-locked is judged by this process's shared system memory use where the
@@ -477,6 +590,7 @@ void test_spill() {
         by_free.begin();
         require(by_free.end(n, 0) == 0, "without the reading a second free-memory reading clears a transient");
     }
+    test_device_step_spill();
 
     // The test seam replaces the sources opened afterwards.
     infernix::testing::set_vram_budget_source([] { return card(5 * kGiB, DisplayState::Headless); });
@@ -830,7 +944,22 @@ void test_ram_monitor() {
         return done();
     };
     {
-        RamMonitor monitor(8 * kGiB, -1, [&] { return available.load(); }, std::chrono::milliseconds(2));
+        std::atomic<int> reads{0};
+        RamMonitor monitor(8 * kGiB, -1,
+                           [&] {
+                               const std::uint64_t value = available.load();
+                               ++reads;
+                               return value;
+                           },
+                           std::chrono::milliseconds(2));
+        // Waits until three more readings have begun: a tick reads, observes, then waits before the next read, so by
+        // then the second of them saw the value stored before the call, and every tick that read an older value has
+        // finished observing it (a fixed sleep let a tick that read the old value, then lost the CPU on a loaded
+        // machine, set a resize due after the test's decide).
+        const auto settled = [&] {
+            const int from = reads.load();
+            return wait_for([&] { return reads.load() >= from + 3; });
+        };
         monitor.set_room(10 * kGiB, 0);
         monitor.set_waker([&] { ++wakes; });
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -840,10 +969,9 @@ void test_ram_monitor() {
         require(monitor.decide(10 * kGiB, 0).release == 5 * kGiB, "monitor: the due release");
         // The band: once no tick still holds the old reading, decide takes what is due and nothing sets it again.
         available = 6 * kGiB;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(settled(), "monitor: it reads the new value");
         require(monitor.decide(10 * kGiB, 0).release == 0, "monitor: nothing due in the band");
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        require(!monitor.due(), "monitor: decide takes the due resize, and the band sets nothing");
+        require(settled() && !monitor.due(), "monitor: decide takes the due resize, and the band sets nothing");
         const int before = wakes.load();
         monitor.set_busy(true);
         require(wait_for([&] { return wakes.load() >= before + 3; }) && !monitor.due(),

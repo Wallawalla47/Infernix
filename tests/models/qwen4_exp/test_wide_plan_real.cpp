@@ -6,7 +6,7 @@
 // was given, the plan and the arena's peak. Every scope is given at least its plan, and peaks within it (the arena
 // throws past what it was given). One line is printed per scope, with the plan's headroom over the peak.
 //
-//   infernix_qwen4_exp_wide_plan_real_test SCENARIO
+//   infernix_qwen4_exp_wide_plan_real_test SCENARIO...
 //   SCENARIO: banks (the experts in RAM as banks), tier (the SSD tier: INFERNIX_EXPERT_RAM_MIB, default 30000),
 //             mtp, dflash2 (INFERNIX_QWEN4_DFLASH2 names the drafter companion), two-lanes (two prompts at once),
 //             scoring (CausalScoring), a8 (--a8-activations), bf16p (the packed BF16 KV cache), chat (a chat prompt of
@@ -17,15 +17,20 @@
 //             cut (a system block and a user message of about 10K tokens each with prefix reuse: a walk whose chunks
 //             the structural tap cuts below the prefill chunk, grouped past the widest, which must run)
 // Every scope must carry the forward's plan (none on the lossless route, which keeps its formula).
-// Skips (77) without INFERNIX_QWEN4_ARTIFACT (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram), for
-// dflash2 without INFERNIX_QWEN4_DFLASH2, and for a4* on an artifact whose experts do not offer 4-bit activations as an
-// option (every one but FP4-Local).
+// Several SCENARIOs run one after another in one process, each Engine on the process's EngineHost (engine_host.h), so
+// every start after the first skips the SSD tier's page-locking and record reads; each prints its own verdict and a
+// failed one does not stop the rest. The exit is 1 when any scenario failed, 77 when every one skipped, 0 otherwise.
+// A scenario skips without INFERNIX_QWEN4_ARTIFACT (INFERNIX_QWEN4_NGRAM: its n-gram volume, default
+// <artifact>.ngram), dflash2 without INFERNIX_QWEN4_DFLASH2, and a4* on an artifact whose experts do not offer 4-bit
+// activations as an option (every one but FP4-Local).
 
+#include "engine_host.h"
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -169,27 +174,17 @@ bool offers_optional_a4(infernix::EngineOptions options) {
     }
 }
 
-} // namespace
+constexpr std::string_view kScenarios[] = {"banks",   "tier",    "mtp",     "dflash2", "two-lanes",
+                                           "scoring", "a8",      "bf16p",   "chat",    "reproducible",
+                                           "kv-bf16", "kv-fp8",  "kv-nvfp4", "kv-k8v4", "kv-vq2",
+                                           "kv-k4v2", "a4",      "a4-residual", "a4-residual-3", "long",
+                                           "cut"};
 
-int main(int argc, char** argv) {
-    const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::printf("skip: INFERNIX_QWEN4_ARTIFACT is not set\n");
-        return 77;
-    }
-    const std::string scenario = argc > 1 ? argv[1] : "banks";
-    constexpr std::string_view kScenarios[] = {"banks",   "tier",    "mtp",     "dflash2", "two-lanes",
-                                               "scoring", "a8",      "bf16p",   "chat",    "reproducible",
-                                               "kv-bf16", "kv-fp8",  "kv-nvfp4", "kv-k8v4", "kv-vq2",
-                                               "kv-k4v2", "a4",      "a4-residual", "a4-residual-3", "long",
-                                               "cut"};
-    if (std::find(std::begin(kScenarios), std::end(kScenarios), scenario) == std::end(kScenarios)) {
-        std::printf("unknown scenario %s\n", scenario.c_str());
-        return 1;
-    }
+// One scenario on `artifact`: 0 when its checks pass, 1 when one fails, 77 when it skips.
+int run_scenario(const std::string& scenario, const char* artifact) {
     const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2");
     if (scenario == "dflash2" && (drafter == nullptr || *drafter == '\0')) {
-        std::printf("skip: INFERNIX_QWEN4_DFLASH2 is not set\n");
+        std::printf("skip dflash2: INFERNIX_QWEN4_DFLASH2 is not set\n");
         return 77;
     }
     try {
@@ -235,7 +230,7 @@ int main(int argc, char** argv) {
                         "(FP4-Local); this one refuses --expert-a4-activations\n", scenario.c_str());
             return 77;
         }
-        infernix::Engine engine(options);
+        infernix::Engine engine(options, infernix::test::engine_host());
         q4t::record_wide_scopes(true);
         if (scenario == "scoring") {
             (void)engine.score_tokens(synthetic_tokens(9000, 5), 1, infernix::ScoreOptions{});
@@ -295,11 +290,50 @@ int main(int argc, char** argv) {
             std::printf("FAIL cut: no walk grouped chunks cut below the prefill chunk\n");
             ++failures;
         }
-        if (failures == 0) { std::printf("wide plan checks passed\n"); }
+        if (failures == 0) { std::printf("%s: wide plan checks passed\n", scenario.c_str()); }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         q4t::record_wide_scopes(false);
-        std::printf("FAIL: %s\n", error.what());
+        std::printf("FAIL %s: %s\n", scenario.c_str(), error.what());
         return 1;
     }
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
+    if (artifact == nullptr || *artifact == '\0') {
+        std::printf("skip: INFERNIX_QWEN4_ARTIFACT is not set\n");
+        return 77;
+    }
+    std::vector<std::string> scenarios;
+    for (int i = 1; i < argc; ++i) { scenarios.emplace_back(argv[i]); }
+    if (scenarios.empty()) { scenarios.emplace_back("banks"); }
+    for (const std::string& scenario : scenarios) {
+        if (std::find(std::begin(kScenarios), std::end(kScenarios), scenario) == std::end(kScenarios)) {
+            std::printf("unknown scenario %s\n", scenario.c_str());
+            return 2;
+        }
+    }
+    std::vector<std::string> failed, skipped;
+    for (const std::string& scenario : scenarios) {
+        const auto start  = std::chrono::steady_clock::now();
+        const int verdict = run_scenario(scenario, artifact);
+        std::printf("-- %s: %s (%.1f s)\n", scenario.c_str(), verdict == 0 ? "PASS" : verdict == 77 ? "SKIP" : "FAIL",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        std::fflush(stdout);
+        if (verdict == 77) { skipped.push_back(scenario); }
+        if (verdict != 0 && verdict != 77) { failed.push_back(scenario); }
+    }
+    const auto join = [](const std::vector<std::string>& names) {
+        std::string text;
+        for (const std::string& name : names) { text += (text.empty() ? "" : " ") + name; }
+        return text;
+    };
+    std::printf("%zu scenarios: %zu failed%s%s, %zu skipped%s%s\n", scenarios.size(), failed.size(),
+                failed.empty() ? "" : ": ", join(failed).c_str(), skipped.size(), skipped.empty() ? "" : ": ",
+                join(skipped).c_str());
+    if (!failed.empty()) { return 1; }
+    return skipped.size() == scenarios.size() ? 77 : 0;
 }

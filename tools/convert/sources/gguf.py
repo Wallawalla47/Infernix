@@ -159,13 +159,15 @@ class GGUFSource:
             yield name, info.shape, info.dtype
 
     def metadata(self) -> dict:
-        """Raw GGUF key/value metadata (architecture, hyperparameters, tokenizer, ...)."""
+        """Raw GGUF key/value metadata (architecture, hyperparameters, tokenizer, ...). A field gguf-py cannot
+        decode raises, naming it: a None in its place read as a missing or different value and named the wrong
+        cause (or passed a check that only asked for a value's absence)."""
         result = {}
         for key, field in self._reader.fields.items():
             try:
                 result[key] = field.contents()
-            except Exception:
-                result[key] = None
+            except Exception as error:
+                raise ValueError(f"{self.path}: GGUF metadata {key} cannot be decoded: {error}") from error
         return result
 
     def close(self) -> None:

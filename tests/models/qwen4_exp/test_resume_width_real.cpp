@@ -117,12 +117,17 @@ int main(int argc, char** argv) {
             const auto [r, L] = cases[c];
             const auto tokens = engine.tokenize_text(infernix::test::resume_probe_text(kThemes[c], 90));
             if (tokens.size() <= L + 1 || r >= L) { throw std::runtime_error("a case's prompt is too short or its resume past its end"); }
-            infernix::models::qwen4_exp::testing::set_forced_tap(r);
             {
+                // The forced tap holds for the head's request only, and is cleared on every path, a throw included.
+                struct ForcedTap {
+                    explicit ForcedTap(std::uint32_t at) { infernix::models::qwen4_exp::testing::set_forced_tap(at); }
+                    ~ForcedTap() { infernix::models::qwen4_exp::testing::set_forced_tap(std::nullopt); }
+                    ForcedTap(const ForcedTap&)            = delete;
+                    ForcedTap& operator=(const ForcedTap&) = delete;
+                } forced_tap(r);
                 const std::vector<infernix::TokenId> head(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(r + 1));
                 (void)engine.generate(engine.prepare_tokens(head), infernix::test::resume_probe_request(1, true));
             }
-            infernix::models::qwen4_exp::testing::set_forced_tap(std::nullopt);
             const Readout resumed = read_next(engine, tokens, L, true);
             const Readout cold    = read_next(engine, tokens, L, false);
             const bool equal      = std::bit_cast<std::uint32_t>(resumed.logprob) == std::bit_cast<std::uint32_t>(cold.logprob);

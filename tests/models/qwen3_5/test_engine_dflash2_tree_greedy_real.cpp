@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
 
         infernix::EngineOptions options;
         options.artifact_path               = artifact;
+        options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
         options.max_context                 = kContext;
         options.kv_capacity                 = infernix::KvCapacityPolicy::explicit_capacity(kContext * streams);
         options.prefill_chunk               = kContext;

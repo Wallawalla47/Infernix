@@ -1,3 +1,4 @@
+#include "real_test_artifact.h"
 #include "infernix/engine.h"
 #include "models/resume_cold_probe.h"
 
@@ -37,6 +38,7 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact, st
                                        bool fast_paths) {
     infernix::EngineOptions options;
     options.artifact_path   = artifact;
+    options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
     options.fast_paths      = fast_paths;
     options.max_context     = 4096;
     options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4096);

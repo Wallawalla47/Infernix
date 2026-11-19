@@ -571,6 +571,66 @@ int fp16_accumulate_case(const Case& test_case, std::uint32_t seed, InputPattern
     return failures;
 }
 
+// Call-split bits of a chunked arithmetic: the tokens in one call against the same tokens cut into
+// calls at `cuts` (the state carried between them), compared bit for bit. Qwen3.8-Flash-Next's prefill
+// calls start on the prefill chunk grid unless free-cache-resume runs, so a resume or a walk group moves no
+// call start off it; where both arithmetics give the same bits for cuts on that grid (multiples of 64),
+// gdn-f16-accumulate couples no requests (qwen4_exp FastPathSelection::request_invariant, P4A-02).
+// Returns the number of differing output and state elements.
+std::size_t split_bits_case(const Case& test_case, const std::vector<int>& cuts, std::uint32_t seed,
+                            ops::GdnChunkArithmetic arithmetic) {
+    const gdn_ref::Inputs in = make_inputs(test_case, seed, InputPattern::Ordinary);
+    const float scale        = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    DeviceInputs device(in);
+    const int tokens = test_case.tokens;
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, tokens});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, tokens});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, tokens});
+    const auto workspace_bytes =
+        ops::gated_delta_net_workspace_capacity_bytes(test_case.qk_heads, test_case.value_heads, 1, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    const auto run = [&](const std::vector<int>& calls) {
+        DeviceBuffer state_a = to_device_f32(in.state);
+        DeviceBuffer state_b = to_device_f32(in.state);
+        DeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
+        Tensor output(out.p, DType::BF16, {kStateDim, test_case.value_heads, tokens});
+        DeviceBuffer* current = &state_a;
+        DeviceBuffer* next    = &state_b;
+        int begin             = 0;
+        for (int length : calls) {
+            Tensor input_state(current->p, DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+            Tensor output_state(next->p, DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+            Tensor os = output.slice(2, begin, length);
+            ops::gated_delta_net(q.slice(2, begin, length), k.slice(2, begin, length), v.slice(2, begin, length),
+                                 g.slice(1, begin, length), beta.slice(1, begin, length), scale, true, workspace,
+                                 input_state, output_state, os, execution(), arithmetic);
+            std::swap(current, next);
+            begin += length;
+        }
+        cuda_synchronize();
+        return std::pair{from_device<std::uint16_t>(out.p, in.v.size()), from_device<std::uint32_t>(current->p, in.state.size())};
+    };
+    std::vector<int> calls;
+    int previous = 0;
+    for (int cut : cuts) {
+        calls.push_back(cut - previous);
+        previous = cut;
+    }
+    calls.push_back(tokens - previous);
+    const auto whole = run({tokens});
+    const auto split = run(calls);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < whole.first.size(); ++i) { differing += whole.first[i] != split.first[i] ? 1U : 0U; }
+    for (std::size_t i = 0; i < whole.second.size(); ++i) { differing += whole.second[i] != split.second[i] ? 1U : 0U; }
+    std::cout << "GDN_SPLIT " << test_case.name << " T=" << tokens << " calls=" << calls.size()
+              << (arithmetic == ops::GdnChunkArithmetic::Fp16Accumulate ? " fp16acc" : " compensated") << ": "
+              << differing << " of " << whole.first.size() + whole.second.size() << " elements differ\n";
+    return differing;
+}
+
 int batch_update_case(const Case& test_case, const std::vector<int>& source_slots,
                       const std::vector<int>& destination_slots, int slots, std::uint32_t seed) {
     if (test_case.tokens != 1) { throw std::logic_error("batch_update_case requires W=1"); }
@@ -1044,6 +1104,20 @@ INFERNIX_OP_TEST(gated_delta_net) {
     failures += fp16_accumulate_case({"zero signal", 1, 3, 17, true}, 14417U, InputPattern::ZeroSignal);
     failures += fp16_accumulate_case({"zero beta", 1, 3, 17, true}, 14517U, InputPattern::ZeroBeta);
     failures += fp16_accumulate_case({"unit beta", 1, 3, 257, true}, 14657U, InputPattern::UnitBeta);
+
+    // Call cuts on the prefill chunk grid (multiples of 64) leave both chunked arithmetics' bits unchanged
+    // (split_bits_case): the Flash-Next and 27B geometries, a cut at a chunk boundary and three calls.
+    for (const auto arithmetic : {ops::GdnChunkArithmetic::Compensated, ops::GdnChunkArithmetic::Fp16Accumulate}) {
+        for (const auto geometry : {Geometry{"flash-next", 16, 32, 2049}, Geometry{"qwen-27b", 16, 48, 2049}}) {
+            const Case split_case{geometry.name, geometry.qk_heads, geometry.value_heads, geometry.tokens, true};
+            for (const auto& cuts : {std::vector<int>{1024}, std::vector<int>{512, 1536}}) {
+                if (split_bits_case(split_case, cuts, 93000U + geometry.value_heads, arithmetic) != 0) {
+                    std::cerr << "GDN split " << geometry.name << ": call cuts on the chunk grid changed the bits\n";
+                    ++failures;
+                }
+            }
+        }
+    }
 
     // fp16-gdn-state on the recurrent route (T < 16), across the chunked boundary and on the 27B, 35B and
     // 122B geometries, with both chunk arithmetics, and through the decode update.

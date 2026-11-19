@@ -116,7 +116,13 @@ struct Arm {
 };
 
 Arm run_arm(const Setup& setup, std::string_view drafter, bool fast_paths, bool startup_capture) {
-    infernix::models::qwen4_exp::testing::set_startup_capture(startup_capture);
+    // The switch holds for this arm's Engine and is cleared on every path, a throw included.
+    struct CaptureSwitch {
+        explicit CaptureSwitch(bool on) { infernix::models::qwen4_exp::testing::set_startup_capture(on); }
+        ~CaptureSwitch() { infernix::models::qwen4_exp::testing::set_startup_capture(std::nullopt); }
+        CaptureSwitch(const CaptureSwitch&)            = delete;
+        CaptureSwitch& operator=(const CaptureSwitch&) = delete;
+    } capture_switch(startup_capture);
     Arm arm;
     std::mutex mutex;
     auto options = engine_options(setup, drafter, fast_paths);
@@ -148,7 +154,6 @@ Arm run_arm(const Setup& setup, std::string_view drafter, bool fast_paths, bool 
         }
         for (auto& handle : handles) { arm.together.push_back(handle.wait().generated_token_ids); }
     }
-    infernix::models::qwen4_exp::testing::set_startup_capture(std::nullopt);
     std::fflush(stdout);
     return arm;
 }

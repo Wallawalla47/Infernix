@@ -101,6 +101,34 @@ struct Observed {
     infernix::RuntimeStats stats;
 };
 
+// Restore-exact's two prompts (the SSD tier's too): the second shares the first's first 1400 tokens.
+std::pair<std::vector<infernix::TokenId>, std::vector<infernix::TokenId>> restore_prompts() {
+    std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
+    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    return {std::move(first), std::move(second)};
+}
+
+// The Device-resident engine on restore_prompts() (16384 KV tokens, a 1 GiB Host tier, eight Device snapshot slots):
+// the first prompt, then the second, which resumes from its snapshot. Restore-exact compares its Host restore with it
+// and the SSD tier its SSD restore, so one run per drafter serves both, made by whichever runs first (a fresh Engine of
+// the same options gives the same greedy tokens, which restore-exact's own comparison already rests on).
+Observed device_restore_reference(const char* artifact, infernix::SpeculativeBackend backend) {
+    static std::vector<std::pair<infernix::SpeculativeBackend, Observed>> runs;
+    for (const auto& [ran, observed] : runs) {
+        if (ran == backend) { return observed; }
+    }
+    const auto prompts = restore_prompts();
+    const std::vector<infernix::TokenId>& first  = prompts.first;
+    const std::vector<infernix::TokenId>& second = prompts.second;
+    infernix::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
+    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+    const infernix::GenerationResult result = engine.generate(engine.prepare_tokens(second), greedy(24));
+    runs.emplace_back(backend, Observed{result.generated_token_ids, result.reused_prompt_tokens, engine.runtime_stats()});
+    return runs.back().second;
+}
+
 // GitHub #29: after a ladder of long prompts with repeats on a small Host tier, the cache stopped
 // reusing for the rest of the session (identical repeats and continued turns prefilled from zero,
 // endpoints_created frozen). A tap or endpoint superseded the lineage's previous snapshot before it
@@ -189,25 +217,21 @@ int exercise_issue29(const char* artifact) {
 // same snapshot comes back through the Host slabs. Both restores carry identical bytes and resume
 // at the same frontier with the same chunking, so greedy generation must match token for token.
 int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend backend) {
-    const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
-    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
-    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
-    second.insert(second.end(), suffix.begin(), suffix.end());
+    const auto prompts = restore_prompts();
+    const std::vector<infernix::TokenId>& first  = prompts.first;
+    const std::vector<infernix::TokenId>& second = prompts.second;
     // 3900 prompt tokens need 61 of the constrained engine's 64 pages, evicting all but the
     // first few of the first request's cached blocks.
     const std::vector<infernix::TokenId> pressure = synthetic_tokens(3900, 3);
 
-    const auto run = [&](infernix::EngineOptions options, bool apply_pressure) {
-        infernix::Engine engine(std::move(options));
+    const Observed device = device_restore_reference(artifact, backend);
+    const Observed host   = [&] {
+        infernix::Engine engine(hybrid_options(artifact, backend, 4096, 1ULL << 30, 1));
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-        if (apply_pressure) { (void)engine.generate(engine.prepare_tokens(pressure), greedy(4)); }
-        const infernix::GenerationResult result =
-            engine.generate(engine.prepare_tokens(second), greedy(24));
-        return Observed{result.generated_token_ids, result.reused_prompt_tokens,
-                        engine.runtime_stats()};
-    };
-    const Observed device = run(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8), false);
-    const Observed host   = run(hybrid_options(artifact, backend, 4096, 1ULL << 30, 1), true);
+        (void)engine.generate(engine.prepare_tokens(pressure), greedy(4));
+        const infernix::GenerationResult result = engine.generate(engine.prepare_tokens(second), greedy(24));
+        return Observed{result.generated_token_ids, result.reused_prompt_tokens, engine.runtime_stats()};
+    }();
 
     // The first prompt's chunks end at 512 and 1024; the final chunk [1024, 1500) holds the
     // flexible prompt-tail tap, realized at its start.
@@ -249,16 +273,10 @@ int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend ba
 // (1024) and its blocks out of the Host tier. The second prompt reads them back from the SSD tier and
 // generates exactly what the Device-resident engine does (byte copies at every tier).
 int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend backend) {
-    const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
-    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
-    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
-    second.insert(second.end(), suffix.begin(), suffix.end());
-    std::vector<infernix::TokenId> device_tokens;
-    {
-        infernix::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
-        (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-        device_tokens = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
-    }
+    const auto prompts = restore_prompts();
+    const std::vector<infernix::TokenId>& first  = prompts.first;
+    const std::vector<infernix::TokenId>& second = prompts.second;
+    const std::vector<infernix::TokenId> device_tokens = device_restore_reference(artifact, backend).tokens;
     std::filesystem::path directory;
     if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') {
         directory = dir;

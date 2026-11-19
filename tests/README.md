@@ -60,7 +60,14 @@ real artifact and holds most of the device and its pinned host memory) gets `RUN
 `ctest -LE real` runs everything else. Tests that need a scratch file name it with
 `unique_temp_path()` (`tests/test_temp_path.h`, the process id in the name), so concurrent runs from
 other build trees or worktrees never share one. Assertions about elapsed time wait for the observed
-event with a generous bound rather than assuming a fixed sleep is enough on a loaded machine.
+event with a generous bound rather than assuming a fixed sleep is enough on a loaded machine; a check
+that two threads or the host and the device met waits on a flag or count the other side sets, never
+on a sleep. A few non-real entries run alone (`RUN_SERIAL`): the idle-latency checks, whose bounds of a
+few milliseconds hold only with the GPU to themselves, and entries whose memory or synchronization
+counts need it, each with its reason beside its registration. The twelve softmax attention entries,
+whose oracles use every host thread, take turns in three resource-lock chains (`tests/ops/tests.cmake`)
+balanced by their times at `-j 8`; together they and the serial entries set the run's length.
+`RUN_SERIAL` orders entries within one `ctest` run only: another program's load still reaches them.
 
 The chat-template reference test uses Python Jinja2.
 
@@ -210,6 +217,9 @@ The Python suites exercise conversion, encoded output and measurement tools with
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
 
+The launcher's web UI checks its pure helpers (duration formatting, the routes' wildcard rule, repository
+links) with `npm test` in `apps/launcher/web`, after `npm ci` there; no browser is needed.
+
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
@@ -287,14 +297,16 @@ request and a prefix-cached extension of the failed one return their cold tokens
 completes; and eight failures in a row stop the Engine. After each swept failure no cached block stays
 pinned and no Device state slot is left reserved. `INFERNIX_TEST_OOM_SWEEP_STRIDE=S` adds every S-th count
 up to 4181 to the sweep (28: 166 counts, about 5 minutes on the NVFP4 27B and 15 on FP4-Local).
-`infernix_qwen4_exp_wide_plan_real_test` and its `_<scenario>_` entries (the expert banks, the SSD tier,
-MTP, DFlash2 with `INFERNIX_QWEN4_DFLASH2` naming the drafter, two lanes, causal scoring,
-`--a8-activations`, the packed BF16 KV cache, a chat prompt's pair call, `--reproducible`, every other KV
-storage, the expert-A4 routes, which only FP4-Local's W4A16 banks take, a 48K prompt's 32,768-column MoE
-group, and a walk whose chunks a structural tap cuts below the prefill chunk) record every prefill call
-that runs in the wide workspace lent from the expert frames (`testing::record_wide_scopes`) and print its
-arena, the forward's plan for it (`Forward::plan_run` and its siblings, which sizes the arena) and its
-peak; a scope without a plan, given less than it, or peaking past it fails.
+`infernix_qwen4_exp_wide_plan_real_test` (scenarios: the expert banks, the SSD tier, MTP, DFlash2 with
+`INFERNIX_QWEN4_DFLASH2` naming the drafter, two lanes, causal scoring, `--a8-activations`, the packed BF16
+KV cache, a chat prompt's pair call, `--reproducible`, every other KV storage, a 48K prompt's 32,768-column
+MoE group, and a walk whose chunks a structural tap cuts below the prefill chunk) and
+`infernix_qwen4_exp_wide_plan_a4_real_test` (the expert-A4 routes, which only FP4-Local's W4A16 banks take)
+record every prefill call that runs in the wide workspace lent from the expert frames
+(`testing::record_wide_scopes`) and print its arena, the forward's plan for it (`Forward::plan_run` and its
+siblings, which sizes the arena) and its peak; a scope without a plan, given less than it, or peaking past
+it fails. An entry runs its scenarios one after another in one process (the executable takes any list of
+them), each with its own verdict line, and a failed scenario does not stop the rest.
 
 These tests start their Engines on one `EngineHost` per process (`tests/models/qwen4_exp/engine_host.h`).
 Each start after the first takes the SSD expert tier's page-locked slots, and the expert records the
