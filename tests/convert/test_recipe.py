@@ -213,6 +213,76 @@ def test_nvfp4_encoded_only_import_streams_complete_parent_tiles(tmp_path):
         )
 
 
+def _modelopt_nvfp4(tmp_path, input_scales=(0.0390625, 0.0390625)):
+    """Two ModelOpt NVFP4 [128, 64] matrices sharing weight_scale_2 7.011777e-05 (not a power of two)."""
+    generator = torch.Generator().manual_seed(3)
+    tensors, words = {}, {}
+    for name, input_scale in zip(("gate", "up"), input_scales):
+        codes = torch.randint(0, 256, (128, 32), generator=generator, dtype=torch.uint8)
+        scales = torch.randint(0, 0x7F, (128, 4), generator=generator, dtype=torch.uint8)
+        tensors[name + ".weight"] = codes
+        tensors[name + ".weight_scale"] = scales.view(torch.float8_e4m3fn)
+        tensors[name + ".weight_scale_2"] = torch.tensor(7.011777e-05, dtype=torch.float32)
+        tensors[name + ".input_scale"] = torch.tensor([input_scale], dtype=torch.float32)
+        words[name] = (codes, scales)
+    from safetensors.torch import save_file
+
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    return words
+
+
+def test_modelopt_nvfp4_imports_its_multiplier_and_input_scale_exactly(tmp_path):
+    """nvfp4_mul in block_scale_k16_m128x4_v1 (NVIDIA's QAD 27B): the codes, block scales and weight_scale_2
+    word as stored, and each A4 Use's input_scale word as its activation_input_scale."""
+    from tools.convert.sources.compressed_tensors import matrix_source
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    words = _modelopt_nvfp4(tmp_path)
+    with SafetensorsSource(tmp_path) as store:
+        model = Model({"text": {"config": {}}})
+        for name in ("gate", "up"):
+            model.add(Parameter(name, (128, 64), matrix_source(store, name + ".weight", (128, 64), "nvfp4_mul"),
+                                inputs=("input",)))
+        model.packing_groups = [("gate", "up")]
+        recipe = Recipe(model)
+        recipe.assign("*", format="nvfp4_mul", layout="block_scale_k16_m128x4_v1", method=import_encoded,
+                      activation_policy="AllowA4")
+        prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+        assert len(prepared.weights) == 1 and len(prepared.auxiliaries) == 2
+        path = tmp_path / "nvfp4_mul.infernix"
+        _write(path, model, prepared)
+    multiplier = struct.pack("<f", 7.011777e-05)
+    expected = encode_nvfp4(
+        torch.cat((words["gate"][0], words["up"][0])), torch.cat((words["gate"][1], words["up"][1])), multiplier,
+        (256, 64),
+    )
+    with Artifact(path) as artifact:
+        obj = artifact.object(prepared.weights[0].spec.id)
+        assert (obj.format, obj.layout) == ("nvfp4_mul", "block_scale_k16_m128x4_v1")
+        assert artifact.read_object(obj.id) == expected
+        for use in artifact.directory.uses:
+            scale = use["auxiliaries"]["activation_input_scale"]["object"]
+            assert artifact.read_object(scale) == struct.pack("<f", 0.0390625)
+
+
+def test_fused_modelopt_nvfp4_inputs_need_one_input_scale(tmp_path):
+    from tools.convert.sources.compressed_tensors import matrix_source
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    _modelopt_nvfp4(tmp_path, input_scales=(0.0390625, 0.046875))
+    with SafetensorsSource(tmp_path) as store:
+        model = Model({"text": {"config": {}}})
+        for name in ("gate", "up"):
+            model.add(Parameter(name, (128, 64), matrix_source(store, name + ".weight", (128, 64), "nvfp4_mul"),
+                                inputs=("input",)))
+        model.packing_groups = [("gate", "up")]
+        recipe = Recipe(model)
+        recipe.assign("*", format="nvfp4_mul", layout="block_scale_k16_m128x4_v1", method=import_encoded,
+                      activation_policy="AllowA4")
+        with pytest.raises(ValueError, match="one activation scale"):
+            recipe.prepare(device="cpu", rows_per_chunk=128)
+
+
 def test_incompatible_nvfp4_divisors_keep_default_parents_separate():
     model = Model({"text": {"config": {}}})
     for name, divisor in (("gate", 2.0), ("up", 4.0)):

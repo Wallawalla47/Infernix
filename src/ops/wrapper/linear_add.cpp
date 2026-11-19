@@ -78,15 +78,19 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::A16ColumnInvariant:
     case LinearPolicy::AllowA4Residual:
     case LinearPolicy::AllowA8Residual:
+    // The NVFP4 and FP8 8-bit routes (the Engine binds A8Only on NVIDIA's NVFP4 and FP8 projections only).
+    case LinearPolicy::A8Only:
         return;
     }
     throw std::invalid_argument("linear_add: invalid compute policy");
 }
 
-// Row-scaled FP8: fp8_e4m3fn_row_bf16 [5120,6144] and [5120,17408]; Qwen3.5-122B-A10B's
-// static-scale fp8_e4m3fn_row_f32 [3072,8192] (attention and GDN output projections).
+// Row-scaled FP8: fp8_e4m3fn_row_bf16 [5120,6144] and [5120,17408]; static-scale fp8_e4m3fn_row_f32
+// [3072,8192] (Qwen3.5-122B-A10B) and [5120,6144] (NVIDIA's QAD 27B): attention and GDN output projections.
 bool fp8_linear_add_shape(QType qtype, std::int32_t output_rows, std::int32_t input_rows) {
-    if (qtype == QType::FP8_E4M3FN_ROW_F32) { return output_rows == 3072 && input_rows == 8192; }
+    const bool n5120_k6144 =
+        output_rows == detail::Fp8N5120K6144::kOutputRows && input_rows == detail::Fp8N5120K6144::kInputRows;
+    if (qtype == QType::FP8_E4M3FN_ROW_F32) { return (output_rows == 3072 && input_rows == 8192) || n5120_k6144; }
     return (output_rows == detail::Fp8N5120K6144::kOutputRows &&
             input_rows == detail::Fp8N5120K6144::kInputRows) ||
            (output_rows == detail::Fp8N5120K17408::kOutputRows &&

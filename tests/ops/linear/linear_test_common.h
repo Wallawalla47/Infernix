@@ -61,6 +61,11 @@ quantized_weight::PackedWeight make_q8_g32_fp16_weight(std::int32_t n, std::int3
                                                        std::uint32_t seed);
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed);
+// ModelOpt's multiplier form (an nvfp4_mul parent run as QType::NVFP4: NVIDIA's QAD 27B): a weight_scale_2
+// and an input_scale that are not powers of two (kNvfp4MulMultiplier, kNvfp4MulInputScale).
+inline constexpr float kNvfp4MulMultiplier = 7.011777e-02F;
+inline constexpr float kNvfp4MulInputScale = 0.2873563F;
+quantized_weight::PackedWeight make_nvfp4_mul_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
 quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
 // fp8_e4m3fn_row_f32 without a static activation scale (a per-token parent).
 quantized_weight::PackedWeight make_fp8_f32_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);

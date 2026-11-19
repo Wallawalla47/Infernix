@@ -202,11 +202,14 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
-// The positive FP32 matrix coefficient word at divisor_offset: an NVFP4 divisor, or an
-// nvfp4_rg16_v1 matrix's multiplier; 0 for every other object.
+// The positive FP32 matrix coefficient word at divisor_offset: an nvfp4 divisor, or a dense nvfp4_mul
+// matrix's multiplier (nvfp4_rg16_v1 or BlockScale); 0 for every other object.
 float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
                    std::span<const std::byte> host, MaterializationStats& stats) {
-    if (geometry.format != QType::NVFP4 && geometry.layout != QuantLayout::Rg16) { return 0.0F; }
+    if (geometry.format != QType::NVFP4 && geometry.layout != QuantLayout::Rg16 &&
+        !(geometry.format == QType::NVFP4_MUL && geometry.layout == QuantLayout::BlockScaleK16M128x4)) {
+        return 0.0F;
+    }
     std::array<std::byte, 4> word{};
     if (!host.empty()) {
         std::copy_n(host.data() + geometry.divisor_offset, word.size(), word.data());
@@ -224,12 +227,12 @@ float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeomet
     return value;
 }
 
-// A parent of `geometry` at `data`: an NVFP4 parent keeps its divisor, an nvfp4_rg16_v1 parent its
+// A parent of `geometry` at `data`: an nvfp4 parent keeps its divisor, a dense nvfp4_mul parent its
 // multiplier (one word, read by read_divisor).
 WeightParent weight_parent(const WeightGeometry& geometry, const std::byte* data, float coefficient,
                            const std::byte* device = nullptr) {
     WeightParent parent{geometry, data, 0.0F, device};
-    if (geometry.layout == QuantLayout::Rg16) {
+    if (geometry.format == QType::NVFP4_MUL) {
         parent.weight_multiplier = coefficient;
     } else {
         parent.weight_scale_divisor = coefficient;
@@ -421,7 +424,7 @@ MaterializedArtifact materialize_geometry(const Reader& reader, MaterializationP
                 throw ArtifactError("invalid or duplicate device placement");
             }
             const auto divisor =
-                object.host ? (geometry.layout == QuantLayout::Rg16 ? object.host->weight_multiplier
+                object.host ? (geometry.format == QType::NVFP4_MUL ? object.host->weight_multiplier
                                                                     : object.host->weight_scale_divisor)
                             : read_divisor(reader, placement.object, geometry, {}, out.stats_);
             std::byte* at = reservation->data() + placement.offset;
@@ -573,7 +576,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             storage_data = device_base + placement.offset;
         }
         const auto divisor =
-            object.host ? (geometry.layout == QuantLayout::Rg16 ? object.host->weight_multiplier
+            object.host ? (geometry.format == QType::NVFP4_MUL ? object.host->weight_multiplier
                                                                 : object.host->weight_scale_divisor)
                         : read_divisor(reader, placement.object, geometry, {}, out.stats_);
         object.device = weight_parent(geometry, storage_data, divisor, storage_data);

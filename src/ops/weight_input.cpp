@@ -59,6 +59,15 @@ bool contiguous(const WeightView& view) {
 }
 
 LinearPolicy common_policy(std::span<const WeightInput> inputs) {
+    // `--a8-activations`' A8Only replaces every input's permission of a parent alike.
+    const auto a8_only_inputs = std::count_if(inputs.begin(), inputs.end(),
+                                              [](const WeightInput& input) { return a8_only(input.policy); });
+    if (a8_only_inputs != 0) {
+        if (a8_only_inputs != static_cast<std::ptrdiff_t>(inputs.size())) {
+            throw std::invalid_argument("a shared projection input mixes A8Only with other activation policies");
+        }
+        return LinearPolicy::A8Only;
+    }
     auto result = LinearPolicy::AllowA4;
     for (const auto& input : inputs) {
         switch (input.policy) {
@@ -82,7 +91,29 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     const auto region = contiguous_weight_region(view);
     const auto policy = common_policy(inputs);
     float divisor     = 0;
-    if (region.parent->geometry.format == QType::NVFP4) {
+    float nvfp4_scale = 0;
+    if (region.parent->geometry.format == QType::NVFP4_MUL &&
+        region.parent->geometry.layout == QuantLayout::BlockScaleK16M128x4) {
+        // ModelOpt's multiplier form: the weight's FP32 weight_scale_2 and, for A4, the inputs' one FP32
+        // input_scale s as stored. The activations encode with fl32(1 / s), vLLM's input_scale_inv, and the
+        // kernels scale the products by fl32(s * weight_scale_2), vLLM's alpha.
+        require(std::isfinite(region.parent->weight_multiplier) && region.parent->weight_multiplier > 0,
+                "an nvfp4_mul parent requires a positive multiplier");
+        for (const auto& input : inputs) {
+            if (!input.activation_input_scale) {
+                require(!allows_a4(policy), "an nvfp4_mul A4 input requires its activation scale");
+                continue;
+            }
+            require(std::isfinite(*input.activation_input_scale) && *input.activation_input_scale > 0,
+                    "an nvfp4_mul input requires a positive activation scale");
+            require(nvfp4_scale == 0 || std::bit_cast<std::uint32_t>(nvfp4_scale) ==
+                                            std::bit_cast<std::uint32_t>(*input.activation_input_scale),
+                    "a shared nvfp4_mul input requires identical activation scales");
+            nvfp4_scale = *input.activation_input_scale;
+        }
+        // A16 reads neither; the native ABI validates a positive divisor.
+        divisor = nvfp4_scale > 0 ? 1.0F / nvfp4_scale : 1.0F;
+    } else if (region.parent->geometry.format == QType::NVFP4) {
         require(std::isfinite(region.parent->weight_scale_divisor) &&
                     region.parent->weight_scale_divisor > 0,
                 "NVFP4 parent requires a positive weight divisor");
@@ -110,6 +141,7 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
         if (divisor == 0) { divisor = 1.0F; }
     }
     auto weight = native_weight(view, divisor);
+    weight.input_scale = nvfp4_scale;
     if (region.parent->geometry.format == QType::FP8_E4M3FN_ROW_F32) {
         // A static A8 parent's inputs share one activation encoding, so one calibrated scale. A parent
         // whose inputs carry none (ModelOpt FP8_PER_CHANNEL_PER_TOKEN) encodes each activation column
@@ -166,8 +198,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
         const bool supported =
             (moe && format == QType::Q8_G32_FP16) ||
             (moe_122b && format == QType::FP8_E4M3FN_ROW_F32) ||
-            (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
-                       (attention && format == QType::BF16)));
+            (dense && (format == QType::NVFP4 || is_fp8_row(format) || (attention && format == QType::BF16)));
         require(supported, "input projection: unsupported single-parent format");
         return result;
     }

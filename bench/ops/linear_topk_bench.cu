@@ -1,4 +1,5 @@
-// Public cold-cache benchmark for the three registered linear_topk profiles.
+// Public cold-cache benchmark for the registered linear_topk profiles: the fused Q8, FP8 and Q4 heads and the
+// materialized NVFP4 head of NVIDIA's Qwen3.8-27B NVFP4-QAD (its A16 linear, then the grouped selection).
 #include "core/weight.h"
 #include "infernix/ops/linear_topk.h"
 
@@ -27,24 +28,27 @@ enum class Profile {
     Q8,
     Fp8,
     Q4,
+    Nvfp4,
 };
 
 const char* profile_name(Profile profile) {
     if (profile == Profile::Q8) { return "q8-full"; }
     if (profile == Profile::Fp8) { return "fp8-full"; }
+    if (profile == Profile::Nvfp4) { return "nvfp4-full"; }
     return "q4-optimized";
 }
 
 void run(Profile profile, std::int32_t width, std::int32_t columns, int warmup, int repeat) {
     constexpr std::int32_t kTopK   = 16;
     const std::int32_t rows        = profile == Profile::Q4 ? 131072 : 248320;
-    const QType qtype              = profile == Profile::Q8    ? QType::Q8_G32_FP16
-                                     : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16
-                                                               : QType::Q4_G64_FP16;
+    const QType qtype              = profile == Profile::Q8      ? QType::Q8_G32_FP16
+                                     : profile == Profile::Fp8   ? QType::FP8_E4M3FN_ROW_BF16
+                                     : profile == Profile::Nvfp4 ? QType::NVFP4
+                                                                 : QType::Q4_G64_FP16;
 
-    PackedQuantizedWeight packed = profile == Profile::Fp8
-                                       ? make_fp8_weight(rows, width)
-                                       : make_row_split_weight(qtype, rows, width, width, 501U);
+    PackedQuantizedWeight packed = profile == Profile::Fp8     ? make_fp8_weight(rows, width)
+                                   : profile == Profile::Nvfp4 ? make_nvfp4_weight(rows, width)
+                                                               : make_row_split_weight(qtype, rows, width, width, 501U);
     DeviceBuffer hidden          = make_bf16(static_cast<std::size_t>(width) * columns, 101U);
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * columns * sizeof(float));
@@ -94,7 +98,8 @@ Profile parse_profile(std::string_view value) {
     if (value == "q8-full") { return Profile::Q8; }
     if (value == "fp8-full") { return Profile::Fp8; }
     if (value == "q4-optimized") { return Profile::Q4; }
-    throw std::invalid_argument("profile must be q8-full, fp8-full, or q4-optimized");
+    if (value == "nvfp4-full") { return Profile::Nvfp4; }
+    throw std::invalid_argument("profile must be q8-full, fp8-full, nvfp4-full or q4-optimized");
 }
 
 } // namespace
@@ -113,7 +118,7 @@ int main(int argc, char** argv) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::printf(
-                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized] [--hidden 5120|2560] "
+                    "usage: %s [--profile all|q8-full|fp8-full|nvfp4-full|q4-optimized] [--hidden 5120|2560] "
                     "[--columns U,...] [--warmup N] [--repeat N]\n"
                     "  --hidden: the head width, Qwen3.8-27B's 5120 (default) or Qwen3.8-Flash-Next's 2560\n"
                     "            (q8-full and q4-optimized).\n",
@@ -148,12 +153,12 @@ int main(int argc, char** argv) {
         if (hidden != 5120 && hidden != 2560) throw std::invalid_argument("--hidden must be 5120 or 2560");
         std::vector<Profile> profiles;
         if (profile == "all")
-            profiles = hidden == 5120 ? std::vector{Profile::Q8, Profile::Fp8, Profile::Q4}
+            profiles = hidden == 5120 ? std::vector{Profile::Q8, Profile::Fp8, Profile::Nvfp4, Profile::Q4}
                                       : std::vector{Profile::Q8, Profile::Q4};
         else
             profiles = {parse_profile(profile)};
-        if (hidden != 5120 && profiles.front() == Profile::Fp8)
-            throw std::invalid_argument("fp8-full registers H 5120 only");
+        if (hidden != 5120 && (profiles.front() == Profile::Fp8 || profiles.front() == Profile::Nvfp4))
+            throw std::invalid_argument("fp8-full and nvfp4-full register H 5120 only");
         std::puts(
             "profile,H,U,median_us,min_us,p95_us,logical_weight_GBs,useful_TFLOPs,workspace_bytes,"
             "graph_nodes");

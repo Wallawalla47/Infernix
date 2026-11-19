@@ -22,8 +22,10 @@ struct PendingWeight {
 
 class Bindings {
 public:
-    // The lossless route binds every Use A16Only (LoadOptions::lossless).
-    Bindings(artifact::Binder& binder, bool a16_only) : binder(binder), a16_only(a16_only) {}
+    // The lossless route binds every Use A16Only (LoadOptions::lossless); `a8_only` (LoadOptions::a8_dense) binds
+    // the text Uses that permit 4- or 8-bit activations A8Only.
+    Bindings(artifact::Binder& binder, bool a16_only, bool a8_only = false)
+        : binder(binder), a16_only(a16_only), a8_only(a8_only) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
@@ -39,6 +41,7 @@ public:
 
     artifact::Binder& binder;
     bool a16_only = false;
+    bool a8_only  = false;
     std::vector<PendingWeight> weights;
 
 private:

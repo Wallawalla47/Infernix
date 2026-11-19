@@ -44,25 +44,29 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
-    const auto operands = fp8_a8_operands(weight, workspace, x.ne[1]);
-    const auto launch   = [&]<class Schedule>() {
-        using S = Fp8ScheduleInstance<Schedule, 5120>;
-        if constexpr (S::kTmaSwizzle)
-            launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
-                                       workspace.partials);
-        else
-            launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream, {},
-                                 pdl::Dependency::Programmatic);
-    };
-    if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
-    if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();
-    if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
-    if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
-    // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
-    if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
-    // Three 192-token tiles: 152-154 against 167-172 us for five 128-token ones (RTX 5090, 2026-11-10; no
-    // split-K tail either way, so the same bits).
-    if (x.ne[1] > 512 && x.ne[1] <= 576) return launch.template operator()<Tma192x128>();
-    launch.template operator()<Bulk>();
+    // BF16 row words with per-token activation scales, or FP32 ones (fp8_e4m3fn_row_f32) with the
+    // parent's static input scale in every token's slot (launch_fp8_a8_quantize).
+    with_fp8_scale_word(weight, [&]<class Scale>() {
+        const auto operands = fp8_a8_operands<Scale>(weight, workspace, x.ne[1]);
+        const auto launch   = [&]<class Schedule>() {
+            using S = Fp8ScheduleInstance<Schedule, 5120>;
+            if constexpr (S::kTmaSwizzle)
+                launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
+                                           workspace.partials);
+            else
+                launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream, {},
+                                     pdl::Dependency::Programmatic);
+        };
+        if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
+        if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();
+        if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
+        if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
+        // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
+        if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
+        // Three 192-token tiles: 152-154 against 167-172 us for five 128-token ones (RTX 5090, 2026-11-10; no
+        // split-K tail either way, so the same bits).
+        if (x.ne[1] > 512 && x.ne[1] <= 576) return launch.template operator()<Tma192x128>();
+        launch.template operator()<Bulk>();
+    });
 }
 } // namespace infernix::ops::detail

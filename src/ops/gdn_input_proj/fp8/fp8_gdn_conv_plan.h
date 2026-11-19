@@ -13,14 +13,15 @@
 
 namespace infernix::ops::detail {
 
-// input_rows selects the parent: 5120 ([16384,5120]) or 3072 (Qwen3.5-122B-A10B's [20480,3072]).
-[[nodiscard]] std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
+// input_rows selects the parent: 5120 ([16384,5120]) or 3072 (Qwen3.5-122B-A10B's [20480,3072]); qtype its row
+// word (fp8_e4m3fn_row_f32: a static input scale, no A8 residual profile).
+[[nodiscard]] std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(QType qtype, LinearPolicy policy,
                                                                     std::int32_t input_rows,
                                                                     std::int32_t batch_size,
                                                                     std::int32_t min_width,
                                                                     std::int32_t max_width);
 
-[[nodiscard]] std::size_t fp8_gdn_record_workspace_capacity_bytes(LinearPolicy policy,
+[[nodiscard]] std::size_t fp8_gdn_record_workspace_capacity_bytes(QType qtype, LinearPolicy policy,
                                                                   std::int32_t input_rows,
                                                                   std::int32_t batch_size,
                                                                   std::int32_t min_width,

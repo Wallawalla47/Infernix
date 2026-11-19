@@ -281,6 +281,23 @@ bool a8_linear_sums(std::span<const GgmlSegment> segments) { return a8_linear::s
 
 std::int32_t a8_linear_column_words(std::int32_t k, bool sums) { return a8_linear::column_stride(k, sums); }
 
+void a8_encode_columns(const Tensor& x, Tensor& encoded, cudaStream_t stream) {
+    using namespace a8_linear;
+    const int k = x.ne[0], columns = x.ne[1];
+    require(x.dtype == DType::BF16 && x.is_contiguous() && k > 0 && k % 32 == 0 && columns >= 1,
+            "a8_encode_columns takes contiguous BF16 [K, T], K a multiple of 32");
+    const int stride = column_stride(k, false);
+    require(encoded.dtype == DType::I32 && encoded.is_contiguous() && encoded.ne[0] == stride && encoded.ne[1] == columns,
+            "a8_encode_columns writes contiguous I32 [a8_linear_column_words(K, false), T]");
+    const int vec   = reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 ? 1 : 0;
+    const int items = columns * (k / 32) * 4;
+    CUDA_CHECK(pdl::launch_consumer({dim3((items + kEncodeThreads - 1) / kEncodeThreads), dim3(kEncodeThreads), 0, stream},
+                                    encode_kernel, static_cast<const std::uint16_t*>(x.data), k,
+                                    static_cast<const std::int32_t*>(nullptr), 32, static_cast<std::int32_t*>(encoded.data),
+                                    stride, columns, 0, vec));
+    check_launch("encode");
+}
+
 void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
                     const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream) {
     using namespace a8_linear;

@@ -355,12 +355,15 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     the source's static FP32 ``input_scale`` as its ``activation_input_scale``, and inputs fused into
     one parent must share it (they share one activation encoding). A source without one (ModelOpt
     ``FP8_PER_CHANNEL_PER_TOKEN``) records none: its activations take a scale per column at run time,
-    and a parent may not mix the two. ``nvfp4_mul`` in
-    ``nvfp4_rg16_v1`` keeps ModelOpt's FP32 multiplier exactly."""
+    and a parent may not mix the two. ``nvfp4_mul`` (``nvfp4_rg16_v1`` or ``block_scale_k16_m128x4_v1``)
+    keeps ModelOpt's FP32 multiplier exactly; an ``AllowA4`` input records the source's FP32 ``input_scale`` as
+    its ``activation_input_scale`` (inputs fused into one parent share it: one activation encoding)."""
     if request.target.format not in _IMPORT_FORMATS or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
-    if request.target.format == "nvfp4_mul" and request.target.layout != "nvfp4_rg16_v1":
-        raise ValueError("a dense nvfp4_mul matrix is stored in nvfp4_rg16_v1")
+    if request.target.format == "nvfp4_mul" and request.target.layout not in (
+        "nvfp4_rg16_v1", "block_scale_k16_m128x4_v1"
+    ):
+        raise ValueError("a dense nvfp4_mul matrix is stored in nvfp4_rg16_v1 or block_scale_k16_m128x4_v1")
     _preflight(request, values=False)
     auxiliaries = {}
     weight_divisor = None
@@ -399,6 +402,21 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                 weight_multiplier = first.weight_multiplier
             elif first.weight_multiplier != weight_multiplier:
                 raise ValueError("nvfp4_mul multipliers differ; choose separate parents")
+            for parameter, input_name in item.uses:
+                key = (parameter, input_name, "activation_input_scale")
+                if key in request.auxiliary_overrides:
+                    value = request.auxiliary_overrides[key]
+                elif request.policies[(parameter, input_name)] == "AllowA4":
+                    if source.input_scale is None:
+                        raise ValueError(f"{parameter}: an AllowA4 nvfp4_mul input needs the matrix's input_scale")
+                    value = AuxiliaryValue.activation_scale(source.input_scale())
+                else:
+                    continue
+                if input_scale is None:
+                    input_scale = value.data
+                elif value.data != input_scale:
+                    raise ValueError(f"{parameter}: fused NVFP4 inputs need one activation scale; separate the parents")
+                auxiliaries[key] = value
         elif first.format == "fp8_e4m3fn_row_f32":
             for parameter, input_name in item.uses:
                 key = (parameter, input_name, "activation_input_scale")
@@ -423,7 +441,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                     )
                 auxiliaries[key] = value
     n = request.target.shape[0]
-    if request.target.format == "nvfp4":
+    if request.target.layout == "block_scale_k16_m128x4_v1":  # nvfp4 or nvfp4_mul: whole 128-row tiles
         chunk = max(128, request.rows_per_chunk // 128 * 128)
     elif request.target.format in ("fp8_e4m3fn_g32_e8m0", "nvfp4_mul"):
         chunk = max(16, request.rows_per_chunk // 16 * 16)  # whole 16-row scale tiles / row groups

@@ -12,8 +12,10 @@ void fp8_attn_input_invariant_launch(const Tensor& x, const Weight& weight, Tens
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
     const auto launch = [&]<int T>() {
-        launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Fp8SlicedInstance<T, 4, 1>, 5120>>(
-            fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+        with_fp8_scale_word(weight, [&]<class Scale>() {
+            launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Fp8SlicedInstance<T, 4, 1>, 5120>>(
+                fp8_a16_operands<Scale>(x, weight), output, LinearIdentityEpilogue{}, stream);
+        });
     };
     if (x.ne[1] <= 8) return launch.template operator()<8>();
     if (x.ne[1] <= 16) return launch.template operator()<16>();
@@ -27,8 +29,10 @@ void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, 
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
     const auto launch = [&]<class Schedule>() {
-        launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, 5120>>(
-            fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+        with_fp8_scale_word(weight, [&]<class Scale>() {
+            launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, 5120>>(
+                fp8_a16_operands<Scale>(x, weight), output, LinearIdentityEpilogue{}, stream);
+        });
     };
     if (x.ne[1] <= 16) return launch.template operator()<Fp8SlicedInstance<16, 4, 1>>();
     if (x.ne[1] <= 24) return launch.template operator()<Fp8SlicedInstance<32, 4, 2>>();

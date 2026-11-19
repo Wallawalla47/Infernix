@@ -1,0 +1,9 @@
+{
+  "_comment": "Infernix does not read this file. It lets the Hugging Face Hub count downloads of this repository, which it does through requests for config.json. Give infernix-serve the .infernix file.",
+  "format": "infernix-v3",
+  "engine": "https://github.com/Wallawalla47/Infernix",
+  "artifact": "Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix",
+  "parts": [
+    "Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix"
+  ]
+}

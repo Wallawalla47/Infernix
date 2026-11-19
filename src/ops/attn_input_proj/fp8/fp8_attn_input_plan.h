@@ -17,7 +17,9 @@ namespace infernix::ops::detail {
 
 inline constexpr int kFp8AttnInputLastSmallMmaT = 32;
 
-[[nodiscard]] std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy,
+// The [14336,5120] parent: fp8_e4m3fn_row_bf16, or fp8_e4m3fn_row_f32 (its static input scale encodes
+// the A8 route's activations; a static scale has no AllowA8Residual profile).
+[[nodiscard]] std::size_t fp8_attn_input_workspace_capacity_bytes(QType qtype, LinearPolicy policy,
                                                                   std::int32_t min_tokens,
                                                                   std::int32_t max_tokens);
 

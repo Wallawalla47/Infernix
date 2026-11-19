@@ -37,6 +37,12 @@ enum class LinearPolicy : std::uint8_t {
     /// A projection that does not register a residual route runs A16 (the FP8 input projections
     /// and gate/up register one; the output and down projections do not).
     AllowA8Residual,
+    /// Admit only A8 profiles, at every width (`--a8-activations` on NVIDIA's NVFP4 and FP8 projections; LOSSY,
+    /// opt-in, for precision comparisons): NVFP4 weights take ops/ggml/ggml_a8.h's activation codec (int8 codes
+    /// per 32 values of K with an FP32 scale, the flag's one 8-bit codec), row-scaled FP8 weights their one-term
+    /// E4M3 route (the parent's static scale, else one per token). A projection that does not register such a
+    /// route rejects this policy.
+    A8Only,
 };
 
 /**
@@ -77,8 +83,9 @@ enum class LinearRoutes : std::uint16_t {
     /// Q8_1 idea), exact int32 slice dots with the weight codes and FP32 sums of the slices' terms, instead
     /// of the exact A16 integer routes. LOSSY and opt-in (`--a8-activations`), never on the reproducible
     /// route; wider calls keep their routes (GgmlBf16Wide or exact). The only dense 8-bit activation
-    /// route of decode widths: the other formats' measured slower than their 16-bit decode routes and
-    /// were removed (docs/maintainer/qwen3_8-flash-next-design.md §19.3.31).
+    /// route of decode widths taken for speed: the other formats' measured slower than their 16-bit decode
+    /// routes and were removed (docs/maintainer/qwen3_8-flash-next-design.md §19.3.31); NVIDIA's NVFP4 and FP8
+    /// projections take 8-bit activations at every width only as a precision option (LinearPolicy::A8Only).
     GgmlA8 = 256,
     /// a8-activations at prefill widths: GGUF projections (ops::ggml_linear) of 32 or more columns take the
     /// same 8-bit activations (the GgmlA8 codec's codes and slice scales) on int8 tensor cores over decoded
@@ -104,8 +111,12 @@ enum class LinearRoutes : std::uint16_t {
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant ||
-           policy == LinearPolicy::AllowA4Residual || policy == LinearPolicy::AllowA8Residual;
+           policy == LinearPolicy::AllowA4Residual || policy == LinearPolicy::AllowA8Residual ||
+           policy == LinearPolicy::A8Only;
 }
+
+// 8-bit activations at every width (the projection's A8 route, whatever the call's width).
+[[nodiscard]] constexpr bool a8_only(LinearPolicy policy) noexcept { return policy == LinearPolicy::A8Only; }
 
 [[nodiscard]] constexpr bool allows_a4_residual(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA4Residual;

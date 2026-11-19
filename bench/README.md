@@ -218,7 +218,8 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   with `auto`);
   `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
-  `infernix-serve`; `reproducible` runs the reproducible route and `path=NAME` also runs a candidate fast path.
+  `infernix-serve`; `reproducible` runs the reproducible route, `a16` and `a8` `--a16-activations` and
+  `--a8-activations`, and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
   token ids.
 - The judge scores any number of generator outputs with one reference: a CausalScoring Engine on
@@ -535,7 +536,8 @@ experts workspace to that byte before each width's calls.
 ## LinearTopK Op benchmark
 
 `infernix_linear_topk_bench` measures the complete public projection-plus-stable-top-16 Op for the
-Q8 and row-FP8 full heads and the mapped Q4 optimized head. Its independent matrix-column axis is
+Q8 and row-FP8 full heads, the NVFP4 full head of NVIDIA's Qwen3.8-27B NVFP4-QAD (`nvfp4-full`: its
+A16 linear into FP32 logits, then the grouped selection) and the mapped Q4 optimized head. Its independent matrix-column axis is
 `U`; the default sweep covers every `U=1..120` needed by variable-width DFlash2 proposals. A fixed
 positive `--columns U` also exercises larger matrices; `--columns U,...` selects a representative
 set without a full sweep. Codes and stored scales vary across the physical head, including signs,
@@ -553,6 +555,7 @@ cmake --build build -j --target infernix_linear_topk_bench
 ./build/bench/infernix_linear_topk_bench --profile q4-optimized --hidden 2560 --columns 1,7,8,16
 ./build/bench/infernix_linear_topk_bench --columns 1,7,16,24,64,120 --repeat 25
 ./build/bench/infernix_linear_topk_bench --profile fp8-full --columns 120
+./build/bench/infernix_linear_topk_bench --profile nvfp4-full --columns 1,8,16,33,64
 ./build/bench/infernix_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
 ```
 

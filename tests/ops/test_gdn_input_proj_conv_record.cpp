@@ -545,7 +545,8 @@ int run_nvfp4() {
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             QType::NVFP4, kRows, kHidden, policy, batch, width, width);
         return run_case(
-            std::string("NVFP4 ") + (policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16") +
+            std::string("NVFP4 ") +
+                (policy == ops::LinearPolicy::AllowA4 ? "A4" : ops::a8_only(policy) ? "A8" : "A16") +
                 " B=" + std::to_string(batch) + " T=" + std::to_string(width),
             kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes,
             record_bytes,
@@ -579,6 +580,13 @@ int run_nvfp4() {
             failures += run(width, 8, ragged(width, 8), policy, 2690U + width);
         }
     }
+    // --a8-activations: the 8-bit projection at every width, adaptive drafting's two-column rounds included.
+    for (int width : {2, 3, 4, 5, 8, 16, 17, 33, 64}) {
+        failures += run(width, 1, {}, ops::LinearPolicy::A8Only, 3600U + width);
+    }
+    for (int width : {2, 4, 16}) {
+        failures += run(width, 8, ragged(width, 8), ops::LinearPolicy::A8Only, 3650U + width);
+    }
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }
@@ -595,6 +603,8 @@ struct Fp8Parent {
 constexpr Fp8Parent kFp8RowBf16{QType::FP8_E4M3FN_ROW_BF16, 5120, 6144, 6144, 0.0F};
 // A static input scale of the checkpoint's kind: its reciprocal is inexact.
 constexpr Fp8Parent kFp8RowF32{QType::FP8_E4M3FN_ROW_F32, 3072, 8192, 8192, 0.0123456791F};
+// The 27B's [16384,5120] in FP32 row words with a static input scale (NVIDIA's NVFP4-QAD, bit-exact).
+constexpr Fp8Parent kFp8RowF32At5120{QType::FP8_E4M3FN_ROW_F32, 5120, 6144, 6144, 0.0123456791F};
 
 int run_fp8_case(const Fp8Parent& shape, DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
                  std::vector<std::int32_t> valid, ops::LinearPolicy policy, std::uint32_t seed) {
@@ -650,6 +660,12 @@ int run_fp8(const Fp8Parent& shape, std::uint32_t weight_seed) {
             failures += run_fp8_case(shape, parent, width, 8, ragged(width, 8), policy, 2790U + width);
         }
     }
+    for (int width : {2, 3, 4, 5, 16, 17, 64}) {
+        failures += run_fp8_case(shape, parent, width, 1, {}, ops::LinearPolicy::A8Only, 3700U + width);
+    }
+    for (int width : {2, 16}) {
+        failures += run_fp8_case(shape, parent, width, 8, ragged(width, 8), ops::LinearPolicy::A8Only, 3750U + width);
+    }
     failures += parent.verify_preserved(std::string(shape.name()) + " record parent weight");
     return failures;
 }
@@ -670,6 +686,7 @@ INFERNIX_OP_TEST(gdn_input_proj_conv_record) {
     failures += run_nvfp4();
     failures += run_fp8(kFp8RowBf16, 1701U);
     failures += run_fp8(kFp8RowF32, 1703U);
+    failures += run_fp8(kFp8RowF32At5120, 1705U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

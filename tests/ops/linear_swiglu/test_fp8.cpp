@@ -81,6 +81,12 @@ INFERNIX_OP_TEST(linear_swiglu_fp8) {
             "LinearSwiGLU FP8_A8",
             {QType::FP8_E4M3FN_ROW_BF16, 34816, 5120, 17408, 1813U, ActivationCompute::A8},
             kA8Cases, std::array{4, 5, 65, 193, 257, 512, 513, 1025});
+        // `--a8-activations` (A8Only): the same one-term route at every width, the 1-4 columns AllowA8 leaves at
+        // A16 included, and at each tile band's edges.
+        failures += run_profile(
+            "LinearSwiGLU FP8_A8 a8-only",
+            {QType::FP8_E4M3FN_ROW_BF16, 34816, 5120, 17408, 1819U, ActivationCompute::A8Only},
+            std::array{1, 2, 3, 4, 5, 16, 17, 33, 129, 257}, std::array{1, 2, 4});
         // The A8 residual route: A16 to 16 columns, then its 32- and 64-token tiles and their edges.
         failures += run_profile(
             "LinearSwiGLU FP8_A8_RESIDUAL",

@@ -52,12 +52,15 @@ namespace infernix::ops {
  * A quantized activation's scale (the design reference, docs/maintainer/lossless-route.md §3b): x holds
  * the quantized values without it (each exact in BF16: an NVFP4 code times its block scale, an E4M3
  * value), and the scale applies to the exact sum together with the weight's own factor before the one
- * rounding: out = round(sum_k w x / divisor * column_scales[t]). divisor 0 and a null column_scales
- * (FP32 [T], x's columns) are none; with neither, the product is lossless_linear's.
+ * rounding: out = round(sum_k w x / divisor * multiplier * column_scales[t]). divisor 0, multiplier 0 and a
+ * null column_scales (FP32 [T], x's columns) are none; with none, the product is lossless_linear's.
  */
 struct LosslessActivationScale {
     float divisor              = 0.0F; // the NVFP4 activation divisor D (positive finite)
     const float* column_scales = nullptr;
+    // A multiplier-form NVFP4 input (an nvfp4_mul matrix's): its activation scale s (ModelOpt input_scale),
+    // which its codes decode with; exclusive with divisor.
+    float multiplier = 0.0F;
 };
 
 void lossless_linear(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,

@@ -2,6 +2,7 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
 #include "ops/linear/nvfp4/nvfp4_layout.h"
+#include "ops/linear/nvfp4/nvfp4_a8_plan.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -14,11 +15,13 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
     ColumnInvariantA16,
     A16,
     A4,
+    A8,
 };
 
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
     if (column_invariant(policy)) { return Nvfp4GdnInputRoute::ColumnInvariantA16; }
+    if (a8_only(policy)) { return Nvfp4GdnInputRoute::A8; }
     // The residual profiles are registered for the NVFP4 MLP and FP8 projections only.
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
         allows_residual(policy)) {
@@ -37,9 +40,13 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::A4
-               ? nvfp4_a4_workspace_capacity_bytes(max_tokens, Nvfp4N16384K5120::kInputRows)
-               : 0;
+    switch (resolve_route(policy, max_tokens)) {
+    case Nvfp4GdnInputRoute::A4: return nvfp4_a4_workspace_capacity_bytes(max_tokens, Nvfp4N16384K5120::kInputRows);
+    case Nvfp4GdnInputRoute::A8: return nvfp4_a8_workspace_capacity_bytes(Nvfp4N16384K5120::kInputRows, max_tokens);
+    case Nvfp4GdnInputRoute::ColumnInvariantA16:
+    case Nvfp4GdnInputRoute::A16: break;
+    }
+    return 0;
 }
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -54,7 +61,11 @@ void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv
         return;
     }
     if (workspace == nullptr) {
-        throw std::invalid_argument("nvfp4 A4 gdn_input_proj requires caller workspace");
+        throw std::invalid_argument("nvfp4 A4 and A8 gdn_input_proj require caller workspace");
+    }
+    if (route == Nvfp4GdnInputRoute::A8) {
+        nvfp4_gdn_input_a8_launch(x, weight, qkv, z, *workspace, stream);
+        return;
     }
     auto scope                     = workspace->scope();
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);

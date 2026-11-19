@@ -23,6 +23,9 @@ void nvfp4_attn_input_invariant_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                  Tensor& k, Tensor& v, cudaStream_t stream);
+// A8Only: x encoded by ggml_a8.h's codec, then the 8-bit tiles (nvfp4_attn_input_a8.cu).
+void nvfp4_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                Tensor& v, WorkspaceArena& workspace, cudaStream_t stream);
 
 void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                     Tensor& k, Tensor& v, cudaStream_t stream);

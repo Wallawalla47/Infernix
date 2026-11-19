@@ -35,6 +35,20 @@ infernix_add_family_op_test(infernix_linear_nvfp4_a4_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_a4.cpp"
   LIBRARIES infernix_linear_test_support)
 
+# NVFP4 weights with 8-bit activations (A8Only, `--a8-activations`): linear, SwiGLU and residual-add routes at the
+# 27B's shapes against the FP64 oracle over the 8-bit codec, the split GDN and attention outputs against linear's.
+infernix_add_family_op_test(infernix_linear_nvfp4_a8_test FAMILY linear
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_a8.cpp"
+  LIBRARIES infernix_linear_test_support)
+set_tests_properties(infernix_linear_nvfp4_a8_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# ModelOpt's NVFP4 multiplier form (NVIDIA's NVFP4-QAD 27B): the output scales bit for bit, the 27B shapes on
+# the A16 and A4 routes against the FP64 oracle, and the NVFP4 head's column invariance.
+infernix_add_family_op_test(infernix_linear_nvfp4_mul_test FAMILY linear
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_mul.cpp"
+  LIBRARIES infernix_linear_test_support)
+set_tests_properties(infernix_linear_nvfp4_mul_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Back-to-back TMA staging race probe for both the plain Linear and fused LinearSwiGLU routes:
 # distinct weights fired without inter-launch sync, each checked against an isolated reference.
 infernix_add_family_op_test(infernix_nvfp4_tma_staging_race_test FAMILY linear

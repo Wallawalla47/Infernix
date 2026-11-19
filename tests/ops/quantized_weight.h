@@ -327,9 +327,13 @@ struct PatternedWeightOptions {
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
-    // FP8_E4M3FN_ROW_F32 only: the static activation scale s of its A8 route (Weight::input_scale); 0
-    // makes a per-token parent.
+    // FP8_E4M3FN_ROW_F32: the static activation scale s of its A8 route (Weight::input_scale); 0 makes a
+    // per-token parent. NVFP4 with weight_multiplier: the A4 input's activation scale s (ModelOpt
+    // input_scale), encoded with input_scale_divisor = fl32(1 / s).
     float activation_scale               = 0.0F;
+    // NVFP4 only: ModelOpt's FP32 multiplier (an nvfp4_mul parent run as QType::NVFP4) in place of
+    // weight_scale_divisor, which must then be 0.
+    float weight_multiplier = 0.0F;
 };
 
 // Builds a deterministic full-shape payload without allocating a source or dequantized matrix.
@@ -488,8 +492,17 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             throw std::invalid_argument(
                 "quantized-weight fixture: row-split patterns do not apply to NVFP4");
         }
-        if (!std::isfinite(options.weight_scale_divisor) || options.weight_scale_divisor <= 0.0F ||
-            !std::isfinite(options.input_scale_divisor) || options.input_scale_divisor <= 0.0F) {
+        const bool multiplier_form = options.weight_multiplier != 0.0F;
+        if (multiplier_form) {
+            if (!std::isfinite(options.weight_multiplier) || options.weight_multiplier <= 0.0F ||
+                options.weight_scale_divisor != 0.0F || !std::isfinite(options.activation_scale) ||
+                options.activation_scale <= 0.0F) {
+                throw std::invalid_argument(
+                    "quantized-weight fixture: an NVFP4 multiplier needs a positive activation scale and no divisor");
+            }
+            options.input_scale_divisor = 1.0F / options.activation_scale;
+        } else if (!std::isfinite(options.weight_scale_divisor) || options.weight_scale_divisor <= 0.0F ||
+                   !std::isfinite(options.input_scale_divisor) || options.input_scale_divisor <= 0.0F) {
             throw std::invalid_argument(
                 "quantized-weight fixture: NVFP4 divisors must be finite and positive");
         }
@@ -547,7 +560,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             }
         }
         detail::store_u32_le(packed.payload, packed.weight_divisor_offset,
-                             detail::float_bits(options.weight_scale_divisor));
+                             detail::float_bits(multiplier_form ? options.weight_multiplier
+                                                                : options.weight_scale_divisor));
 
         packed.weight.qtype                = QType::NVFP4;
         packed.weight.layout               = QuantLayout::BlockScaleK16M128x4;
@@ -573,6 +587,10 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         packed.weight.k                    = k;
         packed.weight.weight_scale_divisor = options.weight_scale_divisor;
         packed.weight.input_scale_divisor  = options.input_scale_divisor;
+        if (multiplier_form) {
+            packed.weight.weight_multiplier = options.weight_multiplier;
+            packed.weight.input_scale       = options.activation_scale;
+        }
         return packed;
     }
     if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
@@ -784,9 +802,11 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     }
 
     if (weight.qtype == QType::NVFP4) {
+        const bool multiplier_form = weight.weight_multiplier > 0.0F;
         if (weight.layout != QuantLayout::BlockScaleK16M128x4 ||
             weight.scale_dtype != DType::FP8_E4M3FN || weight.group != 16 ||
-            !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F) {
+            (!multiplier_form &&
+             (!std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F))) {
             throw std::invalid_argument("quantized-weight fixture: invalid NVFP4 metadata");
         }
         const std::size_t code_offset =
@@ -805,9 +825,12 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
             static_cast<std::size_t>(row_tile * k_tiles + scale_tile) * 512U +
             static_cast<std::size_t>(row_inner % 32) * 16U +
             static_cast<std::size_t>(row_inner / 32) * 4U + static_cast<std::size_t>(scale_lane);
-        const double decoded = detail::decode_e2m1(code) *
-                               detail::decode_e4m3fn(packed.payload[scale_offset]) /
-                               static_cast<double>(weight.weight_scale_divisor);
+        const double product = detail::decode_e2m1(code) * detail::decode_e4m3fn(packed.payload[scale_offset]);
+        if (multiplier_form) {
+            // Exact in FP64: a 3-bit E2M1 value, a 4-bit E4M3 scale and the 24-bit multiplier.
+            return product * static_cast<double>(weight.weight_multiplier);
+        }
+        const double decoded = product / static_cast<double>(weight.weight_scale_divisor);
         return static_cast<double>(static_cast<float>(decoded));
     }
 

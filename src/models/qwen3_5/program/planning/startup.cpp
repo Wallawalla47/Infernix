@@ -1233,6 +1233,9 @@ void validate_target_options(const execution::Parameters& parameters,
     // tier): the loaded model's choice stands.
     auto expected           = models::load_options(options, Architecture::Qwen3_5);
     expected.stream_experts = parameters.model.options().stream_experts;
+    // The Engine decides --a8-activations' dense binding from the artifact's directory (LoadOptions::a8_dense):
+    // the loaded model's choice stands where the flag is set.
+    expected.a8_dense = options.a8_activations && parameters.model.options().a8_dense;
     if (parameters.model.options() != expected) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
@@ -1711,6 +1714,10 @@ std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parame
     options.speculative.draft_tokens =
         std::min(options.speculative.draft_tokens,
                  auto_fixed_draft_tokens(fast.configuration, options.speculative.backend));
+    // A --no-fast-path of the policy has acted: it made the length fixed, where the policy no longer
+    // applies, so a later selection must not refuse it as an exclusion of a path that is not selected.
+    std::erase(options.fast_path_exclusions, FastPath::AdaptiveMtp);
+    std::erase(options.fast_path_exclusions, FastPath::AdaptiveDFlash);
     return options.speculative.draft_tokens;
 }
 

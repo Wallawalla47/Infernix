@@ -29,13 +29,14 @@ using K17408Wide =
 using K17408Bulk =
     Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
 
-template <int K>
-void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
+// `operands`: BF16 row words with per-token activation scales, or (K 6144: fp8_e4m3fn_row_f32) FP32 ones
+// with the parent's static input scale in every token's slot.
+template <int K, class Operands>
+void launch_problem(const Tensor& x, const Operands& operands, const Weight& weight, Tensor& residual,
                     Fp8A8Workspace workspace, cudaStream_t stream) {
     auto* data = static_cast<__nv_bfloat16*>(residual.data);
     const LinearBf16Output output{data, weight.n};
     const Fp8ResidualAddEpilogue epilogue{{{data, weight.n}}};
-    const auto operands = fp8_a8_operands(weight, workspace, x.ne[1]);
     const auto launch   = [&]<class Schedule>() {
         using S = Fp8ScheduleInstance<Schedule, K>;
         if constexpr (S::kTmaSwizzle)
@@ -84,9 +85,12 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_add_partial_capacity_bytes(weight.k, x.ne[1]));
     launch_fp8_a8_quantize(x, weight, scratch, stream);
-    if (weight.k == 6144)
-        launch_problem<6144>(x, weight, residual, scratch, stream);
-    else
-        launch_problem<17408>(x, weight, residual, scratch, stream);
+    if (weight.k == 6144) {
+        with_fp8_a8_operands(weight, scratch, x.ne[1], [&](const auto& operands) {
+            launch_problem<6144>(x, operands, weight, residual, scratch, stream);
+        });
+    } else {
+        launch_problem<17408>(x, fp8_a8_operands(weight, scratch, x.ne[1]), weight, residual, scratch, stream);
+    }
 }
 } // namespace infernix::ops::detail

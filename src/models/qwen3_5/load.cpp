@@ -105,7 +105,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
     // The lossless route binds every Use A16Only; the design reference keeps the declared permissions.
-    loading::Bindings bindings(binder, options.lossless && !options.reference);
+    // --a16-activations binds every Use A16Only too: the artifact's 4- and 8-bit permissions go unused.
+    loading::Bindings bindings(binder, (options.lossless && !options.reference) || options.a16_activations,
+                               options.a8_dense && !options.lossless);
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
     // Offloaded experts are all or nothing: every text block binds the bank form, or none does.

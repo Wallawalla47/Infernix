@@ -21,9 +21,10 @@ using LinearParameters = ops::SingleProjectionWeight;
 [[nodiscard]] inline ops::LinearPolicy residual_projection_policy(const LinearParameters& p,
                                                                   bool wide_verification) {
     // Keep the neural path's residual activation precision in wide copy verification. A
-    // column-invariant projection already runs 16-bit activations at every width.
+    // column-invariant projection already runs 16-bit activations at every width; an A8Only one
+    // (`--a8-activations`) keeps its 8-bit activations at every width.
     return wide_verification && is_fp8_row(p.weight.qtype) &&
-                   !ops::column_invariant(p.policy)
+                   !ops::column_invariant(p.policy) && !ops::a8_only(p.policy)
                ? ops::LinearPolicy::A16Only
                : p.policy;
 }

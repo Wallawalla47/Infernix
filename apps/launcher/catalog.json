@@ -423,12 +423,54 @@
       "notes": null
     },
     {
+      "repo": "wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact",
+      "title": "Qwen3.8-27B NVIDIA NVFP4-QAD (bit-exact)",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "NVIDIA's quantization-aware distillation with every weight and scale exactly as NVIDIA stores it, MTP, a DFlash2 drafter and a proposal head. Perplexity 4.3373 (the NVIDIA NVFP4 conversion 4.3472), plain decode 12 % faster. Needs Infernix main at 3ad591aa or later (a release after windows-2026.11.18).",
+      "recommended": true,
+      "source_repo": "nvidia/Qwen3.8-27B-NVFP4-QAD",
+      "tags": [
+        "NVFP4",
+        "FP8",
+        "QAD",
+        "dense",
+        "DFlash2",
+        "vision"
+      ],
+      "approx_bytes": 22205738944,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
+      "repo": "wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-NInferV3",
+      "title": "Qwen3.8-27B NVIDIA NVFP4-QAD (NInfer form)",
+      "family": "qwen3.8-27b",
+      "kind": "model",
+      "description": "The same quantization-aware distillation in NInfer's form (a Q8 head and an FP8 embedding), with the same drafters and proposal head; it also runs in NInfer.",
+      "recommended": false,
+      "source_repo": "nvidia/Qwen3.8-27B-NVFP4-QAD",
+      "tags": [
+        "NVFP4",
+        "FP8",
+        "QAD",
+        "dense",
+        "DFlash2",
+        "vision"
+      ],
+      "approx_bytes": 20943661216,
+      "drafter_repo": null,
+      "ngram_options": [],
+      "notes": null
+    },
+    {
       "repo": "wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3",
       "title": "Qwen3.8-27B NVIDIA NVFP4",
       "family": "qwen3.8-27b",
       "kind": "model",
       "description": "NVIDIA's NVFP4 checkpoint with a DFlash2 drafter and a proposal head for --lm-head-draft. Fits a 32 GB GPU with 240K context.",
-      "recommended": true,
+      "recommended": false,
       "source_repo": "nvidia/Qwen3.8-27B-NVFP4",
       "tags": [
         "NVFP4",

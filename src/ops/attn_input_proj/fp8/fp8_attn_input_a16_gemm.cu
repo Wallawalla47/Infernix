@@ -15,8 +15,10 @@ void run(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor&
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    launch_fp8_a16_mma<Fp8ScheduleInstance<S, 5120>>(fp8_a16_operands(x, weight), output,
-                                                     LinearIdentityEpilogue{}, stream);
+    with_fp8_scale_word(weight, [&]<class Scale>() {
+        launch_fp8_a16_mma<Fp8ScheduleInstance<S, 5120>>(fp8_a16_operands<Scale>(x, weight), output,
+                                                         LinearIdentityEpilogue{}, stream);
+    });
 }
 } // namespace
 

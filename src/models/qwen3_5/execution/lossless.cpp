@@ -96,6 +96,8 @@ Quantized quantize(A& a, Step step, const Tensor& x, const Weight& w, cudaStream
     Tensor q = alloc(a, DType::BF16, {x.ne[0], x.ne[1]});
     if (step == Step::Nvfp4) {
         if constexpr (kRuns<A>) { ops::lossless_quantize_nvfp4(x, w.input_scale_divisor, q, s); }
+        // A multiplier-form matrix's codes decode with the input's stored scale s (encoded with fl32(1 / s)).
+        if (w.weight_multiplier > 0.0F) { return {q, {0.0F, nullptr, w.input_scale}}; }
         return {q, {w.input_scale_divisor, nullptr}};
     }
     Tensor scales = alloc(a, DType::FP32, {x.ne[1]});

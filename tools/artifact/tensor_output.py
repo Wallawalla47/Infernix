@@ -73,7 +73,9 @@ class TensorOutput:
         elif isinstance(self.format, Fp8GroupFormat):
             g = group_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
-        elif isinstance(self.format, Nvfp4Format):
+        elif isinstance(self.format, Nvfp4Format) or (
+            isinstance(self.format, Nvfp4MulFormat) and obj.layout == "block_scale_k16_m128x4_v1"
+        ):
             g = block_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Nvfp4MulFormat) and obj.layout == "nvfp4_rg16_v1":
@@ -146,23 +148,27 @@ class TensorOutput:
             self.write_bytes(
                 g.scale_plane_offset + row_begin * g.groups, rows16_scale_plane(scales).numpy().tobytes()
             )
-        elif isinstance(self.format, Nvfp4Format):
-            if row_begin % 128 or rows % 128 or weight_divisor is None:
+        elif isinstance(self.format, Nvfp4Format) or (
+            isinstance(self.format, Nvfp4MulFormat) and obj.layout == "block_scale_k16_m128x4_v1"
+        ):
+            # The trailing word: nvfp4's divisor, or nvfp4_mul's multiplier (ModelOpt weight_scale_2), as stored.
+            coefficient = weight_divisor if isinstance(self.format, Nvfp4Format) else weight_multiplier
+            if row_begin % 128 or rows % 128 or coefficient is None:
                 raise ValueError(
-                    f"{obj.id}: NVFP4 output needs whole 128-row tiles and weight divisor"
+                    f"{obj.id}: NVFP4 output needs whole 128-row tiles and its divisor or multiplier"
                 )
             g = block_scale_geometry(self.format, obj.shape)
             local = block_scale_geometry(self.format, (rows, k))
-            block = memoryview(encode_nvfp4(codes, scales, weight_divisor, (rows, k)))
+            block = memoryview(encode_nvfp4(codes, scales, coefficient, (rows, k)))
             self.write_bytes(row_begin * (k // 2), block[: local.code_plane_bytes])
             self.write_bytes(
                 g.scale_plane_offset + row_begin * (k // 16),
                 block[local.scale_plane_offset : local.weight_divisor_offset],
             )
             if self._divisor is None:
-                self.write_bytes(g.weight_divisor_offset, weight_divisor)
-                self._divisor = bytes(weight_divisor)
-            elif self._divisor != weight_divisor:
-                raise ValueError(f"{obj.id}: weight divisor changed between row blocks")
+                self.write_bytes(g.weight_divisor_offset, coefficient)
+                self._divisor = bytes(coefficient)
+            elif self._divisor != coefficient:
+                raise ValueError(f"{obj.id}: weight divisor or multiplier changed between row blocks")
         else:
             raise TypeError(f"{obj.id}: direct format does not accept quantized codes")

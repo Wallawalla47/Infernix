@@ -366,10 +366,156 @@ constexpr std::array kQualified{
     Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, false, true}},
     Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Vq2, false, true}},
     Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, false, true}},
+    // NVIDIA's NVFP4 Qwen3.8-27B artifacts under --a16-activations (24 heads, 16-bit activations, no groupwise Q4
+    // gate/up: no other artifact has this configuration), by the owner's rule of 2026-11-19 (a fast path enabled
+    // elsewhere goes on wherever it measures faster, ahead of its gate), measured on NVIDIA's NVFP4-QAD bit-exact
+    // conversion (RTX 5090, INT8 KV, two rotated rounds against the configuration without the path, model-quality.md
+    // 6.7): batched-decode plain decode +14.5/+14.8 % at one request and +12.1/+12.4 % at four, decode-split64 +0.5 %
+    // and fp16-gdn-state +1.0 % beside it, idle-wide-prefill pp16384 +4.6/+4.7 %, gdn-f16-accumulate +0.9/+1.1 %,
+    // prompt-pv8 +0.22/+0.22 % (pp4096 level), adaptive-speculation DFlash2 +2.0 % (one request) and +3.2 % (two),
+    // free-cache-resume continuing-turn TTFT 0.13-0.33 s -> 0.04-0.06 s, preemption wall -2.4 % (the same replies).
+    // Each path's other KV formats are the NVFP4 27B's (the same kernels and shapes, 6.1); fp16-gdn-state BF16 by its
+    // own timing below. Not registered: single-column-decode (batched-decode's routes, +0.1 % at four requests),
+    // batch-split-attention (-0.04/-0.2 % at four), adaptive-mtp (-2.8 % and -1.6 % against five fixed drafts at one
+    // and four requests), gumbel-sampling (-0.5 to -2.0 %), adaptive-dflash (with the NVFP4 27B's round costs: +38 %
+    // and +4.9 % against seven fixed drafts on the bench's repeating text, but on five real prompts (greedy, 256
+    // tokens, ABBA) the fixed seven were faster on four, +3.2 % summed (the worst prompt -11.6 %), and on the code and
+    // docs slices that qualified it on the default route -2.2 % and +3.9 %).
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    // BF16 KV, by the same rule where timed faster (2026-11-19, ABBA, pp2048 + tg256): fp16-gdn-state on the NVFP4 27B
+    // plain decode +0.81/+0.32 % and MTP +0.64/+0.68 %, on the groupwise 27B +0.42/+0.60 %; q5-ksplit-mma on the
+    // groupwise 27B's MTP decode +0.12/+0.09 % (prefill beside it +0.5 %). gumbel-sampling was slower on the groupwise
+    // 27B (-0.31/-0.31 %): not registered there.
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    // The NVFP4 27B under --a8-activations (24 heads, 8-bit activations at every width; no other local artifact has
+    // this configuration), by the same rule and on the same conversion and workloads (2026-11-19): idle-wide-prefill
+    // pp16384 +6.4/+6.7 %, gdn-f16-accumulate +0.7/+1.1 %, fp16-gdn-state plain decode +0.4 %, decode-split64 (alone
+    // +0.08/+0.14 %, within the spread; jointly with fp16-gdn-state +0.6 % at one request and +1.7 % at four; the same
+    // attention kernels as under --a16-activations, +0.5 % there), adaptive-speculation DFlash2 +1.8 % (one request) and +2.9 % (two),
+    // free-cache-resume continuing-turn TTFT 0.05-0.14 s -> 0.04-0.06 s, preemption wall 5.00-5.04 -> 4.72-4.73 s. Not
+    // registered: batched-decode and single-column-decode (level: the 8-bit projections keep their route at every
+    // width), batch-split-attention (-0.1 %), prompt-pv8 (level), adaptive-mtp (-4.2 % and -1.5 % against five fixed
+    // drafts), gumbel-sampling (-0.4 %), adaptive-dflash (+43 % and +5.6 % on the bench's repeating text, but on five
+    // real prompts the fixed seven drafts were faster on three, +16.4 % summed (+4.6 % without the one prompt whose
+    // texts diverged; the worst -10.7 %), against -3.5 % and -2.8 % on the code and docs slices). fp16-gdn-state's
+    // BF16 KV by its BF16 timings above (its kernels do not read the KV cache).
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}},
+    // gumbel-sampling below INT8's precision, by the owner's decision of 2026-11-01 (a path registered on INT8 KV runs
+    // on every format below its precision when its kernels do not read the KV cache: sampling does not).
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // Gumbel-max sampling on the NVFP4 27B's MTP rounds (2026-11-16, the owner's registration where it was timed
     // faster: +8.5 %; model-quality.md 6.7 holds the timing and that its distribution test is still to run).
     Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
 };
+
+// The NVFP4 Qwen3.8-27B artifacts (24 heads, no groupwise Q4 gate/up), whatever activation precision a flag gives
+// them (--a16-activations, --a8-activations): the same drafters and target shapes, so adaptive drafting takes their
+// round costs.
+bool nvfp4_27b(const FastPathConfiguration& configuration) {
+    return configuration.query_heads == 24 && !configuration.q4_gate_up && !configuration.offloaded_experts;
+}
 
 const char* kv_name(KvCacheStorage kv) {
     switch (kv) {
@@ -412,7 +558,8 @@ FastPathConfiguration fast_path_configuration(const Model& model, const EngineOp
         for (const WeightUse& use : weight.uses) {
             if (ops::allows_a4(use.policy)) {
                 activations = ActivationClass::A4;
-            } else if (ops::allows_a8(use.policy) && activations == ActivationClass::A16) {
+            } else if ((ops::allows_a8(use.policy) || ops::a8_only(use.policy)) &&
+                       activations == ActivationClass::A16) {
                 activations = ActivationClass::A8;
             }
         }
@@ -618,7 +765,9 @@ std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration
     // format changes the round cost only slightly, so every format takes these. The groupwise 27B's
     // adaptive-mtp, re-timed 2026-10-25 on code and docs at one, two and four requests, won on code
     // (+10 % at one request) and lost on docs and at four requests (-1.5 %, -4.8 %): it keeps 3.
-    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) { return 5; }
+    // The NVFP4 27B under --a16-activations and --a8-activations too (2026-11-19, the NVFP4-QAD conversion, one
+    // request, INT8 KV): five drafts +37 % and +35 % against three.
+    if (nvfp4_27b(configuration)) { return 5; }
     return 3;
 }
 
@@ -636,7 +785,7 @@ detail::DFlashWidthCosts dflash_width_costs(const FastPathConfiguration& configu
     // make a draft 0.13-0.15. The groupwise 27B's (nearly free to 7 drafts and 0.05 past them after
     // a block proposal of 0.69) serve a forced --fast-path adaptive-dflash only: it is not
     // registered there.
-    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) {
+    if (nvfp4_27b(configuration)) {
         return {.proposal = 0.18, .per_draft = 0.02, .per_draft_wide = 0.02};
     }
     if (configuration.query_heads == 24) { return {.proposal = 0.69, .per_draft = 0.003, .per_draft_wide = 0.05}; }
@@ -656,7 +805,7 @@ std::uint32_t dflash_batch_drafts(const FastPathConfiguration& configuration, Sp
     // 0.5-0.9 ms a batched round, so its batched rounds run plain at 7. The 35B-A3B's chosen batch
     // widths ran -1.2 to +11.2 % against plain rounds of 3 (+3.8 % geometric mean) and 3-36 % ahead
     // of plain rounds of 5, so it keeps them.
-    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) { return 7; }
+    if (nvfp4_27b(configuration)) { return 7; }
     return 0;
 }
 
@@ -670,6 +819,7 @@ NgramSettings auto_ngram_settings(const FastPathConfiguration& configuration, Sp
     // on code (31: 1.6 %), so batched copies stop at 31. Minimum matches 8 and 16 moved the copy
     // workload +4.1 % and -3.5 % with the opposite effect on code's wrong copies, so it stays 12.
     // The 35B-A3B's DFlash copies did not pay (15 drafts +0.5 %, 31 drafts -4.1 %).
+    // The 4-bit class only: the copy windows were not timed under --a16-activations or --a8-activations.
     if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4 &&
         backend == SpeculativeBackend::DFlash2 && adaptive_drafts) {
         return {.window = 63, .batch_window = 31, .min_match = 12};
@@ -714,6 +864,9 @@ FastPathSelection select_fast_paths(const Model& model, const EngineOptions& opt
 
 A8Routes a8_activation_routes(const FastPathConfiguration& configuration) noexcept {
     // One line per route (design §19.3.31); a route measured slower than the one it replaces is withdrawn on its line.
+    // The NVFP4 27B artifacts' projections take 8-bit activations at every width through their Uses instead
+    // (LinearPolicy::A8Only, LoadOptions::a8_dense: the Engine decides it from the directory), a precision option
+    // whatever its speed.
     A8Routes out;
     // Decode: Ornith-1.5-122B's W4A8 expert kernels 630 against 906 ms, its CPU team 47,490 against 15,831 columns/s.
     out.experts = configuration.offloaded_experts;

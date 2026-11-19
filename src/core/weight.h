@@ -123,9 +123,12 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
-    // nvfp4_rg16_v1: the matrix's FP32 multiplier (ModelOpt weight_scale_2), as stored.
+    // nvfp4_rg16_v1, and an nvfp4_mul BlockScale parent run as QType::NVFP4 (weight_scale_divisor 0):
+    // the matrix's FP32 multiplier (ModelOpt weight_scale_2), as stored.
     float weight_multiplier = 0.0F;
     // A static FP8 A8 input: its FP32 activation scale s (codes e4m3(x * fl32(1 / s))), as stored;
+    // an A4 input of a multiplier-form NVFP4 matrix: its FP32 activation scale s (ModelOpt input_scale;
+    // encoded with input_scale_divisor = fl32(1 / s), the output scaled by fl32(s * weight_multiplier));
     // 0 when the input has none.
     float input_scale = 0.0F;
     // bf16_p12: the parent's escape list (qdata, qhigh and scales address this matrix's first row of

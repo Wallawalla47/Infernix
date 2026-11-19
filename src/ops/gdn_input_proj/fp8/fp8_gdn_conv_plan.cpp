@@ -24,8 +24,12 @@ struct Fp8GdnConvShape {
     bool residual;
 };
 
-Fp8GdnConvShape conv_shape(std::int32_t input_rows) {
-    if (input_rows == Fp8N16384K5120::kInputRows) { return {input_rows, 10240, 6144, true, true}; }
+// The [16384,5120] parent in FP32 row words (fp8_e4m3fn_row_f32: NVIDIA's NVFP4-QAD 27B) encodes with its
+// static input scale, which has no A8 residual profile either.
+Fp8GdnConvShape conv_shape(QType qtype, std::int32_t input_rows) {
+    if (input_rows == Fp8N16384K5120::kInputRows) {
+        return {input_rows, 10240, 6144, true, qtype != QType::FP8_E4M3FN_ROW_F32};
+    }
     if (input_rows == 3072) { return {input_rows, 12288, 8192, false, false}; }
     throw std::invalid_argument("fp8 GDN conv: unsupported K");
 }
@@ -118,6 +122,8 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
 Fp8GdnConvPlan fp8_gdn_conv_resolve_plan(const Fp8GdnConvShape& shape, LinearPolicy policy,
                                          std::int32_t width, std::int32_t batch_size) {
     if (column_invariant(policy)) { return {Fp8GdnConvScheduleId::MaterializedInvariantA16}; }
+    // `--a8-activations`: the projection's one-term 8-bit route at every width, then the convolution.
+    if (a8_only(policy)) { return {Fp8GdnConvScheduleId::MaterializedA8}; }
     if (allows_a8_residual(policy) && width * batch_size >= 17) {
         if (!shape.residual) {
             throw std::invalid_argument(
@@ -155,32 +161,33 @@ Fp8GdnConvPlan fp8_gdn_record_resolve_plan(const Fp8GdnConvShape& shape, LinearP
 
 } // namespace
 
-std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
+std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(QType qtype, LinearPolicy policy, std::int32_t input_rows,
                                                       std::int32_t batch_size,
                                                       std::int32_t min_width,
                                                       std::int32_t max_width) {
     if (min_width <= 0 || max_width < min_width) {
         throw std::invalid_argument("fp8 GDN snapshot workspace: invalid width interval");
     }
-    const Fp8GdnConvShape shape = conv_shape(input_rows);
+    const Fp8GdnConvShape shape = conv_shape(qtype, input_rows);
     (void)fp8_gdn_snapshot_resolve_plan(shape, policy, min_width, batch_size);
     const Fp8GdnConvPlan maximum =
         fp8_gdn_snapshot_resolve_plan(shape, policy, max_width, batch_size);
-    const bool fused_minimum = shape.fused && !column_invariant(policy) && batch_size == 1;
+    // A8Only materializes at every width (fp8_gdn_conv_resolve_plan).
+    const bool fused_minimum = shape.fused && !column_invariant(policy) && !a8_only(policy) && batch_size == 1;
     const std::int32_t largest_materialized_width =
         !fused_minimum || max_width > 3 ? max_width : 0;
     return snapshot_capacity(shape, maximum, batch_size * largest_materialized_width,
                              batch_size * max_width);
 }
 
-std::size_t fp8_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
+std::size_t fp8_gdn_record_workspace_capacity_bytes(QType qtype, LinearPolicy policy, std::int32_t input_rows,
                                                     std::int32_t batch_size,
                                                     std::int32_t min_width,
                                                     std::int32_t max_width) {
     if (min_width < 2 || max_width < min_width) {
         throw std::invalid_argument("fp8 GDN record workspace: invalid width interval");
     }
-    const Fp8GdnConvShape shape = conv_shape(input_rows);
+    const Fp8GdnConvShape shape = conv_shape(qtype, input_rows);
     (void)fp8_gdn_record_resolve_plan(shape, policy, min_width, batch_size);
     const Fp8GdnConvPlan maximum =
         fp8_gdn_record_resolve_plan(shape, policy, max_width, batch_size);
@@ -257,7 +264,7 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-    const Fp8GdnConvShape shape = conv_shape(weight.k);
+    const Fp8GdnConvShape shape = conv_shape(weight.qtype, weight.k);
     launch_snapshot_plan(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                          snapshot_base_slot, query, key, value, z, shape,
                          fp8_gdn_snapshot_resolve_plan(shape, policy, x.ne[1], x.ne[2]),
@@ -270,7 +277,7 @@ void fp8_gdn_record_dispatch(const Tensor* tree_rows, const Tensor& x, const Wei
                              Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                              Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                              cudaStream_t stream) {
-    const Fp8GdnConvShape shape = conv_shape(weight.k);
+    const Fp8GdnConvShape shape = conv_shape(weight.qtype, weight.k);
     launch_record_plan(tree_rows, x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                        conv_record, query, key, value, z, shape,
                        fp8_gdn_record_resolve_plan(shape, policy, x.ne[1], x.ne[2]), workspace,

@@ -22,6 +22,8 @@ enum class Fp8LinearSwiGluRoute : std::uint8_t {
 Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 linear_swiglu: T must be positive"); }
     if (column_invariant(policy)) { return Fp8LinearSwiGluRoute::ColumnInvariantA16; }
+    // `--a8-activations`: the one-term 8-bit route at every width (its 16-column tiles mask narrower calls).
+    if (a8_only(policy)) { return Fp8LinearSwiGluRoute::A8; }
     if (policy == LinearPolicy::A16Only || allows_a4_residual(policy)) {
         return Fp8LinearSwiGluRoute::A16;
     }
@@ -53,7 +55,7 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
     if (resolve_route(policy, max_tokens) == Fp8LinearSwiGluRoute::A8Residual) {
         return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N34816K5120::kInputRows, 0, true);
     }
-    const bool interval_uses_a8 = allows_a8(policy) && max_tokens >= 5;
+    const bool interval_uses_a8 = a8_only(policy) || (allows_a8(policy) && max_tokens >= 5);
     return interval_uses_a8 ? fp8_a8_workspace_capacity_bytes(
                                   max_tokens, Fp8N34816K5120::kInputRows,
                                   fp8_linear_swiglu_partial_capacity_bytes(max_tokens))

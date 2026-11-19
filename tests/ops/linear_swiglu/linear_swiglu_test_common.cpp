@@ -37,6 +37,7 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     case ActivationCompute::A16ColumnInvariant:
         return {3.3e-3, 5.0e-3, 6.3e-3};
     case ActivationCompute::A8:
+    case ActivationCompute::A8Only:
         // Both independently A8-quantized projections feed the nonlinear product, so this profile
         // allows twice Linear's relative-L2 quantization allowance plus a bounded gross tail.
         return {8.0e-2, 1.0e-2, 1.2e-1};
@@ -329,6 +330,7 @@ void validate_profile(const Profile& profile) {
          profile.activation_compute != ActivationCompute::A4Residual && !invariant) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8 &&
+         profile.activation_compute != ActivationCompute::A8Only &&
          profile.activation_compute != ActivationCompute::A8Residual && !invariant) ||
         (q4_w4a8 && profile.activation_compute != ActivationCompute::A8Int) ||
         (!nvfp4 && !fp8 && !q4_w4a8 && profile.activation_compute != ActivationCompute::A16 &&
@@ -402,6 +404,7 @@ int run_profile(std::string_view label, const Profile& profile,
         case ActivationCompute::A4Residual: return ops::LinearPolicy::AllowA4Residual;
         case ActivationCompute::A8Residual: return ops::LinearPolicy::AllowA8Residual;
         case ActivationCompute::A8: return ops::LinearPolicy::AllowA8;
+        case ActivationCompute::A8Only: return ops::LinearPolicy::A8Only;
         case ActivationCompute::A16ColumnInvariant: return ops::LinearPolicy::A16ColumnInvariant;
         case ActivationCompute::A16: break;
         }

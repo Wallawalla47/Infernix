@@ -56,6 +56,122 @@ def _tiny_qwen3_5_source(tmp_path: Path) -> Path:
     return source
 
 
+def _tiny_dflash2_source(tmp_path: Path) -> Path:
+    """A DFlash2 drafter config for _tiny_qwen3_5_source's target (its values come from the recipe)."""
+    draft = tmp_path / "dflash2"
+    draft.mkdir()
+    config = {
+        "architectures": ["DFlash2DraftModel"],
+        "model_type": "qwen3",
+        "hidden_size": 128,
+        "vocab_size": 8,
+        "num_target_layers": 1,
+        "num_hidden_layers": 1,
+        "intermediate_size": 24,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "max_position_embeddings": 128,
+        "layer_types": ["sliding_attention"],
+        "sliding_window": 32,
+        "dflash_config": {
+            "target_layer_ids": [0],
+            "mask_token_id": 7,
+            "conv_kernel_size": 2,
+            "conv_group_size": 4,
+            "selector_rank": 4,
+            "selector_top_k": 2,
+        },
+    }
+    (draft / "config.json").write_text(json.dumps(config))
+    return draft
+
+
+# Distinct values per parameter, so a copied object is told apart from a converted one.
+_VALUES_RECIPE = """import torch
+import zlib
+from tools.convert.sources.logical import array_source
+
+def configure(model, recipe, sources):
+    for name, parameter in model.parameters.items():
+        count = 1
+        for size in parameter.shape:
+            count *= size
+        seed = zlib.crc32(name.encode()) % 97
+        value = ((torch.arange(count) + seed) % 13).float().div(8).reshape(parameter.shape).to(torch.bfloat16)
+        recipe.assign(name, source=array_source(value, name))
+"""
+
+
+def _drafter(artifact: Artifact, component: str = "dflash2"):
+    """Its record, Uses and, per parameter, the bytes and element ranges of what it binds."""
+    directory = artifact.directory
+    words = {}
+    for name, binding in directory.bindings.items():
+        if name.startswith(component + "/"):
+            parts = binding_parts(binding, artifact.by_id)
+            words[name] = [(artifact.read_object(obj), begin, end) for obj, begin, end in parts]
+    uses = sorted(
+        (u["parameter"], u["input"], u["activation_policy"])
+        for u in directory.uses
+        if u["parameter"].startswith(component + "/")
+    )
+    return directory.components[component], uses, words
+
+
+def test_cli_graft_copies_a_drafter_byte_for_byte(tmp_path):
+    source = _tiny_qwen3_5_source(tmp_path)
+    (source / "chat_template.jinja").write_text("{{ messages }}")
+    draft = _tiny_dflash2_source(tmp_path)
+    recipe = tmp_path / "recipe.py"
+    recipe.write_text(_VALUES_RECIPE, encoding="utf-8")
+    reference = tmp_path / "reference.infernix"
+    common = ["--model", str(source), "--recipe", str(recipe), "--device", "cpu"]
+    result = _convert(
+        [*common, "--components", "text,dflash2", "--source", f"dflash2={draft}", "--out", str(reference)]
+    )
+    assert result.returncode == 0, result.stderr
+
+    grafted = tmp_path / "grafted.infernix"
+    result = _convert([*common, "--graft", f"dflash2={reference}", "--out", str(grafted)])
+    assert result.returncode == 0, result.stderr
+    with Artifact(reference) as before, Artifact(grafted) as after:
+        assert _drafter(after) == _drafter(before)
+        assert set(after.directory.components) == {"text", "dflash2"}
+        # The new artifact's own head reads the drafter's final hidden state, as a converted drafter's does.
+        heads = {(u["parameter"], u["input"]) for u in after.directory.uses}
+        assert ("text/output_head", "dflash2/final_hidden") in heads
+        provenance = after.directory.provenance["grafts"]["dflash2"]
+        assert provenance["artifact_id"] == before.artifact_id.hex()
+    report = json.loads(Path(str(grafted) + ".conversion.json").read_text(encoding="utf-8"))
+    (copied,) = report["grafts"]
+    assert copied["component"] == "dflash2" and copied["objects"]
+
+    # A drafter of another target's geometry is refused before anything is written.
+    narrow = tmp_path / "narrow"
+    narrow.mkdir()
+    config = json.loads((source / "config.json").read_text())
+    (narrow / "config.json").write_text(json.dumps({**config, "hidden_size": 64}))
+    for name in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"):
+        (narrow / name).write_bytes((source / name).read_bytes())
+    refused = tmp_path / "refused.infernix"
+    result = _convert(
+        ["--model", str(narrow), "--recipe", str(recipe), "--device", "cpu", "--graft", f"dflash2={reference}",
+         "--out", str(refused)]
+    )
+    assert result.returncode != 0
+    assert "grafted dflash2/" in result.stderr and "elements" in result.stderr, result.stderr
+    assert not refused.exists()
+
+    # A drafter is grafted or converted, not both.
+    result = _convert(
+        [*common, "--components", "text,dflash2", "--source", f"dflash2={draft}", "--graft",
+         f"dflash2={reference}", "--out", str(tmp_path / "both.infernix")]
+    )
+    assert result.returncode != 0
+    assert "a grafted drafter is not also converted" in result.stderr, result.stderr
+
+
 def _convert(arguments: list[str]) -> subprocess.CompletedProcess:
     root = Path(__file__).resolve().parents[2]
     return subprocess.run(

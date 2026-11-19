@@ -259,8 +259,9 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.code_bytes          = out.elements;
         out.scale_offset        = aligned(out.code_bytes, 256);
     } else if (layout == QuantLayout::BlockScaleK16M128x4) {
-        if (format != QType::NVFP4 || n % 128 || k % 64) {
-            throw std::invalid_argument("NVFP4 BlockScale requires N%128=0 and K%64=0");
+        // nvfp4 (an FP32 divisor) or nvfp4_mul (ModelOpt's FP32 multiplier) in the same planes.
+        if ((format != QType::NVFP4 && format != QType::NVFP4_MUL) || n % 128 || k % 64) {
+            throw std::invalid_argument("NVFP4 BlockScale requires nvfp4 or nvfp4_mul with N%128=0 and K%64=0");
         }
         out.group_size          = 16;
         out.code_bytes_per_row  = k / 2;
@@ -272,7 +273,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     }
     out.scale_bytes = mul(n, out.scale_bytes_per_row);
     out.bytes       = add(out.scale_offset, out.scale_bytes);
-    if (format == QType::NVFP4) {
+    if (layout == QuantLayout::BlockScaleK16M128x4) { // the matrix's FP32 divisor or multiplier word
         out.divisor_offset = out.bytes;
         out.bytes          = add(out.bytes, 4);
     }
@@ -431,6 +432,12 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.group                = g.group_size ? dimension(g.group_size) : 0;
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
+    if (g.format == QType::NVFP4_MUL) {
+        // An nvfp4_mul BlockScale parent runs the NVFP4 kernels: the same planes, with ModelOpt's
+        // multiplier in place of a divisor (the kernels' output scale reads whichever is set).
+        out.qtype             = QType::NVFP4;
+        out.weight_multiplier = region.parent->weight_multiplier;
+    }
     if (g.layout == QuantLayout::RowSplit) {
         out.scale_dtype = DType::FP16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);

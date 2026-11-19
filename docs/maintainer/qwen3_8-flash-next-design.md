@@ -12125,9 +12125,28 @@ NVFP4 27B's and the 122B's FP8 projections (and the 27B's NVFP4 ones) already pr
 activations their artifact permits, so the flag adds nothing there. No 8-bit wide route exists for Q8
 projections (Dense8, the 35B-A3B, the drafters), the other row-split Q4/Q5/Q6 projections, BF16, the FP8 heads and
 the 122B's FP8 shared expert (A16 under every policy), resident experts (sparse MoE, resident_moe), or W4A4 and
-block-FP8 experts; they keep their routes, and the NVFP4 27B, the 35B-A3B, Dense8, recipe A and the official FP8
-import still refuse the flag. Measured: not yet (prefill at 8K, 32K and 128K and decode, base against the flag,
-per model). Tests: (4)'s and (7)'s kernel tests, `infernix_linear_fp8_a8_test` (MXFP8 block32 against the FP64
+block-FP8 experts; they keep their routes, and the 35B-A3B, Dense8, recipe A and the official FP8 import still
+refuse the flag. (8), added 2026-11-19 as a precision option rather than a speed route: a dense artifact (no MoE
+layer) whose NVFP4 projections permit 4-bit activations and whose other 4- and 8-bit text projections are NVFP4 or
+row-scaled FP8 (the NVFP4 27B artifacts: NVIDIA's exports and those in their form) binds them, the head aside,
+`LinearPolicy::A8Only`, 8-bit activations at every width, decode and verification included (their column-invariant
+copy keeps A8Only: the flag already withdraws request invariance): NVFP4 on (1)'s codec through
+`ops/linear/nvfp4/nvfp4_a8_mma.cuh` (one m16n8k16 s8 MMA per 16-value block from zero, P_b converted with one exact
+I2F, then fma(P_b S_b, d_s, acc): P_b S_b is exact, so these are the magic start's bits, and the MMA tiles measured
+16-21 % faster than with the magic start's second FFMA, 2026-11-19; sliced-K tiles through 64 columns, one-column
+calls as PDL dependents of their encode; 128 x 128 tiles wider, the 5,120-row projections 64 x 64 through 128
+columns and 64 x 128 through 256), FP8 on its one-term E4M3 route (the static scale where the artifact stores one);
+`infernix_linear_nvfp4_a8_test` checks it against the FP64 chain of the codec. Measured (RTX 5090, 2026-11-19,
+NVIDIA's NVFP4-QAD 27B bit-exact conversion, INT8 KV): prefill pp4096 3,769 and pp16384 3,655 tok/s (16-bit 2,934 and
+2,857, the default 17,110 and 15,486), plain decode 85.1 tok/s (16-bit with `batched-decode`'s routes 89.4, the
+default 90.2), quick-corpus perplexity 4.2868 (16-bit 4.2869, the default 4.3373), each before the flags' fast paths
+were registered (model-quality.md 6.7); with them pp4096 4,046 (16-bit 3,059), pp16384 3,956 (3,002), plain decode
+86.1 (90.4), perplexity 4.2871 (4.2869; paired +0.00004 nats per token, 95 % -0.0003 to +0.0004). Until 2026-11-19
+the decode and verification calls ran the 16-bit column-invariant route instead (the invariant copy replaced
+A8Only), with a forced `batched-decode` the FP8 GDN snapshot sized no workspace for the 8-bit route at 1-3 columns,
+and the FP8 gate/up (`linear_swiglu`: the official NVFP4 27B import's MLP) admitted no A8Only, so the flag refused
+that artifact at startup (all fixed; `infernix_gdn_input_proj_conv_snapshot_test` and `infernix_linear_swiglu_fp8_test`
+cover A8Only from one column). Tests: (4)'s and (7)'s kernel tests, `infernix_linear_fp8_a8_test` (MXFP8 block32 against the FP64
 oracle, and the GDN input projection's and QSA group's rows against linear's), `infernix_linear_swiglu_q4_w4a8_test`,
 and the routes' selection in `infernix_qwen4_exp_fast_paths_test` and `infernix_qwen3_5_fast_paths_test`.
 

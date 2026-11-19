@@ -10,6 +10,12 @@
 namespace infernix::ops::detail {
 namespace {
 
+// The widest A16 call on the fused small-T kernel; wider calls materialize the projection (its sliced-K tiles)
+// and convolve it. Cold [16384,5120] snapshot calls (RTX 5090, 2026-11-19): fused 39.6, 42.0, 51.8, 92.8 us at 4, 5,
+// 8 and 16 columns against materialized 39.5, 39.5, 41.6, 53.9; NVIDIA's NVFP4-QAD 27B, whose 38 NVFP4 GDN layers
+// verify DFlash2 rounds of up to 16 columns this way, decoded 7.5-9.6 % faster with the cut at 4 than at 16.
+constexpr std::int32_t kSmallTFusedA16MaxTokens = 4;
+
 struct Nvfp4GdnProjectedWorkspace {
     Tensor projected;
     DeviceSpan projection;
@@ -40,11 +46,13 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     // convolution (the batched composition, at every B), so a row's result does not depend on
     // the other rows.
     if (batch_size > 1 || column_invariant(policy)) { return {Nvfp4GdnConvScheduleId::Materialized}; }
+    // A8Only: the projection's 8-bit tiles at every width, then the convolution (no fused 8-bit form).
+    if (a8_only(policy)) { return {Nvfp4GdnConvScheduleId::Materialized}; }
     // The residual profiles are registered for the NVFP4 MLP and FP8 projections only.
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
         allows_residual(policy)) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
-        if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
+        if (tokens <= kSmallTFusedA16MaxTokens) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         if (tokens <= 64) { return {Nvfp4GdnConvScheduleId::Materialized}; }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=64");
     }

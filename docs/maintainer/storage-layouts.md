@@ -13,7 +13,7 @@ The storage registry contains exactly these identities:
 |---|---|---|---|---:|
 | `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
 | `row_split_k128_v1` | tensor layout | `q2_g64_fp16`, `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
-| `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
+| `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4`, `nvfp4_mul` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `g32_scale_rows16_v1` | tensor layout | `fp8_e4m3fn_g32_e8m0` | rank 2 `[N,K]`, `N % 16 == 0`, `K % 32 == 0` | 256 bytes |
 | `nvfp4_expert_rg16_v1` | tensor layout | `nvfp4_mul` | rank 3 `[E,H,I]`, `H % 16 == 0`, `I % 16 == 0` | 4096 bytes |
@@ -266,7 +266,7 @@ individual codes.
 
 ## 4. `block_scale_k16_m128x4_v1`
 
-This layout stores only rank-two `nvfp4` matrices `[N,K]` satisfying:
+This layout stores only rank-two `nvfp4` and `nvfp4_mul` matrices `[N,K]` satisfying:
 
 ```text
 N > 0
@@ -286,7 +286,8 @@ payload_bytes         = weight_divisor_offset + 4
 ```
 
 The payload is a row-major E2M1 packed-code plane, zero padding to `scale_plane_offset`, a
-swizzled E4M3FN scale plane, and the little-endian FP32 weight-divisor word. Within each packed code
+swizzled E4M3FN scale plane, and the little-endian FP32 matrix word: `nvfp4`'s divisor, or `nvfp4_mul`'s
+multiplier (ModelOpt `weight_scale_2`; the two formats share every byte position). Within each packed code
 byte, the low nibble is the smaller K coordinate and the high nibble is the next coordinate.
 
 For logical row `n`, scale-group coordinate `g=floor(k/16)`, and `K_tiles=K/64`, define:
@@ -516,7 +517,7 @@ Layout decoding yields only persistent logical words:
 - `row_split_k128_v1` yields the grouped signed codes and binary16 scales for logical columns
   `0..K-1`, discarding physical columns `K..K_pad-1`;
 - `block_scale_k16_m128x4_v1` yields the packed E2M1 words, natural E4M3FN group-scale words, and
-  matrix-level FP32 weight divisor;
+  matrix-level FP32 weight divisor (`nvfp4`) or multiplier (`nvfp4_mul`);
 - `row_scale_v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
 - `nvfp4_expert_rg16_v1` yields, per expert, the gate, up and down E2M1 code words and E4M3FN

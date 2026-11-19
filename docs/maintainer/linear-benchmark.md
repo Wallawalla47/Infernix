@@ -32,6 +32,13 @@ suites:
 [ 5120,17408] MLP down
 ```
 
+The Qwen3.8-27B output head as NVIDIA's NVFP4-QAD stores it, `[248320,5120]`, is an NVFP4 problem with the A16
+policy only (FP32 or BF16 logits; its sliced-K tiles through 64 columns are also its column-invariant route):
+
+```bash
+./build/bench/infernix_linear_bench --qtype nvfp4 --policy a16 --n 248320 --k 5120 --t 1
+```
+
 `--policy a4` measures the complete public call, and the production resolver chooses the already
 qualified A16 or A4 route from the exact geometry and T. The benchmark neither duplicates nor infers
 that private choice.

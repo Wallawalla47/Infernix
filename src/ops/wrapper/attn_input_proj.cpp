@@ -87,6 +87,10 @@ void validate_policy(LinearPolicy policy, QType qtype) {
     case LinearPolicy::AllowA4Residual:
     case LinearPolicy::AllowA8Residual:
         return;
+    case LinearPolicy::A8Only:
+        // The 8-bit routes of the NVFP4 and row-scaled FP8 parents.
+        if (qtype == QType::NVFP4 || is_fp8_row(qtype)) { return; }
+        throw std::invalid_argument("attn_input_proj: A8Only takes NVFP4 or row-scaled FP8 parents");
     }
     throw std::invalid_argument("attn_input_proj: invalid compute policy");
 }
@@ -132,7 +136,9 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
-    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+    // The 27B's [14336,5120] parent: BF16 row words, or FP32 ones (fp8_e4m3fn_row_f32: ModelOpt's
+    // per-tensor weight scale kept exactly, with its static input scale for 8-bit activations).
+    if (is_fp8_row(weight.qtype) && weight.k == 5120) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
         constexpr std::int32_t kKvRows = 1024;
@@ -216,17 +222,15 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::FP8_E4M3FN_ROW_F32:
+        if (parent_qtype == QType::FP8_E4M3FN_ROW_F32 && parent_rows == 17408 && input_rows == 3072) {
+            return detail::fp8_attn_input_n17408_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        }
         if (parent_rows != detail::Fp8N14336K5120::kOutputRows ||
             input_rows != detail::Fp8N14336K5120::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
         }
-        return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
-    case QType::FP8_E4M3FN_ROW_F32:
-        if (parent_rows != 17408 || input_rows != 3072) {
-            throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
-        }
-        return detail::fp8_attn_input_n17408_workspace_capacity_bytes(policy, min_tokens,
-                                                                      max_tokens);
+        return detail::fp8_attn_input_workspace_capacity_bytes(parent_qtype, policy, min_tokens, max_tokens);
     case QType::Q8_G32_FP16: {
         if (!(parent_rows == 9216 && input_rows == 2048) && !(parent_rows == 17408 && input_rows == 3072)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported Q8 profile");

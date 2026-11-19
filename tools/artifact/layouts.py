@@ -68,6 +68,7 @@ class BlockScaleGeometry:
     code_plane_bytes: int
     scale_plane_offset: int
     scale_plane_bytes: int
+    # The matrix's FP32 coefficient word: nvfp4's divisor, or nvfp4_mul's multiplier (ModelOpt weight_scale_2).
     weight_divisor_offset: int
     payload_bytes: int
 
@@ -194,7 +195,7 @@ ROW_SPLIT_K128_V1 = Layout(
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
     256,
-    frozenset(("nvfp4",)),
+    frozenset(("nvfp4", "nvfp4_mul")),
 )
 ROW_SCALE_V1 = Layout(
     "row_scale_v1",
@@ -346,11 +347,12 @@ def row_split_geometry(
 
 
 def block_scale_geometry(
-    format: str | Nvfp4Format, shape: Sequence[int]
+    format: str | Nvfp4Format | Nvfp4MulFormat, shape: Sequence[int]
 ) -> BlockScaleGeometry:
+    """nvfp4 and nvfp4_mul share these planes; only the meaning of the trailing FP32 word differs."""
     spec = _format(format)
-    if not isinstance(spec, Nvfp4Format):
-        raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
+    if not isinstance(spec, (Nvfp4Format, Nvfp4MulFormat)):
+        raise ValueError("block_scale_k16_m128x4_v1 requires nvfp4 or nvfp4_mul")
     n, k = _shape(shape, rank=2)
     if n % 128 != 0 or k % 64 != 0:
         raise ValueError(
@@ -569,8 +571,6 @@ def encoded_size(
             raise ValueError("row_split_k128_v1 requires a grouped quantized format")
         return row_split_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is BLOCK_SCALE_K16_M128X4_V1:
-        if not isinstance(numeric_spec, Nvfp4Format):
-            raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
         return block_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is ROW_SCALE_V1:
         if not isinstance(numeric_spec, Fp8RowFormat):

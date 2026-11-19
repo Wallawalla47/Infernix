@@ -30,6 +30,14 @@ __device__ __forceinline__ void mma_k32_magic(int (&d)[4], int a0, int a1, int a
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(kMagicBits));
 }
 
+// d = a * b over one 16x8x16 int8 tile (s8 x s8, exact in int32), from zero: the NVFP4 W4A8 tiles convert P with
+// one I2F (exact, |P| < 2^15), which measured faster there than the magic start's second FFMA.
+__device__ __forceinline__ void mma_k16(int (&d)[4], unsigned a0, unsigned a1, unsigned b0) {
+    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a0), "r"(a1), "r"(b0), "r"(0));
+}
+
 // d = a * b + M over one 16x8x16 int8 tile (s8 x s8, exact in int32).
 __device__ __forceinline__ void mma_k16_magic(int (&d)[4], unsigned a0, unsigned a1, unsigned b0) {
     asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
