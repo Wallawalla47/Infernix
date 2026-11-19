@@ -1714,6 +1714,10 @@ std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parame
     options.speculative.draft_tokens =
         std::min(options.speculative.draft_tokens,
                  auto_fixed_draft_tokens(fast.configuration, options.speculative.backend));
+    // A --no-fast-path of the policy has acted: it made the length fixed, where the policy no longer
+    // applies, so a later selection must not refuse it as an exclusion of a path that is not selected.
+    std::erase(options.fast_path_exclusions, FastPath::AdaptiveMtp);
+    std::erase(options.fast_path_exclusions, FastPath::AdaptiveDFlash);
     return options.speculative.draft_tokens;
 }
 

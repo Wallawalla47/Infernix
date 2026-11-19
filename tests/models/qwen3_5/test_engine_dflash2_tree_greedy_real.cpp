@@ -3,6 +3,7 @@
 #include "real_test_artifact.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -180,6 +181,37 @@ int main(int argc, char** argv) {
             side_drafts += result.speculative.tree_side_accepted_tokens;
         }
         if (tree) { require(side_rounds != 0, "the greedy streams accepted no side branch"); }
+        // --no-fast-path of the length policy beside --draft-tokens auto: the Engine starts with the
+        // configuration's fixed length (it once refused its own exclusion when planning re-selected the
+        // paths). Where the policy is not qualified the exclusion is refused before the fixed-length notice.
+        if (block) {
+            infernix::EngineOptions fixed  = options;
+            fixed.fast_path_candidates     = {infernix::FastPath::AdaptiveSpeculation};
+            fixed.fast_path_exclusions     = {infernix::FastPath::AdaptiveDFlash};
+            fixed.max_concurrency          = 1;
+            fixed.kv_capacity              = infernix::KvCapacityPolicy::explicit_capacity(kContext);
+            std::atomic<bool> fixed_notice{false};
+            fixed.diagnostic_observer.callback = [&](const infernix::Diagnostic& d) {
+                if (d.message.find("--draft-tokens auto: each round drafts") != std::string::npos) {
+                    fixed_notice = true;
+                }
+            };
+            try {
+                infernix::Engine engine(fixed);
+                const auto& resolved = engine.options().speculative;
+                require(fixed_notice.load() && !resolved.draft_tokens_auto && resolved.draft_tokens != 0,
+                        "--no-fast-path adaptive-dflash did not fix the automatic length");
+                const auto result = engine.generate(engine.prepare_tokens(prompts.front()), greedy(32));
+                require(result.generated_token_ids.size() == 32 && result.speculative.rounds != 0,
+                        "the fixed-length rounds stopped early");
+                std::cout << "--no-fast-path adaptive-dflash: fixed length " << resolved.draft_tokens << '\n';
+            } catch (const std::invalid_argument& error) {
+                const bool unqualified = !fixed_notice.load() && std::string(error.what()).find("not selected for") !=
+                                                              std::string::npos;
+                if (!unqualified) { throw; }
+                std::cout << "skip --no-fast-path check: " << error.what() << '\n';
+            }
+        }
         if (block) {
             const auto widths = std::count_if(by_length.begin(), by_length.end(),
                                               [](std::uint64_t n) { return n != 0; });
