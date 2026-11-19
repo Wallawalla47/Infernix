@@ -2807,14 +2807,7 @@ public:
     // A pair call passes its head: the residency runs the two calls' rounds (ExpertResidency::after_round), each
     // with the promotions its own call starts.
     void apply_prompt_routes(Lane& lane, std::int32_t width, std::size_t promotions, PairHead head = {}) {
-        static const double continuing = [] {
-            const auto value = temporary_switches::value("INFERNIX_TMP_CONTINUING_PROMPT");
-            const double fraction = value ? std::stod(*value) : 0.0;
-            if (value && !(fraction > 0.0 && fraction <= 1.0)) {
-                throw std::invalid_argument("INFERNIX_TMP_CONTINUING_PROMPT must be a fraction in (0, 1]");
-            }
-            return fraction;
-        }();
+        const double continuing = temporary_switches::continuing_prompt();
         if (continuing > 0.0 && lane.prompt_tokens != 0 &&
             static_cast<double>(lane.prefix.reused) >= continuing * static_cast<double>(lane.prompt_tokens)) {
             prompt_silent_.assign(static_cast<std::size_t>(width), 0);

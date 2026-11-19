@@ -44,6 +44,22 @@ set_tests_properties(infernix_device_sync_invalid_test PROPERTIES
 set_tests_properties(infernix_device_sync_empty_test PROPERTIES
   ENVIRONMENT "INFERNIX_CUDA_SYNC=")
 
+# INFERNIX_TMP_CONTINUING_PROMPT is parsed where every start lists the switches (temporary_switches::describe): a
+# malformed value fails there, a fraction in (0, 1] is read as given, unset is 0.
+infernix_add_test(infernix_temporary_switches_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_temporary_switches.cpp"
+  LIBRARIES infernix_core ARGS 0.25)
+set_tests_properties(infernix_temporary_switches_test PROPERTIES ENVIRONMENT "INFERNIX_TMP_CONTINUING_PROMPT=0.25")
+add_test(NAME infernix_temporary_switches_unset_test COMMAND infernix_temporary_switches_test 0)
+set_tests_properties(infernix_temporary_switches_unset_test PROPERTIES
+  ENVIRONMENT_MODIFICATION "INFERNIX_TMP_CONTINUING_PROMPT=unset:")
+set(malformed_names suffix zero above)
+set(malformed_values 0.5x 0 1.5)
+foreach(name value IN ZIP_LISTS malformed_names malformed_values)
+  add_test(NAME infernix_temporary_switches_${name}_test COMMAND infernix_temporary_switches_test malformed)
+  set_tests_properties(infernix_temporary_switches_${name}_test PROPERTIES
+    ENVIRONMENT "INFERNIX_TMP_CONTINUING_PROMPT=${value}")
+endforeach()
+
 # The prefill expert stream's gated plans with copy-ahead (candidates BX-09): slots, tables and record bytes; CSF banks'
 # records expanded in their slots.
 infernix_add_test(infernix_expert_stream_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_stream.cpp"

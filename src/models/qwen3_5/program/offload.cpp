@@ -353,14 +353,7 @@ void ProgramOffload::end_pass(cudaStream_t compute, const execution::OffloadedCa
 }
 
 bool ProgramOffload::continuing_prompt(std::uint32_t reused, std::uint32_t prompt) {
-    static const double fraction = [] {
-        const auto value      = temporary_switches::value("INFERNIX_TMP_CONTINUING_PROMPT");
-        const double parsed   = value ? std::stod(*value) : 0.0;
-        if (value && !(parsed > 0.0 && parsed <= 1.0)) {
-            throw std::invalid_argument("INFERNIX_TMP_CONTINUING_PROMPT must be a fraction in (0, 1]");
-        }
-        return parsed;
-    }();
+    const double fraction = temporary_switches::continuing_prompt();
     return fraction > 0.0 && prompt != 0 && static_cast<double>(reused) >= fraction * static_cast<double>(prompt);
 }
 

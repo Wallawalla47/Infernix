@@ -42,6 +42,11 @@ enum class Scope : std::uint8_t {
 // ---------------------------------------------------------------------------------------------
 // Switches with a structured value, parsed once here for every reader.
 
+// INFERNIX_TMP_CONTINUING_PROMPT=<fraction in (0, 1]>: a prompt whose reused prefix covers at least that share of it
+// is a continuing conversation turn to the offloaded-expert caches (candidates CF-01); 0 when unset. describe()
+// parses it, so a malformed value fails the start.
+[[nodiscard]] double continuing_prompt();
+
 // INFERNIX_TMP_GW_SHAPE=<rows>x<stages>: the groupwise sliced-K pipelined kernel's forced block rows
 // (16, 32 or 64) and ring stages (1-4) instead of choose_sliced_k_shape's (ops/linear/common/
 // sliced_k_route.h); unset (0x0) keeps the rule.
