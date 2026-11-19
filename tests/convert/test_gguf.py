@@ -71,6 +71,21 @@ def test_gguf_source_empty_range_returns_empty_tensor(tmp_path):
         assert empty.numel() == 0
 
 
+def test_gguf_source_metadata_names_an_undecodable_field(tmp_path):
+    path = tmp_path / "model.gguf"
+    _write_gguf(path, {"vector": np.arange(4, dtype=np.float32)})
+    with GGUFSource(path) as source:
+        assert source.metadata()["general.architecture"] == "test"
+
+        class Broken:
+            def contents(self):
+                raise IndexError("truncated array")
+
+        source._reader.fields["clip.vision.image_size"] = Broken()
+        with pytest.raises(ValueError, match="clip.vision.image_size cannot be decoded"):
+            source.metadata()
+
+
 def test_hf_alias_source_name_map_and_missing_name(tmp_path):
     path = tmp_path / "model.gguf"
     _write_gguf(path, {"blk.0.attn_q.weight": np.ones((2, 3), dtype=np.float32)})
