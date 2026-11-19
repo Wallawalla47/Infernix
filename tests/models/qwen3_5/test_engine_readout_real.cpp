@@ -6,6 +6,7 @@
 // hidden), and cost nothing on requests that name no tokens.
 // Requires INFERNIX_TEST_ARTIFACT.
 
+#include "real_test_artifact.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -85,6 +86,7 @@ int main() {
         const std::string name = "chunk " + std::to_string(configuration.prefill_chunk);
         infernix::EngineOptions options;
         options.artifact_path   = artifact;
+        options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
         options.max_context     = kMaxContext;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4U * kMaxContext);
         options.kv_cache        = kKvStorage;

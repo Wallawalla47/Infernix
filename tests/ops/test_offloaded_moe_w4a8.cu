@@ -25,6 +25,7 @@
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
+#include "ops/miss_service_count.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -414,7 +415,7 @@ CallResult layer_call(Bank& bank, Streams& streams, const std::vector<float>& lo
         }
         infernix::ops::moe_experts(tx, dispatch, source, kTopK, max_jobs, d_workspace, out, nullptr, true, planned);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
-        if (config.cpu) { result.cpu_served = bank.service->served_experts() - served; }
+        if (config.cpu) { result.cpu_served = infernix::test::served_experts_past(*bank.service, served) - served; }
         read();
     }
     cudaFree(d_out);

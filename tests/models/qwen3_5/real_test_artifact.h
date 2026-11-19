@@ -10,10 +10,18 @@
 //
 // A test skips (exit 77) when its variable is unset or empty.
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
 namespace infernix::test {
+
+// The Host tier a generating Engine of a test that does not size it starts with: 1 GiB, page-locked at the start. The
+// automatic tier (the Engine's default) page-locks most of the free RAM at every start and releases it at the end,
+// about 6 s of each 27B Engine (a dflash2 tree entry took 13.1-14.2 s with it and 7.3-7.4 s without, 2026-11-19);
+// a tier of this size keeps the snapshot spills and restores the tests rely on. Tests of the tier's own sizing, and
+// the offloaded MoE's RAM layouts, keep their own settings.
+inline constexpr std::size_t kTestHostTierBytes = std::size_t{1} << 30;
 
 inline constexpr const char* kDenseArtifactVariable     = "INFERNIX_TEST_ARTIFACT";
 inline constexpr const char* kMoeArtifactVariable       = "INFERNIX_TEST_MOE_ARTIFACT";

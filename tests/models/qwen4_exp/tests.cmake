@@ -241,19 +241,19 @@ set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RET
 
 # The wide prefill workspace against its plan (design §19.3.7): every wide scope's peak stays within its arena and the
 # forward's own allocation plan, on the expert banks, the SSD tier, MTP, DFlash2, two lanes, causal scoring,
-# --a8-activations, the packed BF16 KV cache, a chat prompt's pair call, the reproducible route, every KV storage, the
-# expert-A4 routes (a4*: FP4-Local's W4A16 banks only), a 48K prompt's 32,768-column MoE group (long) and a walk
-# whose chunks a structural tap cuts below the prefill chunk (cut).
+# --a8-activations, the packed BF16 KV cache, a chat prompt's pair call, the reproducible route, every KV storage, a
+# 48K prompt's 32,768-column MoE group (long) and a walk whose chunks a structural tap cuts below the prefill chunk
+# (cut); the _a4_ entry runs the expert-A4 routes (FP4-Local's W4A16 banks only; they skip on every other artifact).
+# An entry's scenarios run one after another in one process on one EngineHost, so only its first start page-locks the
+# SSD tier's slots and reads their records; each scenario prints its own verdict and the rest run after a failure.
 infernix_add_test(infernix_qwen4_exp_wide_plan_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_plan_real.cpp"
   LIBRARIES infernix_engine
-  ARGS banks)
-foreach(scenario IN ITEMS tier mtp dflash2 two-lanes scoring a8 bf16p chat reproducible kv-bf16 kv-fp8 kv-nvfp4
-                          kv-k8v4 kv-vq2 kv-k4v2 a4 a4-residual a4-residual-3 long cut)
-  add_test(NAME infernix_qwen4_exp_wide_plan_${scenario}_real_test COMMAND infernix_qwen4_exp_wide_plan_real_test ${scenario})
-  list(APPEND infernix_qwen4_exp_wide_plan_tests infernix_qwen4_exp_wide_plan_${scenario}_real_test)
-endforeach()
-set_tests_properties(infernix_qwen4_exp_wide_plan_real_test ${infernix_qwen4_exp_wide_plan_tests}
+  ARGS banks tier mtp dflash2 two-lanes scoring a8 bf16p chat reproducible kv-bf16 kv-fp8 kv-nvfp4 kv-k8v4 kv-vq2
+       kv-k4v2 long cut)
+add_test(NAME infernix_qwen4_exp_wide_plan_a4_real_test
+  COMMAND infernix_qwen4_exp_wide_plan_real_test a4 a4-residual a4-residual-3)
+set_tests_properties(infernix_qwen4_exp_wide_plan_real_test infernix_qwen4_exp_wide_plan_a4_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against

@@ -184,11 +184,13 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     };
     // Poison, launch, wait until the gate waits, write the data, publish; returns whether the copy
     // holds the data. The host waits for the stream to pass a marker just before the gate, then
-    // 200 ms: a fixed sleep after the launch alone let a busy GPU (other processes' kernels) start
-    // the gate after the publish, so it recorded no wait or a short one; under a parallel CTest run
-    // the gate was seen starting about 19 ms after the marker.
+    // `hold` (200 ms at first): a busy GPU (other processes' kernels) can still start the gate after
+    // the publish, so it records no wait or a short one, which says nothing about the gate; the
+    // callers retry such a round with a longer hold (gated() below). Under a parallel CTest run the
+    // gate was seen starting about 19 ms after the marker.
     std::atomic<bool> reached{false};
-    const auto produce = [&](std::size_t bytes, std::uint32_t round, const std::function<void()>& launch) {
+    const auto produce = [&](std::size_t bytes, std::uint32_t round, const std::function<void()>& launch,
+                             std::chrono::milliseconds hold) {
         std::memset(src, 0xa5, bytes);
         *expected_h = ++word;
         CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));
@@ -199,7 +201,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         ctx.flush();
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (!reached.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(hold);
         fill(bytes, round);
         std::memcpy(src, host.data(), bytes);
         infernix::publish_pinned_word(ready, word);
@@ -211,20 +213,39 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     const auto read_stats = [&](std::uint64_t (&out)[2]) {
         CUDA_CHECK(cudaMemcpy(out, stats, sizeof(out), cudaMemcpyDeviceToHost));
     };
+    // One gated round through produce() with fresh stats; returns false when the copy does not hold the
+    // published data, and leaves the round's stats in `waited`. A round whose gate recorded no wait, or one
+    // under 1 ms, started late (after the publish, or just before it): it is run again with twice the hold, up
+    // to 3.2 s, so only a gate that never records its wait fails the wait check.
+    const auto gated = [&](std::size_t bytes, std::uint32_t& round, const std::function<void()>& launch,
+                           std::uint64_t (&waited)[2], const char* what) {
+        for (auto hold = std::chrono::milliseconds(200);; hold *= 2) {
+            CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(std::uint64_t), ctx.stream));
+            const bool holds = produce(bytes, ++round, launch, hold);
+            read_stats(waited);
+            if (!holds) {
+                std::cerr << what << " does not hold the published data\n";
+                return false;
+            }
+            if ((waited[1] == 1 && waited[0] >= 1000000) || waited[1] > 1 || hold >= std::chrono::milliseconds(3200)) {
+                return true;
+            }
+            std::cerr << what << ": the gate started late (" << waited[1] << " waits, " << waited[0] << " ns after a "
+                      << hold.count() << " ms hold); again with a longer hold\n";
+        }
+    };
     std::uint32_t round = 0;
     for (const std::size_t bytes : {std::size_t{2560}, std::size_t{12800}, kMaxBytes}) {
-        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(std::uint64_t), ctx.stream));
-        if (!produce(bytes, ++round, [&] {
-                infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, {}, ctx.stream);
-            })) {
-            ++failures;
-            std::cerr << "gated copy of " << bytes << " bytes does not hold the published data\n";
-        }
+        const std::string what = "gated copy of " + std::to_string(bytes) + " bytes";
         std::uint64_t waited[2] = {};
-        read_stats(waited);
+        if (!gated(bytes, round, [&] {
+                infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, {}, ctx.stream);
+            }, waited, what.c_str())) {
+            ++failures;
+        }
         if (waited[1] != 1 || waited[0] < 1000000) {
             ++failures;
-            std::cerr << "gated copy of " << bytes << " bytes recorded " << waited[1] << " waits, " << waited[0]
+            std::cerr << what << " recorded " << waited[1] << " waits, " << waited[0]
                       << " ns (expected 1 wait of at least 1 ms)\n";
         }
     }
@@ -255,18 +276,17 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, {}, ctx.stream);
         CUDA_CHECK(cudaStreamEndCapture(ctx.stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
-        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(std::uint64_t), ctx.stream));
         for (int replay = 0; replay < 3; ++replay) {
-            if (!produce(bytes, ++round, [&] { CUDA_CHECK(cudaGraphLaunch(exec, ctx.stream)); })) {
+            const std::string what = "graph replay " + std::to_string(replay);
+            std::uint64_t waited[2] = {};
+            if (!gated(bytes, round, [&] { CUDA_CHECK(cudaGraphLaunch(exec, ctx.stream)); }, waited, what.c_str())) {
                 ++failures;
-                std::cerr << "graph replay " << replay << " copied a stale or partial round\n";
+                std::cerr << what << " copied a stale or partial round\n";
             }
-        }
-        std::uint64_t waited[2] = {};
-        read_stats(waited);
-        if (waited[1] != 3) {
-            ++failures;
-            std::cerr << "graph replays recorded " << waited[1] << " waits (expected 3)\n";
+            if (waited[1] != 1) {
+                ++failures;
+                std::cerr << what << " recorded " << waited[1] << " waits (expected 1)\n";
+            }
         }
         CUDA_CHECK(cudaGraphExecDestroy(exec));
         CUDA_CHECK(cudaGraphDestroy(graph));
@@ -308,7 +328,7 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
         if (!produce(bytes, ++round, [&] {
                 infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr,
                                              infernix::DeviceFault{.word = fault, .value = kFault}, ctx.stream, kBoundNs * 100);
-            })) {
+            }, std::chrono::milliseconds(200))) {
             ++failures;
             std::cerr << "the gate after a timed-out one did not copy its round\n";
         }
@@ -497,17 +517,32 @@ int main(int argc, char** argv) {
         std::cerr << "timer elapsed time was negative\n";
     }
 
-    // try_elapsed_ms never waits: empty while the stop is queued behind host work, a value after.
+    // try_elapsed_ms never waits: empty while the stop is queued behind host work, a value after. The stream is
+    // held by a host function until released (not for a fixed time a loaded machine could outlast before the
+    // check), and released 150 ms after it began holding, so the stop lands at least that long after the start.
     infernix::CudaEventTimer pending(moved);
     pending.start();
+    struct Hold {
+        std::atomic<bool> holding{false};
+        std::atomic<bool> release{false};
+    } hold;
     CUDA_CHECK(cudaLaunchHostFunc(
         moved.stream,
-        [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); }, nullptr));
+        [](void* p) {
+            auto* h = static_cast<Hold*>(p);
+            h->holding.store(true);
+            while (!h->release.load()) { std::this_thread::yield(); }
+        },
+        &hold));
     pending.record_stop();
     if (pending.try_elapsed_ms()) {
         ++failures;
         std::cerr << "try_elapsed_ms returned a time before the stop completed\n";
     }
+    const auto hold_until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!hold.holding.load() && std::chrono::steady_clock::now() < hold_until) { std::this_thread::yield(); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    hold.release.store(true);
     moved.synchronize();
     const auto settled = pending.try_elapsed_ms();
     if (!settled || *settled < 100.0f) {

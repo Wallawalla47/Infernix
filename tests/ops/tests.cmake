@@ -380,18 +380,29 @@ foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
 endforeach()
 
 # Every softmax attention entry's oracle runs on all host threads (ops/host_parallel.h) and its
-# kernels fill the GPU, so entries started together only oversubscribe both: the bf16 entry, 62 s
-# alone, timed out at 900 s beside five others (2026-10-22). They take turns; other tests still run
-# beside them.
-set(infernix_attention_oracle_tests infernix_softmax_attention_test infernix_softmax_attention_extended_test)
-foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
-  list(APPEND infernix_attention_oracle_tests infernix_softmax_attention_${kv_dtype}_test
-    infernix_softmax_attention_wide_${kv_dtype}_test)
+# kernels fill the GPU, so many entries started together only oversubscribe both: the bf16 entry,
+# 62 s alone, timed out at 900 s beside five others (2026-10-22). Most of an entry is one thread,
+# though (its cases' fixtures, cache snapshots and checks: 6.3 of 32 threads busy on average, the wide
+# fp8 entry alone, 2026-11-18), and one turn-taking chain of all twelve was the whole suite's critical
+# path (2,068 of 2,517 s at -j 8). So they take turns in three chains, three at a time, balanced by their
+# times beside each other at -j 8 (697, 676 and 765 s with measured costs, 2026-11-19); other tests still run
+# beside them. Each entry is slower beside the other chains than alone or in one chain (the twelve's sum rose
+# from 1,738 to 2,138 s), the run shorter (36.6 to 21.3 min).
+set(infernix_attention_chain_a infernix_softmax_attention_int8_test infernix_softmax_attention_fp8_test
+  infernix_softmax_attention_wide_fp8_test infernix_softmax_attention_test)
+set(infernix_attention_chain_b infernix_softmax_attention_nvfp4_test infernix_softmax_attention_k8v4_test
+  infernix_softmax_attention_extended_test)
+set(infernix_attention_chain_c infernix_softmax_attention_bf16_test)
+foreach(kv_dtype bf16 int8 nvfp4 k8v4)
+  list(APPEND infernix_attention_chain_c infernix_softmax_attention_wide_${kv_dtype}_test)
 endforeach()
-set_tests_properties(${infernix_attention_oracle_tests} PROPERTIES RESOURCE_LOCK infernix_attention_oracle)
-# Their turns are the run's critical path, so a tree without measured costs (CTestCostData.txt, which
+foreach(chain a b c)
+  set_tests_properties(${infernix_attention_chain_${chain}} PROPERTIES RESOURCE_LOCK infernix_attention_oracle_${chain})
+endforeach()
+# Their chains are the run's critical path, so a tree without measured costs (CTestCostData.txt, which
 # replaces COST once present) starts them first, with the longest single entry.
-set(infernix_attention_first ${infernix_attention_oracle_tests} infernix_lossless_ops_test)
+set(infernix_attention_first ${infernix_attention_chain_a} ${infernix_attention_chain_b} ${infernix_attention_chain_c}
+  infernix_lossless_ops_test)
 set_tests_properties(${infernix_attention_first} PROPERTIES COST 1000)
 
 add_test(NAME infernix_sparse_moe_wide_test
@@ -414,9 +425,11 @@ endforeach()
 set_tests_properties(infernix_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
 # The acceptance suites on FP32 verification logits (every vocabulary head writes FP32).
 add_test(NAME infernix_speculative_round_fp32_test COMMAND ${infernix_speculative_round_test_COMMAND} --fp32-logits)
-# Thousands of small synchronous launches: 119 s alone, past 900 s beside the suite's GPU-heavy tests (2026-10-27,
-# -j 8), whose kernels it waits behind at every synchronization.
-set_tests_properties(infernix_speculative_round_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+# Thousands of small synchronous launches, which wait behind other tests' kernels at every synchronization: past 900 s
+# beside the suite's GPU-heavy tests on 2026-10-27 (-j 8, when the attention entries still ran six at a time), so it
+# ran alone; its BF16 twin (infernix_speculative_round_test, the same suites) takes 111-143 s beside them at -j 8
+# (2026-11-18), so it runs beside them too, with the default 900 s bound.
+set_tests_properties(infernix_speculative_round_fp32_test PROPERTIES SKIP_RETURN_CODE 77)
 foreach(mode IN ITEMS ngram-only mtp-onehot onehot-distribution mtp-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
   add_test(NAME infernix_speculative_${test_suffix}_fp32_test

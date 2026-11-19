@@ -26,6 +26,7 @@
 #include "ops/ggml/ggml_exact.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
+#include "ops/miss_service_count.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -301,7 +302,7 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
             char none[128];
             std::snprintf(none, sizeof none, "ggml experts (%d, %d) at %d columns, %s: the CPU served no expert",
                           static_cast<int>(gu), static_cast<int>(down), columns, config.name);
-            check(service.served_experts() > served, none);
+            check(infernix::test::served_experts_past(service, served) > served, none);
         }
         std::vector<std::uint16_t> actual(expected.size());
         cuda_check(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");

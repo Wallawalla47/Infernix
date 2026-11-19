@@ -18,6 +18,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
+#include "ops/miss_service_count.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -350,7 +351,7 @@ void run(int columns, std::mt19937& rng) {
         if (config.cpu) {
             char none[128];
             std::snprintf(none, sizeof none, "fp8 experts at %d columns, %s: the CPU served no expert", columns, config.name);
-            check(service.served_experts() > served, none);
+            check(infernix::test::served_experts_past(service, served) > served, none);
         }
         std::vector<std::uint16_t> actual(expected.size());
         cuda_check(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");

@@ -944,7 +944,22 @@ void test_ram_monitor() {
         return done();
     };
     {
-        RamMonitor monitor(8 * kGiB, -1, [&] { return available.load(); }, std::chrono::milliseconds(2));
+        std::atomic<int> reads{0};
+        RamMonitor monitor(8 * kGiB, -1,
+                           [&] {
+                               const std::uint64_t value = available.load();
+                               ++reads;
+                               return value;
+                           },
+                           std::chrono::milliseconds(2));
+        // Waits until three more readings have begun: a tick reads, observes, then waits before the next read, so by
+        // then the second of them saw the value stored before the call, and every tick that read an older value has
+        // finished observing it (a fixed sleep let a tick that read the old value, then lost the CPU on a loaded
+        // machine, set a resize due after the test's decide).
+        const auto settled = [&] {
+            const int from = reads.load();
+            return wait_for([&] { return reads.load() >= from + 3; });
+        };
         monitor.set_room(10 * kGiB, 0);
         monitor.set_waker([&] { ++wakes; });
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -954,10 +969,9 @@ void test_ram_monitor() {
         require(monitor.decide(10 * kGiB, 0).release == 5 * kGiB, "monitor: the due release");
         // The band: once no tick still holds the old reading, decide takes what is due and nothing sets it again.
         available = 6 * kGiB;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(settled(), "monitor: it reads the new value");
         require(monitor.decide(10 * kGiB, 0).release == 0, "monitor: nothing due in the band");
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        require(!monitor.due(), "monitor: decide takes the due resize, and the band sets nothing");
+        require(settled() && !monitor.due(), "monitor: decide takes the due resize, and the band sets nothing");
         const int before = wakes.load();
         monitor.set_busy(true);
         require(wait_for([&] { return wakes.load() >= before + 3; }) && !monitor.due(),
