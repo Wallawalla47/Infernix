@@ -210,6 +210,9 @@ The Python suites exercise conversion, encoded output and measurement tools with
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
 
+The launcher's web UI checks its pure helpers (duration formatting, the routes' wildcard rule, repository
+links) with `npm test` in `apps/launcher/web`, after `npm ci` there; no browser is needed.
+
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
