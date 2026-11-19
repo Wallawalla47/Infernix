@@ -571,8 +571,8 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
 
 // A layer walk of two chunks as ProgramImpl::walk_step / walk_moe run it (prefill_walk.cpp), on Forward's public steps:
 // each chunk's embedding and every layer's mixer chunk by chunk, every layer's MoE once over both chunks, the last
-// layer's over the last chunk's trailing columns when `trim` (its dense shared expert over that chunk); the last chunk's
-// logits.
+// layer's over the last chunk's trailing columns when `trim` (its dense shared expert and its experts' routes over both
+// chunks, as the untrimmed walk's MoE runs them); the last chunk's logits.
 std::vector<float> walk_logits(const q4::execution::Parameters& parameters, DeviceContext& device,
                                const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv,
                                q4::execution::ForwardFastPaths fast, std::int32_t w0, std::int32_t w1, bool trim,
