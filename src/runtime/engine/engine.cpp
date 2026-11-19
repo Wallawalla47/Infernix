@@ -747,6 +747,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
+        // Answered here without the core, but only by an Engine that would accept the request: after stop() or a
+        // failure a zero-token request is refused as Unavailable like any other.
+        if (!is_available()) { throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable"); }
         struct ImmediateSubmission {
             GenerationResult result;
             OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;

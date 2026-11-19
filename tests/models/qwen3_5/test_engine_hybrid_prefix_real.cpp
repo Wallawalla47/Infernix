@@ -446,6 +446,12 @@ int exercise_persist(const char* artifact) {
             std::cerr << "persist: a stopped Engine accepted a request\n";
             ++failures;
         }
+        // A request for no output tokens is answered without the queue, but not by a stopped Engine.
+        if (!fails_unavailable(
+                [&] { (void)saver.submit(saver.prepare_tokens(second), greedy(0)).wait(); })) {
+            std::cerr << "persist: a stopped Engine answered a zero-token request\n";
+            ++failures;
+        }
     }
     if (!std::filesystem::exists(file)) {
         std::cerr << "persist: the Engine did not save its Host tier\n";
