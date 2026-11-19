@@ -939,10 +939,13 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
                 kHidden);
         });
     const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
+    // A8Only's projection is qualified against its codec's oracle in infernix_linear_nvfp4_a8_test; here its
+    // composition with the convolution and the workspace contract, within the 4-bit bound.
+    const bool a8 = ops::a8_only(policy);
     const ReductionCriterion& criterion =
-        a4 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
+        a4 || a8 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens) +
+        std::string(" NVFP4 ") + (a4 ? "A4" : a8 ? "A8" : "A16") + " T=" + std::to_string(tokens) +
         " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(kSnapshotBaseSlot);
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
@@ -990,6 +993,9 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A8Only, 2);
+    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A8Only, 5);
+    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::A8Only, 0);
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
     constexpr std::int32_t kChannels  = 10240;
@@ -1049,6 +1055,8 @@ struct Fp8Parent {
 };
 constexpr Fp8Parent kFp8RowBf16{QType::FP8_E4M3FN_ROW_BF16, 5120, 6144, 6144, 0.0F};
 constexpr Fp8Parent kFp8RowF32{QType::FP8_E4M3FN_ROW_F32, 3072, 8192, 8192, fp8_static::kScale};
+// The 27B's [16384,5120] in FP32 row words with a static input scale (NVIDIA's NVFP4-QAD, bit-exact).
+constexpr Fp8Parent kFp8RowF32At5120{QType::FP8_E4M3FN_ROW_F32, 5120, 6144, 6144, fp8_static::kScale};
 
 // The activations a route's products read: the A8 codes' values on a static A8 route, else the BF16
 // values (a dynamic A8 route keeps them, under its own criterion).
@@ -1124,7 +1132,8 @@ int run_fp8_case(const Fp8Parent& shape, DevicePackedWeight& parent, std::int32_
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
     const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
                                                        3 * kChannels);
-    const bool uses_a8               = policy == ops::LinearPolicy::AllowA8 && tokens >= 17;
+    // A8Only (--a8-activations): its one-term route at every width.
+    const bool uses_a8 = (policy == ops::LinearPolicy::AllowA8 && tokens >= 17) || ops::a8_only(policy);
     const bool uses_a8_residual      = ops::allows_a8_residual(policy) && tokens >= 17;
     const std::vector<double> inputs = fp8_reference(shape, activation, uses_a8);
     const SnapshotOracle oracle = snapshot_oracle(
@@ -1197,6 +1206,10 @@ int run_fp8(const Fp8Parent& shape, std::uint32_t seed) {
     failures += run_fp8_case(shape, parent, 257, P::AllowA8, 258);
     failures += run_fp8_case(shape, parent, 512, P::AllowA8, 513);
     failures += run_fp8_case(shape, parent, 1025, P::AllowA8, 1026);
+    // --a8-activations: the one-term route at the fused widths too (their workspace is the materialized route's).
+    failures += run_fp8_case(shape, parent, 1, P::A8Only, 2);
+    failures += run_fp8_case(shape, parent, 3, P::A8Only, 4);
+    failures += run_fp8_case(shape, parent, 17, P::A8Only, 18);
     if (shape.static_a8()) {
         // Decode and verification (A16ColumnInvariant): one projection schedule at every width.
         failures += run_fp8_case(shape, parent, 1, P::A16ColumnInvariant, 2);
@@ -1283,8 +1296,14 @@ INFERNIX_OP_TEST(gdn_input_proj_conv_snapshot) {
     }
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
+    // A16: the fused small-T kernel through 4 columns (no workspace), the materialized projection from 5.
+    const std::size_t nvfp4_a16_5 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 5, 5);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 4) != 0 ||
+        nvfp4_a16_5 == 0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 5) != nvfp4_a16_5 ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
         nvfp4_a4_4 == 0 ||
@@ -1293,7 +1312,7 @@ INFERNIX_OP_TEST(gdn_input_proj_conv_snapshot) {
         std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
         ++failures;
     }
-    for (const Fp8Parent& shape : {kFp8RowBf16, kFp8RowF32}) {
+    for (const Fp8Parent& shape : {kFp8RowBf16, kFp8RowF32, kFp8RowF32At5120}) {
         const auto fp8_snapshot_capacity = [&](ops::LinearPolicy policy, std::int32_t batch,
                                                std::int32_t min_width, std::int32_t max_width) {
             return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1313,18 +1332,21 @@ INFERNIX_OP_TEST(gdn_input_proj_conv_snapshot) {
             }
         }
     }
-    // A static input scale has no A8 residual profile.
-    try {
-        (void)ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            kFp8RowF32.qtype, kFp8RowF32.rows(), kFp8RowF32.hidden, ops::LinearPolicy::AllowA8Residual, 1, 17, 17);
-        std::cerr << "FP8 row-f32 snapshot accepted the A8 residual policy\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    // A static input scale has no A8 residual profile, at either geometry.
+    for (const Fp8Parent& shape : {kFp8RowF32, kFp8RowF32At5120}) {
+        try {
+            (void)ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                shape.qtype, shape.rows(), shape.hidden, ops::LinearPolicy::AllowA8Residual, 1, 17, 17);
+            std::cerr << shape.name() << " K=" << shape.hidden << " snapshot accepted the A8 residual policy\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
     failures += run_q4_q5();
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8(kFp8RowBf16, 929U);
     failures += run_fp8(kFp8RowF32, 963U);
+    failures += run_fp8(kFp8RowF32At5120, 965U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

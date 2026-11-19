@@ -20,6 +20,8 @@ enum class Fp8AttnInputRoute : std::uint8_t {
 Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 attn_input_proj: T must be positive"); }
     if (column_invariant(policy)) { return Fp8AttnInputRoute::ColumnInvariantA16; }
+    // `--a8-activations`: the one-term 8-bit route at every width.
+    if (a8_only(policy)) { return Fp8AttnInputRoute::A8; }
     if (policy == LinearPolicy::A16Only || allows_a4_residual(policy)) {
         return Fp8AttnInputRoute::A16;
     }
@@ -42,14 +44,22 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         fp8_attn_input_a16_gemm_launch(x, weight, q, gate, k, v, stream);
 }
 
+// A static input scale (fp8_e4m3fn_row_f32) has no two-term residual encoding.
+void require_static_route(QType qtype, Fp8AttnInputRoute route) {
+    if (qtype == QType::FP8_E4M3FN_ROW_F32 && route == Fp8AttnInputRoute::A8Residual) {
+        throw std::invalid_argument("fp8 attn_input_proj: a static input scale has no A8 residual route");
+    }
+}
+
 } // namespace
 
-std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+std::size_t fp8_attn_input_workspace_capacity_bytes(QType qtype, LinearPolicy policy, std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 attn_input_proj workspace: invalid token interval");
     }
-    (void)resolve_route(policy, min_tokens);
+    require_static_route(qtype, resolve_route(policy, min_tokens));
+    require_static_route(qtype, resolve_route(policy, max_tokens));
     switch (resolve_route(policy, max_tokens)) {
     case Fp8AttnInputRoute::A8:
         return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N14336K5120::kInputRows,
@@ -67,6 +77,7 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream) {
     const Fp8AttnInputRoute route = resolve_route(policy, x.ne[1]);
+    require_static_route(weight.qtype, route);
     if (route == Fp8AttnInputRoute::ColumnInvariantA16) {
         fp8_attn_input_invariant_launch(x, weight, q, gate, k, v, stream);
         return;

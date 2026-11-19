@@ -1233,6 +1233,9 @@ void validate_target_options(const execution::Parameters& parameters,
     // tier): the loaded model's choice stands.
     auto expected           = models::load_options(options, Architecture::Qwen3_5);
     expected.stream_experts = parameters.model.options().stream_experts;
+    // The Engine decides --a8-activations' dense binding from the artifact's directory (LoadOptions::a8_dense):
+    // the loaded model's choice stands where the flag is set.
+    expected.a8_dense = options.a8_activations && parameters.model.options().a8_dense;
     if (parameters.model.options() != expected) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");

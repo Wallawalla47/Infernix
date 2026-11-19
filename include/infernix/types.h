@@ -818,12 +818,13 @@ struct EngineOptions {
     // default 16-bit activations. Other artifacts refuse it, as does the lossless route without the
     // design reference.
     bool expert_a4_activations         = false;
-    // Qwen3.8-Flash-Next artifacts whose routed experts are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and
-    // B, Dense8): run them with 16-bit activations (--a16-activations), the arithmetic of the weight-only banks
-    // (design §16.2.1), instead of the 4-bit activations at NVIDIA's calibrated scales. Changes the output; the
-    // engine warns at launch that the default follows NVIDIA's specification and is recommended. Artifacts whose
-    // experts already run 16-bit activations accept it unchanged; --expert-a4-activations, --a8-activations
-    // and the lossless route refuse it.
+    // 16-bit activations where the checkpoint specifies fewer bits (--a16-activations): Qwen3.8-Flash-Next routed
+    // experts that are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and B, Dense8, NVFP4-QAD) run the
+    // arithmetic of the weight-only banks (design §16.2.1); on a Qwen3.5-family artifact every text projection
+    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations).
+    // Changes the output; the engine warns at launch that the default follows NVIDIA's specification and is
+    // recommended. Artifacts that already run 16-bit activations accept it unchanged; --expert-a4-activations,
+    // --a8-activations and the lossless route refuse it.
     bool expert_a16_activations        = false;
     // The 8-bit activation routes (--a8-activations; approximate, opt-in, never a default), each where it
     // measured faster than the route it replaces (or is being measured; docs/maintainer/qwen3_8-flash-next-design.md

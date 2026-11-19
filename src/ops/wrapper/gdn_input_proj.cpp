@@ -42,14 +42,16 @@ struct Fp8GdnShape {
     std::int32_t z;
 };
 
-Fp8GdnShape fp8_gdn_shape(QType qtype) {
-    return qtype == QType::FP8_E4M3FN_ROW_F32 ? Fp8GdnShape{3072, 2048, 2048, 8192, 8192}
-                                              : Fp8GdnShape{5120, 2048, 2048, 6144, 6144};
+// The registered parents by K: Qwen3.5-122B-A10B's static-scale fp8_e4m3fn_row_f32 [20480,3072], and
+// the 27B's [16384,5120] in either row word (fp8_e4m3fn_row_f32: NVIDIA's per-tensor scales kept exactly).
+Fp8GdnShape fp8_gdn_shape(QType qtype, std::int32_t input_rows) {
+    return qtype == QType::FP8_E4M3FN_ROW_F32 && input_rows == 3072 ? Fp8GdnShape{3072, 2048, 2048, 8192, 8192}
+                                                                    : Fp8GdnShape{5120, 2048, 2048, 6144, 6144};
 }
 
 bool fp8_gdn_profile(QType qtype, std::int32_t parent_rows, std::int32_t input_rows) {
     if (!is_fp8_row(qtype)) { return false; }
-    const Fp8GdnShape shape = fp8_gdn_shape(qtype);
+    const Fp8GdnShape shape = fp8_gdn_shape(qtype, input_rows);
     return parent_rows == shape.query + shape.key + shape.value + shape.z &&
            input_rows == shape.hidden;
 }
@@ -326,6 +328,10 @@ void validate_policy(LinearPolicy policy, QType qtype) {
     case LinearPolicy::AllowA4Residual:
     case LinearPolicy::AllowA8Residual:
         return;
+    case LinearPolicy::A8Only:
+        // The 8-bit routes of the NVFP4 and row-scaled FP8 parents.
+        if (qtype == QType::NVFP4 || is_fp8_row(qtype)) { return; }
+        throw std::invalid_argument("gdn_input_proj: A8Only takes NVFP4 or row-scaled FP8 parents");
     }
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");
 }
@@ -355,7 +361,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     }
 
     if (is_fp8_row(weight.qtype)) {
-        const Fp8GdnShape shape     = fp8_gdn_shape(weight.qtype);
+        const Fp8GdnShape shape     = fp8_gdn_shape(weight.qtype, weight.k);
         const std::int32_t hidden   = shape.hidden;
         const std::int32_t qkv_rows = shape.query + shape.key + shape.value;
         const std::int32_t z_rows   = shape.z;
@@ -560,7 +566,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
     }
 
     if (is_fp8_row(weight.qtype)) {
-        const Fp8GdnShape shape        = fp8_gdn_shape(weight.qtype);
+        const Fp8GdnShape shape        = fp8_gdn_shape(weight.qtype, weight.k);
         const std::int32_t hidden      = shape.hidden;
         const std::int32_t query_rows  = shape.query;
         const std::int32_t key_rows    = shape.key;
@@ -726,7 +732,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
     }
 
     if (is_fp8_row(weight.qtype)) {
-        const Fp8GdnShape shape        = fp8_gdn_shape(weight.qtype);
+        const Fp8GdnShape shape        = fp8_gdn_shape(weight.qtype, weight.k);
         const std::int32_t hidden      = shape.hidden;
         const std::int32_t query_rows  = shape.query;
         const std::int32_t key_rows    = shape.key;
@@ -981,7 +987,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     validate_policy(policy, parent_qtype);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     if (fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
-        return detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, input_rows, batch_size,
+        return detail::fp8_gdn_snapshot_workspace_capacity_bytes(parent_qtype, policy, input_rows, batch_size,
                                                                  min_width, max_width);
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
@@ -1042,7 +1048,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     validate_policy(policy, parent_qtype);
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
-        return detail::fp8_gdn_record_workspace_capacity_bytes(policy, input_rows, batch_size,
+        return detail::fp8_gdn_record_workspace_capacity_bytes(parent_qtype, policy, input_rows, batch_size,
                                                                min_width, max_width);
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
@@ -1059,8 +1065,9 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, std::max(min_width, 4),
-                                                                max_width);
+        // Below the fused A16 kernel's widths only A8Only materializes (nvfp4_gdn_conv_resolve_plan).
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(
+            policy, a8_only(policy) ? min_width : std::max(min_width, 4), max_width);
     }
     return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
                                                             batch_size * max_width);

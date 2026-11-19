@@ -32,6 +32,8 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
         throw std::invalid_argument("fp8 linear_add: unsupported shape");
     }
     if (column_invariant(policy)) { return Fp8LinearAddRoute::ColumnInvariantA16; }
+    // `--a8-activations`: the one-term 8-bit route at every width (its 32-column tiles mask narrower calls).
+    if (a8_only(policy)) { return Fp8LinearAddRoute::A8; }
     // Two E4M3 terms (AllowA8Residual) never beat A16 on these 5,120 outputs: 34 against 29 us at
     // 17-32 columns of K=6144 and 75-116 against 68-121 us at 24-128 of K=17408 (RTX 5090), the
     // doubled MMA work on too few CTAs. The static-scale [3072,8192] has no residual profile.

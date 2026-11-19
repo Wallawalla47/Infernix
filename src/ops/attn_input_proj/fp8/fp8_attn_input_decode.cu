@@ -22,8 +22,11 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
         static_cast<__nv_bfloat16*>(gate.data),
         static_cast<__nv_bfloat16*>(v.data),
     };
-    launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+    // BF16 row words, or FP32 ones (fp8_e4m3fn_row_f32: ModelOpt's per-tensor scales kept exactly).
+    with_fp8_scale_word(weight, [&]<class Scale>() {
+        launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            fp8_a16_operands<Scale>(x, weight), output, LinearIdentityEpilogue{}, stream);
+    });
 }
 
 } // namespace infernix::ops::detail

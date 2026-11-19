@@ -142,7 +142,7 @@ among other things:
 One format may have more than one deliberately supported layout, but every layout must decode to
 exactly the same direct words or logical codes and scales. The currently registered layouts are
 `contiguous_le_v1` for direct words, `row_split_k128_v1` for grouped signed-integer formats, and
-`block_scale_k16_m128x4_v1` for `nvfp4`, and `row_scale_v1` for
+`block_scale_k16_m128x4_v1` for `nvfp4` (and dense `nvfp4_mul`), and `row_scale_v1` for
 `fp8_e4m3fn_row_bf16`. Their byte order, plane packing, padding, swizzle, divisor placement, and
 alignment rules belong to the layout registry, not to these nine numeric formats.
 
@@ -334,10 +334,12 @@ W[n,k] = decode_e2m1(c[n,k]) * decode_e4m3fn(s[n,g]) * m_w
 `m_w` is a finite, strictly positive binary32 word. The product is exact in binary64. Storing
 `1/m_w` as an `nvfp4` divisor changes the represented weight unless `m_w` is a power of two, so the
 two formats are distinct. The only producer is `import_encoded`. ModelOpt's activation
-`input_scale` is a separate model-role tensor. The format's layouts are `nvfp4_expert_rg16_v1` for
-routed-expert banks ([storage layouts §6](storage-layouts.md#6-nvfp4_expert_rg16_v1)) and
-`nvfp4_rg16_v1` for one dense matrix ([§6.1](storage-layouts.md#61-nvfp4_rg16_v1): Qwen3.5-122B's
-output head, NVIDIA FP4-Local's vision MLPs and merger).
+`input_scale` is a separate model-role tensor (an A4 Use's `activation_input_scale` auxiliary). The
+format's layouts are `nvfp4_expert_rg16_v1` for routed-expert banks
+([storage layouts §6](storage-layouts.md#6-nvfp4_expert_rg16_v1)), `nvfp4_rg16_v1` for one dense matrix
+([§6.1](storage-layouts.md#61-nvfp4_rg16_v1): Qwen3.5-122B's output head, NVIDIA FP4-Local's vision MLPs
+and merger), and `block_scale_k16_m128x4_v1` for a dense matrix the NVFP4 kernels run (NVIDIA's NVFP4-QAD
+Qwen3.8-27B: its planes are `nvfp4`'s, with `m_w` in the divisor's word).
 
 ### 3.6 GGUF (ggml) block formats
 

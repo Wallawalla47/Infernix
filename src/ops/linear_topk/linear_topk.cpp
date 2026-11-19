@@ -4,6 +4,7 @@
 #include "infernix/ops/linear.h"
 #include "infernix/ops/rg16_linear.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
@@ -21,14 +22,15 @@ enum class HeadProfile : std::uint8_t {
     Fp8Full,
     Q4Optimized,
     Nvfp4Full,
-    // Qwen3.5-122B-A10B's per-row FP8 head (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4): its FP32
-    // logits through linear, then the NVFP4 head's grouped selection.
-    Fp8F32Full,
+    // Heads whose FP32 logits come from linear, then the NVFP4 head's grouped selection: Qwen3.5-122B-A10B's
+    // per-row FP8 head (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4) and the 27B head NVIDIA's NVFP4-QAD
+    // stores as NVFP4 (block_scale_k16_m128x4_v1, run as QType::NVFP4).
+    LinearFull,
 };
 
 // The profiles whose logits are materialized before the grouped selection.
 bool materialized(HeadProfile profile) {
-    return profile == HeadProfile::Nvfp4Full || profile == HeadProfile::Fp8F32Full;
+    return profile == HeadProfile::Nvfp4Full || profile == HeadProfile::LinearFull;
 }
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -73,7 +75,10 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     }
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_F32 &&
         input_rows == detail::kLinearTopK122BHidden) {
-        return HeadProfile::Fp8F32Full;
+        return HeadProfile::LinearFull;
+    }
+    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::NVFP4 && input_rows == detail::kLinearTopKHidden) {
+        return HeadProfile::LinearFull;
     }
     throw std::invalid_argument("linear_topk: unsupported head profile");
 }
@@ -169,9 +174,10 @@ void require_nvfp4(const Weight& head) {
 void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                                const Tensor& candidate_ids, const Tensor& candidate_scores,
                                const Tensor* id_map, const detail::LinearTopKWorkspace& scratch) {
-    // An nvfp4_rg16_v1 head keeps its scales inside its payload.
+    // An nvfp4_rg16_v1 head keeps its scales inside its payload; a BlockScale NVFP4 head has an E4M3 word
+    // per 16 values.
     const std::size_t code_bytes = head.qtype == QType::NVFP4_MUL ? static_cast<std::size_t>(head.payload_bytes)
-                                   : head.qtype == QType::Q4_G64_FP16
+                                   : head.qtype == QType::Q4_G64_FP16 || head.qtype == QType::NVFP4
                                        ? static_cast<std::size_t>(head.n) * head.k / 2
                                        : static_cast<std::size_t>(head.n) * head.k;
     const std::size_t scale_bytes =
@@ -179,6 +185,8 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
             ? static_cast<std::size_t>(head.n) * (head.k / 32) * sizeof(std::uint16_t)
         : head.qtype == QType::Q4_G64_FP16
             ? static_cast<std::size_t>(head.n) * (head.k / 64) * sizeof(std::uint16_t)
+        : head.qtype == QType::NVFP4
+            ? static_cast<std::size_t>(head.n) * (head.k / 16)
         : head.qtype == QType::NVFP4_MUL
             ? std::size_t{0}
         : head.qtype == QType::FP8_E4M3FN_ROW_F32
@@ -290,7 +298,7 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
         if (profile == HeadProfile::Nvfp4Full) {
             (void)layout.alloc(DType::FP32, {head_rows, columns}, 256);
             (void)layout.alloc_bytes(rg16_linear_workspace_bytes(head_rows, input_rows, columns));
-        } else if (profile == HeadProfile::Fp8F32Full) {
+        } else if (profile == HeadProfile::LinearFull) {
             (void)layout.alloc(DType::FP32, {head_rows, columns}, 256);
             (void)layout.alloc_bytes(
                 linear_workspace_capacity_bytes(qtype, head_rows, input_rows, LinearPolicy::A16Only, columns, columns));
@@ -312,8 +320,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
         require_q8(head);
     } else if (profile == HeadProfile::Nvfp4Full) {
         require_nvfp4(head);
-    } else if (profile == HeadProfile::Fp8F32Full) {
-        (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
+    } else if (profile == HeadProfile::LinearFull && head.qtype == QType::NVFP4) {
+        (void)detail::validate_nvfp4_weight(head, "linear_topk NVFP4 full head");
     } else {
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }

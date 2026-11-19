@@ -23,6 +23,10 @@ namespace infernix::ops::detail {
 void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual, bool wide_k,
                                  cudaStream_t stream);
 
+// A8Only: x encoded by ggml_a8.h's codec, then the 8-bit tiles (nvfp4_linear_add_a8.cu).
+void nvfp4_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual, WorkspaceArena& workspace,
+                                cudaStream_t stream);
+
 // A16ColumnInvariant: one K-warp count per K for every T (8 at K=6144, 4 at K=17408), so a
 // column's arithmetic does not depend on the call's other columns. Calls of 17+ columns (32+ at
 // K=17408) run the slice-major ring tile of that count, narrower ones the sliced-K tiles; the two give

@@ -121,7 +121,8 @@ same route as generation; `--ngram-volume FILE` names their n-gram volume when i
 `--expert-a4-activations` scores nvidia/Qwen3.8-Flash-Next-FP4-Local with 4-bit expert activations
 ([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)); `report.json` records it as
 `expert_a4_activations`. `--a16-activations` scores the artifacts whose routed experts NVIDIA specifies as W4A4
-(NVFP4, NVFP4 Dense8 and NVFP4-QAD) with 16-bit expert activations, and `--a8-activations` scores infernix-serve's
+(NVFP4, NVFP4 Dense8 and NVFP4-QAD) with 16-bit expert activations and NVIDIA's NVFP4 Qwen3.8-27B artifacts with
+16-bit activations at every text projection, and `--a8-activations` scores infernix-serve's
 8-bit route, which the reproducible and lossless routes refuse; `report.json` records them as
 `expert_a16_activations` and `a8_activations`. The
 [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)

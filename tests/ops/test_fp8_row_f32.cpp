@@ -1,5 +1,6 @@
 // fp8_e4m3fn_row_f32 (FP32 row multipliers, one static activation scale s per parent): the
-// Qwen3.5-122B-A10B projections (docs/maintainer/qwen3_5-122b-offload-design.md §6.2, §8.2).
+// Qwen3.5-122B-A10B projections (docs/maintainer/qwen3_5-122b-offload-design.md §6.2, §8.2) and the Qwen3.8-27B's
+// attention input [14336, 5120], GDN input [16384, 5120] and output [5120, 6144] (NVIDIA's NVFP4-QAD, bit-exact).
 //
 //   - The static A8 encoding (D4) bit for bit: code = e4m3_rn_satfinite(fl32(x * fl32(1 / s))) with
 //     the sign of x, every token's scale s, on columns with saturating outliers, E4M3 subnormals and
@@ -102,12 +103,14 @@ std::vector<double> represented_per_token(const std::vector<float>& x, int k, in
     return out;
 }
 
+// A8Only (`--a8-activations`) takes the 8-bit route at every width.
 bool a8(ops::LinearPolicy policy, int tokens, int first_a8 = 17) {
-    return policy == ops::LinearPolicy::AllowA8 && tokens >= first_a8;
+    return (policy == ops::LinearPolicy::AllowA8 && tokens >= first_a8) || policy == ops::LinearPolicy::A8Only;
 }
 
 std::string name(ops::LinearPolicy policy) {
     return policy == ops::LinearPolicy::AllowA8           ? "allow-a8"
+           : policy == ops::LinearPolicy::A8Only             ? "a8-only"
            : policy == ops::LinearPolicy::A16ColumnInvariant ? "column-invariant"
                                                               : "a16";
 }
@@ -201,9 +204,25 @@ std::vector<double> oracle_input(const std::vector<float>& x, int k, int tokens,
     return per_token ? represented_per_token(x, k, tokens) : represented(x);
 }
 
+// The parents' geometries: Qwen3.5-122B-A10B's, and the Qwen3.8-27B's (NVIDIA's NVFP4-QAD keeps its attention
+// and ten GDN layers in per-tensor FP8, stored exactly as fp8_e4m3fn_row_f32).
+struct AttentionShape {
+    int hidden, q, kv, rows;
+};
+struct GdnShape {
+    int hidden, qkv, z, rows;
+};
+struct OutputShape {
+    int rows, k;
+};
+constexpr AttentionShape kAttention122B{3072, 8192, 512, 17408}, kAttention27B{5120, 6144, 1024, 14336};
+constexpr GdnShape kGdn122B{3072, 12288, 8192, 20480}, kGdn27B{5120, 10240, 6144, 16384};
+constexpr OutputShape kOutput122B{3072, 8192}, kOutput27B{5120, 6144};
+
 int run_attention(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
-                  std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false) {
-    constexpr int kHidden = 3072, kQ = 8192, kKv = 512, kRows = 17408;
+                  std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false,
+                  AttentionShape shape = kAttention122B) {
+    const int kHidden = shape.hidden, kQ = shape.q, kKv = shape.kv, kRows = shape.rows;
     const auto x       = activations(kHidden, tokens, 101U);
     const auto x_bits  = bf16_bits(x);
     DeviceBuffer input = to_device(x_bits);
@@ -247,8 +266,8 @@ int run_attention(DevicePackedWeight& parent, int tokens, ops::LinearPolicy poli
 }
 
 int run_gdn(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
-            std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false) {
-    constexpr int kHidden = 3072, kQkv = 12288, kZ = 8192, kRows = 20480;
+            std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false, GdnShape shape = kGdn122B) {
+    const int kHidden = shape.hidden, kQkv = shape.qkv, kZ = shape.z, kRows = shape.rows;
     const auto x       = activations(kHidden, tokens, 201U);
     const auto x_bits  = bf16_bits(x);
     DeviceBuffer input = to_device(x_bits);
@@ -283,8 +302,9 @@ int run_gdn(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
 }
 
 int run_linear_add(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
-                   std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false) {
-    constexpr int kRows = 3072, kK = 8192;
+                   std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false,
+                   OutputShape shape = kOutput122B) {
+    const int kRows = shape.rows, kK = shape.k;
     const auto x       = activations(kK, tokens, 301U);
     const auto x_bits  = bf16_bits(x);
     DeviceBuffer input = to_device(x_bits);
@@ -369,7 +389,7 @@ int run_invariance(const char* label, DevicePackedWeight& parent, int k, int row
 
 } // namespace
 
-INFERNIX_OP_TEST(fp8_row_f32) {
+static int run_fp8_row_f32() {
     int failures = 0;
     for (const int k : {3072, 8192}) {
         for (const int tokens : {1, 17, 300}) { failures += run_quantizer(k, tokens); }
@@ -410,6 +430,57 @@ INFERNIX_OP_TEST(fp8_row_f32) {
         }
         std::vector<std::uint16_t> column;
         for (int t : {1, 8, 9, 16, 17, 64, 65, 129}) { failures += run_linear_add(parent, t, P::A16ColumnInvariant, &column); }
+    }
+    // The Qwen3.8-27B's parents with static scales (NVIDIA's NVFP4-QAD): the same criteria at its widths' schedule
+    // bands, the A8 route from 17 columns.
+    {
+        DevicePackedWeight parent(
+            quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 14336, 5120, 731U, options));
+        for (int t : {1, 2, 16, 17, 24, 32, 33, 64, 65, 80, 96, 97, 129, 160, 161}) {
+            failures += run_attention(parent, t, P::A16Only, nullptr, false, kAttention27B);
+        }
+        for (int t : {17, 32, 33, 96, 97, 128, 129, 192, 193, 288, 289, 385, 576, 1025}) {
+            failures += run_attention(parent, t, P::AllowA8, nullptr, false, kAttention27B);
+        }
+        for (int t : {1, 2, 5, 8, 16, 17, 33}) {
+            failures += run_attention(parent, t, P::A8Only, nullptr, false, kAttention27B);
+        }
+        std::vector<std::uint16_t> column;
+        for (int t : {1, 8, 9, 16, 17, 32, 33, 64, 65, 129}) {
+            failures += run_attention(parent, t, P::A16ColumnInvariant, &column, false, kAttention27B);
+        }
+    }
+    {
+        DevicePackedWeight parent(
+            quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 16384, 5120, 733U, options));
+        for (int t : {1, 2, 4, 5, 16, 17, 24, 25, 32, 33, 64, 65, 96, 97, 129}) {
+            failures += run_gdn(parent, t, P::A16Only, nullptr, false, kGdn27B);
+        }
+        for (int t : {17, 32, 33, 64, 65, 128, 129, 192, 193, 257, 320, 385, 480, 512, 513, 1025}) {
+            failures += run_gdn(parent, t, P::AllowA8, nullptr, false, kGdn27B);
+        }
+        for (int t : {1, 2, 4, 5, 16, 17, 33}) { failures += run_gdn(parent, t, P::A8Only, nullptr, false, kGdn27B); }
+        std::vector<std::uint16_t> column;
+        for (int t : {1, 8, 9, 16, 17, 32, 33, 64, 65, 129}) {
+            failures += run_gdn(parent, t, P::A16ColumnInvariant, &column, false, kGdn27B);
+        }
+    }
+    {
+        DevicePackedWeight parent(
+            quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 5120, 6144, 737U, options));
+        for (int t : {1, 2, 3, 4, 8, 16, 17, 64, 65, 128, 129, 192, 193, 257, 384, 385}) {
+            failures += run_linear_add(parent, t, P::A16Only, nullptr, false, kOutput27B);
+        }
+        for (int t : {17, 64, 65, 128, 129, 192, 193, 640, 641, 1025}) {
+            failures += run_linear_add(parent, t, P::AllowA8, nullptr, false, kOutput27B);
+        }
+        for (int t : {1, 2, 8, 16, 17, 33}) {
+            failures += run_linear_add(parent, t, P::A8Only, nullptr, false, kOutput27B);
+        }
+        std::vector<std::uint16_t> column;
+        for (int t : {1, 8, 9, 16, 17, 64, 65, 129}) {
+            failures += run_linear_add(parent, t, P::A16ColumnInvariant, &column, false, kOutput27B);
+        }
     }
     // Per-token parents (no static scale): their encoding, then the three projections' A8 routes.
     for (const int k : {3072, 8192}) {
@@ -458,4 +529,13 @@ INFERNIX_OP_TEST(fp8_row_f32) {
     }
     std::cout << "fp8_e4m3fn_row_f32 projections: all checks passed\n";
     return 0;
+}
+
+INFERNIX_OP_TEST(fp8_row_f32) {
+    try {
+        return run_fp8_row_f32();
+    } catch (const std::exception& error) {
+        std::cerr << "fp8_row_f32: " << error.what() << '\n';
+        return 1;
+    }
 }

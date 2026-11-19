@@ -154,6 +154,35 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
 
 namespace {
 
+// NVIDIA's dense NVFP4 Qwen3.5 exports (the 27B's W4A4 and FP8 layers): no MoE layer, at least one NVFP4 text
+// projection permitted 4-bit activations, and every text projection permitted 4- or 8-bit ones (the head aside)
+// bound to NVFP4 or row-scaled FP8 parents. `--a8-activations` then binds those Uses A8Only
+// (LoadOptions::a8_dense), 8-bit activations at every width; a MoE artifact keeps the flag's expert routes.
+bool dense_a8_artifact(const artifact::Directory& directory) {
+    for (const auto& [name, binding] : directory.bindings) {
+        if (name.starts_with("text/") && name.find("/moe/") != std::string::npos) { return false; }
+    }
+    bool w4a4 = false;
+    for (const auto& [key, use] : directory.uses) {
+        if (!use.parameter.starts_with("text/") || use.parameter == "text/output_head" || !use.activation_policy ||
+            *use.activation_policy == artifact::ActivationPolicy::A16Only) {
+            continue;
+        }
+        const auto binding = directory.bindings.find(use.parameter);
+        if (binding == directory.bindings.end() || binding->second.parts.empty()) { return false; }
+        for (const auto& part : binding->second.parts) {
+            const auto* tensor = std::get_if<artifact::TensorObject>(&directory.objects.at(part.object.index));
+            const bool nvfp4 = tensor != nullptr && (tensor->format == "nvfp4" || tensor->format == "nvfp4_mul");
+            if (!nvfp4 && (tensor == nullptr || (tensor->format != "fp8_e4m3fn_row_bf16" &&
+                                                 tensor->format != "fp8_e4m3fn_row_f32"))) {
+                return false;
+            }
+            w4a4 = w4a4 || (nvfp4 && *use.activation_policy == artifact::ActivationPolicy::AllowA4);
+        }
+    }
+    return w4a4;
+}
+
 // The hybrid index ranks admission sources and values snapshots with the same calibrated
 // prefill and Host-to-Device coefficients as the original cache's ResourceManager.
 // Uncalibrated (zero) terms keep the index's generic defaults.
@@ -623,9 +652,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         throw std::invalid_argument("--expert-a4-activations applies to nvidia/Qwen3.8-Flash-Next-FP4-Local only");
     }
     if (options.expert_a16_activations) {
-        if (!qwen4_exp) { throw std::invalid_argument("--a16-activations applies to Qwen3.8-Flash-Next artifacts only"); }
         if (options.expert_a4_activations || options.a8_activations) {
-            throw std::invalid_argument("--a16-activations runs the routed experts with 16-bit activations: it excludes "
+            throw std::invalid_argument("--a16-activations runs with 16-bit activations: it excludes "
                                         "--expert-a4-activations and --a8-activations");
         }
         if (options.lossless) {
@@ -864,7 +892,29 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     artifact::Reader& reader = *opened;
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
+    models::LoadOptions load = models::load_options(options, models::Architecture::Qwen3_5);
+    const bool dense_a8      = options.a8_activations && options.fast_paths && !options.lossless &&
+                          dense_a8_artifact(reader.directory());
+    load.a8_dense = dense_a8;
+    auto plan     = models::qwen3_5::plan_load(reader, load);
+    // --a16-activations on an artifact whose text projections permit 4- or 8-bit activations (NVIDIA's NVFP4 and FP8
+    // 27B layers): they run 16-bit instead. The default follows the checkpoint's specification, so the launch says so.
+    if (options.expert_a16_activations) {
+        const auto& uses   = reader.directory().uses;
+        const bool reduced = std::any_of(uses.begin(), uses.end(), [](const auto& entry) {
+            const artifact::Use& use = entry.second;
+            return use.parameter.starts_with("text/") && use.activation_policy &&
+                   *use.activation_policy != artifact::ActivationPolicy::A16Only;
+        });
+        if (reduced) {
+            report_engine(options, DiagnosticLevel::Warning,
+                          "--a16-activations: this artifact's text projections are specified with 4- or 8-bit "
+                          "activations at their calibrated scales (NVIDIA's NVFP4 and FP8 layers, as NVIDIA serves "
+                          "them); they now run with 16-bit activations everywhere, which changes the output and "
+                          "reads prompts more slowly. The default follows the checkpoint's specification and is the "
+                          "recommended configuration");
+        }
+    }
     // Offloaded experts: the VRAM in use before anything is uploaded, for the reproducible route's nominal
     // prefill-chunk fit (offloaded_prefill_lent), as Qwen3.8-Flash-Next takes it.
     std::optional<std::uint64_t> in_use_before_load;
@@ -946,6 +996,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (expert_ram->tier) {
             auto streamed           = models::load_options(options, models::Architecture::Qwen3_5);
             streamed.stream_experts = true;
+            streamed.a8_dense       = dense_a8;
             plan                    = models::qwen3_5::plan_load(reader, streamed);
         }
         plan.set_host_reserve(options.ram_free_bytes, expert_ram->demand.later_pinned);
@@ -1010,6 +1061,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (plan.offloaded_experts() && !(expert_ram && expert_ram->tier)) {
             auto streamed           = models::load_options(options, models::Architecture::Qwen3_5);
             streamed.stream_experts = true;
+            streamed.a8_dense       = dense_a8;
             plan                    = models::qwen3_5::plan_load(reader, streamed);
         }
     }
@@ -1158,16 +1210,25 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     if (options.a8_activations) {
         const models::qwen3_5::A8Routes a8 =
             models::qwen3_5::a8_activation_routes(models::qwen3_5::fast_path_configuration(*instance->model, options));
-        if (!a8.any()) {
+        if (!a8.any() && !dense_a8) {
             throw std::invalid_argument(
                 "--a8-activations: no 8-bit activation route applies to this artifact (it covers offloaded experts in "
-                "decode and prefill and a groupwise Q4 MLP gate/up in prefill; the NVFP4 27B's FP8 and NVFP4 "
-                "projections already take the 8- and 4-bit activations their artifact permits)");
+                "decode and prefill, a groupwise Q4 MLP gate/up in prefill, and every NVFP4 and FP8 text projection "
+                "of a dense NVFP4 27B artifact whose NVFP4 projections permit 4-bit activations)");
+        }
+        if (dense_a8) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--a8-activations (approximate): every NVFP4 and FP8 text projection at every width "
+                               "(NVFP4: int8 codes per 32 values with an FP32 scale; FP8: one E4M3 term); the head "
+                               "and the drafters keep their routes");
         }
         // The CPU-served misses compute the GPU's 8-bit route (offloaded experts: the offload options exist).
         if (a8.experts) { offload_options.value().engine.narrow_a16 = ops::offloaded_moe::NarrowA16::kA8; }
-        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--a8-activations (approximate): %s; every other call keeps its route", a8.describe().c_str());
+        if (a8.any()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--a8-activations (approximate): %s; every other call keeps its route",
+                               a8.describe().c_str());
+        }
     }
     std::optional<StartupPhaseScope> planning;
     planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);

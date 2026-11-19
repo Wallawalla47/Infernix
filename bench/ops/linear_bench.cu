@@ -293,7 +293,8 @@ LinearPolicy parse_policy(std::string_view text) {
     if (value == "a8" || value == "allowa8") { return LinearPolicy::AllowA8; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
     if (value == "invariant") { return LinearPolicy::A16ColumnInvariant; }
-    throw std::invalid_argument("Linear benchmark policy must be a16, a8, a4 or invariant");
+    if (value == "a8only") { return LinearPolicy::A8Only; }
+    throw std::invalid_argument("Linear benchmark policy must be a16, a8, a4, a8only or invariant");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {

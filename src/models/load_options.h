@@ -30,6 +30,13 @@ struct LoadOptions {
     // Qwen4Exp: banks that are W4A4 by their checkpoint run 16-bit activations instead
     // (EngineOptions::expert_a16_activations, or a8_activations, whose 8-bit route runs on the 16-bit banks).
     bool expert_a16_activations = false;
+    // Qwen3.5: every Use binds A16Only (EngineOptions::expert_a16_activations, --a16-activations): projections
+    // the artifact permits 4- or 8-bit activations (NVIDIA's NVFP4 and FP8 27B layers) run 16-bit instead.
+    bool a16_activations = false;
+    // Qwen3.5 `--a8-activations` on an artifact whose 4- and 8-bit text Uses are all NVFP4 or row-scaled FP8 parents
+    // (NVIDIA's NVFP4 artifacts; the Engine decides it from the directory): those Uses bind A8Only, 8-bit
+    // activations at every width.
+    bool a8_dense = false;
     // Offloaded routed expert banks (Qwen4Exp, Qwen3.5 with offloaded experts) stay in the artifact
     // and are read in place by the SSD expert tier (Flash-Next design §19.3.7) instead of being
     // pinned in host memory.
@@ -127,6 +134,7 @@ struct LoadOptions {
             .expert_a4_activations    = options.expert_a4_activations,
             .expert_a16_activations   = architecture == Architecture::Qwen4Exp &&
                                       (options.expert_a16_activations || options.a8_activations),
+            .a16_activations          = architecture != Architecture::Qwen4Exp && options.expert_a16_activations,
             .expert_csf               = options.expert_csf,
             .draft_model              = options.speculative.draft_model,
             // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).

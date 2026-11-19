@@ -244,6 +244,13 @@ quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
 }
 
+quantized_weight::PackedWeight make_nvfp4_mul_weight(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_multiplier = kNvfp4MulMultiplier;
+    options.activation_scale  = kNvfp4MulInputScale;
+    return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
+}
+
 quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     return quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
 }

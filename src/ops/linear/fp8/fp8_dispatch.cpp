@@ -35,25 +35,35 @@ bool vocabulary_head(const Fp8LinearShape& shape) noexcept {
     return &shape == &kFp8N248320K5120 || &shape == &kFp8F32N248320K3072;
 }
 
+// The single-term A8 route over [min_tokens, max_tokens]: where the policy permits it and the shape takes it at
+// those widths, and at every width under A8Only (`--a8-activations`), which a shape without one rejects.
+bool takes_a8(const Fp8LinearShape& shape, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (a8_only(policy)) {
+        if (shape.a8 == nullptr) throw std::invalid_argument("fp8 linear: A8Only needs the shape's A8 route");
+        return true;
+    }
+    return allows_a8(policy) && shape.uses_a8(min_tokens, max_tokens);
+}
+
 // The single-term A8 route takes precedence where the policy permits it; the pair route only
 // replaces an A16 route.
 bool uses_pair(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes routes,
                std::int32_t tokens) {
     return has_route(routes, LinearRoutes::Fp8A8Pair) && shape.pair != nullptr &&
-           tokens >= shape.pair_min_tokens && !(allows_a8(policy) && shape.uses_a8(tokens, tokens));
+           tokens >= shape.pair_min_tokens && !takes_a8(shape, policy, tokens, tokens);
 }
 
 // fp8-a8-pair-block32 takes the column-scaled pair's admission and precedence over it.
 bool uses_pair_block32(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes routes,
                        std::int32_t tokens) {
     return has_route(routes, LinearRoutes::Fp8A8PairBlock32) && shape.pair_block32 != nullptr &&
-           tokens >= shape.pair_min_tokens && !(allows_a8(policy) && shape.uses_a8(tokens, tokens));
+           tokens >= shape.pair_min_tokens && !takes_a8(shape, policy, tokens, tokens);
 }
 
 // The FP16-accumulate route likewise replaces only an A16 route, and takes precedence over both pairs.
 bool uses_f16(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes routes, std::int32_t tokens) {
     return has_route(routes, LinearRoutes::F16Accumulate) && shape.f16 != nullptr &&
-           tokens >= shape.f16_min_tokens && !(allows_a8(policy) && shape.uses_a8(tokens, tokens));
+           tokens >= shape.f16_min_tokens && !takes_a8(shape, policy, tokens, tokens);
 }
 } // namespace
 
@@ -71,7 +81,7 @@ std::size_t fp8_linear_workspace_capacity_bytes(QType qtype, std::int32_t n, std
     if (column_invariant(policy) && shape.invariant == nullptr)
         throw std::invalid_argument("fp8 linear: the shape registers no column-invariant route");
     if (column_invariant(policy)) return 0; // one A16 schedule, no route flag applies
-    const std::size_t single = allows_a8(policy) && shape.uses_a8(min_tokens, max_tokens)
+    const std::size_t single = takes_a8(shape, policy, min_tokens, max_tokens)
                                    ? fp8_a8_workspace_capacity_bytes(
                                          max_tokens, k,
                                          shape.partial_capacity_bytes
@@ -129,8 +139,7 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
         const auto scratch = allocate_fp8_a8_pair_workspace(*workspace, x.ne[1], weight.k);
         return shape.pair(x, weight, out, scratch, stream);
     }
-    if (!allows_a8(policy) || !shape.uses_a8(x.ne[1], x.ne[1]))
-        return shape.a16(x, weight, out, stream);
+    if (!takes_a8(shape, policy, x.ne[1], x.ne[1])) return shape.a16(x, weight, out, stream);
     if (workspace == nullptr)
         throw std::invalid_argument("fp8 A8 linear requires caller workspace");
     auto scope         = workspace->scope();

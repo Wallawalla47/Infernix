@@ -48,6 +48,11 @@ void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std:
 [[nodiscard]] bool a8_linear_sums(std::span<const GgmlSegment> segments);
 [[nodiscard]] std::int32_t a8_linear_column_words(std::int32_t k, bool sums);
 
+// Every column of x (BF16 [K, T], K a multiple of 32) encoded by ops/ggml/ggml_a8.h's codec into `encoded` (I32
+// [a8_linear_column_words(K, false), T], no code sums): column t's K int8 codes, then its K / 32 binary32 slice
+// scales, columns 16-byte aligned. The 8-bit activations of the NVFP4 and other dense routes of `--a8-activations`.
+void a8_encode_columns(const Tensor& x, Tensor& encoded, cudaStream_t stream);
+
 // The wide route (ggml_linear_a8_wide.cu), for a call of kA8WideMinColumns or more columns of K a multiple of 64
 // with ggml_linear's validated arguments: the segments' decoded planes (at most kA8WidePlaneBytes) and the encoded
 // columns of batches of up to kA8WideBatchColumns.

@@ -33,6 +33,9 @@ void nvfp4_linear_swiglu_invariant_ring_launch(const Tensor& x, const Weight& we
                                                cudaStream_t stream);
 void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                    WorkspaceArena& workspace, cudaStream_t stream);
+// A8Only: x encoded by ggml_a8.h's codec, then the 8-bit tiles (nvfp4_linear_swiglu_a8.cu).
+void nvfp4_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                   WorkspaceArena& workspace, cudaStream_t stream);
 // AllowA4Residual: kNvfp4A4ResidualTerms NVFP4 activation planes into one accumulator.
 void nvfp4_linear_swiglu_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                             WorkspaceArena& workspace, cudaStream_t stream);

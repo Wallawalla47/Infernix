@@ -43,6 +43,11 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
             break;
         }
         if (a16_only) { result.policy = ops::LinearPolicy::A16Only; }
+        // The head keeps its route (an FP8 vocabulary head has no 8-bit route at every width).
+        if (a8_only && name.starts_with("text/") && name != "text/output_head" &&
+            result.policy != ops::LinearPolicy::A16Only) {
+            result.policy = ops::LinearPolicy::A8Only;
+        }
         for (const auto& [role, binding] : use.auxiliaries) {
             if (role != "activation_input_divisor" && role != "activation_input_scale") {
                 throw artifact::ArtifactError(name + "@" + input + ": unknown auxiliary " + role);

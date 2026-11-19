@@ -28,6 +28,8 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::A16ColumnInvariant:
     case LinearPolicy::AllowA4Residual:
     case LinearPolicy::AllowA8Residual:
+    // The NVFP4 gate/up's 8-bit route (the Engine binds A8Only on NVIDIA's NVFP4 and FP8 projections only).
+    case LinearPolicy::A8Only:
         return;
     }
     throw std::invalid_argument("linear_swiglu: invalid compute policy");

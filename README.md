@@ -71,7 +71,7 @@ it:
 | NVIDIA NVFP4-QAD Flash-Next (Dense8 and the bit-exact conversion) | Routed and shared experts **4-bit** (W4A4 with NVIDIA's scales), as NVIDIA serves it; MXFP8 projections and everything else 16-bit | `--a16-activations`: experts 16-bit (perplexity 3.4138 against 3.4422, decode within 1 %). `--a8-activations`: experts 8-bit (3.4139 on the default route, with `expert-a4-residual`) |
 | Uncensored NVFP4 Flash-Next | 16-bit (weight-only NVFP4 experts) | `--a8-activations`: experts 8-bit |
 | IQ3_S GGUF Flash-Next | 16-bit everywhere | `--a8-activations`: dense projections and experts 8-bit, as Strata and Basalt |
-| Qwen3.8-27B NVFP4 | 4-bit at its NVFP4 layers, as the artifact specifies (NInfer the same) | none |
+| Qwen3.8-27B NVFP4 | Prompts **4-bit** at the NVFP4 layers and **8-bit** at the FP8 ones, as the artifact specifies (NInfer the same); decode and verification 16-bit (wide rounds of several requests: the MLP two-term 4-bit residual, fast path batched-a4-residual-decode). NVIDIA's NVFP4-QAD bit-exact conversion: the same, with NVIDIA's calibrated input scales (W4A4 and static W8A8, as NVIDIA serves it) | `--a16-activations`: 16-bit everywhere. `--a8-activations`: every NVFP4 and FP8 projection 8-bit at every width, for precision comparisons. On the NVFP4-QAD conversion (RTX 5090, INT8 KV): prompts 3.9x slower than the default and 1.3x faster than `--a16-activations` (pp16384 15.5K / 3.96K / 3.0K tok/s, each with its fast paths), plain decode 5 % slower (85.7 against 90.2 tok/s) |
 
 On NVIDIA's NVFP4 weights Strata, strata-nvfp4 and Basalt run the experts at 8 bits in decode and
 every other activation at 8 bits. The options on Dense8 (RTX 5090, one request):

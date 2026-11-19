@@ -46,6 +46,14 @@ inline void require_fp8_scale_word(const Weight& w) {
     }
 }
 
+// Calls f.template operator()<Scale>() with the weight's stored row word (float for
+// fp8_e4m3fn_row_f32, BF16 otherwise): one launcher serves both row formats at a shape.
+template <class F>
+decltype(auto) with_fp8_scale_word(const Weight& w, F&& f) {
+    if (w.qtype == QType::FP8_E4M3FN_ROW_F32) { return f.template operator()<float>(); }
+    return f.template operator()<__nv_bfloat16>();
+}
+
 template <class Scale = __nv_bfloat16>
 inline Fp8A16OperandsT<Scale> fp8_a16_operands(const Tensor& x, const Weight& w) {
     require_fp8_scale_word<Scale>(w);
@@ -68,6 +76,18 @@ inline Fp8A8OperandsT<Scale> fp8_a8_operands(const Weight& w, Fp8A8Workspace x, 
             w.k,
             tokens,
             x.residual};
+}
+
+// f(operands) with the A16 or A8 operands of the weight's row word: a launcher generic over the
+// operands type serves fp8_e4m3fn_row_bf16 and fp8_e4m3fn_row_f32 parents of its shape.
+template <class F>
+decltype(auto) with_fp8_a16_operands(const Tensor& x, const Weight& w, F&& f) {
+    return with_fp8_scale_word(w, [&]<class Scale>() { return f(fp8_a16_operands<Scale>(x, w)); });
+}
+
+template <class F>
+decltype(auto) with_fp8_a8_operands(const Weight& w, Fp8A8Workspace x, int tokens, F&& f) {
+    return with_fp8_scale_word(w, [&]<class Scale>() { return f(fp8_a8_operands<Scale>(w, x, tokens)); });
 }
 
 // Private template admission is independent of the public finite shape registry. FP32 words are

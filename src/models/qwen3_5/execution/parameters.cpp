@@ -431,12 +431,18 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
 
 namespace {
 
-void make_invariant(LinearParameters& p) { p.policy = ops::LinearPolicy::A16ColumnInvariant; }
+// `--a8-activations` keeps its 8-bit route in decode and verification too (the flag withdraws request invariance:
+// EngineSummary::request_invariant).
+void make_invariant(LinearParameters& p) {
+    if (!ops::a8_only(p.policy)) { p.policy = ops::LinearPolicy::A16ColumnInvariant; }
+}
 
 // Keeps the projection's low-precision permission only where its format's class is permitted; a
 // projection permitted its class's one-term activations may take its residual profile instead
 // (the NVFP4 one, `a4_residual_here`, is registered for the MLP only).
 void limit_precision(LinearParameters& p, DecodePrecision precision, bool a4_residual_here) {
+    // `--a8-activations`: the projection's 8-bit route at every width, decode and verification included.
+    if (ops::a8_only(p.policy)) { return; }
     const bool fp8   = is_fp8_row(p.weight.qtype);
     const bool nvfp4 = p.weight.qtype == QType::NVFP4;
     if ((fp8 && precision.a8) || (nvfp4 && precision.a4)) { return; }

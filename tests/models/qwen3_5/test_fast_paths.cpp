@@ -1,9 +1,10 @@
 // Fast-path selection (models/qwen3_5/program/planning/fast_paths.h): where each fast path's kernels
 // run, which configurations the registry qualifies it for, how a configuration is described, and the
-// routes --a8-activations gives it.
+// routes --a8-activations gives it, which the decode and verification copies of the parameters keep.
 // The selection itself (select_fast_paths) needs a loaded model; the engine real tests and startup
 // logs cover it.
 
+#include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
 
 #include <iostream>
@@ -181,17 +182,15 @@ int main() {
     // Qualification is per configuration: the measured one, not its neighbours.
     failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, int8_24),
                       "decode-split64 is qualified for 24 heads, 4-bit activations, INT8 KV");
-    for (const auto activations : {ActivationClass::A8, ActivationClass::A16}) {
-        failures += check(!q::fast_path_qualified(FastPath::DecodeSplit64,
-                                                  {24, activations, KvCacheStorage::Int8Group64}),
-                          "decode-split64 is not qualified at higher activation precision");
-    }
+    failures += check(!q::fast_path_qualified(FastPath::DecodeSplit64, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}),
+                      "decode-split64 is not qualified on 16 heads");
     for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
         failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv}),
                           "prompt-pv8 is qualified for 24 heads and 4-bit activations on these KV formats");
-        failures += check(!q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv}),
-                          "prompt-pv8 is not qualified at 16-bit activations");
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv}) &&
+                              !q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A8, kv}),
+                          "prompt-pv8 is qualified for the NVFP4 27B under --a16-activations, not at 8 bits");
     }
     failures += check(q::describe(int8_24) == "24 heads, 4-bit activations, int8 KV",
                       "configuration description changed");
@@ -213,13 +212,66 @@ int main() {
     failures += check(q::fast_path_applies(FastPath::Fp16GdnState, int8_24, options) &&
                           !q::couples_requests(FastPath::Fp16GdnState) &&
                           q::fast_path_qualified(FastPath::Fp16GdnState, int8_24) &&
-                          !q::fast_path_qualified(FastPath::Fp16GdnState,
-                                                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}),
+                          q::fast_path_qualified(FastPath::Fp16GdnState,
+                                                 {24, ActivationClass::A4, KvCacheStorage::BFloat16}),
                       "fp16-gdn-state applies everywhere, keeps a request invariant and is qualified where it "
-                      "was measured faster (the 27Bs with INT8 KV)");
-    failures += check(!q::fast_path_qualified(FastPath::IdleWidePrefill,
-                                              {24, ActivationClass::A16, KvCacheStorage::Int8Group64}),
-                      "idle-wide-prefill is not qualified at 16-bit activations");
+                      "was measured faster (the 27Bs, BF16 KV included since 2026-11-19)");
+    // The NVFP4 27B under --a8-activations (24 heads, 8-bit activations at every width), where measured faster.
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                                    KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        const q::FastPathConfiguration a8_27b{24, ActivationClass::A8, kv};
+        for (const FastPath path : {FastPath::IdleWidePrefill, FastPath::GdnF16Accumulate, FastPath::Fp16GdnState,
+                                    FastPath::AdaptiveSpeculation, FastPath::AdaptiveDFlash, FastPath::FreeCacheResume,
+                                    FastPath::Preemption}) {
+            failures += check(q::fast_path_qualified(path, a8_27b),
+                              std::string(infernix::fast_path_name(path)) + " is qualified under --a8-activations");
+        }
+        for (const FastPath path : {FastPath::BatchedDecode, FastPath::SingleColumnDecode,
+                                    FastPath::BatchSplitAttention, FastPath::PromptPv8, FastPath::AdaptiveMtp,
+                                    FastPath::GumbelSampling, FastPath::BatchedA8Decode,
+                                    FastPath::BatchedA8ResidualDecode}) {
+            failures += check(!q::fast_path_qualified(path, a8_27b),
+                              std::string(infernix::fast_path_name(path)) + " stays off under --a8-activations");
+        }
+    }
+    failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, {24, ActivationClass::A8, KvCacheStorage::Int8Group64}) &&
+                          q::auto_fixed_draft_tokens({24, ActivationClass::A8, KvCacheStorage::Int8Group64},
+                                                     infernix::SpeculativeBackend::Mtp) == 5,
+                      "decode-split64 and five MTP drafts under --a8-activations");
+    // NVIDIA's NVFP4 27B under --a16-activations (24 heads, 16-bit activations, no Q4 gate/up), registered where each
+    // path was measured faster (2026-11-19); the paths that were not stay off.
+    {
+        for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                                        KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                        KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                        KvCacheStorage::Q4KeyVq2Value}) {
+            const q::FastPathConfiguration a16_27b{24, ActivationClass::A16, kv};
+            for (const FastPath path : {FastPath::BatchedDecode, FastPath::Fp16GdnState, FastPath::IdleWidePrefill,
+                                        FastPath::GdnF16Accumulate, FastPath::AdaptiveSpeculation,
+                                        FastPath::AdaptiveDFlash, FastPath::FreeCacheResume, FastPath::Preemption}) {
+                failures += check(q::fast_path_qualified(path, a16_27b),
+                                  std::string(infernix::fast_path_name(path)) + " is qualified for the NVFP4 27B under "
+                                                                      "--a16-activations");
+            }
+            for (const FastPath path : {FastPath::SingleColumnDecode, FastPath::BatchSplitAttention,
+                                        FastPath::AdaptiveMtp, FastPath::GumbelSampling}) {
+                failures += check(!q::fast_path_qualified(path, a16_27b),
+                                  std::string(infernix::fast_path_name(path)) + " was not faster for the NVFP4 27B under "
+                                                                      "--a16-activations");
+            }
+        }
+        const q::FastPathConfiguration a16_27b{24, ActivationClass::A16, KvCacheStorage::Int8Group64};
+        failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, a16_27b), "decode-split64 under --a16");
+        // Adaptive drafting takes the NVFP4 27B's round costs and batch length at any activation precision, its MTP
+        // fixed length five; the n-gram copy windows stay on the 4-bit class (not timed elsewhere).
+        failures += check(q::auto_fixed_draft_tokens(a16_27b, infernix::SpeculativeBackend::Mtp) == 5 &&
+                              q::dflash_width_costs(a16_27b, infernix::SpeculativeBackend::DFlash2).proposal == 0.18 &&
+                              q::dflash_batch_drafts(a16_27b, infernix::SpeculativeBackend::DFlash2) == 7 &&
+                              q::auto_ngram_settings(a16_27b, infernix::SpeculativeBackend::DFlash2, true).window == 0,
+                          "the NVFP4 27B under --a16-activations drafts with its own round costs");
+    }
     // expert-a4-residual (either term count) acts on offloaded W4A16 experts (Qwen3.5-122B-A10B: 32 heads, 8-bit
     // FP8 activations) only, and it couples a column to its call. Two terms are registered there on every KV
     // format (measured faster, 2026-10-28); three terms stay a candidate.
@@ -462,20 +514,25 @@ int main() {
     failures += check(infernix::parse_fast_path("block-verification") == FastPath::BlockVerification,
                       "block-verification parses");
     // gumbel-sampling (candidates ZH-01): MTP rounds only (DFlash2's equality acceptance timed slower), a row's draw
-    // reads only that row; registered on the NVFP4 27B's configuration with INT8 KV only (the owner, 2026-11-16).
+    // reads only that row; registered on the NVFP4 27B's configuration with INT8 KV (2026-11-16) and the formats below
+    // its precision (2026-11-19); not BF16, the groupwise 27B (timed slower) or the 35B-A3B.
     failures += check(!q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash2) &&
                           q::fast_path_applies(FastPath::GumbelSampling, int8_24, mtp) &&
                           !q::fast_path_applies(FastPath::GumbelSampling, int8_24, dflash) &&
                           !q::fast_path_applies(FastPath::GumbelSampling, int8_24, options) &&
                           !q::couples_requests(FastPath::GumbelSampling) &&
                           q::fast_path_qualified(FastPath::GumbelSampling, int8_24) &&
+                          q::fast_path_qualified(FastPath::GumbelSampling,
+                                                 {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}) &&
                           !q::fast_path_qualified(FastPath::GumbelSampling,
-                                                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}) &&
+                                                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}) &&
+                          !q::fast_path_qualified(FastPath::GumbelSampling,
+                                                  {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}) &&
                           !q::fast_path_qualified(FastPath::GumbelSampling,
                                                   {16, ActivationClass::A16, KvCacheStorage::Int8Group64}) &&
                           infernix::parse_fast_path("gumbel-sampling") == FastPath::GumbelSampling,
                       "gumbel-sampling applies to MTP rounds, keeps a request invariant, is registered on the NVFP4 "
-                      "27B with INT8 KV only and parses");
+                      "27B with INT8 KV and the formats below its precision only and parses");
     // univer-trees: fixed-table tree rounds of the drafters that build their trees (DFlash2, DFlash);
     // not automatic widths, not MTP's leaf trees, not chains.
     infernix::EngineOptions dflash2_trees = dflash2, dflash_trees = dflash, mtp_trees = mtp,
@@ -517,11 +574,14 @@ int main() {
     failures += check(!q::fast_path_applies(FastPath::Q5KSplitMma,
                                             {24, ActivationClass::A4, KvCacheStorage::Int8Group64}, options),
                       "q5-ksplit-mma must not apply to 4-bit-activation artifacts");
-    // Both run on the KV formats below INT8's precision too (the owner's decision, 2026-11-01), not on BF16.
+    // Both run on the KV formats below INT8's precision too (the owner's decision, 2026-11-01), and on BF16 where timed
+    // faster (2026-11-19).
     failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, groupwise) &&
-                          !q::fast_path_qualified(FastPath::Q5KSplitMma,
-                                                  {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}),
-                      "q5-ksplit-mma is qualified where it was measured faster only");
+                          q::fast_path_qualified(FastPath::Q5KSplitMma,
+                                                 {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}) &&
+                          q::fast_path_qualified(FastPath::Fp16GdnState,
+                                                 {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}),
+                      "q5-ksplit-mma and fp16-gdn-state are qualified on the groupwise 27B with BF16 KV (timed faster)");
     failures += check(q::fast_path_qualified(FastPath::Fp16GdnState, groupwise),
                       "fp16-gdn-state is qualified on the groupwise 27B with INT8 KV");
     for (const KvCacheStorage kv : {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
@@ -536,6 +596,32 @@ int main() {
                       "fp16-gdn-state stays off the 35B-A3B");
     failures += check(!q::couples_requests(FastPath::Q5KSplitMma),
                       "q5-ksplit-mma must not couple requests");
+
+    // --a8-activations binds the text projections A8Only, 8-bit at every width: the column-invariant copy that decode and
+    // verification run without batched-decode keeps them (until 2026-11-19 it made them A16ColumnInvariant, so the flag
+    // decoded at 16 bits), while every other projection there takes its column-invariant route.
+    {
+        namespace ex = infernix::models::qwen3_5::execution;
+        using P = infernix::ops::LinearPolicy;
+        ex::TextParameters text;
+        text.output_head.policy = P::AllowA8;
+        ex::GdnParameters gdn;
+        gdn.projection    = ex::LinearParameters{.policy = P::A8Only};
+        gdn.output.policy = P::A8Only;
+        ex::BlockParameters block;
+        block.mixer = gdn;
+        block.ffn   = ex::DenseParameters{.gate_up = {.policy = P::A8Only}, .down = {.policy = P::AllowA4}};
+        text.layers.push_back(block);
+        const ex::TextParameters invariant = ex::column_invariant_text(text);
+        const auto& g = std::get<ex::GdnParameters>(invariant.layers.front().mixer);
+        const auto& d = std::get<ex::DenseParameters>(invariant.layers.front().ffn);
+        failures += check(std::get<ex::LinearParameters>(g.projection).policy == P::A8Only &&
+                              g.output.policy == P::A8Only && d.gate_up.policy == P::A8Only &&
+                              ex::projection_policy(g.control) == P::A16ColumnInvariant &&
+                              d.down.policy == P::A16ColumnInvariant &&
+                              invariant.output_head.policy == P::A16ColumnInvariant,
+                          "the column-invariant decode copy keeps A8Only and makes the other projections invariant");
+    }
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " fast-path selection\n";
     return failures == 0 ? 0 : 1;

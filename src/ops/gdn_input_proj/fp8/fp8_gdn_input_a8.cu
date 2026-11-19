@@ -40,27 +40,30 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                    static_cast<__nv_bfloat16*>(z.data)};
-    const auto operands = fp8_a8_operands(weight, workspace, x.ne[1]);
-    const auto launch   = [&]<class Schedule>() {
-        using S = Fp8ScheduleInstance<Schedule, 5120>;
-        if constexpr (S::kTmaSwizzle)
-            launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
-                                       workspace.partials);
-        else
-            launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
-    };
-    if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
-    if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
-    if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
-    if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
-    // 2026-11-10 (RTX 5090, every tile forced): five 64-token tiles of 256 rows take 109-113 against 109-119 us
-    // for the 128x256 tile with its split-K tail at 257-320 columns, and five 96-token ones 148-155 against
-    // 156-164 us for the 128x128 tile at 385-480. Neither has a split-K tail, so the columns the tail held
-    // there take the unsplit K order (their bits change at those widths).
-    if (x.ne[1] > 256 && x.ne[1] <= 320) return launch.template operator()<Tma64x256>();
-    if (x.ne[1] > 384 && x.ne[1] <= 480) return launch.template operator()<Tma96x256>();
-    // Smaller output tiles leave only two full-K tiles to split near the 512-token anchor.
-    if (x.ne[1] > 480 && x.ne[1] <= 512) return launch.template operator()<MidBulk>();
-    launch.template operator()<Bulk>();
+    // BF16 row words with per-token activation scales, or FP32 ones (fp8_e4m3fn_row_f32) with the
+    // parent's static input scale in every token's slot (launch_fp8_a8_quantize).
+    with_fp8_a8_operands(weight, workspace, x.ne[1], [&](const auto& operands) {
+        const auto launch = [&]<class Schedule>() {
+            using S = Fp8ScheduleInstance<Schedule, 5120>;
+            if constexpr (S::kTmaSwizzle)
+                launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
+                                           workspace.partials);
+            else
+                launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+        };
+        if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
+        if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
+        if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
+        if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
+        // 2026-11-10 (RTX 5090, every tile forced): five 64-token tiles of 256 rows take 109-113 against 109-119 us
+        // for the 128x256 tile with its split-K tail at 257-320 columns, and five 96-token ones 148-155 against
+        // 156-164 us for the 128x128 tile at 385-480. Neither has a split-K tail, so the columns the tail held
+        // there take the unsplit K order (their bits change at those widths).
+        if (x.ne[1] > 256 && x.ne[1] <= 320) return launch.template operator()<Tma64x256>();
+        if (x.ne[1] > 384 && x.ne[1] <= 480) return launch.template operator()<Tma96x256>();
+        // Smaller output tiles leave only two full-K tiles to split near the 512-token anchor.
+        if (x.ne[1] > 480 && x.ne[1] <= 512) return launch.template operator()<MidBulk>();
+        launch.template operator()<Bulk>();
+    });
 }
 } // namespace infernix::ops::detail

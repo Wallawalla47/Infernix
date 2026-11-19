@@ -243,6 +243,21 @@ HostWeight make_nvfp4(int n, int k, std::mt19937& rng, float divisor) {
     return h;
 }
 
+// nvfp4_mul in block_scale_k16_m128x4_v1 (NVIDIA's NVFP4-QAD 27B), run as QType::NVFP4: make_nvfp4's planes with
+// ModelOpt's weight_scale_2 multiplying every row's sum instead of a divisor dividing it.
+HostWeight make_nvfp4_mul(int n, int k, std::mt19937& rng, float multiplier) {
+    HostWeight h  = make_nvfp4(n, k, rng, 1.0F);
+    h.name        = "nvfp4_mul";
+    h.factor      = Factor::Multiply;
+    const std::uint32_t m = f32_bits(multiplier);
+    const int field = static_cast<int>((m >> 23) & 0xFF), mantissa = static_cast<int>(m & 0x7FFFFF);
+    h.fm.assign(static_cast<std::size_t>(n), static_cast<std::uint32_t>(field == 0 ? mantissa : ((1 << 23) | mantissa)));
+    h.fe.assign(static_cast<std::size_t>(n), (field == 0 ? 1 : field) - 150);
+    h.weight.weight_scale_divisor = 0.0F;
+    h.weight.weight_multiplier    = multiplier;
+    return h;
+}
+
 // fp8_e4m3fn_row_bf16 in row_scale_v1: codes [n][k], then the BF16 row scales.
 HostWeight make_fp8_row(int n, int k, std::mt19937& rng) {
     HostWeight h;
@@ -1161,7 +1176,7 @@ HostBank make_bank(const std::string& name, QType q, int rows, int k, int expert
 // lossless_linear with a design-reference activation scale: a divisor (0: none) and per-column multipliers
 // (empty: none).
 void run_scaled(const std::string& label, const HostWeight& w, const std::vector<std::uint16_t>& x, int columns, bool bf16,
-                float divisor, const std::vector<float>& column_scales) {
+                float divisor, const std::vector<float>& column_scales, float multiplier = 0.0F) {
     DeviceBuffer dx(x.size() * 2);
     dx.copy_from_host(x.data(), x.size() * 2, 0);
     DeviceBuffer dscales(std::max<std::size_t>(column_scales.size(), 1) * 4);
@@ -1172,8 +1187,8 @@ void run_scaled(const std::string& label, const HostWeight& w, const std::vector
     Tensor tout(dout.p, bf16 ? DType::BF16 : DType::FP32, {w.n, columns});
     DeviceBuffer ws(ops::lossless_linear_workspace_bytes(w.weight, w.n, columns));
     WorkspaceArena arena(DeviceSpan{ws.p, ws.bytes});
-    const ops::LosslessActivationScale scale{divisor,
-                                             column_scales.empty() ? nullptr : static_cast<const float*>(dscales.p)};
+    const ops::LosslessActivationScale scale{
+        divisor, column_scales.empty() ? nullptr : static_cast<const float*>(dscales.p), multiplier};
     ops::lossless_linear(tx, w.weight, 0, w.n, tout, 0, arena, nullptr, scale);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<std::uint8_t> got(static_cast<std::size_t>(w.n) * columns * esize);
@@ -1183,6 +1198,7 @@ void run_scaled(const std::string& label, const HostWeight& w, const std::vector
         std::memcpy(&g, got.data() + (static_cast<std::size_t>(t) * w.n + r) * esize, esize);
         ActScales act;
         act.divisor           = f32_bits(divisor);
+        act.row_multiplier    = multiplier == 0.0F ? 0U : f32_bits(multiplier);
         act.column_multiplier = column_scales.empty() ? 0U : f32_bits(column_scales[static_cast<std::size_t>(t)]);
         want = oracle(w, r, x.data() + static_cast<std::size_t>(t) * w.k, bf16, act);
         return true;
@@ -1344,6 +1360,8 @@ INFERNIX_OP_TEST(lossless_linear) {
         for (const QType q : formats) { suite(make_row_split(q, 200, 640, rng, false), rng); }
         suite(make_nvfp4(256, 640, rng, 2.75e-3F), rng);
         suite(make_nvfp4(128, 640, rng, 3.0F), rng);
+        // ModelOpt's multiplier form (NVIDIA's NVFP4-QAD 27B), a weight_scale_2 that is not a power of two.
+        suite(make_nvfp4_mul(256, 640, rng, 7.011777e-05F), rng);
         suite(make_fp8_row(200, 640, rng), rng);
         suite(make_fp8_row_f32(200, 640, rng), rng);
         suite(make_rg16_dense(192, 640, rng, 0.0123F), rng);
@@ -1489,6 +1507,11 @@ INFERNIX_OP_TEST(lossless_linear) {
             run_scaled("fp8row f32 column scales bf16", f8f32, x, 37, true, 0.0F, scales);
             run_scaled("nvfp4 divisor and column scales fp32", n4, x, 37, false, 0.0371F, scales);
             run_scaled("q4 activation divisor fp32", q4, x, 37, false, 3.0e-3F, {});
+            // A multiplier-form NVFP4 matrix's A4 input: the codes decode with its input_scale, which multiplies
+            // the sum with the weight's own multiplier (both exact).
+            const HostWeight m4 = make_nvfp4_mul(128, 640, rng, 7.011777e-05F);
+            run_scaled("nvfp4_mul activation multiplier bf16", m4, x, 37, true, 0.0F, {}, 0.2873563F);
+            run_scaled("nvfp4_mul activation multiplier fp32", m4, x, 37, false, 0.0F, {}, 0.0371F);
         }
         // The grouped form (routed experts): Q4 gate/up banks and the Q5 down bank's depth.
         // (the 35B's layout: expert e's gate at e 1024, its up at e 1024 + 512; down at e 2048).

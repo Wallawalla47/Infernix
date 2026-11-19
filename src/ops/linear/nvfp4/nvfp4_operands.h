@@ -2,6 +2,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include <cuda_bf16.h>
 #include <cmath>
 #include <stdexcept>
@@ -36,7 +37,7 @@ inline Nvfp4A16Operands nvfp4_a16_operands(const Tensor& x, const Weight& w) {
             w.n,
             w.k,
             x.ne[1],
-            1.0f / w.weight_scale_divisor};
+            nvfp4_a16_alpha(w)};
 }
 
 inline Nvfp4A4Operands nvfp4_a4_operands(const Weight& w, Nvfp4A4Workspace x, int tokens,
@@ -48,7 +49,7 @@ inline Nvfp4A4Operands nvfp4_a4_operands(const Weight& w, Nvfp4A4Workspace x, in
             w.n,
             w.k,
             tokens,
-            1.0f / (w.input_scale_divisor * w.weight_scale_divisor),
+            nvfp4_a4_alpha(w),
             layout,
             x.terms,
             static_cast<std::int64_t>(x.code_plane),

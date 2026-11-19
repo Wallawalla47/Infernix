@@ -51,6 +51,7 @@ void validate_linear_policy(LinearPolicy policy) {
     case LinearPolicy::A16ColumnInvariant:
     case LinearPolicy::AllowA4Residual:
     case LinearPolicy::AllowA8Residual:
+    case LinearPolicy::A8Only:
         return;
     }
     throw std::invalid_argument("linear: invalid compute policy");
@@ -62,7 +63,7 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
         throw std::invalid_argument("linear: x must be BF16 and out BF16 or FP32");
     }
     if (out.dtype == DType::FP32 && !linear_fp32_output(w.qtype)) {
-        throw std::invalid_argument("linear: FP32 output needs a Q6, Q8, BF16, row FP8 or nvfp4_rg16 weight");
+        throw std::invalid_argument("linear: FP32 output needs a Q6, Q8, BF16, row FP8 or NVFP4 vocabulary head");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -133,11 +134,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 
 } // namespace
 
-// The formats a vocabulary head is stored in.
+// The formats a vocabulary head is stored in (NVFP4: the 27B head NVIDIA's QAD artifact stores as NVFP4).
 bool linear_fp32_output(QType qtype) noexcept {
     return qtype == QType::Q6_G64_FP16 || qtype == QType::Q8_G32_FP16 || qtype == QType::BF16 ||
            qtype == QType::BF16_P12 || qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::FP8_E4M3FN_ROW_F32 ||
-           qtype == QType::NVFP4_MUL;
+           qtype == QType::NVFP4_MUL || qtype == QType::NVFP4;
 }
 
 bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
@@ -146,6 +147,7 @@ bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
     if (qtype == QType::Q6_G64_FP16) { return detail::q6_column_invariant_route(output_rows, input_rows); }
     if (qtype == QType::Q8_G32_FP16) { return detail::q8_column_invariant_route(output_rows, input_rows); }
     if (is_fp8_row(qtype)) { return detail::fp8_linear_column_invariant_route(qtype, output_rows, input_rows); }
+    if (qtype == QType::NVFP4) { return detail::nvfp4_linear_column_invariant_route(output_rows, input_rows); }
     // nvfp4_rg16_v1 sums exactly: every route is column-invariant.
     if (qtype == QType::NVFP4_MUL) { return true; }
     // bf16_p12: the packed skinny GEMV, 16 columns a pass (bf16_p12_dispatch.h).
@@ -167,6 +169,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     validate_linear_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+    if (a8_only(policy) && qtype != QType::NVFP4 && !is_fp8_row(qtype)) {
+        throw std::invalid_argument("linear: A8Only takes NVFP4 or row-scaled FP8 weights");
     }
     if (column_invariant(policy) && !linear_column_invariant_route(qtype, output_rows, input_rows)) {
         // One A16 call per column.
@@ -222,6 +227,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
     validate_linear_semantics(x, w, out, policy);
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("linear: unsupported route set");
+    }
+    if (a8_only(policy) && w.qtype != QType::NVFP4 && !is_fp8_row(w.qtype)) {
+        throw std::invalid_argument("linear: A8Only takes NVFP4 or row-scaled FP8 weights");
     }
     if (column_invariant(policy) && !linear_column_invariant_route(w.qtype, w.n, w.k)) {
         // No dedicated column-invariant route: the exact one-column route, once per column.

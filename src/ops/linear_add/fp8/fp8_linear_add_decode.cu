@@ -20,8 +20,16 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
     auto* output   = static_cast<__nv_bfloat16*>(residual.data);
     const LinearBf16Output destination{output, Geometry::kOutputRows};
     const LinearResidualAddEpilogue epilogue{{output, Geometry::kOutputRows}};
-    launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        fp8_a16_operands(x, weight), destination, epilogue, stream);
+    // [5120,6144] also with FP32 row words (fp8_e4m3fn_row_f32: NVIDIA's QAD 27B).
+    if constexpr (Geometry::kInputRows == 6144) {
+        with_fp8_a16_operands(x, weight, [&](const auto& operands) {
+            launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(operands, destination,
+                                                                                     epilogue, stream);
+        });
+    } else {
+        launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            fp8_a16_operands(x, weight), destination, epilogue, stream);
+    }
 }
 
 } // namespace
