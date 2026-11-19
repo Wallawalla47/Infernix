@@ -2393,9 +2393,19 @@ format from the volume header's format tag (byte 62, written since 2026-10-19: 1
   columns: plain calls of 9 to 16,384 columns and pair calls, trimmed against untrimmed, and walks of two chunks
   (1,024 + 1,000, 4,096 + 300 and 3,072 + 4,096 columns), trimmed and untrimmed, against the chunk-major calls, on the
   exact routes with `router-mma` off and on. All equal (2026-11-18) on NVFP4-QAD Dense8, NVIDIA Dense8, IQ3_S,
-  FP4-Local, recipe A and recipe C; the FP8 artifact's 114 GiB of pinned weights do not load there. The fast paths
-  beside `router-mma` were not compared: `q8-sliced-k` has no entry for the shared expert's shapes, and
-  `ggml-bf16-prefill` acts on a GGUF shared expert, which now takes the untrimmed call's width.
+  FP4-Local, recipe A and recipe C; the FP8 artifact's 114 GiB of pinned weights do not load there. **On the default
+  fast paths the trim changes the logits** where a path routes an expert job by its width in the call (2026-11-19,
+  `--trim-last-layer --default-fast-paths`, router-mma off, the same cases): the untrimmed call runs its wide jobs on
+  that path's arithmetic, the trimmed one-column call runs the kept column's jobs on the narrow route. IQ3_S
+  (`ggml-bf16-prefill`: BF16 stage-decode tiles for a GGUF bank's jobs of more than 8 columns in calls of 512 or
+  more) differs on every KV format in some calls of 512+ columns and in none below (largest 3.1e-3; INT8 KV: 1,000
+  columns; presumably the BF16 tiles' FP32 sums round to the exact kernels' BF16 in most outputs, so which wide calls
+  differ scatters by format: not traced). FP4-Local on INT8 KV (`expert-a4-residual`) differs in every call from 16 columns (largest 0.052). Each
+  artifact's untrimmed call repeats bit for bit, and leaving out that one path (`--drop-fast-path`) makes every case
+  equal again (`f16-accumulate-prefill` and `gdn-f16-accumulate` change no trimmed bit). Recipe C (`expert-a4-residual`)
+  and `--a8-activations` (8-bit wide tiles) are expected to differ the same way (not run). The reproducible and
+  lossless routes are unaffected. Open: whether the trim stays on these paths (it moves the logit column's last-layer
+  experts to the narrow route, the exact one on the default paths) or stops where they engage.
   History: until 2026-11-18 the shared expert ran over the kept columns too. 824d757c then kept 17 columns for Q8 and
   GGUF shared experts and turned the trim off for every other dense format; the shared expert over the whole call
   restored it on those with the same bits on the exact routes (both give the untrimmed call's). RTX 5090, default
