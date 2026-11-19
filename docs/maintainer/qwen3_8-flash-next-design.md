@@ -12161,7 +12161,23 @@ I2F, then fma(P_b S_b, d_s, acc): P_b S_b is exact, so these are the magic start
 16-21 % faster than with the magic start's second FFMA, 2026-11-19; sliced-K tiles through 64 columns, one-column
 calls as PDL dependents of their encode; 128 x 128 tiles wider, the 5,120-row projections 64 x 64 through 128
 columns and 64 x 128 through 256), FP8 on its one-term E4M3 route (the static scale where the artifact stores one);
-`infernix_linear_nvfp4_a8_test` checks it against the FP64 chain of the codec. Measured (RTX 5090, 2026-11-19,
+`infernix_linear_nvfp4_a8_test` checks it against the FP64 chain of the codec. The 128 x 128 tile runs on a
+decode-warp ring since 2026-11-19 (`ops/linear/nvfp4/nvfp4_a8_ring.cuh`: a producer warpgroup copies the activations
+and scales and widens the weight codes into each stage behind mbarriers, eight MMA warps never stop for a barrier;
+setmaxnreg, so each family builds it in a non-RDC translation unit; the token tiles fastest in the grid; the same
+bits: `ops::linear` against the barrier-synchronised tile bit for bit at 129 and 257 columns, and the `--a8`
+quick-corpus perplexity 4.287068 with every one of its 124 windows' NLL equal): op time 0.86-0.90 of that tile's on
+the gate/up at 65-3,584 columns and 0.87-0.92 on the 5,120-row projections at 257-3,584 (up to 224 TOPS),
+`--a8-activations` prefill pp128-pp1024 +5.1 to +9.1 %, pp4096 3,974 -> 4,287 and pp16384 3,875 -> 4,167 tok/s (ABBA,
+the same session). Its investigation (ncu, one launch at 3,584 columns): the barrier-synchronised
+tile ran 190-200 TOPS against the 372 of its arithmetic in registers (k16 s8 MMA, I2F, FMUL, FFMA; the raw k16 MMA
+507), tensor pipe 44 % and issue 57 % busy at two warps a sub-partition (255 registers, 79 KB), 38 % of its stall
+samples between its two barriers. Measured and not taken (op time against that tile, two rotated rounds): 16-warp
+layouts at 128 registers (4 x 4 warps 1.00-1.10, 2 x 8 1.04-1.09), A fragments decoded in registers from swizzled
+codes without the widen pass (1.06-1.13), the conversion as an integer magic add with fma(M + P, S, -M S) (1.04-1.05),
+two 64-deep CTAs an SM (1.06-1.15 on the gate/up), the tile with its token tiles fastest (0.94-1.05), and the ring
+with BK 64 (three or four stages, 0.97-1.09) or its row tiles fastest (the gate/up level from 1,792 columns). Bounds
+with wrong outputs: no widen pass 0.81-0.89, no per-block arithmetic 0.83-0.91. Measured (RTX 5090, 2026-11-19,
 NVIDIA's NVFP4-QAD 27B bit-exact conversion, INT8 KV): prefill pp4096 3,769 and pp16384 3,655 tok/s (16-bit 2,934 and
 2,857, the default 17,110 and 15,486), plain decode 85.1 tok/s (16-bit with `batched-decode`'s routes 89.4, the
 default 90.2), quick-corpus perplexity 4.2868 (16-bit 4.2869, the default 4.3373), each before the flags' fast paths

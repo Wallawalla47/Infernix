@@ -24,8 +24,10 @@
 //   KWarps * 64 group, its columns' codes (64 bytes, 80-byte rows: conflict-free B loads) and two slice scales
 //   staged per warp; the A fragment decoded in registers from the swizzled codes, one MMA per block and 8-column
 //   tile, the K-warp partials summed as the A16 tiles sum theirs.
-// - MMA (prefill widths): BlockRows x BlockTokens tiles of BlockK = 128, the codes widened once per K tile to int8
-//   in a padded tile (each fragment then one 32-bit load), the activation codes and scales in a two-stage ring.
+// - MMA (the 5,120-row projections' 65-256 columns): BlockRows x BlockTokens tiles of BlockK = 128, the codes
+//   widened once per K tile to int8 in a padded tile (each fragment then one 32-bit load) between two CTA barriers,
+//   the activation codes and scales in a two-stage ring.
+// - Wider: the 128 x 128 tile on a decode-warp ring (nvfp4_a8_ring.cuh), whose producer warps widen the codes.
 
 #include "ops/common/canonical_math.h"
 #include "ops/common/dynamic_shared.cuh"
@@ -44,6 +46,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/linear/nvfp4/nvfp4_a8_ring.h"
 #include "core/weight.h"
 #include "core/arena.h"
 #include "ops/ggml/ggml_linear_a8.h"
@@ -599,8 +602,8 @@ inline Nvfp4A8Operands nvfp4_a8_encode(const Tensor& x, const Weight& w, Workspa
 
 // Every NVFP4 projection's 8-bit tiles by width (the families pass their output, epilogue and row policies: the
 // sliced-K tiles' and the MMA's, as their A16 tiles take them): the sliced-K tiles through 64 columns (8 K-warps
-// through 16, 4 above), the 128 x 128 MMA tiles wider (the 5,120-row
-// projections: 64-row tiles through 256 columns).
+// through 16, 4 above), the 128 x 128 tiles on the decode-warp ring wider (nvfp4_a8_ring.cuh, through each family's
+// launch_nvfp4_a8_ring; the 5,120-row projections: 64-row MMA tiles through 256 columns).
 // `NarrowOutput`: a 5,120-row projection (linear_add: the MLP down, attention and GDN outputs), whose 40 row tiles of
 // 128 leave most SMs idle through 256 columns: there 64-row tiles. RTX 5090, 2026-11-19, [5120,17408] and [5120,6144],
 // two rounds: 65-128 columns 64 x 64 took 0.46-0.54 of the 128 x 128 tiles' time, 192-256 columns 64 x 128 (2 x 4
@@ -624,7 +627,7 @@ void launch_nvfp4_a8(const Nvfp4A8Operands& p, Output output, Epilogue epilogue,
         if (tokens <= 256)
             return launch_nvfp4_a8_mma<Nvfp4A8MmaSchedule<64, 128, 2, 4>>(p, output, epilogue, stream, mma_rows);
     }
-    launch_nvfp4_a8_mma<Nvfp4A8MmaSchedule<128, 128, 2, 4>>(p, output, epilogue, stream, mma_rows);
+    launch_nvfp4_a8_ring(p, output, epilogue, mma_rows, stream);
 }
 
 } // namespace infernix::ops::detail

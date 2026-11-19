@@ -1,9 +1,11 @@
 // NVFP4 weights with 8-bit activations (LinearPolicy::A8Only: `--a8-activations` on NVIDIA's NVFP4 artifacts).
 //
 //   - ops::linear, ops::linear_swiglu and ops::linear_add at the 27B's NVFP4 shapes, every route (the sliced-K tiles
-//     through 64 columns, the MMA tiles wider), against an FP64 oracle over the codec: each column encoded on the host
-//     by ops/ggml/ggml_a8.h's own functions (the int8 codes and FP32 slice scales the kernels read), the weights
-//     decoded exactly from their E2M1 codes, E4M3 block scales and matrix coefficient, the products summed in FP64.
+//     through 64 columns, the 5,120-row projections' 64-row MMA tiles through 256, the 128 x 128 ring wider, each
+//     full and with a partly filled last token tile), against an FP64 oracle over the codec: each column encoded on
+//     the host by ops/ggml/ggml_a8.h's own functions (the int8 codes and FP32 slice scales the kernels read), the
+//     weights decoded exactly from their E2M1 codes, E4M3 block scales and matrix coefficient, the products summed
+//     in FP64.
 //     The kernels add a block's exact P_b S_b times the slice scale into FP32 (one rounding a block) and round the
 //     output once, so the criterion is a BF16 rounding plus an FP32 accumulation bound over the |terms|.
 //   - gdn_input_proj and attn_input_proj (the split QKV/Z and Q/K/gate/V outputs) bit for bit against ops::linear's
@@ -206,9 +208,23 @@ int run_linear() {
     return failures;
 }
 
+// The columns checked at a width: every one through 33, then every fifth (every eleventh past 129) and the last.
+std::vector<int> sampled_columns(int t) {
+    std::vector<int> columns;
+    const int step = t > 129 ? 11 : t > 33 ? 5 : 1;
+    for (int c = 0; c < t; c += step) { columns.push_back(c); }
+    if (columns.back() != t - 1) { columns.push_back(t - 1); }
+    return columns;
+}
+
+// The widths of the gate/up and the 5,120-row projections: the sliced-K tiles, the 5,120-row ones' MMA tiles (64 x 64
+// and 64 x 128 through 256 columns) and the 128 x 128 ring (the gate/up from 65 columns, the others from 257), each
+// full (128, 256, 384) and with a partly filled last token tile.
+constexpr int kSwiGluAddWidths[] = {1, 8, 16, 17, 33, 65, 128, 129, 256, 257, 384};
+
 int run_swiglu_and_add() {
     int failures = 0;
-    constexpr int kMax = 129;
+    constexpr int kMax = 384;
     // Gate/up [34816,5120]: h = silu(gate) * up of the two halves' rows.
     {
         constexpr int n = 34816, k = 5120, half = n / 2;
@@ -219,7 +235,7 @@ int run_swiglu_and_add() {
         DeviceArena workspace(std::max<std::size_t>(
             ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, n, k, ops::LinearPolicy::A8Only, 1, kMax), 256));
         const HostNvfp4 host{n, k, &w.packed};
-        for (const int t : {1, 8, 16, 17, 33, 65, 129}) {
+        for (const int t : kSwiGluAddWidths) {
             const Encoded e = encode(x, k, t);
             Tensor tx(input.p, DType::BF16, {k, t});
             Tensor out(output.p, DType::BF16, {half, t});
@@ -229,7 +245,7 @@ int run_swiglu_and_add() {
             const auto got = read<std::uint16_t>(output, static_cast<std::size_t>(half) * t);
             int bad = 0;
             for (const int r : sampled_rows(half)) {
-                for (int c = 0; c < t; c += (t > 33 ? 5 : 1)) {
+                for (const int c : sampled_columns(t)) {
                     const Reference g = reference(host, e, r, c), u = reference(host, e, r + half, c);
                     const double h    = g.y / (1.0 + std::exp(-g.y)) * u.y;
                     const double mag  = (std::abs(g.y) + g.magnitude) * (std::abs(u.y) + u.magnitude);
@@ -256,7 +272,7 @@ int run_swiglu_and_add() {
         DeviceArena workspace(std::max<std::size_t>(
             ops::linear_add_workspace_capacity_bytes(QType::NVFP4, n, k, ops::LinearPolicy::A8Only, 1, kMax), 256));
         const HostNvfp4 host{n, k, &w.packed};
-        for (const int t : {1, 8, 16, 17, 33, 65, 129}) {
+        for (const int t : kSwiGluAddWidths) {
             const Encoded e = encode(x, k, t);
             output.copy_from_host(residual.data(), static_cast<std::size_t>(n) * t * 2);
             Tensor tx(input.p, DType::BF16, {k, t});
@@ -267,7 +283,7 @@ int run_swiglu_and_add() {
             const auto got = read<std::uint16_t>(output, static_cast<std::size_t>(n) * t);
             int bad = 0;
             for (const int r : sampled_rows(n)) {
-                for (int c = 0; c < t; c += (t > 33 ? 5 : 1)) {
+                for (const int c : sampled_columns(t)) {
                     Reference ref = reference(host, e, r, c);
                     ref.y += bf16(residual[static_cast<std::size_t>(c) * n + r]);
                     ref.magnitude += 1.0;
@@ -286,7 +302,7 @@ int run_swiglu_and_add() {
 // The split outputs equal ops::linear's 8-bit route over the same parent bit for bit.
 int run_split_outputs() {
     int failures = 0;
-    constexpr int kMax = 129;
+    constexpr int kMax = 257;
     for (const bool gdn : {true, false}) {
         const int n = gdn ? 16384 : 14336, k = 5120;
         DeviceNvfp4 w(n, k, gdn ? 4801U : 4802U);
@@ -301,7 +317,7 @@ int run_split_outputs() {
         DeviceArena workspace(std::max<std::size_t>(bytes, 256));
         // GDN: QKV rows [0, 10240), Z rows [10240, 16384). Attention: Q [0, 6144), K [6144, 7168), gate
         // [7168, 13312), V [13312, 14336) (the A16 tiles' segmented outputs).
-        for (const int t : {1, 9, 33, 129}) {
+        for (const int t : {1, 9, 33, 129, 257}) {
             Tensor tx(input.p, DType::BF16, {k, t});
             Tensor all(whole.p, DType::BF16, {n, t});
             workspace.reset();

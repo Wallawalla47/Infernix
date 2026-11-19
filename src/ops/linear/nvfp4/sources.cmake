@@ -13,4 +13,5 @@ target_sources(infernix_ops PRIVATE
 
 target_sources(infernix_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_a4_tma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_a8_linear_ring.cu"
 )
