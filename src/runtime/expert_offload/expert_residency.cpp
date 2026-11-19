@@ -285,7 +285,8 @@ void ExpertResidency::resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t
                 pool.memory.fill(0);
                 const std::uint64_t spilled = guard.end(pool.memory.bytes);
                 if (spilled == 0) { break; }
-                out.spilled = spilled;
+                out.spilled        = spilled;
+                out.spill_readings = guard.readings(pool.memory.bytes);
                 pool.memory = DeviceBuffer{};
                 const std::uint64_t drop = (spilled + kChunkBytes + pool.pitch - 1) / pool.pitch;
                 frames = attempt == 0 && frames > drop ? frames - static_cast<std::uint32_t>(drop) : 0U;
@@ -326,6 +327,7 @@ void ExpertResidency::resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t
                                        pool.arena->chunk_bytes(), compute));
             CUDA_CHECK(cudaStreamSynchronize(compute));
             if (const std::uint64_t spilled = guard.end(pool.arena->chunk_bytes()); spilled != 0) {
+                out.spill_readings = guard.readings(pool.arena->chunk_bytes());
                 pool.arena->unmap_chunk();
                 out.spilled = spilled;
                 break;

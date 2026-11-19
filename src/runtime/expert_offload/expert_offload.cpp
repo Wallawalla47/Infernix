@@ -948,12 +948,15 @@ void ExpertOffload::size_frames(cudaStream_t compute) {
     // Each pool maps whole chunks: one chunk of slack per pool.
     const std::uint32_t slack = pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
     sizing_.frames            = sizing_.frames > slack ? sizing_.frames - slack : 0U;
+    diagnostic(sizing_.describe(), DiagnosticLevel::Debug); // its frames are the "of M frames" below
     const auto grown = residency_->resize(sizing_.frames, compute, *vram_, GrowthLimit{sizing_.headroom, sizing_.reserve});
     if (grown.spilled != 0) {
         diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory and given "
                        "back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames",
                    DiagnosticLevel::Warning);
+        diagnostic("expert frames: the chunk read as placed in system memory: " + grown.spill_readings,
+                   DiagnosticLevel::Debug);
     } else if (grown.short_of_room) {
         diagnostic(short_of_room_line(grown.frames, sizing_.frames), DiagnosticLevel::Info);
     } else if (grown.refused) {
@@ -1109,6 +1112,10 @@ void ExpertOffload::apply_vram_target(cudaStream_t compute, bool idle) {
                    (resized.spilled != 0 ? " (a chunk placed in system memory was given back)"
                     : resized.short_of_room ? " (free memory went while it grew)" : ""),
                DiagnosticLevel::Info);
+    if (resized.spilled != 0) {
+        diagnostic("expert frames: the chunk read as placed in system memory: " + resized.spill_readings,
+                   DiagnosticLevel::Debug);
+    }
     if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
         diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
                        std::to_string(startup_frames_) + " frames, so decode is slower until that memory is released",

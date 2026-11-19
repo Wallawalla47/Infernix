@@ -199,6 +199,7 @@ public:
                 // and the expert cache started empty (RTX 5090 beside an RTX 3090, mdbro's fork,
                 // 2026-10-11): the budget less usage is read directly there too.
                 if (allowance_ != 0 || several_devices_) {
+                    out.free_from_budget = true;
                     out.budget_allowance = allowance_;
                     out.local_budget += allowance_;
                     out.device_free = out.local_budget > out.local_usage
@@ -322,11 +323,30 @@ std::uint64_t spill_shortfall(std::uint64_t free_before, std::uint64_t free_afte
     return missing > tolerance ? missing : 0;
 }
 
+std::uint64_t local_shortfall(std::uint64_t local_before, std::uint64_t local_after, std::uint64_t bytes,
+                              std::uint64_t tolerance) noexcept {
+    const std::uint64_t rose    = local_after > local_before ? local_after - local_before : 0;
+    const std::uint64_t missing = bytes > rose ? bytes - rose : 0;
+    return missing > tolerance ? missing : 0;
+}
+
+namespace {
+
+// A device-only step's spill between two readings (SpillGuard::end(bytes)).
+std::uint64_t device_step_spill(const VramSnapshot& before, const VramSnapshot& after, std::uint64_t bytes) {
+    if (before.has_local_usage && after.has_local_usage) {
+        return local_shortfall(before.local_usage, after.local_usage, bytes);
+    }
+    return spill_shortfall(before.device_free, after.device_free, bytes);
+}
+
+} // namespace
+
 std::uint64_t SpillGuard::end(std::uint64_t bytes) {
     after_ = source_.query();
-    if (spill_shortfall(before_.device_free, after_.device_free, bytes) == 0) { return 0; }
+    if (device_step_spill(before_, after_, bytes) == 0) { return 0; }
     after_ = source_.query();
-    return spill_shortfall(before_.device_free, after_.device_free, bytes);
+    return device_step_spill(before_, after_, bytes);
 }
 
 std::uint64_t spill_rise(std::uint64_t nonlocal_before, std::uint64_t nonlocal_after, std::uint64_t bytes,
@@ -349,10 +369,22 @@ std::uint64_t SpillGuard::end(std::uint64_t bytes, std::uint64_t pinned_bytes) {
 std::string SpillGuard::readings(std::uint64_t bytes) const {
     const auto mib = [](std::uint64_t value) { return std::to_string(value >> 20) + " MiB"; };
     std::string out = "free device memory " + mib(before_.device_free) + " before and " + mib(after_.device_free) +
-                      " after " + mib(bytes) + " of allocations";
+                      " after " + mib(bytes) + " of allocations" +
+                      (after_.free_from_budget ? " (the OS budget less this process's use)" : " (cudaMemGetInfo)");
+    if (before_.has_budget && after_.has_budget) {
+        out += "; OS budget " + mib(before_.local_budget) + " before and " + mib(after_.local_budget) + " after";
+    }
+    if (before_.has_local_usage && after_.has_local_usage) {
+        out += "; this process's device memory use " + mib(before_.local_usage) + " before and " +
+               mib(after_.local_usage) + " after";
+    }
     if (before_.shared_system != 0 && after_.shared_system != 0) {
         out += "; this process's shared system memory use " + mib(before_.nonlocal_usage) + " before and " +
                mib(after_.nonlocal_usage) + " after";
+    }
+    if (before_.physical_free != 0 || after_.physical_free != 0) {
+        out += "; free over every process " + mib(before_.physical_free) + " before and " + mib(after_.physical_free) +
+               " after (NVML)";
     }
     return out;
 }

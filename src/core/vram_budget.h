@@ -30,6 +30,9 @@ struct VramSnapshot {
     // Whether local_usage is this process's device-memory use: with has_budget on Windows, and under WSL2 through
     // DXCore's budget query of the local segment, which only reports it (no WSL2 sizing reads a budget).
     bool has_local_usage = false;
+    // Whether device_free is the DXGI budget less local_usage rather than cudaMemGetInfo's figure (past the
+    // budget, or with several CUDA devices visible).
+    bool free_from_budget = false;
     DisplayState display       = DisplayState::Unknown;
     int outputs                = -1; // DXGI outputs of the adapter; -1 unknown
     // A source opened past the budget: the bytes added to the OS budget (already included in
@@ -88,8 +91,14 @@ inline constexpr std::uint64_t kSpillToleranceBytes = 32ULL << 20;
                                        std::uint64_t bytes, std::uint64_t pinned_bytes,
                                        std::uint64_t tolerance = kSpillToleranceBytes) noexcept;
 
-// Checks device allocation steps against a source's free memory. A shortfall is confirmed by a
-// second reading, since another program can change free memory during the step.
+// The same from this process's own device-memory use (DXGI / DXCore LOCAL usage) before and after
+// the step: the bytes of `bytes` it did not rise by, beyond `tolerance`; 0: resident.
+[[nodiscard]] std::uint64_t local_shortfall(std::uint64_t local_before, std::uint64_t local_after,
+                                            std::uint64_t bytes,
+                                            std::uint64_t tolerance = kSpillToleranceBytes) noexcept;
+
+// Checks device allocation steps against a source's readings. A spill is confirmed by a second
+// reading, since another program or thread can change a reading during the step.
 class SpillGuard {
 public:
     explicit SpillGuard(VramBudgetSource& source) : source_(source) {}
@@ -97,9 +106,15 @@ public:
     void begin() { before_ = source_.query(); }
     // The reading begin() took: what a caller decides the step against before taking it.
     [[nodiscard]] const VramSnapshot& before() const noexcept { return before_; }
-    // After a step that allocated `bytes`: the bytes not placed in device memory (0: resident), from
-    // the drop in free device memory. Another program that frees or takes device memory during the
-    // step changes that drop, so a caller that knows what it page-locked uses the form below.
+    // After a step that allocated `bytes` of device memory and page-locked nothing: the bytes not
+    // placed in device memory (0: resident). Where the source reads this process's own device-memory
+    // (LOCAL) use (Windows, WSL2), the step's spill is that use's rise short of `bytes`: free memory is
+    // the OS budget less that use, so the free drop also moved with the budget, which the OS can
+    // change during the step (a display GPU at startup, issue #68), and clamps at 0 past the budget.
+    // On an RTX 5090 (2026-11-19, 494 64 MiB pieces grown to the card's end, VMM and cudaMalloc alike)
+    // every piece raised LOCAL use by exactly 64 MiB and ran at VRAM speed, the free drop read 10 of them
+    // as spilled once the budget bound, and the driver refused the pieces past the card instead of
+    // placing them in system memory. Without that reading the drop in free device memory decides.
     [[nodiscard]] std::uint64_t end(std::uint64_t bytes);
     // The same for a step that also page-locked `pinned_bytes` of host memory for the device (net of
     // what it released again). Where the source reads this process's shared system memory use
@@ -108,8 +123,9 @@ public:
     // that reading the free-memory drop decides, as above.
     [[nodiscard]] std::uint64_t end(std::uint64_t bytes, std::uint64_t pinned_bytes);
     // The last step's readings, for its failure: free device memory before and after a step of
-    // `bytes`, and where the source reads it (Windows, WSL2) this process's shared system memory use,
-    // which a real sysmem fallback raises and a misread free-memory figure does not.
+    // `bytes` (and where it comes from), and where the source reads them the OS budget, this process's
+    // LOCAL and shared-system memory use (a real sysmem fallback raises the latter, a misread free
+    // figure does not) and NVML's free memory over every process.
     [[nodiscard]] std::string readings(std::uint64_t bytes) const;
 
 private:

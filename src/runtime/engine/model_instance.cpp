@@ -257,7 +257,8 @@ std::size_t current_free_device_bytes(int device, bool past_budget) {
 }
 
 // What stepped growth maps on `device` now, up to `max_bytes`: 64 MiB VMM chunks as the expert frames grow, each
-// mapped only while growth_room covers it and kept only while free memory dropped by it, all released after. Under
+// mapped only while growth_room covers it and kept only while the spill guard finds it resident (SpillGuard::end),
+// all released after. Under
 // WDDM the OS budget and free memory need not see another process's VRAM, so a resident model's automatic KV sized
 // from them was one allocation that made Windows evict the other process: the 27B NVFP4 at --max-context auto beside
 // a 3 GiB holder resolved 370,304 tokens as on an empty card and the holder's VRAM fell from 3,504 to 416 MiB (RTX
@@ -267,6 +268,7 @@ struct GrowthProbe {
     std::uint64_t bytes = 0;     // what it mapped (max_bytes when nothing stopped it)
     bool stopped        = false; // growth_room, a refused chunk or a spill stopped it short of max_bytes
     double milliseconds = 0.0;
+    std::string spill_readings; // a spill stopped it: the readings that found it (SpillGuard::readings)
 };
 
 GrowthProbe probe_growth(int device, VramBudgetSource& source, const expert_offload::GrowthLimit& limit,
@@ -286,6 +288,7 @@ GrowthProbe probe_growth(int device, VramBudgetSource& source, const expert_offl
         CUDA_CHECK(cudaMemset(static_cast<std::byte*>(arena.base()) + arena.mapped_bytes() - chunk, 0, chunk));
         CUDA_CHECK(cudaDeviceSynchronize());
         if (guard.end(chunk) != 0) {
+            out.spill_readings = guard.readings(chunk);
             arena.unmap_chunk();
             out.stopped = true;
             break;
@@ -1275,6 +1278,11 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                                "KV room probe: %zu MiB mapped in 64 MiB steps in %.0f ms%s",
                                static_cast<std::size_t>(probe.bytes >> 20), probe.milliseconds,
                                probe.stopped ? ", stopped short" : "");
+            if (!probe.spill_readings.empty()) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                                   "KV room probe: a chunk read as placed in system memory stopped it: %s",
+                                   probe.spill_readings.c_str());
+            }
         }
         // The sequence plan of `trial` (these options at another prefill chunk, for the fit below) with its
         // KV capacity resolved; none when Engine::plan finds no capacity that fits.

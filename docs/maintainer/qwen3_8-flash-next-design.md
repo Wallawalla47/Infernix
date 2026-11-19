@@ -7655,6 +7655,23 @@ measured results are under "Status" at the end of this section.
   figures and the budget's differ by a few hundred MiB either way (at idle 198 MiB in use beyond the one
   process's budget usage; after startup 362 MiB free against the engine's 161), so it stays a diagnostic
   until a physically full card is measured.
+- **The spill check of a device-only step** (issue #68, 2026-11-19): the reporter's build had the
+  `growth_room` stop and still warned "64 MiB … placed in system memory" on every start, with NVML
+  counting 2.7 GiB free, while the elastic pool grew the same cache to 8,519 frames 30 s later; with the
+  display moved to the other card (two NVIDIA cards: free memory is the DXGI budget less this
+  process's LOCAL use) the warning went. A whole chunk missing means free memory did not drop at all
+  across the step: the budget moved with it. The frames' chunks and the Qwen3.5 KV room probe
+  (`SpillGuard::end(bytes)`) now read the spill from this process's LOCAL use where the source has it
+  (Windows, WSL2), and the free drop elsewhere. Measured on this RTX 5090 (headless) with
+  `.local/issue68/vram68 spillgrow`, 64 MiB pieces grown with no room check to the card's end: every
+  piece raised LOCAL use by exactly 64 MiB and NON_LOCAL use by 0, and ran at VRAM speed (memset
+  0.028 ms); the free drop read the last 10 as spilled (usage past the 31,419 MiB budget clamps free
+  memory at 0), and the driver refused the pieces past the card (494 pieces, VMM and `cudaMalloc`
+  alike) rather than placing them in system memory, so no real spill could be produced to test
+  against; a LOCAL-only rule catches every spill the free drop caught. A device free of this process
+  during a step still reads as a spill under both rules. The warning is followed by a Debug line with
+  every reading (`SpillGuard::readings`), and the sizing line is logged at Debug. Not reproduced: a
+  display-attached card.
 
 #### Feature 2: the SSD expert tier
 

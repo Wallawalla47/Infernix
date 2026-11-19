@@ -936,11 +936,14 @@ startup
   it stops with the largest terms and what to lower (`--max-context`, `--max-concurrency`,
   `--prefill-chunk`, `--kv-dtype int8`). Below 2,048 expert frames it warns that decode will be slow.
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
-  system memory without an error, which slows everything down. The engine checks that every startup
-  allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. The error
-  prints the readings it compared: free VRAM before and after the allocations and, on Windows and
-  under WSL2, this process's shared system memory use, which a real spill raises. Setting the
+  system memory without an error, which slows everything down. The engine checks every startup
+  allocation: dense weights or fixed buffers that spilled stop startup; expert frames that spilled
+  are given back once and the cache starts smaller. On Windows and under WSL2 an expert-frame chunk
+  counts as spilled only when this process's own device-memory use did not rise by it, so a budget
+  Windows moves during the step (as on a GPU that drives a display) is not taken for a spill;
+  elsewhere the drop in free VRAM decides. The error prints the readings it
+  compared, and with `--log-level debug` the expert frames' warning is followed by them: free VRAM,
+  the OS budget, this process's device and shared system memory use, and NVML's free memory. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
 - **Other programs' VRAM.** On Windows the per-process budget and free VRAM can leave out memory

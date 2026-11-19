@@ -149,6 +149,7 @@ public:
         std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
         bool refused          = false; // the device had no memory for the next chunk
         bool short_of_room    = false; // a grow stopped: free memory no longer left the next chunk (growth_room)
+        std::string spill_readings;    // with `spilled`: the readings that found it (SpillGuard::readings)
     };
     // Backs `frames` frames over the pools (every layer frames / layers; clamped to frame_limit());
     // unchanged while frames are lent. Call only between rounds, with nothing in flight on the
