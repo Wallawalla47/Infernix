@@ -8,7 +8,8 @@
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --decode-widths [--kv KV]
-//   infernix_qwen4_exp_forward_real_test TOKENS --trim-last-layer [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --trim-last-layer [--default-fast-paths [--drop-fast-path NAME]...]
+//       [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --screened-heads [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
@@ -54,6 +55,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/rope_positions.h"
@@ -76,6 +78,7 @@
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -625,8 +628,11 @@ std::vector<float> walk_logits(const q4::execution::Parameters& parameters, Devi
 // calls (run_split) whose tail trims (each on a fresh harness), trimmed and untrimmed, with router-mma off and on (on,
 // a call of 256 columns or more keeps 256), on the exact routes: the logits compared bit for bit. Each line prints
 // the kept columns (0: nothing trims, so the line holds trivially).
+// With `selected` (--default-fast-paths: the artifact's default fast paths at this KV storage, as a server runs them),
+// the same comparisons run once on those paths' Forward flags instead of on the exact routes with router-mma off and on.
 bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceContext& device,
-                           const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv) {
+                           const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv,
+                           std::optional<q4::execution::ForwardFastPaths> selected = std::nullopt) {
     const auto& c     = parameters.model.config().text;
     const auto n      = static_cast<std::int32_t>(tokens.size());
     const auto vocab  = static_cast<std::int32_t>(c.vocab_size);
@@ -646,10 +652,44 @@ bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceCo
         ok = ok && differing == 0;
         ++compared;
     };
+    if (selected) {
+        // Engagement: the selected paths must change a wide call's untrimmed logits against the exact routes, or the
+        // comparisons below say nothing about them. Repeat: the selected paths' untrimmed call, run again on a fresh
+        // harness, must give the same bits, or trimmed against untrimmed has no oracle on these paths.
+        for (const std::int32_t width : {std::min<std::int32_t>(n, 1000), std::min<std::int32_t>(n, 4096)}) {
+            const std::int32_t context = std::max<std::int32_t>(256, (width + 63) / 64 * 64);
+            std::vector<float> rows[3];
+            for (const int which : {0, 1, 2}) {
+                Harness harness(parameters, device, context, width, 1, kv,
+                                which == 0 ? q4::execution::ForwardFastPaths{} : *selected);
+                auto call = make_call(c, volume, {tokens}, 0, width, {0}, {0});
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run(call.batch, out);
+                device.synchronize();
+                rows[which] = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            std::int32_t engaged = 0, repeat = 0;
+            for (std::int32_t v = 0; v < vocab; ++v) {
+                engaged += std::memcmp(&rows[0][v], &rows[1][v], sizeof(float)) != 0;
+                repeat += std::memcmp(&rows[1][v], &rows[2][v], sizeof(float)) != 0;
+            }
+            std::printf("default fast paths %s at %d columns: %d of %d untrimmed logits differ from the exact routes'\n",
+                        engaged != 0 ? "ENGAGED" : "NOT ENGAGED (equal to the exact routes)", width, engaged, vocab);
+            std::printf("default fast paths, %d columns run twice: %s (%d of %d differ)\n", width,
+                        repeat == 0 ? "repeatable" : "NOT REPEATABLE", repeat, vocab);
+            ok = ok && repeat == 0;
+        }
+    }
     for (const bool router_mma : {false, true}) {
+        if (selected && router_mma) { break; }
         q4::execution::ForwardFastPaths fast{};
         fast.router_mma = router_mma;
-        const std::string mode = std::string("router-mma ") + (router_mma ? "on" : "off");
+        std::string mode = std::string("router-mma ") + (router_mma ? "on" : "off");
+        if (selected) {
+            fast = *selected;
+            mode = std::string("default fast paths (router-mma ") + (fast.router_mma ? "on)" : "off)");
+        }
         // Both sides of every width where a route of the last layer's MoE may change, to the default prefill chunk.
         for (const std::int32_t width : {9, 16, 17, 18, 32, 33, 64, 65, 96, 97, 128, 129, 200, 255, 256, 257, 300, 512,
                                          1000, 4096, 16384}) {
@@ -710,6 +750,22 @@ bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceCo
             }
             const std::string label = mode + ", walk " + std::to_string(w0) + " + " + std::to_string(w1) + " columns";
             std::int32_t kept = 0;
+            if (selected) {
+                // Fast paths such as ggml-bf16-prefill route by how the walk groups its chunks, so a walk need not give
+                // the chunk-major calls' bits (printed only); the trim must still give the untrimmed walk's.
+                std::int32_t whole = 0;
+                std::vector<float> walk = walk_logits(parameters, device, volume, tokens, kv, fast, w0, w1, false, whole);
+                std::int32_t differing = 0;
+                for (std::int32_t v = 0; v < vocab; ++v) {
+                    differing += std::memcmp(&walk[v], &chunk_major[v], sizeof(float)) != 0;
+                }
+                std::printf("%s: the walk against chunk-major (information): %d of %d differ\n", label.c_str(), differing,
+                            vocab);
+                std::vector<float> rows[2] = {walk, walk_logits(parameters, device, volume, tokens, kv, fast, w0, w1, true,
+                                                                kept)};
+                compare(label + ", last layer trimmed, against the untrimmed walk", rows, kept);
+                continue;
+            }
             for (const bool trim : {false, true}) {
                 std::vector<float> rows[2] = {chunk_major, walk_logits(parameters, device, volume, tokens, kv, fast, w0,
                                                                        w1, trim, kept)};
@@ -996,6 +1052,8 @@ int main(int argc, char** argv) {
         bool decode_widths  = false;
         bool screened_heads = false;
         bool trim_last      = false;
+        bool default_fast   = false; // --default-fast-paths: --trim-last-layer on the artifact's default fast paths
+        std::vector<FastPath> dropped; // --drop-fast-path NAME: one of those paths left out (attribution)
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
@@ -1036,6 +1094,20 @@ int main(int argc, char** argv) {
             if (arg == "--trim-last-layer") {
                 if (jobs.empty()) { throw std::invalid_argument("--trim-last-layer needs a token list before it"); }
                 jobs.back().trim_last = true;
+                continue;
+            }
+            if (arg == "--default-fast-paths") {
+                if (jobs.empty()) { throw std::invalid_argument("--default-fast-paths needs a token list before it"); }
+                jobs.back().default_fast = true;
+                continue;
+            }
+            if (arg == "--drop-fast-path") {
+                if (jobs.empty() || !jobs.back().default_fast || i + 1 >= argc) {
+                    throw std::invalid_argument("--drop-fast-path NAME follows --default-fast-paths");
+                }
+                const auto path = parse_fast_path(argv[++i]);
+                if (!path) { throw std::invalid_argument(std::string("unknown fast path: ") + argv[i]); }
+                jobs.back().dropped.push_back(*path);
                 continue;
             }
             if (arg == "--screened-heads") {
@@ -1193,7 +1265,24 @@ int main(int argc, char** argv) {
         if (job.decode_widths) { return check_decode_widths(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
         if (job.trim_last) {
             if (load.stream_experts) { throw std::invalid_argument("--trim-last-layer runs whole calls: not with --stream-experts"); }
-            return check_trim_last_layer(parameters, device, volume, tokens, job.kv) ? 0 : 1;
+            std::optional<q4::execution::ForwardFastPaths> selected;
+            if (job.default_fast) {
+                // The paths a server qualifies by default for this artifact and KV storage (no drafter, no
+                // --fast-path candidates); only their Forward flags matter here.
+                EngineOptions options;
+                options.kv_cache = job.kv;
+                q4::FastPathSelection selection = q4::select_fast_paths(model->config(), false, options);
+                for (const FastPath path : job.dropped) {
+                    selection.paths.erase(std::remove(selection.paths.begin(), selection.paths.end(), path),
+                                          selection.paths.end());
+                    std::printf("left out: %s\n", fast_path_name(path));
+                }
+                std::string names;
+                for (const FastPath path : selection.paths) { names += std::string(names.empty() ? "" : ", ") + fast_path_name(path); }
+                std::printf("default fast paths at this KV storage: %s\n", names.empty() ? "none" : names.c_str());
+                selected = selection.forward();
+            }
+            return check_trim_last_layer(parameters, device, volume, tokens, job.kv, selected) ? 0 : 1;
         }
         if (job.screened_heads) { return check_screened_heads(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
         Harness harness(parameters, device, context, n, 3, job.kv);
