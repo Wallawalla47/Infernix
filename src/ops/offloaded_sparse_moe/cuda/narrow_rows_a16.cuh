@@ -44,9 +44,13 @@ struct RowsShape {
     static constexpr int kDownCtas  = G::kDownRowGroups / kRowsDownGroups;
 };
 
-// Whether a call's W4A16 jobs take these kernels (moe_experts' prepare and launch_pass decide it identically).
+// Whether a call's W4A16 jobs take these kernels (moe_experts' prepare and launch_pass decide it identically). Their x
+// rows are the workspace's x limb rows as A16Act blocks, so a call with jobs on the exact wide route (a trimmed call on
+// a wider call's routes, moe::route_width), which reads those rows as its limbs, keeps the tensor-core kernels: their
+// prepare writes the wide route's limbs, and their outputs are these kernels' bits.
 inline bool a16_rows_call(const MoeExpertSource& source, int columns, const moe::wide::ExpertsWorkspace& layout) {
-    return columns <= kA16RowsMaxColumns && a16_nmma_call(source, columns, layout);
+    return columns <= kA16RowsMaxColumns && a16_nmma_call(source, columns, layout) &&
+           !(source.wide_a16 == moe::WideA16::kExact && moe::route_width(source, columns) > moe::kMaxColumns);
 }
 
 // A lane's code words (q, i) of one unit, q = 0..3, and its two rows' scale words (byte 0: row i, byte 1: row i + 8).
