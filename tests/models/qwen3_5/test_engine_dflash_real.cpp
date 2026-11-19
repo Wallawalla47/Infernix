@@ -18,6 +18,7 @@ namespace {
 infernix::EngineOptions base_engine_options(const char* artifact) {
     infernix::EngineOptions options;
     options.artifact_path  = artifact;
+    options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
     options.max_context    = 128;
     options.kv_capacity    = infernix::KvCapacityPolicy::explicit_capacity(128);
     options.prefill_chunk  = 128;

@@ -1,3 +1,4 @@
+#include "real_test_artifact.h"
 #include "infernix/engine.h"
 #include "speculative_page_boundary.h"
 #include "kv_cache_storage.h"
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
         const auto batch     = argc > 4 ? static_cast<unsigned>(std::stoul(argv[4])) : 8U;
         infernix::EngineOptions options;
         options.artifact_path   = artifact;
+        options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
         options.max_context     = 2304;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(2304 * batch);
         options.prefill_chunk   = 2304;

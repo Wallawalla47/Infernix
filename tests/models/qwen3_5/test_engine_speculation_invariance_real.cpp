@@ -1,9 +1,12 @@
+#include "real_test_artifact.h"
 #include "infernix/engine.h"
 
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -29,10 +32,24 @@
 // of every Qwen3.5-family model) and frequency penalty 0.3, greedy and sampled: a verified draft
 // changes the next position's penalties, which speculation must apply as plain decoding does (SGLang
 // #46752 shipped DFlash outputs that ignored the penalty).
+//
+// The plain run and the drafters without a fixed copy width run their requests together on kLanes lanes. The
+// reproducible route gives a request the tokens it has alone whatever runs beside it (its request invariance, which
+// the invariance entry checks), so every comparison is the one-at-a-time run's; rounds of several rows still draft,
+// each row as if alone (dflash.md), and each drafting arm must accept drafts. The dflash2-ngramN arms run one request
+// at a time: their rounds are placed at single-row verify widths (the GDN record routes' boundaries), which rounds of
+// several rows would move.
 namespace {
 
 constexpr std::uint32_t kOutputTokens = 200;
 constexpr std::uint32_t kContext      = 4096;
+constexpr std::uint32_t kLanes        = 4;
+
+// One lane for the arms that place their rounds at a verify width (dflash2-ngramN), kLanes for the rest.
+std::uint32_t lanes_for(std::string_view drafter) {
+    return drafter.starts_with("dflash2-ngram") && drafter.size() > std::string_view("dflash2-ngram").size() ? 1U
+                                                                                                           : kLanes;
+}
 constexpr float kPresencePenalty      = 1.5F;
 constexpr float kFrequencyPenalty     = 0.3F;
 
@@ -74,10 +91,12 @@ bool penalised_drafter(std::string_view drafter) {
 infernix::EngineOptions reproducible_options(const std::filesystem::path& artifact, std::string_view drafter) {
     infernix::EngineOptions options;
     options.artifact_path   = artifact;
+    options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
     options.fast_paths      = false; // the reproducible route
     options.max_context     = kContext;
-    options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(kContext);
-    options.max_concurrency = 1;
+    options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(kContext * lanes_for(drafter));
+    options.max_concurrency = lanes_for(drafter);
+    options.max_pending_requests = 32; // every request of a run is submitted at once
     options.prefill_chunk   = 1024;
     options.enable_vision   = false;
     if (drafter == "mtp" || drafter == "mtp-cut" || drafter == "mtp-sampled") {
@@ -129,39 +148,59 @@ struct Decoded {
     std::vector<std::string> labels;
     std::vector<std::vector<infernix::TokenId>> tokens;
     std::uint64_t one_token_drafts = 0; // drafts verified for the one-token prompt
+    std::uint64_t drafted = 0, accepted = 0; // over every request (MTP/DFlash drafts and n-gram copies)
 };
 
 Decoded decode(const std::filesystem::path& artifact, std::string_view drafter, bool penalised) {
     infernix::Engine engine(reproducible_options(artifact, drafter));
     Decoded out;
-    const auto add = [&out](std::string label, std::vector<infernix::TokenId> tokens) {
+    // Each request as its label and a call that submits it.
+    std::vector<std::function<infernix::GenerationHandle()>> requests;
+    const auto add = [&](std::string label, std::function<infernix::GenerationHandle()> submit) {
         out.labels.push_back(std::move(label));
-        out.tokens.push_back(std::move(tokens));
+        requests.push_back(std::move(submit));
+    };
+    const auto chat = [&engine](std::string text, infernix::RequestOptions options) {
+        return [&engine, text = std::move(text), options] { return engine.submit(engine.prepare(prompt(text)), options); };
     };
     const std::vector<std::string> texts = prompts();
     for (std::size_t p = 0; p < texts.size(); ++p) {
         const std::string name = "prompt " + std::to_string(p);
-        add(name + " greedy", engine.generate(engine.prepare(prompt(texts[p])), request(0.0F, 0)).generated_token_ids);
+        add(name + " greedy", chat(texts[p], request(0.0F, 0)));
         for (std::uint64_t seed : {11ULL, 12ULL}) {
-            add(name + " sampled seed " + std::to_string(seed),
-                engine.generate(engine.prepare(prompt(texts[p])), request(1.0F, seed)).generated_token_ids);
+            add(name + " sampled seed " + std::to_string(seed), chat(texts[p], request(1.0F, seed)));
         }
     }
     // A one-token prompt speculates like any other (Strata aece46db: there, position 0 meant "no
     // speculation", so such a prompt never drafted).
     const std::vector<infernix::TokenId> first = engine.tokenize_text("Once");
     require(!first.empty(), "the tokenizer encoded no token");
-    const infernix::GenerationResult one = engine.generate(engine.prepare_tokens({first.front()}), request(0.0F, 0));
-    add("one-token greedy", one.generated_token_ids);
-    out.one_token_drafts = one.speculative.drafted_tokens + one.speculative.ngram_drafted_tokens;
+    const std::size_t one_token = requests.size();
+    const infernix::TokenId once = first.front();
+    add("one-token greedy", [&engine, once] { return engine.submit(engine.prepare_tokens({once}), request(0.0F, 0)); });
     if (penalised) {
         for (std::size_t p = 0; p < texts.size(); ++p) {
             const std::string name = "prompt " + std::to_string(p);
-            add(name + " penalised greedy",
-                engine.generate(engine.prepare(prompt(texts[p])), request(0.0F, 0, true)).generated_token_ids);
-            add(name + " penalised sampled",
-                engine.generate(engine.prepare(prompt(texts[p])), request(1.0F, 11, true)).generated_token_ids);
+            add(name + " penalised greedy", chat(texts[p], request(0.0F, 0, true)));
+            add(name + " penalised sampled", chat(texts[p], request(1.0F, 11, true)));
         }
+    }
+    // At most twice the lanes submitted and unfinished, oldest first: a request queued longer than the Engine's admission
+    // bound expires (a one-lane arm's last requests did when all sixteen were submitted at once).
+    const std::size_t window = 2 * static_cast<std::size_t>(lanes_for(drafter));
+    std::deque<infernix::GenerationHandle> in_flight;
+    std::size_t submitted = 0;
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        for (; submitted < requests.size() && in_flight.size() < window; ++submitted) {
+            in_flight.push_back(requests[submitted]());
+        }
+        const infernix::GenerationResult result = in_flight.front().wait();
+        in_flight.pop_front();
+        const auto& s = result.speculative;
+        if (i == one_token) { out.one_token_drafts = s.drafted_tokens + s.ngram_drafted_tokens; }
+        out.drafted += s.drafted_tokens + s.ngram_drafted_tokens;
+        out.accepted += s.accepted_tokens + s.ngram_accepted_tokens;
+        out.tokens.push_back(result.generated_token_ids);
     }
     return out;
 }
@@ -206,6 +245,12 @@ int main(int argc, char** argv) {
             std::cout << drafter << " one-token prompt: " << speculative_run.one_token_drafts << " drafts verified\n";
             if (speculative_run.one_token_drafts == 0) {
                 std::cerr << "FAIL " << drafter << ": a one-token prompt verified no drafts\n";
+                ++failures;
+            }
+            std::cout << drafter << ": " << speculative_run.accepted << " of " << speculative_run.drafted
+                      << " drafts accepted over every request (" << lanes_for(drafter) << " lanes)\n";
+            if (speculative_run.accepted == 0) {
+                std::cerr << "FAIL " << drafter << ": no draft was accepted\n";
                 ++failures;
             }
             if (failures != 0) {

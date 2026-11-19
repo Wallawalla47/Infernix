@@ -6,6 +6,7 @@
 // A request the Program refuses to plan on the worker fails alone, and the Engine serves on.
 // Requires INFERNIX_TEST_ARTIFACT (an artifact with a DFlash2 drafter).
 
+#include "real_test_artifact.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -53,6 +54,7 @@ infernix::RequestOptions constrained(infernix::TokenConstraint constraint, float
 infernix::EngineOptions engine_options(const char* artifact, infernix::SpeculativeBackend backend) {
     infernix::EngineOptions options;
     options.artifact_path   = artifact;
+    options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
     options.max_context     = kMaxContext;
     options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4 * kMaxContext);
     options.kv_cache        = infernix::KvCacheStorage::BFloat16;

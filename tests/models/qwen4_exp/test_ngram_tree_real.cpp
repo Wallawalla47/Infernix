@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -42,6 +43,9 @@
 namespace {
 
 using Tokens = std::vector<infernix::TokenId>;
+
+// The lossless reference Engine, started the first time a comparison needs it (only streams that differ are scored).
+using Reference = std::function<infernix::Engine&()>;
 
 constexpr std::uint32_t kOutputs     = 600;
 constexpr std::uint32_t kContext      = 4096;
@@ -198,12 +202,13 @@ std::string prompt(int variant) {
 }
 
 struct Arm {
+    std::vector<Tokens> prompts; // the two prompts as the arm's own Engine tokenized them
     std::vector<Tokens> streams;
     std::uint64_t tree_rounds = 0, side_rounds = 0, side_drafts = 0, ngram_rounds = 0;
 };
 
-Arm run(const char* artifact, const char* ngram, const char* draft_model, std::uint32_t tree_nodes,
-        const std::vector<Tokens>& prompts) {
+// Each arm tokenizes the prompts with its own Engine (one artifact, one tokenizer: no Engine of its own for that).
+Arm run(const char* artifact, const char* ngram, const char* draft_model, std::uint32_t tree_nodes) {
     infernix::EngineOptions options;
     options.artifact_path = artifact;
     if (ngram != nullptr) { options.ngram_volume_path = ngram; }
@@ -219,11 +224,18 @@ Arm run(const char* artifact, const char* ngram, const char* draft_model, std::u
         options.speculative.draft_model  = draft_model;
         options.speculative.draft_tokens = 7;
     }
-    // Both arms take every copy, to a two-path tree's depth; the tree arm verifies every eligible tree.
-    infernix::models::qwen4_exp::testing::set_ngram_policy_override(true);
+    // Both arms take every copy, to a two-path tree's depth; the tree arm verifies every eligible tree. The override
+    // ends with the arm's Engine, on every path (the process's later Engines take the cost policy again).
+    struct PolicyOverride {
+        PolicyOverride() { infernix::models::qwen4_exp::testing::set_ngram_policy_override(true); }
+        ~PolicyOverride() { infernix::models::qwen4_exp::testing::set_ngram_policy_override(false); }
+        PolicyOverride(const PolicyOverride&)            = delete;
+        PolicyOverride& operator=(const PolicyOverride&) = delete;
+    } override_policy;
     infernix::Engine engine(options, infernix::test::engine_host());
     Arm arm;
-    for (const Tokens& tokens : prompts) {
+    for (int variant = 0; variant < 2; ++variant) { arm.prompts.push_back(engine.tokenize_text(prompt(variant))); }
+    for (const Tokens& tokens : arm.prompts) {
         infernix::RequestOptions request;
         request.execution.requested_output_tokens = kOutputs;
         request.execution.sampling.temperature    = 0.0F;
@@ -260,7 +272,7 @@ std::uint32_t misses(const std::vector<double>& r) {
 // `chains`: every chain arm of the run (`chain`, the tree arm's own, among them), each a chain decoding of the same
 // route; the tree arm's misses are held to the most of theirs, since chain arms of different drafters differ from
 // each other too (NVIDIA Dense8, whose 4-bit expert activations flip more near-ties: 7 against 4 on one prompt).
-int compare(const char* label, infernix::Engine& reference, const std::vector<Tokens>& prompts, const Arm& tree,
+int compare(const char* label, const Reference& reference, const std::vector<Tokens>& prompts, const Arm& tree,
             const Arm& chain, const std::vector<const Arm*>& chains) {
     int failures = 0;
     std::printf("%s: tree arm %llu n-gram tree rounds, %llu took the other source (%llu drafts), %llu copy rounds; "
@@ -285,12 +297,12 @@ int compare(const char* label, infernix::Engine& reference, const std::vector<To
         }
         std::size_t at = 0;
         while (a[at] == b[at]) { ++at; }
-        const std::vector<double> tree_regret  = regrets(reference, prompts[p], a);
-        const std::vector<double> chain_regret = regrets(reference, prompts[p], b);
+        const std::vector<double> tree_regret  = regrets(reference(), prompts[p], a);
+        const std::vector<double> chain_regret = regrets(reference(), prompts[p], b);
         std::uint32_t chain_misses             = misses(chain_regret);
         for (const Arm* other : chains) {
             if (other != &chain && p < other->streams.size()) {
-                chain_misses = std::max(chain_misses, misses(regrets(reference, prompts[p], other->streams[p])));
+                chain_misses = std::max(chain_misses, misses(regrets(reference(), prompts[p], other->streams[p])));
             }
         }
         // Before the first difference the tree arm's tokens are the chain arm's own choices.
@@ -323,27 +335,25 @@ int main() {
     const char* ngram   = std::getenv("INFERNIX_QWEN4_NGRAM");
     const char* dflash2 = std::getenv("INFERNIX_QWEN4_DFLASH2");
     try {
-        std::vector<Tokens> prompts;
-        {
-            infernix::EngineOptions options;
-            options.artifact_path = artifact;
-            if (ngram != nullptr) { options.ngram_volume_path = ngram; }
-            options.max_context = kContext;
-            infernix::Engine engine(options, infernix::test::engine_host());
-            for (int variant = 0; variant < 2; ++variant) { prompts.push_back(engine.tokenize_text(prompt(variant))); }
-        }
-        int failures = 0;
         const bool with_dflash2 = dflash2 != nullptr && *dflash2 != '\0';
-        const Arm copies_tree   = run(artifact, ngram, nullptr, 16, prompts);
-        const Arm copies_chain  = run(artifact, ngram, nullptr, 0, prompts);
+        const Arm copies_tree   = run(artifact, ngram, nullptr, 16);
+        const Arm copies_chain  = run(artifact, ngram, nullptr, 0);
         std::optional<Arm> dflash2_tree, dflash2_chain;
         if (with_dflash2) {
-            dflash2_tree.emplace(run(artifact, ngram, dflash2, 16, prompts));
-            dflash2_chain.emplace(run(artifact, ngram, dflash2, 0, prompts));
+            dflash2_tree.emplace(run(artifact, ngram, dflash2, 16));
+            dflash2_chain.emplace(run(artifact, ngram, dflash2, 0));
         }
+        const std::vector<Tokens>& prompts = copies_tree.prompts;
+        int failures = check(copies_chain.prompts == prompts && (!with_dflash2 || (dflash2_tree->prompts == prompts &&
+                                                                                    dflash2_chain->prompts == prompts)),
+                             "every arm tokenized the prompts alike");
         std::vector<const Arm*> chains{&copies_chain};
         if (with_dflash2) { chains.push_back(&*dflash2_chain); }
-        infernix::Engine reference(reference_options(artifact, ngram), infernix::test::engine_host());
+        std::optional<infernix::Engine> reference_engine;
+        const Reference reference = [&]() -> infernix::Engine& {
+            if (!reference_engine) { reference_engine.emplace(reference_options(artifact, ngram), infernix::test::engine_host()); }
+            return *reference_engine;
+        };
         failures += compare("copies alone", reference, prompts, copies_tree, copies_chain, chains);
         if (with_dflash2) { failures += compare("DFlash2 7 + copies", reference, prompts, *dflash2_tree, *dflash2_chain, chains); }
         std::printf(failures == 0 ? "ngram tree real test passed\n" : "ngram tree real test: %d failure(s)\n", failures);

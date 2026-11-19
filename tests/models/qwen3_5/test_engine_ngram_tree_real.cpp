@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -172,6 +173,7 @@ std::string prompt(int variant) {
 }
 
 struct Arm {
+    std::vector<Tokens> prompts; // the two prompts as the arm's own Engine tokenized them
     std::vector<Tokens> streams;
     std::uint64_t tree_rounds = 0, side_rounds = 0, side_drafts = 0, ngram_rounds = 0;
 };
@@ -180,6 +182,7 @@ infernix::EngineOptions engine_options(const char* artifact, const std::string& 
                                        infernix::KvCacheStorage kv, std::uint32_t tree_nodes) {
     infernix::EngineOptions options;
     options.artifact_path   = artifact;
+    options.context_cache.host_capacity_bytes = infernix::test::kTestHostTierBytes;
     options.max_context     = kContext;
     options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(kContext * streams);
     options.prefill_chunk   = kContext;
@@ -196,10 +199,13 @@ infernix::EngineOptions engine_options(const char* artifact, const std::string& 
     return options;
 }
 
-Arm run(const infernix::EngineOptions& options, const std::vector<Tokens>& prompts) {
+// Each arm tokenizes the prompts with its own Engine (one artifact, one tokenizer: no Engine of its own for that).
+Arm run(const infernix::EngineOptions& options) {
     infernix::Engine engine(options);
+    Arm arm;
+    for (int variant = 0; variant < 2; ++variant) { arm.prompts.push_back(engine.tokenize_text(prompt(variant))); }
     std::vector<infernix::GenerationHandle> handles;
-    for (const Tokens& tokens : prompts) {
+    for (const Tokens& tokens : arm.prompts) {
         infernix::RequestOptions request;
         request.execution.requested_output_tokens = kOutputs;
         request.execution.sampling.temperature    = 0.0F;
@@ -207,7 +213,6 @@ Arm run(const infernix::EngineOptions& options, const std::vector<Tokens>& promp
         request.stop.include_model_defaults       = false;
         handles.push_back(engine.submit(engine.prepare_tokens(tokens), request));
     }
-    Arm arm;
     for (infernix::GenerationHandle& handle : handles) {
         const infernix::GenerationResult result = handle.wait();
         arm.streams.push_back(result.generated_token_ids);
@@ -230,18 +235,10 @@ int main(int argc, char** argv) {
     try {
         const auto streams        = argc > 2 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 1U;
         const auto kv             = infernix::test::parse_kv_cache_storage(argc > 3 ? argv[3] : "int8");
-        std::vector<Tokens> prompts;
-        {
-            infernix::EngineOptions options;
-            options.artifact_path = artifact;
-            options.max_context   = kContext;
-            options.kv_capacity   = infernix::KvCapacityPolicy::explicit_capacity(kContext);
-            infernix::Engine engine(options);
-            for (int variant = 0; variant < 2; ++variant) { prompts.push_back(engine.tokenize_text(prompt(variant))); }
-        }
-        const Arm tree  = run(engine_options(artifact, drafter, streams, kv, 16), prompts);
-        const Arm chain = run(engine_options(artifact, drafter, streams, kv, 0), prompts);
-        int failures    = 0;
+        const Arm tree  = run(engine_options(artifact, drafter, streams, kv, 16));
+        const Arm chain = run(engine_options(artifact, drafter, streams, kv, 0));
+        const std::vector<Tokens>& prompts = tree.prompts;
+        int failures    = check(chain.prompts == prompts, "both arms tokenized the prompts alike");
         std::printf("%s x%u: tree arm %llu n-gram tree rounds, %llu took the other source (%llu drafts), %llu copy "
                     "rounds; chain arm %llu copy rounds\n",
                     drafter.c_str(), streams, static_cast<unsigned long long>(tree.tree_rounds),
@@ -255,7 +252,12 @@ int main(int argc, char** argv) {
         scoring.purpose       = infernix::EnginePurpose::CausalScoring;
         scoring.max_context   = kContext;
         scoring.kv_cache      = kv;
-        infernix::Engine scorer(scoring);
+        // Started only when a prompt's streams differ (identical streams need no score).
+        std::optional<infernix::Engine> scorer_engine;
+        const auto scorer = [&]() -> infernix::Engine& {
+            if (!scorer_engine) { scorer_engine.emplace(scoring); }
+            return *scorer_engine;
+        };
         for (std::size_t p = 0; p < prompts.size(); ++p) {
             const Tokens& a = tree.streams[p];
             const Tokens& b = chain.streams[p];
@@ -276,8 +278,8 @@ int main(int argc, char** argv) {
             sequence.push_back(a[at]);
             Tokens other = sequence;
             other.back() = b[at];
-            const float tree_logprob  = scorer.score_tokens(sequence, first, {.top_k = 1}).logprobs.back();
-            const float chain_logprob = scorer.score_tokens(other, first, {.top_k = 1}).logprobs.back();
+            const float tree_logprob  = scorer().score_tokens(sequence, first, {.top_k = 1}).logprobs.back();
+            const float chain_logprob = scorer().score_tokens(other, first, {.top_k = 1}).logprobs.back();
             failures += check(std::abs(tree_logprob - chain_logprob) <= kNearTie,
                               where + ": first difference at " + std::to_string(at) + " is a near-tie (tree token log p " +
                                   std::to_string(tree_logprob) + ", chain token " + std::to_string(chain_logprob) + ")");
