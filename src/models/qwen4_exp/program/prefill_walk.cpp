@@ -13,7 +13,8 @@
 // columns): its router, routed experts and combine act column by column, and its dense shared
 // expert, whose projections pick their routes by width, gave each chunk's bits over a group of
 // streamed chunks in every walk infernix_qwen4_exp_forward_real_test --trim-last-layer runs, so
-// grouping changes no bit either.
+// on the exact routes grouping changes no bit either (a fast path that routes an expert job by its
+// entry count gives a group's jobs the group's routes).
 //
 // The span's residual stream (BF16 [S*H, tokens]) and every chunk's staged io image live in the
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
@@ -459,7 +460,11 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
     // (Forward::last_layer_kept of its width), as the untrimmed walk's MoE over the group gives them: its dense shared
     // expert over the group, its routed experts on the group call's routes (TrimmedCall); no other final residual is
     // read, so earlier groups run no MoE in the last layer. The span's last chunk still opens the layer's stream
-    // release.
+    // release. The kept columns' router takes the form the group's takes (Forward::last_layer_kept goes by the last
+    // chunk's width) because a group of several chunks holds chunks of kStreamMinColumns or more only (walk_groups;
+    // a narrower last chunk is a group of its own).
+    static_assert(kStreamMinColumns >= execution::kRouterMmaMinColumns,
+                  "a walk group of several chunks must take the router's MMA form in each of its chunks");
     const std::int32_t last_width = walk_.widths.back();
     const std::int32_t kept       = l + 1 == L && trims_last_layer() ? forward_->last_layer_kept(last_width) : 0;
     if (kept > 0) {
