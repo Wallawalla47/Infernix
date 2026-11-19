@@ -1363,6 +1363,38 @@ without `preemption`).
   oldest one completed, so batched occupancy followed the finishing order (four requests on sampled
   docs: 3.40 rows a round for `auto` against 3.60 for fixed 7, 464 against 478 tok/s); every batched
   number above is from the worker tool.
+- **Re-timed 2026-11-19** (the owner's request to set the NVFP4 27B's `--draft-tokens auto` and
+  `--ngram-draft-tokens auto` to the fastest settings; RTX 5090, INT8 KV, main 397f8cd1, the NVIDIA
+  NVFP4-QAD bit-exact artifact with `--lm-head-draft`): five chat prompts through the CLI (prose,
+  tables, code, a serving question and a 72-token question; greedy, 256 tokens), the code and docs
+  slices above (384 tokens), and 24 copy-heavy rewrites (`copy_prompts.py`, greedy, 512 tokens), at
+  one request (decode tok/s; the chat cell is the geometric mean of its prompts) and two (wall tok/s).
+  Ratios to today's `auto` (one-row adaptive widths, plain 7-draft batches, copies of 63 drafts, 31 in
+  batches), one round an arm except the two ABBA rows; `auto` itself ran 244 / 420 / 351 / 234 / 339
+  tok/s on the chat prompts, 439 (code), 203 (docs) and 1,730 (copies) at one request, 588, 330 and
+  1,432 at two:
+
+  | Arm | Chat | Code | Docs | Copies | Code, 2 | Docs, 2 | Copies, 2 |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | `auto` without copies | 0.974 | 0.909 | 0.989 | 0.416 | 0.983 | 1.010 | 0.579 |
+  | fixed 5 / 7 / 9 drafts, no copies | 0.927 / 0.984 / 0.997 | 0.760 / 0.860 / 0.893 | 0.975 / 1.007 / 0.950 | | 0.905 / 0.992 / 0.907 | 1.045 / 1.022 / 0.931 | |
+  | fixed 11 / 15 drafts, no copies | 0.960 / 0.906 | 0.892 / 0.882 | 0.953 / 0.909 | | 0.936 / 0.900 | 0.859 / 0.838 | |
+  | MTP, five fixed drafts / `adaptive-mtp` | 0.742 / 0.745 | 0.705 / 0.695 | 0.954 / 0.947 | | 0.850 / 0.851 | 1.017 / 0.995 | |
+  | 7 drafts, automatic trees, copies 63 / 31 (ABBA) | 1.092 | 0.975 | 0.982 | 0.941 | 1.019 | 0.993 | 0.996 |
+  | one-row copies of 31 | 0.990 | 0.980 | 1.001 | 0.766 | | | |
+  | batched copies of 63 (ABBA) | = | = | = | = | 0.990 | 0.969 | 1.086 |
+
+  Nothing changed. Against `auto` without copies the fixed lengths are 7.8, 0.9, 1.1, 2.3 and 6.0 %
+  behind over the one-request chat, code and docs cells; batches stay plain at 7 (5 and 9 lose the
+  two-request code by 8 %); MTP stays behind DFlash2; seven drafts with automatic trees tie over the
+  seven cells (0.999; rounds 0.996 and 1.002). Batched copies of 63 now copy 8.6 % faster than 31 (in
+  October they copied alike) at a cost of 1.1 % on code and 1-5 % on the sampled docs; on the NVIDIA
+  NVFP4 artifact in NInfer form +6.6, -1.6 and -1.8 %, and with a copy rewrite beside a code slice
+  -0.6 %: +0.6 % and +0.4 % over the seven cells, inside `auto`'s own 0.48 % between the confirm
+  rounds, so the owner kept 31. At two requests a run lands on one of a few texts (the scheduling sets
+  each round's batch, so its bits), each repeating its speed within 0.1 %: a two-request cell's spread
+  (4 % on the sampled docs) is the choice of text. The chat prompts' texts are not compared: the CLI
+  keeps only the visible answer, which 256 tokens of these prompts reach only on the short question.
 
 **`idle-wide-prefill`: wider prefill steps while no request waits to decode (qualified
 2026-10-15).**
@@ -1810,8 +1842,11 @@ and a serving question of 1,763-2,491 tokens, and a 72-token question; greedy, 2
 arm, decode tok/s summed over the five: under `--a16-activations` five fixed drafts 1,245.7, `adaptive-mtp` 1,193.9
 (ahead only on the serving question), three fixed drafts 1,073.3; under `--a8-activations` 1,104.2, 1,074.4 and 941.5:
 five fixed drafts stay `auto`'s length. DFlash2 `--draft-tokens auto` with the proposal head (`--lm-head-draft`) and
-`adaptive-dflash` (A) against `--no-fast-path adaptive-dflash`, the fixed seven drafts (B), ABBA (the two rounds within 0.1 %, the arms'
-texts identical on nine of the ten prompt pairs, so the policy alone differs):
+`adaptive-dflash` (A) against `--no-fast-path adaptive-dflash`, the fixed seven drafts (B), ABBA (the two rounds within
+0.1 %). Whether the arms wrote the same text is known only for the question: the CLI keeps the visible answer, which
+256 tokens reach on that prompt alone, and there the answers are identical under `--a16-activations` and differ under
+`--a8-activations`. On the code and docs slices below, whose tokens are kept, the arms' texts differ, so these ratios
+mix the policy with the text it leads to:
 
 | Activations | Prose | Tables | Code | Serving | Question | Summed |
 |---|---:|---:|---:|---:|---:|---:|
@@ -1824,13 +1859,15 @@ On `adaptive-dflash`'s qualification workload (`infernix_decode_quality_gen`, 24
 code continued greedily and of its docs sampled at temperature 1, 384 tokens each, one request, ABBA) the fixed seven
 were -2.2 % (code) and +3.9 % (docs) under `--a16-activations`, -3.5 % and -2.8 % under `--a8-activations` (wall
 tok/s; the rounds within 0.1 %). `adaptive-dflash` was decided on the real prompts, the criterion set before these
-runs, and is not registered under either flag: its losses there reach -17 to -37 % (the largest where the texts diverged), the fixed length's -11.6 %, and a
+runs, and is not registered under either flag: its losses there reach -17 to -37 % (the largest on the `--a8-activations` question, whose answers differ), the fixed length's -11.6 %, and a
 policy whose sign changes with the workload is not measured faster. `--draft-tokens auto` with DFlash2 verifies seven
 drafts there (`auto_fixed_draft_tokens`); its round costs stay the NVFP4 27B's for a forced `--fast-path
 adaptive-dflash`. Open: the policy's round costs measured under each flag (the 8-bit code and docs wins suggest they
 differ from the 4-bit route's). The default route on the same five prompts, for the record and not re-decided (its
 qualification is the 2026-10-22 code and docs runs above): the fixed seven +1.6 % summed, ahead on three (prose
--2.7 %, tables +8.4 %, code +7.0 %, serving +2.9 %, question -7.5 %, where the arms' texts diverged).
+-2.7 %, tables +8.4 %, code +7.0 %, serving +2.9 %, question -7.5 %, where the arms' answers differ; the other
+prompts' texts are not compared). The default route's settings were re-timed the same day on more workloads
+(`adaptive-dflash` above): nothing changed.
 
 ### 6.8 Exact-route numerics changes
 

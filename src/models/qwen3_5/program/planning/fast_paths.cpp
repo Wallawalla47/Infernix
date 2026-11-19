@@ -719,7 +719,9 @@ SpeculativeBackend auto_speculative_backend(bool offloaded_experts, const Bundle
     if (offloaded_experts) { return drafters.mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None; }
     // Resident: DFlash2 where bundled (the Qwen3.8-27Bs: groupwise at one request DFlash2's 7 drafts 54 % faster
     // than MTP's 3 on code and 40 % on docs; NVFP4 DFlash2 7 ahead of MTP 3 in every category of
-    // docs/performance/qwen3.8-27b.md but Story, level there), then MTP (the Qwen3.6-35B-A3B: MTP auto 8-28 %
+    // docs/performance/qwen3.8-27b.md but Story, level there; re-timed 2026-11-19 on the NVFP4-QAD conversion:
+    // MTP's five drafts, fixed or adaptive, 25-30 % behind DFlash2 auto on chat and code, model-quality.md 6.7),
+    // then MTP (the Qwen3.6-35B-A3B: MTP auto 8-28 %
     // faster than DFlash auto with several requests and on sampled docs, model-quality.md 6.7; the Qwen3.6-27Bs
     // bundle MTP alone), then DFlash.
     if (drafters.dflash2) { return SpeculativeBackend::DFlash2; }
@@ -802,7 +804,8 @@ std::uint32_t dflash_batch_drafts(const FastPathConfiguration& configuration, Sp
     // Measured 2026-10-21/22 (RTX 5090, INT8 KV, two and four requests, code and sampled docs): the
     // NVFP4 27B's split rounds (a 15-draft proposal, a host wait, then the chosen width) ran 1-8 %
     // slower than fixed 7-draft rounds whatever widths they chose, the proposal and the wait costing
-    // 0.5-0.9 ms a batched round, so its batched rounds run plain at 7. The 35B-A3B's chosen batch
+    // 0.5-0.9 ms a batched round, so its batched rounds run plain at 7 (re-timed 2026-11-19 on the NVFP4-QAD
+    // conversion: fixed 5 and 9 everywhere lost two-request code by 8 %). The 35B-A3B's chosen batch
     // widths ran -1.2 to +11.2 % against plain rounds of 3 (+3.8 % geometric mean) and 3-36 % ahead
     // of plain rounds of 5, so it keeps them.
     if (nvfp4_27b(configuration)) { return 7; }
@@ -819,6 +822,10 @@ NgramSettings auto_ngram_settings(const FastPathConfiguration& configuration, Sp
     // on code (31: 1.6 %), so batched copies stop at 31. Minimum matches 8 and 16 moved the copy
     // workload +4.1 % and -3.5 % with the opposite effect on code's wrong copies, so it stays 12.
     // The 35B-A3B's DFlash copies did not pay (15 drafts +0.5 %, 31 drafts -4.1 %).
+    // Re-timed 2026-11-19 (the NVIDIA NVFP4-QAD bit-exact artifact, ABBA): batched copies of 63 now copy 8.6 %
+    // faster than 31 but cost code 1.1 % and sampled docs 1-5 % at two requests (the NVIDIA NVFP4 artifact +6.6,
+    // -1.6, -1.8 %; a copy rewrite beside a code slice -0.6 %), within the run-to-run spread over the workloads:
+    // the owner kept 31 (model-quality.md 6.7, adaptive-dflash).
     // The 4-bit class only: the copy windows were not timed under --a16-activations or --a8-activations.
     if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4 &&
         backend == SpeculativeBackend::DFlash2 && adaptive_drafts) {

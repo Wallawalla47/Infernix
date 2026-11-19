@@ -64,7 +64,13 @@ temperature 1, 384 tokens each. Wall-clock tok/s:
 
 A 63-draft copy round of several requests makes every row verify 64 columns, which cost the code
 workload 6.3 % at two requests against 1.6 % with 31 drafts, while copying as fast, hence the
-batched window of 31. Minimum matches of 8 and 16 moved the copy workload +4.1 % and -3.5 % and the
+batched window of 31. Re-timed 2026-11-19 (main 397f8cd1, the NVIDIA NVFP4-QAD bit-exact artifact,
+the same workloads, two requests, ABBA): batched copies of 63 now copy 8.6 % faster than 31 (1,553
+against 1,430 tok/s) and cost code 1.1 % and the sampled docs 1-5 %; on the NVIDIA NVFP4 artifact
++6.6, -1.6 and -1.8 %, and with a copy rewrite beside a code slice -0.6 %. Over these workloads that
+is within the run-to-run spread, and the owner kept 31
+([model-quality](maintainer/model-quality.md#67-fast-path-registry), `adaptive-dflash`'s 2026-11-19
+re-timing). Minimum matches of 8 and 16 moved the copy workload +4.1 % and -3.5 % and the
 code workload's wrong copies the other way (code -3.6 % and +1.1 %), so the default 12 stays. On
 the sampled docs, copies changed the one-request rate by -0.2 % (31 drafts) and -3.4 % (63
 drafts; 14 copy rounds in 3,297, so most of that is the different sampled text). The 35B-A3B's
