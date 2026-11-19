@@ -365,12 +365,12 @@ public:
     // (SharedCalls::x), whose routes go by width. On the exact routes those steps act column by column and the router
     // keeps its form, so the kept columns' outputs are the untrimmed call's bit for bit
     // (infernix_qwen4_exp_forward_real_test --trim-last-layer: plain and pair calls of 9 to 16,384 columns and walks, on
-    // the exact routes and router-mma). A fast path that routes an expert job by its width in the call does not keep
-    // them: ggml-bf16-prefill (a GGUF bank's jobs of more than 8 columns in calls of 512 or more) and
-    // expert-a4-residual (an NVFP4 W4A16 bank's jobs of more than 8 columns) run the untrimmed call's wide jobs on their
-    // own arithmetic and the kept columns' jobs on the narrow route, so the logits differ (IQ3_S up to 3.1e-3 in calls
-    // of 512+ columns, FP4-Local up to 0.052 from 16 columns; 2026-11-19, --default-fast-paths, each path's drop
-    // restoring the bits).
+    // the exact routes and router-mma). A fast path that routes expert jobs by their width in the call does not keep
+    // them: ggml-bf16-prefill runs a GGUF bank's jobs of more than 8 columns in calls of 512 or more on BF16 tiles, the
+    // trimmed one-column call the kept column's jobs on the narrow kernels (IQ3_S: up to 3.1e-3 in some calls of 512+
+    // columns); expert-a4-residual changes FP4-Local's kept column from 16 columns (up to 0.052; 9 columns equal, which
+    // a per-job rule of more than 8 columns does not explain: not traced). 2026-11-19, --default-fast-paths; leaving
+    // out that one path restores every case.
     [[nodiscard]] std::int32_t last_layer_kept(std::int32_t columns) const noexcept;
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
     // A pair call (design §19.3.1, the zero-split tap): two consecutive chunks of one lane, `head` then
