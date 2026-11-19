@@ -218,7 +218,8 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   with `auto`);
   `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
-  `infernix-serve`; `reproducible` runs the reproducible route and `path=NAME` also runs a candidate fast path.
+  `infernix-serve`; `reproducible` runs the reproducible route, `a16` and `a8` `--a16-activations` and
+  `--a8-activations`, and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
   token ids.
 - The judge scores any number of generator outputs with one reference: a CausalScoring Engine on
