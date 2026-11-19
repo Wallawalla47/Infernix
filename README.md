@@ -598,7 +598,7 @@ infernix-serve.exe Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-0000
 Qwen3.8-27B on a 32 GB RTX 5090:
 
 ```bat
-infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --prefill-chunk 4096 --tolerant-tool-calls
+infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --prefill-chunk 4096 --tolerant-tool-calls
 ```
 
 Ornith-1.5-122B (experts in about 70 GiB of RAM; [guide](docs/qwen3_5-122b.md)):
@@ -746,7 +746,9 @@ n-gram table or BF16.
 
 | Repository | Converted from | What it is |
 |---|---|---|
-| **[Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3)** (**recommended**) | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) | NVIDIA's NVFP4 checkpoint with a DFlash2 drafter and a proposal head for `--lm-head-draft`. |
+| **[Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact)** (**recommended**) | [nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) | NVIDIA's quantization-aware-distilled NVFP4 checkpoint, bit-exact (Infernix only), with MTP, the DFlash2 drafter and a proposal head; it runs at NVIDIA's served precision (4-bit and static 8-bit prompts, 16-bit decode). Against the NVIDIA NVFP4 conversion below: perplexity 4.3373 against 4.3472, plain decode 1.12x, DFlash2 1.04x (RTX 5090, INT8 KV). |
+| [Qwen3.8-27B-NVIDIA-NVFP4-QAD-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-NInferV3) | [nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) | The same checkpoint in NInfer's form (NInfer and Infernix), a Q8 head and FP8 embedding; same drafters and head. |
+| [Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3) | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) | NVIDIA's NVFP4 checkpoint with a DFlash2 drafter and a proposal head for `--lm-head-draft`. |
 | [Qwen3.8-27B-Quasar-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NVFP4-NInferV3) | [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) | The QAT-trained NVFP4 model, same drafter and head. |
 | [Qwen3.8-27B-Uncensored-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Uncensored-NVFP4-NInferV3) | [orcarouter/Qwen3.8-27B-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4) | Abliterated (safety alignment largely removed; see its card), same drafter and head. |
 | [Swift-Qwen3.8-27B-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Swift-Qwen3.8-27B-NVFP4-NInferV3) | [ukisai/Swift-Qwen3.8-27B-NVFP4](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-NVFP4) | UkisAI's token-efficient fine-tune, converted like the NVIDIA artifact. Smoke-tested; quality and speed not measured. |
