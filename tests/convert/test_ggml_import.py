@@ -93,6 +93,27 @@ def test_store_reads_stored_rows(tmp_path):
         assert np.array_equal(store.plain("f"), np.arange(10, dtype=np.float64))
 
 
+def test_plain_source_shape_must_match_up_to_unit_dimensions(tmp_path):
+    from tools.convert.sources.gguf_logical import plain
+
+    path = tmp_path / "plain.gguf"
+    writer = gguf.GGUFWriter(str(path), "test")
+    writer.add_tensor("conv", np.arange(12, dtype=np.float32).reshape(6, 2))  # (channels, taps)
+    writer.add_tensor("score", np.arange(4, dtype=np.float32))  # a one-row matrix stored as a vector
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    with GgufStore([path]) as store:
+        assert torch.equal(plain(store, "conv", (6, 2)).values(), torch.arange(12, dtype=torch.float64))
+        assert torch.equal(plain(store, "score", (1, 4)).values(), torch.arange(4, dtype=torch.float64))
+        # The same element count in another order would bind the values transposed.
+        with pytest.raises(ValueError, match="differs"):
+            plain(store, "conv", (2, 6))
+        with pytest.raises(ValueError, match="differs"):
+            plain(store, "conv", (3, 4))
+
+
 def test_layout_geometry():
     g = ggml_rows_geometry("ggml_q6_k", (10240, 2560))
     assert g.row_bytes == 10 * 210 and g.payload_bytes == 10240 * 2100

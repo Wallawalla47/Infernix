@@ -8,8 +8,6 @@ order; ``head_rows``, ``permute_vector`` and ``value_head_columns`` restore Hugg
 
 from __future__ import annotations
 
-from math import prod
-
 import numpy as np
 import torch
 
@@ -70,7 +68,10 @@ def plain(store: GgufStore, name: str, shape: tuple[int, ...], *, minus_one: boo
     t = store.tensor(name)
     if t.ggml_type not in (GGUF_F32, GGUF_F16, GGUF_BF16):
         raise ValueError(f"{name}: expected an F32, F16 or BF16 tensor")
-    if prod(t.shape) != prod(shape):
+    # Equal up to size-1 dimensions: llama.cpp stores a one-row matrix as a vector (Flash-Next's shared expert
+    # score, (1, 2560) as (2560,)). A transposed or regrouped tensor with the same element count is refused, since
+    # its values would bind in the wrong order.
+    if tuple(d for d in t.shape if d != 1) != tuple(d for d in shape if d != 1):
         raise ValueError(f"{name}: GGUF shape {t.shape} differs from {shape}")
     cache: list[torch.Tensor] = []
 
