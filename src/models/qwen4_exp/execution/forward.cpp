@@ -1,7 +1,6 @@
 #include "models/qwen4_exp/execution/forward.h"
 
 #include "core/layout.h"
-#include "core/temporary_switches.h"
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/embedding.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -302,15 +301,6 @@ ops::offloaded_moe::NarrowA16 Forward::expert_narrow_a16(const MoeParameters& p)
 }
 
 bool Forward::trimmed_routes(const MoeParameters& p, std::int32_t columns) const {
-    // INFERNIX_TMP_TRIM_ROUTES=own: the A/B arm of the trim on the kept columns' own routes (=off: no trim, the Program's).
-    static const bool own_routes = [] {
-        const auto arm = temporary_switches::value("INFERNIX_TMP_TRIM_ROUTES");
-        if (arm && *arm != "own" && *arm != "off") {
-            throw std::invalid_argument("INFERNIX_TMP_TRIM_ROUTES=" + *arm + ": own or off");
-        }
-        return arm && *arm == "own";
-    }();
-    if (own_routes) { return false; }
     // The op decides from the bank's arithmetic in this call (expert_source's bank kind, expert_wide_a16,
     // expert_narrow_a16, the GGUF 8-bit flag).
     ops::MoeExpertSource arithmetic{};

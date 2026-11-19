@@ -6030,9 +6030,7 @@ private:
 
     // YC-01's trim of the last layer (ForwardBatch::trim_last_layer) where a call's final residuals are read only for
     // its logits: not with MTP (its cells read every column) or a scored prompt (it exports them).
-    [[nodiscard]] bool trims_last_layer() const noexcept { return !mtp_ && !scoring_ && !trim_switched_off_; }
-    // INFERNIX_TMP_TRIM_ROUTES=off: the A/B arm without the trim (core/temporary_switches.cpp).
-    const bool trim_switched_off_ = temporary_switches::value("INFERNIX_TMP_TRIM_ROUTES").value_or("") == "off";
+    [[nodiscard]] bool trims_last_layer() const noexcept { return !mtp_ && !scoring_; }
 
     // The head's logits of `columns` columns as the Forward writes them: FP32 (logits32_), or with BF16 logits on
     // the lossless route BF16 (logits16_, each exact sum correctly rounded).

@@ -71,11 +71,6 @@ constexpr Registration kSwitches[] = {
     // Diagnostic (2026-10-29): =<MB/s>; the artifact read queues (core/direct_read_queue.cpp) hold each finished read
     // until a device of that rate would have delivered it, to measure the SSD tier on a slower drive. Same bits.
     {"INFERNIX_TMP_SSD_MBPS", Scope::All, Kind::Value},
-    // VK-02 option B's A/B (2026-11-19): =own runs a trimmed last layer's routed experts on their own routes (the
-    // trim before option B: other bits on ggml-bf16-prefill, expert-a4-residual, W4A4 and the 8-bit routes), =off
-    // runs the last layer untrimmed (models/qwen4_exp: Forward::trimmed_routes, ProgramImpl::trims_last_layer).
-    // Unset: the trim on the untrimmed call's routes (same bits as =off).
-    {"INFERNIX_TMP_TRIM_ROUTES", Scope::Qwen4Exp, Kind::Value},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 
