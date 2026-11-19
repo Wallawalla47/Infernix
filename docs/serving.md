@@ -1168,7 +1168,7 @@ wire response contains typed `output` Items.
 | `tools` | direct function and free-form `custom` definitions, or namespace groups containing them; see below |
 | `tool_choice` | `auto`, `none`, `required`, a named function or `custom` tool, or `allowed_tools` of function and custom entries with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
-| `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; Infernix does not execute hosted tools |
+| `max_tool_calls` | non-negative integer: once the Response's hosted `tool_search` calls reach it, no further generation runs and the Response ends `completed` after that generation's searches, which all run ([tool search](#deferred-tools-and-tool-search)); Infernix executes no other hosted tool |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |

@@ -21,8 +21,8 @@
 namespace infernix::serve {
 
 // Generations one response may run for server-side tools before it pauses (Anthropic
-// `stop_reason: "pause_turn"`, Responses `incomplete`): the client resumes by sending the response
-// back as history.
+// `stop_reason: "pause_turn"`; a Response ends `completed` after its last searches): the client
+// resumes by sending the response back as history.
 inline constexpr std::size_t kMaximumServerToolRounds = 10;
 
 // One generation that ended in server-side tool calls, with what the server added after it.
