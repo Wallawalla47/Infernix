@@ -138,21 +138,29 @@ def p90(values: list[float]) -> float:
 
 
 def summary(paths: list[str]) -> int:
+    """Per file and gap: the TTFT of request 2 and its excess over the gap-0 median (no idle time). A file without a
+    measured gap-0 pair has no baseline: its excess is not printed and the summary exits 1, since measuring it against
+    the smallest gap that did run would hide that gap's own excess."""
     print(f"{'file':32} {'gap s':>6} {'n':>3} {'median ms':>10} {'p90 ms':>8} {'excess ms':>10}  P-states before request 2")
+    status = 0
     for path in paths:
         rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
         by_gap: dict[float, list[dict]] = {}
         for row in rows:
             if row.get("ttft2") is not None:
                 by_gap.setdefault(row["gap"], []).append(row)
-        base = statistics.median([r["ttft2"] for r in by_gap[min(by_gap)]]) if by_gap else 0.0
+        base = statistics.median([r["ttft2"] for r in by_gap[0]]) if 0 in by_gap else None
+        if base is None:
+            print(f"{Path(path).name[:32]:32} no measured gap-0 pair: no baseline for the excess")
+            status = 1
         for gap in sorted(by_gap):
             ttfts = [r["ttft2"] for r in by_gap[gap]]
             states = Counter(r.get("pstate", "?") for r in by_gap[gap])
             median = statistics.median(ttfts)
+            excess = f"{1000 * (median - base):>10.1f}" if base is not None else f"{'-':>10}"
             print(f"{Path(path).name[:32]:32} {gap:>6g} {len(ttfts):>3} {1000 * median:>10.1f} {1000 * p90(ttfts):>8.1f} "
-                  f"{1000 * (median - base):>10.1f}  {dict(states)}")
-    return 0
+                  f"{excess}  {dict(states)}")
+    return status
 
 
 def main() -> int:

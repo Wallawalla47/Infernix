@@ -108,7 +108,8 @@ opens part 1. `--resource` stores the maintained Qwen3.8 template, as for Qwen3.
   the [design notes](maintainer/qwen3_8-flash-next-design.md) (§6.1.1, §16.2.1).
 - **Verification.** `python -m tools.flash_next.verify_artifact --model <checkpoint> --artifact
   <part 1> --ngram <volume>` compares every stored tensor, expert and n-gram row with the
-  checkpoint and lists the re-quantized parameters per component.
+  checkpoint and lists the re-quantized parameters per component. The volume is required; `--no-ngram`
+  skips it explicitly, and the report then says the volume was not checked.
 - **Second artifact of the same checkpoint.** It can share an existing n-gram volume: pass
   `--ngram-reuse <volume>` instead of `--ngram-out`. The converter checks the volume's geometry and
   512 of its rows against the checkpoint, so a volume of another checkpoint is refused.
