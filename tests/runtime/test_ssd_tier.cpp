@@ -596,7 +596,10 @@ void test_idle_retry(const std::filesystem::path& directory) {
     const auto retry = tier.write_back_retry_at();
     require(retry.has_value(), "a refused write-back names its next attempt");
     require(*retry - std::chrono::steady_clock::now() < std::chrono::seconds(1), "the next attempt is near");
-    if (std::chrono::steady_clock::now() < *retry) { require(!tier.write_back_due(), "not due before its time"); }
+    // Due first, then the clock: a due answer read its clock no later than this one, so it must be past the retry
+    // (the other order fails when this thread loses the CPU between its clock reading and the tier's).
+    const bool due_early = tier.write_back_due();
+    require(!due_early || std::chrono::steady_clock::now() >= *retry, "not due before its time");
     index.unpin_snapshot(a.endpoint);
     index.unpin_snapshot(b.endpoint);
     std::this_thread::sleep_until(*retry + std::chrono::milliseconds(1));

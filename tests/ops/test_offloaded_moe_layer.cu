@@ -832,9 +832,12 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             };
             // Other processes on the machine can stall one measurement (CTest runs this entry alone:
             // beside other GPU tests no bound of a few milliseconds holds); a slow idle wait slows every
-            // one. The service check passes when any of three measurements meets the bound.
+            // one. The service check passes when any of six measurements meets the bound; only failing
+            // attempts take the extra time. More attempts ride out a passing load, not a lasting one: all
+            // three failed (70-230 ms spikes) while another program's conversion and a build ran
+            // (2026-11-18), and such a load still fails it.
             bool within = false;
-            for (int attempt = 0; attempt < 3 && !within; ++attempt) {
+            for (int attempt = 0; attempt < 6 && !within; ++attempt) {
                 // Warm until two consecutive calls agree within 10 %: a configuration's first calls may still
                 // load kernels or fill frames (a GPU-only E=96 T=10 call took 73-82 ms as its second call and
                 // 5 ms after, which made the GPU's own idle cost -71 ms). The busy time is the fastest of three.

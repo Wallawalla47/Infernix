@@ -544,12 +544,19 @@ void test_router() {
     auto a2 = router.acquire("a", nullptr, refusal);
     check(a2 && a2->instance() == a1->instance(), "a request for the loaded model is admitted at once");
 
+    // Waits (up to 30 s) for what another thread does next, rather than sleeping a fixed time a loaded machine can
+    // outlast before that thread runs.
+    const auto settle = [](const auto& done) {
+        const auto until = std::chrono::steady_clock::now() + 30s;
+        while (!done() && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(2ms); }
+        return done();
+    };
     std::shared_ptr<Router::Lease> b, a3;
     std::thread wants_b([&] { b = router.acquire("b", nullptr, refusal); });
-    std::this_thread::sleep_for(300ms);
+    check(settle([&] { return router.pending_model() == "b"; }), "the switch is asked for");
     // A request for the loaded model arriving after the switch was asked for waits its turn.
     std::thread wants_a([&] { a3 = router.acquire("a", nullptr, refusal); });
-    std::this_thread::sleep_for(300ms);
+    std::this_thread::sleep_for(300ms); // time for a wrongly admitted request or an early load to show
     check(snapshot() == std::vector<std::string>{"load:a"}, "the switch waits for running requests (drain)");
     check(router.pending_model() == "b", "the pending switch is reported");
     a1.reset();
@@ -588,9 +595,11 @@ void test_router() {
     auto held = router.acquire("a", nullptr, refusal);
     check(held != nullptr, "the model loads again after a failure");
     router.request_load("d", true);
-    std::this_thread::sleep_for(700ms);
-    const std::vector<std::string> forced = snapshot();
-    check(!forced.empty() && forced.back() == "load:d", "a forced load does not wait for running requests");
+    check(settle([&] {
+              const std::vector<std::string> forced = snapshot();
+              return !forced.empty() && forced.back() == "load:d";
+          }),
+          "a forced load does not wait for running requests");
     held.reset();
 
     // Restart (unload, then load the same model) loads it again rather than keeping the old instance.

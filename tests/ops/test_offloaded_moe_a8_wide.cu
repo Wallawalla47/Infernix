@@ -37,6 +37,7 @@
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
+#include "ops/miss_service_count.h"
 #include "ops/op_tester.h"
 #include "ggml_block_oracle.h"
 
@@ -542,7 +543,7 @@ std::vector<std::uint16_t> layer_call(Bank& bank, const std::vector<float>& logi
     Tensor out(d_out, DType::BF16, {H, entries});
     infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
     cuda_check(cudaDeviceSynchronize(), "moe_experts");
-    cpu_served = config.cpu && bank.service && bank.service->served_experts() > served;
+    cpu_served = config.cpu && bank.service && infernix::test::served_experts_past(*bank.service, served) > served;
     std::vector<std::uint16_t> got(static_cast<std::size_t>(H) * entries);
     cuda_check(cudaMemcpy(got.data(), d_out, bytes, cudaMemcpyDeviceToHost), "cudaMemcpy");
     cudaFree(d_out);
