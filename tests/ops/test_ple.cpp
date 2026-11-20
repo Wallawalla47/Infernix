@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -114,7 +115,8 @@ void test_embed(int width, int heads, int columns, std::uint32_t seed) {
 
 // The BF16 P12 row's bytes for `words` at `base`: W sign-and-mantissa bytes, W/2 exponent-offset
 // nibbles, the base and the escape count, then each escaped value's (column, BF16 bits) in column
-// order. The test builds the rows it needs; decode_p12_row reads them independently of the kernel.
+// order. The test packs the rows from known BF16 words, and those words are the oracle: the codec is
+// lossless, so the kernel must return each one bit for bit.
 void pack_p12_row(const std::uint16_t* words, int width, int base, std::vector<std::uint8_t>& row) {
     row.assign(static_cast<std::size_t>(width) + width / 2 + 16, 0);
     const int base_at = width + width / 2;
@@ -125,6 +127,7 @@ void pack_p12_row(const std::uint16_t* words, int width, int base, std::vector<s
         const int q              = static_cast<int>((bits >> 7) & 0xFFU) - base;
         row[j]                   = static_cast<std::uint8_t>(((bits >> 8) & 0x80U) | (bits & 0x7FU));
         if (q < 0 || q > 14) {
+            if (escapes == 4) { throw std::invalid_argument("a BF16 P12 row holds at most 4 escapes"); }
             std::uint8_t* escape = row.data() + base_at + 2 + 3 * escapes;
             escape[0]            = static_cast<std::uint8_t>(j);
             escape[1]            = static_cast<std::uint8_t>(bits & 0xFFU);
@@ -136,25 +139,7 @@ void pack_p12_row(const std::uint16_t* words, int width, int base, std::vector<s
     row[base_at + 1] = static_cast<std::uint8_t>(escapes);
 }
 
-std::uint16_t decode_p12_row(const std::uint8_t* row, int width, int j) {
-    const std::uint8_t code = row[j];
-    const unsigned q        = (row[width + j / 2] >> (4 * (j & 1))) & 15U;
-    if (q < 15U) {
-        const unsigned base = row[width + width / 2];
-        return static_cast<std::uint16_t>(((code & 0x80U) << 8U) | ((base + q) << 7U) | (code & 0x7FU));
-    }
-    const unsigned escapes   = row[width + width / 2 + 1];
-    const std::uint8_t* list = row + width + width / 2 + 2;
-    for (unsigned e = 0; e < escapes; ++e) {
-        if (list[3 * e] == j) {
-            return static_cast<std::uint16_t>(static_cast<unsigned>(list[3 * e + 1]) |
-                                              (static_cast<unsigned>(list[3 * e + 2]) << 8U));
-        }
-    }
-    return 0;
-}
-
-// ple_embed_bf16_p12 against decode_p12_row: zeros, negative zero, subnormals, an in-window row, rows
+// ple_embed_bf16_p12 against the packed words: zeros, negative zero, subnormals, an in-window row, rows
 // with one and four escapes, a row whose sign and every mantissa bit must survive, and random rows.
 void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) {
     constexpr int kSpecialRows = 7; // before the random fill: zero, -0, subnormal, window, 1/4 escapes, sign
@@ -167,6 +152,8 @@ void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) 
     std::vector<std::uint8_t> rows(static_cast<std::size_t>(row_bytes) * heads * columns, 0);
     std::mt19937 rng(seed);
     std::vector<std::uint16_t> words(width);
+    const std::size_t elements = static_cast<std::size_t>(width) * heads;
+    std::vector<std::uint16_t> want(elements * columns); // out[h * W + j, t]: row (t, h)'s word j
     int filled = 0;
     const auto put = [&](int base) {
         const int t = filled / heads, h = filled % heads;
@@ -174,6 +161,7 @@ void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) 
         std::vector<std::uint8_t> row;
         pack_p12_row(words.data(), width, base, row);
         std::memcpy(rows.data() + static_cast<std::size_t>(t * heads + h) * row_bytes, row.data(), row_bytes);
+        std::copy(words.begin(), words.end(), want.begin() + static_cast<std::ptrdiff_t>(t * elements + h * width));
     };
     std::fill(words.begin(), words.end(), std::uint16_t{0}); // all zeros, base 0
     put(0);
@@ -213,7 +201,6 @@ void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) 
     expect(filled == heads * columns, label + " fills every row");
 
     DeviceBuffer d_rows = to_device(rows);
-    const std::size_t elements = static_cast<std::size_t>(width) * heads;
     GuardedDeviceBuffer d_out(elements * columns * sizeof(std::uint16_t));
     d_out.fill(0xFF);
     Tensor t_rows(d_rows.p, DType::U8, {row_bytes, heads, columns});
@@ -221,16 +208,6 @@ void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) 
     ops::ple_embed_bf16_p12(t_rows, t_out, nullptr);
     cuda_synchronize();
 
-    std::vector<std::uint16_t> want(elements * columns);
-    for (int t = 0; t < columns; ++t) {
-        for (int h = 0; h < heads; ++h) {
-            const std::uint8_t* row = rows.data() + static_cast<std::size_t>(t * heads + h) * row_bytes;
-            for (int j = 0; j < width; ++j) {
-                want[static_cast<std::size_t>(t) * elements + static_cast<std::size_t>(h) * width + j] =
-                    decode_p12_row(row, width, j);
-            }
-        }
-    }
     g_failures += verify_exact(label.c_str(), from_device<std::uint16_t>(d_out.data(), want.size()), want);
     g_failures += d_out.verify_guards(label);
 }
