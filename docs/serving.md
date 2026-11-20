@@ -2005,22 +2005,38 @@ log-likelihood requests of evaluation harnesses such as lm-evaluation-harness.
 An unknown field is refused with `400` and `code: "unknown_field"`. Prompt plus continuation must fit
 the server's `--max-context` (`context_length_exceeded`).
 
+A request (Qwen3.8-Flash-Next, NVIDIA NVFP4-QAD):
+
+```json
+{"model": "pr1test", "apply_chat_template": true, "messages": [{"role": "user", "content": "Say hello."}],
+ "enable_thinking": false, "continuation": " Hello there", "top_k": 2}
+```
+
+and its response:
+
 ```json
 {
   "object": "score",
-  "model": "flash-next",
+  "model": "pr1test",
   "chat_template_applied": true,
   "enable_thinking": false,
   "top_k": 2,
   "max_top_k": 256,
   "positions": [
-    {"token_id": 22, "token": " Sure", "logprob": -0.41,
-     "top_logprobs": [{"token_id": 22, "token": " Sure", "logprob": -0.41},
-                      {"token_id": 40, "token": " I", "logprob": -1.32}]}
+    {"token_id": 21251, "token": " Hello", "logprob": -9.647107124328613,
+     "top_logprobs": [{"token_id": 9419, "token": "Hello", "logprob": -0.0006939148879610002},
+                      {"token_id": 12675, "token": "Hi", "logprob": -8.805469512939453}]},
+    {"token_id": 1017, "token": " there", "logprob": -5.637060165405273,
+     "top_logprobs": [{"token_id": 0, "token": "!", "logprob": -0.01845814660191536},
+                      {"token_id": 248046, "token": "<|im_end|>", "logprob": -4.612805366516113}]}
   ],
-  "usage": {"prompt_tokens": 28, "continuation_tokens": 1}
+  "usage": {"prompt_tokens": 15, "continuation_tokens": 2}
 }
 ```
+
+The continuation's own tokens are scored whatever their rank. Here the model's first choice after
+the generation prompt is `Hello` with no leading space, so the continuation's ` Hello` scores −9.65:
+write the continuation as the text that follows the prompt, boundary spacing included.
 
 `enable_thinking` is the template's thinking switch as rendered (`null` without a template).
 Repeating a request returns byte-identical output.
