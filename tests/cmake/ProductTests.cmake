@@ -61,6 +61,10 @@ infernix_add_test(infernix_decide_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decide_schema.cpp"
   LIBRARIES infernix_serve)
 
+infernix_add_test(infernix_score_schema_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_score_schema.cpp"
+  LIBRARIES infernix_serve)
+
 infernix_add_test(infernix_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES infernix_serve)

@@ -122,6 +122,7 @@ private:
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_decide(const httplib::Request& req, httplib::Response& res);
+    void handle_score(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);
     void handle_response_input_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_response_get(const httplib::Request& req, httplib::Response& res);
