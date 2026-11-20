@@ -413,13 +413,18 @@ void test_library() {
     const auto own  = parse_ngram_header("own.ngram", volume_header(160, nvidia, 0, 0));
     const auto iq4  = parse_ngram_header("iq4.ngram", volume_header(90, other, 0, 0));
     const auto bf16 = parse_ngram_header("bf16.ngram", volume_header(320, other, 0, 3));
+    const auto q8   = parse_ngram_header("q8.ngram", volume_header(170, other, 0, 5));
+    const auto p12  = parse_ngram_header("p12.ngram", volume_header(256, other, 0, 6));
     const auto fp8_unscaled = parse_ngram_header("fp8.ngram", volume_header(160, other, 0, 1));
-    check(own && iq4 && bf16 && fp8_unscaled, "n-gram headers parse");
+    check(own && iq4 && bf16 && q8 && p12 && fp8_unscaled, "n-gram headers parse");
     check(!parse_ngram_header("x", std::string(68, 'x')), "other files are not n-gram volumes");
-    if (own && iq4 && bf16 && fp8_unscaled) {
-        check(iq4->format == "iq4_nl" && bf16->format == "bf16" && own->format == "fp8", "formats from tag or row size");
+    if (own && iq4 && bf16 && q8 && p12 && fp8_unscaled) {
+        check(iq4->format == "iq4_nl" && bf16->format == "bf16" && q8->format == "q8_0" &&
+                  p12->format == "bf16_p12" && own->format == "fp8",
+              "formats from tag or row size");
         check(ngram_rank(model, *own) == 0, "the artifact's own volume ranks first");
-        check(ngram_rank(model, *iq4) == 3 && ngram_rank(model, *bf16) == 4, "IQ4_NL before BF16");
+        check(ngram_rank(model, *iq4) == 3 && ngram_rank(model, *bf16) == 6, "IQ4_NL before BF16");
+        check(ngram_rank(model, *q8) == 4 && ngram_rank(model, *p12) == 5, "Q8_0 and BF16 P12 before BF16");
         check(!ngram_rank(model, *fp8_unscaled), "an FP8 volume without a scale serves only its own artifact");
     }
 
