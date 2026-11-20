@@ -802,7 +802,7 @@ NGRAM_SCALE_OFFSET = NGRAM_HEADER.size
 # multiplier (bits; 0 for other formats). Volumes published before stay unchanged.
 NGRAM_FORMAT = struct.Struct("<H")
 NGRAM_FORMAT_OFFSET = NGRAM_SCALE_OFFSET + NGRAM_SCALE.size
-NGRAM_FORMAT_CODES = {"fp8_e4m3fn": 1, "iq4_nl": 2, "bf16": 3, "nvfp4": 4, "q8_0": 5}
+NGRAM_FORMAT_CODES = {"fp8_e4m3fn": 1, "iq4_nl": 2, "bf16": 3, "nvfp4": 4, "q8_0": 5, "bf16_p12": 6}
 NGRAM_NVFP4_SCALE = struct.Struct("<I")
 NGRAM_NVFP4_SCALE_OFFSET = NGRAM_FORMAT_OFFSET + NGRAM_FORMAT.size
 
