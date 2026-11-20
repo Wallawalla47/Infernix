@@ -2152,10 +2152,11 @@ tok/s (older build) against 72 aggregate for plain C = 2.
   expert banks, which are only read at load.
 - The artifact's `ngram_table` names the row format: `fp8_e4m3fn` (above), `iq4_nl` (the GGUF
   import, 90 B rows), `q8_0` (a Q8_0 GGUF's or a .basalt pack's rows verbatim, 170 B, 24 per block;
-  `ops::ple_embed_q8_0` decodes them exactly) or `bf16` (Qwen's unquantized table, 320 B rows, 12 per block, 109.2 GB, no
-  scale parameter). FP8 F-A binds `bf16`: `--ngram-reuse` with a BF16 volume checks that sampled
-  rows quantize to the checkpoint's FP8 codes by ModelOpt's per-tensor rule. A BF16 volume may also
-  replace a quantized table at run time (`resolve_ngram_volume`); nothing replaces a `bf16` table.
+  `ops::ple_embed_q8_0` decodes them exactly), `bf16` (Qwen's unquantized table, 320 B rows, 12 per block, 109.2 GB, no
+  scale parameter) or `nvfp4` (§12.5). FP8 F-A binds `bf16`: `--ngram-reuse` with a BF16 volume checks that sampled
+  rows quantize to the checkpoint's FP8 codes by ModelOpt's per-tensor rule. A volume of any format may
+  replace the artifact's own table at run time (`resolve_ngram_volume`, §12.5), including BF16 P12, which no
+  artifact binds.
 
 ### 12.3 Host-hashed row cache and gated reads
 
@@ -2256,10 +2257,11 @@ and a trap names no site (#48's `cudaErrorIllegalInstruction`). The GGUF token e
 
 ### 12.5 Row formats and RAM residency (2026-10-11)
 
-Four row formats share the volume layout of §12.2 and the read paths above; the engine reads the
+Six row formats share the volume layout of §12.2 and the read paths above; the engine reads the
 format from the volume header's format tag (byte 62, written since 2026-10-19: 1 FP8, 2 IQ4_NL,
-3 BF16, 4 NVFP4) or, for a volume written before the tag, from its row size (`resolve_ngram_volume`,
-`config.h`). NVFP4 rows have IQ4_NL's 90 bytes, so an NVFP4 volume always carries the tag:
+3 BF16, 4 NVFP4, 5 Q8_0, 6 BF16 P12) or, for a volume written before the tag, from its row size
+(`resolve_ngram_volume`, `config.h`). NVFP4 rows have IQ4_NL's 90 bytes, so an NVFP4 volume always
+carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
 
 | Format | Row | Rows per 4 KiB block | Volume | Source |
 |---|---:|---:|---:|---|
@@ -2267,11 +2269,25 @@ format from the volume header's format tag (byte 62, written since 2026-10-19: 1
 | IQ4_NL (llama.cpp blocks: fp16 d, 16 nibble bytes) | 90 B | 45 | 29.1 GB (27.1 GiB) | the GSQ-RCO GGUF's shard 2, byte for byte |
 | BF16 | 320 B | 12 | 109.2 GB | Qwen's unquantized table (`tools/flash_next/ngram_bf16.py`) |
 | NVFP4 (80 E2M1 code bytes, 10 E4M3FN block scales; one FP32 multiplier) | 90 B | 45 | 29.1 GB | NVIDIA FP4-Local's table (recipe D, §6.1.2), byte for byte |
+| Q8_0 (blocks of 32: fp16 scale, 32 int8 codes) | 170 B | 24 | 54.6 GB | a Q8_0 GGUF's or a .basalt pack's table, byte for byte |
+| BF16 P12 (sign-and-mantissa bytes, 4-bit exponent offsets, base, up to 4 escapes) | 256 B | 16 | 81.9 GB | the BF16 volume repacked losslessly (`tools/flash_next/ngram_p12.py`); run time only |
 
 - **IQ4_NL.** `ple_embed` decodes each value as `bf16_rn(fl32(d) · kvalue)`: the product is exact in
   FP32 and rounds once at the BF16 boundary the FP8 rows have. Nibble order is llama.cpp's (elements
   0-15 low nibbles, 16-31 high). `ngram_scale` does not apply.
 - **BF16.** The PLE takes the rows as its embedding with no decode.
+- **BF16 P12 (2026-11-20, PR #72).** A row of W values is W sign-and-mantissa bytes (sign << 7 |
+  mantissa7), W/2 bytes of 4-bit exponent offsets q from the row's base b, then b, the escape count K
+  (0-4) and K 3-byte escapes (column, BF16 bits) in a 16-byte tail; q = 15 marks an escaped value.
+  The packer picks the b whose window [b, b+14] holds the most of the row's exponents (the lowest on a
+  tie, so zeros and subnormals sit in the window at b = 0); every row of Qwen's table needs at most 3
+  escapes. `ple_embed_bf16_p12` writes each value's exact BF16 bits, so the embedding equals the BF16
+  volume's and every route gives the BF16 volume's output; it costs one decode launch per PLE call that
+  the BF16 rows, read in place, do not. Each W must be even and at most 255 (the escape column is a
+  byte); Flash-Next's 160 gives 256-byte rows. No artifact binds the format (`config.cpp` refuses it,
+  `--ngram-reuse` refuses such a volume), so the volume serves only as a run-time replacement. A missed
+  row is one 4 KiB read in every format (§12.3), so against the BF16 volume it saves disk space and
+  resident RAM, not reads.
 - **NVFP4 (2026-10-19).** `ple_embed_nvfp4` decodes each value as `bf16_rn(e2m1 · e4m3 · m)`, the
   exact product (at most 30 significant bits) rounded once (an FMA residual decides the FP32 product's
   BF16 ties); element 2i is byte i's low nibble, ModelOpt's packing. The multiplier `m` (ModelOpt's
