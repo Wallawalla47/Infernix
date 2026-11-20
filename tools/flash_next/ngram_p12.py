@@ -33,9 +33,9 @@ volume. Only Python 3 and numpy are used (no torch, no checkpoint).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import struct
 import sys
@@ -225,6 +225,12 @@ def decode_rows(rows: np.ndarray, width: int) -> np.ndarray:
     if not np.all(hit[escaped]):
         raise ValueError("a BF16 P12 row has an escaped column with no escape entry")
     return out
+
+
+def packed_volume_id(source_id: bytes) -> bytes:
+    """The packed volume's id, which follows from its source's: every repack of one BF16 volume is the
+    same file byte for byte (a local repack can be checked against a published one by its hash)."""
+    return hashlib.sha256(b"infernix bf16_p12 v1" + bytes(source_id)).digest()[:16]
 
 
 def write_volume(source: Volume, width: int, out: Path, volume_id: bytes, progress=None) -> dict:
@@ -440,7 +446,7 @@ def main() -> None:
         width = source.row_bytes // 2
         if width > 255 or width % 2:
             parser.error(f"{args.source}: a BF16 P12 row needs an even width up to 255, this one is {width}")
-        volume_id = os.urandom(16)
+        volume_id = packed_volume_id(source.volume_id)
         printed = [0]
 
         def progress(done: int, total: int) -> None:
