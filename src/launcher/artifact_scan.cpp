@@ -84,6 +84,7 @@ std::uint32_t row_bytes_for(std::string_view format, std::uint32_t width) {
     if (format == "fp8") { return width; }
     if (format == "bf16") { return 2 * width; }
     if (format == "iq4_nl") { return width % 32 == 0 ? width / 32 * 18 : 0; }
+    if (format == "q8_0") { return width % 32 == 0 ? width / 32 * 34 : 0; }
     if (format == "nvfp4") { return width % 16 == 0 ? width / 2 + width / 16 : 0; }
     if (format == "bf16_p12") { return width % 2 == 0 && width <= 255 ? width + width / 2 + 16 : 0; }
     return 0;
@@ -451,8 +452,10 @@ std::optional<int> ngram_rank(const ScannedModel& model, const ScannedNgramVolum
     if (format == "fp8") { return 1; }
     if (format == "nvfp4") { return 2; }
     if (format == "iq4_nl") { return 3; }
-    if (format == "bf16_p12") { return 4; }
-    return 5;
+    if (format == "q8_0") { return 4; }
+    if (format == "bf16_p12") { return 5; }
+    if (format == "bf16") { return 6; }
+    return 6;
 }
 
 LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int depth) {

@@ -125,7 +125,7 @@ struct LibraryScan {
 [[nodiscard]] LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int depth);
 
 // The rank of an n-gram volume for a model (lower is better): its own table first, then FP8, NVFP4,
-// IQ4_NL, BF16 P12 and BF16; nullopt when the model cannot read it.
+// IQ4_NL, Q8_0, BF16 P12 and BF16; nullopt when the model cannot read it.
 [[nodiscard]] std::optional<int> ngram_rank(const ScannedModel& model, const ScannedNgramVolume& volume);
 
 // Parses one artifact entry's directory JSON into a model or drafter (exposed for tests). `path` is
