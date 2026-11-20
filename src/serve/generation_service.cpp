@@ -3,6 +3,7 @@
 
 #include "product/media_acquire/acquire.h"
 #include "serve/documents.h"
+#include "serve/request_validation.h"
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -416,6 +417,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     // The lossless route runs no fast path.
     engine_options.fast_paths                    = options.fast_paths && !options.lossless;
     engine_options.lossless                      = options.lossless;
+    if (options.causal_scoring) { engine_options.purpose = infernix::EnginePurpose::CausalScoring; }
     engine_options.fast_path_candidates          = options.fast_path_candidates;
     engine_options.fast_path_exclusions          = options.fast_path_exclusions;
     engine_options.kv_cache                  = options.kv_cache;
@@ -807,7 +809,80 @@ void GenerationService::schedule_next_turn(PreparedRequest& prepared,
     engine_->prefill_next_turn(std::move(conversation));
 }
 
+ScoreOutcome GenerationBackend::score(const ScoreRequest&) {
+    throw ApiException(ApiError{.status  = 501,
+                                .type    = "not_supported",
+                                .message = "this server does not score: start infernix-serve with --causal-scoring",
+                                .code    = "scoring_not_enabled"});
+}
+
+ScoreOutcome GenerationService::score(const ScoreRequest& request) {
+    if (engine_->options().purpose != infernix::EnginePurpose::CausalScoring) {
+        return GenerationBackend::score(request);
+    }
+    ScoreOutcome outcome;
+    outcome.chat_template_applied = request.apply_chat_template;
+    outcome.top_k                 = request.top_k;
+    std::vector<infernix::TokenId> tokens;
+    try {
+        if (request.apply_chat_template) {
+            // The prompt /v1/chat/completions would prefill for the same turns, generation prompt
+            // included: the same semantics, translation and Engine::prepare.
+            const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request.chat, options_);
+            outcome.enable_thinking                 = semantics.enable_thinking;
+            infernix::PromptInput input = to_prompt_input(request.chat, semantics, [](const ContentPart&) -> infernix::OwnedMedia {
+                throw std::invalid_argument("scoring takes text only");
+            });
+            const infernix::PreparedPrompt prepared = engine_->prepare(std::move(input));
+            tokens.assign(prepared.token_ids().begin(), prepared.token_ids().end());
+        } else {
+            tokens = engine_->tokenize_text(request.prompt);
+        }
+    } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {
+        throw_request_error(exception, "structured_outputs.grammar", {}, queue_retry_after_seconds());
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_prompt");
+    }
+    if (tokens.empty()) { bad_request("the prompt encodes to no tokens", "prompt", "empty_prompt"); }
+    outcome.prompt_tokens                       = static_cast<std::uint32_t>(tokens.size());
+    const std::vector<infernix::TokenId> scored = engine_->tokenize_text(request.continuation);
+    if (scored.empty()) {
+        bad_request("the continuation encodes to no tokens", "continuation", "continuation_required");
+    }
+    tokens.insert(tokens.end(), scored.begin(), scored.end());
+    if (tokens.size() > engine_->options().max_context) {
+        bad_request("prompt and continuation are " + std::to_string(tokens.size()) +
+                        " tokens, past the scoring window of " +
+                        std::to_string(engine_->options().max_context),
+                    "continuation", "context_length_exceeded");
+    }
+    infernix::ScoreOptions score_options;
+    score_options.top_k = request.top_k;
+    infernix::ScoreResult result;
+    try {
+        result = engine_->score_tokens(std::move(tokens), outcome.prompt_tokens, score_options);
+    } catch (const std::invalid_argument& exception) {
+        bad_request(exception.what(), {}, "invalid_score_request");
+    }
+    const auto text = [this](infernix::TokenId id) {
+        return engine_->detokenize_bytes(std::span<const infernix::TokenId>(&id, 1));
+    };
+    outcome.positions.reserve(scored.size());
+    for (std::size_t i = 0; i < scored.size(); ++i) {
+        ScoredPosition position{.id = scored[i], .text = text(scored[i]), .logprob = result.logprobs[i], .top = {}};
+        position.top.reserve(request.top_k);
+        for (std::size_t k = 0; k < request.top_k; ++k) {
+            const std::size_t at = i * request.top_k + k;
+            position.top.push_back(ScoredAlternative{
+                .id = result.top_ids[at], .text = text(result.top_ids[at]), .logprob = result.top_logprobs[at]});
+        }
+        outcome.positions.push_back(std::move(position));
+    }
+    return outcome;
+}
+
 void GenerationService::warmup() {
+    if (engine_->options().purpose == infernix::EnginePurpose::CausalScoring) { return; }
     const auto generate = [this](int max_tokens, bool ignore_eos) {
         GenerationRequest request;
         ChatTurn turn;

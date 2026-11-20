@@ -6,6 +6,7 @@
 #include "infernix/engine.h"
 #include "serve/prefix_miss.h"
 #include "serve/request.h"
+#include "serve/score.h"
 #include "serve/serve_options.h"
 
 #include <algorithm>
@@ -206,6 +207,10 @@ public:
     virtual bool admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
                        std::chrono::steady_clock::time_point until) const = 0;
 
+    // POST /v1/score (serve/score.h): teacher-forced scoring on a causal-scoring Engine. Not pure,
+    // so a backend that does not score refuses with scoring_not_enabled.
+    [[nodiscard]] virtual ScoreOutcome score(const ScoreRequest& request);
+
     // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
     virtual void stop() noexcept = 0;
 
@@ -290,6 +295,9 @@ public:
     bool admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
                std::chrono::steady_clock::time_point until) const override;
 
+    [[nodiscard]] ScoreOutcome score(const ScoreRequest& request) override;
+
+    // Generates, so a causal-scoring Engine (ServeOptions::causal_scoring) skips it.
     void warmup();
 
     void stop() noexcept override { engine_->stop(); }
