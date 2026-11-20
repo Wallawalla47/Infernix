@@ -1465,6 +1465,8 @@ void ExpertOffload::check_error(const std::string& model) {
                                : code == moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
                                : code == moe::kErrorFetchSilent  ? "the SSD expert tier's read agent stopped answering"
                                : code == moe::kErrorDownStalled  ? "an expert's down pass waited past its bound for its h"
+                               : code == moe::kErrorHostStalled  ? "the CPU expert service did not answer within its bound"
+                               : code == moe::kErrorFetchStalled ? "the SSD expert tier's read agent did not land a record within its bound"
                                                                  : "an expert record could not be read (" +
                                                                      std::generic_category().message(static_cast<int>(code)) + ")";
     throw RecoverableExecutionError(model + " layer " + std::to_string(value >> 16U) + ": " + what);

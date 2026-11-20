@@ -4296,6 +4296,8 @@ public:
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the CPU expert service stopped answering"
                                    : code == ops::offloaded_moe::kErrorFetchSilent  ? "the SSD expert tier's read agent stopped answering"
                                    : code == ops::offloaded_moe::kErrorDownStalled  ? "an expert's down pass waited past its bound for its h"
+                                   : code == ops::offloaded_moe::kErrorHostStalled  ? "the CPU expert service did not answer within its bound"
+                                   : code == ops::offloaded_moe::kErrorFetchStalled ? "the SSD expert tier's read agent did not land a record within its bound"
                                                                                      : "an expert record could not be read (" +
                                                                                        std::generic_category().message(static_cast<int>(code)) + ")";
         throw runtime::RecoverableExecutionError("Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) + ": " + what);

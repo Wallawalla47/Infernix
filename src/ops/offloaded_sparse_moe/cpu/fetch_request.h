@@ -29,6 +29,8 @@ inline constexpr std::uint32_t kErrorUnservedRecord = 0xFF01; // an SSD-only exp
 inline constexpr std::uint32_t kErrorHostSilent     = 0xFF02; // the CPU service's heartbeat stopped during a wait
 inline constexpr std::uint32_t kErrorFetchSilent    = 0xFF03; // the fetch responder's heartbeat stopped during a wait
 inline constexpr std::uint32_t kErrorDownStalled    = 0xFF04; // a narrow down pass's job h never became ready
+inline constexpr std::uint32_t kErrorHostStalled    = 0xFF05; // the CPU service kept beating but did not answer in time
+inline constexpr std::uint32_t kErrorFetchStalled   = 0xFF06; // the fetch responder kept beating but did not land in time
 
 // How long a narrow expert down pass waits for its own job's h without progress (GPU time): the 122B's A16 ring and
 // the narrow routes' per-job waits. The h comes from gate/up work already running (taken before any down task, or a
@@ -46,6 +48,17 @@ inline constexpr std::uint64_t kDownReadyTimeoutNs = 10000000000ULL; // kHeartbe
 // FP8 requests on a healthy service (2026-10-16: 8 of 34 SSD-tier runs at ~2 GiB available).
 inline constexpr std::uint64_t kHeartbeatTimeoutNs = 10000000000ULL;
 static_assert(kDownReadyTimeoutNs == kHeartbeatTimeoutNs, "the down-wait bound is the heartbeat's");
+
+// A wait on a host that keeps beating gives up once it has lasted this many heartbeat bounds in all (GPU time;
+// MoeExpertSource::heartbeat_timeout_ns, so 60 s by default), whatever the heartbeat does: the CPU wait
+// (kErrorHostStalled) and a fetch-served copy's wait for its record (kErrorFetchStalled). A live host answers in
+// milliseconds to a few seconds (a CPU job of a wide prefill call, SSD reads under RAM pressure); without this bound a
+// host thread that beats but can never answer (a lost request, a slot it waits for that only the waiting device would
+// free) spins the GPU forever: on 2026-11-20 a Dense8 decode on the SSD tier's RAM slots held an RTX 5090 at full use
+// for over ten minutes with nothing logged, and ending the process then hung the display driver until the PC was
+// restarted. The round fails instead, through the call's error word. A multiple of the heartbeat bound, so a silent
+// host is always reported as silent, not as stalled.
+inline constexpr std::uint64_t kHostAnswerBoundFactor = 6;
 
 struct alignas(64) FetchRequest {
     std::uint32_t sequence;

@@ -71,6 +71,8 @@ IdleChecks g_idle_checks = IdleChecks::kAll;
 // use a short one.
 constexpr std::uint64_t kTestHeartbeatTimeoutNs   = moe::kHeartbeatTimeoutNs;
 constexpr std::uint64_t kSilentHeartbeatTimeoutNs = 1000000000ULL;
+// The stalled-host cases (a host that keeps beating but never answers) wait their whole answer bound,
+// moe::kHostAnswerBoundFactor heartbeat bounds: they take the silent cases' short heartbeat bound too.
 
 void check(bool ok, const char* what) {
     if (!ok) {
@@ -122,11 +124,11 @@ struct CopiedRecords final : moe::RecordProvider {
 // The SSD tier's agent in miniature (design §19.3.7): answers each fetch request with copies of the
 // bank's records written into a ring of mapped slots, landing them in swapped pairs (record i + 1
 // before record i) and reusing a slot only once the device has consumed its previous record.
-// Modes: answer, fail the request at record fail_at (EIO), or stay silent (acknowledge, then
-// neither land nor beat).
+// Modes: answer, fail the request at record fail_at (EIO), stay silent (acknowledge, then
+// neither land nor beat), or stall (acknowledge and keep beating, but never land).
 class Responder {
 public:
-    enum class Mode { kAnswer, kFail, kSilent };
+    enum class Mode { kAnswer, kFail, kSilent, kStalled };
     static constexpr std::uint32_t kRing = 72; // more than the largest pass (64 jobs) plus one swap
 
     Responder(const std::uint8_t* bank, std::size_t stride) : bank_(bank), stride_(stride) {
@@ -163,7 +165,7 @@ private:
             requests_.fetch_add(1);
             const auto count = static_cast<std::uint32_t>(request.experts.size());
             count_.store(count);
-            if (mode == Mode::kSilent) { continue; }
+            if (mode == Mode::kSilent || mode == Mode::kStalled) { continue; }
             for (std::uint32_t pair = 0; pair < count; pair += 2) {
                 bool failed = false;
                 for (const std::uint32_t i : {pair + 1, pair}) {
@@ -711,6 +713,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                        .fetch = Responder::Mode::kFail, .fetched = true},
                                 Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2,
                                        .fetch = Responder::Mode::kSilent, .fetched = true},
+                                Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2,
+                                       .fetch = Responder::Mode::kStalled, .fetched = true},
                                 // Split staging (forked calls): alone, with CPU jobs, with landings, with
                                 // a host table, with fetched records (copied by both launches, consumed
                                 // after the second), with fetched records and CPU jobs (the fused route
@@ -779,6 +783,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         // The long-quiet modes (3, 4: five calls after 1.2 s each) test the service's long waits, which no layer
         // shape changes: they run on each route's decode call (one column). On all 41 shapes they took ~750 s.
         if (config.idle >= 3 && columns != 1) { continue; }
+        // The stalled fetch host (each call waits out its answer bound, six heartbeat bounds) tests a bound that no
+        // layer shape changes: it runs on the decode calls (one column). On all 41 shapes it added ~250 s.
+        if (config.fetch == Responder::Mode::kStalled && columns != 1) { continue; }
         const int slots = config.slots;
         // A fresh dispatch: a fetch call reorders its jobs (fetch-served last).
         infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
@@ -797,7 +804,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         source.narrow_a16           = narrow;
         source.wide_a16             = wide;
         source.a4_shared_input      = !a16 && shared_input;
-        source.heartbeat_timeout_ns = config.fetch == Responder::Mode::kSilent ? kSilentHeartbeatTimeoutNs : kTestHeartbeatTimeoutNs;
+        source.heartbeat_timeout_ns = config.fetch == Responder::Mode::kSilent || config.fetch == Responder::Mode::kStalled
+                                          ? kSilentHeartbeatTimeoutNs
+                                          : kTestHeartbeatTimeoutNs;
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
             source.l2_warm.ptr[0]   = d_frame_base;
@@ -984,10 +993,16 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             const bool published = responder.requests() > requests_before;
             const std::uint32_t count = published ? responder.count() : 0;
             if (config.fetch != Responder::Mode::kAnswer) {
-                // The wait ends without a trap; the word names the layer and the host's errno or the silence.
-                const std::uint32_t want = config.fetch == Responder::Mode::kFail ? EIO : moe::kErrorFetchSilent;
+                // The wait ends without a trap; the word names the layer and the host's errno, the silence, or the
+                // answer bound passed while the host kept beating.
+                const std::uint32_t want = config.fetch == Responder::Mode::kFail     ? EIO
+                                           : config.fetch == Responder::Mode::kSilent ? moe::kErrorFetchSilent
+                                                                                      : moe::kErrorFetchStalled;
                 std::printf("E=%d T=%d k=%d staging slots %2d (fetch, %s): %u records requested, error word %#x\n",
-                            experts, columns, top_k, slots, config.fetch == Responder::Mode::kFail ? "failing host" : "silent host",
+                            experts, columns, top_k, slots,
+                            config.fetch == Responder::Mode::kFail     ? "failing host"
+                            : config.fetch == Responder::Mode::kSilent ? "silent host"
+                                                                       : "stalled host",
                             count, error);
                 if (count > (config.fetch == Responder::Mode::kFail ? 5U : 0U)) {
                     check(error == (static_cast<std::uint32_t>(kFetchLayer) << 16U | want),
@@ -1068,11 +1083,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             cuda_check(cudaMemset(d_frame_base + static_cast<std::size_t>(resident) * stride, 0, 3 * stride), "cudaMemset");
         }
     }
-    for (const bool heartbeat : {true, false}) {
+    enum class Beat { kStill, kNone, kBeating };
+    for (const Beat beat : {Beat::kStill, Beat::kNone, Beat::kBeating}) {
         if (experts != 12 || g_idle_checks == IdleChecks::kOnly) { break; }
+        const bool heartbeat = beat != Beat::kNone;
         // A CPU channel whose host never answers and whose heartbeat stands still (or which has none:
-        // then the wait is bounded at 2 s): the wait gives up and reports it in the error word instead
-        // of trapping, and the device stays usable.
+        // then the wait is bounded at 2 s, or which keeps beating: then the answer bound ends it): the
+        // wait gives up and reports it in the error word instead of trapping, and the device stays usable.
         const auto mapped = [](std::size_t bytes) {
             void* p = nullptr;
             cuda_check(cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc");
@@ -1100,17 +1117,29 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                       .max_columns = 64};
         *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
         source.error = error_device;
+        // The beating host: a thread that advances the heartbeat word and never answers.
+        std::atomic<bool> beating{beat == Beat::kBeating};
+        std::thread beater([&] {
+            for (std::uint32_t n = 1; beating.load(); ++n) {
+                *reinterpret_cast<volatile std::uint32_t*>(words + 2) = n;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
         const auto start = std::chrono::steady_clock::now();
         infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         const cudaError_t status = cudaDeviceSynchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        beating.store(false);
+        beater.join();
         const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
-        std::printf("silent CPU host (%s heartbeat): %s after %.2f s, error word %#x\n", heartbeat ? "a still" : "no",
+        std::printf("silent CPU host (%s heartbeat): %s after %.2f s, error word %#x\n",
+                    beat == Beat::kStill ? "a still" : beat == Beat::kNone ? "no" : "a beating",
                     cudaGetErrorString(status), seconds, error);
-        check(status == cudaSuccess && error == (7U << 16U | moe::kErrorHostSilent),
-              "a silent CPU host fails the call through its error word, without a trap");
+        const std::uint32_t want = beat == Beat::kBeating ? moe::kErrorHostStalled : moe::kErrorHostSilent;
+        check(status == cudaSuccess && error == (7U << 16U | want),
+              "a silent or stalled CPU host fails the call through its error word, without a trap");
         cuda_check(cudaMemset(d_out, 0, 16), "a device that is still usable");
         cudaFree(sequence);
         cudaFreeHost(words);

@@ -284,6 +284,8 @@ struct MoeExpertSource {
     std::uint32_t* error = nullptr;
     // How long the CPU wait and the fetch poller wait on a heartbeat that stands still (GPU time)
     // before they write kErrorHostSilent / kErrorFetchSilent.
+    // Either wait also ends once it has lasted kHostAnswerBoundFactor times this in all, whatever the heartbeat does
+    // (kErrorHostStalled / kErrorFetchStalled).
     std::uint64_t heartbeat_timeout_ns = offloaded_moe::kHeartbeatTimeoutNs;
     // How long a narrow down pass waits for its own job's h (GPU time) before it writes kErrorDownStalled and
     // reads none (the per-job waits of the A16 tensor-core, rows, ring and GGUF down CTAs). Tests shorten it to

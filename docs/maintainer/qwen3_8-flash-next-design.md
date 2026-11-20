@@ -8342,12 +8342,17 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   `.cv` loads (their host slots are rewritten; the full-mode bank keeps `.cs`). Waits: the CPU
   wait and the fetch poller end when the host's heartbeat has not changed for 10 s and write
   `kErrorHostSilent` (the CPU service) or `kErrorFetchSilent` (the fetch responder; never a trap,
-  unreported when the source has no error word, since 2026-10-31); host failures write their
+  unreported when the source has no error word, since 2026-10-31), and since 2026-11-20 also once
+  they have lasted `kHostAnswerBoundFactor` (6) heartbeat bounds in all while the host keeps beating
+  (`kErrorHostStalled`, `kErrorFetchStalled`): a host that beat but never answered held a GPU at
+  full use for over ten minutes on 2026-11-20, and ending that process hung the display driver until
+  the PC was restarted; host failures write their
   errno; an SSD-only expert with no path writes `kErrorUnservedRecord`. Tests (layer test): SSD-only
   sets served by CPU jobs (caps 8 and 256, fork, zero staging) and by the fetch channel (serial
   passes of 1 and 3 slots, overlap, fork, landing, with CPU jobs taking the narrow ones), a
-  responder that fails a request or stays silent, an unserved set without a channel, and a silent
-  CPU host, each against the CPU engine's bits or the expected error word. **Not done:** the
+  responder that fails a request, stays silent or keeps beating without landing, an unserved set
+  without a channel, and a silent or still-beating CPU host, each against the CPU engine's bits or
+  the expected error word. **Not done:** the
   tier's agent as responder (R10).
 - **R10.1** (2026-10-05, tier mode end to end without demotions): the ledger's tier placement (or
   `--expert-ram-mib N`, new in `infernix`, `infernix-serve` and `infernix_bench`; a cap above what is free is an

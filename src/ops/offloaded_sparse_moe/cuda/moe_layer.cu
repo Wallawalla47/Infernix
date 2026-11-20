@@ -312,9 +312,12 @@ __device__ void poll_fetch(const MoeExpertSource& source, FetchCall* call) {
 }
 
 // Thread 0 of a stage CTA: waits until record f of the call's request has landed and returns its
-// host address, or null once the request has failed.
+// host address, or null once the request has failed. A host that keeps beating without landing the
+// record fails the request after kHostAnswerBoundFactor heartbeat bounds (kErrorFetchStalled) instead
+// of holding the GPU forever.
 __device__ const std::uint8_t* fetch_wait(const MoeExpertSource& source, FetchCall* call, int f) {
     volatile FetchCall* v = call;
+    const std::uint64_t entered = global_ns();
     for (;;) {
         if (v->failed != 0) { return nullptr; }
         if (static_cast<int>(v->landed) > f) { break; }
@@ -322,6 +325,12 @@ __device__ const std::uint8_t* fetch_wait(const MoeExpertSource& source, FetchCa
             poll_fetch(source, call);
             __threadfence();
             atomicExch(&call->poller, 0U);
+        }
+        if (global_ns() - entered > offloaded_moe::kHostAnswerBoundFactor * source.heartbeat_timeout_ns) {
+            report_error(source, offloaded_moe::kErrorFetchStalled);
+            v->failed = 1;
+            __threadfence();
+            return nullptr;
         }
         __nanosleep(256);
     }
@@ -2708,9 +2717,10 @@ __global__ void __launch_bounds__(kThreads)
     if (sequence == 0 || static_cast<int>(blockIdx.x) >= n) { return; }
     __shared__ bool silent;
     if (threadIdx.x == 0) {
-        // The wait lasts while the host's heartbeat changes (an SSD-served job may take seconds);
-        // without a heartbeat it is bounded at 2 s. A silent host fails the call through its error
-        // word (unreported without one), never a trap: that would lose the context.
+        // The wait lasts while the host's heartbeat changes (an SSD-served job may take seconds), at
+        // most kHostAnswerBoundFactor heartbeat bounds in all; without a heartbeat it is bounded at 2 s. A silent
+        // or stalled host fails the call through its error word (unreported without one), never a
+        // trap: that would lose the context.
         const auto* done  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.done);
         const auto* beat  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.heartbeat);
         std::uint32_t seen = beat != nullptr ? *beat : 0;
@@ -2725,6 +2735,11 @@ __global__ void __launch_bounds__(kThreads)
                 since = now;
             } else if (now - since > limit) {
                 report_error(source, offloaded_moe::kErrorHostSilent);
+                silent = true;
+                break;
+            }
+            if (beat != nullptr && now - entered > offloaded_moe::kHostAnswerBoundFactor * limit) {
+                report_error(source, offloaded_moe::kErrorHostStalled);
                 silent = true;
                 break;
             }
