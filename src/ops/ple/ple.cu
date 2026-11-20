@@ -57,6 +57,38 @@ __global__ void embed_kernel(const std::uint8_t* __restrict__ rows, const bf16* 
     }
 }
 
+// BF16 P12 rows: each value's BF16 bits are the row's base-plus-offset exponent and its stored sign
+// and mantissa, or an inline escape entry when the offset is 15. Every value decodes to its exact bits.
+__global__ void embed_bf16_p12_kernel(const std::uint8_t* __restrict__ rows, int row_bytes, int heads, int width,
+                                      int columns, std::uint16_t* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements = heads * width;
+    if (i >= elements) { return; }
+    const int h = i / width, j = i % width;
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        const std::uint8_t* row = rows + (static_cast<std::size_t>(t) * heads + h) * row_bytes;
+        const std::uint8_t code = row[j];
+        const unsigned q        = (row[width + (j >> 1)] >> (4 * (j & 1))) & 15U;
+        std::uint16_t bits;
+        if (q < 15U) {
+            const unsigned base = row[width + width / 2];
+            bits = static_cast<std::uint16_t>(((code & 0x80U) << 8U) | ((base + q) << 7U) | (code & 0x7FU));
+        } else {
+            const unsigned escapes   = row[width + width / 2 + 1];
+            const std::uint8_t* list = row + width + width / 2 + 2;
+            bits                     = 0;
+            for (unsigned e = 0; e < escapes; ++e) {
+                if (list[3 * e] == j) {
+                    bits = static_cast<std::uint16_t>(static_cast<unsigned>(list[3 * e + 1]) |
+                                                      (static_cast<unsigned>(list[3 * e + 2]) << 8U));
+                    break;
+                }
+            }
+        }
+        out[static_cast<std::size_t>(t) * elements + i] = bits;
+    }
+}
+
 // bf16_rn(p * m) of the exact product: hi = fl32(p * m) and its error lo (an FMA residual, exact)
 // round together, so lo decides only a hi that lies exactly halfway between two BF16 values.
 __device__ __forceinline__ std::uint16_t bf16_rn_product(float p, float m) {
@@ -232,6 +264,24 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
         static_cast<const std::uint8_t*>(rows.data), static_cast<const bf16*>(scale.data), elements, columns,
         static_cast<bf16*>(out.data));
     check_launch("embed");
+}
+
+void ple_embed_bf16_p12(const Tensor& rows, Tensor& out, cudaStream_t stream) {
+    require(contiguous(rows, DType::U8) && contiguous(out, DType::BF16),
+            "BF16 P12 embed requires contiguous U8 rows and BF16 output");
+    const int row_bytes = rows.ne[0], heads = rows.ne[1], columns = rows.ne[2];
+    const int payload   = row_bytes - 16;
+    require(row_bytes >= 16 && payload > 0 && payload % 3 == 0 && heads > 0 && columns > 0,
+            "BF16 P12 rows must be W + W / 2 + 16 bytes");
+    const int width = payload / 3 * 2;
+    require(width % 2 == 0 && width <= 255 && width + width / 2 + 16 == row_bytes,
+            "BF16 P12 rows must be W + W / 2 + 16 bytes for an even W up to 255");
+    require(out.ne[0] == heads * width && out.ne[1] == columns, "BF16 P12 embed shapes disagree");
+    const int elements = heads * width;
+    embed_bf16_p12_kernel<<<dim3((elements + kThreads - 1) / kThreads, grid_rows(columns)), kThreads, 0, stream>>>(
+        static_cast<const std::uint8_t*>(rows.data), row_bytes, heads, width, columns,
+        static_cast<std::uint16_t*>(out.data));
+    check_launch("embed bf16 p12");
 }
 
 void ple_embed_nvfp4(const Tensor& rows, const Tensor& multiplier, Tensor& out, cudaStream_t stream) {
