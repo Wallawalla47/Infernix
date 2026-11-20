@@ -325,6 +325,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                    : format == models::qwen4_exp::NgramRowFormat::Iq4Nl ? std::string("IQ4_NL")
                    : format == models::qwen4_exp::NgramRowFormat::Nvfp4 ? std::string("NVFP4")
                    : format == models::qwen4_exp::NgramRowFormat::Q8_0  ? std::string("Q8_0")
+                   : format == models::qwen4_exp::NgramRowFormat::Bf16P12 ? std::string("BF16_P12")
                                                                         : std::string("FP8");
         };
         report(options, DiagnosticLevel::Info,
