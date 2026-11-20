@@ -12706,15 +12706,15 @@ second, 2026-10-31): its narrow jobs ran the one-column kernels (§19.3.21) at e
 per column of half2 products over a staged 46 KB slice, A4(x) re-encoded per column in every CTA between six
 barriers, while the W4A16 banks had the tensor-core narrow kernels of §19.3.40.
 
-**What** (`narrow_a4_mma.cuh`, calls of at most eight columns (of four to eight since 2026-11-09: narrower ones take
-§19.3.53's row pairs), banks whose every expert shares its gate and up input
+**What** (`narrow_a4_mma.cuh`, calls of at most eight columns (of four to eight from 2026-11-09 to 2026-11-20, while
+§19.3.53's row pairs took the narrower ones), banks whose every expert shares its gate and up input
 scales: `MoeExpertSource::a4_shared_input`, set at load; NVIDIA's exports always do, other banks keep the one-column
 kernels). Per 16-element block one `mma.m16n8k16` s8 product of the doubled E2M1 codes (A: the record word's rows g
 and g + 8; B: column g's codes) gives P_b exactly for up to eight columns, folded as (P_b Sw) Sa into the same int64
 sums as `unit_sums`, so every output equals the one-column kernels' and the CPU engine's bit for bit. Gate/up CTAs
 of eight warps, two a row group, each streaming half of K through a three-stage ring (the halves add exactly); each
-CTA quantizes its job's A4(x) into shared memory while its rings fill (from four columns it copies the rows a per-job
-encode kernel wrote, §19.3.47) and its two A4 blocks of h with the down input scale. Down: a warp a row group, its units copied before the PDL wait. Shared memory is sized by the call's columns
+CTA quantizes its job's A4(x) into shared memory while its rings fill (from two columns since 2026-11-20, four before,
+it copies the rows a per-job encode kernel wrote, §19.3.47) and its two A4 blocks of h with the down input scale. Down: a warp a row group, its units copied before the PDL wait. Shared memory is sized by the call's columns
 so three gate/up CTAs fit an SM at one to three columns. Registers 80 (gate/up) and 71 (down), no spills.
 
 **Rejected on the way.** A once-per-call A4(x) encode kernel before the passes with one warp a row group over its
@@ -12926,8 +12926,8 @@ state, three interleaved runs each; outputs equal in every arm: same tokens, rou
   measures, so its one-column work is memory-bound. Op (the GGUF CPU test's `--columns` and `--rates fp8`, extended
   for the run to FP8 records and 4- and 8-column jobs; same-code GGUF rows varied +-4 %): one thread 2-7 % faster at
   2-8 columns, level at one; the 16-worker team 2-6 % faster at four and eight columns.
-- Per-job x encode from four columns: never encoding lost 0.4-0.6 % on every workload, encoding at every width was
-  level (+0.2 / +0.2 / -0.2 %).
+- Per-job x encode from four columns (two since 2026-11-20, §19.3.53): never encoding lost 0.4-0.6 % on every
+  workload, encoding at every width was level (+0.2 / +0.2 / -0.2 %).
 
 **Rejected on the way.**
 - *Per-token A4(x).* FP4-Local's experts share one gate/up input scale in every layer (all 512), so a token's A4(x) is
@@ -13352,9 +13352,32 @@ one binary with the switch, three ABBA blocks of fresh processes):
 - Not timed: long contexts, the reproducible route (it takes the same kernels), Huihui FP4-Local, recipe C and the
   uncensored NVFP4 (same kernels, same bits).
 
-### 19.3.53 NVFP4 W4A4 decode calls on register-resident row pairs (2026-11-09; exact, same bits; default)
+### 19.3.53 NVFP4 W4A4 decode calls on register-resident row pairs (2026-11-09; exact, same bits; removed 2026-11-20)
 
-**What.** §19.3.52's row-pair kernels on 4-bit activations (`ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh`,
+**Removed** (2026-11-20): W4A4 calls of one to three columns take §19.3.44's tensor-core narrow kernels again (with
+the per-job x encode from two columns), and `narrow_rows_a4.cuh` is gone. These kernels fell into a slow state that
+outlasted the process: in the README benchmark of 2026-11-20 (served Dense8, DFlash2 companion auto and n-gram
+drafting, INT8 KV, `--vram-past-budget --vram-headroom-mib 128`, a 6K and two 8K prompts with 1,024 greedy tokens,
+fresh processes from the same saved expert state) every process for an hour at a time decoded at 80-130 tok/s instead
+of ~185, while the tensor-core kernels (a switch in one build) decoded at 181-209 in every process between them. The
+state followed VRAM pressure: another process taking 400 MiB while the engine ran (the engine then gives frames back
+to its 128 MiB headroom) set it off three times, and it stayed for later processes until it cleared on its own or at
+a restart; with 1,024 MiB of headroom the same pressure left the row pairs fast. Under that pressure, mirrored pairs:
+row pairs 35-102 tok/s, row pairs at one column only (the tensor-core kernels from two) 84-156, the tensor-core
+kernels 158-190. Plain decode (one-column calls) was not slowed in the state. In a slow process (nsys, 4 s of
+decode) the row-pair gate/up kernel took a median 238 µs a call against ~31 µs alone and the per-pass x encode
+125-133 µs on the staged passes' streams, the GPU drew ~185 W against ~234 W, and it sent ~6x the GPU-to-host PCIe
+traffic a token (9.8 against 3.3 GB/s); the engine's own VRAM readings matched fast processes', no other process
+used the GPU, and the kernels alone were unchanged (op bench 30.8 / 47.1 / 61.5 µs at T = 1 / 2 / 3). The
+mechanism inside the driver was not found. Neither the down pass's wait (the PDL wait, or stream order, with no
+per-element counts) nor launching the gate/up pass in stream order changed it, and FP4-Local's W4A16 row pairs
+(§19.3.52) were level with its tensor-core kernels in sessions between slow Dense8 ones.
+Cost (op bench, same output hashes): T = 1 30.8 -> 34.8 µs a call, T = 2 47.1 -> 45.1, T = 3 61.5 -> 57.3-59.4.
+End to end (the same probe, fresh processes): plain decode (`--spec off`) A C C A 128.4 / 136.3 / 131.1, 128.4 /
+135.7 / 131.0, 128.5 / 135.9 / 130.9, 128.5 / 136.1 / 131.4 tok/s (level; 5f3a0c2e had measured the row pairs +1.6 %
+there); DFlash2 in a fast state the tensor-core kernels 180-213 against the row pairs' 171-213 at another hour.
+
+**What it was.** §19.3.52's row-pair kernels on 4-bit activations (`ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh`,
 candidates TM-02c): the narrow jobs of calls of at most three columns (`moe::wide::kA4RowsMaxColumns`) of W4A4 banks
 whose experts share their gate and up input scales (`a4_shared_input`: Dense8, recipe A, FP4-Local under
 `--expert-a4-activations`), in place of §19.3.44's tensor-core kernels, which keep calls of 4 to 8 columns.

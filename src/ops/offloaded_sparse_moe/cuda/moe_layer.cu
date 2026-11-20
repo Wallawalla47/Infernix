@@ -2052,12 +2052,11 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
 #include "ops/offloaded_sparse_moe/cuda/narrow_a16_mma.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_rows_a16.cuh"
 #include "ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh"
-#include "ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh"
 
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
-// jobs of a bank whose experts share their gate and up input scales take the row-pair kernels in calls of at most
-// kA4RowsMaxColumns columns (narrow_rows_a4.cuh) and the tensor-core narrow kernels in calls of at most kMaxColumns
-// (narrow_a4_mma.cuh), else the one-column kernels (one pass per column over the
+// jobs of a bank whose experts share their gate and up input scales take the tensor-core narrow kernels in calls of
+// at most kMaxColumns (narrow_a4_mma.cuh; design §19.3.53 for the row pairs they replaced), else the one-column
+// kernels (one pass per column over the
 // staged weights); W4A16 jobs at Flash-Next's geometry the row-pair kernels in calls of at most kA16RowsMaxColumns
 // columns (narrow_rows_a16.cuh), the tensor-core narrow kernels in calls of at most kMaxColumns (narrow_a16_mma.cuh);
 // W4A16 jobs
@@ -2131,11 +2130,6 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
                                                            h_plane, outputs, stream, phase, part);
             }
         });
-        return;
-    }
-    if (a4_rows_call(source, columns, layout)) {
-        launch_expert_pass_a4_rows(x, columns, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs,
-                                   stream, phase, part);
         return;
     }
     if (a4_nmma_call(source, columns, layout)) {
@@ -3105,15 +3099,14 @@ void require_fetch_channel(const MoeExpertSource& source, std::int32_t max_jobs)
 // and counters cleared), a ggml bank's x limbs (on the 8-bit route its codes) and its jobs' gate/up CTA counts,
 // an NVFP4 bank's 8-bit codes, or an NVFP4 W4A16 call's x for the row-pair kernels (A16Act blocks, its jobs' h
 // counts cleared) or the tensor-core narrow kernels (x limbs, its jobs' gate/up CTA counts cleared), each encoded
-// once per call.
+// once per call, or an NVFP4 W4A4 tensor-core narrow call's gate/up CTA counts cleared.
 // Whether prepare_x launches anything for the call (a ring, a ggml bank, an 8-bit NVFP4 call, a W4A16 narrow call
-// at Flash-Next's geometry: a16_rows_call implies a16_nmma_call, or a W4A4 row-pair call: its jobs' h counts).
+// at Flash-Next's geometry: a16_rows_call implies a16_nmma_call, or a W4A4 narrow call with per-job counts).
 bool prepares_x(const Tensor& x, const MoeExpertSource& source, const moe::wide::ExpertsWorkspace& layout) {
     const int columns   = static_cast<int>(x.ne[1]);
     const bool nvfp4_a8 = nvfp4_a8_call(source, columns);
     return (layout.x_acts != nullptr && !nvfp4_a8) || ggml_bank(source) || nvfp4_a8 || nvfp4_a8_wide_call(source, columns) ||
-           a16_nmma_call(source, columns, layout) || a4_rows_call(source, columns, layout) ||
-           (a4_nmma_call(source, columns, layout) && layout.job_ctas != nullptr);
+           a16_nmma_call(source, columns, layout) || (a4_nmma_call(source, columns, layout) && layout.job_ctas != nullptr);
 }
 
 void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
@@ -3132,10 +3125,9 @@ void prepare_x(const Tensor& x, const MoeExpertSource& source, std::int32_t max_
         launch_prepare_a16_rows(x, static_cast<int>(max_jobs), layout, stream);
     } else if (a16_nmma_call(source, columns, layout)) {
         launch_prepare_a16_nmma(x, static_cast<int>(max_jobs), layout, stream);
-    } else if (a4_rows_call(source, columns, layout) ||
-               (a4_nmma_call(source, columns, layout) && layout.job_ctas != nullptr)) {
-        // The row-pair kernels' h element counts, or the tensor-core narrow kernels' gate/up CTA counts (ZK-04).
-        launch_prepare_a4_rows(static_cast<int>(max_jobs), layout, stream);
+    } else if (a4_nmma_call(source, columns, layout) && layout.job_ctas != nullptr) {
+        // The tensor-core narrow kernels' gate/up CTA counts (ZK-04).
+        launch_prepare_a4_nmma(static_cast<int>(max_jobs), layout, stream);
     }
 }
 

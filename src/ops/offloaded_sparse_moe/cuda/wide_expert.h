@@ -304,12 +304,8 @@ inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rou
 // pp65536 -0.4 %.
 inline constexpr int kA16NmmaCallColumns = 4096;
 INFERNIX_WIDE_HD constexpr bool a16_nmma_columns(int columns) { return columns <= kA16NmmaCallColumns; }
-// W4A4 calls of at most kA4RowsMaxColumns columns at Flash-Next's geometry may take the row-pair narrow kernels
-// (moe_layer.cu's narrow_rows_a4.cuh), so their workspace also holds each entry's BF16 h row (h_rows) and the per-job
-// h counts (job_ctas) beside the A4 planes; calls of at most kMaxColumns columns hold job_ctas for the tensor-core narrow
-// kernels' per-job waits as well (candidates ZK-04).
-inline constexpr int kA4RowsMaxColumns = 3;
-INFERNIX_WIDE_HD constexpr bool a4_rows_columns(int columns) { return columns <= kA4RowsMaxColumns; }
+// W4A4 calls of at most kMaxColumns columns at Flash-Next's geometry hold the per-job gate/up CTA counts (job_ctas)
+// beside the A4 planes for the tensor-core narrow kernels' per-job waits (candidates ZK-04).
 // `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.
 // `shape` is the bank's geometry (MoeExpertSource::shape; shape_supported).
 [[nodiscard]] std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,
