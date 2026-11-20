@@ -692,13 +692,28 @@ int run_next_turn(const char* artifact, const char* ngram, bool reproducible) {
 
 } // namespace
 
-// The SSD tier's directory: INFERNIX_TEST_SSD_DIR (a drive to measure), else a temporary one.
-std::filesystem::path ssd_directory() {
-    if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') { return dir; }
-    std::filesystem::path dir = infernix::test::unique_temp_path("qwen4_ssd_tier");
-    std::filesystem::create_directories(dir);
-    return dir;
-}
+// The SSD tier's directory: INFERNIX_TEST_SSD_DIR (a drive to measure), else a temporary one, which goes when the
+// scenario ends (declared before its Engines, it is destroyed after their stops).
+struct SsdDirectory {
+    std::filesystem::path path;
+    bool temporary = false;
+
+    SsdDirectory() {
+        if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') {
+            path = dir;
+            return;
+        }
+        path      = infernix::test::unique_temp_path("qwen4_ssd_tier");
+        temporary = true;
+        std::filesystem::create_directories(path);
+    }
+    ~SsdDirectory() {
+        std::error_code ignored;
+        if (temporary) { std::filesystem::remove_all(path, ignored); }
+    }
+    SsdDirectory(const SsdDirectory&)            = delete;
+    SsdDirectory& operator=(const SsdDirectory&) = delete;
+};
 
 void print_ssd(const infernix::RuntimeStats& s) {
     std::printf("        SSD tier: %.1f MB written (%llu images, %llu blocks), %.1f MB read in %llu promotions, "
@@ -754,7 +769,8 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
         t3.insert(t3.end(), third.begin(), third.end());
         resident3 = generate(reference, t3, 32, true);
     }
-    const std::filesystem::path directory = ssd_directory();
+    const SsdDirectory ssd;
+    const std::filesystem::path& directory = ssd.path;
     // A prefix cache file keeps the SSD tier across the restart at the end (spec §5.5, candidates YK-02).
     const std::filesystem::path file =
         infernix::test::unique_temp_path(drafter != nullptr ? "infernix_qwen4_exp_ssd_dflash2.cache" : "infernix_qwen4_exp_ssd.cache");
@@ -826,7 +842,8 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     // The restart: a new Engine on the same file and SSD directory takes the SSD copies back unread, and
     // turn 3 resumes at turn 2's endpoint from them.
     const auto endpoint2 = static_cast<std::uint32_t>(t2.size() + restored.tokens.size() - 1U);
-    infernix::Engine restarted(ssd_options(), infernix::test::engine_host());
+    first.emplace(ssd_options(), infernix::test::engine_host());
+    infernix::Engine& restarted = *first;
     const infernix::LoadSummary::PrefixCacheRestore restore = restarted.load_summary().prefix_cache;
     std::printf("        restart: restored %llu blocks and %llu snapshots, %llu and %llu of them on the SSD tier (%s%s)\n",
                 static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots),
@@ -842,6 +859,10 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     failures += check(third.tokens == resident3.tokens, "turn 3 after the restart equals the lane-resident resume (" +
                                                      first_difference(third.tokens, resident3.tokens) + ")");
     failures += check(restarted.runtime_stats().hybrid_ssd_failures == 0, "no SSD transfer failed after the restart");
+    // The stop saves the file again, so it goes after the Engine.
+    first.reset();
+    std::filesystem::remove(file, ignored);
+    failures += check(!std::filesystem::exists(file), "the prefix cache file is not left in the temp directory");
     return failures;
 }
 
@@ -854,7 +875,8 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
 int run_ssd_scale(const char* artifact, const char* ngram) {
     constexpr std::uint32_t kContext = 100'000;
     std::printf("== SSD tier at scale (%u-token conversations, Host tier 4 GiB, SSD tier 16 GiB)\n", kContext);
-    const std::filesystem::path directory = ssd_directory();
+    const SsdDirectory ssd;
+    const std::filesystem::path& directory = ssd.path;
     std::printf("        SSD directory %s\n", directory.string().c_str());
     infernix::EngineOptions options = base_options(artifact, ngram);
     options.max_context             = kContext + 1024;

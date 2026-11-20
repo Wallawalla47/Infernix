@@ -278,11 +278,20 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
     const std::vector<infernix::TokenId>& second = prompts.second;
     const std::vector<infernix::TokenId> device_tokens = device_restore_reference(artifact, backend).tokens;
     std::filesystem::path directory;
+    // A directory the scenario made goes when it ends: declared before its Engines, after their stops.
+    struct RemoveOnExit {
+        std::filesystem::path path;
+        ~RemoveOnExit() {
+            std::error_code ignored;
+            if (!path.empty()) { std::filesystem::remove_all(path, ignored); }
+        }
+    } temporary;
     if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') {
         directory = dir;
     } else {
         directory = infernix::test::unique_temp_path("hybrid_ssd_tier");
         std::filesystem::create_directories(directory);
+        temporary.path = directory;
     }
     const auto ssd_options = [&](const std::filesystem::path& persistent) {
         infernix::EngineOptions options = hybrid_options(artifact, backend, 4096, 480ULL << 20, 1);
@@ -316,7 +325,9 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
         }
         // The restore refills the Host tier with entries the SSD does not hold yet; the promotion waits for their
         // write-back to land (SsdTier::Promotion::Pending) rather than falling back to a cold prefill.
-        infernix::Engine restarted(ssd_options(persistent));
+        std::optional<infernix::Engine> holder;
+        holder.emplace(ssd_options(persistent));
+        infernix::Engine& restarted = *holder;
         const infernix::LoadSummary::PrefixCacheRestore restore = restarted.load_summary().prefix_cache;
         std::cout << "ssd-restore (restart): restored " << restore.blocks << " blocks and " << restore.snapshots
                   << " snapshots, " << restore.ssd_blocks << " and " << restore.ssd_snapshots
@@ -341,7 +352,13 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
             std::cerr << "ssd-restore (restart): the kept SSD restore generated other tokens or failed a transfer\n";
             ++failures;
         }
+        // The stop saves the file again, so it goes after the Engine.
+        holder.reset();
         std::filesystem::remove(persistent, ignored);
+        if (std::filesystem::exists(persistent)) {
+            std::cerr << "ssd-restore (restart): the kept SSD file was left in the temp directory\n";
+            ++failures;
+        }
     }
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
         if (entry.path().filename().string().starts_with("infernix-context-kept-")) {

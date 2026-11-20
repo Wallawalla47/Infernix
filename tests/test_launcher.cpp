@@ -709,10 +709,8 @@ void test_load_advice() {
           "a smaller Host prefix cache");
 }
 
-void test_event_log() {
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-events";
+void check_event_log(const std::filesystem::path& dir) {
     std::error_code ignored;
-    std::filesystem::remove_all(dir, ignored);
     EventLog log(dir);
     std::vector<std::string> heard;
     log.set_listener([&](const EventRecord& record) { heard.push_back(record.message); });
@@ -773,7 +771,16 @@ void test_event_log() {
               "a later try rotates it once it is free");
     }
 #endif
+}
+
+void test_event_log() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-events";
+    std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
+    check_event_log(dir);
+    // After the log, which holds its files open (Windows deletes no open file).
+    std::filesystem::remove_all(dir, ignored);
+    check(!std::filesystem::exists(dir), "the event log test leaves no files behind");
 }
 
 void test_routing() {

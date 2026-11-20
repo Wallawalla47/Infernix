@@ -3,6 +3,7 @@
 // above -16, the target's NLL and probability change, the top-token rule, and the summary's lines.
 
 #include "llama_kld.h"
+#include "test_temp_path.h"
 
 #include <algorithm>
 #include <cmath>
@@ -78,10 +79,10 @@ void check_encoding() {
     }
 }
 
-void check_file(const std::filesystem::path& directory) {
+// `path`: a file of this process's own in the temp directory, removed at the end.
+void check_file(const std::filesystem::path& path) {
     std::mt19937 rng(2);
     llama::BaseHeader header{.context = 8, .vocab = 5, .chunks = 2, .tokens = {1, 2, 3, 4, 0, 1, 2, 3, 4, 4, 3, 2, 1, 0, 1, 2}};
-    const std::filesystem::path path = directory / "base.kld";
     std::vector<std::vector<std::uint16_t>> written;
     {
         llama::BaseWriter writer(path, header);
@@ -92,18 +93,23 @@ void check_file(const std::filesystem::path& directory) {
         }
         writer.finish();
     }
-    llama::BaseReader reader(path);
-    require(reader.header().context == 8 && reader.header().vocab == 5 && reader.header().chunks == 2 &&
-                reader.header().tokens == header.tokens,
-            "the header round-trips");
-    require(header.rows_per_chunk() == 3 && header.first_row() == 4 && header.row_words() == 10, "llama.cpp's row geometry");
-    for (int c = 0; c < 2; ++c) {
-        const std::vector<std::uint16_t> rows = reader.next_chunk();
-        for (std::uint32_t k = 0; k < 3; ++k) {
-            require(std::equal(written[c * 3 + k].begin(), written[c * 3 + k].end(), rows.begin() + k * 10), "rows round-trip");
+    {
+        // In a scope of its own: the reader holds the file open until it is destroyed.
+        llama::BaseReader reader(path);
+        require(reader.header().context == 8 && reader.header().vocab == 5 && reader.header().chunks == 2 &&
+                    reader.header().tokens == header.tokens,
+                "the header round-trips");
+        require(header.rows_per_chunk() == 3 && header.first_row() == 4 && header.row_words() == 10,
+                "llama.cpp's row geometry");
+        for (int c = 0; c < 2; ++c) {
+            const std::vector<std::uint16_t> rows = reader.next_chunk();
+            for (std::uint32_t k = 0; k < 3; ++k) {
+                require(std::equal(written[c * 3 + k].begin(), written[c * 3 + k].end(), rows.begin() + k * 10),
+                        "rows round-trip");
+            }
         }
+        reader.finish();
     }
-    reader.finish();
     // Rows read in any order through a stream of their own.
     std::ifstream in(path, std::ios::binary);
     std::vector<std::uint16_t> row(header.row_words());
@@ -119,6 +125,9 @@ void check_file(const std::filesystem::path& directory) {
         llama::BaseReader truncated(path);
     } catch (const std::runtime_error&) { refused = true; }
     require(refused, "a truncated base file is refused");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    require(!std::filesystem::exists(path), "the base file is not left in the temp directory");
 }
 
 // The definitions in binary64: the base's decoded log-probabilities, the evaluated run's log-softmax.
@@ -312,7 +321,7 @@ void check_summary() {
 int main() {
     try {
         check_encoding();
-        check_file(std::filesystem::temp_directory_path());
+        check_file(infernix::test::unique_temp_path("llama-base.kld"));
         check_positions();
         check_bucket();
         check_bf16_rounding();
