@@ -1,9 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# CUDA 13.4 compiles the binaries (CMake refuses an older toolkit). On Linux they link the CUDA
-# runtime as a shared library (cmake/Dependencies.cmake), which the runtime image below provides;
-# its 13.1 keeps the host-driver requirement low.
-FROM docker.io/nvidia/cuda:13.4.3-devel-ubuntu24.04 AS build
+# One CUDA version for both stages. CMake refuses a toolkit older than 13.4, and on Linux the binaries
+# link the CUDA runtime as a shared library (cmake/Dependencies.cmake) that the runtime stage provides,
+# so that library must be at least the one they were built against: an older one lacks entry points
+# the binaries call (issue #73: 13.1's has no cudaGraphNodeGetParams). A host driver of an earlier
+# CUDA 13 release runs it through CUDA's minor-version compatibility (seen with driver 595, CUDA 13.2).
+ARG CUDA_VERSION=13.4.3
+
+FROM docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -35,7 +39,7 @@ RUN cmake -S . -B /build -G Ninja \
         -DPDFIUM_ROOT=/opt/pdfium \
     && cmake --build /build --parallel --target infernix infernix-serve
 
-FROM docker.io/nvidia/cuda:13.1.2-runtime-ubuntu24.04
+FROM docker.io/nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
