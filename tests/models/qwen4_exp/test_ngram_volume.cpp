@@ -125,10 +125,11 @@ void write_header(const std::filesystem::path& path, std::uint64_t rows, std::ui
 
 // resolve_ngram_volume: the artifact's own volume (its format and id) keeps the artifact's table; a
 // volume of the same table geometry in any of the five formats (FP8 rows of the head width, IQ4_NL
-// blocks of 18 bytes per 32, BF16 rows of twice the width, NVFP4 codes and block scales) replaces any
-// artifact's table with its own geometry and id, an FP8 one only with a scale and an NVFP4 one only with
-// a multiplier in its header; another row count or row size is refused. The header's format tag decides
-// the format (NVFP4 rows have IQ4_NL's 90 bytes); a volume written before the tag is read by row size.
+// blocks of 18 bytes per 32, BF16 rows of twice the width, NVFP4 codes and block scales, BF16 P12 rows
+// of W + W/2 + 16 bytes) replaces any artifact's table with its own geometry and id, an FP8 one only
+// with a scale and an NVFP4 one only with a multiplier in its header; another row count or row size is
+// refused. The header's format tag decides the format (NVFP4 rows have IQ4_NL's 90 bytes); a volume
+// written before the tag is read by row size. BF16 P12 is a run-time volume only, never an artifact's own.
 void test_resolve(const std::filesystem::path& path) {
     constexpr std::uint64_t rows        = 100'003;
     constexpr std::uint16_t kScale      = 0x3A83;     // a positive normal BF16 value
@@ -139,11 +140,12 @@ void test_resolve(const std::filesystem::path& path) {
     const std::uint32_t row_bytes[]     = {160, 90, 320, 90, 256};
     const std::uint16_t tags[]          = {1, 2, 3, 4, 6};
     constexpr int kFormats              = 5;
+    constexpr int kArtifactFormats      = 4; // the formats an artifact binds as its own (not BF16 P12)
     const auto scale_of = [&](int format) { return formats[format] == q4::NgramRowFormat::Fp8E4m3 ? kScale : std::uint16_t{0}; };
     const auto multiplier_of = [&](int format) {
         return formats[format] == q4::NgramRowFormat::Nvfp4 ? kMultiplier : std::uint32_t{0};
     };
-    for (int own = 0; own < kFormats; ++own) {
+    for (int own = 0; own < kArtifactFormats; ++own) {
         q4::PleConfig ple;
         ple.embed_dim             = 2560;
         ple.ngram.ngram_size      = 3;
@@ -218,16 +220,16 @@ void test_resolve(const std::filesystem::path& path) {
         write_header(path, rows, 200, 0x55);
         check(refused(), name + "a row size of no known format is refused");
     }
-    // BF16 P12 rows: W + W/2 + 16 bytes (160 values -> 256 bytes, 16 rows per 4 KiB block). The tag
-    // names the format; a row size that is not its formula is refused.
+    // BF16 P12 rows: W + W/2 + 16 bytes (160 values -> 256 bytes, 16 rows per 4 KiB block), replacing an
+    // FP8 artifact's table. The tag names the format; a row size that is not its formula is refused.
     {
         q4::PleConfig ple;
         ple.embed_dim             = 2560;
         ple.ngram.ngram_size      = 3;
         ple.ngram.heads_per_ngram = 8; // 16 heads of 160
-        ple.table.format          = q4::NgramRowFormat::Bf16P12;
+        ple.table.format          = q4::NgramRowFormat::Fp8E4m3;
         ple.table.rows            = rows;
-        ple.table.row_bytes       = 256;
+        ple.table.row_bytes       = 160;
         ple.table.volume_id.fill(0xAA);
         const auto refused = [&] {
             try {

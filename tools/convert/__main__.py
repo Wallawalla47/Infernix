@@ -268,6 +268,9 @@ def main(argv=None):
             ngram_format = None
             if args.ngram_reuse is not None:
                 ngram_format = qwen4_exp.ngram_volume_format(base, args.ngram_reuse)
+                if ngram_format == "bf16_p12":
+                    raise ValueError("a BF16 P12 volume replaces a table at run time only (--ngram-volume); bind "
+                                     "the BF16 volume it was packed from")
             if gguf_store is not None:
                 if ngram_format == "bf16":
                     raise ValueError("a GGUF import binds its own IQ4_NL or Q8_0 volume; give it a BF16 volume at "

@@ -16,7 +16,7 @@
 namespace infernix::launcher {
 
 struct NgramTableFacts {
-    std::string format; // the artifact's own table: "fp8", "iq4_nl", "bf16", "nvfp4", "q8_0", "bf16_p12"
+    std::string format; // the artifact's own table: "fp8", "iq4_nl", "bf16", "nvfp4", "q8_0" or "unknown"
     std::uint64_t rows      = 0;
     std::uint32_t row_bytes = 0;
     std::string volume_id; // 32 hex digits

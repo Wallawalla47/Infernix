@@ -58,10 +58,12 @@ std::string artifact_stem(const std::filesystem::path& path) {
     return stem;
 }
 
+// The formats an artifact binds as its own table (the engine's config.cpp). BF16 P12 is a run-time
+// volume only: it replaces a table through --ngram-volume and is never an artifact's own.
 std::string ngram_format_name(std::string_view artifact_format) {
     if (artifact_format == "fp8_e4m3fn") { return "fp8"; }
     if (artifact_format == "iq4_nl" || artifact_format == "bf16" || artifact_format == "nvfp4" ||
-        artifact_format == "bf16_p12") {
+        artifact_format == "q8_0") {
         return std::string(artifact_format);
     }
     return "unknown";
@@ -72,11 +74,8 @@ std::uint32_t head_width(const NgramTableFacts& table) {
     if (table.format == "fp8") { return table.row_bytes; }
     if (table.format == "bf16") { return table.row_bytes / 2; }
     if (table.format == "iq4_nl") { return table.row_bytes / 18 * 32; }
+    if (table.format == "q8_0") { return table.row_bytes / 34 * 32; }
     if (table.format == "nvfp4") { return table.row_bytes * 16 / 9; }
-    if (table.format == "bf16_p12") {
-        const std::uint32_t payload = table.row_bytes >= 16 ? table.row_bytes - 16 : 0;
-        return payload % 3 == 0 ? payload / 3 * 2 : 0;
-    }
     return 0;
 }
 
