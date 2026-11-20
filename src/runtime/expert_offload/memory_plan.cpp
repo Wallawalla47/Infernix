@@ -135,11 +135,16 @@ std::string HostMemoryLedger::summary() const {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB)%s",
                       gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks), split);
     } else {
+        // Against what every expert needs in RAM (full_need: the records and the full mode's margin): the records
+        // alone can fit while the margin does not ("63.5 of the experts' 63.3 GiB fit in RAM, the rest are read from
+        // the model files", 2026-11-20).
         std::snprintf(line, sizeof(line),
-                      "RAM: %.1f of %.1f GiB free; %.1f of the experts' %.1f GiB fit in RAM%s%s, the rest are read "
-                      "from the model files on demand (slower)",
+                      "RAM: %.1f of %.1f GiB free; %.1f GiB for the experts%s, short of the %.1f GiB that keeps every "
+                      "one in RAM (%.1f of records, a %.1f GiB margin and the page-locking overhead)%s: the experts not "
+                      "in RAM are read from the model files on demand (slower)",
                       gib(snapshot.available_physical), gib(snapshot.total_physical), gib(expert_ram),
-                      gib(demand.expert_banks), capped ? " (--expert-ram-mib)" : "", split);
+                      capped ? " (--expert-ram-mib)" : "", gib(full_need), gib(demand.expert_banks),
+                      gib(demand.full_margin), split);
     }
     return line;
 }

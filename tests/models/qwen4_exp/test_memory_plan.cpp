@@ -217,6 +217,13 @@ void test_pin_room() {
     const HostMemoryLedger unlimited = plan_host_memory(snapshot(need, 200 * kGiB), d);
     require(unlimited.placement == ExpertPlacement::Full && !unlimited.pin_limited && unlimited.expert_pageable == 0,
             "no pin limit: full mode as before");
+    // Half a GiB short of the full need: the records alone would fit (the margin does not), so the summary names the
+    // full need instead of more of the records fitting than there are ("63.5 of the experts' 63.3 GiB", 2026-11-20).
+    const HostMemoryLedger margin_short = plan_host_memory(snapshot(need - kGiB / 2, 200 * kGiB), d);
+    require(margin_short.placement == ExpertPlacement::Tier && margin_short.expert_ram >= d.expert_banks &&
+                margin_short.summary().find("short of the") != std::string::npos &&
+                margin_short.summary().find("of the experts'") == std::string::npos,
+            "a RAM plan past the records but short of the margin names the full need: " + margin_short.summary());
     // A 96 GB machine whose limit is half of RAM (47.9 GiB, 1 GiB margin): every expert fits in RAM
     // but not in the pin room, so the SSD tier holds all of them, part unpinned.
     const std::uint64_t pins = plan_host_memory(snapshot(need, 200 * kGiB), d).planned; // unchanged by the room
