@@ -16,7 +16,7 @@
 namespace infernix::launcher {
 
 struct NgramTableFacts {
-    std::string format; // the artifact's own table: "fp8", "iq4_nl", "bf16", "nvfp4"
+    std::string format; // the artifact's own table: "fp8", "iq4_nl", "bf16", "nvfp4", "q8_0", "bf16_p12"
     std::uint64_t rows      = 0;
     std::uint32_t row_bytes = 0;
     std::string volume_id; // 32 hex digits
@@ -81,7 +81,7 @@ struct ScannedNgramVolume {
     std::filesystem::path path;
     std::uint64_t bytes          = 0;
     std::uint64_t expected_bytes = 0; // header + blocks from the header's geometry
-    std::string format;     // "fp8" | "iq4_nl" | "bf16" | "nvfp4" | "unknown"
+    std::string format;     // "fp8" | "iq4_nl" | "bf16" | "nvfp4" | "q8_0" | "bf16_p12" | "unknown"
     std::uint16_t tag       = 0;
     std::uint16_t fp8_scale = 0;
     std::uint64_t rows      = 0;
@@ -125,7 +125,7 @@ struct LibraryScan {
 [[nodiscard]] LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int depth);
 
 // The rank of an n-gram volume for a model (lower is better): its own table first, then FP8, NVFP4,
-// IQ4_NL and BF16; nullopt when the model cannot read it.
+// IQ4_NL, BF16 P12 and BF16; nullopt when the model cannot read it.
 [[nodiscard]] std::optional<int> ngram_rank(const ScannedModel& model, const ScannedNgramVolume& volume);
 
 // Parses one artifact entry's directory JSON into a model or drafter (exposed for tests). `path` is
