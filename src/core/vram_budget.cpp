@@ -225,6 +225,16 @@ public:
         }
 #endif
         (void)nvml_->memory_info(out.physical_used, out.physical_free);
+        // Free memory never exceeds what NVML finds free over every process: the OS budget does not see another
+        // process's VRAM, so past the budget (whose allowance is the card's usable memory less the budget, read
+        // once) the budget less this process's usage counted other programs' memory as this process's to take
+        // (2026-11-20, RTX 5090, headless: 25,221 MiB free against NVML's 25,052 with 534 MiB used by others; the
+        // expert frames then left ~180 MiB of the card free, and VRAM pressure from another program put the W4A4
+        // row-pair decode into a slow state that outlasted the process). Startup sizing, the frames' growth and
+        // the pressure check all read it here.
+        if (out.physical_free != 0 && out.physical_free < out.device_free) {
+            out.device_free = static_cast<std::size_t>(out.physical_free);
+        }
         const int active = nvml_->display_active();
         if (out.outputs > 0 || active == 1) {
             out.display = DisplayState::Attached;

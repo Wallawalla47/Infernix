@@ -977,7 +977,11 @@ startup
   - The engine measures this allowance at startup: physical memory less the reserve, less the
     budget, less a 128 MiB margin. It reports it in the ledger (`… in use before loading (640 MiB
     past the OS budget)`).
-  - If Windows lowers the budget later, the cache shrinks by the same amount.
+  - It never takes other programs' memory: free VRAM is at most what NVML finds free over every
+    process, at startup and later (until 2026-11-20 the allowance could count the desktop's and other
+    programs' VRAM as free, about 70-170 MiB on a headless RTX 5090).
+  - If Windows lowers the budget later, or another program takes VRAM, the cache shrinks by the same
+    amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
   - Measured on an RTX 5090 (2026-10-30, greedy 500-token decodes, three runs a side,

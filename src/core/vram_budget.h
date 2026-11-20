@@ -20,7 +20,8 @@ enum class DisplayState : std::uint8_t {
 
 struct VramSnapshot {
     // cudaMemGetInfo (device-wide under WDDM); under WDDM with a DXGI budget, past the budget or with
-    // several CUDA devices visible, the budget less this process's usage instead.
+    // several CUDA devices visible, the budget less this process's usage instead. At most physical_free
+    // where NVML reads it: other programs' memory is never counted as free.
     std::size_t device_free  = 0;
     std::size_t device_total = 0;
     // Windows WDDM: this process's local-memory budget and usage (DXGI QueryVideoMemoryInfo).
@@ -47,9 +48,9 @@ struct VramSnapshot {
     // size, often half of RAM (80 % on that machine); the NON_LOCAL budget is not the limit.
     std::uint64_t shared_system  = 0;
     std::uint64_t nonlocal_usage = 0;
-    // NVML (nvmlDeviceGetMemoryInfo_v2): the device's memory in use and free over every process, 0 unknown. For the
-    // sizing and ledger lines only, no sizing reads them: under WDDM neither the budget nor cudaMemGetInfo moved
-    // while another process held 3 GiB (RTX 5090, 2026-11-17, issue #68), NVML did.
+    // NVML (nvmlDeviceGetMemoryInfo_v2): the device's memory in use and free over every process, 0 unknown. Under
+    // WDDM neither the budget nor cudaMemGetInfo moved while another process held 3 GiB (RTX 5090, 2026-11-17, issue
+    // #68), NVML did; the source caps device_free at physical_free (since 2026-11-20).
     std::uint64_t physical_used = 0;
     std::uint64_t physical_free = 0;
 };
@@ -74,7 +75,9 @@ public:
 // budget - kPastBudgetMargin, and reports budget + allowance as the budget and free memory derived
 // from it, as cudaMemGetInfo derives it (budget - usage). A later budget cut by the OS lowers the
 // effective budget by the same amount. Memory past the budget may be demoted to system memory
-// when another program needs VRAM. Without DXGI or NVML the allowance is 0.
+// when another program needs VRAM. Without DXGI or NVML the allowance is 0. Free memory stays at most
+// what NVML finds free over every process (VramSnapshot::device_free), so the allowance never takes
+// another program's memory.
 inline constexpr std::uint64_t kPastBudgetMargin = 128ULL << 20;
 [[nodiscard]] std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget = false);
 
