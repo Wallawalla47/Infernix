@@ -69,7 +69,8 @@ DeviceContext initialize_device(const EngineOptions& options, bool start) {
     if (const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, stack); err != cudaSuccess) {
         throw std::runtime_error(std::string("cudaDeviceSetLimit(cudaLimitStackSize) failed: ") + cudaGetErrorString(err));
     }
-    if (start) {
+    if (start && !ops::kernel_images_beside_weights()) {
+        // (By default a start reads them beside its weight read instead, after its RAM plan: ops::KernelImagesLoad.)
         // The first kernel launch reads the kernel images into RAM (ops/kernel_images.h). Launched here, before the RAM plans read
         // the host's free memory, they see it used: a launch after them left Qwen3.8-Flash-Next and the 122B 2.4-3.8 GiB
         // short of the RAM their plans left free, and an automatic Host prefix tier pinned that RAM while Windows moved

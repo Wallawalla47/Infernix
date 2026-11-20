@@ -18,6 +18,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/engine_plan.h"
 #include "runtime/engine/expert_memory.h"
+#include "infernix/ops/kernel_images.h"
 #include "runtime/expert_offload/drafter_pool.h"
 #include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/memory_plan.h"
@@ -1203,9 +1204,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         spill->begin();
     }
     if (plan_only && !pinned_refusal.empty()) { plan_refuse(*planned, std::move(pinned_refusal)); }
+    // The kernel images load beside the weights: the RAM plan above counted them as the process's growth.
+    std::optional<ops::KernelImagesLoad> kernel_images;
+    if (!plan_only) { kernel_images.emplace(device.device); }
     auto model = plan_only ? models::qwen3_5::plan_model(std::move(plan))
                           : models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
+    if (kernel_images) { report_kernel_images(options, kernel_images->finish()); }
     if (spill) {
         // The upload's staging slots count as page-locked too: they are released before this reading, but a
         // release the OS has not yet taken off the process's use must not read as a spill.
