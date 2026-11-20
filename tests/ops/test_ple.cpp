@@ -29,6 +29,7 @@
 #include <cstring>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -156,6 +157,10 @@ std::uint16_t decode_p12_row(const std::uint8_t* row, int width, int j) {
 // ple_embed_bf16_p12 against decode_p12_row: zeros, negative zero, subnormals, an in-window row, rows
 // with one and four escapes, a row whose sign and every mantissa bit must survive, and random rows.
 void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) {
+    constexpr int kSpecialRows = 7; // before the random fill: zero, -0, subnormal, window, 1/4 escapes, sign
+    if (heads * columns < kSpecialRows) {
+        throw std::invalid_argument("ple_embed_bf16_p12 needs at least " + std::to_string(kSpecialRows) + " rows");
+    }
     const std::string label = "ple_embed_bf16_p12 W=" + std::to_string(width) + " heads=" + std::to_string(heads) +
                               " T=" + std::to_string(columns);
     const int row_bytes = width + width / 2 + 16;
@@ -420,7 +425,7 @@ INFERNIX_OP_TEST(ple) {
         // rows, at the real width and at the escape column's largest even width.
         test_embed_bf16_p12(160, 16, 3, 3001);
         test_embed_bf16_p12(160, 4, 5, 3002);
-        test_embed_bf16_p12(254, 2, 2, 3003);
+        test_embed_bf16_p12(254, 3, 3, 3003); // 9 rows: the seven fixed cases plus the random fill
         // Four streams of 2,048 and an odd geometry (H not a multiple of the 256-thread block).
         for (const int columns : {1, 4, 33}) { test_gate(4, 2048, columns, 100U + columns); }
         test_gate(2, 300, 5, 150);
