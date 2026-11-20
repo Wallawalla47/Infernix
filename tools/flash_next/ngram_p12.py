@@ -6,8 +6,10 @@
     python3 -m tools.flash_next.ngram_p12 --source BF16.ngram --out P12.ngram --stats
 
 SOURCE is an Infernix BF16 n-gram volume (the engine's own layout: a 4 KiB header, then 4 KiB
-blocks of whole rows; Qwen3.8-Flash-Next's is row_bytes=320, 12 rows per block, tag 3 = BF16). The
-header's rows and row_bytes are read, never assumed; a BF16 source must hold 12 rows per block.
+blocks of whole rows; Qwen3.8-Flash-Next's is row_bytes=320, 12 rows per block, tag 3 = BF16). An
+untagged volume (tag 0) whose rows are an even number of bytes is accepted as BF16, as the engine
+resolves it by row size; the published Qwen3.8-Flash-Next BF16 volume is untagged. The header's rows
+and row_bytes are read, never assumed; a BF16 source must hold 12 rows per block.
 
 Each BF16 row of W values becomes W + W / 2 + 16 bytes:
 
@@ -290,8 +292,11 @@ def histogram_dict(histogram: np.ndarray) -> dict:
 
 
 def require_bf16_source(source: Volume, action: str) -> None:
-    if source.tag != TAG_BF16:
-        raise ValueError(f"{source.path}: {action} needs a BF16 volume (tag 3), this one is {source.format}")
+    # The engine resolves an untagged volume (tag 0) by its row size, where BF16 rows are the first
+    # inference; accept an even-sized untagged row as BF16 the same way.
+    if not (source.tag == TAG_BF16 or (source.tag == 0 and source.row_bytes % 2 == 0)):
+        raise ValueError(f"{source.path}: {action} needs a BF16 volume (tag 3, or untagged even-sized rows), "
+                         f"this one is {source.format} with {source.row_bytes}-byte rows")
     if source.rows_per_block != 12:
         raise ValueError(f"{source.path}: a BF16 source must hold 12 rows per block, this one holds "
                          f"{source.rows_per_block}")
