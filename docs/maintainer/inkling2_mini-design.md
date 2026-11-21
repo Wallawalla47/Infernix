@@ -395,11 +395,12 @@ from the first implementation.
 Its lead over this design's first builds is the artifact (fewer bytes a token, not the trained arithmetic) and the
 routes this design has not built yet (prefill, DSpark, prefix reuse, vision, structured output); per byte its decode
 moves less than this design's (~0.64 TB/s against ~0.85 TB/s effective, estimates from its reported rate on another
-RTX 5090 and this design's 158.5 tok/s at 4K, measured with the clocks stuck at P1 after an nsys run).
+RTX 5090 and this design's 158.5 tok/s at 4K, measured with the clocks held high after an nsys run: P0/P1, SM 2400 MHz, even when idle; the forward test's
+captured round, not an end-to-end rate).
 
 | Idea | Source | Use here |
 |---|---|---|
-| At ≤ 16 rows a depth mix or residual update spreads each row over one-warp blocks; each block keeps its warp's sums and every reader adds them in the one-block kernel's warp order, so the values are the one-block kernel's bits (with batched controllers and a sorted route: decode 88.9 → 111.4 tok/s on an RTX 3090) | `kernels.cu` `mix_split_terms_kernel` / `mix_split_rows_kernel`, `residual_split_kernel` | the visit kernels run one CTA a column; the pinned order (288 groups, bfly32, a fold over 9 warps) allows the same split with one-warp blocks of 256 channels. Measured, not built (2026-11-21, `infernix_inkling2_visit_bench` at T = 1 launched one warp wide): one warp's share takes 0.60-0.86× the 288-thread CTA's time, ~0.23 ms a 6.3 ms round in all, but a split mix needs every block's partial sums before its weighted sum, so it adds a dependent launch per mix (two a visit), and a dependent launch with almost no work costs ~3.1-3.7 µs here: ~0.29 ms added against ~0.23 ms saved |
+| At ≤ 16 rows a depth mix or residual update spreads each row over one-warp blocks; each block keeps its warp's sums and every reader adds them in the one-block kernel's warp order, so the values are the one-block kernel's bits (with batched controllers and a sorted route: decode 88.9 → 111.4 tok/s on an RTX 3090) | `kernels.cu` `mix_split_terms_kernel` / `mix_split_rows_kernel`, `residual_split_kernel` | the visit kernels run one CTA a column; the pinned order (288 groups, bfly32, a fold over 9 warps) allows the same split with one-warp blocks of 256 channels. Probed, not built (2026-11-21, `infernix_inkling2_visit_bench` at T = 1 launched one warp wide): one warp's share takes 0.60-0.86× the 288-thread CTA's time, so the split's ceiling is ~0.23 ms of a 6.3 ms round. A split mix needs every block's partial sums before its weighted sum. As two launches a mix (NInfer-all's form) it would add ~0.29 ms (an estimate: 96 launches at the ~3.1-3.7 µs a near-empty `gate_exit` takes here, not a measured empty dependent launch). One launch whose blocks of a column exchange the partials through global memory (an arrival count and a wait, as the MoE's last CTA does) is not costed; it is the form to try, worth at most the ceiling less the exchanges |
 | A sliding visit's prefill attends over a staging ring: the window before the chunk copied in, the chunk's keys appended, the window that ends the chunk copied back to the sequence's ring | `executor.cpp` `visit()` (`ring_copy`, `prefill_ring`) | the M8 prefill route over the StateImage's 17-page window ring ([§9.3](#93-prefill)) |
 | A named tool choice forced by the prompt: it ends with `<|message_model|>NAME<|content_invoke_tool_json|>`, the turn resumes inside the call's JSON and the decoder starts in it | `inkling_output.h` `InklingToolCallDecoder` | needs the tool choice at preparation (PromptOptions has none today); with it, a required choice of one name needs no grammar |
 | The prompt opens the answer's text block for typed decisions and reranking (the token read is the answer's) | `docs/inkling2.md` | a readout recipe for the frontend, if typed decisions come to this family |
@@ -814,8 +815,12 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   Measured (2026-11-21, inkling2-mini, 4K context, C = 1, each group packed alone against a 6.305 ms round): the head
   saves 0.129 ms (its sweep predicted 0.125), but the K2 parents cost 0.070 ms more, W_o 0.044 ms and the message
   gates 0.269 ms, although the op sweep (each launch on its own cold copy) had K2 at 0.80× and W_o at 0.71× BF16's time
-  at T = 1. Only the head packs (the embedding stays BF16: its gather does not take the packed form yet). Why K2 and
-  W_o lose inside the round is not established.
+  at T = 1. Only the head packs (the embedding stays BF16: its gather does not take the packed form yet); packed, it
+  also saves 1.8 % of the round at 2 columns and 0.7 % at 8. K2's loss is residency: the packed projections kernel
+  takes 153 registers a thread at one column (BF16's 72), so one 8-warp CTA fits an SM instead of three, and (computed
+  from those counts) ~14 % of the matrix loads before the PDL wait instead of ~42 %. With 4-warp CTAs (three an SM; same bits) packed K2 saves 1.1 % at one column but
+  costs 1.6 % at 2 and 4.4 % at 8, the widths of decode at C ≥ 2 and of DSpark's verify, so K2 stays BF16. Why W_o
+  loses is not established.
 - **K2.** A multi-input packed GEMV: row ranges bound to one of three input vectors (one pointer on the 20 pass-1 sliding
   visits, three elsewhere); new tuned routes for Inkling's shapes (`bf16_p12_linear_tuned` registers only measured shapes).
 - **K4.** GEMV 2304 × 3072 (packed or BF16 per M1) with the post-attention conv and residual in the epilogue (each output

@@ -101,6 +101,14 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     std::string template_override;
     auto model = models::inkling2::materialize_model(std::move(plan), device, &options.startup_observer);
+    const auto& packed = model->packed();
+    if (packed.source_bytes != 0) {
+        constexpr double kMiB = 1024.0 * 1024.0;
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                           "packed BF16 weights: %zu matrices, %.0f MiB -> %.0f MiB (bf16_p12, %llu escapes) in %.0f ms",
+                           packed.parents.size(), packed.source_bytes / kMiB, packed.storage.bytes / kMiB,
+                           static_cast<unsigned long long>(packed.escapes), packed.seconds * 1000.0);
+    }
     EngineOptions resolved = options;
     auto instance          = std::make_unique<Inkling2Instance>(std::move(model), resolved);
     if (!options.chat_template_path.empty()) {
@@ -126,6 +134,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"bf16", "fp32", "nvfp4_mul", "fp8_e4m3fn_g32_e8m0"};
+    if (instance->model->packed().source_bytes != 0) { summary.weight_formats.push_back("bf16_p12"); }
     summary.fast_paths_disabled  = !options.fast_paths;
     summary.request_invariant    = true; // every route is column-invariant and the decode rows independent
 
