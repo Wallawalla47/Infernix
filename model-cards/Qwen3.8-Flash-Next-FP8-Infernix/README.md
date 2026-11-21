@@ -56,6 +56,7 @@ This is the most accurate Flash-Next artifact for Infernix, and the slowest: see
 | `Qwen3.8-Flash-Next-FP8-Infernix-00004-of-00005.infernix` | 32,000,000,000 | model, part 4 of 5 |
 | `Qwen3.8-Flash-Next-FP8-Infernix-00005-of-00005.infernix` | 4,689,672,704 | model, part 5 of 5 |
 | `Qwen3.8-Flash-Next-BF16.ngram` | 109,227,196,416 | PLE n-gram volume: Qwen's BF16 table (read in random 4 KiB blocks) |
+| `Qwen3.8-Flash-Next-BF16-P12.ngram` | 81,920,397,312 | the same BF16 table packed losslessly (BF16 P12): same output, three quarters of the space |
 | `Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix.conversion.json` | 799,119 | conversion report: sources, methods and formats per object |
 | `config.json` | | metadata only, so the Hub counts downloads; Infernix does not read it |
 | `LICENSE`, `NOTICE` | | the Qwen Community License 1.0; attribution and changes |
@@ -83,18 +84,22 @@ in the model's folder by themselves when no `--spec` is given. See the drafter's
 
 Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is not in the model files: it is a
 separate volume, read in random 4 KiB blocks from an NVMe drive (or held in RAM when it fits) and
-passed with `--ngram-volume`. Three volumes of the table exist, one per row format, and any of them
+passed with `--ngram-volume`. Five volumes of the table exist, one per row format, and any of them
 runs any Qwen3.8-Flash-Next model. **The FP8 volume is the recommended one.**
 
 | Table | File | Bytes | Download from |
 |---|---|---:|---|
 | **FP8**, one scale for the table (NVIDIA's), **recommended** | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram), or the identical copy in [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) |
 | BF16, unquantized (Qwen's) | `Qwen3.8-Flash-Next-BF16.ngram` | 109,227,196,416 | this repository |
+| BF16 P12, the BF16 values bit for bit in 12.8 bits each | `Qwen3.8-Flash-Next-BF16-P12.ngram` | 81,920,397,312 | this repository |
+| NVFP4, 4.5 bits per value (NVIDIA FP4-Local's) | `Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram` | 29,127,258,112 | [Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram) |
 | IQ4_NL, 4.5 bits per value (ISTA-DASLab's GSQ-RCO GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram` | 29,127,258,112 | [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix/blob/main/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram) |
 
 ```text
 hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
 hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16-P12.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram --local-dir <nvme dir>
 hf download Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram --local-dir <nvme dir>
 ```
 
@@ -102,11 +107,13 @@ One copy of a volume serves every Flash-Next model.
 
 This artifact was converted with the BF16 table, the one in this repository: with it the PLE uses
 Qwen's BF16 values unrounded, the whole main model is bit-exact to Qwen's checkpoint, and the
-[Quality](#quality) and [Performance](#performance) figures below were measured with it. The FP8
-and IQ4_NL tables round those values (FP8 with one scale for the whole table, IQ4_NL to 4.5 bits per
-value); their effect on this model has not been measured. On a 96 GB machine no table fits in RAM
-beside this model's experts, so each is read from the drive. Older Infernix builds run this
-artifact with the BF16 volume only.
+[Quality](#quality) and [Performance](#performance) figures below were measured with it. The FP8,
+NVFP4 and IQ4_NL tables round those values (FP8 with one scale for the whole table, NVFP4 and IQ4_NL
+to 4.5 bits per value); their effect on this model has not been measured. The BF16 P12 volume, also in this
+repository, holds the BF16 table's values bit for bit in three quarters of the space, so it gives the
+same output as the BF16 volume; Infernix reads it from `main` at `fed37c0e` (a release after
+`windows-2026.11.20`). On a 96 GB machine no table fits in RAM beside this model's experts, so each
+is read from the drive. Older Infernix builds run this artifact with the BF16 volume only.
 
 ## What is bit-exact and what is quantized
 
@@ -143,7 +150,7 @@ tensors are listed, not compared).
   table is read from its volume.
 - **Disk:** ~133 GB for the artifact on a fast NVMe drive (the SSD tier reads from it), plus an
   n-gram volume on an NVMe drive: 52 GB for the recommended FP8 table, 109 GB for this repository's
-  BF16 one.
+  BF16 one or 82 GB for its BF16 P12 packing.
 - **Engine:** [Infernix](https://github.com/Wallawalla47/Infernix) (Windows or Linux).
 
 ## Run
@@ -165,7 +172,8 @@ needs that memory. Infernix builds from 2026-10-31 speculate even without `--spe
 with DFlash2 when its drafter is the only one in the model's folder, else with MTP.
 
 The command uses the recommended FP8 n-gram table; for the bit-exact BF16 table, with which the
-figures below were measured, pass `--ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram` instead.
+figures below were measured, pass `--ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram` instead
+(or `Qwen3.8-Flash-Next-BF16-P12.ngram`, which gives the same output).
 
 N-gram copy drafts (`--ngram-draft-tokens 7`) speed up highly repetitive text (the benchmark row
 below) but made no difference in a replayed agentic coding workload, so the command leaves them

@@ -731,7 +731,15 @@ and its exponent as a 4-bit offset from the row's base; a value whose exponent l
 of Qwen's table fits: 98.4 % need no escape and the rest at most three. The PLE decodes the rows to
 their exact BF16 values, so an artifact gives the same output with the BF16 P12 volume as with the
 BF16 volume, on every route (NVIDIA NVFP4 Dense8 gave the same tokens with either volume on the
-reproducible, default and lossless routes). Pack it from a BF16 volume and check every row:
+reproducible, default and lossless routes). The volume packed from Qwen's table is published beside
+the BF16 volume:
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16-P12.ngram --local-dir <fast drive>
+```
+
+Its SHA-256 is `70d19c5666a74f44604143aa947c7ac4b6f6fda7ae275463dea31cbbb9ce5abb`. To make it from a
+BF16 volume instead and check every row:
 
 ```text
 python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --census

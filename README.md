@@ -722,7 +722,7 @@ in 8 bits (`--spec dflash2 --draft-model FILE --draft-tokens auto`), 8-11 % fast
 context, INT8 KV) FP8 scores 3.487, NVIDIA NVFP4 Dense8 3.508 and IQ3_S 3.522.
 
 Every conversion also needs a PLE n-gram volume (`--ngram-volume`) on an NVMe drive. Any of the
-four runs any conversion; **the FP8 volume is recommended**, except for the two FP4-Local
+five runs any conversion; **the FP8 volume is recommended**, except for the two FP4-Local
 conversions (NVIDIA's and Huihui's), which store NVIDIA FP4-Local's NVFP4 table and recommend its
 volume:
 
@@ -730,6 +730,7 @@ volume:
 |---|---|---:|---|
 | [`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) (**recommended**) | FP8, one scale (NVIDIA's) | 52,429,058,048 | [NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix), copy in [Dense8](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) |
 | [`Qwen3.8-Flash-Next-BF16.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16.ngram) | BF16 (Qwen's) | 109,227,196,416 | [FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) |
+| [`Qwen3.8-Flash-Next-BF16-P12.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16-P12.ngram) | BF16 P12: the BF16 values bit for bit in 12.8 bits each | 81,920,397,312 | [FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) |
 | [`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix/blob/main/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram) | IQ4_NL, 4.5 bits (the GGUF's) | 29,127,258,112 | [GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) |
 | [`Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram) (**recommended for the FP4-Local conversions**) | NVFP4, 4.5 bits (NVIDIA FP4-Local's) | 29,127,258,112 | [NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix) |
 
@@ -739,8 +740,10 @@ Swift and NVFP4-QAD repositories carry none
 ([n-gram table formats](docs/qwen3_8-flash-next.md#n-gram-table-formats)). IQ3_S and FP8 need
 Infernix `windows-2026.10.18` or later, the uncensored conversion `windows-2026.10.09.2`, the
 NVFP4-QAD conversions `main` at `eac2b3d8` or later (a release after `windows-2026.11.07`), the DFlash2
-drafter a build whose `--help` lists `--draft-model`; older builds accept only an artifact's own
-n-gram table or BF16.
+drafter a build whose `--help` lists `--draft-model`, the BF16 P12 volume `main` at `fed37c0e` or later
+(a release after `windows-2026.11.20`); older builds accept only an artifact's own n-gram table or BF16.
+The BF16 P12 volume gives the same output as the BF16 one in three quarters of the space; it reads as
+many blocks per token ([BF16 P12](docs/qwen3_8-flash-next.md#bf16-p12-n-gram-table)).
 
 ### Qwen3.8-27B
 

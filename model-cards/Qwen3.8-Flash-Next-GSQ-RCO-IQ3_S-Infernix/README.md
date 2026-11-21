@@ -78,18 +78,22 @@ in the model's folder by themselves when no `--spec` is given. See the drafter's
 
 Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is not in the model files: it is a
 separate volume, read in random 4 KiB blocks from an NVMe drive (or held in RAM when it fits) and
-passed with `--ngram-volume`. Three volumes of the table exist, one per row format, and any of them
+passed with `--ngram-volume`. Five volumes of the table exist, one per row format, and any of them
 runs any Qwen3.8-Flash-Next model. **The FP8 volume is the recommended one.**
 
 | Table | File | Bytes | Download from |
 |---|---|---:|---|
 | **FP8**, one scale for the table (NVIDIA's), **recommended** | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram), or the identical copy in [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) |
 | BF16, unquantized (Qwen's) | `Qwen3.8-Flash-Next-BF16.ngram` | 109,227,196,416 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16.ngram) |
+| BF16 P12, the BF16 values bit for bit in 12.8 bits each | `Qwen3.8-Flash-Next-BF16-P12.ngram` | 81,920,397,312 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16-P12.ngram) |
+| NVFP4, 4.5 bits per value (NVIDIA FP4-Local's) | `Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram` | 29,127,258,112 | [Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram) |
 | IQ4_NL, 4.5 bits per value (ISTA-DASLab's GSQ-RCO GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram` | 29,127,258,112 | this repository |
 
 ```text
 hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
 hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16-P12.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram --local-dir <nvme dir>
 hf download Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram --local-dir <nvme dir>
 ```
 
@@ -98,10 +102,12 @@ One copy of a volume serves every Flash-Next model.
 This artifact was converted with the IQ4_NL table, the one in this repository (the GGUF's own rows,
 byte for byte), and the [Quality](#quality) and [Performance](#performance) figures below were
 measured with it held in RAM. With the BF16 table perplexity measured slightly better (3.5198
-against 3.5223); the FP8 table has not been measured on this model. On a 96 GB machine only the
-IQ4_NL table (27.1 GiB) fits in RAM beside the experts; the FP8 (48.8 GiB) and BF16 (101.7 GiB)
-tables are read from the drive. Older Infernix builds run this artifact with the IQ4_NL and BF16
-volumes only.
+against 3.5223), and the BF16 P12 volume gives the BF16 volume's output in three quarters of the
+space; the FP8 and NVFP4 tables have not been measured on this model. On a 96 GB machine the IQ4_NL
+table (27.1 GiB) fits in RAM beside the experts; the FP8 (48.8 GiB), BF16 P12 (76.3 GiB) and BF16
+(101.7 GiB) tables are read from the drive.
+Older Infernix builds run this artifact with the IQ4_NL and BF16 volumes only; the BF16 P12 volume
+needs `main` at `fed37c0e` or later (a release after `windows-2026.11.20`).
 
 ## What is bit-exact and what is quantized
 
