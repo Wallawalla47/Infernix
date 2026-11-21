@@ -584,6 +584,24 @@ bool graph_replay(const m::Parameters& p, m::Forward& fw, State& state, const Re
             std::printf("graph replay %d of a %d-column call at position %d: %s\n", replay + 1, width, c0,
                         same ? "the eager logits bit for bit" : "DIFFERENT");
         }
+        if (std::getenv("INFERNIX_INKLING2_TIME") != nullptr) {
+            // Diagnostic: the captured call's time (the same positions replayed; not a qualified measurement).
+            cudaEvent_t start = nullptr, stop = nullptr;
+            cuda(cudaEventCreate(&start), "event");
+            cuda(cudaEventCreate(&stop), "event");
+            for (int i = 0; i < 20; ++i) { cuda(cudaGraphLaunch(exec, stream), "warm"); }
+            constexpr int kRuns = 100;
+            cuda(cudaEventRecord(start, stream), "event");
+            for (int i = 0; i < kRuns; ++i) { cuda(cudaGraphLaunch(exec, stream), "time"); }
+            cuda(cudaEventRecord(stop, stream), "event");
+            cuda(cudaEventSynchronize(stop), "event");
+            float ms = 0;
+            cuda(cudaEventElapsedTime(&ms, start, stop), "event");
+            std::printf("  captured %d-column call: %.3f ms a call (%.1f columns/s)\n", width, ms / kRuns,
+                        1000.0 * width * kRuns / ms);
+            cuda(cudaEventDestroy(start), "event");
+            cuda(cudaEventDestroy(stop), "event");
+        }
         cuda(cudaGraphExecDestroy(exec), "destroy");
         cuda(cudaGraphDestroy(graph), "destroy");
         state.restore();

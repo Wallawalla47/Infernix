@@ -514,17 +514,17 @@ per visit:  [attention mixer] → [projection q,k,v,r,gate,sink(,taps)] → [att
 
 | Area | Location | Notes |
 |---|---|---|
-| Config, binding, read-only model | `src/models/inkling2_loop/config.*`, `load/`, `model.*` | parses `text_config.loop_config`, `mtp_config`, `vision_config`; rejects configs the Ops do not cover |
-| Native parameters, fixed calls | `src/models/inkling2_loop/execution/` | `visit.cpp` (one visit), `loop.cpp` (pass driver, messages), `moe.cpp`, `head.cpp`, `dspark.cpp`, `vision_tower.cpp`, `forward_lossless.cpp` |
-| Program | `src/models/inkling2_loop/program/` | planning, stores, transactions, graphs, prefix binding; implements `runtime::EngineProgramContract` |
-| State layout | `src/models/inkling2_loop/state/` | StateImage parts ([§7.2](#72-stateimage)) |
-| Frontend | `src/models/inkling2_loop/frontend/` | pre-tokenizer and pipeline validation, renderer, output session, image preprocessing |
+| Config, binding, read-only model | `src/models/inkling2/config.*`, `load.*`, `model.h`, `weights.h` | parses `text_config.loop_config`, `mtp_config`, `vision_config`; rejects configs the Ops do not cover |
+| Native parameters, fixed calls | `src/models/inkling2/execution/` | built: `parameters.*` (the native operands), `forward.*` (one call: embed, the 48 visits with the pass restarts and messages, the head; the StateImage layout); planned: `dspark.cpp`, `vision_tower.cpp`, `forward_lossless.cpp` |
+| Program | `src/models/inkling2/program/` | planning, stores, transactions, graphs, prefix binding; implements `runtime::EngineProgramContract` |
+| State layout | `src/models/inkling2/execution/forward.h` (`state_layout`) | StateImage parts ([§7.2](#72-stateimage)) |
+| Frontend | `src/models/inkling2/frontend/` | renderer, output session, image preprocessing (the pre-tokenizer is the shared core's `Inkling` pipeline) |
 | Shared BPE core | `src/text/tokenizer.{h,cpp}` (moved from `qwen3_5/frontend/`) | the byte-level BPE tokenizer with two fixed pipelines (`TokenizerPipeline::Qwen`: NFC and Qwen's split; `Inkling`: no normalizer, the o200k-style split with case classes, `ignore_merges`), each pipeline's description in `tokenizer.json` checked against it. Two explicit consumers justify the move |
-| Ops | `src/ops/relbias_attention/`, `src/ops/w4a4_sparse_moe/`, `src/ops/attn_res_mix/`, `src/ops/short_conv/`; contracts in `include/infernix/ops/` | [§9](#9-attention-ops)-[§12](#12-residual-mixing-message-gates-and-short-convolutions) |
+| Ops | `src/ops/w4a4_sparse_moe/`; `src/ops/inkling2/` (`visit.cu`: the mixers, message gates, short convs and the experts' rows fused at the K1/K4-K5 boundaries of [§8.2](#82-the-visit-chain); `attention.cu`: the attention prologue and decode/verify attention); contracts `include/infernix/ops/{w4a4_sparse_moe,inkling2_visit,inkling2_attention}.h` | [§9](#9-attention-ops)-[§12](#12-residual-mixing-message-gates-and-short-convolutions); the fused kernels made separate `attn_res_mix`/`short_conv` Ops unnecessary |
 | Kernel cores reused | `ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh`, `narrow_rows_a4.cuh`, `wide_expert.cuh`; `ops/linear/bf16_p12/`; `ops/common/{rowsplit_ring,mbarrier,mma}.cuh`; `ops/kernel/sampling.cuh` | the expert cores move to `ops/common/` once two Ops use them; the offloaded Op keeps its planning |
 | Runtime reuse | `src/runtime/prefix_cache/`, `src/runtime/speculative/` (calibrated length), Scheduler, EngineCore | model-agnostic, unchanged |
 | Converter | `tools/convert/inkling2_loop.py` + recipe `inkling2_mini` | [§18](#18-artifact-and-conversion) |
-| Tests | `tests/ops/` per Op; `tests/models/inkling2_loop/` | [§16](#16-numerics-and-qualification) |
+| Tests | `tests/ops/` per Op; `tests/models/inkling2/` | [§16](#16-numerics-and-qualification) |
 
 The Qwen3.5 Program is not extended: the state (window rings instead of GDN state, 48 visits) and the forward differ
 throughout, and the rule is explicit implementations per supported architecture.
