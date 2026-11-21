@@ -43,25 +43,44 @@ inline constexpr std::int32_t kRelativeExtent         = 1024;
 inline constexpr std::int32_t kWindow                 = 1024;
 inline constexpr std::int32_t kKeyUnit                = 64;  // a unit of keys: one KV page
 inline constexpr std::int32_t kWindowRingPages        = 17;  // a sliding visit's ring: 17 pages, 1088 positions
-inline constexpr std::int32_t kSlidingSplits          = 18;  // the units a lane's columns can touch
+inline constexpr std::int32_t kSlidingSplits          = 18;  // the units a group's columns can touch
 inline constexpr std::int32_t kFullSplits             = 32;
-inline constexpr std::int32_t kMaxAttentionLaneColumns = 16;
+inline constexpr std::int32_t kMaxAttentionLaneColumns = 16; // a group's columns
 inline constexpr std::int32_t kMaxAttentionColumns     = w4a4_moe::kMaxColumns;
 inline constexpr std::int32_t kMaxAttentionLanes       = 8;
+// A call's groups: each lane's columns in runs of at most kMaxAttentionLaneColumns.
+inline constexpr std::int32_t kMaxAttentionGroups =
+    kMaxAttentionLanes + kMaxAttentionColumns / kMaxAttentionLaneColumns;
+// The pages of a staging ring that holds a lane's call of up to kMaxAttentionColumns positions and the window before
+// it: the first query's 1023 earlier keys and the call's own, whole pages.
+inline constexpr std::int32_t kStagingRingPages =
+    (kWindow - 1 + kMaxAttentionColumns + 2 * (kKeyUnit - 1)) / kKeyUnit + 1;
 
 // One visit's keys and values: K as BF16 words, V as FP16 words, 64 positions a page of [64][128] per KV head.
-//   sliding (table null): each lane's ring [kKvHeads][kWindowRingPages][64][128] at k (v) + lane * lane_stride
-//            (elements), position p in page (p / 64) % kWindowRingPages;
+//   sliding (table null): each lane's ring [kKvHeads][ring_pages][64][128] at k (v) + lane * lane_stride (elements),
+//            position p in page (p / 64) % ring_pages (the state's ring has kWindowRingPages; a call writing more
+//            than kKeyUnit positions a lane runs over a staging ring of kStagingRingPages, window_copy filling it
+//            from the state's ring before and returning its last positions after);
 //   full: a head-major page pool [kKvHeads][pool_pages][64][128] and each lane's block table row
 //            table[lane * table_stride + p / 64].
 struct KvView {
     std::uint16_t* k             = nullptr;
     std::uint16_t* v             = nullptr;
     std::int64_t lane_stride     = 0;
+    std::int32_t ring_pages      = kWindowRingPages;
     const std::int32_t* table    = nullptr;
     std::int32_t table_stride    = 0;
     std::int64_t pool_pages      = 0;
 };
+
+// Copies positions [from, to) of a lane's sliding K and V from one ring view to another (by position: the views'
+// page counts may differ).
+struct WindowCopyArgs {
+    KvView src, dst;
+    std::int32_t src_lane = 0, dst_lane = 0;
+    std::int32_t from = 0, to = 0;
+};
+void window_copy(const WindowCopyArgs& args, cudaStream_t stream);
 
 // K2's outputs for the call's columns (BF16 [T][width]).
 struct AttentionInputs {
@@ -85,23 +104,25 @@ struct AttentionLayer {
     const std::uint16_t* value_conv     = nullptr;
 };
 
-// Call scratch: the final q and r, the splits' statistics and the per-(lane, KV head) counters (each last CTA resets
+// Call scratch: the final q and r, the splits' statistics and the per-(group, KV head) counters (each last CTA resets
 // its own). Zero the memory once before the first call.
 struct AttentionWorkspace {
     std::uint16_t* q         = nullptr; // [kMaxAttentionColumns][24][128]
     std::uint16_t* r         = nullptr; // [kMaxAttentionColumns][24][16]
     float* stats             = nullptr; // [kMaxAttentionColumns][24][kFullSplits][132]: m, l, -, -, acc[128]
-    std::uint32_t* counters  = nullptr; // [kMaxAttentionLanes][kKvHeads]
+    std::uint32_t* counters  = nullptr; // [kMaxAttentionGroups][kKvHeads]
 };
 [[nodiscard]] std::size_t attention_workspace_bytes();
 [[nodiscard]] AttentionWorkspace carve_attention_workspace(void* base);
 
+// A group is a run of one lane's columns: its rows' arithmetic is the same in any group (it depends only on each row's
+// position and lane), so a lane's columns may split into groups anywhere.
 struct AttentionArgs {
     std::int32_t columns = 0;
-    std::int32_t lanes   = 0;               // the call's lanes (grid), at most kMaxAttentionLanes
-    std::int32_t max_lane_columns = 0;      // the most columns any lane has (sizes the CTA)
+    std::int32_t groups  = 0;               // the call's groups (grid), at most kMaxAttentionGroups; 0: all padding
+    std::int32_t max_group_columns = 0;     // the most columns any group has (sizes the CTA)
     ColumnMap map;
-    const std::int32_t* lane_columns = nullptr; // [lanes][2]: the lane's first column and column count
+    const std::int32_t* groups_columns = nullptr; // [groups][3]: the group's first column, column count and lane
     AttentionInputs in;
     AttentionLayer layer;
     Ring key_ring, value_ring;              // the K and V conv input rings (width 1024)

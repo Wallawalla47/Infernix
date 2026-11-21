@@ -109,13 +109,15 @@ struct DeviceMap {
     int* lane = nullptr;
     int* pos  = nullptr;
     int* first = nullptr;
-    explicit DeviceMap(const Columns& c) : lane(upload(c.lane)), pos(upload(c.pos)), first(upload(c.first)) {}
+    explicit DeviceMap(const Columns& c)
+        : lane(upload(c.lane)), pos(upload(c.pos)), first(upload(c.first)), columns(c.size()) {}
     ~DeviceMap() {
         cudaFree(lane);
         cudaFree(pos);
         cudaFree(first);
     }
-    [[nodiscard]] ik::ColumnMap map() const { return {lane, pos, first}; }
+    int columns = 0;
+    [[nodiscard]] ik::ColumnMap map() const { return {lane, pos, first, columns}; }
 };
 
 // ---------------------------------------------------------------------------- random data

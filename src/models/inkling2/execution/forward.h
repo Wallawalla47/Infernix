@@ -50,7 +50,8 @@ struct StateView {
 
 // One call: each column's token, lane and position (a lane's columns consecutive, positions ascending by 1; lane -1
 // pads), and each lane's first position: where its sequence begins (the first key it attends to), not its first column
-// in this call.
+// in this call. A lane may have up to kMaxForwardColumns columns: every Op gives a column the same bits in any call,
+// so a wide call (prefill) equals single-column calls of the same positions.
 struct CallPlan {
     std::vector<std::int32_t> tokens, lane, position;
     std::vector<std::int32_t> first;
@@ -60,7 +61,14 @@ struct CallPlan {
 
 // The call's device buffers ([columns][width] rows unless stated).
 struct ForwardBuffers {
-    std::int32_t *tokens = nullptr, *lane = nullptr, *position = nullptr, *first = nullptr, *lane_columns = nullptr;
+    std::int32_t *tokens = nullptr, *lane = nullptr, *position = nullptr, *first = nullptr;
+    std::int32_t* groups = nullptr; // [kMaxAttentionGroups][3]: attention's column groups
+    // A wide call's state copies: each lane's conv ring histories ([lanes][history_words], the image's 192 rings at
+    // kHistorySlots rows each) and its sliding visits' staging ring ([lanes][kKvHeads][kStagingRingPages][64][128] K
+    // and V), with the {ring, history, width} descriptors conv_history reads.
+    std::uint16_t* history = nullptr;
+    std::uint16_t *staging_k = nullptr, *staging_v = nullptr;
+    std::int64_t* history_rings = nullptr;
     std::uint16_t *e = nullptr, *h6 = nullptr, *hp = nullptr, *h12[3] = {}, *h18[3] = {};
     float* cand = nullptr;
     std::uint16_t* x[3] = {};
@@ -102,7 +110,8 @@ public:
     void prepare(const CallPlan& call);
     // The same through `staging` (pinned, kUploadWords words, unused by any copy still in flight) on `stream`.
     void upload(const CallPlan& call, std::int32_t* staging, cudaStream_t stream);
-    static constexpr std::size_t kUploadWords = 3 * kMaxForwardColumns + 3 * ops::inkling2::kMaxAttentionLanes;
+    static constexpr std::size_t kUploadWords =
+        3 * kMaxForwardColumns + ops::inkling2::kMaxAttentionLanes + 3 * ops::inkling2::kMaxAttentionGroups;
     void embed(cudaStream_t stream);
     void visit(std::uint32_t visit, const StateView& state, const VisitInputs& in, cudaStream_t stream);
     void visit(std::uint32_t v, const StateView& state, cudaStream_t stream) { visit(v, state, inputs(v), stream); }
@@ -123,20 +132,35 @@ private:
     // the layer's own input).
     [[nodiscard]] ops::inkling2::Blocks blocks(std::uint32_t layer, std::uint32_t pass, bool include_current) const;
     [[nodiscard]] std::uint16_t* tail_out(std::uint32_t visit) const;
-    // Validates the call, fixes its width and returns each attention lane's (first column, count).
+    // Validates the call, fixes its width and lanes, and returns attention's groups ([groups][3]).
     std::vector<std::int32_t> layout_call(const CallPlan& call);
     // Columns [from, from + columns) (-1: through the last) of x through w.
     void project(const std::uint16_t* x, const Weight& w, void* out, bool fp32, cudaStream_t stream,
                  std::int32_t from = 0, std::int32_t columns = -1) const;
-    [[nodiscard]] ops::inkling2::Ring ring(const StateView& s, std::int64_t offset, std::int32_t width) const;
+    // A visit's conv ring (kind: 0 K input, 1 V input, 2 W_o output, 3 MLP output), with its history on a wide call.
+    [[nodiscard]] ops::inkling2::Ring ring(const StateView& s, std::uint32_t visit, int kind) const;
+    [[nodiscard]] ops::inkling2::ColumnMap column_map() const;
+    // A wide call's state copies: the conv ring histories (before visit 0) and a sliding visit's staging ring.
+    void snapshot_history(const StateView& s, cudaStream_t stream) const;
+    void stage_window(const StateView& s, const VisitState& vs, bool in, cudaStream_t stream) const;
+
+    // A lane's columns in the call.
+    struct CallLane {
+        std::int32_t lane = 0, count = 0, position = 0, first = 0; // position: of its first column
+    };
 
     const Parameters& p_;
     const TextConfig& c_;
     StateLayout layout_;
+    std::int64_t history_words_ = 0; // a lane's histories
     std::int32_t max_lanes_ = 0;
     std::int32_t columns_   = 0;
     std::int32_t lanes_     = 0;
-    std::int32_t max_lane_columns_ = 0;
+    std::int32_t groups_    = 0;
+    std::int32_t max_group_columns_ = 0;
+    std::vector<CallLane> call_lanes_;
+    bool wide_conv_   = false; // a lane has more columns than its conv rings can take without a history
+    bool wide_window_ = false; // a lane appends more positions than its window ring can take: staging rings
     DeviceBuffer memory_;
     ForwardBuffers b_;
 };

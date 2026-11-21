@@ -24,8 +24,22 @@ constexpr std::int32_t kKv       = ik::kKvHeads * ik::kHeadDim;
 constexpr std::int32_t kTaps     = ik::kKvHeads * 4;
 constexpr std::int32_t kSlice    = 8; // projection columns a call: the BF16 skinny route, whose column bits never
                                       // depend on the call's width
+constexpr std::int32_t kD        = ik::kHeadDim;
 constexpr std::int64_t ring_words(std::int32_t width) { return std::int64_t{ik::kRingPositions} * width; }
 constexpr std::int64_t kWindowWords = std::int64_t{ik::kKvHeads} * ik::kWindowRingPages * ik::kKeyUnit * ik::kHeadDim;
+
+// A visit's conv rings by kind: 0 the K input, 1 the V input, 2 W_o's output, 3 the MLP output.
+constexpr std::int64_t ring_width(int kind) { return kind < 2 ? kKv : kH; }
+std::int64_t ring_offset(const VisitState& vs, int kind) {
+    const std::int64_t offsets[4] = {vs.key_ring, vs.value_ring, vs.attention_ring, vs.mlp_ring};
+    return offsets[kind];
+}
+// A ring's history within a lane's histories: visit-major, its kHistorySlots rows of each kind in order.
+constexpr std::int64_t history_offset(std::uint32_t visit, int kind) {
+    std::int64_t at = static_cast<std::int64_t>(visit) * (2 * kKv + 2 * kH) * ik::kHistorySlots;
+    for (int k = 0; k < kind; ++k) { at += ring_width(k) * ik::kHistorySlots; }
+    return at;
+}
 
 // The block layout this forward is written for: blocks of 6, the core at 6-17 run 3 times, 24 layers.
 void check_schedule(const TextConfig& c) {
@@ -102,7 +116,13 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes)
     };
     const std::size_t row16 = T * kH * 2;
     add(b_.tokens, T * 4), add(b_.lane, T * 4), add(b_.position, T * 4), add(b_.first, ik::kMaxAttentionLanes * 4);
-    add(b_.lane_columns, 2 * ik::kMaxAttentionLanes * 4);
+    add(b_.groups, 3 * ik::kMaxAttentionGroups * 4);
+    history_words_ = static_cast<std::int64_t>(c_.visits()) * history_offset(1, 0);
+    const std::size_t lanes = static_cast<std::size_t>(max_lanes);
+    const std::size_t staging_words = static_cast<std::size_t>(ik::kKvHeads) * ik::kStagingRingPages * ik::kKeyUnit * kD;
+    add(b_.history, lanes * static_cast<std::size_t>(history_words_) * 2);
+    add(b_.staging_k, lanes * staging_words * 2), add(b_.staging_v, lanes * staging_words * 2);
+    add(b_.history_rings, static_cast<std::size_t>(c_.visits()) * 4 * 3 * 8);
     add(b_.e, row16), add(b_.h6, row16), add(b_.hp, row16);
     for (auto*& h : b_.h12) { add(h, row16); }
     for (auto*& h : b_.h18) { add(h, row16); }
@@ -128,6 +148,14 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes)
     b_.moe          = moe::carve_workspace(moe_base, static_cast<std::int32_t>(c_.experts),
                                            static_cast<std::int32_t>(c_.intermediate));
     b_.attention_ws = ik::carve_attention_workspace(attention_base);
+    // conv_history's descriptors: every visit's four rings.
+    std::vector<std::int64_t> rings;
+    for (std::uint32_t v = 0; v < c_.visits(); ++v) {
+        for (int kind = 0; kind < 4; ++kind) {
+            rings.insert(rings.end(), {ring_offset(layout_.visits[v], kind), history_offset(v, kind), ring_width(kind)});
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(b_.history_rings, rings.data(), rings.size() * 8, cudaMemcpyHostToDevice));
 }
 
 std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
@@ -136,39 +164,54 @@ std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
         call.position.size() != call.tokens.size()) {
         throw std::invalid_argument("inkling2 forward: a call of 1-128 columns over the forward's lanes");
     }
-    std::vector<std::int32_t> lane_columns(2 * ik::kMaxAttentionLanes, 0);
-    std::int32_t widest = 1;
+    std::vector<CallLane> lanes;
+    std::vector<std::int32_t> starts(static_cast<std::size_t>(B), -1);
     for (std::int32_t t = 0; t < T; ++t) {
         const std::int32_t l = call.lane[t];
         if (l < -1 || l >= B) { throw std::invalid_argument("inkling2 forward: a column's lane is outside the call"); }
         if (l < 0) { continue; }
-        if (lane_columns[2 * l + 1] == 0) {
-            lane_columns[2 * l] = t;
+        if (starts[l] < 0) {
+            starts[l] = t;
+            lanes.push_back({l, 0, call.position[t], call.first[l]});
         } else if (call.lane[t - 1] != l || call.position[t] != call.position[t - 1] + 1) {
             throw std::invalid_argument("inkling2 forward: a lane's columns are consecutive at consecutive positions");
         }
-        widest = std::max(widest, ++lane_columns[2 * l + 1]);
+        ++lanes.back().count;
     }
-    if (widest > ik::kMaxAttentionLaneColumns) {
-        throw std::invalid_argument("inkling2 forward: at most 16 columns a lane");
+    // Attention's groups: each lane's columns in runs of at most 16.
+    std::vector<std::int32_t> groups;
+    std::int32_t widest = 1;
+    for (const CallLane& l : lanes) {
+        if (l.first < 0 || l.position < l.first) {
+            throw std::invalid_argument("inkling2 forward: a lane's columns start at or after its first position");
+        }
+        for (std::int32_t done = 0; done < l.count; done += ik::kMaxAttentionLaneColumns) {
+            const std::int32_t count = std::min(ik::kMaxAttentionLaneColumns, l.count - done);
+            groups.insert(groups.end(), {starts[l.lane] + done, count, l.lane});
+            widest = std::max(widest, count);
+        }
     }
-    columns_          = T;
-    lanes_            = B;
-    max_lane_columns_ = widest;
-    return lane_columns;
+    columns_           = T;
+    lanes_             = B;
+    groups_            = static_cast<std::int32_t>(groups.size() / 3);
+    max_group_columns_ = widest;
+    wide_conv_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kMaxLaneColumns; });
+    wide_window_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kKeyUnit; });
+    call_lanes_  = std::move(lanes);
+    return groups;
 }
 
 void Forward::prepare(const CallPlan& call) {
-    const std::vector<std::int32_t> lane_columns = layout_call(call);
+    const std::vector<std::int32_t> groups = layout_call(call);
     const auto copy = [](void* dst, const std::vector<std::int32_t>& src) {
         CUDA_CHECK(cudaMemcpy(dst, src.data(), src.size() * 4, cudaMemcpyHostToDevice));
     };
     copy(b_.tokens, call.tokens), copy(b_.lane, call.lane), copy(b_.position, call.position);
-    copy(b_.first, call.first), copy(b_.lane_columns, lane_columns);
+    copy(b_.first, call.first), copy(b_.groups, groups);
 }
 
 void Forward::upload(const CallPlan& call, std::int32_t* staging, cudaStream_t stream) {
-    const std::vector<std::int32_t> lane_columns = layout_call(call);
+    const std::vector<std::int32_t> groups = layout_call(call);
     std::int32_t* at = staging;
     const auto copy = [&](void* dst, const std::vector<std::int32_t>& src) {
         std::copy(src.begin(), src.end(), at);
@@ -176,7 +219,54 @@ void Forward::upload(const CallPlan& call, std::int32_t* staging, cudaStream_t s
         at += src.size();
     };
     copy(b_.tokens, call.tokens), copy(b_.lane, call.lane), copy(b_.position, call.position);
-    copy(b_.first, call.first), copy(b_.lane_columns, lane_columns);
+    copy(b_.first, call.first), copy(b_.groups, groups);
+}
+
+ik::ColumnMap Forward::column_map() const { return {b_.lane, b_.position, b_.first, columns_}; }
+
+void Forward::snapshot_history(const StateView& s, cudaStream_t stream) const {
+    for (const CallLane& l : call_lanes_) {
+        ik::ConvHistoryArgs h;
+        h.rings    = b_.history_rings;
+        h.count    = static_cast<std::int32_t>(c_.visits()) * 4;
+        h.image    = s.images + static_cast<std::int64_t>(l.lane) * s.lane_words;
+        h.history  = b_.history + static_cast<std::int64_t>(l.lane) * history_words_;
+        h.position = l.position;
+        h.first    = l.first;
+        ik::conv_history(h, stream);
+    }
+}
+
+namespace {
+ik::KvView staging_view(const ForwardBuffers& b) {
+    ik::KvView v;
+    v.k           = b.staging_k;
+    v.v           = b.staging_v;
+    v.ring_pages  = ik::kStagingRingPages;
+    v.lane_stride = std::int64_t{ik::kKvHeads} * ik::kStagingRingPages * ik::kKeyUnit * kD;
+    return v;
+}
+} // namespace
+
+void Forward::stage_window(const StateView& s, const VisitState& vs, bool in, cudaStream_t stream) const {
+    ik::KvView state;
+    state.k           = s.images + vs.window_k;
+    state.v           = s.images + vs.window_v;
+    state.lane_stride = s.lane_words;
+    const ik::KvView staging = staging_view(b_);
+    for (const CallLane& l : call_lanes_) {
+        ik::WindowCopyArgs w;
+        w.src_lane = w.dst_lane = l.lane;
+        if (in) { // the window before the call's first column
+            w.src = state, w.dst = staging;
+            w.from = std::max(l.first, l.position - (ik::kWindow - 1)), w.to = l.position;
+        } else { // the state ring's positions after the call
+            const std::int32_t end = l.position + l.count;
+            w.src = staging, w.dst = state;
+            w.from = std::max(l.first, end - ik::kWindowRingPages * ik::kKeyUnit), w.to = end;
+        }
+        ik::window_copy(w, stream);
+    }
 }
 
 void Forward::embed(cudaStream_t stream) {
@@ -197,8 +287,14 @@ void Forward::project(const std::uint16_t* x, const Weight& w, void* out, bool f
     }
 }
 
-ik::Ring Forward::ring(const StateView& s, std::int64_t offset, std::int32_t width) const {
-    return {s.images + offset, width, s.lane_words};
+ik::Ring Forward::ring(const StateView& s, std::uint32_t visit, int kind) const {
+    ik::Ring r{s.images + ring_offset(layout_.visits.at(visit), kind), static_cast<std::int32_t>(ring_width(kind)),
+               s.lane_words};
+    if (wide_conv_) {
+        r.history             = b_.history + history_offset(visit, kind);
+        r.history_lane_stride = history_words_;
+    }
+    return r;
 }
 
 ik::Blocks Forward::blocks(std::uint32_t layer, std::uint32_t pass, bool include_current) const {
@@ -247,8 +343,9 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     const bool messages       = op.messages && pass > 0;
     const std::int32_t T      = columns_;
     const std::size_t TH      = static_cast<std::size_t>(T) * kH;
-    const ik::ColumnMap map{b_.lane, b_.position, b_.first};
-    const std::uint16_t* h = in.input;
+    const ik::ColumnMap map = column_map();
+    const std::uint16_t* h  = in.input;
+    if (v == 0 && wide_conv_) { snapshot_history(s, stream); } // before the call's first ring write
 
     // K1 (K1a): the previous visit's tail, the attention mix, the norms or the messages.
     ik::EntryArgs e;
@@ -257,7 +354,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     if (v > 0) {
         const std::uint32_t prev = v - 1;
         e.tail     = {b_.experts, b_.cand, p_.layers[c_.visit_layer(prev)].mlp_conv,
-                      ring(s, layout_.visits[prev].mlp_ring, kH)};
+                      ring(s, prev, 3)};
         e.tail_out = in.tail_out;
         e.input    = h == in.tail_out ? nullptr : h;
     } else {
@@ -334,23 +431,36 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     // K3: attention.
     ik::AttentionArgs at;
     at.columns          = T;
-    at.lanes            = lanes_;
-    at.max_lane_columns = max_lane_columns_;
-    at.map              = map;
-    at.lane_columns     = b_.lane_columns;
+    at.groups            = groups_;
+    at.max_group_columns = max_group_columns_;
+    at.map               = map;
+    at.groups_columns    = b_.groups;
     at.in               = {b_.q, b_.r, b_.k, b_.v, b_.sink, b_.gate, op.full ? b_.key_taps : nullptr,
                            op.full ? b_.value_taps : nullptr};
     at.layer            = a.layer;
-    at.key_ring         = ring(s, vs.key_ring, kKv);
-    at.value_ring       = ring(s, vs.value_ring, kKv);
+    at.key_ring         = ring(s, v, 0);
+    at.value_ring       = ring(s, v, 1);
+    const bool staged   = !op.full && wide_window_;
     if (op.full) {
-        at.kv = {s.pool_k.at(vs.full_slot), s.pool_v.at(vs.full_slot), 0, s.table, s.table_stride, s.pool_pages};
+        at.kv.k            = s.pool_k.at(vs.full_slot);
+        at.kv.v            = s.pool_v.at(vs.full_slot);
+        at.kv.table        = s.table;
+        at.kv.table_stride = s.table_stride;
+        at.kv.pool_pages   = s.pool_pages;
+    } else if (staged) {
+        // A lane appending more than a page: its window runs over the staging ring, filled from the state's ring and
+        // returned to it after.
+        stage_window(s, vs, true, stream);
+        at.kv = staging_view(b_);
     } else {
-        at.kv = {s.images + vs.window_k, s.images + vs.window_v, s.lane_words, nullptr, 0, 0};
+        at.kv.k           = s.images + vs.window_k;
+        at.kv.v           = s.images + vs.window_v;
+        at.kv.lane_stride = s.lane_words;
     }
     at.ws  = b_.attention_ws;
     at.out = b_.attention;
     ik::attention(at, stream);
+    if (staged) { stage_window(s, vs, false, stream); }
 
     // K4: W_o; K5 (K5a): its post-attention conv and residual, the MLP mix, norm and the experts' rows.
     project(b_.attention, a.output, b_.o, false, stream);
@@ -360,7 +470,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     m.map      = map;
     m.o        = b_.o;
     m.conv     = op.attention_conv;
-    m.ring     = ring(s, vs.attention_ring, kH);
+    m.ring     = ring(s, v, 2);
     m.h        = h;
     m.boundary = op.boundary;
     m.cand     = b_.cand;
@@ -413,9 +523,9 @@ void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t str
     const std::uint32_t last = c_.visits() - 1;
     ik::FinalArgs f;
     f.columns  = columns_;
-    f.map      = {b_.lane, b_.position, b_.first};
+    f.map      = column_map();
     f.tail     = {b_.experts, b_.cand, p_.layers[c_.visit_layer(last)].mlp_conv,
-                  ring(s, layout_.visits[last].mlp_ring, kH)};
+                  ring(s, last, 3)};
     f.tail_out = in.tail_out;
     f.blocks   = in.blocks;
     f.query    = p_.output_query;

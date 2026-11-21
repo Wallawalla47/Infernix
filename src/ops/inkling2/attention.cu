@@ -31,9 +31,11 @@ namespace {
 
 using detail::Column;
 using detail::column_of;
+using detail::history_row;
 using detail::history_source;
 using detail::ring_row;
 using detail::Source;
+using detail::writes_ring;
 
 constexpr unsigned kAll        = 0xFFFFFFFFU;
 constexpr int kD               = kHeadDim;
@@ -92,9 +94,9 @@ __device__ __forceinline__ float head_sum(const float (&a)[4], const float (&b)[
 // The element offset of a position's row of 128 in a visit's K or V.
 __device__ __forceinline__ std::size_t kv_row(const KvView& kv, int lane, int head, int pos) {
     if (kv.table == nullptr) {
-        const int page = (pos / kKeyUnit) % kWindowRingPages;
+        const int page = (pos / kKeyUnit) % kv.ring_pages;
         return lane * kv.lane_stride +
-               ((static_cast<std::size_t>(head) * kWindowRingPages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
+               ((static_cast<std::size_t>(head) * kv.ring_pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
     }
     const std::int64_t page = kv.table[static_cast<std::int64_t>(lane) * kv.table_stride + pos / kKeyUnit];
     return ((static_cast<std::size_t>(head) * kv.pool_pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
@@ -143,7 +145,7 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
                 for (int j = 0; j < 4; ++j) { x[k][j] = 0.0F; }
                 break;
             case Source::Call: load4(raw + static_cast<std::size_t>(t - k) * kKvWidth + ch, x[k]); break;
-            case Source::Ring: load4(ring_row(ring, col.lane, col.pos - k) + ch, x[k]); break;
+            case Source::Ring: load4(history_row(ring, col.lane, col.pos - k) + ch, x[k]); break;
             }
         }
         float c[4];
@@ -181,7 +183,7 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
             *reinterpret_cast<uint2*>(a.kv.v + at) =
                 make_uint2(std::uint32_t{h[0]} | (std::uint32_t{h[1]} << 16), std::uint32_t{h[2]} | (std::uint32_t{h[3]} << 16));
         }
-        *reinterpret_cast<uint2*>(ring_row(ring, col.lane, col.pos) + ch) = pack4(x[0]);
+        if (writes_ring(a.map, col)) { *reinterpret_cast<uint2*>(ring_row(ring, col.lane, col.pos) + ch) = pack4(x[0]); }
         return;
     }
     // q: scaled, clipped, rounded; full visits times tau, rounded again.
@@ -276,15 +278,16 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __shared__ int range[2];
     __shared__ int last;
-    const int split = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y), lane = static_cast<int>(blockIdx.z);
+    const int split = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y), group = static_cast<int>(blockIdx.z);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, wl = tid & 31;
     const bool full = a.layer.full;
     pdl::enter();
-    const int c0 = a.lane_columns[2 * lane], count = a.lane_columns[2 * lane + 1];
+    const int c0    = a.groups_columns[3 * group], count = a.groups_columns[3 * group + 1];
+    const int lane  = a.groups_columns[3 * group + 2];
     if (count == 0) { return; }
     const int rows  = kGroupHeads * count;
     const int first = a.map.first[lane];
-    const Smem s    = carve(smem_raw, kGroupHeads * a.max_lane_columns);
+    const Smem s    = carve(smem_raw, kGroupHeads * a.max_group_columns);
 
     // Rows: their units of this split.
     const int lane_lo = row_units(full, a.map.position[c0], first).lo;
@@ -489,7 +492,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     __syncthreads();
     if (tid == 0) {
         __threadfence();
-        const unsigned done = atomicAdd(a.ws.counters + lane * kKvHeads + kv, 1U);
+        const unsigned done = atomicAdd(a.ws.counters + group * kKvHeads + kv, 1U);
         last                = done == gridDim.x - 1 ? 1 : 0;
     }
     __syncthreads();
@@ -536,7 +539,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         }
         *reinterpret_cast<uint2*>(a.out + static_cast<std::size_t>(t) * kQWidth + head * kD + 4 * wl) = pack4(out);
     }
-    if (tid == 0) { a.ws.counters[lane * kKvHeads + kv] = 0; }
+    if (tid == 0) { a.ws.counters[group * kKvHeads + kv] = 0; }
 }
 
 // ---------------------------------------------------------------------------- host side
@@ -557,7 +560,7 @@ WorkspaceLayout workspace_layout() {
     l.r        = align256(l.q + std::size_t{kMaxAttentionColumns} * kHeads * kD * 2);
     l.stats    = align256(l.r + std::size_t{kMaxAttentionColumns} * kHeads * kRelDim * 2);
     l.counters = align256(l.stats + std::size_t{kMaxAttentionColumns} * kHeads * kFullSplits * kStatWords * 4);
-    l.total    = align256(l.counters + std::size_t{kMaxAttentionLanes} * kKvHeads * 4);
+    l.total    = align256(l.counters + std::size_t{kMaxAttentionGroups} * kKvHeads * 4);
     return l;
 }
 
@@ -577,12 +580,13 @@ AttentionWorkspace carve_attention_workspace(void* base) {
 }
 
 void attention(const AttentionArgs& a, cudaStream_t stream) {
-    if (a.columns <= 0 || a.columns > kMaxAttentionColumns || a.lanes <= 0 || a.lanes > kMaxAttentionLanes ||
-        a.max_lane_columns <= 0 || a.max_lane_columns > kMaxAttentionLaneColumns) {
-        throw std::invalid_argument("inkling2 attention: 1-128 columns over 1-8 lanes of at most 16 columns each");
+    if (a.columns <= 0 || a.columns > kMaxAttentionColumns || a.groups < 0 || a.groups > kMaxAttentionGroups ||
+        (a.groups > 0 && (a.max_group_columns <= 0 || a.max_group_columns > kMaxAttentionLaneColumns))) {
+        throw std::invalid_argument("inkling2 attention: 1-128 columns in 0-16 groups of at most 16 columns each");
     }
-    if (a.map.lane == nullptr || a.map.position == nullptr || a.map.first == nullptr || a.lane_columns == nullptr) {
-        throw std::invalid_argument("inkling2 attention: the column map and the lanes' columns are needed");
+    if (a.map.lane == nullptr || a.map.position == nullptr || a.map.first == nullptr || a.map.columns != a.columns ||
+        a.groups_columns == nullptr) {
+        throw std::invalid_argument("inkling2 attention: the call's column map and its groups are needed");
     }
     const AttentionInputs& in = a.in;
     if (in.q == nullptr || in.r == nullptr || in.k == nullptr || in.v == nullptr || in.sink == nullptr ||
@@ -596,14 +600,17 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     }
     for (const Ring* ring : {&a.key_ring, &a.value_ring}) {
         if (ring->base == nullptr || ring->width != kKvWidth || !aligned16(ring->base) ||
-            ring->lane_stride < std::int64_t{kRingPositions} * kKvWidth || ring->lane_stride % 8 != 0) {
+            ring->lane_stride < std::int64_t{kRingPositions} * kKvWidth || ring->lane_stride % 8 != 0 ||
+            (ring->history != nullptr && (!aligned16(ring->history) || ring->history_lane_stride % 8 != 0 ||
+                                          ring->history_lane_stride < std::int64_t{kHistorySlots} * kKvWidth))) {
             throw std::invalid_argument("inkling2 attention: the K and V conv rings of width 1024 are needed");
         }
     }
-    constexpr std::int64_t kLaneRing = std::int64_t{kKvHeads} * kWindowRingPages * kKeyUnit * kD;
     if (a.kv.k == nullptr || a.kv.v == nullptr || !aligned16(a.kv.k) || !aligned16(a.kv.v) ||
         (l.full != (a.kv.table != nullptr)) || (l.full && (a.kv.table_stride <= 0 || a.kv.pool_pages <= 0)) ||
-        (!l.full && (a.kv.lane_stride < kLaneRing || a.kv.lane_stride % 8 != 0))) {
+        (!l.full && (a.kv.ring_pages < kWindowRingPages ||
+                     a.kv.lane_stride < std::int64_t{kKvHeads} * a.kv.ring_pages * kKeyUnit * kD ||
+                     a.kv.lane_stride % 8 != 0))) {
         throw std::invalid_argument("inkling2 attention: sliding visits use a ring per lane, full visits a paged pool");
     }
     if (a.ws.q == nullptr || a.ws.stats == nullptr || a.out == nullptr) {
@@ -611,7 +618,8 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     }
     CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(a.columns), kKvHeads), dim3(kPrologueThreads), 0, stream},
                                     prologue_kernel, a));
-    const std::size_t bytes = smem_bytes(kGroupHeads * a.max_lane_columns);
+    if (a.groups == 0) { return; } // every column is padding: the prologue wrote their zero outputs
+    const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns);
     static const bool attribute = [] {
         CUDA_CHECK(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(smem_bytes(kMaxRows))));
@@ -619,8 +627,39 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     }();
     (void)attribute;
     const unsigned splits = l.full ? kFullSplits : kSlidingSplits;
-    CUDA_CHECK(pdl::launch_consumer({dim3(splits, kKvHeads, static_cast<unsigned>(a.lanes)), dim3(kThreads), bytes, stream},
+    CUDA_CHECK(pdl::launch_consumer({dim3(splits, kKvHeads, static_cast<unsigned>(a.groups)), dim3(kThreads), bytes, stream},
                                     attention_kernel, a));
+}
+
+namespace {
+
+// Block (position, KV head): its K row and V row, 16 uint4 each, one a thread.
+__global__ void window_copy_kernel(const WindowCopyArgs a) {
+    const int pos = a.from + static_cast<int>(blockIdx.x), head = static_cast<int>(blockIdx.y);
+    const int i = static_cast<int>(threadIdx.x) % 16, plane = static_cast<int>(threadIdx.x) / 16;
+    const std::size_t s = kv_row(a.src, a.src_lane, head, pos), d = kv_row(a.dst, a.dst_lane, head, pos);
+    const auto* src = reinterpret_cast<const uint4*>((plane == 0 ? a.src.k : a.src.v) + s);
+    auto* dst       = reinterpret_cast<uint4*>((plane == 0 ? a.dst.k : a.dst.v) + d);
+    dst[i]          = src[i];
+}
+
+} // namespace
+
+void window_copy(const WindowCopyArgs& a, cudaStream_t stream) {
+    for (const KvView* v : {&a.src, &a.dst}) {
+        if (v->k == nullptr || v->v == nullptr || v->table != nullptr || !aligned16(v->k) || !aligned16(v->v) ||
+            v->ring_pages < kWindowRingPages || v->lane_stride % 8 != 0 ||
+            v->lane_stride < std::int64_t{kKvHeads} * v->ring_pages * kKeyUnit * kD) {
+            throw std::invalid_argument("inkling2 window_copy: two sliding ring views are needed");
+        }
+    }
+    if (a.from < 0 || a.to < a.from || a.src_lane < 0 || a.dst_lane < 0 ||
+        a.to - a.from > kKeyUnit * std::min(a.src.ring_pages, a.dst.ring_pages)) {
+        throw std::invalid_argument("inkling2 window_copy: positions within both rings are needed");
+    }
+    if (a.to == a.from) { return; }
+    window_copy_kernel<<<dim3(static_cast<unsigned>(a.to - a.from), kKvHeads), 32, 0, stream>>>(a);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace infernix::ops::inkling2

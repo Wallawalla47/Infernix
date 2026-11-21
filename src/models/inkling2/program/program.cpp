@@ -833,8 +833,8 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Inkling 2: max_concurrency must be 1-8");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk > 16) {
-        throw std::invalid_argument("Inkling 2: prefill chunks are 1-16 columns");
+    if (options.prefill_chunk == 0 || options.prefill_chunk > static_cast<std::uint32_t>(kMaxForwardColumns)) {
+        throw std::invalid_argument("Inkling 2: prefill chunks are 1-128 columns");
     }
     const StateLayout layout   = state_layout(config.text);
     const std::uint64_t lanes  = options.max_concurrency;

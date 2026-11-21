@@ -1,7 +1,8 @@
 // Inkling 2's decode and verify attention (include/infernix/ops/inkling2_attention.h), sliding and full visits.
 //
-// One call of 24 columns: lane 0 at positions 1100-1103 (its window starts inside unit 1), lane 1 at 60-75 (crossing
-// a unit boundary, history from position 0), a padding column, lane 2 at 5000 (sliding: a 17-unit window; full: 79
+// One call of 30 columns: lane 0 at positions 1100-1103 (its window starts inside unit 1), lane 1 at 60-81 (crossing
+// a unit boundary, history from position 0; two attention groups of 16 and 6), a padding column, lane 2 at 5000
+// (sliding: a 17-unit window; full: 79
 // units in 27 splits of 3, so the in-split merge runs) and lane 3 at 9000-9001 with its first position 8013 inside
 // its lowest unit (keys and conv history below it masked; full visits' tau above 1). Every earlier position of each lane holds random represented
 // keys (BF16 K, FP16 V of BF16 values) and the conv rings random inputs. Projections are random BF16 of the
@@ -121,7 +122,7 @@ struct Call {
 Call the_call() {
     Call c;
     for (int p = 1100; p < 1104; ++p) { c.lane.push_back(0), c.pos.push_back(p); }
-    for (int p = 60; p < 76; ++p) { c.lane.push_back(1), c.pos.push_back(p); }
+    for (int p = 60; p < 82; ++p) { c.lane.push_back(1), c.pos.push_back(p); } // two groups: 16 + 6 columns
     c.lane.push_back(-1), c.pos.push_back(0);
     c.lane.push_back(2), c.pos.push_back(5000);
     for (int p = 9000; p < 9002; ++p) { c.lane.push_back(3), c.pos.push_back(p); }
@@ -205,7 +206,7 @@ Problem make_problem(bool full, const Call& call, std::uint32_t seed) {
 struct Device {
     std::uint16_t *q, *r, *k, *v, *sink, *gate, *ktaps, *vtaps, *qscale, *rscale, *table, *kconv, *vconv;
     std::uint16_t *kv_k, *kv_v, *kring, *vring, *out;
-    int *block_table, *lane, *pos, *first, *lane_columns;
+    int *block_table, *lane, *pos, *first, *groups;
     void* ws;
 };
 
@@ -216,9 +217,10 @@ struct Outputs {
 
 Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, Device& d) {
     const int T = static_cast<int>(subset.size());
-    std::vector<int> lane, pos, cols(2 * kLanes, 0);
-    int max_lane = 1;
+    std::vector<int> lane, pos, groups;
+    int widest = 1;
     for (int i = 0; i < T; ++i) { lane.push_back(call.lane[subset[i]]), pos.push_back(call.pos[subset[i]]); }
+    // Each lane's columns in groups of at most 16, as the forward splits them.
     for (int l = 0; l < kLanes; ++l) {
         int begin = -1, count = 0;
         for (int i = 0; i < T; ++i) {
@@ -227,8 +229,11 @@ Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, 
                 ++count;
             }
         }
-        cols[2 * l] = std::max(begin, 0), cols[2 * l + 1] = count;
-        max_lane = std::max(max_lane, count);
+        for (int done = 0; done < count; done += ik::kMaxAttentionLaneColumns) {
+            const int n = std::min(ik::kMaxAttentionLaneColumns, count - done);
+            groups.insert(groups.end(), {begin + done, n, l});
+            widest = std::max(widest, n);
+        }
     }
     const auto pick = [&](const std::vector<std::uint16_t>& v, int width) {
         std::vector<std::uint16_t> o(std::size_t(T) * width);
@@ -245,19 +250,23 @@ Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, 
     upload_to(d.vtaps, pick(p.vtaps, NKV * 4));
     upload_to(d.lane, lane);
     upload_to(d.pos, pos);
-    upload_to(d.lane_columns, cols);
+    upload_to(d.groups, groups);
     ik::AttentionArgs a;
-    a.columns          = T;
-    a.lanes            = kLanes;
-    a.max_lane_columns = max_lane;
-    a.map              = {d.lane, d.pos, d.first};
-    a.lane_columns     = d.lane_columns;
+    a.columns           = T;
+    a.groups            = static_cast<int>(groups.size() / 3);
+    a.max_group_columns = widest;
+    a.map               = {d.lane, d.pos, d.first, T};
+    a.groups_columns    = d.groups;
     a.in               = {d.q, d.r, d.k, d.v, d.sink, d.gate, p.full ? d.ktaps : nullptr, p.full ? d.vtaps : nullptr};
     a.layer            = {p.full, d.qscale, d.rscale, d.table, d.kconv, d.vconv};
     a.key_ring         = {d.kring, KVW, std::int64_t{R} * KVW};
     a.value_ring       = {d.vring, KVW, std::int64_t{R} * KVW};
-    a.kv               = {d.kv_k, d.kv_v, std::int64_t{NKV} * ik::kWindowRingPages * U * D, p.full ? d.block_table : nullptr, p.full ? kTableStride : 0,
-                          p.full ? kPoolPages : 0};
+    a.kv.k            = d.kv_k;
+    a.kv.v            = d.kv_v;
+    a.kv.lane_stride  = std::int64_t{NKV} * ik::kWindowRingPages * U * D;
+    a.kv.table        = p.full ? d.block_table : nullptr;
+    a.kv.table_stride = p.full ? kTableStride : 0;
+    a.kv.pool_pages   = p.full ? kPoolPages : 0;
     a.ws               = ik::carve_attention_workspace(d.ws);
     a.out              = d.out;
     ik::attention(a, nullptr);
@@ -473,7 +482,7 @@ void run_case(bool full, std::uint32_t seed) {
     d.kv_k = upload(p.kv_k), d.kv_v = upload(p.kv_v), d.kring = upload(p.kring), d.vring = upload(p.vring);
     d.out = dalloc<std::uint16_t>(std::size_t(T) * QW);
     d.block_table = full ? upload(p.block_table) : dalloc<int>(1);
-    d.lane = dalloc<int>(T), d.pos = dalloc<int>(T), d.first = upload(call.first), d.lane_columns = dalloc<int>(2 * kLanes);
+    d.lane = dalloc<int>(T), d.pos = dalloc<int>(T), d.first = upload(call.first), d.groups = dalloc<int>(3 * ik::kMaxAttentionGroups);
     d.ws = dalloc<unsigned char>(ik::attention_workspace_bytes());
     // Garbage in the output, so the padding column's zeros are the kernel's.
     upload_to(d.out, std::vector<std::uint16_t>(std::size_t(T) * QW, 0x7FC0));
@@ -512,7 +521,7 @@ void run_case(bool full, std::uint32_t seed) {
                     static_cast<void*>(d.kv_k), static_cast<void*>(d.kv_v), static_cast<void*>(d.kring),
                     static_cast<void*>(d.vring), static_cast<void*>(d.out), static_cast<void*>(d.block_table),
                     static_cast<void*>(d.lane), static_cast<void*>(d.pos), static_cast<void*>(d.first),
-                    static_cast<void*>(d.lane_columns), d.ws}) {
+                    static_cast<void*>(d.groups), d.ws}) {
         cudaFree(x);
     }
 }

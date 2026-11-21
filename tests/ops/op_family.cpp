@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <string_view>
 #include <utility>
@@ -30,7 +31,15 @@ int run_op_family(int argc, char** argv) {
     }
     if (argc >= 2) {
         for (const auto& [name, entry] : tests) {
-            if (name == argv[1]) { return entry(argc - 1, argv + 1); }
+            if (name != argv[1]) { continue; }
+            // An Op's throw (a refused argument, a CUDA error) is a failure with its message, not a silent abort.
+            try {
+                return entry(argc - 1, argv + 1);
+            } catch (const std::exception& error) {
+                std::cout.flush();
+                std::cerr << "FAIL: " << name << ": " << error.what() << '\n';
+                return 1;
+            }
         }
     }
     std::cerr << "usage: " << (argc > 0 ? argv[0] : "op test family") << " <test> [arguments...] | --list\n";

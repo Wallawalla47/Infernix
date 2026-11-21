@@ -20,10 +20,12 @@
 //   softcap      the head's logits capped in place
 //
 // A short conv's history is keyed by absolute position: column (lane, p) reads positions p - 1 .. p - 3 from the
-// call's earlier columns of its lane (recomputed from their inputs), else from its lane's ring, and 0 below the lane's
-// first position; it writes its own raw input to the ring at slot p % kRingPositions. A lane may have at most
-// kMaxLaneColumns columns a call, so no write reaches a slot a read of the same call needs. A column of lane -1 is
-// padding: its history is 0 and it writes no ring.
+// call's earlier columns of its lane (recomputed from their inputs), else from its lane's ring (or, when the call
+// passes one, the ring's history snapshot), and 0 below the lane's first position; a column among its lane's last
+// kRingPositions in the call writes its own raw input to the ring at slot p % kRingPositions, so the ring ends the call
+// holding the lane's last kRingPositions positions. A lane of more than kMaxLaneColumns columns would overwrite a slot
+// its first columns read: such a call passes each ring's history, taken by conv_history before the call's first
+// kernel. A column of lane -1 is padding: its history is 0 and it writes no ring.
 
 #include "infernix/ops/w4a4_sparse_moe.h"
 
@@ -45,15 +47,36 @@ struct ColumnMap {
     const std::int32_t* lane     = nullptr; // [T]; a lane's columns are consecutive, positions ascending by 1
     const std::int32_t* position = nullptr; // [T]
     const std::int32_t* first    = nullptr; // [lanes]
+    std::int32_t columns         = 0;       // T
 };
 
+// History rows a snapshot keeps: positions p - 1 .. p - 3 of a lane's first column p, at slot p % kHistorySlots.
+inline constexpr std::int32_t kHistorySlots = 4;
+
 // One visit's conv ring: per lane [kRingPositions][width] BF16 at base + lane * lane_stride (elements, at least
-// kRingPositions * width: a lane's state may hold other parts between), position p at slot p % kRingPositions.
+// kRingPositions * width: a lane's state may hold other parts between), position p at slot p % kRingPositions. A call
+// with a lane of more than kMaxLaneColumns columns passes `history`: per lane [kHistorySlots][width] at history +
+// lane * history_lane_stride, which reads of positions before the lane's first column take instead of the ring.
 struct Ring {
-    std::uint16_t* base      = nullptr;
-    std::int32_t width       = 0;
-    std::int64_t lane_stride = 0;
+    std::uint16_t* base             = nullptr;
+    std::int32_t width              = 0;
+    std::int64_t lane_stride        = 0;
+    const std::uint16_t* history    = nullptr;
+    std::int64_t history_lane_stride = 0;
 };
+
+// Copies rows of a lane's rings to their history snapshot (a ring's rows p - 1 .. p - 3 at or above `first`, p the
+// lane's first column in the coming call): `rings` device descriptors {ring offset, history offset, width} in 16-bit
+// words from the lane's image and history bases.
+struct ConvHistoryArgs {
+    const std::int64_t* rings     = nullptr; // [count][3]
+    std::int32_t count            = 0;
+    const std::uint16_t* image    = nullptr; // the lane's state image
+    std::uint16_t* history        = nullptr; // the lane's history snapshot
+    std::int32_t position         = 0;       // the lane's first column's position
+    std::int32_t first            = 0;       // the lane's first position
+};
+void conv_history(const ConvHistoryArgs& args, cudaStream_t stream);
 
 // A mix's completed blocks, BF16 [T][H] each, in block order (the partial source is the kernel's own).
 struct Blocks {

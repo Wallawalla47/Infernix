@@ -6,8 +6,9 @@
 // First slice (.local tracker "F3 Program, first slice"): every lane's KV is reserved to the context limit at startup,
 // so a binding never waits for pages and no request is paused; the prefix cache, speculation, the n-gram archive,
 // next-turn prefill and constrained output are off for this architecture (normalize_inkling2_options refuses them).
-// Prompts prefill in chunks of at most 16 columns a lane through the decode and verify kernels (the interim route
-// until the prefill route), decode rounds are B lanes x 1 column, both as CUDA graphs per (B, T) captured at startup.
+// Prompts prefill in chunks of up to 128 columns of one lane through the decode and verify kernels' arithmetic (a wide
+// call runs the same per-column bits; the wide-route milestone moves each Op's pass loop inside its kernel), decode
+// rounds are B lanes x 1 column as CUDA graphs per (B, T) captured at startup.
 
 #include "infernix/types.h"
 #include "models/inkling2/execution/parameters.h"
@@ -271,8 +272,8 @@ struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
     bool causal_scoring           = false;
-    // Columns a prefill call takes of one lane (1-16: the decode and verify kernels' lane width).
-    std::uint32_t prefill_chunk = 16;
+    // Columns a prefill call takes of one lane (1-128: the forward's call width).
+    std::uint32_t prefill_chunk = 128;
     bool use_cuda_graph         = true;
     DiagnosticObserver diagnostics;
 };

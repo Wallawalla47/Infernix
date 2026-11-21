@@ -7,7 +7,9 @@
 // 3. Request invariance: four sampled requests (temperature 1, a seed each, 24-48 tokens so lanes drop out mid-run in a
 //    known order) give their solo tokens two at once (C = 2), all at once in reverse order (C = 4) and twice over at
 //    once (C = 8).
-// 4. Prefill chunk width: an Engine prefilling 7 columns a call gives the reference's tokens.
+// 4. Prefill chunk width: an Engine prefilling 7 columns a call gives the reference's tokens; on a 2,300-token prompt
+//    at context 4,096, chunks of 128 and of 100 (the latter beside a decoding request) give the greedy continuation
+//    and the scoring logits (19 positions across the window's wrap and the chunk edges) of chunks of 16 byte for byte.
 // 5. Scoring: a CausalScoring Engine's logits of the 32 golden ids (positions 0-30) equal the forward test's
 //    free-running logits (INFERNIX_INKLING2_LOGITS_GUARD) byte for byte.
 // Reported, not judged: a chat turn's channels, and a turn whose thinking budget (6) injects the control (the
@@ -55,11 +57,11 @@ Tokens golden_ids(const std::string& prefix) {
 }
 
 infernix::EngineOptions engine_options(const std::filesystem::path& artifact, std::uint32_t chunk, bool graphs,
-                                       std::uint32_t concurrency) {
+                                       std::uint32_t concurrency, std::uint32_t context = kContext) {
     infernix::EngineOptions options;
     options.artifact_path        = artifact;
-    options.max_context          = kContext;
-    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(concurrency * kContext);
+    options.max_context          = context;
+    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(concurrency * context);
     options.max_concurrency      = concurrency;
     options.max_pending_requests = 16;
     options.prefill_chunk        = chunk;
@@ -119,6 +121,37 @@ void require_same(const std::string& label, const Tokens& a, const Tokens& b) {
     require(!a.empty() && a == b, label + ": tokens differ at " + std::to_string(at) + " of " + std::to_string(a.size()) +
                                       "/" + std::to_string(b.size()));
     std::cout << label << ": " << a.size() << " tokens identical\n";
+}
+
+// A long prompt: numbered sentences, the first kLongPrompt ids of their raw-text encoding.
+constexpr std::size_t kLongPrompt  = 2300;
+constexpr std::uint32_t kLongContext = 4096;
+Tokens long_prompt(const infernix::Engine& engine) {
+    static const char* const adjectives[] = {"quiet", "amber", "distant", "narrow", "restless", "silver", "patient"};
+    static const char* const nouns[]      = {"harbour", "ledger", "orchard", "signal", "bridge", "lantern",
+                                             "archive", "valley", "engine", "garden", "compass"};
+    std::string text;
+    for (int i = 0; text.size() < 24000; ++i) {
+        text += "Item " + std::to_string(i) + ": the " + adjectives[i % 7] + " " + nouns[i % 11] + " in section " +
+                std::to_string(i * 37 % 101) + " was logged at " + std::to_string(i * 13 % 60) + " minutes past " +
+                std::to_string(i % 12 + 1) + ".\n";
+    }
+    Tokens ids = engine.tokenize_text(text);
+    require(ids.size() >= kLongPrompt, "the long prompt's text encodes to at least 2,300 ids");
+    ids.resize(kLongPrompt);
+    return ids;
+}
+
+// Scoring logits of the long prompt at positions inside the first chunk, across chunk edges (16, 100, 128 columns),
+// the window's wrap (1023-1088), the full visits' multi-unit splits and the end.
+std::vector<float> long_scores(const std::filesystem::path& artifact, std::uint32_t chunk, const Tokens& prompt,
+                               const std::vector<std::uint32_t>& positions) {
+    infernix::EngineOptions options = engine_options(artifact, chunk, false, 1, kLongContext);
+    options.purpose                 = infernix::EnginePurpose::CausalScoring;
+    infernix::Engine engine(options);
+    infernix::ScoreOptions score;
+    score.logits_positions = positions;
+    return engine.score_tokens(prompt, 1, score).logits;
 }
 
 std::vector<Tokens> alone(infernix::Engine& engine) {
@@ -214,6 +247,49 @@ int main() {
         {
             infernix::Engine engine(engine_options(artifact, 7, true, 8));
             require_alone("prefill chunks of 7", engine, reference_tokens);
+        }
+        {
+            // Wide prefill calls (128 and 100 columns: the conv rings' history snapshot, the window's staging ring,
+            // attention's groups) against 16 a call, on a prompt past the window.
+            Tokens prompt;
+            Tokens oracle_long, oracle_request;
+            {
+                infernix::Engine engine(engine_options(artifact, 16, true, 1, kLongContext));
+                prompt         = long_prompt(engine);
+                oracle_long    = engine.generate(engine.prepare_tokens(prompt), greedy(16)).generated_token_ids;
+                oracle_request = engine.generate(engine.prepare(chat(texts()[2])), sampled(2)).generated_token_ids;
+            }
+            {
+                infernix::Engine engine(engine_options(artifact, 128, true, 1, kLongContext));
+                require_same("prefill chunks of 128: the long prompt's greedy continuation", oracle_long,
+                             engine.generate(engine.prepare_tokens(prompt), greedy(16)).generated_token_ids);
+            }
+            {
+                // Chunks of 100 while another request decodes: its prompt and decode rounds interleave with the wide
+                // prefill calls.
+                infernix::Engine engine(engine_options(artifact, 100, true, 2, kLongContext));
+                auto other = engine.submit(engine.prepare(chat(texts()[2])), sampled(2));
+                auto mine  = engine.submit(engine.prepare_tokens(prompt), greedy(16));
+                require_same("prefill chunks of 100 beside a decoding request: the long prompt", oracle_long,
+                             mine.wait().generated_token_ids);
+                require_same("prefill chunks of 100 beside a decoding request: the other request", oracle_request,
+                             other.wait().generated_token_ids);
+            }
+            const std::vector<std::uint32_t> positions = {0, 15, 16, 99, 100, 127, 128, 1022, 1023, 1024, 1087,
+                                                          1088, 1151, 1200, 2047, 2048, 2200, 2297, 2298};
+            const std::vector<float> oracle = long_scores(artifact, 16, prompt, positions);
+            for (const std::uint32_t chunk : {128U, 100U}) {
+                const std::vector<float> wide = long_scores(artifact, chunk, prompt, positions);
+                require(wide.size() == oracle.size(), "scoring: the logits' sizes differ");
+                std::size_t differ = 0;
+                for (std::size_t i = 0; i < oracle.size(); ++i) {
+                    differ += std::memcmp(&oracle[i], &wide[i], 4) != 0 ? 1 : 0;
+                }
+                require(differ == 0, "scoring the long prompt in chunks of " + std::to_string(chunk) + ": " +
+                                         std::to_string(differ) + " logits differ from chunks of 16");
+                std::cout << "scoring the long prompt in chunks of " << chunk << ": " << positions.size()
+                          << " logits rows equal chunks of 16 byte for byte\n";
+            }
         }
         if (guard != nullptr) {
             infernix::EngineOptions options = engine_options(artifact, 16, false, 1);

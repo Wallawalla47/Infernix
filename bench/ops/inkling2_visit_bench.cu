@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(d_lane, lane.data(), T * 4, cudaMemcpyHostToDevice), "upload");
     check(cudaMemcpy(d_pos, pos.data(), T * 4, cudaMemcpyHostToDevice), "upload");
     check(cudaMemcpy(d_first, first.data(), 4, cudaMemcpyHostToDevice), "upload");
-    const ik::ColumnMap map{d_lane, d_pos, d_first};
+    const ik::ColumnMap map{d_lane, d_pos, d_first, T};
     auto* experts = bf16_rows(TH * moe::kTopK, 0.05F);
     auto* cand    = f32_rows(TH, 1.0F);
     auto* conv    = bf16_rows(4 * H, 0.4F);

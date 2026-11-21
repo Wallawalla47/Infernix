@@ -227,9 +227,11 @@ __device__ __forceinline__ void mix_columns(float (&src)[Mix<QA, QB>::kS][8], in
 
 using detail::Column;
 using detail::column_of;
+using detail::history_row;
 using detail::history_source;
 using detail::ring_row;
 using detail::Source;
+using detail::writes_ring;
 
 // The static conv of the thread's 8 channels: taps w[lag][j], values x[lag][j] (lag 0 the current position).
 __device__ __forceinline__ void conv8(const float (&w)[4][8], const float (&x)[4][8], float (&out)[8]) {
@@ -306,7 +308,7 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
         switch (history_source(map, col, k)) {
         case Source::Zero: zero8(x[k]); break;
         case Source::Call: combine8(tail.experts, col.t - k, c, x[k]); break;
-        case Source::Ring: load8(ring_row(tail.ring, col.lane, col.pos - k) + c, x[k]); break;
+        case Source::Ring: load8(history_row(tail.ring, col.lane, col.pos - k) + c, x[k]); break;
         }
     }
     float m[8];
@@ -316,7 +318,7 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
 #pragma unroll
     for (int j = 0; j < 8; ++j) { out[j] = canon::add_rn(cand[j], m[j]); }
     round8(out);
-    if (col.lane >= 0) { store8(ring_row(tail.ring, col.lane, col.pos) + c, x[0]); }
+    if (writes_ring(map, col)) { store8(ring_row(tail.ring, col.lane, col.pos) + c, x[0]); }
 }
 
 // ---------------------------------------------------------------------------- the experts' activation rows
@@ -591,12 +593,12 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
         switch (history_source(a.map, col, k)) {
         case Source::Zero: zero8(x[k]); break;
         case Source::Call: load8(a.o + row - static_cast<std::size_t>(k) * kHidden, x[k]); break;
-        case Source::Ring: load8(ring_row(a.ring, col.lane, col.pos - k) + c, x[k]); break;
+        case Source::Ring: load8(history_row(a.ring, col.lane, col.pos - k) + c, x[k]); break;
         }
     }
     float attn[8];
     conv8(conv, x, attn);
-    if (col.lane >= 0) { store8(ring_row(a.ring, col.lane, col.pos) + c, x[0]); }
+    if (writes_ring(a.map, col)) { store8(ring_row(a.ring, col.lane, col.pos) + c, x[0]); }
 
     float cand[8];
     if (a.boundary) {
@@ -709,9 +711,9 @@ void check_columns(std::int32_t columns, const char* op) {
     if (columns <= 0 || columns > 65535) { throw std::invalid_argument(std::string(op) + ": columns must be in [1, 65535]"); }
 }
 
-void check_map(const ColumnMap& map, const char* op) {
-    if (map.lane == nullptr || map.position == nullptr || map.first == nullptr) {
-        throw std::invalid_argument(std::string(op) + ": the column map is incomplete");
+void check_map(const ColumnMap& map, std::int32_t columns, const char* op) {
+    if (map.lane == nullptr || map.position == nullptr || map.first == nullptr || map.columns != columns) {
+        throw std::invalid_argument(std::string(op) + ": the column map is incomplete or not the call's width");
     }
 }
 
@@ -720,6 +722,10 @@ void check_ring(const Ring& ring, std::int32_t width, const char* op) {
         ring.lane_stride < std::int64_t{kRingPositions} * width || ring.lane_stride % 8 != 0) {
         throw std::invalid_argument(std::string(op) + ": a conv ring of width " + std::to_string(width) +
                                     " and a 16-byte lane stride of at least its positions is needed");
+    }
+    if (ring.history != nullptr && (!aligned16(ring.history) || ring.history_lane_stride % 8 != 0 ||
+                                    ring.history_lane_stride < std::int64_t{kHistorySlots} * width)) {
+        throw std::invalid_argument(std::string(op) + ": a ring's history needs a 16-byte lane stride of its slots");
     }
 }
 
@@ -774,7 +780,7 @@ void embed(const std::int32_t* tokens, std::int32_t columns, const std::uint16_t
 void visit_entry(const EntryArgs& a, cudaStream_t stream) {
     constexpr const char* op = "inkling2 visit_entry";
     check_columns(a.columns, op);
-    check_map(a.map, op);
+    check_map(a.map, a.columns, op);
     const bool tail = a.tail.experts != nullptr;
     if (tail) {
         check_ring(a.tail.ring, kHidden, op);
@@ -812,7 +818,7 @@ void visit_entry(const EntryArgs& a, cudaStream_t stream) {
 void mlp_entry(const MlpEntryArgs& a, cudaStream_t stream) {
     constexpr const char* op = "inkling2 mlp_entry";
     check_columns(a.columns, op);
-    check_map(a.map, op);
+    check_map(a.map, a.columns, op);
     check_ring(a.ring, kHidden, op);
     check_blocks(a.blocks, op);
     if (a.o == nullptr || a.conv == nullptr || (!a.boundary && a.h == nullptr) || a.cand == nullptr ||
@@ -869,6 +875,30 @@ void final_mix(const FinalArgs& f, cudaStream_t stream) {
         throw std::invalid_argument("inkling2 final_mix: the last visit's tail and the output query are needed");
     }
     visit_entry(a, stream);
+}
+
+namespace {
+
+// Block (ring, lag): the ring's row of position `position - lag - 1` to its history slot.
+__global__ void conv_history_kernel(const ConvHistoryArgs a) {
+    const int ring = static_cast<int>(blockIdx.x), pos = a.position - static_cast<int>(blockIdx.y) - 1;
+    if (pos < a.first) { return; }
+    const std::int64_t* d = a.rings + 3 * ring;
+    const auto width      = static_cast<int>(d[2]);
+    const auto* src = reinterpret_cast<const uint4*>(a.image + d[0] + static_cast<std::int64_t>(pos & (kRingPositions - 1)) * width);
+    auto* dst       = reinterpret_cast<uint4*>(a.history + d[1] + static_cast<std::int64_t>(pos & (kHistorySlots - 1)) * width);
+    for (int i = static_cast<int>(threadIdx.x); i < width / 8; i += static_cast<int>(blockDim.x)) { dst[i] = src[i]; }
+}
+
+} // namespace
+
+void conv_history(const ConvHistoryArgs& a, cudaStream_t stream) {
+    if (a.rings == nullptr || a.count <= 0 || a.image == nullptr || a.history == nullptr || !aligned16(a.image) ||
+        !aligned16(a.history) || a.first < 0 || a.position < a.first) {
+        throw std::invalid_argument("inkling2 conv_history: the rings, the image, the history and a position are needed");
+    }
+    conv_history_kernel<<<dim3(static_cast<unsigned>(a.count), kHistorySlots - 1), 128, 0, stream>>>(a);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void softcap(float* logits, std::int64_t count, float cap, cudaStream_t stream) {

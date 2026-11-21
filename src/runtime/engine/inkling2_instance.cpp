@@ -1,6 +1,7 @@
 #include "runtime/engine/inkling2_instance.h"
 
 #include "core/device.h"
+#include "models/inkling2/execution/forward.h"
 #include "models/inkling2/load.h"
 #include "runtime/engine/diagnostics.h"
 
@@ -55,8 +56,9 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
     refuse(options.max_context_auto, "--max-context auto is not resolved yet: give a context limit");
     refuse(options.max_concurrency == 0 || options.max_concurrency > models::inkling2::kMaximumConcurrency,
            "max_concurrency must be 1-8");
-    if (options.prefill_chunk == 0) { options.prefill_chunk = 16; }
-    refuse(options.prefill_chunk > 16, "prefill chunks are at most 16 columns (the decode kernels' lane width)");
+    if (options.prefill_chunk == 0) { options.prefill_chunk = models::inkling2::kMaxForwardColumns; }
+    refuse(options.prefill_chunk > static_cast<std::uint32_t>(models::inkling2::kMaxForwardColumns),
+           "prefill chunks are at most 128 columns (the forward's call width)");
     if (options.context_cache.enabled) {
         options.context_cache.enabled = false;
         report(options, "Inkling 2: the prefix cache is not available yet; it is off");
