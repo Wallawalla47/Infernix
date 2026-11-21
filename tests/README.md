@@ -496,7 +496,18 @@ router add (`expm1_c`, `tanh_c`, `sigmoid_c`, `softcap_c`, four-over-six NVFP4 a
 header's exhaustively over BF16, each within 2 ulp of FP64, and four-over-six against the torch reference's fixture
 (`tests/models/inkling2/generate_four_over_six_fixture.py`). `tests/convert/test_inkling2.py` converts a synthetic
 checkpoint and checks every word, and `tools/convert/verify_inkling2.py` re-checks a real artifact against its
-checkpoint with its own reader.
+checkpoint with its own reader. The Inkling 2 Op tests (GPU, family `inkling2`): `infernix_w4a4_sparse_moe_test` (the
+routed experts, also as a captured graph), `infernix_inkling2_visit_test` (embed, the mixers, message gates, short
+convs and the experts' rows: bit for bit their host emulation of the pinned orders, FP64 stage criteria, and
+single-column calls equal to a 22-column call, rings included) and `infernix_inkling2_attention_test` (sliding and full:
+the prologue bit for bit its emulation, the output against FP64 over the represented K/V, decode = verify).
+`infernix_inkling2_chat_template_test` (CPU only) renders `tools/chat_templates/inkling2.jinja` (the checkpoint's,
+byte for byte) through the Jinja engine against transformers' `apply_chat_template`
+(`tests/fixtures/inkling2/chat_template_golden.json`, from `generate_chat_template_golden.py`).
+`infernix_inkling2_forward_real_test` (GPU) runs the forward on `INFERNIX_INKLING2_ARTIFACT` against a CPU reference's
+per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
+their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
+rather than judges and why.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

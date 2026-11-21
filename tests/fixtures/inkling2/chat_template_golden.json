@@ -1,0 +1,322 @@
+{
+ "source": "transformers 5.21.0.dev0 apply_chat_template",
+ "cases": [
+  {
+   "name": "user only",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello!<|end_message|>"
+  },
+  {
+   "name": "system and user",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are terse."
+     },
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|>"
+  },
+  {
+   "name": "effort string",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Plan a trip."
+     }
+    ],
+    "reasoning_effort": "low"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Plan a trip.<|end_message|>"
+  },
+  {
+   "name": "effort none",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": "none"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort number",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 0.35
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.35<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "effort zero number",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "reasoning_effort": 0.0
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  {
+   "name": "multi turn with thinking",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Capital of France?"
+     },
+     {
+      "role": "assistant",
+      "reasoning_content": "Easy: Paris.",
+      "content": "Paris."
+     },
+     {
+      "role": "user",
+      "content": "And of Italy?"
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Capital of France?<|end_message|><|message_model|><|content_thinking|>Easy: Paris.<|end_message|><|message_model|><|content_text|>Paris.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And of Italy?<|end_message|>"
+  },
+  {
+   "name": "assistant empty content with thinking",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "reasoning_content": "hmm",
+      "content": ""
+     },
+     {
+      "role": "user",
+      "content": "y"
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|><|content_thinking|>hmm<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>y<|end_message|>"
+  },
+  {
+   "name": "content parts",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "Part one."
+       },
+       "Part two.",
+       {
+        "text": "Part three."
+       }
+      ]
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Part one.<|end_message|><|message_user|><|content_text|>Part two.<|end_message|><|message_user|><|content_text|>Part three.<|end_message|>"
+  },
+  {
+   "name": "tools and a call",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Paris, in C?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "unit": "c",
+          "city": "Paris",
+          "Zeta": [
+           1,
+           2
+          ],
+          "alpha": {
+           "b": 1,
+           "a": "é"
+          }
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temp\": 18}"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 °C."
+     },
+     {
+      "role": "user",
+      "content": "Thanks"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "name": "search",
+      "description": "",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"]}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"search\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris, in C?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"Zeta\":[1,2],\"alpha\":{\"b\":1,\"a\":\"é\"},\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18}<|end_message|><|message_model|><|content_text|>It is 18 °C.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks<|end_message|>"
+  },
+  {
+   "name": "tool result named",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "find cats"
+     },
+     {
+      "role": "assistant",
+      "content": "Searching.",
+      "tool_calls": [
+       {
+        "function": {
+         "name": "search",
+         "arguments": {
+          "q": "cats"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "name": "search",
+      "content": "many cats"
+     }
+    ],
+    "tools": [
+     {
+      "name": "search",
+      "description": "",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"search\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>find cats<|end_message|><|message_model|><|content_text|>Searching.<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"cats\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>search<|content_text|>many cats<|end_message|>"
+  },
+  {
+   "name": "named assistant",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "role": "assistant",
+      "name": "helper",
+      "content": "hello"
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>hi<|end_message|><|message_model|>helper<|content_text|>hello<|end_message|><|content_model_end_sampling|>"
+  },
+  {
+   "name": "system only",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Only a system message."
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>Only a system message.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+  },
+  {
+   "name": "unicode and specials in text",
+   "context": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ünïcödé 北京 🌏 <tag> \\n {{ not a template }} {% raw %}"
+     }
+    ]
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Ünïcödé 北京 🌏 <tag> \\n {{ not a template }} {% raw %}<|end_message|>"
+  }
+ ]
+}

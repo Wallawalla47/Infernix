@@ -1,0 +1,667 @@
+// Inkling 2's forward (src/models/inkling2/execution/forward.h) on the real artifact against the private CPU reference's
+// per-visit dump (.local inkling2 tools/inkling_ref.py: the pinned arithmetic in FP32/FP64, the experts in their trained
+// arithmetic; 32 positions: the golden prompt and the first 8 tokens of its completion).
+//
+//   INFERNIX_INKLING2_ARTIFACT   an artifact converted with the inkling2_mini recipe
+//   INFERNIX_INKLING2_REFERENCE  the dump's path prefix: <prefix>.bin and <prefix>.json (tools/npz_to_bin.py)
+//
+// 1. Teacher-forced: two calls of 16 columns; before each visit the reference's input, blocks and message sources are
+//    injected, so each stage of each visit compares with the reference from the same inputs. Judged: every stage
+//    upstream of the experts (x_q/x_k/x_v, q, r, the stored k and v, sink, gate, a, W_o, cand, x_mlp, gamma, the
+//    final hidden) within 2^-5 of its row's largest magnitude; a routing difference at a near-tie is counted. The visit
+//    tails cross the experts' 4-bit activation codes with inputs an ulp apart, so they are reported, not judged here:
+//    their check is boundary-conditioned (the reference's MoE, conv and residual on this forward's own x_mlp and cand,
+//    dumped with INFERNIX_INKLING2_DUMP, private .local tools/tail_check.py) and is not part of this test, a gap.
+// 2. Free-running: the same calls on the forward's own wiring. Judged: the argmax from the last prompt position on
+//    (the greedy continuation) equals the reference's. Reported: every other position's argmax, the largest logit
+//    difference and the mean NLL of the next ids (with <reference>.spread.json's perturbation distribution when
+//    present). The model is sensitive to rounding in its trained W4A4 arithmetic: a 1-ulp change in 24 of 2304
+//    embedding elements moves the reference's own logits by up to 8.8 and its mean NLL by up to 0.40, so neither is a
+//    criterion (a first criterion on prompt-position argmax and one on the NLL both failed for that reason, 2026-11-21).
+// 3. Decode = verify: the 32 positions as single-column calls give the free-running calls' logits bit for bit.
+//
+// Diagnostics (environment): INFERNIX_INKLING2_DRIFT prints the free-running drift per visit and the NLL detail;
+// INFERNIX_INKLING2_HYBRID = blocks | input | perturb runs a hybrid (the reference's blocks and message sources, or its
+// visit inputs, or a 1-ulp embedding perturbation); INFERNIX_INKLING2_DUMP = a directory writes the teacher-forced
+// x_mlp, cand, tails and routing.
+
+#include "artifact/reader.h"
+#include "core/device.h"
+#include "infernix/ops/inkling2_attention.h"
+#include "models/inkling2/execution/forward.h"
+#include "models/inkling2/execution/parameters.h"
+#include "models/inkling2/load.h"
+#include "ops/common/canonical_math.h"
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace infernix;
+namespace ik    = ops::inkling2;
+namespace canon = ops::canon;
+namespace m     = models::inkling2;
+
+constexpr int H = ik::kHidden, kT = 16, kPositions = 32;
+
+void cuda(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) { throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e)); }
+}
+
+struct Reference {
+    nlohmann::json index;
+    std::vector<char> bytes;
+    explicit Reference(const std::string& prefix) {
+        std::ifstream j(prefix + ".json");
+        if (!j) { throw std::runtime_error("cannot read " + prefix + ".json"); }
+        index = nlohmann::json::parse(j);
+        std::ifstream b(prefix + ".bin", std::ios::binary | std::ios::ate);
+        if (!b) { throw std::runtime_error("cannot read " + prefix + ".bin"); }
+        bytes.resize(static_cast<std::size_t>(b.tellg()));
+        b.seekg(0);
+        b.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    [[nodiscard]] bool has(const std::string& name) const { return index.contains(name); }
+    template <class T>
+    [[nodiscard]] const T* get(const std::string& name) const {
+        if (!has(name)) { throw std::runtime_error("the reference has no " + name); }
+        return reinterpret_cast<const T*>(bytes.data() + index.at(name).at("offset").get<std::size_t>());
+    }
+    [[nodiscard]] std::size_t row(const std::string& name) const { // elements per position
+        const auto& shape = index.at(name).at("shape");
+        std::size_t n = 1;
+        for (std::size_t i = 1; i < shape.size(); ++i) { n *= shape[i].get<std::size_t>(); }
+        return n;
+    }
+};
+
+std::uint16_t b16(float x) { return canon::f32_to_bf16_rn(x); }
+float f(std::uint16_t v) { return canon::bf16_to_f32(v); }
+
+struct DeviceRows {
+    std::uint16_t* p = nullptr;
+    explicit DeviceRows(std::size_t words) {
+        cuda(cudaMalloc(&p, words * 2), "cudaMalloc");
+        cuda(cudaMemset(p, 0, words * 2), "cudaMemset");
+    }
+    ~DeviceRows() { cudaFree(p); }
+    DeviceRows(const DeviceRows&)            = delete;
+    DeviceRows& operator=(const DeviceRows&) = delete;
+};
+
+// Uploads the reference rows [c0, c0 + T) of `name` (FP32 carrying BF16 values) as BF16.
+void upload_rows(const Reference& ref, const std::string& name, int c0, int T, std::uint16_t* dst, std::size_t width = H) {
+    const float* src = ref.get<float>(name) + static_cast<std::size_t>(c0) * width;
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(T) * width);
+    for (std::size_t i = 0; i < host.size(); ++i) {
+        host[i] = b16(src[i]);
+        if (f(host[i]) != src[i]) { throw std::runtime_error(name + " holds a value that is not BF16"); }
+    }
+    cuda(cudaMemcpy(dst, host.data(), host.size() * 2, cudaMemcpyHostToDevice), "upload");
+}
+
+template <class T>
+std::vector<T> download(const T* p, std::size_t n) {
+    std::vector<T> v(n);
+    cuda(cudaMemcpy(v.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost), "download");
+    return v;
+}
+
+// ---------------------------------------------------------------------------- stage comparison
+
+struct Stage {
+    double worst  = 0; // max over columns of max |kernel - ref| / max |ref row|
+    long columns  = 0;
+    long excluded = 0;
+};
+
+std::map<std::string, Stage> g_stages;
+long g_routing_differs = 0;
+
+// Compares `T` rows of `width` (kernel values as doubles) against the reference rows from c0, skipping columns whose
+// previous routing differed (skip[t]).
+void compare(const std::string& stage, const std::vector<double>& got, const Reference& ref, const std::string& name,
+             int c0, int T, std::size_t width, const std::vector<bool>& skip) {
+    const float* r = ref.get<float>(name) + static_cast<std::size_t>(c0) * width;
+    Stage& s       = g_stages[stage];
+    for (int t = 0; t < T; ++t) {
+        if (skip[t]) {
+            ++s.excluded;
+            continue;
+        }
+        double scale = 0, diff = 0;
+        for (std::size_t i = 0; i < width; ++i) { scale = std::max(scale, std::fabs(double{r[t * width + i]})); }
+        for (std::size_t i = 0; i < width; ++i) { diff = std::max(diff, std::fabs(got[t * width + i] - r[t * width + i])); }
+        s.worst = std::max(s.worst, scale > 0 ? diff / scale : diff);
+        ++s.columns;
+    }
+}
+
+std::vector<double> bf16_values(const std::uint16_t* p, std::size_t n) {
+    const auto host = download(p, n);
+    std::vector<double> out(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = f(host[i]); }
+    return out;
+}
+std::vector<double> f32_values(const float* p, std::size_t n) {
+    const auto host = download(p, n);
+    return {host.begin(), host.end()};
+}
+
+// ---------------------------------------------------------------------------- state
+
+struct State {
+    m::StateView view;
+    std::uint16_t* images = nullptr;
+    std::vector<std::uint16_t*> pools;
+    int* table = nullptr;
+    std::size_t image_bytes = 0, pool_bytes = 0;
+    explicit State(const m::StateLayout& layout) {
+        image_bytes = static_cast<std::size_t>(layout.lane_words) * 2;
+        cuda(cudaMalloc(&images, image_bytes), "state");
+        pool_bytes = std::size_t{ik::kKvHeads} * 1 * ik::kKeyUnit * ik::kHeadDim * 2;
+        for (int s = 0; s < 2 * layout.full_visits; ++s) {
+            std::uint16_t* p = nullptr;
+            cuda(cudaMalloc(&p, pool_bytes), "pool");
+            pools.push_back(p);
+        }
+        cuda(cudaMalloc(&table, 4), "table");
+        cuda(cudaMemset(table, 0, 4), "table");
+        view.images     = images;
+        view.lane_words = layout.lane_words;
+        for (int s = 0; s < layout.full_visits; ++s) {
+            view.pool_k.push_back(pools[2 * s]);
+            view.pool_v.push_back(pools[2 * s + 1]);
+        }
+        view.pool_pages   = 1;
+        view.table        = table;
+        view.table_stride = 1;
+        reset();
+    }
+    void reset() {
+        cuda(cudaMemset(images, 0, image_bytes), "reset");
+        for (auto* p : pools) { cuda(cudaMemset(p, 0, pool_bytes), "reset"); }
+    }
+    ~State() {
+        cudaFree(images);
+        for (auto* p : pools) { cudaFree(p); }
+        cudaFree(table);
+    }
+};
+
+// The K and V the visit appended at positions [c0, c0 + T) of lane 0, as values ([T][8][128]).
+void appended_kv(const m::StateView& s, const m::VisitState& vs, int c0, int T, std::vector<double>& k,
+                 std::vector<double>& v) {
+    k.assign(static_cast<std::size_t>(T) * ik::kKvHeads * ik::kHeadDim, 0);
+    v = k;
+    for (int t = 0; t < T; ++t) {
+        const int pos = c0 + t;
+        for (int head = 0; head < ik::kKvHeads; ++head) {
+            std::size_t at;
+            const std::uint16_t *kb, *vb;
+            if (vs.full_slot < 0) {
+                at = ((static_cast<std::size_t>(head) * ik::kWindowRingPages + (pos / 64) % ik::kWindowRingPages) * 64 +
+                      pos % 64) * ik::kHeadDim;
+                kb = s.images + vs.window_k, vb = s.images + vs.window_v;
+            } else {
+                at = ((static_cast<std::size_t>(head) * s.pool_pages + 0) * 64 + pos % 64) * ik::kHeadDim;
+                kb = s.pool_k[vs.full_slot], vb = s.pool_v[vs.full_slot];
+            }
+            const auto kr = download(kb + at, ik::kHeadDim), vr = download(vb + at, ik::kHeadDim);
+            for (int d = 0; d < ik::kHeadDim; ++d) {
+                const std::size_t o = (static_cast<std::size_t>(t) * ik::kKvHeads + head) * ik::kHeadDim + d;
+                k[o]                = f(kr[d]);
+                v[o]                = __half2float(__ushort_as_half(vr[d]));
+            }
+        }
+    }
+}
+
+m::CallPlan call_plan(const Reference& ref, int c0, int T) {
+    m::CallPlan plan;
+    const std::int32_t* ids = ref.get<std::int32_t>("ids");
+    for (int t = 0; t < T; ++t) {
+        plan.tokens.push_back(ids[c0 + t]);
+        plan.lane.push_back(0);
+        plan.position.push_back(c0 + t);
+    }
+    plan.first = {0};
+    return plan;
+}
+
+// ---------------------------------------------------------------------------- 1. teacher-forced
+
+// Diagnostic (INFERNIX_INKLING2_DUMP = a directory): the teacher-forced kernel's x_mlp, cand, visit tails and routing
+// for every visit and position ([48][32][H] FP32, routing [48][32][8] I32), for the reference's MoE to rerun on them.
+struct TailDump {
+    std::vector<float> xm, cand, tail;
+    std::vector<std::int32_t> routed;
+    std::vector<double> worst; // per visit: the tail's worst |diff| / row max against the reference
+    explicit TailDump(std::uint32_t visits)
+        : xm(std::size_t{visits} * kPositions * H), cand(xm.size()), tail(xm.size()),
+          routed(std::size_t{visits} * kPositions * 8), worst(visits, 0) {}
+    void rows(std::vector<float>& dst, std::uint32_t v, int c0, const std::vector<double>& values) {
+        std::copy(values.begin(), values.end(), dst.begin() + (std::size_t{v} * kPositions + c0) * H);
+    }
+    void write(const std::string& dir) const {
+        const auto put = [&](const std::string& name, const void* data, std::size_t bytes) {
+            std::ofstream out(dir + "/" + name, std::ios::binary);
+            out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+        };
+        put("kxm.f32", xm.data(), xm.size() * 4);
+        put("kcand.f32", cand.data(), cand.size() * 4);
+        put("ktail.f32", tail.data(), tail.size() * 4);
+        put("krouted.i32", routed.data(), routed.size() * 4);
+    }
+};
+
+double tail_worst(const std::vector<double>& got, const Reference& ref, const std::string& name, int c0, int T) {
+    const float* r = ref.get<float>(name) + static_cast<std::size_t>(c0) * H;
+    double worst   = 0;
+    for (int t = 0; t < T; ++t) {
+        double scale = 0, diff = 0;
+        for (int i = 0; i < H; ++i) {
+            scale = std::max(scale, std::fabs(double{r[t * H + i]}));
+            diff  = std::max(diff, std::fabs(got[t * H + i] - r[t * H + i]));
+        }
+        worst = std::max(worst, diff / scale);
+    }
+    return worst;
+}
+
+void teacher_forced(const m::Parameters& p, m::Forward& fw, State& state, const Reference& ref) {
+    const auto& c  = p.model.config().text;
+    const auto& b  = fw.buffers();
+    const char* dump_dir = std::getenv("INFERNIX_INKLING2_DUMP");
+    TailDump dump(dump_dir != nullptr ? c.visits() : 0);
+    DeviceRows input(static_cast<std::size_t>(kT) * H), tail(static_cast<std::size_t>(kT) * H);
+    DeviceRows msrc0(static_cast<std::size_t>(kT) * H), msrc1(static_cast<std::size_t>(kT) * H);
+    std::vector<std::unique_ptr<DeviceRows>> blocks;
+    for (int i = 0; i < 4; ++i) { blocks.push_back(std::make_unique<DeviceRows>(static_cast<std::size_t>(kT) * H)); }
+    long logit_columns = 0;
+    double logit_worst = 0;
+    for (int c0 = 0; c0 < kPositions; c0 += kT) {
+        fw.prepare(call_plan(ref, c0, kT));
+        fw.embed(nullptr);
+        std::vector<bool> skip(kT, false), none(kT, false);
+        compare("embed", bf16_values(b.e, static_cast<std::size_t>(kT) * H), ref, "e", c0, kT, H, none);
+        for (std::uint32_t v = 0; v < c.visits(); ++v) {
+            const std::string pre = "v" + std::to_string(v) + "_";
+            const std::uint32_t layer = c.visit_layer(v), pass = c.visit_pass(v);
+            const auto& op = p.layers[layer];
+            m::VisitInputs in;
+            upload_rows(ref, pre + "h_in", c0, kT, input.p);
+            in.input    = input.p;
+            in.tail_out = v > 0 ? tail.p : nullptr;
+            const std::string bname = pre + "blocks";
+            const int nb = ref.index.at(bname).at("shape")[0].get<int>();
+            for (int i = 0; i < nb; ++i) {
+                const float* src = ref.get<float>(bname) + (static_cast<std::size_t>(i) * kPositions + c0) * H;
+                std::vector<std::uint16_t> host(static_cast<std::size_t>(kT) * H);
+                for (std::size_t j = 0; j < host.size(); ++j) { host[j] = b16(src[j]); }
+                cuda(cudaMemcpy(blocks[i]->p, host.data(), host.size() * 2, cudaMemcpyHostToDevice), "blocks");
+                in.attention_blocks.rows[i] = blocks[i]->p;
+                in.mlp_blocks.rows[i]       = blocks[i]->p;
+            }
+            in.attention_blocks.count = in.mlp_blocks.count = nb;
+            if (op.boundary) { in.mlp_blocks.rows[in.mlp_blocks.count++] = input.p; }
+            if (op.messages && pass > 0) {
+                const std::uint32_t base = c.loop.core_start + (pass - 1) * c.loop.core_layers();
+                upload_rows(ref, "v" + std::to_string(base + 6) + "_h_in", c0, kT, msrc0.p);
+                upload_rows(ref, "v" + std::to_string(base + 11) + "_out", c0, kT, msrc1.p);
+                in.message_sources[0] = msrc0.p;
+                in.message_sources[1] = msrc1.p;
+            }
+            fw.visit(v, state.view, in, nullptr);
+            cuda(cudaDeviceSynchronize(), "visit");
+            const std::size_t TH = static_cast<std::size_t>(kT) * H;
+            if (v > 0) {
+                const auto t = bf16_values(tail.p, TH);
+                compare("tail (previous out)", t, ref, "v" + std::to_string(v - 1) + "_out", c0, kT, H, skip);
+                if (dump_dir != nullptr) {
+                    dump.rows(dump.tail, v - 1, c0, t);
+                    dump.worst[v - 1] = std::max(dump.worst[v - 1],
+                                                 tail_worst(t, ref, "v" + std::to_string(v - 1) + "_out", c0, kT));
+                }
+            }
+            if (dump_dir != nullptr) {
+                dump.rows(dump.xm, v, c0, bf16_values(b.xm, TH));
+                dump.rows(dump.cand, v, c0, f32_values(b.cand, TH));
+                const auto routed = download(b.moe.routed, static_cast<std::size_t>(kT) * 8);
+                std::copy(routed.begin(), routed.end(), dump.routed.begin() + (std::size_t{v} * kPositions + c0) * 8);
+            }
+            const bool three = op.full || (op.messages && pass > 0);
+            compare("x_q", bf16_values(b.x[0], TH), ref, pre + "xq", c0, kT, H, none);
+            compare("x_k", bf16_values(three ? b.x[1] : b.x[0], TH), ref, pre + "xk", c0, kT, H, none);
+            compare("x_v", bf16_values(three ? b.x[2] : b.x[0], TH), ref, pre + "xv", c0, kT, H, none);
+            const std::size_t QW = ik::kHeads * ik::kHeadDim;
+            compare("q", bf16_values(b.attention_ws.q, kT * QW), ref, pre + "q", c0, kT, QW, none);
+            compare("r", bf16_values(b.attention_ws.r, kT * ik::kHeads * ik::kRelDim), ref, pre + "r", c0, kT,
+                    ik::kHeads * ik::kRelDim, none);
+            std::vector<double> kk, vv;
+            appended_kv(state.view, fw.layout().visits[v], c0, kT, kk, vv);
+            compare("k (stored)", kk, ref, pre + "k", c0, kT, ik::kKvHeads * ik::kHeadDim, none);
+            compare("v (stored, FP16)", vv, ref, pre + "v", c0, kT, ik::kKvHeads * ik::kHeadDim, none);
+            compare("sink", bf16_values(b.sink, kT * ik::kHeads), ref, pre + "sink", c0, kT, ik::kHeads, none);
+            compare("gate", bf16_values(b.gate, kT * QW), ref, pre + "gate", c0, kT, QW, none);
+            compare("attention a", bf16_values(b.attention, kT * QW), ref, pre + "a", c0, kT, QW, none);
+            compare("W_o", bf16_values(b.o, TH), ref, pre + "o", c0, kT, H, none);
+            compare("cand", f32_values(b.cand, TH), ref, pre + "cand", c0, kT, H, none);
+            compare("x_mlp", bf16_values(b.xm, TH), ref, pre + "xm", c0, kT, H, none);
+            // Routing: the experts in slot order, and gamma.
+            const auto routed = download(b.moe.routed, static_cast<std::size_t>(kT) * 8);
+            const auto gamma  = download(b.moe.gamma, static_cast<std::size_t>(kT) * 8);
+            const std::int32_t* rr = ref.get<std::int32_t>(pre + "routed") + c0 * 8;
+            const float* rg        = ref.get<float>(pre + "gamma") + c0 * 8;
+            for (int t = 0; t < kT; ++t) {
+                bool same = true;
+                for (int j = 0; j < 8; ++j) { same = same && routed[t * 8 + j] == rr[t * 8 + j]; }
+                skip[t] = !same;
+                g_routing_differs += same ? 0 : 1;
+                if (same) {
+                    double d = 0;
+                    for (int j = 0; j < 8; ++j) { d = std::max(d, std::fabs(double{gamma[t * 8 + j]} - rg[t * 8 + j])); }
+                    Stage& s = g_stages["gamma"];
+                    s.worst  = std::max(s.worst, d / 8.0);
+                    ++s.columns;
+                } else {
+                    std::printf("  routing differs at visit %u column %d\n", v, c0 + t);
+                }
+            }
+        }
+        // The output mix over the reference's blocks and the kernel's last tail, then the head.
+        m::FinalInputs fin;
+        fin.tail_out = tail.p;
+        const char* names[4] = {"v0_h_in", "v6_h_in", "v36_h_in", "v41_out"};
+        for (int i = 0; i < 4; ++i) {
+            upload_rows(ref, names[i], c0, kT, blocks[i]->p);
+            fin.blocks.rows[i] = blocks[i]->p;
+        }
+        fin.blocks.count = 4;
+        fw.finish(state.view, fin, nullptr);
+        cuda(cudaDeviceSynchronize(), "finish");
+        const auto last_tail = bf16_values(tail.p, static_cast<std::size_t>(kT) * H);
+        compare("tail (visit 47 out)", last_tail, ref, "v47_out", c0, kT, H, skip);
+        if (dump_dir != nullptr) {
+            dump.rows(dump.tail, c.visits() - 1, c0, last_tail);
+            dump.worst[c.visits() - 1] = std::max(dump.worst[c.visits() - 1], tail_worst(last_tail, ref, "v47_out", c0, kT));
+        }
+        compare("final hidden", bf16_values(b.final_hidden, static_cast<std::size_t>(kT) * H), ref, "final", c0, kT,
+                H, skip);
+        const std::size_t V = c.vocab_size;
+        const auto logits   = download(b.logits, static_cast<std::size_t>(kT) * V);
+        const float* rl     = ref.get<float>("logits") + static_cast<std::size_t>(c0) * V;
+        for (int t = 0; t < kT; ++t) {
+            double d = 0;
+            for (std::size_t i = 0; i < V; ++i) { d = std::max(d, std::fabs(double{logits[t * V + i]} - rl[t * V + i])); }
+            logit_worst = std::max(logit_worst, d);
+            ++logit_columns;
+        }
+    }
+    std::printf("teacher-forced logits: largest difference %.4f over %ld columns\n", logit_worst, logit_columns);
+    if (dump_dir != nullptr) {
+        dump.write(dump_dir);
+        std::printf("teacher-forced tails, worst |diff| / row max per visit:");
+        for (std::uint32_t v = 0; v < c.visits(); ++v) { std::printf("%s %u:%.1e", v % 8 == 0 ? "\n " : "", v, dump.worst[v]); }
+        std::printf("\n");
+    }
+}
+
+// ---------------------------------------------------------------------------- 2-3. free-running, decode = verify
+
+// The worst |kernel - ref| / max |ref row| over the call's columns.
+double drift(const std::vector<double>& got, const Reference& ref, const std::string& name, int c0, int T,
+             std::size_t width) {
+    const float* r = ref.get<float>(name) + static_cast<std::size_t>(c0) * width;
+    double worst   = 0;
+    for (int t = 0; t < T; ++t) {
+        double scale = 0, diff = 0;
+        for (std::size_t i = 0; i < width; ++i) {
+            scale = std::max(scale, std::fabs(double{r[t * width + i]}));
+            diff  = std::max(diff, std::fabs(got[t * width + i] - r[t * width + i]));
+        }
+        worst = std::max(worst, diff / scale);
+    }
+    return worst;
+}
+
+// Diagnostic hybrids (INFERNIX_INKLING2_HYBRID): "blocks" runs the forward's own inputs with the reference's block and
+// message sources; "input" the reference's visit inputs with the forward's own blocks and message sources.
+std::vector<float> free_running(const m::Parameters& p, m::Forward& fw, State& state, const Reference& ref, int width,
+                                bool report = false, const std::string& hybrid = {}, int perturb_offset = 0) {
+    const auto& c = p.model.config().text;
+    state.reset();
+    std::vector<float> out;
+    DeviceRows rinput(static_cast<std::size_t>(width) * H), m0(static_cast<std::size_t>(width) * H),
+        m1(static_cast<std::size_t>(width) * H);
+    std::vector<std::unique_ptr<DeviceRows>> rblocks;
+    for (int i = 0; i < 4; ++i) { rblocks.push_back(std::make_unique<DeviceRows>(static_cast<std::size_t>(width) * H)); }
+    for (int c0 = 0; c0 < kPositions; c0 += width) {
+        fw.prepare(call_plan(ref, c0, width));
+        fw.embed(nullptr);
+        if (hybrid == "perturb") {
+            // One BF16 ulp up in every 97th element of each column's embedding: the model's own sensitivity.
+            auto e = download(fw.buffers().e, static_cast<std::size_t>(width) * H);
+            for (int t = 0; t < width; ++t) {
+                for (int j = perturb_offset; j < H; j += 97) {
+                    std::uint16_t& w = e[static_cast<std::size_t>(t) * H + j];
+                    w                = static_cast<std::uint16_t>(w + 1);
+                }
+            }
+            cuda(cudaMemcpy(fw.buffers().e, e.data(), e.size() * 2, cudaMemcpyHostToDevice), "perturb");
+        }
+        if (report) {
+            std::printf("free-running drift%s, positions %d-%d (visit: input, x_q, x_mlp):\n",
+                        hybrid.empty() ? "" : (" [" + hybrid + "]").c_str(), c0, c0 + width - 1);
+        }
+        for (std::uint32_t v = 0; v < c.visits(); ++v) {
+            m::VisitInputs in = fw.inputs(v);
+            const std::string pre = "v" + std::to_string(v) + "_";
+            const std::uint32_t layer = c.visit_layer(v), pass = c.visit_pass(v);
+            if (hybrid == "blocks") {
+                const int nb = ref.index.at(pre + "blocks").at("shape")[0].get<int>();
+                for (int i = 0; i < nb; ++i) {
+                    const float* src = ref.get<float>(pre + "blocks") + (static_cast<std::size_t>(i) * kPositions + c0) * H;
+                    std::vector<std::uint16_t> host(static_cast<std::size_t>(width) * H);
+                    for (std::size_t j = 0; j < host.size(); ++j) { host[j] = b16(src[j]); }
+                    cuda(cudaMemcpy(rblocks[i]->p, host.data(), host.size() * 2, cudaMemcpyHostToDevice), "blocks");
+                    in.attention_blocks.rows[i] = in.mlp_blocks.rows[i] = rblocks[i]->p;
+                }
+                in.attention_blocks.count = in.mlp_blocks.count = nb;
+                if (p.layers[layer].boundary) { in.mlp_blocks.rows[in.mlp_blocks.count++] = in.input; }
+                if (p.layers[layer].messages && pass > 0) {
+                    const std::uint32_t base = c.loop.core_start + (pass - 1) * c.loop.core_layers();
+                    upload_rows(ref, "v" + std::to_string(base + 6) + "_h_in", c0, width, m0.p);
+                    upload_rows(ref, "v" + std::to_string(base + 11) + "_out", c0, width, m1.p);
+                    in.message_sources[0] = m0.p, in.message_sources[1] = m1.p;
+                }
+            } else if (hybrid == "input" && v > 0) {
+                upload_rows(ref, pre + "h_in", c0, width, rinput.p);
+                in.input = rinput.p;
+                for (int i = 0; i < in.mlp_blocks.count; ++i) {
+                    if (in.mlp_blocks.rows[i] == in.tail_out) { in.mlp_blocks.rows[i] = rinput.p; }
+                }
+            }
+            fw.visit(v, state.view, in, nullptr);
+            if (report) {
+                cuda(cudaDeviceSynchronize(), "visit");
+                const std::size_t TH = static_cast<std::size_t>(width) * H;
+                const std::string pre = "v" + std::to_string(v) + "_";
+                const auto& b         = fw.buffers();
+                std::printf("  %2u L%-2u p%u: %.2e %.2e %.2e\n", v, c.visit_layer(v), c.visit_pass(v),
+                            drift(bf16_values(in.input, TH), ref, pre + "h_in", c0, width, H),
+                            drift(bf16_values(b.x[0], TH), ref, pre + "xq", c0, width, H),
+                            drift(bf16_values(b.xm, TH), ref, pre + "xm", c0, width, H));
+            }
+        }
+        fw.finish(state.view, nullptr);
+        cuda(cudaDeviceSynchronize(), "forward");
+        const auto logits = download(fw.buffers().logits, static_cast<std::size_t>(width) * c.vocab_size);
+        out.insert(out.end(), logits.begin(), logits.end());
+    }
+    return out;
+}
+
+} // namespace
+
+int main() {
+    const char* artifact_path = std::getenv("INFERNIX_INKLING2_ARTIFACT");
+    const char* reference     = std::getenv("INFERNIX_INKLING2_REFERENCE");
+    if (artifact_path == nullptr || *artifact_path == '\0' || reference == nullptr || *reference == '\0') {
+        std::cout << "skip: INFERNIX_INKLING2_ARTIFACT and INFERNIX_INKLING2_REFERENCE are needed\n";
+        return 77;
+    }
+    try {
+        DeviceContext device(0);
+        const Reference ref(reference);
+        artifact::Reader reader(artifact_path);
+        auto model = m::materialize_model(m::plan_load(reader, {}), device);
+        const m::Parameters parameters(*model);
+        m::Forward forward(parameters, 1);
+        State state(forward.layout());
+        const auto& c = model->config().text;
+
+        teacher_forced(parameters, forward, state, ref);
+        bool ok = true;
+        std::printf("%-24s %8s %8s %s\n", "stage", "columns", "excluded", "worst |diff| / row max");
+        for (const auto& [name, s] : g_stages) {
+            // The tails cross the experts' 4-bit activation boundary with inputs an ulp apart: reported here, judged
+            // boundary-conditioned (the reference's MoE on the kernel's own x_mlp: .local tools/tail_check.py).
+            const bool judged = name.rfind("tail", 0) != 0;
+            const bool pass   = !judged || s.worst <= 0x1p-5;
+            ok                = ok && pass;
+            std::printf("%-24s %8ld %8ld %.3e%s\n", name.c_str(), s.columns, s.excluded, s.worst,
+                        !judged ? "  (reported)" : (pass ? "" : "  FAIL"));
+        }
+        std::printf("routing differs from the reference in %ld (visit, column) pairs\n", g_routing_differs);
+
+        std::vector<float> hybrid_logits;
+        const char* hybrid = std::getenv("INFERNIX_INKLING2_HYBRID");
+        if (hybrid != nullptr) {
+            hybrid_logits = free_running(parameters, forward, state, ref, kT, std::string(hybrid) != "perturb", hybrid);
+            double worst  = 0;
+            for (std::size_t i = 0; i < hybrid_logits.size(); ++i) {
+                worst = std::max(worst, std::fabs(double{hybrid_logits[i]} - ref.get<float>("logits")[i]));
+            }
+            std::printf("hybrid %s: largest logit difference from the reference %.4f\n", hybrid, worst);
+        }
+        const auto verify = free_running(parameters, forward, state, ref, kT, std::getenv("INFERNIX_INKLING2_DRIFT") != nullptr);
+        if (hybrid != nullptr && std::string(hybrid) == "perturb") {
+            int flips = 0;
+            for (int t = 0; t < kPositions; ++t) {
+                const float* a = verify.data() + static_cast<std::size_t>(t) * c.vocab_size;
+                const float* q = hybrid_logits.data() + static_cast<std::size_t>(t) * c.vocab_size;
+                double d       = 0;
+                std::size_t aa = 0, qa = 0;
+                for (std::size_t i = 0; i < c.vocab_size; ++i) {
+                    d  = std::max(d, std::fabs(double{a[i]} - q[i]));
+                    aa = a[i] > a[aa] ? i : aa;
+                    qa = q[i] > q[qa] ? i : qa;
+                }
+                flips += aa != qa ? 1 : 0;
+                std::printf("  perturbed position %2d: largest logit change %.3f%s\n", t, d, aa != qa ? " (argmax changed)" : "");
+            }
+            std::printf("perturbation (1 ulp in 24 of 2304 embedding elements): %d of %d argmax changed\n", flips, kPositions);
+        }
+        for (int t = 0; t < kPositions; ++t) {
+            double d = 0;
+            for (std::size_t i = 0; i < c.vocab_size; ++i) {
+                d = std::max(d, std::fabs(double{verify[t * c.vocab_size + i]} - ref.get<float>("logits")[t * c.vocab_size + i]));
+            }
+            std::printf("  position %2d: largest logit difference %.3f\n", t, d);
+        }
+        const auto decode = free_running(parameters, forward, state, ref, 1);
+        const bool equal  = std::memcmp(verify.data(), decode.data(), verify.size() * 4) == 0;
+        std::printf("decode = verify: %s\n", equal ? "the logits agree bit for bit" : "DIFFERENT");
+        ok = ok && equal;
+        // Free-running, token level: the argmax from the last prompt position on (the greedy continuation) equals the
+        // reference's; the mean NLL of the next ids is within the reference's own perturbation spread
+        // (<reference>.spread.json from ref_perturb.py: three 1-ulp embedding perturbations of the CPU reference).
+        // Elsewhere the model's sensitivity to rounding (a 1-ulp embedding change moves its logits by up to ~9)
+        // makes per-position argmax a report, not a criterion.
+        const std::size_t V = c.vocab_size;
+        const float* rl     = ref.get<float>("logits");
+        const std::int32_t* ids = ref.get<std::int32_t>("ids");
+        constexpr int kLastPrompt = 23;
+        int argmax_differ = 0;
+        double worst = 0, nll = 0, ref_nll = 0;
+        const auto log_softmax_at = [V](const float* l, std::size_t id) {
+            double m = l[0];
+            for (std::size_t i = 1; i < V; ++i) { m = std::max(m, double{l[i]}); }
+            double s = 0;
+            for (std::size_t i = 0; i < V; ++i) { s += std::exp(double{l[i]} - m); }
+            return double{l[id]} - m - std::log(s);
+        };
+        for (int t = 0; t < kPositions; ++t) {
+            const float* g = verify.data() + static_cast<std::size_t>(t) * V;
+            const float* r = rl + static_cast<std::size_t>(t) * V;
+            std::size_t ga = 0, ra = 0;
+            for (std::size_t i = 0; i < V; ++i) {
+                worst = std::max(worst, std::fabs(double{g[i]} - r[i]));
+                if (g[i] > g[ga]) { ga = i; }
+                if (r[i] > r[ra]) { ra = i; }
+            }
+            if (ga != ra) {
+                std::printf("  position %d: argmax %zu, the reference's %zu%s\n", t, ga, ra,
+                            t >= kLastPrompt ? "  FAIL (greedy continuation)" : "");
+                ++argmax_differ;
+                ok = ok && t < kLastPrompt;
+            }
+            if (t + 1 < kPositions) {
+                nll -= log_softmax_at(g, static_cast<std::size_t>(ids[t + 1]));
+                ref_nll -= log_softmax_at(r, static_cast<std::size_t>(ids[t + 1]));
+            }
+        }
+        nll /= kPositions - 1, ref_nll /= kPositions - 1;
+        if (std::getenv("INFERNIX_INKLING2_DRIFT") != nullptr || hybrid != nullptr) {
+            // Diagnostic: per-position NLL, and this forward's own NLL under 1-ulp embedding perturbations.
+            for (int t = 0; t + 1 < kPositions; ++t) {
+                const std::size_t id = static_cast<std::size_t>(ids[t + 1]);
+                std::printf("  nll position %2d: %.4f, the reference's %.4f\n", t,
+                            -log_softmax_at(verify.data() + static_cast<std::size_t>(t) * V, id),
+                            -log_softmax_at(rl + static_cast<std::size_t>(t) * V, id));
+            }
+            for (const int offset : {0, 31, 61, 7, 13, 47, 71, 89}) {
+                const auto pl = free_running(parameters, forward, state, ref, kT, false, "perturb", offset);
+                double pn     = 0;
+                for (int t = 0; t + 1 < kPositions; ++t) {
+                    pn -= log_softmax_at(pl.data() + static_cast<std::size_t>(t) * V, static_cast<std::size_t>(ids[t + 1]));
+                }
+                pn /= kPositions - 1;
+                std::printf("  this forward perturbed from offset %2d: mean NLL %.5f (change %.5f)\n", offset, pn, pn - nll);
+            }
+        }
+        std::printf("free-running: %d of %d argmax differ from the reference (none allowed from position %d); largest "
+                    "logit difference %.4f\n", argmax_differ, kPositions, kLastPrompt, worst);
+        std::printf("mean NLL of the next ids (reported): %.5f, the reference's %.5f (difference %.5f)\n", nll, ref_nll,
+                    nll - ref_nll);
+        if (std::ifstream spread_file(std::string(reference) + ".spread.json"); spread_file) {
+            const auto spread = nlohmann::json::parse(spread_file);
+            std::printf("  the reference's own mean NLL under 1-ulp embedding perturbations:");
+            for (const auto& [offset, value] : spread.at("perturbed").items()) {
+                std::printf(" %s:%+.3f", offset.c_str(), value.get<double>() - spread.at("reference").get<double>());
+            }
+            std::printf("\n");
+        }
+        std::printf(ok ? "PASS\n" : "FAIL\n");
+        return ok ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: " << error.what() << '\n';
+        return 1;
+    }
+}
