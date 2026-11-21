@@ -391,7 +391,30 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     moe::moe_experts(moe::Activations{d_rows, d_amax, call.columns}, routing, bank, ws, d_out, nullptr);
     cuda_check(cudaDeviceSynchronize(), "moe call");
     Result r;
-    r.out    = download(d_out, entries * H);
+    r.out = download(d_out, entries * H);
+    // The same call captured in a CUDA graph, where the down pass is a programmatic dependent of the gate/up pass
+    // (its CTAs wait on their jobs' counts while gate/up CTAs still run), replayed three times: the eager bits.
+    {
+        cudaStream_t stream;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+        moe::moe_dispatch(routing, call.columns, E, ws, stream);
+        moe::moe_experts(moe::Activations{d_rows, d_amax, call.columns}, routing, bank, ws, d_out, stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (int replay = 0; replay < 3; ++replay) {
+            cuda_check(cudaMemsetAsync(d_out, 0xFF, entries * H * 2, stream), "clear");
+            cuda_check(cudaGraphLaunch(exec, stream), "replay");
+            cuda_check(cudaStreamSynchronize(stream), "replay");
+            check(download(d_out, entries * H) == r.out, "a graph replay (programmatic down pass) differs from the eager call");
+        }
+        cuda_check(cudaGraphExecDestroy(exec), "destroy");
+        cuda_check(cudaGraphDestroy(graph), "destroy");
+        cuda_check(cudaStreamDestroy(stream), "stream");
+        check(download(ws.error, 1)[0] == 0U, "the call's error word is set");
+    }
     r.h      = download(ws.h, entries * I);
     r.h_rows = download(ws.h_rows, entries * moe::row_bytes(bank.format, I));
     r.h_amax = download(ws.h_amax, entries);

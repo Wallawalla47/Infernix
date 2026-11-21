@@ -30,6 +30,8 @@ inline constexpr std::int32_t kMaxColumns = 128; // per call: B lanes x T column
 
 enum class ExpertFormat : std::uint8_t { Nvfp4FourOverSix, Mxfp8 };
 
+inline constexpr std::uint32_t kErrorDownStalled = 1U;
+
 // One layer's experts [E, H, I]: records at records + e * record_stride (the bank's layout), and for NVFP4 the
 // checkpoint's FP32 amax [E][2] (gate/up, down) and denominators [2].
 struct Bank {
@@ -82,6 +84,8 @@ struct Workspace {
     std::uint16_t* h          = nullptr; // [kMaxColumns * kTopK][I] BF16
     std::uint32_t* h_amax     = nullptr; // [kMaxColumns * kTopK]: binary32 bits of max |h| (NVFP4)
     std::uint8_t* h_rows      = nullptr; // [kMaxColumns * kTopK][row_bytes(I)]
+    // [1]: kErrorDownStalled once a down CTA's wait for its job made no progress for 2 s (zero: no error).
+    std::uint32_t* error      = nullptr;
 };
 
 // The router of `columns` columns of x (BF16 [T][H], the MoE input), then the dispatch (moe_dispatch's) of its routing

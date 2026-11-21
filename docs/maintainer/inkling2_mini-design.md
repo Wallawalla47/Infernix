@@ -615,14 +615,14 @@ launched ~1,440 kernels).
 
 | Kernel | Reads | Does | Writes |
 |---|---|---|---|
-| K1 attention mixer | previous visit's per-expert partials (8 × H FP32 per column), conv ring, block sources | expert combine in slot order → BF16; post-MLP conv + residual; block bookkeeping; attention mix (1 or 3 queries); norm(s); DSpark tap copy on visits 5, 23, 41 | x_q (and x_k, x_v), BF16 |
+| K1 attention mixer | previous visit's per-entry expert outputs (8 × H BF16 per column), conv ring, block sources | expert combine in slot order → BF16; post-MLP conv + residual; block bookkeeping; attention mix (1 or 3 queries); norm(s); DSpark tap copy on visits 5, 23, 41 | x_q (and x_k, x_v), BF16 |
 | K2 projection | x_q, x_k, x_v; packed W (8,576 rows; the sink's 24 and the full visits' 64 dynamic-tap rows in a small parent) | multi-input GEMV: row ranges take their own input vector; FP32 accumulate; epilogue writes each output in its consumer's layout (L6) | q, k, v, r, gate, sink, taps |
 | K3 attention | K2 outputs, ring or pages | per-KV-head prologue: K/V conv (ring history), clips, v-norm, τ, append; relative-bias vector; split-K over keys; the last split CTA combines with the sink and multiplies σ(gate) | a, BF16 [3072] |
 | K4 output projection | a, packed W_o | GEMV, epilogue: post-attention conv (per channel, ring), residual add or restart | h (BF16), conv ring |
 | K5 MoE mixer | h, block sources | MLP mix, norm, four-over-six (or MXFP8) quantization of x | A4(x), BF16 x for the router |
 | K6 router and route | x, W_router | FP32 router GEMV (few-row mapping, weights before the PDL wait); a one-CTA tail: sigmoid, bias, rank-based top-8, γ, per-expert job lists | dispatch |
 | K7 gate/up | A4(x), dispatch, expert weights | narrow W4A4 (or W8A8); epilogue: softcapped SwiGLU × γ → BF16 h; per-(column, expert) row amax by `atomicMax` (order-independent, so deterministic) | h_e, amax_e |
-| K8 down | h_e, amax_e | polls its job's completion count (L11); A4(h) (where: M5); W4A4 down | per-expert partials FP32 |
+| K8 down | h_e, amax_e | polls its job's completion count (L11); A4(h) (where: M5); W4A4 down | per-entry expert outputs, BF16 |
 
 The combine of K8's partials moves into the next visit's K1, which needs them first; the order is the fixed slot
 order of [§2.5](#25-rounding-points-pinned-at-m0), never arrival order. K2, K7 and K8 stream weights at the GEMV floor;
@@ -737,8 +737,9 @@ lossless route has its own attention kernel (exact scores, correctly rounded sof
 ### 10.1 Contract
 
 `w4a4_sparse_moe`: inputs x [H × columns] BF16 (or its quantized form), the dispatch, the experts of one layer (NVFP4 or
-MXFP8 family), the softcaps; outputs per-expert FP32 partials (decode: combined by the next K1 in slot order) or the
-BF16 combined output (prefill). Routes: narrow (decode, verify) and wide (prefill), each qualified against the FP64
+MXFP8 family), the softcaps; outputs one BF16 row per (column, slot) entry, bf16 of the expert output as the trained kernels write it
+(decode: combined by the next K1, an FP32 fold over the slots in slot order, one BF16 rounding) or the BF16 combined
+output (prefill). Routes: narrow (decode, verify) and wide (prefill), each qualified against the FP64
 oracle of [§16.3](#163-op-oracles).
 
 ### 10.2 MoE mixer, router and dispatch

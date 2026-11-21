@@ -93,12 +93,32 @@ __device__ __forceinline__ std::uint16_t swiglu(std::uint16_t g, std::uint16_t u
     return canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(a, canon::softcap_c(up, up_cap)), gamma));
 }
 
-// Spins until *word reaches `target` (thread 0 of a CTA; an acquire for the CTA after the following barrier).
-__device__ __forceinline__ void wait_count(const std::uint32_t* word, std::uint32_t target) {
-    while (true) {
+__device__ __forceinline__ std::uint64_t global_ns() {
+    std::uint64_t now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    return now;
+}
+
+// Spins until *word reaches `target` (thread 0 of a CTA; an acquire for the CTA after the following barrier). A count
+// that makes no progress for kWaitTimeoutNs sets kErrorDownStalled in *error and gives up (the CTA then writes nothing):
+// a lost count fails the call through its error word, never hangs the GPU.
+constexpr std::uint64_t kWaitTimeoutNs = 2'000'000'000ULL;
+
+__device__ __forceinline__ bool wait_count(const std::uint32_t* word, std::uint32_t target, std::uint32_t* error) {
+    std::uint32_t seen = 0;
+    std::uint64_t since = 0;
+    for (bool first = true;; first = false) {
         std::uint32_t v;
         asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(word) : "memory");
-        if (v >= target) { return; }
+        if (v >= target) { return true; }
+        const std::uint64_t now = global_ns();
+        if (first || v != seen) {
+            seen  = v;
+            since = now;
+        } else if (now - since > kWaitTimeoutNs) {
+            atomicOr(error, kErrorDownStalled);
+            return false;
+        }
         __nanosleep(64);
     }
 }
@@ -488,8 +508,13 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a4_kernel(
     for (int i = lane; i < S::kDownBytes / 16; i += 32) { tile::cp_async16(sm.units[warp] + 16 * i, src + 16 * i, 16); }
     tile::cp_async_commit();
     a4_mma_fill_scaled(sm.scaled, S::kDownThreads);
-    if (tid == 0) { wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpCtas + 1)); }
+    __shared__ int stalled;
+    if (tid == 0) { stalled = wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpCtas + 1), a.ws.error) ? 0 : 1; }
     __syncthreads();
+    if (stalled != 0) {
+        tile::cp_async_wait<0>();
+        return;
+    }
     const float w_amax = a.bank.amax[2 * v.expert + 1];
     const float rcp    = canon::div_rn(1.0F, canon::mul_rn(1536.0F, a.bank.denominators[1]));
     for (int base = 0; base < v.count; base += kPass) {
@@ -681,8 +706,13 @@ __global__ void __launch_bounds__(Shape<G, true>::kDownThreads) down_a8_kernel(A
     const std::uint8_t* src = v.record + S::kGateUpBytes + static_cast<std::size_t>(group) * S::kDownBytes;
     for (int i = lane; i < S::kDownBytes / 16; i += 32) { tile::cp_async16(sm.units[warp] + 16 * i, src + 16 * i, 16); }
     tile::cp_async_commit();
-    if (tid == 0) { wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpCtas)); }
+    __shared__ int stalled;
+    if (tid == 0) { stalled = wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpCtas), a.ws.error) ? 0 : 1; }
     __syncthreads();
+    if (stalled != 0) {
+        tile::cp_async_wait<0>();
+        return;
+    }
     for (int base = 0; base < v.count; base += kPass) {
         const int n = min(kPass, v.count - base);
         constexpr int kWords = S::kHRowBytes / 4;
@@ -747,6 +777,7 @@ Workspace layout(std::int32_t experts, std::int32_t intermediate, Take&& take) {
     w.h          = reinterpret_cast<std::uint16_t*>(take(m * i * 2));
     w.h_amax     = reinterpret_cast<std::uint32_t*>(take(m * 4));
     w.h_rows     = reinterpret_cast<std::uint8_t*>(take(m * h_row));
+    w.error      = reinterpret_cast<std::uint32_t*>(take(4));
     return w;
 }
 
