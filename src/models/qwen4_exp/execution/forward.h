@@ -12,6 +12,7 @@
 #include "core/tensor.h"
 #include "models/qwen4_exp/expert_offload.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/load/ablate.h"
 #include "models/qwen4_exp/execution/activation_scan.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
@@ -381,6 +382,10 @@ public:
     // call of more than 128 columns leaves the 8-bit routes (--a8-activations). The exact wide routes (W4A16, GGUF
     // and block-FP8 integer tiles) give the narrow kernels' bits.
     [[nodiscard]] bool trimmed_routes(const MoeParameters& p, std::int32_t columns) const;
+
+    // Ablation sidecar (--ablate, docs/ablate.md): set once after construction and before the first
+    // run() — the decode-graph capture bakes the hook launches. Throws on the lossless route.
+    void set_ablate_sidecar(AblateBinding&& sidecar);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
     // A pair call (design §19.3.1, the zero-split tap): two consecutive chunks of one lane, `head` then
     // `tail`, as one call whose prefix tap between them costs no second pass. Per layer the mixers run
@@ -406,9 +411,11 @@ public:
     // scoring runs it in tiles over a prompt's saved residuals. Uses the workspace (no call open).
     void head_logits(const Tensor& residuals, Tensor& logits);
 
+    // ablate_mlp_cut: an --ablate sidecar is configured. A cut MLP lane keeps the MoE output un-injected so it
+    // can be cut (moe_impl's y, H x T BF16); the fused inject never allocates it, so it is budgeted only here.
     [[nodiscard]] static std::size_t workspace_bytes(
         const TextConfig& config, std::int32_t columns, std::int32_t max_context, KvCacheStorage storage,
-        ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact);
+        ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact, bool ablate_mlp_cut = false);
     // The lossless route's workspace for a call of `columns` (TextConfig::lossless): a scored window, or with
     // key_capacity > 0 the cache form over up to `sequences` sequences with keys up to key_capacity.
     [[nodiscard]] static std::size_t lossless_workspace_bytes(const TextConfig& config, std::int32_t columns,
@@ -603,6 +610,7 @@ private:
     const TextConfig& config_;
     DeviceContext& device_;
     WorkspaceArena& work_;
+    AblateBinding ablate_;  // disabled until set_ablate_sidecar (docs/ablate.md)
     ForwardState state_;
     ForwardKV kv_;
     ForwardExperts experts_;

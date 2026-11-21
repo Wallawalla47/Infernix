@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/execution/forward.h"
 
 #include "core/layout.h"
+#include "infernix/ops/ablate_direction.h"
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/embedding.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -394,7 +395,7 @@ ops::LinearRoutes Forward::dense_routes() const noexcept {
 }
 
 std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context,
-                                     KvCacheStorage storage, ops::offloaded_moe::WideA16 wide_a16) {
+                                     KvCacheStorage storage, ops::offloaded_moe::WideA16 wide_a16, bool ablate_mlp_cut) {
     const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t h = c.hidden_size, w = c.residual_width(), k = c.moe.top_k;
     const std::size_t bf = 2;
@@ -425,6 +426,9 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
              ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts + sj),
                                               dim((k + sj) * t), std::max(columns, 1), expert_activation(c), wide_a16);
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * bf * 3;
+    // An ablation cut on the MLP lane: the MoE output is formed (moe_impl's y) instead of injected, so the
+    // cut can act on it. The arena is sized before the sidecar is read, so --ablate budgets it outright.
+    if (ablate_mlp_cut) { bytes += h * t * bf; }
     // Linear and GDN scratch (chunked recurrence), plus alignment slack per allocation.
     bytes += ops::gated_delta_net_workspace_capacity_bytes(dim(c.gdn.key_heads), dim(c.gdn.value_heads), 1,
                                                            std::max(columns, 1));
@@ -599,6 +603,14 @@ void Forward::embed_impl(A& a, const ForwardBatch* batch, Tensor& residual) {
     }
 }
 
+void Forward::set_ablate_sidecar(AblateBinding&& sidecar) {
+    if (sidecar.enabled && config_.lossless) {
+        throw std::invalid_argument("Qwen4Exp forward: --ablate does not combine with the lossless route"
+                                    " (docs/ablate.md)");
+    }
+    ablate_ = std::move(sidecar);
+}
+
 void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap) {
     layer_impl(work_, layer, &batch, call_shape(batch), residual, tap);
 }
@@ -629,6 +641,12 @@ void Forward::layer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, c
         Tensor xa_a8;
         Tensor xa     = mix_mixer_input_impl(a, block, residual, inject, xa_a8);
         Tensor y      = mixer_impl(a, layer, batch, shape, xa, xa_a8.data != nullptr ? &xa_a8 : nullptr);
+        if constexpr (kRuns<A>) {
+            if (const float av = ablate_.alpha_for(layer, AblateBinding::Lane::Attn); ablate_.enabled && av != 0.0F) {
+                ops::ablate_direction(y.data, static_cast<std::uint32_t>(dim(config_.hidden_size)),
+                                      static_cast<std::uint32_t>(y.ne[1]), ablate_.device_d(layer), av, s);
+            }
+        }
         // The attention half's inject, then the MLP half's mix. One fused Op folding the inject into the
         // mixer's reads (candidates §7.3 D6) measured flat (removed 2026-10-28).
         if constexpr (kRuns<A>) { ops::hyper_connection_inject(y, inject, residual, s); }
@@ -642,17 +660,33 @@ void Forward::layer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, c
             Tensor xm_kept       = xm.slice(1, T - kept, kept);
             Tensor inject_kept   = inject.slice(1, T - kept, kept);
             Tensor residual_kept = residual.slice(1, T - kept, kept);
-            // The dense shared expert over the whole call, as the untrimmed call runs it.
-            (void)moe_impl(a, block.moe, xm_kept, layer, nullptr, batch, shape, -1, &inject_kept, &residual_kept, T - kept,
-                           nullptr, 0, TrimmedCall{.shared = &xm, .routes = &xm});
+            if (ablate_.alpha_for(layer, AblateBinding::Lane::Mlp) != 0.0F) {
+                // An MLP-lane cut acts on the MoE output before its inject, so the trimmed MoE runs in the form a
+                // pair call's trimmed tail takes (layer_moe_impl: formed, cut, then injected), with the same
+                // whole-call shared expert and routes.
+                layer_moe_impl(a, layer, batch, shape, xm_kept, inject_kept, residual_kept, -1, T - kept, 0,
+                               TrimmedCall{.shared = &xm, .routes = &xm});
+            } else {
+                // The dense shared expert over the whole call, as the untrimmed call runs it.
+                (void)moe_impl(a, block.moe, xm_kept, layer, nullptr, batch, shape, -1, &inject_kept, &residual_kept,
+                               T - kept, nullptr, 0, TrimmedCall{.shared = &xm, .routes = &xm});
+            }
         } else {
-            // The combine injects its output directly unless a tap records it.
-            const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
+            // The combine injects its output directly unless a tap records it (or ablation needs ym observable).
+            const bool mlp_cut = ablate_.enabled && ablate_.alpha_for(layer, AblateBinding::Lane::Mlp) != 0.0F;
+            const bool fused_inject = (tap == nullptr || tap->moe_outputs == nullptr) && !mlp_cut;
             ym = moe_impl(a, block.moe, xm, layer,
                           tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, batch, shape, -1,
                           fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr, 0, &residual, 0);
             if constexpr (kRuns<A>) {
-                if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
+                if (!fused_inject) {
+                    if (mlp_cut) {
+                        ops::ablate_direction(ym.data, static_cast<std::uint32_t>(dim(config_.hidden_size)),
+                                              static_cast<std::uint32_t>(ym.ne[1]), ablate_.device_d(layer),
+                                              ablate_.alpha_for(layer, AblateBinding::Lane::Mlp), s);
+                    }
+                    ops::hyper_connection_inject(ym, inject, residual, s);
+                }
             }
         }
         if constexpr (kRuns<A>) {
@@ -802,6 +836,14 @@ void Forward::layer_mixer_impl(A& a, std::uint32_t layer, const ForwardBatch* ba
         if (block.ple) { ple_impl(a, *block.ple, residual, batch, shape); }
         Tensor xa = mix_impl(a, block.attn_hc, residual, &inject);
         Tensor y  = mixer_impl(a, layer, batch, shape, xa, nullptr);
+        // The captured decode lanes must match the eager walk above lane for lane, or a fit measured
+        // on prefill would not be the cut that serves tokens.
+        if constexpr (kRuns<A>) {
+            if (const float a = ablate_.alpha_for(layer, AblateBinding::Lane::Attn); ablate_.enabled && a != 0.0F) {
+                ops::ablate_direction(y.data, static_cast<std::uint32_t>(dim(config_.hidden_size)),
+                                      static_cast<std::uint32_t>(y.ne[1]), ablate_.device_d(layer), a, device_.stream);
+            }
+        }
         if constexpr (kRuns<A>) { ops::hyper_connection_inject(y, inject, residual, device_.stream); }
         (void)mix_impl(a, block.mlp_hc, residual, &inject, &xm);
     } catch (const std::exception&) {
@@ -824,6 +866,13 @@ void Forward::layer_moe_impl(A& a, std::uint32_t layer, const ForwardBatch* batc
         auto scope = a.scope();
         Tensor ym  = moe_impl(a, parameters_.layers[layer].moe, xm, layer, nullptr, batch, shape, route_columns, nullptr,
                               nullptr, route_skipped, &residual, chunk_columns, trimmed);
+        // This lane always sees ym before its inject, so the MLP alpha alone decides it.
+        if constexpr (kRuns<A>) {
+            if (const float a = ablate_.alpha_for(layer, AblateBinding::Lane::Mlp); ablate_.enabled && a != 0.0F) {
+                ops::ablate_direction(ym.data, static_cast<std::uint32_t>(dim(config_.hidden_size)),
+                                      static_cast<std::uint32_t>(ym.ne[1]), ablate_.device_d(layer), a, device_.stream);
+            }
+        }
         if constexpr (kRuns<A>) { ops::hyper_connection_inject(ym, inject, residual, device_.stream); }
     } catch (const std::exception&) {
         runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");

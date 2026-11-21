@@ -446,6 +446,20 @@ int main() {
     failures += check(context_cost.context_cost_presets == "local-costs.json",
                       "--context-cost-presets did not preserve its path");
 
+    // --ablate: its own path, alone and beside --context-cost-presets (an earlier draft of this option
+    // split that option's branch, so --ablate checked the other path and always failed), and off by default.
+    const ServeOptions ablate = parse({"infernix-serve", "model.ninfer", "--ablate", "refusal/sidecar.json"});
+    failures += check(ablate.ablate_sidecar_path == std::filesystem::path("refusal/sidecar.json") &&
+                          ablate.context_cost_presets.empty(),
+                      "--ablate did not preserve its path on its own");
+    const ServeOptions ablate_beside = parse({"infernix-serve", "model.ninfer", "--context-cost-presets",
+                                              "local-costs.json", "--ablate", "refusal/sidecar.json"});
+    failures += check(ablate_beside.ablate_sidecar_path == std::filesystem::path("refusal/sidecar.json") &&
+                          ablate_beside.context_cost_presets == "local-costs.json",
+                      "--ablate and --context-cost-presets did not each keep their own path");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).ablate_sidecar_path.empty(),
+                      "--ablate is not off by default");
+
     const ServeOptions thinking_budget =
         parse({"infernix-serve", "model.ninfer", "--default-thinking-budget", "37"});
     failures += check(thinking_budget.default_thinking_budget == 37,

@@ -6,6 +6,11 @@ infernix_add_test(infernix_artifact_peft_lora_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_peft_lora.cpp"
   LIBRARIES infernix_artifact)
 
+# The ablation sidecar reader (--ablate, docs/ablate.md) on synthetic sidecars: every refusal names its cause.
+infernix_add_test(infernix_artifact_ablate_sidecar_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ablate_sidecar.cpp"
+  LIBRARIES infernix_artifact)
+
 infernix_add_test(infernix_artifact_materialization_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_materialization.cpp" "${CMAKE_CURRENT_LIST_DIR}/materialization_cuda_errors.cpp"
   LIBRARIES infernix_artifact)

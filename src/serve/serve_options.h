@@ -52,6 +52,8 @@ struct ServeOptions {
     // --lora PATH: a LoRA adapter applied at runtime (EngineOptions::lora_path).
     std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
+    // --ablate FILE: the ablation sidecar (docs/ablate.md). Empty: byte-identical standard.
+    std::filesystem::path ablate_sidecar_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.

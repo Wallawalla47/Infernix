@@ -11,6 +11,7 @@
 #include "models/load_options.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/load/ablate.h"
 #include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 #include "runtime/expert_offload/memory_plan.h"
@@ -347,6 +348,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefill_cpu_split = false;
     }
     program_options.kv_cache        = options.kv_cache;
+    program_options.ablate_sidecar_path = options.ablate_sidecar_path;
     program_options.diagnostics     = options.diagnostic_observer;
     program_options.kv_capacity_tokens =
         options.kv_capacity.mode == KvCapacityMode::Explicit ? options.kv_capacity.explicit_tokens : 0U;
@@ -919,6 +921,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary summary;
     summary.architecture         = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
     summary.model_name           = instance->model->info().name;
+    if (!options.ablate_sidecar_path.empty()) {
+        summary.ablate_sidecar = options.ablate_sidecar_path.string() + ": " +
+                                 models::qwen4_exp::bind_ablate(options.ablate_sidecar_path, text).describe();
+    }
     summary.load_seconds         = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;

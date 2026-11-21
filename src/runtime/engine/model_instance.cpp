@@ -1,4 +1,5 @@
 #include "runtime/engine/model_instance.h"
+#include "artifact/ablate_sidecar.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "artifact/materializer.h"
@@ -72,6 +73,11 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
                                         "offloaded), and Infernix applies LoRA adapters to the dense Qwen3.5-family "
                                         "models (the 27B) only");
         }
+    }
+    // --ablate is wired into Qwen3.8-Flash-Next's forward only; any other model would load nothing and serve uncut.
+    if (!options.ablate_sidecar_path.empty() && architecture != models::Architecture::Qwen4Exp) {
+        throw std::invalid_argument("--ablate cuts Qwen3.8-Flash-Next only (docs/ablate.md); this artifact is " +
+                                    std::string(models::architecture_name(architecture)));
     }
     // An automatic context takes all the VRAM the KV pool may have: offloaded experts size their cache from what
     // the fixed allocations leave, so it would starve the expert cache.
@@ -253,6 +259,13 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
     // The 8-bit activation routes change the KV and state their calls write (decode, short and prefill calls).
     if (options.a8_activations) { out += ";a8"; }
+    const auto stamp = [](const std::filesystem::path& file) {
+        std::error_code e;
+        const auto bytes = std::filesystem::file_size(file, e);
+        const auto when  = std::filesystem::last_write_time(file, e);
+        return std::filesystem::absolute(file).string() + ":" + std::to_string(e ? 0U : bytes) + ":" +
+               std::to_string(e ? 0 : when.time_since_epoch().count());
+    };
     // A LoRA adapter changes every adapted projection: its weights file and configuration name it as the artifact's
     // path, size and time do.
     if (!options.lora_path.empty()) {
@@ -260,14 +273,13 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
                                                   ? options.lora_path / "adapter_model.safetensors"
                                                   : options.lora_path;
         const std::filesystem::path config = weights.parent_path() / "adapter_config.json";
-        const auto stamp = [&](const std::filesystem::path& file) {
-            std::error_code e;
-            const auto bytes = std::filesystem::file_size(file, e);
-            const auto when  = std::filesystem::last_write_time(file, e);
-            return std::filesystem::absolute(file).string() + ":" + std::to_string(e ? 0U : bytes) + ":" +
-                   std::to_string(e ? 0 : when.time_since_epoch().count());
-        };
         out += ";lora=" + stamp(weights) + "|" + stamp(config);
+    }
+    // An ablation sidecar changes the residual writes of every layer it cuts: the sidecar and its direction file name
+    // it the same way.
+    if (!options.ablate_sidecar_path.empty()) {
+        out += ";ablate=" + stamp(options.ablate_sidecar_path) + "|" +
+               stamp(artifact::AblateSidecar::direction_path(options.ablate_sidecar_path));
     }
     // Tail skip leaves experts out of decode and verification rounds, so the KV and state those rounds wrote
     // (endpoints, continued turns) differ from what a run without it computes, and the reverse.
