@@ -141,6 +141,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-a4-activations", false},
     CliOption{"--a16-activations", false},
     CliOption{"--a8-activations", false},
+    CliOption{"--q8-weights", false},
     CliOption{"--embedding-host", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
@@ -199,7 +200,7 @@ std::string usage_text(const char* argv0) {
            "       [--chat-template FILE] [--lora PATH] [--ablate FILE] [--ngram-volume FILE]\n"
            "       [--ngram-residency auto|ram|volume]\n"
            "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--a16-activations]\n"
-           "       [--a8-activations]\n"
+           "       [--a8-activations] [--q8-weights]\n"
            "       [--embedding-host]\n"
            "       [--ram-free-mib N] [--expert-ram-mib N|auto] [--expert-ram-layout exclusive|full]\n"
            "       [--expert-pin-mib N|auto] [--expert-csf]\n"
@@ -346,6 +347,11 @@ std::string usage_text(const char* argv0) {
            "                           8-bit at load. Other calls keep their routes.\n"
            "                           Approximate: changes the output; --reproducible and\n"
            "                           artifacts without such a route refuse it (default: off)\n"
+           "  --q8-weights             8-bit weights where they measured faster: Inkling 2's\n"
+           "                           attention input projections and head become int8 with\n"
+           "                           an FP16 scale per 32 values at load (activations stay\n"
+           "                           16-bit). Approximate: changes the output; --reproducible\n"
+           "                           and other artifacts refuse it (default: off)\n"
            "  --embedding-host         Qwen3.5-family artifacts: keep the token embedding in\n"
            "                           pinned host memory, read zero-copy, so its VRAM\n"
            "                           (1.18 GiB on the 27B) goes to the KV and prefix\n"
@@ -665,6 +671,8 @@ Options parse_options(int argc, char** argv) {
             options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
+        } else if (arg == "--q8-weights") {
+            options.q8_weights = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--stop-token-id") {

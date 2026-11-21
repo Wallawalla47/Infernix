@@ -413,6 +413,7 @@ int main(int argc, char** argv) {
         engine_options.expert_a4_activations    = cli.expert_a4_activations;
         engine_options.expert_a16_activations   = cli.expert_a16_activations;
         engine_options.a8_activations           = cli.a8_activations;
+        engine_options.q8_weights               = cli.q8_weights;
         engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;

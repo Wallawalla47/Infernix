@@ -672,6 +672,30 @@ void profile_rounds(const m::Parameters& p, m::Forward& fw, State& state, const 
     cuda(cudaStreamDestroy(stream), "stream");
 }
 
+// Under INFERNIX_INKLING2_Q8: the converted matrices' FP16 group scales, counted (a group whose largest magnitude is
+// under 127 * 2^-25 gets scale 0 and loses its values; a subnormal scale keeps fewer than 11 bits).
+void q8_census(const m::Model& model) {
+    std::uint64_t groups = 0, zero = 0, subnormal = 0;
+    for (const auto& parent : model.q8().parents) {
+        const WeightGeometry& g = parent->geometry;
+        std::vector<std::uint16_t> scales(g.scale_bytes / 2);
+        cuda(cudaMemcpy(scales.data(), parent->device + g.scale_offset, g.scale_bytes, cudaMemcpyDeviceToHost), "scales");
+        const std::uint64_t real = (g.shape[1] + 31) / 32; // a row's groups before the padding to 128
+        const std::uint64_t per_row = g.scale_bytes_per_row / 2;
+        for (std::uint64_t r = 0; r < g.shape[0]; ++r) {
+            for (std::uint64_t j = 0; j < real; ++j) {
+                const std::uint16_t s = scales[r * per_row + j];
+                ++groups;
+                zero += (s & 0x7FFFU) == 0 ? 1 : 0;
+                subnormal += (s & 0x7C00U) == 0 && (s & 0x3FFU) != 0 ? 1 : 0;
+            }
+        }
+    }
+    std::printf("q8 census: %llu groups, %llu with scale 0, %llu with a subnormal scale\n",
+                static_cast<unsigned long long>(groups), static_cast<unsigned long long>(zero),
+                static_cast<unsigned long long>(subnormal));
+}
+
 // Diagnostic and timing (INFERNIX_INKLING2_PREFILL_PROFILE = width): one eager prefill call of `width` columns from an
 // empty state (pseudo-random ids, so the routing varies as text does), after a warm-up call, with an event at every
 // Op boundary (Forward::set_marker): each Op kind's time summed over the 48 visits, and the call's rate. The Ops run
@@ -815,14 +839,23 @@ int main() {
         const Reference ref(reference);
         artifact::Reader reader(artifact_path);
         // INFERNIX_INKLING2_PACK: the projections packed to bf16_p12 at load (the same bits: the bit guard holds).
+        // INFERNIX_INKLING2_Q8: --q8-weights' conversion (other bits: the reference criteria do not apply; for its
+        // timing, the invariance checks and the census).
         models::LoadOptions load_options;
-        load_options.pack_bf16 = std::getenv("INFERNIX_INKLING2_PACK") != nullptr;
+        load_options.pack_bf16  = std::getenv("INFERNIX_INKLING2_PACK") != nullptr;
+        load_options.q8_weights = std::getenv("INFERNIX_INKLING2_Q8") != nullptr;
         auto model = m::materialize_model(m::plan_load(reader, load_options), device);
-        if (load_options.pack_bf16) {
+        if (model->packed().source_bytes != 0) {
             std::printf("packed %zu matrices at load: %.2f GB of BF16 -> %.2f GB, %llu escapes, %.0f ms\n",
                         model->packed().parents.size(), model->packed().source_bytes / 1e9,
                         model->packed().storage.bytes / 1e9, static_cast<unsigned long long>(model->packed().escapes),
                         1000.0 * model->packed().seconds);
+        }
+        if (model->q8().source_bytes != 0) {
+            std::printf("q8 weights at load: %zu matrices, %.1f MiB of BF16 -> %.1f MiB, %.0f ms\n",
+                        model->q8().parents.size(), model->q8().source_bytes / 1048576.0,
+                        model->q8().storage.bytes / 1048576.0, 1000.0 * model->q8().seconds);
+            q8_census(*model);
         }
         const m::Parameters parameters(*model);
         m::Forward forward(parameters, 1);
@@ -864,6 +897,14 @@ int main() {
                 worst = std::max(worst, std::fabs(double{hybrid_logits[i]} - ref.get<float>("logits")[i]));
             }
             std::printf("hybrid %s: largest logit difference from the reference %.4f\n", hybrid, worst);
+            // INFERNIX_INKLING2_HYBRID_OUT writes the hybrid's free-running logits ([32][V] FP32): with "perturb",
+            // the model's own sensitivity to a 1-ulp input change, a floor for comparing other weights' logits.
+            if (const char* out = std::getenv("INFERNIX_INKLING2_HYBRID_OUT"); out != nullptr) {
+                std::ofstream f(out, std::ios::binary);
+                f.write(reinterpret_cast<const char*>(hybrid_logits.data()),
+                        static_cast<std::streamsize>(hybrid_logits.size() * 4));
+                std::printf("wrote the hybrid's logits to %s\n", out);
+            }
         }
         const auto verify = free_running(parameters, forward, state, ref, kT, std::getenv("INFERNIX_INKLING2_DRIFT") != nullptr);
         // A bit guard for changes claimed to keep the bits: INFERNIX_INKLING2_LOGITS_OUT writes the free-running

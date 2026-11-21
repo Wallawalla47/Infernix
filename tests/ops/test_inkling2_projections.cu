@@ -5,6 +5,8 @@
 // run here), at widths 1, 3, 8, 16, 17, 40, 100 and 300 (passes of 16 and a partial one; past 16 columns BF16 storage
 // runs the wide kernel, the weights held across passes). linear() runs 8 columns a call (its column-invariant skinny
 // route), so the oracle is linear's arithmetic itself; its accuracy is the Linear Op's qualification.
+// Q8 storage (the lossy 8-bit weights) against an FP64 oracle on the stored codes and scales decoded on the host, within
+// the FP32 fold's error bound, and every column equal to the same column projected alone (run_q8).
 
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -12,6 +14,7 @@
 #include "infernix/ops/bf16_p12.h"
 #include "infernix/ops/inkling2_projections.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/q8_g32.h"
 #include "ops/common/canonical_math.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
@@ -19,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -96,6 +100,136 @@ Packed pack(const std::uint16_t* src, int n, int k) {
     p.words   = reinterpret_cast<const unsigned*>(p.base + g.scale_offset);
     p.escapes = reinterpret_cast<const unsigned*>(p.base + g.escape_offset);
     return p;
+}
+
+// An FP16 value (finite) exactly.
+double f16_value(std::uint16_t h) {
+    const int e = (h >> 10) & 31, m = h & 1023;
+    const double s = (h & 0x8000U) != 0 ? -1.0 : 1.0;
+    return e == 0 ? s * std::ldexp(m, -24) : s * std::ldexp(1024 + m, e - 25);
+}
+
+// Q8 storage (LOSSY): the matrix quantized by ops::quantize_bf16_q8_g32 (its codes and scales are qualified exactly
+// by test_hyper_connection's repack case, which runs the same Op). The oracle decodes the stored codes with their
+// stored scales on the host and sums in FP64; the criterion is the FP32 fold's error bound (each lane folds K / 32
+// products by fma, then 5 butterfly adds: |err| <= (K / 32 + 5) u sum |w x|, u = 2^-24) plus BF16 rounding of the
+// output (<= 2^-8 |y|, one ulp's half on either side of a rounding). Every column of the call must also equal the
+// same column projected alone (T = 1, the narrow kernel) bit for bit: width invariance, and wide = narrow.
+void run_q8(const Case& c, int columns, std::uint32_t seed) {
+    std::mt19937 gen(seed);
+    const int word = c.fp32 ? 4 : 2;
+    std::uint16_t* x[3];
+    std::vector<std::uint16_t> xh[3];
+    for (int i = 0; i < 3; ++i) {
+        x[i]  = dalloc<std::uint16_t>(static_cast<std::size_t>(columns) * c.k);
+        xh[i] = random_bf16(static_cast<std::size_t>(columns) * c.k, 1.0F, gen);
+        cuda_check(cudaMemcpy(x[i], xh[i].data(), xh[i].size() * 2, cudaMemcpyHostToDevice), "upload");
+    }
+    ik::ProjectionArgs args;
+    args.columns  = columns;
+    args.k        = c.k;
+    args.fp32_out = c.fp32;
+    for (int i = 0; i < 3; ++i) { args.x[i] = x[i]; }
+    std::vector<void*> blocks;
+    std::vector<std::vector<double>> want, scale_sum;
+    for (const auto& [rows, input] : c.segments) {
+        auto* w   = dalloc<std::uint16_t>(static_cast<std::size_t>(rows) * c.k);
+        auto host = random_bf16(static_cast<std::size_t>(rows) * c.k, 0.03F, gen);
+        for (std::size_t i = 0; i < host.size(); i += 997) { // zeros and outliers among the groups
+            host[i] = (i / 997) % 2 == 0 ? std::uint16_t{0} : canon::f32_to_bf16_rn(3.0F);
+        }
+        std::fill(host.begin(), host.begin() + 32, std::uint16_t{0}); // a zero group: scale 0, codes 0
+        cuda_check(cudaMemcpy(w, host.data(), host.size() * 2, cudaMemcpyHostToDevice), "upload");
+        void* block = dalloc<std::uint8_t>(infernix::ops::q8_g32_bytes(rows, c.k));
+        auto* scale_plane = static_cast<std::uint8_t*>(block) +
+                            static_cast<std::size_t>(rows) * infernix::ops::q8_g32_padded_columns(c.k);
+        const Weight q = infernix::ops::quantize_bf16_q8_g32(bf16_weight(w, rows, c.k), block, scale_plane, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "quantize");
+        cudaFree(w);
+        blocks.push_back(block);
+        const int stride = static_cast<int>(q.padded_shape[1]);
+        std::vector<std::int8_t> codes(static_cast<std::size_t>(rows) * stride);
+        std::vector<std::uint16_t> scales(static_cast<std::size_t>(rows) * (stride / 32));
+        cuda_check(cudaMemcpy(codes.data(), q.qdata, codes.size(), cudaMemcpyDeviceToHost), "download");
+        cuda_check(cudaMemcpy(scales.data(), q.scales, scales.size() * 2, cudaMemcpyDeviceToHost), "download");
+        std::vector<double> y(static_cast<std::size_t>(columns) * rows), bound(y.size());
+        for (int t = 0; t < columns; ++t) {
+            const std::uint16_t* xt = xh[input].data() + static_cast<std::size_t>(t) * c.k;
+            for (int r = 0; r < rows; ++r) {
+                double s = 0, a = 0;
+                for (int j = 0; j < c.k; ++j) {
+                    const double wv = codes[static_cast<std::size_t>(r) * stride + j] *
+                                      f16_value(scales[static_cast<std::size_t>(r) * (stride / 32) + j / 32]);
+                    const double p = wv * canon::bf16_to_f32(xt[j]);
+                    s += p, a += std::fabs(p);
+                }
+                y[static_cast<std::size_t>(t) * rows + r]     = s;
+                bound[static_cast<std::size_t>(t) * rows + r] = a;
+            }
+        }
+        want.push_back(std::move(y));
+        scale_sum.push_back(std::move(bound));
+        ik::ProjectionSegment seg;
+        seg.rows      = rows;
+        seg.input     = input;
+        seg.out       = dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * rows * word);
+        seg.codes     = q.qdata;
+        seg.q8_scales = static_cast<const std::uint16_t*>(q.scales);
+        seg.q8_stride = stride;
+        args.segments[args.count++] = seg;
+    }
+    ik::projections(args, nullptr);
+    // Each column alone: the same segments, the inputs and outputs offset to that column.
+    std::vector<void*> alone;
+    for (int s = 0; s < args.count; ++s) {
+        alone.push_back(dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * args.segments[s].rows * word));
+    }
+    for (int t = 0; t < columns; ++t) {
+        ik::ProjectionArgs one = args;
+        one.columns            = 1;
+        for (int i = 0; i < 3; ++i) { one.x[i] = x[i] + static_cast<std::size_t>(t) * c.k; }
+        for (int s = 0; s < args.count; ++s) {
+            one.segments[s].out = static_cast<std::uint8_t*>(alone[s]) + static_cast<std::size_t>(t) * args.segments[s].rows * word;
+        }
+        ik::projections(one, nullptr);
+    }
+    cuda_check(cudaDeviceSynchronize(), "projections");
+    long outside = 0, differ = 0, total = 0;
+    double worst = 0;
+    const double depth = c.k / 32 + 5;
+    for (int s = 0; s < args.count; ++s) {
+        const std::size_t n = static_cast<std::size_t>(columns) * args.segments[s].rows;
+        std::vector<std::uint8_t> got(n * word), solo(n * word);
+        cuda_check(cudaMemcpy(got.data(), args.segments[s].out, got.size(), cudaMemcpyDeviceToHost), "download");
+        cuda_check(cudaMemcpy(solo.data(), alone[s], solo.size(), cudaMemcpyDeviceToHost), "download");
+        for (std::size_t i = 0; i < n; ++i) {
+            double g = 0;
+            if (c.fp32) {
+                float f = 0;
+                std::memcpy(&f, &got[i * 4], 4);
+                g = f;
+            } else {
+                std::uint16_t b = 0;
+                std::memcpy(&b, &got[i * 2], 2);
+                g = canon::bf16_to_f32(b);
+            }
+            const double y   = want[s][i];
+            const double tol = 1.001 * depth * 0x1p-24 * scale_sum[s][i] + (c.fp32 ? 0.0 : 0x1p-8 * std::fabs(y) + 1e-30);
+            const double err = std::fabs(g - y);
+            outside += err > tol ? 1 : 0;
+            worst = std::max(worst, scale_sum[s][i] > 0 ? err / scale_sum[s][i] : 0.0);
+            differ += std::memcmp(&got[i * word], &solo[i * word], word) != 0 ? 1 : 0;
+        }
+        total += static_cast<long>(n);
+    }
+    std::printf("%-44s Q8   T = %2d: %ld of %ld outside the bound (worst |err| / sum|wx| %.2e), %ld differ from the "
+                "column alone\n",
+                c.name, columns, outside, total, worst, differ);
+    if (outside != 0 || differ != 0) { ++g_failures; }
+    for (auto* p : x) { cudaFree(p); }
+    for (auto* p : blocks) { cudaFree(p); }
+    for (int s = 0; s < args.count; ++s) { cudaFree(args.segments[s].out); }
+    for (auto* p : alone) { cudaFree(p); }
 }
 
 void run_case(const Case& c, int columns, std::uint32_t seed, bool packed) {
@@ -186,6 +320,12 @@ INFERNIX_OP_TEST(inkling2_projections) {
         for (const auto& c : cases) {
             for (const int columns : {1, 3, 8, 16, 17, 40, 100, 300}) { run_case(c, columns, seed++, packed); }
         }
+    }
+    // Q8 storage: the shapes an 8-bit load converts (the forget/gain stay BF16), and the head's arithmetic (FP32 out,
+    // K = 2304; 4,096 of its rows: the kernel's shape for any row count past 256).
+    const std::vector<Case> q8_cases = {cases[0], cases[1], cases[3], {"head rows [4096, 2304], FP32 out", 2304, true, {{4096, 0}}}};
+    for (const auto& c : q8_cases) {
+        for (const int columns : {1, 3, 8, 16, 17, 40, 100}) { run_q8(c, columns, seed++); }
     }
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

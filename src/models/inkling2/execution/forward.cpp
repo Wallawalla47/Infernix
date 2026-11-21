@@ -51,7 +51,10 @@ void check_schedule(const TextConfig& c) {
 
 std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 
-// A BF16 or bf16_p12 matrix as one segment of a fused projection launch.
+// A matrix of 8-bit weights (Q8_G32_FP16 RowSplit, include/infernix/ops/q8_g32.h).
+bool q8(const Weight& w) { return w.qtype == QType::Q8_G32_FP16 && w.layout == QuantLayout::RowSplit; }
+
+// A BF16, bf16_p12 or Q8 matrix as one segment of a fused projection launch.
 void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, void* out) {
     if (w.qdata == nullptr || args.count >= ik::kMaxProjectionSegments) {
         throw std::invalid_argument("inkling2 forward: a fused projection segment is missing");
@@ -67,8 +70,12 @@ void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, 
         s.nibbles = w.qhigh;
         s.words   = static_cast<const unsigned*>(w.scales);
         s.escapes = static_cast<const unsigned*>(w.escapes);
+    } else if (q8(w)) {
+        s.codes     = w.qdata;
+        s.q8_scales = static_cast<const std::uint16_t*>(w.scales);
+        s.q8_stride = static_cast<std::int32_t>(w.padded_shape[1]);
     } else {
-        throw std::invalid_argument("inkling2 forward: the fused projections take BF16 or bf16_p12 matrices");
+        throw std::invalid_argument("inkling2 forward: the fused projections take BF16, bf16_p12 or Q8 matrices");
     }
     args.segments[args.count++] = s;
 }
@@ -501,7 +508,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
 
     // K4: W_o (a wide call: one launch of the fused projections, the skinny route's bits); K5 (K5a): its post-attention
     // conv and residual, the MLP mix, norm and the experts' rows.
-    if (T > ik::kMaxAttentionLaneColumns) {
+    if (T > ik::kMaxAttentionLaneColumns || q8(a.output)) { // ops::linear has no route for Q8 at W_o's shape
         ik::ProjectionArgs wo{};
         wo.columns = T;
         wo.k       = kQ;
@@ -597,7 +604,17 @@ void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) 
     // The rows go to the buffer's start (row r holds column first + r): a logits row is 8 bytes off 16-byte alignment,
     // so an odd column's own row could not take the head's output.
     const std::uint16_t* x = b_.final_hidden + static_cast<std::size_t>(first) * kH;
-    project(x, p_.head, b_.logits, true, stream, 0, count);
+    if (q8(p_.head)) { // ops::linear has no route for Q8 at the head's shape
+        ik::ProjectionArgs h{};
+        h.columns  = count;
+        h.k        = kH;
+        h.x[0]     = x;
+        h.fp32_out = true;
+        add_segment(h, p_.head, 0, b_.logits);
+        ik::projections(h, stream);
+    } else {
+        project(x, p_.head, b_.logits, true, stream, 0, count);
+    }
     ik::softcap(b_.logits, static_cast<std::int64_t>(count) * c_.vocab_size, c_.final_logit_softcap, stream);
     mark("head");
 }

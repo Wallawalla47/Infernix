@@ -174,14 +174,16 @@ void check_expert_uses(const std::vector<PendingWeight>& pending, const TextWeig
 // whose packed route measured faster in the decode round. Every projection's reader takes bf16_p12 (the fused
 // projections and ops::linear), but packed alone at 4K, C = 1 (11-21, the round 6.305 ms unpacked) the head saves
 // 0.129 ms, while each visit's K2 parent costs 0.070 ms more, W_o 0.044 ms and the message gates 0.269 ms, although
-// the op sweep has K2 and W_o faster at one column. So only the head packs.
-std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
-                                                     const artifact::Reader& reader) {
-    std::vector<bool> packed(pending.size(), false);
-    if (w.output_head.valid()) { packed.at(w.output_head.index) = true; }
-    std::map<std::size_t, bool> objects; // object -> every parameter on it packable
+// the op sweep has K2 and W_o faster at one column. So only the head packs (none under q8_weights, whose Q8 head
+// measured faster still).
+//
+// The artifact objects whose every parameter is selected, device-resident, and a BF16 [n, k] matrix with k a multiple
+// of `k_multiple`.
+std::vector<artifact::ObjectHandle> objects_of(const std::vector<bool>& selected, const std::vector<PendingWeight>& pending,
+                                               const artifact::Reader& reader, std::uint64_t k_multiple) {
+    std::map<std::size_t, bool> objects; // object -> every parameter on it selected
     for (std::size_t i = 0; i < pending.size(); ++i) {
-        const bool ok = packed[i] && pending[i].reference.residency == Residency::Device;
+        const bool ok = selected[i] && pending[i].reference.residency == Residency::Device;
         for (const auto& part : pending[i].reference.binding.parts) {
             auto [it, fresh] = objects.emplace(part.object.index, ok);
             if (!fresh) { it->second = it->second && ok; }
@@ -192,11 +194,41 @@ std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const
         const artifact::ObjectHandle handle{index};
         const auto& g = reader.geometry(handle);
         if (ok && g.format == QType::BF16 && g.layout == QuantLayout::Contiguous && g.shape.size() == 2 &&
-            g.shape[1] % 8 == 0 && g.shape[0] <= static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            g.shape[1] % k_multiple == 0 &&
+            g.shape[0] <= static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
             out.push_back(handle);
         }
     }
     return out;
+}
+
+std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
+                                                     const artifact::Reader& reader, const LoadOptions& options) {
+    std::vector<bool> packed(pending.size(), false);
+    if (w.output_head.valid() && !options.q8_weights) { packed.at(w.output_head.index) = true; }
+    return objects_of(packed, pending, reader, 8);
+}
+
+// The artifact objects --q8-weights converts (LoadOptions::q8_weights; models/q8_weights.h), the groups measured
+// faster as 8-bit weights in the decode round (2026-11-21, 4K context, captured round, against the shipped route):
+// each attention's fused input projections (the K2 parent and the sink/taps parent beside it, one launch) -7.6 % at
+// one column, -5.6 % at two, -1.3 % at eight; the head (in place of its bf16_p12 packing) -1.6 %, -1.4 %, -0.2 %.
+// W_o (-2.5 %, -1.4 %, +2.7 %; +6.7 % of its prefill time) and the message gates' downs (-0.1 %, +0.1 %, +0.1 %) stay
+// BF16.
+std::vector<artifact::ObjectHandle> q8_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
+                                               const artifact::Reader& reader) {
+    std::vector<bool> selected(pending.size(), false);
+    const auto select = [&](WeightId id) {
+        if (id.valid()) { selected.at(id.index) = true; }
+    };
+    for (const auto& layer : w.layers) {
+        const auto& a = layer.attention;
+        for (const WeightId id : {a.query, a.relative, a.gate, a.key, a.value, a.sink, a.key_taps, a.value_taps}) {
+            select(id);
+        }
+    }
+    select(w.output_head);
+    return objects_of(selected, pending, reader, 32);
 }
 
 FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config) {
@@ -234,6 +266,8 @@ struct LoadPlan::Impl {
     std::vector<PendingWeight> pending;
     std::vector<artifact::ObjectHandle> packed_objects; // LoadOptions::pack_bf16: loaded transient, packed at load
     std::uint64_t packed_bytes = 0;
+    std::vector<artifact::ObjectHandle> q8_objects; // LoadOptions::q8_weights: loaded transient, converted at load
+    std::uint64_t q8_bytes = 0;
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
@@ -247,7 +281,9 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 const Config& LoadPlan::config() const { return impl_->config; }
 const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 const artifact::MaterializationPlan& LoadPlan::materialization() const { return impl_->materialization; }
-std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity_bytes + impl_->packed_bytes; }
+std::uint64_t LoadPlan::device_bytes() const {
+    return impl_->materialization.device_capacity_bytes + impl_->packed_bytes + impl_->q8_bytes;
+}
 std::uint32_t LoadPlan::public_token_count() const { return impl_->resources.public_token_count; }
 
 bool is_inkling2(const artifact::Reader& reader) {
@@ -266,10 +302,17 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     check_expert_uses(bindings.weights, out->weights, out->config.text);
     out->pending = std::move(bindings.weights);
     if (options.pack_bf16) {
-        out->packed_objects = packable_objects(out->weights, out->pending, reader);
+        out->packed_objects = packable_objects(out->weights, out->pending, reader, options);
         for (const auto object : out->packed_objects) {
             binder.mark_device_transient(object);
             out->packed_bytes += models::packed_estimate(reader.geometry(object));
+        }
+    }
+    if (options.q8_weights) {
+        out->q8_objects = q8_objects(out->weights, out->pending, reader);
+        for (const auto object : out->q8_objects) {
+            binder.mark_device_transient(object);
+            out->q8_bytes += models::q8_bytes(reader.geometry(object));
         }
     }
     out->materialization = std::move(binder).finish();
@@ -281,8 +324,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 }
 
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
-             FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed)
-    : backing_(std::move(backing)), packed_(std::move(packed)), config_(std::move(config)), options_(options),
+             FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed,
+             Q8Weights q8)
+    : backing_(std::move(backing)), packed_(std::move(packed)), q8_(std::move(q8)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)) {}
 
 Model::~Model() = default;
@@ -302,13 +346,17 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         bound.push_back(std::move(weight));
     }
     PackedWeights packed = models::pack_bf16_objects(backing, data->packed_objects, {}, device);
-    if (!data->packed_objects.empty()) {
-        for (auto& weight : bound) { models::repoint(weight.view, packed); }
+    Q8Weights q8         = models::quantize_q8_objects(backing, data->q8_objects, device);
+    if (!data->packed_objects.empty() || !data->q8_objects.empty()) {
+        for (auto& weight : bound) {
+            models::repoint(weight.view, packed);
+            models::repoint(weight.view, q8);
+        }
         backing.release_transient();
     }
     return std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
                                             std::move(bound), std::move(data->resources), std::move(data->info),
-                                            std::move(backing), std::move(packed)));
+                                            std::move(backing), std::move(packed), std::move(q8)));
 }
 
 } // namespace infernix::models::inkling2

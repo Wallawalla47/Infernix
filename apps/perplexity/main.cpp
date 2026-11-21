@@ -71,6 +71,7 @@ struct Options {
     bool expert_a4_activations          = false;
     bool expert_a16_activations         = false;
     bool a8_activations                 = false; // EngineOptions::a8_activations
+    bool q8_weights                     = false; // EngineOptions::q8_weights
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
     std::vector<infernix::FastPath> fast_path_exclusions;
@@ -106,6 +107,8 @@ std::string usage_text() {
            "       [--a16-activations] (16-bit activations where the checkpoint specifies fewer\n"
            "        bits: Flash-Next's W4A4 NVFP4 experts, NVIDIA's NVFP4 27B's NVFP4 and FP8 layers)\n"
            "       [--a8-activations] (8-bit activations where infernix-serve's option takes them;\n"
+           "        not on the reproducible or lossless route)\n"
+           "       [--q8-weights] (8-bit weights where infernix-serve's option takes them: Inkling 2;\n"
            "        not on the reproducible or lossless route)\n"
            "       [--reproducible] (score the reproducible route; by default the qualified fast\n"
            "        paths run, as in infernix-serve)\n"
@@ -187,6 +190,8 @@ Options parse_options(int argc, char** argv) {
             out.expert_a16_activations = true;
         } else if (option == "--a8-activations") {
             out.a8_activations = true;
+        } else if (option == "--q8-weights") {
+            out.q8_weights = true;
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
         } else if (option == "--lora") {
@@ -359,6 +364,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.expert_a4_activations         = options.expert_a4_activations;
     engine_options.expert_a16_activations        = options.expert_a16_activations;
     engine_options.a8_activations                = options.a8_activations;
+    engine_options.q8_weights                    = options.q8_weights;
     // The lossless route runs no fast path.
     engine_options.fast_paths           = options.fast_paths && !options.lossless;
     engine_options.fast_path_candidates = options.fast_path_candidates;
@@ -654,6 +660,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"lora_adapter", load.lora_adapter.empty() ? nlohmann::json(nullptr) : nlohmann::json(load.lora_adapter)},
           {"ablate_sidecar",
            load.ablate_sidecar.empty() ? nlohmann::json(nullptr) : nlohmann::json(load.ablate_sidecar)},
+          {"q8_weights", options.q8_weights},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},

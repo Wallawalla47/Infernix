@@ -312,6 +312,9 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--a8-activations"}).a8_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).a8_activations,
                       "--a8-activations did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--q8-weights"}).q8_weights &&
+                          !parse({"infernix-serve", "model.ninfer"}).q8_weights,
+                      "--q8-weights did not parse (default off)");
     failures += check(parse({"infernix-serve", "model.ninfer", "--embedding-host"}).embedding_host &&
                           !parse({"infernix-serve", "model.ninfer"}).embedding_host,
                       "--embedding-host did not parse (default off)");

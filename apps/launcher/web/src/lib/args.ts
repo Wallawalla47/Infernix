@@ -191,6 +191,7 @@ export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--expert-a4-activations",
   "--a16-activations",
   "--a8-activations",
+  "--q8-weights",
   "--embedding-host",
   "--lm-head-draft",
   "--no-thinking-answer-room",

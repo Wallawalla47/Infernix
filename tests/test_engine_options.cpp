@@ -154,6 +154,13 @@ int main() {
     failures += check(exact_text.find("fast paths") == std::string::npos,
                       "the reproducible route was rejected with the lossless route");
     options.lossless = false;
+    // 8-bit weights (--q8-weights) exist for Inkling 2 only: every other artifact refuses them.
+    options.q8_weights = true;
+    bool q8_invalid    = false;
+    const std::string q8_text = construction_error(options, q8_invalid);
+    failures += check(q8_invalid && q8_text.find("--q8-weights applies to Inkling 2") != std::string::npos,
+                      "--q8-weights was accepted for an artifact other than Inkling 2");
+    options.q8_weights = false;
     // --no-fast-path leaves a path out of the default route's selection: the reproducible route refuses it.
     options.fast_path_exclusions = {infernix::FastPath::PromptPv8};
     bool excluded_invalid        = false;

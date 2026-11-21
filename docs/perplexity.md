@@ -125,7 +125,8 @@ same route as generation; `--ngram-volume FILE` names their n-gram volume when i
 (NVFP4, NVFP4 Dense8 and NVFP4-QAD) with 16-bit expert activations and NVIDIA's NVFP4 Qwen3.8-27B artifacts with
 16-bit activations at every text projection, and `--a8-activations` scores infernix-serve's
 8-bit route, which the reproducible and lossless routes refuse; `report.json` records them as
-`expert_a16_activations` and `a8_activations`. `--lora PATH` scores the model with a LoRA adapter applied
+`expert_a16_activations` and `a8_activations`. `--q8-weights` scores Inkling 2 with infernix-serve's 8-bit weights
+(the same refusals), recorded as `q8_weights`. `--lora PATH` scores the model with a LoRA adapter applied
 ([LoRA adapters](lora.md)); `report.json` names it in `execution.lora_adapter` (`null` without one). `--ablate FILE`
 scores the model with an ablation sidecar applied ([Ablation sidecars](ablate.md)); `report.json` names it in
 `execution.ablate_sidecar` (`null` without one). The

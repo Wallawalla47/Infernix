@@ -82,6 +82,7 @@ struct ServeOptions {
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations (--a16-activations)
     bool a8_activations            = false; // EngineOptions::a8_activations
+    bool q8_weights                = false; // EngineOptions::q8_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
     // At most kMaximumPendingRequests: the HTTP pool starts a worker for each admitted or pending request.

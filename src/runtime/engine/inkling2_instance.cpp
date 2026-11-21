@@ -47,6 +47,13 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
     refuse(options.lossless || options.reference, "the lossless and reference routes are a later milestone");
     refuse(options.expert_a4_activations || options.expert_a16_activations || options.a8_activations,
            "the expert and 8-bit activation switches belong to other architectures");
+    if (options.q8_weights && !options.fast_paths) {
+        throw std::invalid_argument("--q8-weights is approximate; the reproducible route (--reproducible) refuses it");
+    }
+    if (options.q8_weights) {
+        report(options, "Inkling 2: --q8-weights: the attention input projections and the head run as 8-bit weights "
+                        "(approximate: the output differs from the artifact's BF16 weights)");
+    }
     refuse(options.kv_cache != KvCacheStorage::BFloat16, "the KV cache stores BF16 keys and FP16 values (INT8 KV is "
                                                          "a later milestone)");
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
@@ -113,6 +120,12 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                            packed.parents.size(), packed.source_bytes / kMiB, packed.storage.bytes / kMiB,
                            static_cast<unsigned long long>(packed.escapes), packed.seconds * 1000.0);
     }
+    if (const auto& q8 = model->q8(); q8.source_bytes != 0) {
+        constexpr double kMiB = 1024.0 * 1024.0;
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                           "8-bit weights: %zu matrices, %.0f MiB -> %.0f MiB (q8_g32_fp16) in %.0f ms",
+                           q8.parents.size(), q8.source_bytes / kMiB, q8.storage.bytes / kMiB, q8.seconds * 1000.0);
+    }
     EngineOptions resolved = options;
     auto instance          = std::make_unique<Inkling2Instance>(std::move(model), resolved);
     if (!options.chat_template_path.empty()) {
@@ -139,6 +152,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"bf16", "fp32", "nvfp4_mul", "fp8_e4m3fn_g32_e8m0"};
     if (instance->model->packed().source_bytes != 0) { summary.weight_formats.push_back("bf16_p12"); }
+    if (instance->model->q8().source_bytes != 0) { summary.weight_formats.push_back("q8_g32_fp16"); }
     summary.fast_paths_disabled  = !options.fast_paths;
     summary.request_invariant    = true; // every route is column-invariant and the decode rows independent
 

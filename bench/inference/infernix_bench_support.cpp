@@ -516,7 +516,10 @@ std::string usage_text(std::string_view program) {
         << "                              MXFP8 dense projections; on the NVFP4 Qwen3.8-27B artifacts every NVFP4\n"
         << "                              and FP8 text projection at every width (approximate; --reproducible\n"
         << "                              refuses it)\n"
-        << "  --embedding-host            Qwen3.5-family artifacts: the token embedding in pinned host memory,\n"
+        << "  --q8-weights                8-bit weights where they measured faster: Inkling 2's attention input\n"
+        << "                              projections and head as int8 with an FP16 scale per 32 values\n"
+        << "                              (approximate; --reproducible and other artifacts refuse it)\n"
+        << "  --embedding-host           Qwen3.5-family artifacts: the token embedding in pinned host memory,\n"
         << "                              read zero-copy (its VRAM goes to the KV cache; same output)\n"
         << "  --concurrency <1..8>     simultaneous requests per repetition (default: 1)\n"
         << "  --rows <distinct|same>   concurrent rows' prompts: distinct shares of the corpus (default), so a MoE\n"
@@ -666,6 +669,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
+        } else if (arg == "--q8-weights") {
+            options.q8_weights = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--expert-ram-mib") {
@@ -1126,6 +1131,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " expert_a4_activations=" << (env.expert_a4_activations ? "on" : "off")
         << " expert_a16_activations=" << (env.expert_a16_activations ? "on" : "off")
         << " a8_activations=" << (env.a8_activations ? "on" : "off")
+        << " q8_weights=" << (env.q8_weights ? "on" : "off")
         << " expert_state=" << env.expert_state
         << " lora=" << (env.lora_path.empty() ? "none" : env.lora_path)
         << " ablate=" << (env.ablate_sidecar_path.empty() ? "none" : env.ablate_sidecar_path)
@@ -1295,6 +1301,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"expert_a4_activations\": " << (env.expert_a4_activations ? "true" : "false") << ",\n"
         << "    \"expert_a16_activations\": " << (env.expert_a16_activations ? "true" : "false") << ",\n"
         << "    \"a8_activations\": " << (env.a8_activations ? "true" : "false") << ",\n"
+        << "    \"q8_weights\": " << (env.q8_weights ? "true" : "false") << ",\n"
         << "    \"expert_state\": \"" << json_escape(env.expert_state) << "\",\n"
         << "    \"lora\": \"" << json_escape(env.lora_path) << "\",\n"
         << "    \"ablate\": \"" << json_escape(env.ablate_sidecar_path) << "\",\n"

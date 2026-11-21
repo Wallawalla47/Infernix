@@ -183,7 +183,8 @@ the Qwen3.5-122B-A10B's is not generated yet, so it starts empty), and no file i
 written; `off`: `--expert-state off`, an empty cache, as cold measurements need; otherwise the state
 file read at startup and written at exit), `ram_free_mib` (`--ram-free-mib`, the RAM the offloaded
 models' RAM plan leaves free) and `a8_activations` (`--a8-activations`, the approximate 8-bit
-activation route; its speeds are not the engine's quoted ones). Schema v27 adds `lora` to `config` (`--lora`,
+activation route; its speeds are not the engine's quoted ones). `config.q8_weights` records `--q8-weights` (Inkling 2's
+approximate 8-bit weights; likewise not the engine's quoted speeds). Schema v27 adds `lora` to `config` (`--lora`,
 empty without an adapter), `lora_adapter` to `load` (the adapter the Engine applied, as its startup log names it),
 and to `memory` `draft_screen_bytes` and `adapter_bytes` (the DFlash2 head screen and a LoRA adapter's factors,
 beside the weights' arena) and `cuda_graph_measured_bytes` (what CUDA Graph preparation took). Schema v28 adds `ablate`

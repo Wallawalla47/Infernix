@@ -831,6 +831,25 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   from those counts) ~14 % of the matrix loads before the PDL wait instead of ~42 %. With 4-warp CTAs (three an SM; same bits) packed K2 saves 1.1 % at one column but
   costs 1.6 % at 2 and 4.4 % at 8, the widths of decode at C ≥ 2 and of DSpark's verify, so K2 stays BF16. Why W_o
   loses is not established.
+- **8-bit weights (`--q8-weights`, approximate, opt-in).** At load (`models/q8_weights.h`) the K2 parents, the
+  sink/taps parents and the head become Q8_G32_FP16 RowSplit (`ops/q8_g32.h`: int8 codes, an FP16 scale fl16(max / 127)
+  per 32 values) and their BF16 copies are freed; the head is then not packed. The fused projections read Q8 storage
+  (a weight is code × scale, exact in FP32; the fold is the BF16 route's, so every column's bits stay independent of
+  the call's width and other columns), the head runs on them too (`ops::linear` has no Q8 route at its shape). Chosen
+  per group in the captured round (2026-11-21, 4K context, against the shipped route, each group alone): K2 -7.6 % at
+  one column, -5.6 % at two, -1.3 % at eight; the head (against its packed form) -1.6 %, -1.4 %, -0.2 %; W_o -2.5 %,
+  -1.4 %, +2.7 % (and +6.7 % of its prefill time) and the gates' downs -0.1 %, +0.1 %, +0.1 % stay BF16 (W_o's Q8 arm
+  also changed its kernel from `ops::linear`'s to the fused projections', so its result is not storage alone). A
+  2,048-column prefill call with every group in Q8 took +0.5 % (the wide Q8 kernel then spilled at W_o's and the gates'
+  K: the compiler hoisted every chunk's decode out of the pass loop; an empty `asm volatile` on the held codes keeps it
+  in the loop, 0 spills). Its oracle is the Op test's FP64 sum of the stored codes and scales; model-level closeness to
+  BF16 is reported, not judged (the quality gate is Quality Gates'). Shipped set measured (2026-11-21, infernix_bench,
+  Inkling corpus, two interleaved invocations against the default route): tg128 167.1 → 185.2 tok/s at C = 1, 399.8 →
+  419.4 at C = 4; pp2048 1,504.5 → 1,512.3, pp10000 1,457.0 → 1,463.3; load +0.03 s (the conversion 12-16 ms); weights
+  1,787 MiB of BF16 → 950 MiB (619 MiB less than the default's packed head + BF16 K2). On the perplexity corpus's quick
+  set (291,842 tokens, context 4,096 / stride 2,048): perplexity 4.0348 → 4.0328, KL(BF16 ‖ Q8) mean 0.0107 (p99
+  0.108), top-1 agreement 96.0 % (code 98.2 %, the prose and Chinese streams 95.1-95.6 %). Its FP16 group scales on the
+  real matrices: none rounds to zero, 47 of 29.3 M are subnormal.
 - **K2.** A multi-input packed GEMV: row ranges bound to one of three input vectors (one pointer on the 20 pass-1 sliding
   visits, three elsewhere); new tuned routes for Inkling's shapes (`bf16_p12_linear_tuned` registers only measured shapes).
 - **K4.** GEMV 2304 × 3072 (packed or BF16 per M1) with the post-attention conv and residual in the epilogue (each output
@@ -1109,6 +1128,7 @@ vision tower (M7).
 | `--vision` | on when the artifact carries the tower (M7) |
 | `--prefill-chunk` | default 16K if chunk-width invariance holds ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |
+| `--q8-weights` | approximate 8-bit K2 and head ([§11](#11-dense-projections-and-the-head)); refused with `--reproducible` and `--lossless` |
 
 No family-specific tuning switches ship; experiments use temporary `INFERNIX_TMP_*` switches removed before merge.
 

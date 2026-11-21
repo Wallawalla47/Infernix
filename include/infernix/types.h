@@ -850,6 +850,13 @@ struct EngineOptions {
     // projections already take the activations their artifact permits, the 35B-A3B and the official FP8 import),
     // the reproducible route and the lossless route refuse it.
     bool a8_activations                = false;
+    // 8-bit weights (--q8-weights; approximate, opt-in, never a default): BF16 projections converted at load to Q8
+    // (int8 codes, an FP16 scale per 32 values; include/infernix/ops/q8_g32.h) where that measured faster, and their
+    // BF16 copies freed. Inkling 2: each attention's fused input projections (query, relative, gate, key, value, sink
+    // and the dynamic-conv taps) and the head (in place of its lossless bf16_p12 packing); the activations stay 16-bit.
+    // Every route stays column- and request-invariant. Other artifacts, the reproducible route and the lossless route
+    // refuse it.
+    bool q8_weights                    = false;
     // Qwen3.5-family artifacts (--embedding-host): keep the token embedding in pinned host memory and
     // gather its rows zero-copy, as artifacts with offloaded experts already do, so its VRAM (1.18 GiB on
     // the 27B) goes to the KV and prefix caches. Same bits; a prefill chunk reads its rows over the link.

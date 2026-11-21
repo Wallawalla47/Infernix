@@ -223,6 +223,9 @@ int test_cli_contract() {
     failures += expect(!parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).a8_activations &&
                            parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--a8-activations"}).a8_activations,
                        "--a8-activations is an opt-in flag");
+    failures += expect(!parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).q8_weights &&
+                           parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--q8-weights"}).q8_weights,
+                       "--q8-weights is an opt-in flag");
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
         for (unsigned width = 0; width <= 63; ++width) {
             for (const unsigned minimum : {4U, 12U, 64U}) {

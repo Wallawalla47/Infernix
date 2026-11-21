@@ -61,6 +61,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-a4-activations", false},
     ServeOptionArity{"--a16-activations", false},
     ServeOptionArity{"--a8-activations", false},
+    ServeOptionArity{"--q8-weights", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--ablate"},
@@ -375,6 +376,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             Other calls keep their routes. Approximate: changes\n"
            "                             the output; --reproducible and artifacts without such\n"
            "                             a route refuse it (default: off)\n"
+           "  --q8-weights               8-bit weights where they measured faster: Inkling 2's\n"
+           "                             attention input projections and head become int8 with\n"
+           "                             an FP16 scale per 32 values at load (activations stay\n"
+           "                             16-bit). Approximate: changes the output; --reproducible\n"
+           "                             and other artifacts refuse it (default: off)\n"
            "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
            "                             pinned host memory, read zero-copy, so its VRAM\n"
            "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
@@ -952,6 +958,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
+        } else if (arg == "--q8-weights") {
+            options.q8_weights = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--context-cost-presets") {

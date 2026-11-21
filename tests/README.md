@@ -518,16 +518,22 @@ non-canonical turn departs) and checks the refusals of this slice and the contex
 per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
 their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
 rather than judges and why. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
-`INFERNIX_INKLING2_LOGITS_GUARD` compares them). `infernix_inkling2_projections_test` (GPU) requires the fused
+`INFERNIX_INKLING2_LOGITS_GUARD` compares them); `INFERNIX_INKLING2_Q8` loads with `--q8-weights`' conversion (other
+bits, so the reference criteria do not apply: for its timing, its invariance checks and a census of its FP16 group
+scales). `infernix_inkling2_projections_test` (GPU) requires the fused
 projections launch to equal `linear()` bit for bit on one visit's real shapes (and W_o's) at widths 1-300 (past 16
-columns the wide kernel), BF16 and FP32 out, plain and packed (bf16_p12 segments, escapes included).
+columns the wide kernel), BF16 and FP32 out, plain and packed (bf16_p12 segments, escapes included); with Q8 storage
+(`--q8-weights`) every output within the FP32 fold's bound of an FP64 sum of the stored codes and scales, and every
+column equal to the same column projected alone.
 `infernix_qwen4_exp_forward_real_test --pack-bf16` loads Flash-Next packed as the Engine does.
 `infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2 through the public Engine against an eager
 one-request Engine prefilling 16 columns a call: the golden prompt's greedy continuation, CUDA graphs, four sampled
 requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's logits equal to the forward test's
 (`INFERNIX_INKLING2_LOGITS_GUARD`) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
 128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of
-16 byte for byte; it reports a chat turn and a thinking-budget turn without judging them.
+16 byte for byte; under `--q8-weights` (refused with `--reproducible`) an eager one-request Engine is again the
+reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it reports a chat turn, a thinking-budget
+turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

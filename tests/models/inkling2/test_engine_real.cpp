@@ -13,8 +13,11 @@
 //    window's wrap and the chunk edges), of chunks of 16 byte for byte.
 // 5. Scoring: a CausalScoring Engine's logits of the 32 golden ids (positions 0-30) equal the forward test's
 //    free-running logits (INFERNIX_INKLING2_LOGITS_GUARD) byte for byte.
-// Reported, not judged: a chat turn's channels, and a turn whose thinking budget (6) injects the control (the
-// mixed-width decode after forced tokens).
+// 6. --q8-weights (approximate 8-bit weights): refused with --reproducible; under it, an eager Engine at chunks of 16
+//    serving one request at a time is the reference, and graphs (alone and C = 4 in reverse order), chunks of 7, and
+//    the long prompt in one 4,096-column call give its tokens.
+// Reported, not judged: a chat turn's channels, a turn whose thinking budget (6) injects the control (the mixed-width
+// decode after forced tokens), and how long --q8-weights' tokens agree with the BF16 weights'.
 //
 //   INFERNIX_INKLING2_ARTIFACT      an artifact converted with the inkling2_mini recipe
 //   INFERNIX_INKLING2_REFERENCE     the reference dump's path prefix (<prefix>.bin and <prefix>.json: the golden ids)
@@ -290,6 +293,80 @@ int main() {
                                          std::to_string(differ) + " logits differ from chunks of 16");
                 std::cout << "scoring the long prompt in chunks of " << chunk << ": " << positions.size()
                           << " logits rows equal chunks of 16 byte for byte\n";
+            }
+        }
+        {
+            // 6. --q8-weights (8-bit weights: approximate, so other tokens than the BF16 weights'): its own reference
+            // (no graphs, chunks of 16, one request at a time) and every other configuration must agree, as above.
+            const auto q8 = [&](std::uint32_t chunk, bool graphs, std::uint32_t concurrency,
+                                std::uint32_t context = kContext) {
+                infernix::EngineOptions options = engine_options(artifact, chunk, graphs, concurrency, context);
+                options.q8_weights              = true;
+                return options;
+            };
+            {
+                infernix::EngineOptions refused = q8(16, false, 1);
+                refused.fast_paths              = false;
+                bool threw                      = false;
+                try {
+                    infernix::Engine engine(refused);
+                } catch (const std::invalid_argument& e) {
+                    threw = std::string(e.what()).find("--q8-weights") != std::string::npos;
+                }
+                require(threw, "--q8-weights was accepted on the reproducible route");
+                std::cout << "--q8-weights with --reproducible: refused\n";
+            }
+            std::vector<Tokens> q8_reference;
+            Tokens q8_greedy;
+            {
+                infernix::Engine engine(q8(16, false, 1));
+                q8_greedy = engine.generate(engine.prepare_tokens(prompt), greedy(8)).generated_token_ids;
+                std::size_t same = 0;
+                while (same < q8_greedy.size() && same < continuation.size() && q8_greedy[same] == continuation[same]) {
+                    ++same;
+                }
+                std::cout << "q8: the golden prompt's greedy continuation agrees with the BF16 weights' for " << same
+                          << " of 8 tokens (reported)\n";
+                q8_reference = alone(engine);
+                for (std::size_t i = 0; i < q8_reference.size(); ++i) {
+                    std::size_t at = 0;
+                    while (at < q8_reference[i].size() && at < reference_tokens[i].size() &&
+                           q8_reference[i][at] == reference_tokens[i][at]) {
+                        ++at;
+                    }
+                    std::cout << "q8: sampled request " << i << " agrees with the BF16 weights' for " << at << " of "
+                              << reference_tokens[i].size() << " tokens (reported)\n";
+                }
+            }
+            {
+                infernix::Engine engine(q8(16, true, 8));
+                require_same("q8, graphs: greedy continuation", q8_greedy,
+                             engine.generate(engine.prepare_tokens(prompt), greedy(8)).generated_token_ids);
+                require_alone("q8, graphs alone", engine, q8_reference);
+                std::vector<infernix::GenerationHandle> handles;
+                for (std::size_t i = texts().size(); i-- > 0;) {
+                    handles.push_back(engine.submit(engine.prepare(chat(texts()[i])), sampled(i)));
+                }
+                for (std::size_t j = 0; j < handles.size(); ++j) {
+                    const std::size_t i = texts().size() - 1 - j;
+                    require_same("q8, C = 4, request " + std::to_string(i), q8_reference[i],
+                                 handles[j].wait().generated_token_ids);
+                }
+            }
+            {
+                infernix::Engine engine(q8(7, true, 8));
+                require_alone("q8, prefill chunks of 7", engine, q8_reference);
+            }
+            Tokens long_ids, q8_long;
+            {
+                infernix::Engine engine(q8(16, true, 1, kLongContext));
+                long_ids = long_prompt(engine);
+                q8_long  = engine.generate(engine.prepare_tokens(long_ids), greedy(16)).generated_token_ids;
+            }
+            {
+                infernix::Engine engine(q8(4096, true, 1, kLongContext));
+                require_same("q8, prefill chunks of 4096: the long prompt's greedy continuation", q8_long,
+                             engine.generate(engine.prepare_tokens(long_ids), greedy(16)).generated_token_ids);
             }
         }
         if (guard != nullptr) {

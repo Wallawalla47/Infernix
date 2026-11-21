@@ -69,11 +69,14 @@ struct LoadOptions {
     bool mtp_expert_pool = false;
     // Qwen4Exp and Inkling 2 off the lossless route: BF16 weights whose every reader takes bf16_p12 are packed
     // losslessly at load (core/weight.h), and their BF16 copies freed (Inkling 2: the head only, the set measured
-    // faster).
+    // faster; nothing under q8_weights).
     bool pack_bf16 = false;
     // Qwen4Exp --a8-activations with fast paths: a GGUF import's hyper-connection matrices are repacked to Q8 at load
     // (execution::Parameters' hc_q8), so its mixers stay BF16 for that repack; every other artifact's mixers pack.
     bool hc_q8_repack = false;
+    // Inkling 2 --q8-weights (EngineOptions::q8_weights): the fused attention input projections and the head become
+    // Q8 at load (models/q8_weights.h), and the head is not packed.
+    bool q8_weights = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -163,7 +166,9 @@ struct LoadOptions {
             .pack_bf16 = (architecture == Architecture::Qwen4Exp || architecture == Architecture::Inkling2Loop) &&
                          !options.lossless,
             .hc_q8_repack    = architecture == Architecture::Qwen4Exp && options.a8_activations && !options.lossless &&
-                            options.fast_paths};
+                            options.fast_paths,
+            .q8_weights = architecture == Architecture::Inkling2Loop && options.q8_weights && !options.lossless &&
+                          options.fast_paths};
 }
 
 } // namespace infernix::models
