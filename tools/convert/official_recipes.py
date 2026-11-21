@@ -914,7 +914,29 @@ def qwen3_8_flash_next_dflash2(model, recipe, sources):
     _optional(model, recipe)
 
 
+def inkling2_mini(model, recipe, sources):
+    """thinkingmachines/Inkling-2-Mini bit-exact (docs/maintainer/inkling2_mini-design.md §18): the NVFP4 experts
+    (layers 0-19) keep their codes and E4M3 scales in ``nvfp4_expert_rg16_v1`` (their exact FP32 amax and
+    denominators beside them), the MXFP8 experts (layers 20-23) keep their codes and UE8M0 scales in
+    ``mxfp8_expert_rg16_v1``, and every BF16 or FP32 tensor keeps its dtype (BF16 matrices are packed losslessly at
+    load). Their activation policies permit the trained W4A4 and W8A8 arithmetic, which the text config names."""
+    from .inkling2_loop import StackedMxfp8Bank, StackedNvfp4Bank, import_mxfp8_bank, import_nvfp4_bank
+
+    if model.config.get("architectures") != ["Inkling2LoopForCausalLM"]:
+        raise ValueError("this official recipe requires Inkling2Loop mathematics")
+    for name, parameter in model.parameters.items():
+        if isinstance(parameter.source, StackedNvfp4Bank):
+            recipe.assign(name, format="nvfp4_mul", layout="nvfp4_expert_rg16_v1", method=import_nvfp4_bank,
+                          activation_policy="AllowA4")
+            recipe.group(name, shape=parameter.shape)
+        elif isinstance(parameter.source, StackedMxfp8Bank):
+            recipe.assign(name, format="fp8_e4m3fn_g32_e8m0", layout="mxfp8_expert_rg16_v1",
+                          method=import_mxfp8_bank, activation_policy="AllowA8")
+            recipe.group(name, shape=parameter.shape)
+
+
 RECIPES = {
+    "inkling2_mini": inkling2_mini,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

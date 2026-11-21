@@ -45,6 +45,7 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::GgmlTiles16, std::string_view{"ggml_tiles16_v1"}},
     std::pair{QuantLayout::G32ScaleRows16, std::string_view{"g32_scale_rows16_v1"}},
     std::pair{QuantLayout::Rg16, std::string_view{"nvfp4_rg16_v1"}},
+    std::pair{QuantLayout::Mxfp8ExpertRg16, std::string_view{"mxfp8_expert_rg16_v1"}},
 };
 
 } // namespace

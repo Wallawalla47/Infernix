@@ -134,6 +134,24 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.bytes          = add(out.scale_offset, out.scale_bytes);
         return out;
     }
+    if (layout == QuantLayout::Mxfp8ExpertRg16) {
+        if (format != QType::FP8_E4M3FN_G32_E8M0 || shape.size() != 3 || shape[1] % 32 || shape[2] % 32) {
+            throw std::invalid_argument(
+                "mxfp8_expert_rg16_v1 requires fp8_e4m3fn_g32_e8m0 [experts, hidden, intermediate] with hidden and "
+                "intermediate divisible by 32");
+        }
+        constexpr std::uint64_t kUnit = 528;
+        const auto experts = shape[0], hidden = shape[1], inter = shape[2];
+        const auto gate_up = mul(mul(2 * inter / 16, hidden / 32), kUnit);
+        out.group_size         = 32;
+        out.alignment          = 4096;
+        out.record_bytes       = add(gate_up, mul(mul(hidden / 16, inter / 32), kUnit));
+        out.record_stride      = aligned(out.record_bytes, 4096);
+        out.code_bytes         = mul(experts, out.record_stride);
+        out.scale_offset       = out.code_bytes;
+        out.bytes              = out.code_bytes;
+        return out;
+    }
     if (is_ggml_expert_layout(layout)) {
         const QType down = ggml_expert_down_format(layout);
         if (!is_ggml(format) || shape.size() != 3 || format == QType::GGML_IQ4_NL || format == QType::GGML_Q2_0 ||
@@ -509,6 +527,18 @@ ExpertBankPlanes expert_bank_layout(const WeightGeometry& g, const float* multip
         out.gate_row_bytes = g.code_bytes_per_row;
         out.down_row_bytes = g.high_bytes_per_row;
         out.gate_up_bytes  = 2ULL * out.intermediate * out.gate_row_bytes;
+        return out;
+    }
+    if (g.layout == QuantLayout::Mxfp8ExpertRg16) {
+        ExpertBankPlanes out;
+        out.record_bytes   = g.record_bytes;
+        out.record_stride  = g.record_stride;
+        out.experts        = static_cast<std::uint32_t>(dimension(g.shape[0]));
+        out.hidden         = static_cast<std::uint32_t>(dimension(g.shape[1]));
+        out.intermediate   = static_cast<std::uint32_t>(dimension(g.shape[2]));
+        out.gate_up_format = g.format;
+        out.down_format    = g.format;
+        out.gate_up_bytes  = 2ULL * out.intermediate / 16 * (out.hidden / 32) * 528;
         return out;
     }
     if (g.layout != QuantLayout::ExpertRg16) {

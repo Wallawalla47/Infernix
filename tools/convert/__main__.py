@@ -16,7 +16,7 @@ from .graft import Graft
 from .official_recipes import RECIPES
 from .pipeline import DEFAULT_MAX_BUFFERED_BYTES, convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
-from . import qwen4_exp
+from . import inkling2_loop, qwen4_exp
 from .screen import add_screen_heads
 from .qwen3_5 import build_model
 from .recipe import Recipe
@@ -220,7 +220,14 @@ def main(argv=None):
     graft_paths = _pairs(args.graft, "graft")
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
+        if inkling2_loop.is_inkling2_loop(base.config):
+            # Inkling2Loop converts from its own checkpoint only: no GGUF, graft, n-gram or companion options.
+            if graft_paths or args.gguf or args.mmproj or args.screen_heads or args.ngram_out or args.ngram_reuse:
+                raise ValueError("Inkling2Loop takes no --graft, --gguf, --mmproj, --screen-heads or n-gram options")
+            if "dspark" in components and "dspark" not in paths:
+                paths["dspark"] = Path(base.root) / "mtp.safetensors"
         sources = SourceInputs(base, paths, stack)
+        inkling = inkling2_loop.is_inkling2_loop(base.config)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
         companion = "text" not in components
         if graft_paths and (qwen4 or companion or args.gguf):
@@ -260,7 +267,14 @@ def main(argv=None):
 
             mmproj = stack.enter_context(GGUFSource(args.mmproj))
         ngram_out = None
-        if companion:
+        if inkling:
+            model = inkling2_loop.build_model(
+                base,
+                components=components,
+                drafter=sources["dspark"] if "dspark" in components else None,
+                resource_overrides=overrides,
+            )
+        elif companion:
             model = qwen4_exp.build_dflash2_companion(base, sources["dflash2"])
         elif qwen4:
             # The checkpoint's own table format; a BF16 volume (tools/flash_next/ngram_bf16.py) binds the

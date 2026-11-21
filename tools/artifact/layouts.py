@@ -183,7 +183,28 @@ class Fp8ExpertGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class Mxfp8ExpertGeometry:
+    """``mxfp8_expert_rg16_v1``: one 4 KiB-aligned record per expert of [experts, hidden, intermediate]:
+    the gate/up matrix (rows interleaved gate_i, up_i), then the down matrix, each as 16-row groups of
+    528-byte units, one per 32-element K block, row-group major and block ascending
+    (tools/artifact/codecs/mxfp8_expert.py)."""
+
+    experts: int
+    hidden: int
+    intermediate: int
+    gate_up_row_groups: int
+    gate_up_blocks: int
+    down_row_groups: int
+    down_blocks: int
+    gate_up_bytes: int  # the down matrix starts here inside a record
+    record_bytes: int
+    record_stride: int
+    payload_bytes: int
+
+
 EXPERT_UNIT_BYTES = 144
+MXFP8_EXPERT_UNIT_BYTES = 528  # 16 rows x 32 E4M3FN codes, then their 16 UE8M0 scales
 EXPERT_RECORD_ALIGNMENT = 4096
 
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
@@ -231,6 +252,9 @@ GGML_EXPERT_DOWN_FORMATS = MappingProxyType(
 )
 
 FP8_EXPERT_B128_V1 = Layout("fp8_expert_b128_v1", EXPERT_RECORD_ALIGNMENT, frozenset(("fp8_e4m3fn_b128",)))
+MXFP8_EXPERT_RG16_V1 = Layout(
+    "mxfp8_expert_rg16_v1", EXPERT_RECORD_ALIGNMENT, frozenset(("fp8_e4m3fn_g32_e8m0",))
+)
 
 LAYOUTS = MappingProxyType(
     {
@@ -248,6 +272,7 @@ LAYOUTS = MappingProxyType(
             GGML_EXPERT_IQ4_NL_V1,
             GGML_EXPERT_Q2_0_V1,
             FP8_EXPERT_B128_V1,
+            MXFP8_EXPERT_RG16_V1,
         )
     }
 )
@@ -548,6 +573,36 @@ def fp8_expert_geometry(format: str | Fp8BlockFormat, shape: Sequence[int]) -> F
     )
 
 
+def mxfp8_expert_geometry(format: str | Fp8GroupFormat, shape: Sequence[int]) -> Mxfp8ExpertGeometry:
+    """Geometry of an MXFP8 routed-expert bank ``[experts, hidden, intermediate]`` (Inkling 2's
+    layers 20-23): whole 16-row groups and 32-element blocks on both matrices."""
+
+    spec = _format(format)
+    if not isinstance(spec, Fp8GroupFormat) or spec.group != 32:
+        raise ValueError("mxfp8_expert_rg16_v1 requires fp8_e4m3fn_g32_e8m0")
+    experts, hidden, intermediate = _shape(shape, rank=3)
+    if hidden % 32 or intermediate % 32:
+        raise ValueError("mxfp8_expert_rg16_v1 requires hidden and intermediate divisible by 32")
+    gate_up_row_groups, gate_up_blocks = 2 * intermediate // 16, hidden // 32
+    down_row_groups, down_blocks = hidden // 16, intermediate // 32
+    gate_up_bytes = gate_up_row_groups * gate_up_blocks * MXFP8_EXPERT_UNIT_BYTES
+    record_bytes = gate_up_bytes + down_row_groups * down_blocks * MXFP8_EXPERT_UNIT_BYTES
+    record_stride = align_up(record_bytes, EXPERT_RECORD_ALIGNMENT)
+    return Mxfp8ExpertGeometry(
+        experts=experts,
+        hidden=hidden,
+        intermediate=intermediate,
+        gate_up_row_groups=gate_up_row_groups,
+        gate_up_blocks=gate_up_blocks,
+        down_row_groups=down_row_groups,
+        down_blocks=down_blocks,
+        gate_up_bytes=gate_up_bytes,
+        record_bytes=record_bytes,
+        record_stride=record_stride,
+        payload_bytes=experts * record_stride,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -590,4 +645,6 @@ def encoded_size(
         return ggml_expert_geometry(layout_spec, numeric_spec, shape).payload_bytes
     if layout_spec is FP8_EXPERT_B128_V1:
         return fp8_expert_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is MXFP8_EXPERT_RG16_V1:
+        return mxfp8_expert_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

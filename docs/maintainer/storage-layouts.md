@@ -22,6 +22,7 @@ The storage registry contains exactly these identities:
 | `ggml_tiles16_v1` | tensor layout | `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq4_xs` | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
 | `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1` | tensor layout | `ggml_iq2_s`, `ggml_iq3_xxs`, `ggml_iq3_s`, `ggml_iq4_xs` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
 | `fp8_expert_b128_v1` | tensor layout | `fp8_e4m3fn_b128` | rank 3 `[E,H,I]`, `H % 128 == 0`, `I % 128 == 0` | 4096 bytes |
+| `mxfp8_expert_rg16_v1` | tensor layout | `fp8_e4m3fn_g32_e8m0` | rank 3 `[E,H,I]`, `H % 32 == 0`, `I % 32 == 0` | 4096 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
@@ -493,6 +494,28 @@ Record e begins at `e * record_stride`; up rows at `I * H` and down rows at `2 *
 Zero bytes pad each record to its stride. For the Flash-Next shape `[512, 2560, 640]` a record is
 4,915,800 bytes in a 4,919,296-byte stride. Every row is addressed as `base + r * K`, as in the GGUF
 banks, so expert routes read rows and their tile row in place.
+
+### 9.1 `mxfp8_expert_rg16_v1`
+
+`mxfp8_expert_rg16_v1` stores one MoE layer's routed experts `[E,H,I]` of `fp8_e4m3fn_g32_e8m0` words (Inkling 2
+Mini's layers 20-23; [design](inkling2_mini-design.md) §18.2). Each expert is one record: the gate/up matrix with rows
+interleaved as in §6 (row `2i` gate row `i`, row `2i + 1` up row `i`), then the down matrix, each as 16-row groups of
+528-byte units, one per 32-element K block, row group major and block ascending:
+
+```text
+gate_up_blocks = H / 32                down_blocks = I / 32
+gate_up_bytes  = (2 * I / 16) * gate_up_blocks * 528
+record_bytes   = gate_up_bytes + (H / 16) * down_blocks * 528
+record_stride  = align_up(record_bytes, 4096)
+payload_bytes  = E * record_stride
+```
+
+**Unit.** The 16 rows `16rg .. 16rg+15` of block `32b .. 32b+31` as the A operand of one `mma.sync.m16n8k32` E4M3
+product: bytes `16l .. 16l+15` (`l = 4g + t`, `g < 8`, `t < 4`) are lane l's four registers, row `16rg + g` at
+`k = 32b + 4t .. +3`, row `16rg + g + 8` at the same k, row `16rg + g` at `k = 32b + 16 + 4t .. +3`, row
+`16rg + g + 8` at those k; bytes `512..527` the 16 rows' UE8M0 scale words in row order. There is no global scale and
+no tail plane; zero bytes pad each record to its stride. For Inkling's `[128, 2304, 1152]` a record is 8,211,456
+bytes in an 8,212,480-byte stride. Codes and scales are the checkpoint's words, NaN words refused.
 
 ## 10. `raw_bytes_v1`
 

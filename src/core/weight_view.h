@@ -116,9 +116,10 @@ struct WeightRowPlanes {
 [[nodiscard]] Weight device_native_weight(const WeightView& view, float input_divisor = 0.0F);
 
 // A routed-expert bank: nvfp4_expert_rg16_v1 (Qwen3.8-Flash-Next design §6.2), a ggml expert
-// layout (ggml_expert_*_v1) or fp8_expert_b128_v1 (whose tile scales follow the down rows, at
-// record_bytes - 3 * (hidden / 128) * (intermediate / 128) * 2). Pointers are in the parent's
-// memory space; nothing is dereferenced.
+// layout (ggml_expert_*_v1), fp8_expert_b128_v1 (whose tile scales follow the down rows, at
+// record_bytes - 3 * (hidden / 128) * (intermediate / 128) * 2) or mxfp8_expert_rg16_v1 (528-byte
+// units, the down matrix at gate_up_bytes). Pointers are in the parent's memory space; nothing is
+// dereferenced.
 struct ExpertBankPlanes {
     const std::byte* records     = nullptr; // expert e at records + e * record_stride
     const std::byte* device_records = nullptr; // records where device code reads them (WeightParent::device)

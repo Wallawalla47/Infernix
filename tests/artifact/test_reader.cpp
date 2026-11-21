@@ -160,6 +160,27 @@ void geometry_and_views() {
     rejects<std::invalid_argument>(
         [&] { (void)weight_geometry(QType::NVFP4_MUL, QuantLayout::Fp8ExpertB128, std::array<std::uint64_t, 3>{2, 256, 128}); },
         "block-FP8 expert bank layout accepted another format");
+
+    // MXFP8 banks (mxfp8_expert_rg16_v1): Inkling 2 Mini's layers 20-23, sizes equal tools/artifact/layouts.py's
+    // mxfp8_expert_geometry.
+    const auto mx_bank = weight_geometry(QType::FP8_E4M3FN_G32_E8M0, QuantLayout::Mxfp8ExpertRg16,
+                                         std::array<std::uint64_t, 3>{128, 2304, 1152});
+    require(mx_bank.record_bytes == 8211456 && mx_bank.record_stride == 8212480 && mx_bank.bytes == 128ULL * 8212480 &&
+                mx_bank.alignment == 4096 && mx_bank.scale_bytes == 0,
+            "MXFP8 expert bank size differs from the Python layout");
+    std::vector<std::byte> mx_bytes(mx_bank.bytes);
+    const auto mx_planes = expert_bank_planes(WeightParent{mx_bank, mx_bytes.data()});
+    require(mx_planes.experts == 128 && mx_planes.hidden == 2304 && mx_planes.intermediate == 1152 &&
+                mx_planes.gate_up_bytes == 5474304 && mx_planes.record_stride == 8212480 &&
+                mx_planes.multipliers == nullptr && mx_planes.gate_up_format == QType::FP8_E4M3FN_G32_E8M0 &&
+                mx_planes.down_format == QType::FP8_E4M3FN_G32_E8M0,
+            "MXFP8 expert bank planes lost their geometry");
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::FP8_E4M3FN_G32_E8M0, QuantLayout::Mxfp8ExpertRg16, std::array<std::uint64_t, 3>{2, 256, 48}); },
+        "MXFP8 expert bank accepted a partial 32-element block");
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::FP8_E4M3FN_B128, QuantLayout::Mxfp8ExpertRg16, std::array<std::uint64_t, 3>{2, 256, 128}); },
+        "MXFP8 expert bank layout accepted another format");
 }
 
 void invalid_directories() {

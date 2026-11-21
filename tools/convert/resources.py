@@ -225,7 +225,11 @@ def load_resources(
     vocab_size: int,
     vision_config: Mapping[str, int] | None = None,
     overrides: Mapping[str, str | Path] | None = None,
+    qwen_normalizers: bool = True,
 ) -> tuple[dict[str, dict[str, str]], dict[str, bytes], int, tuple[int, ...]]:
+    """The selected resources' bytes, the public token count and the special token ids. ``qwen_normalizers``
+    rewrites Qwen tokenizer resources to the forms the Qwen frontend requires; other families (Inkling2Loop) keep
+    their resources byte for byte."""
     overrides = {} if overrides is None else dict(overrides)
     roles = {"text": TEXT_RESOURCES + tuple(r for r in OPTIONAL_TEXT_RESOURCES if r in overrides)}
     if vision_config is not None:
@@ -271,6 +275,13 @@ def load_resources(
             payloads[object_id] = data
     tokenizer_json = parsed["tokenizer.json"]
     tokenizer_config = parsed["tokenizer_config.json"]
+    if qwen_normalizers:
+        _apply_qwen_normalizers(tokenizer_json, tokenizer_config, payloads)
+    count, special = token_domain(tokenizer_json, tokenizer_config, vocab_size)
+    return references, payloads, count, special
+
+
+def _apply_qwen_normalizers(tokenizer_json: dict, tokenizer_config: dict, payloads: dict[str, bytes]) -> None:
     if _normalize_qwen_split(tokenizer_json):
         payloads["resource/text/tokenizer.json"] = _dump_json(tokenizer_json)
         print(
@@ -301,5 +312,3 @@ def load_resources(
         config_changed = True
     if config_changed:
         payloads["resource/text/tokenizer_config.json"] = _dump_json(tokenizer_config)
-    count, special = token_domain(tokenizer_json, tokenizer_config, vocab_size)
-    return references, payloads, count, special

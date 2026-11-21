@@ -88,6 +88,11 @@ enum class QuantLayout : std::uint16_t {
     // escape << 8 | its base; word n: the escape count << 8), escapes u32 (column << 16 | the BF16 bits),
     // each row's in column order.
     P12Rows = 12,
+    // mxfp8_expert_rg16_v1 (FP8_E4M3FN_G32_E8M0 only): [experts, hidden, intermediate] banks of 4 KiB-aligned
+    // records, the gate/up rows interleaved (2i gate, 2i + 1 up) and then the down rows, as 16-row groups of
+    // 528-byte units per 32-element K block (512 code bytes in m16n8k32 A-fragment order, then the 16 rows'
+    // UE8M0 scales), row-group major, block ascending (tools/artifact/codecs/mxfp8_expert.py).
+    Mxfp8ExpertRg16 = 13,
 };
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).
@@ -98,7 +103,8 @@ enum class QuantLayout : std::uint16_t {
 // Whether `layout` stores routed-expert banks (one 4 KiB-aligned record per expert).
 [[nodiscard]] constexpr bool is_expert_bank_layout(QuantLayout layout) noexcept {
     return layout == QuantLayout::ExpertRg16 || layout == QuantLayout::GgmlExpertIq4Nl ||
-           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::Fp8ExpertB128;
+           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::Fp8ExpertB128 ||
+           layout == QuantLayout::Mxfp8ExpertRg16;
 }
 
 struct Weight {
