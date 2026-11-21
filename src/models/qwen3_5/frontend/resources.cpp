@@ -5,9 +5,11 @@
 namespace infernix::models::qwen3_5 {
 
 void parse_resources(FrontendResources& resources, const Config& config) {
-    resources.tokenizer = std::make_shared<const frontend::Tokenizer>(
-        frontend::TokenizerResources{resources.tokenizer_json, resources.tokenizer_config_json,
-                                     resources.generation_config_json});
+    resources.tokenizer = std::make_shared<const text::Tokenizer>(
+        text::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
+                                 .tokenizer_config_json  = resources.tokenizer_config_json,
+                                 .generation_config_json = resources.generation_config_json,
+                                 .pipeline               = text::TokenizerPipeline::Qwen});
     const auto count = resources.tokenizer->vocab_size();
     if (!count || count > config.text.vocab_size ||
         !resources.tokenizer->has_exact_token_domain(count)) {

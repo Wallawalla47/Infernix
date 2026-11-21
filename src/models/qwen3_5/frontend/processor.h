@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/frontend/chat_template.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
@@ -183,12 +183,12 @@ struct EncodedChat {
 };
 
 EncodedChat
-encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+encode_rendered_chat(const text::Tokenizer& tokenizer, const RenderedChat& rendered,
                      std::size_t maximum_tokens = std::numeric_limits<std::size_t>::max());
 
 class Processor {
 public:
-    Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
+    Processor(const text::Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
               ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
 
     [[nodiscard]] std::size_t count_tokens(std::vector<ChatMessage> messages,
@@ -201,7 +201,7 @@ public:
             std::size_t maximum_prompt_tokens = std::numeric_limits<std::size_t>::max()) const;
 
 private:
-    const Tokenizer& tokenizer_;
+    const text::Tokenizer& tokenizer_;
     const CompiledChatTemplate& chat_template_;
     ProcessorOptions options_;
     std::shared_ptr<MediaPreprocessCache> media_cache_;

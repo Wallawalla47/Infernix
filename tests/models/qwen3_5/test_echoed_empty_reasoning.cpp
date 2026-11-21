@@ -20,7 +20,7 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/resources.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -76,7 +76,7 @@ std::string ids_text(std::span<const TokenId> ids) {
 // The tokenizer files and one maintained template; the views the Frontend borrows live here.
 struct Resources {
     std::string tokenizer_json, tokenizer_config_json, generation_config_json, chat_template;
-    std::shared_ptr<const q::frontend::Tokenizer> tokenizer;
+    std::shared_ptr<const infernix::text::Tokenizer> tokenizer;
 };
 
 q::Frontend make_frontend(const Resources& source) {
@@ -206,7 +206,7 @@ int main() {
         qwen3_8.tokenizer_config_json  = read_file(root / "tokenizer_config.json");
         qwen3_8.generation_config_json = read_file(root / "generation_config.json");
         qwen3_8.chat_template = read_file(fs::path(INFERNIX_SOURCE_DIR) / "tools" / "chat_templates" / "qwen3_8.jinja");
-        qwen3_8.tokenizer     = std::make_shared<const q::frontend::Tokenizer>(q::frontend::TokenizerResources{
+        qwen3_8.tokenizer     = std::make_shared<const infernix::text::Tokenizer>(infernix::text::TokenizerResources{
             qwen3_8.tokenizer_json, qwen3_8.tokenizer_config_json, qwen3_8.generation_config_json});
         Resources qwen3_6 = qwen3_8;
         qwen3_6.chat_template =

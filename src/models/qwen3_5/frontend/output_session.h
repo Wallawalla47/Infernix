@@ -13,11 +13,11 @@
 
 namespace infernix::text {
 class GrammarSession;
+class Tokenizer;
 }
 
 namespace infernix::models::qwen3_5 {
 namespace frontend {
-class Tokenizer;
 struct ToolCallOutputContract;
 
 // The added tokens whose identity marks a turn's phases: `</think>` ends the reasoning and
@@ -118,7 +118,7 @@ public:
 
 private:
     class Impl;
-    OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer,
+    OutputSession(std::shared_ptr<const text::Tokenizer> tokenizer,
                   frontend::OutputMarkerTokens markers, StopPolicy policy, OutputOptions output,
                   bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,

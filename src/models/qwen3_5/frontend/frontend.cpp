@@ -7,7 +7,7 @@
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 #include "models/qwen3_5/frontend/ngram_sources.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "models/qwen3_5/frontend/tool_contract.h"
@@ -50,9 +50,9 @@ static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerializati
 
 // The output phases are marked by the identity of these added tokens, so the tokenizer must hold
 // each as an ordinary (non-special) added token: generation and constraints read them as text.
-fi::OutputMarkerTokens output_marker_tokens(const fi::Tokenizer& tokenizer) {
+fi::OutputMarkerTokens output_marker_tokens(const text::Tokenizer& tokenizer) {
     const auto added_text_token = [&](std::string_view content) {
-        const fi::AddedToken* token = tokenizer.find_added_token(content);
+        const text::AddedToken* token = tokenizer.find_added_token(content);
         if (token == nullptr || token->special) {
             throw std::invalid_argument("Qwen tokenizer must define " + std::string(content) +
                                         " as an added non-special token");
@@ -66,7 +66,7 @@ fi::OutputMarkerTokens output_marker_tokens(const fi::Tokenizer& tokenizer) {
 // A tool grammar reads its free text and call openers as tokens, so the assistant prefix it
 // continues is accepted as tokens: each `<tool_call>` the client spelled as the call opener, every
 // other byte as its byte-level token, which keeps the prefix's exact bytes.
-std::vector<std::int32_t> tool_continuation_tokens(const fi::Tokenizer& tokenizer,
+std::vector<std::int32_t> tool_continuation_tokens(const text::Tokenizer& tokenizer,
                                                    TokenId tool_call, std::string_view text) {
     std::vector<std::int32_t> tokens;
     tokens.reserve(text.size());
@@ -407,7 +407,7 @@ VisionItem convert_vision_item(fi::VisionItem item) {
     return result;
 }
 
-StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& caller) {
+StopPolicy merge_stop_policy(const text::Tokenizer& tokenizer, const StopPolicy& caller) {
     StopPolicy result;
     result.publish_stop_token = caller.publish_stop_token;
     const auto append_token   = [&](TokenId token) {
@@ -675,7 +675,7 @@ public:
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
         markers               = output_marker_tokens(*tokenizer);
-        if (const fi::AddedToken* open = tokenizer->find_added_token("<think>"); open != nullptr) {
+        if (const text::AddedToken* open = tokenizer->find_added_token("<think>"); open != nullptr) {
             reasoning_open = static_cast<TokenId>(open->id);
         }
         ngram_sources_enabled = options.ngram_sources_enabled;
@@ -718,7 +718,7 @@ public:
                                         control_name);
         }
         const std::string exact =
-            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
+            tokenizer->decode(encoded, text::DecodeOptions{.skip_special_tokens = false});
         // The control closes the thinking as the model does: by the close token, then the
         // separator. A close spelled earlier in a message would close it there instead.
         const auto close = std::find(encoded.begin(), encoded.end(), markers.reasoning_close);
@@ -748,7 +748,7 @@ public:
     }
 
     fi::CompiledChatTemplate chat_template;
-    std::shared_ptr<const fi::Tokenizer> tokenizer;
+    std::shared_ptr<const text::Tokenizer> tokenizer;
     fi::OutputMarkerTokens markers;
     TokenId reasoning_open = -1; // `<think>`
     fi::ProcessorOptions processor;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/config.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 
 #include <memory>
 #include <string_view>
@@ -20,7 +20,7 @@ struct FrontendResources {
     std::string_view sampling_json;
     std::string_view preprocessor_config_json;
     std::string_view video_preprocessor_config_json;
-    std::shared_ptr<const frontend::Tokenizer> tokenizer;
+    std::shared_ptr<const text::Tokenizer> tokenizer;
     std::uint32_t public_token_count = 0;
 };
 

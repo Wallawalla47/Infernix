@@ -110,6 +110,37 @@ bool is_letter(std::int32_t codepoint) noexcept {
     }
 }
 
+bool is_cased_upper_or_other_letter_or_mark(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return codepoint >= 'A' && codepoint <= 'Z'; }
+    switch (utf8proc_category(codepoint)) {
+    case UTF8PROC_CATEGORY_LU:
+    case UTF8PROC_CATEGORY_LT:
+    case UTF8PROC_CATEGORY_LM:
+    case UTF8PROC_CATEGORY_LO:
+    case UTF8PROC_CATEGORY_MN:
+    case UTF8PROC_CATEGORY_MC:
+    case UTF8PROC_CATEGORY_ME:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_cased_lower_or_other_letter_or_mark(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return codepoint >= 'a' && codepoint <= 'z'; }
+    switch (utf8proc_category(codepoint)) {
+    case UTF8PROC_CATEGORY_LL:
+    case UTF8PROC_CATEGORY_LM:
+    case UTF8PROC_CATEGORY_LO:
+    case UTF8PROC_CATEGORY_MN:
+    case UTF8PROC_CATEGORY_MC:
+    case UTF8PROC_CATEGORY_ME:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool is_mark(std::int32_t codepoint) noexcept {
     if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return false; }
     switch (utf8proc_category(codepoint)) {

@@ -1,7 +1,7 @@
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/reasoning_loop.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "runtime/contract/execution.h"
 #include "text/unicode.h"
@@ -421,7 +421,7 @@ DecoderState terminal_state(DecoderState state) {
 
 class OutputSession::Impl {
 public:
-    Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, fi::OutputMarkerTokens markers_,
+    Impl(std::shared_ptr<const text::Tokenizer> tokenizer_, fi::OutputMarkerTokens markers_,
          StopPolicy policy_, OutputOptions output, bool starts_in_reasoning,
          ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
@@ -524,7 +524,7 @@ public:
         }
     }
 
-    std::shared_ptr<const fi::Tokenizer> tokenizer;
+    std::shared_ptr<const text::Tokenizer> tokenizer;
     fi::OutputMarkerTokens markers;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
@@ -611,7 +611,7 @@ OutputSession::OutputSession(OutputSession&&) noexcept            = default;
 OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
 OutputSession::OutputSession(
-    std::shared_ptr<const frontend::Tokenizer> tokenizer, frontend::OutputMarkerTokens markers,
+    std::shared_ptr<const text::Tokenizer> tokenizer, frontend::OutputMarkerTokens markers,
     StopPolicy policy, OutputOptions output, bool starts_in_reasoning,
     ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
@@ -723,7 +723,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
         const TokenId token                = tokens[index];
-        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        const text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
         const bool reasoning_close         = token == impl_->markers.reasoning_close;
 
         if (impl_->preview_prefix_execution.feed(reasoning_close, decoded.bytes)) {
@@ -872,7 +872,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->clear_preview_tool_calls();
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                = tokens[index];
-        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        const text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
         const bool reasoning_close         = token == impl_->markers.reasoning_close;
         if (impl_->preview_prefix_execution.feed(reasoning_close, decoded.bytes)) {
             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);

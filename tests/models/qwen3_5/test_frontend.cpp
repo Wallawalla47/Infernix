@@ -6,7 +6,7 @@
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 #include "runtime/contract/execution.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "text/unicode.h"
@@ -60,8 +60,8 @@ Frontend make_frontend(const FrontendResources& source,
         .generation_config_json         = source.generation_config_json,
         .preprocessor_config_json       = source.preprocessor_config_json,
         .video_preprocessor_config_json = source.video_preprocessor_config_json};
-    parsed.tokenizer = std::make_shared<const infernix::models::qwen3_5::frontend::Tokenizer>(
-        infernix::models::qwen3_5::frontend::TokenizerResources{
+    parsed.tokenizer = std::make_shared<const infernix::text::Tokenizer>(
+        infernix::text::TokenizerResources{
             source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
     parsed.public_token_count = static_cast<std::uint32_t>(parsed.tokenizer->vocab_size());
     return infernix::models::qwen3_5::make_frontend(parsed, options);
@@ -295,9 +295,9 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     return result;
 }
 
-const fi::Tokenizer& fixture_tokenizer() {
+const infernix::text::Tokenizer& fixture_tokenizer() {
     static const FrontendResources fixture = resources();
-    static const fi::Tokenizer tokenizer(
+    static const infernix::text::Tokenizer tokenizer(
         {.tokenizer_json         = fixture.tokenizer_json,
          .tokenizer_config_json  = fixture.tokenizer_config_json,
          .generation_config_json = fixture.generation_config_json});
@@ -309,7 +309,7 @@ constexpr infernix::TokenId kMergedFunctionNameToken = 3005;
 
 // Shaped like the model's tokenizer, unlike the fixture: the control spellings are its only added
 // tokens, and a BPE merge joins the template's "<function=" to the request's tool name.
-const fi::Tokenizer& control_spelling_tokenizer() {
+const infernix::text::Tokenizer& control_spelling_tokenizer() {
     static const std::string tokenizer_json = [] {
         nlohmann::json vocab = nlohmann::json::object();
         for (int value = 0; value <= 255; ++value) {
@@ -345,7 +345,7 @@ const fi::Tokenizer& control_spelling_tokenizer() {
                               {"added_tokens", tokens}}
             .dump();
     }();
-    static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
+    static const infernix::text::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = R"({"added_tokens_decoder":{}})",
                                           .generation_config_json = R"({"eos_token_id":[6]})"});
     return tokenizer;
@@ -525,7 +525,7 @@ int test_declared_frontend_semantics() {
         R"json({"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]})json");
     tokenizer["decoder"]  = {{"type", "ByteLevel"}};
     source.tokenizer_json = tokenizer.dump();
-    const fi::Tokenizer supported(
+    const infernix::text::Tokenizer supported(
         {source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
     int failures =
         check(supported.encode("ABC e\xcc\x81") ==
@@ -573,7 +573,7 @@ int test_declared_frontend_semantics() {
         source.tokenizer_json                       = changed.dump();
         failures +=
             check(throws_invalid_argument([&] {
-                      (void)fi::Tokenizer({source.tokenizer_json, source.tokenizer_config_json,
+                      (void)infernix::text::Tokenizer({source.tokenizer_json, source.tokenizer_config_json,
                                            source.generation_config_json});
                   }),
                   "unsupported declared tokenizer algorithm was accepted");
@@ -606,7 +606,7 @@ int test_declared_frontend_semantics() {
 }
 
 int test_tokenizer_config_merge() {
-    const fi::Tokenizer& tokenizer = fixture_tokenizer();
+    const infernix::text::Tokenizer& tokenizer = fixture_tokenizer();
 
     constexpr std::array<std::pair<const char*, int>, 7> appended = {{
         {"<|audio_start|>", 248070},
@@ -631,7 +631,7 @@ int test_tokenizer_config_merge() {
     conflicting.tokenizer_config_json                   = config.dump();
     failures += check(
         throws_invalid_argument([&] {
-            fi::Tokenizer invalid({.tokenizer_json         = conflicting.tokenizer_json,
+            infernix::text::Tokenizer invalid({.tokenizer_json         = conflicting.tokenizer_json,
                                    .tokenizer_config_json  = conflicting.tokenizer_config_json,
                                    .generation_config_json = conflicting.generation_config_json});
         }),
@@ -643,7 +643,7 @@ int test_tokenizer_config_merge() {
 // for a diagnosis: the byte-preserving route returns those bytes as they are, the strict route keeps
 // refusing them, and for every other input both join exactly the same bytes (serve/prefix_miss.h).
 int test_byte_preserving_decode(const Frontend& frontend) {
-    const fi::Tokenizer& tokenizer = fixture_tokenizer();
+    const infernix::text::Tokenizer& tokenizer = fixture_tokenizer();
     const auto byte = [](const std::uint8_t value) {
         return static_cast<int>(fixture_byte_token(value));
     };
@@ -697,11 +697,11 @@ int test_byte_preserving_decode(const Frontend& frontend) {
     failures += check(tokenizer.decode_bytes(with_special) == "A<|im_start|>B" &&
                           tokenizer.decode(with_special) == "A<|im_start|>B",
                       "special tokens no longer decode the same way in both routes");
-    const fi::DecodeOptions skipped{.skip_special_tokens = true};
+    const infernix::text::DecodeOptions skipped{.skip_special_tokens = true};
     failures += check(tokenizer.decode_bytes(with_special, skipped) == "AB" &&
                           tokenizer.decode(with_special, skipped) == "AB",
                       "skip_special_tokens no longer applies to both routes");
-    const fi::DecodeOptions stop{.stop_token_ids = {6}};
+    const infernix::text::DecodeOptions stop{.stop_token_ids = {6}};
     failures += check(tokenizer.decode_bytes(std::vector<int>{byte('A'), 6}, stop) == "A" &&
                           tokenizer.decode(std::vector<int>{byte('A'), 6}, stop) == "A",
                       "a terminal stop token is no longer suppressed the same way in both routes");
@@ -739,7 +739,7 @@ int test_bpe_merge_order() {
              {added(8, "<sep>", true)})}}.dump();
     const std::string tokenizer_config_json =
         nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump();
-    const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
+    const infernix::text::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                    .tokenizer_config_json  = tokenizer_config_json,
                                    .generation_config_json = R"({"eos_token_id":0})"});
     int failures     = check(tokenizer.encode("aaa") == std::vector<int>{2} &&
@@ -800,11 +800,11 @@ int test_boundary_aware_tokenization() {
          nlohmann::json::array()}}.dump();
     const std::string tokenizer_config_json =
         nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump();
-    const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
+    const infernix::text::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                    .tokenizer_config_json  = tokenizer_config_json,
                                    .generation_config_json = R"({"eos_token_id":0})"});
     constexpr std::array<std::size_t, 5> boundaries{2, 3, 0, 1, 2};
-    const fi::BoundaryEncodedText encoded = tokenizer.encode_with_boundaries("abc", boundaries);
+    const infernix::text::BoundaryEncodedText encoded = tokenizer.encode_with_boundaries("abc", boundaries);
     int failures                          = check(
         encoded.input_ids == std::vector<int>({0, 3}) && encoded.boundaries.size() == 5 &&
             !encoded.boundaries[0].exact_frontier && encoded.boundaries[0].stable_frontier == 0 &&
@@ -815,8 +815,8 @@ int test_boundary_aware_tokenization() {
 
     constexpr std::string_view decomposed = "e\xCC\x81x";
     constexpr std::array<std::size_t, 1> composition_boundary{1};
-    const fi::Tokenizer& fixture = fixture_tokenizer();
-    const fi::BoundaryEncodedText normalized =
+    const infernix::text::Tokenizer& fixture = fixture_tokenizer();
+    const infernix::text::BoundaryEncodedText normalized =
         fixture.encode_with_boundaries(decomposed, composition_boundary);
     failures += check(normalized.input_ids == fixture.encode(decomposed) &&
                           !normalized.boundaries.front().exact_frontier &&
@@ -1010,15 +1010,15 @@ int test_repeated_special_tokens_scan_linearly() {
 }
 
 int test_bounded_tokenizer_prefix() {
-    const fi::Tokenizer& tokenizer = fixture_tokenizer();
+    const infernix::text::Tokenizer& tokenizer = fixture_tokenizer();
     const std::string text =
         "<|im_start|>user\nA bounded tokenizer must preserve the exact ordinary and special-token "
         "prefix.<|im_end|>\n";
     const std::vector<int> full    = tokenizer.encode(text);
     constexpr std::size_t limit    = 7;
-    const std::vector<int> bounded = tokenizer.encode(text, fi::EncodeOptions{.max_tokens = limit});
+    const std::vector<int> bounded = tokenizer.encode(text, infernix::text::EncodeOptions{.max_tokens = limit});
     const std::vector<int> roomy =
-        tokenizer.encode(text, fi::EncodeOptions{.max_tokens = full.size() + 1U});
+        tokenizer.encode(text, infernix::text::EncodeOptions{.max_tokens = full.size() + 1U});
     return check(full.size() > limit && bounded.size() == limit &&
                      std::equal(bounded.begin(), bounded.end(), full.begin()) && roomy == full,
                  "bounded tokenizer output is not the exact prefix of unbounded tokenization");
@@ -1972,7 +1972,7 @@ int test_trimmed_source_cache_boundaries() {
         tokenizer_json["model"]["vocab"]["xy"] = 2000;
         tokenizer_json["model"]["merges"]      = nlohmann::json::array({{"x", "y"}});
         source.tokenizer_json                  = tokenizer_json.dump();
-        const fi::Tokenizer tokenizer(
+        const infernix::text::Tokenizer tokenizer(
             {source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
         const auto frontend = make_frontend(source, false);
         for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::User}) {
@@ -3577,7 +3577,7 @@ int test_thinking_budget_message() {
     const std::vector<infernix::TokenId> control(session.pending_control_tokens().begin(),
                                                session.pending_control_tokens().end());
     const std::string control_text = fixture_tokenizer().decode(
-        control, fi::DecodeOptions{.skip_special_tokens = false});
+        control, infernix::text::DecodeOptions{.skip_special_tokens = false});
     failures += check(control_text == expected_control,
                       "custom thinking budget message lost its canonical close");
     const auto control_decision =
@@ -3608,7 +3608,7 @@ int test_thinking_budget_message() {
         exact_session.pending_control_tokens().begin(),
         exact_session.pending_control_tokens().end());
     const std::string exact_text = fixture_tokenizer().decode(
-        exact_tokens, fi::DecodeOptions{.skip_special_tokens = false});
+        exact_tokens, infernix::text::DecodeOptions{.skip_special_tokens = false});
     failures += check(exact_text == expected_control,
                       "canonical close was appended to a message that already had it");
 

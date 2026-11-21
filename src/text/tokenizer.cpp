@@ -1,4 +1,4 @@
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 
 #include "text/unicode.h"
 
@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <charconv>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -18,7 +17,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace infernix::models::qwen3_5::frontend {
+namespace infernix::text {
 namespace {
 
 using Json    = nlohmann::json;
@@ -29,11 +28,15 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
-void validate_pipeline(const Json& root, const Json& model) {
-    const auto require = [](bool valid, const char* field) {
+constexpr std::string_view kInklingSplitPattern =
+    R"ink([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)ink";
+
+void validate_pipeline(const Json& root, const Json& model, TokenizerPipeline pipeline) {
+    const bool qwen = pipeline == TokenizerPipeline::Qwen;
+    const auto require = [qwen](bool valid, const char* field) {
         if (!valid) {
-            throw std::invalid_argument(std::string("tokenizer.json ") + field +
-                                        " is not supported by the Qwen tokenizer");
+            throw std::invalid_argument(std::string("tokenizer.json ") + field + " is not supported by the " +
+                                        (qwen ? "Qwen" : "Inkling") + " tokenizer");
         }
     };
     const auto type = [](const Json& value, const char* name) {
@@ -41,7 +44,10 @@ void validate_pipeline(const Json& root, const Json& model) {
     };
     // Omitted pipeline descriptions use the architecture's fixed tokenizer semantics.
     // An explicit description must agree with the implemented transformations.
-    if (root.contains("normalizer")) { require(type(root["normalizer"], "NFC"), "normalizer"); }
+    if (root.contains("normalizer")) {
+        require(qwen ? type(root["normalizer"], "NFC") : root["normalizer"].is_null(), "normalizer");
+    }
+    const std::string_view split_pattern = qwen ? kQwenSplitPattern : kInklingSplitPattern;
     if (root.contains("pre_tokenizer")) {
         const auto& pre = root["pre_tokenizer"];
         require(type(pre, "Sequence") && pre.contains("pretokenizers") &&
@@ -50,7 +56,7 @@ void validate_pipeline(const Json& root, const Json& model) {
         const auto& split = pre["pretokenizers"][0];
         const auto& bytes = pre["pretokenizers"][1];
         require(type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
-                    split["pattern"].value("Regex", std::string{}) == kQwenSplitPattern &&
+                    split["pattern"].value("Regex", std::string{}) == split_pattern &&
                     split.value("behavior", std::string{}) == "Isolated" &&
                     split.value("invert", Json(false)) == false,
                 "pre_tokenizer.Split");
@@ -68,7 +74,9 @@ void validate_pipeline(const Json& root, const Json& model) {
     for (const char* field : {"continuing_subword_prefix", "end_of_word_suffix"}) {
         require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
     }
-    require(model.value("ignore_merges", Json(false)) == false, "model.ignore_merges");
+    require(model.value("byte_fallback", Json(false)) == false, "model.byte_fallback");
+    // Each pipeline's own BPE: Qwen merges every word, Inkling emits a word that is itself a token whole.
+    require(model.value("ignore_merges", Json(!qwen)) == Json(!qwen), "model.ignore_merges");
 }
 
 struct VocabMetadata {
@@ -469,39 +477,82 @@ bool is_non_space_non_letter_mark_number(std::int32_t codepoint) noexcept {
            !uni::is_mark(codepoint) && !uni::is_number(codepoint);
 }
 
-bool ascii_ci_matches(std::string_view text, std::size_t offset, std::string_view suffix) {
-    if (offset + suffix.size() > text.size()) { return false; }
-    for (std::size_t i = 0; i < suffix.size(); ++i) {
-        const unsigned char lhs = static_cast<unsigned char>(text[offset + i]);
-        const unsigned char rhs = static_cast<unsigned char>(suffix[i]);
-        if (std::tolower(lhs) != std::tolower(rhs)) { return false; }
-    }
-    return true;
-}
-
-uni::CodepointSpan qwen_codepoint_at(std::string_view text, std::size_t offset) {
+uni::CodepointSpan codepoint_at(std::string_view text, std::size_t offset) {
     return uni::utf8_codepoint_at(text, offset, "Tokenizer::encode input");
 }
 
+// The whitespace alternatives both patterns end with, \s*[\r\n]+ | \s+(?!\S) | \s+, from a whitespace `begin`:
+// through the run's last newline if it has one; else the whole run at the end of the text; else the run without
+// its last character when that leaves one (the lookahead's backtrack); else the single character.
+std::size_t whitespace_end(std::string_view text, std::size_t begin) {
+    std::size_t end              = begin;
+    std::size_t last_begin       = begin;
+    std::size_t last_newline_end = std::string_view::npos;
+    std::size_t count            = 0;
+    while (end < text.size()) {
+        const uni::CodepointSpan value = codepoint_at(text, end);
+        if (!uni::is_whitespace(value.value)) { break; }
+        last_begin = end;
+        end += value.length;
+        ++count;
+        if (is_newline(value.value)) { last_newline_end = end; }
+    }
+    if (last_newline_end != std::string_view::npos) { return last_newline_end; }
+    if (end == text.size()) { return end; }
+    return count >= 2 ? last_begin : end;
+}
+
+// The start of the codepoint that ends at `end` (valid UTF-8 already walked forward).
+std::size_t previous_codepoint(std::string_view text, std::size_t end) {
+    std::size_t offset = end - 1U;
+    while (offset > 0 && (static_cast<unsigned char>(text[offset]) & 0xc0U) == 0x80U) { --offset; }
+    return offset;
+}
+
+// (?i:'s|'t|'re|'ve|'m|'ll|'d)? at `offset`: its end, or `offset`. Oniguruma folds case by Unicode: besides the
+// ASCII capitals, U+017F LATIN SMALL LETTER LONG S folds to s (no other character folds to one of these letters).
+std::size_t contraction_end(std::string_view text, std::size_t offset) {
+    if (offset >= text.size() || text[offset] != '\'') { return offset; }
+    const auto folded = [&](std::size_t at, std::size_t& next) -> std::int32_t {
+        if (at >= text.size()) { return 0; }
+        const uni::CodepointSpan value = codepoint_at(text, at);
+        next = at + value.length;
+        if (value.value >= 'A' && value.value <= 'Z') { return value.value - 'A' + 'a'; }
+        return value.value == 0x017F ? 's' : value.value;
+    };
+    std::size_t second = 0;
+    std::size_t third  = 0;
+    switch (folded(offset + 1U, second)) {
+    case 's':
+    case 't':
+    case 'm':
+    case 'd':
+        return second;
+    case 'r':
+    case 'v':
+        return folded(second, third) == 'e' ? third : offset;
+    case 'l':
+        return folded(second, third) == 'l' ? third : offset;
+    default:
+        return offset;
+    }
+}
+
 std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
-    const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
+    const uni::CodepointSpan first = codepoint_at(text, begin);
     const std::size_t after_first  = begin + first.length;
     const std::int32_t cp          = first.value;
 
-    if (cp == '\'') {
-        constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
-        for (std::string_view suffix : suffixes) {
-            if (ascii_ci_matches(text, after_first, suffix)) { return after_first + suffix.size(); }
-        }
-    }
+    // (?i:'s|'t|'re|'ve|'m|'ll|'d), folded as Oniguruma folds case (contraction_end).
+    if (const std::size_t end = contraction_end(text, begin); end != begin) { return end; }
 
     const bool has_next     = after_first < text.size();
-    const std::int32_t next = has_next ? qwen_codepoint_at(text, after_first).value : 0;
+    const std::int32_t next = has_next ? codepoint_at(text, after_first).value : 0;
     if (is_letter_or_mark(cp) ||
         (is_non_newline_non_letter_non_number(cp) && has_next && is_letter_or_mark(next))) {
         std::size_t end = is_letter_or_mark(cp) ? begin : after_first;
         while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            const uni::CodepointSpan value = codepoint_at(text, end);
             if (!is_letter_or_mark(value.value)) { break; }
             end += value.length;
         }
@@ -514,37 +565,101 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
         is_non_space_non_letter_mark_number(cp)) {
         std::size_t end = cp == ' ' ? after_first : begin;
         while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            const uni::CodepointSpan value = codepoint_at(text, end);
             if (!is_non_space_non_letter_mark_number(value.value)) { break; }
             end += value.length;
         }
         while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            const uni::CodepointSpan value = codepoint_at(text, end);
             if (!is_newline(value.value)) { break; }
             end += value.length;
         }
         return end;
     }
 
-    if (uni::is_whitespace(cp)) {
-        std::size_t end              = begin;
-        std::size_t last_begin       = begin;
-        std::size_t last_newline_end = std::string_view::npos;
-        std::size_t count            = 0;
-        while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
-            if (!uni::is_whitespace(value.value)) { break; }
-            last_begin = end;
-            end += value.length;
-            ++count;
-            if (is_newline(value.value)) { last_newline_end = end; }
-        }
-        if (last_newline_end != std::string_view::npos) { return last_newline_end; }
-        if (end == text.size()) { return end; }
-        return count >= 2 ? last_begin : end;
-    }
+    if (uni::is_whitespace(cp)) { return whitespace_end(text, begin); }
 
     return after_first;
+}
+
+// One alternative's letter runs from `start`, as Oniguruma backtracks greedy runs:
+//   lower_required: [Lu Lt Lm Lo M]* [Ll Lm Lo M]+ (the upper run gives back characters until one of the lower class
+//                   starts the lower run);
+//   otherwise:      [Lu Lt Lm Lo M]+ [Ll Lm Lo M]*.
+// Returns the end of the match, or npos.
+std::size_t inkling_letters_end(std::string_view text, std::size_t start, bool lower_required) {
+    std::size_t upper_end = start;
+    while (upper_end < text.size()) {
+        const uni::CodepointSpan value = codepoint_at(text, upper_end);
+        if (!uni::is_cased_upper_or_other_letter_or_mark(value.value)) { break; }
+        upper_end += value.length;
+    }
+    const auto lower_run = [&](std::size_t from) {
+        while (from < text.size()) {
+            const uni::CodepointSpan value = codepoint_at(text, from);
+            if (!uni::is_cased_lower_or_other_letter_or_mark(value.value)) { break; }
+            from += value.length;
+        }
+        return from;
+    };
+    if (!lower_required) { return upper_end == start ? std::string_view::npos : lower_run(upper_end); }
+    // The longest upper prefix whose next character opens a lower run.
+    for (std::size_t split = upper_end;;) {
+        if (split < text.size() && uni::is_cased_lower_or_other_letter_or_mark(codepoint_at(text, split).value)) {
+            return lower_run(split);
+        }
+        if (split == start) { return std::string_view::npos; }
+        split = previous_codepoint(text, split);
+    }
+}
+
+// The end of the piece starting at `begin` under Inkling's Split pattern (kInklingSplitPattern), alternative by
+// alternative in order (leftmost-first), each with Oniguruma's greedy backtracking.
+std::size_t inkling_word_end(std::string_view text, std::size_t begin) {
+    const uni::CodepointSpan first = codepoint_at(text, begin);
+    const std::size_t after_first  = begin + first.length;
+    const std::int32_t cp          = first.value;
+    // [^\r\n\p{L}\p{N}]? then the letter runs, then the optional contraction (alternatives 1 and 2).
+    const bool prefix = !is_newline(cp) && !uni::is_letter(cp) && !uni::is_number(cp);
+    for (const bool lower_required : {true, false}) {
+        for (const std::size_t start : {prefix ? after_first : std::string_view::npos, begin}) {
+            if (start == std::string_view::npos) { continue; }
+            const std::size_t end = inkling_letters_end(text, start, lower_required);
+            if (end != std::string_view::npos) { return contraction_end(text, end); }
+        }
+    }
+    // \p{N}{1,3}
+    if (uni::is_number(cp)) {
+        std::size_t end = after_first;
+        for (int count = 1; count < 3 && end < text.size(); ++count) {
+            const uni::CodepointSpan value = codepoint_at(text, end);
+            if (!uni::is_number(value.value)) { break; }
+            end += value.length;
+        }
+        return end;
+    }
+    //  ?[^\s\p{L}\p{N}]+[\r\n/]*
+    const auto punctuation = [](std::int32_t value) {
+        return !uni::is_whitespace(value) && !uni::is_letter(value) && !uni::is_number(value);
+    };
+    const bool spaced = cp == ' ' && after_first < text.size() && punctuation(codepoint_at(text, after_first).value);
+    if (spaced || punctuation(cp)) {
+        std::size_t end = spaced ? after_first : begin;
+        while (end < text.size()) {
+            const uni::CodepointSpan value = codepoint_at(text, end);
+            if (!punctuation(value.value)) { break; }
+            end += value.length;
+        }
+        while (end < text.size() && (text[end] == '\r' || text[end] == '\n' || text[end] == '/')) { ++end; }
+        return end;
+    }
+    // \s*[\r\n]+ | \s+(?!\S) | \s+
+    if (uni::is_whitespace(cp)) { return whitespace_end(text, begin); }
+    return after_first; // unreachable: every codepoint starts one of the alternatives
+}
+
+std::size_t word_end(TokenizerPipeline pipeline, std::string_view text, std::size_t begin) {
+    return pipeline == TokenizerPipeline::Qwen ? qwen_word_end(text, begin) : inkling_word_end(text, begin);
 }
 
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
@@ -598,17 +713,38 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
     return ids;
 }
 
-bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
-                               const BpeMergeTable& merge_rules,
-                               const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
-                               BpeScratch& scratch, std::vector<std::size_t>* token_ends = nullptr,
+// The tables one encode call reads.
+struct BpeModel {
+    TokenizerPipeline pipeline;
+    const BpeMergeTable& merge_rules;
+    const std::array<int, 256>& byte_token_ids;
+    const Tokenizer::WordTable& whole_words; // empty unless model.ignore_merges
+};
+
+bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized, const BpeModel& bpe,
+                               std::size_t max_tokens, BpeScratch& scratch,
+                               std::vector<std::size_t>* token_ends = nullptr,
                                std::vector<BpeWordEnd>* word_ends = nullptr) {
     if (normalized.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
+    const BpeMergeTable& merge_rules           = bpe.merge_rules;
+    const std::array<int, 256>& byte_token_ids = bpe.byte_token_ids;
 
     for (std::size_t begin = 0; begin < normalized.size();) {
-        const std::size_t end = qwen_word_end(normalized, begin);
+        const std::size_t end = word_end(bpe.pipeline, normalized, begin);
         const std::string_view word(normalized.data() + begin, end - begin);
+        if (!bpe.whole_words.empty()) {
+            if (const auto whole = bpe.whole_words.find(word); whole != bpe.whole_words.end()) {
+                ids.push_back(whole->second);
+                if (token_ends != nullptr) { token_ends->push_back(end); }
+                if (ids.size() == max_tokens) { return false; }
+                if (word_ends != nullptr) {
+                    word_ends->push_back(BpeWordEnd{.normalized_offset = end, .token_frontier = ids.size()});
+                }
+                begin = end;
+                continue;
+            }
+        }
         auto& nodes = scratch.nodes;
         nodes.clear();
         nodes.reserve(word.size());
@@ -697,9 +833,7 @@ struct IndexedByteBoundary {
 
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
-                          const BpeMergeTable& merge_rules,
-                          const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
-                          BpeScratch& scratch) {
+                          const BpeModel& bpe, std::size_t max_tokens, BpeScratch& scratch) {
     const std::size_t token_base = encoded.input_ids.size();
     if (text.empty()) {
         for (const IndexedByteBoundary boundary : boundaries) {
@@ -709,7 +843,11 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
         return true;
     }
 
-    const std::string normalized = uni::normalize_nfc(text);
+    // Qwen normalizes to NFC; Inkling has no normalizer, so its text is its own normal form.
+    const bool nfc = bpe.pipeline == TokenizerPipeline::Qwen;
+    std::string nfc_text;
+    if (nfc) { nfc_text = uni::normalize_nfc(text); }
+    const std::string_view normalized = nfc ? std::string_view(nfc_text) : text;
     const bool has_internal_boundary =
         std::any_of(boundaries.begin(), boundaries.end(), [&](IndexedByteBoundary boundary) {
             const std::size_t local = boundary.offset - text_offset;
@@ -718,8 +856,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
     std::vector<std::size_t> token_ends;
     std::vector<BpeWordEnd> word_ends;
     if (has_internal_boundary) { token_ends.reserve(normalized.size()); }
-    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, merge_rules, byte_token_ids,
-                                   max_tokens, scratch,
+    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, bpe, max_tokens, scratch,
                                    has_internal_boundary ? &token_ends : nullptr,
                                    has_internal_boundary ? &word_ends : nullptr)) {
         return false;
@@ -734,6 +871,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
         return true;
     }
 
+    const auto normalize = [nfc](std::string_view part) { return nfc ? uni::normalize_nfc(part) : std::string(part); };
     std::vector<std::size_t> normalized_boundaries(boundaries.size());
     std::string independently_normalized;
     independently_normalized.reserve(normalized.size());
@@ -741,14 +879,13 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
     for (std::size_t request = 0; request < boundaries.size(); ++request) {
         const std::size_t raw_end = boundaries[request].offset - text_offset;
         if (raw_end != raw_begin) {
-            independently_normalized +=
-                uni::normalize_nfc(text.substr(raw_begin, raw_end - raw_begin));
+            independently_normalized += normalize(text.substr(raw_begin, raw_end - raw_begin));
             raw_begin = raw_end;
         }
         normalized_boundaries[request] = independently_normalized.size();
     }
     if (raw_begin != text.size()) {
-        independently_normalized += uni::normalize_nfc(text.substr(raw_begin));
+        independently_normalized += normalize(text.substr(raw_begin));
     }
 
     if (independently_normalized != normalized) {
@@ -806,7 +943,8 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json tokenizer_config =
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
     const Json& model = require_object_field(root, "model", tokenizer_label);
-    validate_pipeline(root, model);
+    pipeline_         = resources.pipeline;
+    validate_pipeline(root, model, pipeline_);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
     decoded_token_bytes_         = std::move(vocab_metadata.id_to_token);
@@ -845,6 +983,14 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     bpe_merge_rules_        = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
     byte_token_ids_         = load_byte_token_ids(vocab_token_to_id_);
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
+    if (pipeline_ == TokenizerPipeline::Inkling) { // model.ignore_merges (validate_pipeline)
+        whole_words_.reserve(vocab_token_to_id_.size());
+        for (std::size_t index = 0; index < decoded_token_bytes_.size(); ++index) {
+            if (valid_token_ids_[index] && !added_token_ids[index]) {
+                whole_words_.emplace(decoded_token_bytes_[index], static_cast<int>(index));
+            }
+        }
+    }
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
@@ -883,6 +1029,10 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     if (options.max_tokens == 0) { return encoded; }
 
     BpeScratch scratch;
+    const BpeModel bpe{.pipeline       = pipeline_,
+                       .merge_rules    = bpe_merge_rules_,
+                       .byte_token_ids = byte_token_ids_,
+                       .whole_words    = whole_words_};
     std::size_t boundary_cursor     = 0;
     const auto boundary_end_through = [&](std::size_t offset) {
         std::size_t end = boundary_cursor;
@@ -895,7 +1045,7 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
             append_ordinary_text(encoded, text.substr(begin, end - begin), begin,
                                  std::span<const IndexedByteBoundary>(boundaries)
                                      .subspan(boundary_cursor, request_end - boundary_cursor),
-                                 bpe_merge_rules_, byte_token_ids_, options.max_tokens, scratch);
+                                 bpe, options.max_tokens, scratch);
         boundary_cursor = request_end;
         return complete;
     };
@@ -1026,4 +1176,4 @@ bool Tokenizer::has_exact_token_domain(std::size_t size) const noexcept {
                valid_token_ids_.end();
 }
 
-} // namespace infernix::models::qwen3_5::frontend
+} // namespace infernix::text

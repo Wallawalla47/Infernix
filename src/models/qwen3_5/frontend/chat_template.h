@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 #include "text/jinja.h"
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"

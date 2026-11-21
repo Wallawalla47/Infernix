@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -13,7 +14,17 @@
 #include <unordered_map>
 #include <vector>
 
-namespace infernix::models::qwen3_5::frontend {
+// The byte-level BPE tokenizers of the supported families (Hugging Face tokenizers' `tokenizer.json`): the
+// vocabulary, merges and added tokens are data; the normalizer and the Split pre-tokenizer are one of these fixed
+// pipelines, implemented by hand and checked against the resource's own description.
+namespace infernix::text {
+
+enum class TokenizerPipeline {
+    // Qwen3.5/3.6/3.8: NFC, then Qwen's Split pattern (kQwenSplitPattern).
+    Qwen,
+    // Inkling 2: no normalizer, then the o200k-style Split pattern with case classes (kInklingSplitPattern).
+    Inkling,
+};
 
 struct EncodeOptions {
     bool parse_added_tokens = true;
@@ -44,6 +55,8 @@ struct TokenizerResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;
     std::string_view generation_config_json;
+    // The family's pipeline: an omitted description in tokenizer.json takes it, a present one must equal it.
+    TokenizerPipeline pipeline = TokenizerPipeline::Qwen;
 };
 
 struct BpeMergeRule {
@@ -167,16 +180,27 @@ public:
         return byte_token_ids_[byte];
     }
 
+    // Transparent string hashing, so a pre-tokenized word (a view into the input) is looked up without a copy.
+    struct WordHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view word) const noexcept { return std::hash<std::string_view>{}(word); }
+    };
+    using WordTable = std::unordered_map<std::string, int, WordHash, std::equal_to<>>;
+
 private:
+    TokenizerPipeline pipeline_ = TokenizerPipeline::Qwen;
     std::vector<std::string> decoded_token_bytes_;
     std::vector<bool> valid_token_ids_;
     std::vector<bool> special_token_ids_;
     std::unordered_map<std::string, int> vocab_token_to_id_;
     BpeMergeTable bpe_merge_rules_;
     std::array<int, 256> byte_token_ids_{};
+    // model.ignore_merges: a pre-tokenized word that is itself a vocabulary token (its raw bytes here) is emitted
+    // as that token without merging. Empty when the model merges every word.
+    WordTable whole_words_;
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;
 };
 
-} // namespace infernix::models::qwen3_5::frontend
+} // namespace infernix::text

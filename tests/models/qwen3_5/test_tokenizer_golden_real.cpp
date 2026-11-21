@@ -1,4 +1,4 @@
-// The Qwen tokenizer (frontend/tokenizer.cpp: its hand-written pre-tokenizer split and BPE) against
+// The Qwen tokenizer (text/tokenizer.cpp's Qwen pipeline: its hand-written pre-tokenizer split and BPE) against
 // Hugging Face `tokenizers` on a real tokenizer.json (candidates LE-10). The golden ids come from
 // generate_tokenizer_golden.py (tests/fixtures/qwen3_5/tokenizer_golden.json) over about 2,600
 // adversarial strings: CRLF and tab runs, NBSP and zero-width spaces, combining marks, ZWJ emoji, CJK
@@ -10,7 +10,7 @@
 // The golden belongs to one tokenizer.json (its byte count and SHA-256 are recorded); a directory
 // holding another tokenizer skips, since its ids would not apply.
 
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -24,8 +24,7 @@
 
 namespace {
 
-namespace fi = infernix::models::qwen3_5::frontend;
-using Json   = nlohmann::json;
+using Json = nlohmann::json;
 
 std::string read_file(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
@@ -55,7 +54,7 @@ int main() {
             std::cout << "skip: the tokenizer.json is not the one the golden ids were made with\n";
             return 77;
         }
-        const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
+        const infernix::text::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                        .tokenizer_config_json  = tokenizer_config,
                                        .generation_config_json = generation});
         int failures = 0;
