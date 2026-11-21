@@ -497,6 +497,24 @@ INFERNIX_CANON_HD std::uint8_t e4m3_signed_rn(float x) {
     return static_cast<std::uint8_t>(sign | e4m3_rn_satfinite(f32_from_bits(f32_bits(x) & 0x7FFFFFFFU)));
 }
 
+// The UE8M0 exponent of a group whose largest magnitude is amax (`nan`: the group holds a NaN).
+INFERNIX_CANON_HD std::uint32_t mxfp8_exponent(float amax, bool nan) {
+    const float raw = mul_rn(amax, 1.0F / 448.0F);
+    std::uint32_t e = ((f32_bits(raw) + 0x007FFFFFU) & 0x7F800000U) >> 23;
+    e               = raw <= 0x1p-127F ? 0U : (e < 254U ? e : 254U);
+    return nan ? 255U : e;
+}
+
+// The code of one value of a group of exponent e: zero in a NaN group (e = 255, vLLM's inverse 0).
+INFERNIX_CANON_HD std::uint8_t mxfp8_code(float x, std::uint32_t e) {
+    if (e == 255U) { return 0; }
+    const float scale   = e == 0U ? 0x1p-127F : f32_from_bits(e << 23);
+    const float inverse = e == 0U ? 0x1p127F : div_rn(1.0F, scale);
+    float v             = mul_rn(x, inverse);
+    v                   = v < -448.0F ? -448.0F : (v > 448.0F ? 448.0F : v);
+    return e4m3_signed_rn(v);
+}
+
 INFERNIX_CANON_HD Mxfp8Group mxfp8_group(const float (&x)[32]) {
     Mxfp8Group out{};
     float amax = 0.0F;
@@ -507,20 +525,10 @@ INFERNIX_CANON_HD Mxfp8Group mxfp8_group(const float (&x)[32]) {
         const float a = f32_from_bits(f32_bits(x[j]) & 0x7FFFFFFFU);
         amax         = a > amax ? a : amax;
     }
-    const float raw = mul_rn(amax, 1.0F / 448.0F);
-    std::uint32_t e = ((f32_bits(raw) + 0x007FFFFFU) & 0x7F800000U) >> 23;
-    e               = raw <= 0x1p-127F ? 0U : (e < 254U ? e : 254U);
-    if (nan) { e = 255U; }
-    out.exponent = static_cast<std::uint8_t>(e);
-    if (e == 255U) { return out; } // a NaN group: codes zero (vLLM's inverse 0), its scale word NaN
-    const float scale   = e == 0U ? 0x1p-127F : f32_from_bits(e << 23);
-    const float inverse = e == 0U ? 0x1p127F : div_rn(1.0F, scale);
+    const std::uint32_t e = mxfp8_exponent(amax, nan);
+    out.exponent          = static_cast<std::uint8_t>(e);
     INFERNIX_CANON_UNROLL
-    for (int j = 0; j < 32; ++j) {
-        float v     = mul_rn(x[j], inverse);
-        v           = v < -448.0F ? -448.0F : (v > 448.0F ? 448.0F : v);
-        out.code[j] = e4m3_signed_rn(v);
-    }
+    for (int j = 0; j < 32; ++j) { out.code[j] = mxfp8_code(x[j], e); }
     return out;
 }
 

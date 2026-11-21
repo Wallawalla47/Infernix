@@ -548,15 +548,18 @@ so a rejected draft never overwrites a position a later query needs and rollback
 
 | Part | Shape | INT8 profile | BF16 |
 |---|---|---:|---:|
-| Window K/V, 40 visits | R = 1040 slots × 8 heads × 128 × (K, V) | 84 MiB (INT8-G64) | 162.5 MiB |
-| Conv histories, 48 visits | 4 rings (K 1024, V 1024, attn-out 2304, MLP-out 2304 channels) × 18 slots (3 taps + 15) | 11 MiB | 11 MiB |
-| DSpark context rings, layers 0 and 2 | 2 × 1040 × 8 × 128 × (K, V) | 8.1 MiB (BF16 always) | 8.1 MiB |
+| Window K/V, 40 visits | 17 pages of 64 (R = 1088 positions) × 8 heads × 128 × (K, V) | 88 MiB (INT8-G64) | 170 MiB |
+| Conv histories, 48 visits | 4 rings (K 1024, V 1024, attn-out 2304, MLP-out 2304 channels) × 32 slots (3 taps + up to 29 columns) | 19.5 MiB | 19.5 MiB |
+| DSpark context rings, layers 0 and 2 | 2 × 1088 × 8 × 128 × (K, V) | 8.5 MiB (BF16 always) | 8.5 MiB |
 | DSpark Markov seed `f_rnn`, continuation hidden, the last column's tap features | 4-6 × 2304 | < 0.1 MiB | < 0.1 MiB |
-| **Total per lane** | | **~103 MiB** | **~182 MiB** |
+| **Total per lane** | | **~116 MiB** | **~198 MiB** |
 
-R = 1024 + 16 covers T ≤ 16 (position p lives at slot p mod R). The ring holds the KV profile's rows (INT8-G64, or BF16
-K and FP16 V as the paged `bf16` profile; BF16 V on the lossless route). The size matches the 27B's StateImage
-(186.8 MiB), so the prefix cache's slot and Host-tier policies apply as they are.
+A window ring is whole pages, so a 64-key unit of attention is one contiguous page (position p in page (p / 64) mod 17,
+at row p mod 64); 1088 = 1024 + 64 lets a call append up to 65 positions a lane before a write reaches a key the call's
+first query reads. A conv ring of 32 slots (p at slot p mod 32) holds 3 taps of history plus the call's columns, up to
+29 a lane. Each lane's image is contiguous (the kernels take a lane stride), so a snapshot is one copy. The ring holds
+the KV profile's rows (INT8-G64, or BF16 K and FP16 V as the paged `bf16` profile; BF16 V on the lossless route). The
+size is close to the 27B's StateImage (186.8 MiB), so the prefix cache's slot and Host-tier policies apply as they are.
 
 ### 7.3 Speculative rollback
 
@@ -698,20 +701,22 @@ the attention output; the cached K/V values are an observable boundary (the KV c
   key and value a query sees, from this call or earlier, is the codec's represented value. So a column's result does
   not depend on whether its neighbours arrived in the same call: verify columns equal decode columns bit for bit, as
   speculation invariance needs ([§13.4](#134-draft-length-and-verification)).
-- **Shape (L15).** 512-thread CTAs; K/V streamed in 64-key tiles through a 2-stage cp.async ring (64 KB in BF16, 33 KB in
-  INT8: one CTA per SM); exponentials in parallel across the tile; query rows loaded vectorized; accumulators in
-  registers.
+- **Launches.** A prologue kernel per (column, KV head) (the K/V convs over their rings, clips, v-norm, τ, the append,
+  the final q and r), then the attention kernel per (split, KV head, lane). Built 2026-11-21:
+  `src/ops/inkling2/attention.cu`, qualified by `tests/ops/test_inkling2_attention.cu`.
+- **Shape (L15).** 512-thread CTAs; a unit's K and V pages copied to shared memory by cp.async (one stage; a 2-stage
+  ring for multi-unit full splits is an M5 item); scores a thread per (row group, key) as 4 fold chains, the unit
+  softmax a warp per row, P×V a thread per (row group, 4 dims); accumulators in registers.
 - **Packing.** Per KV head, the 3 query heads × T columns form the rows (3T ≤ 48), so K/V tiles are read once per KV head.
-- **Splits.** A split is an arithmetic unit over fixed absolute 64-key blocks, so a query's units depend only on its own
-  position (sliding: the ≤ 17 blocks its window touches) and length (full: a fixed split count from the Engine's maximum
-  context, TokenSpeed's 32 at 262K, each split's length from the row's own length rounded to 64 keys), never on B or T
-  (L16). Units map to CTAs per (B, T) plan ([§8.4](#84-grids)); the last unit of a (head, column) to finish combines all of
-  them in unit order.
+- **Splits.** Units are fixed absolute 64-key pages, so a query's arithmetic depends only on its own position and lane
+  (sliding: one split per unit of its window, ≤ 17; full: 32 splits of ⌈units / 32⌉ units of the row's own key count,
+  folded in order inside the split), never on B or T (L16). Grids are (18 or 32) × 8 × lanes; the CTA completing a
+  (lane, KV head) counter combines each row's splits in split order and resets the counter.
 - **Route per width.** The reproducible route runs one column-invariant schedule at every T ≤ 16 (each column's score,
   softmax and P×V in a fixed order whatever the other columns). A tensor-core verify route (from ~8 query rows per KV
   head, i.e. T ≥ 3) is a fast path, registered where faster (L16).
-- **Bias.** Each CTA computes its rows' bias for the distances its keys span: `bias[d] = r · P[:, d]`, 16-deep
-  products over ≤ 64 + T distances per tile, P's slice staged beside the tile. Distances ≥ 1024 add nothing.
+- **Bias.** Each score thread computes its (row, key) bias `bf16(r · P[:, d])`, a 16-deep fma fold, reading P through
+  the read-only cache (staging P's slice beside the tile is an M5 item). Distances ≥ 1024 add nothing.
 - **Sink.** The combine adds `exp(sink - m)` to the denominator only.
 
 ### 9.3 Prefill
@@ -818,7 +823,8 @@ and previous pass's h12 and h18, the partial sum). Two forms:
 
 **`short_conv`.** Four kinds share one contract (static width 1024 or 2304, dynamic per-head taps, residual scale 1/√5
 or 1/√9), always fused into a neighbour (K3 prologue, K4 epilogue, K1) with the ring as state. Prefill runs them over
-the chunk with the ring as left history and writes the last 18 positions back.
+the chunk with the ring as left history and writes the ring's positions back (the decode and verify kernels take at
+most 29 columns a lane, so no write of a call reaches a slot its reads need).
 
 ---
 

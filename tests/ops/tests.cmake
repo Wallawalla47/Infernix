@@ -608,5 +608,19 @@ infernix_add_family_op_test(infernix_w4a4_sparse_moe_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_w4a4_sparse_moe.cu"
   LIBRARIES infernix_ops)
 
+# Inkling 2's visit chain (embed, mixers, message gates, short convs, the experts' rows, softcap): bit for bit the
+# pinned arithmetic's host emulation, FP64 stage by stage, exact activation rows, and single-column calls equal to a
+# 22-column call (rings included).
+infernix_add_family_op_test(infernix_inkling2_visit_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_visit.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's decode and verify attention, sliding and full: the prologue bit for bit its host emulation and within
+# FP64 stage criteria, the output within an FP64 criterion over the represented K/V, single-column calls equal to a
+# 22-column call (outputs, K/V, rings), a repeated call equal.
+infernix_add_family_op_test(infernix_inkling2_attention_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_attention.cu"
+  LIBRARIES infernix_ops)
+
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

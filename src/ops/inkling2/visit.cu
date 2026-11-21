@@ -1,0 +1,790 @@
+// Inkling 2's visit-chain kernels of the decode and verify route (include/infernix/ops/inkling2_visit.h). One CTA a
+// column; thread g holds elements 8g .. 8g + 7 of every H-wide row, so an H-vector sum is the pinned order of
+// visit_math.h: a thread's 8 products folded by fma, the warp's 32 by a xor butterfly (the bfly32 tree), the 9 warps
+// folded from +0.0 through shared memory. Each reduction phase has its own shared scratch, so a phase needs one
+// barrier. Immutable weights (queries, norms, conv taps) are read before the PDL wait; everything a producer wrote is
+// read after it with ordinary loads (never the non-coherent path, which may be hoisted above the wait).
+
+#include "infernix/ops/inkling2_visit.h"
+
+#include "core/device.h"
+#include "core/pdl.cuh"
+#include "ops/common/canonical_math.h"
+#include "ops/inkling2/column.cuh"
+#include "ops/inkling2/visit_math.h"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace infernix::ops::inkling2 {
+namespace {
+
+namespace moe = infernix::ops::w4a4_moe;
+
+constexpr int kThreads  = kGroups;
+constexpr unsigned kAll = 0xFFFFFFFFU;
+constexpr int kTopK     = moe::kTopK;
+constexpr int kNvfp4RowBytes = moe::row_bytes(moe::ExpertFormat::Nvfp4FourOverSix, kHidden);
+constexpr int kMxfp8RowBytes = moe::row_bytes(moe::ExpertFormat::Mxfp8, kHidden);
+
+// ---------------------------------------------------------------------------- loads and stores of 8 elements
+
+__device__ __forceinline__ void unpack8(uint4 w, float (&v)[8]) {
+    const std::uint32_t u[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[2 * j]     = canon::f32_from_bits(u[j] << 16);
+        v[2 * j + 1] = canon::f32_from_bits(u[j] & 0xFFFF0000U);
+    }
+}
+
+// Producer-written rows.
+__device__ __forceinline__ void load8(const std::uint16_t* p, float (&v)[8]) {
+    unpack8(*reinterpret_cast<const uint4*>(p), v);
+}
+__device__ __forceinline__ void load8(const float* p, float (&v)[8]) {
+    const float4 a = reinterpret_cast<const float4*>(p)[0];
+    const float4 b = reinterpret_cast<const float4*>(p)[1];
+    v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+}
+
+// Immutable weights.
+__device__ __forceinline__ void weight8(const std::uint16_t* p, float (&v)[8]) {
+    unpack8(__ldg(reinterpret_cast<const uint4*>(p)), v);
+}
+__device__ __forceinline__ void weight8(const float* p, float (&v)[8]) {
+    const float4 a = __ldg(reinterpret_cast<const float4*>(p));
+    const float4 b = __ldg(reinterpret_cast<const float4*>(p) + 1);
+    v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+}
+
+__device__ __forceinline__ void store8(std::uint16_t* p, const float (&v)[8]) {
+    std::uint32_t u[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        u[j] = std::uint32_t{canon::f32_to_bf16_rn(v[2 * j])} | (std::uint32_t{canon::f32_to_bf16_rn(v[2 * j + 1])} << 16);
+    }
+    *reinterpret_cast<uint4*>(p) = make_uint4(u[0], u[1], u[2], u[3]);
+}
+__device__ __forceinline__ void store8(float* p, const float (&v)[8]) {
+    reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
+    reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
+}
+
+__device__ __forceinline__ void zero8(float (&v)[8]) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { v[j] = 0.0F; }
+}
+
+// The BF16 value of each element (round to nearest even).
+__device__ __forceinline__ void round8(float (&v)[8]) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { v[j] = canon::bf16_to_f32(canon::f32_to_bf16_rn(v[j])); }
+}
+
+__device__ __forceinline__ float fold8(const float (&a)[8], const float (&b)[8]) {
+    float acc = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { acc = canon::fma_rn(a[j], b[j], acc); }
+    return acc;
+}
+
+// ---------------------------------------------------------------------------- CTA reductions
+
+// N H-vector sums at once: each thread's partials in v, the totals back in v (every thread holds them).
+template <int N>
+__device__ __forceinline__ void cta_sum(float (&v)[N], float (&scratch)[N][kWarpsH]) {
+    const int lane = static_cast<int>(threadIdx.x & 31U), warp = static_cast<int>(threadIdx.x >> 5);
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+#pragma unroll
+        for (int offset = 16; offset >= 1; offset >>= 1) {
+            v[n] = canon::add_rn(v[n], __shfl_xor_sync(kAll, v[n], offset));
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int n = 0; n < N; ++n) { scratch[n][warp] = v[n]; }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        float total = 0.0F;
+#pragma unroll
+        for (int w = 0; w < kWarpsH; ++w) { total = canon::add_rn(total, scratch[n][w]); }
+        v[n] = total;
+    }
+}
+
+// The largest of the threads' non-negative values (order-free).
+__device__ __forceinline__ float cta_max(float v, float (&scratch)[kWarpsH]) {
+    const int lane = static_cast<int>(threadIdx.x & 31U), warp = static_cast<int>(threadIdx.x >> 5);
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset >>= 1) {
+        const float o = __shfl_xor_sync(kAll, v, offset);
+        v             = o > v ? o : v;
+    }
+    if (lane == 0) { scratch[warp] = v; }
+    __syncthreads();
+    float m = 0.0F;
+#pragma unroll
+    for (int w = 0; w < kWarpsH; ++w) { m = scratch[w] > m ? scratch[w] : m; }
+    return m;
+}
+
+// ---------------------------------------------------------------------------- mixes
+
+// QA queries over group A's sources (at most kMaxSources: the completed blocks and the partial) and QB queries over
+// group B's two (the previous pass's message sources), in two reduction phases for both groups: the sources' sums
+// of squares, then every (query, source) score.
+template <int QA, int QB>
+struct Mix {
+    static constexpr int kSB = QB > 0 ? 2 : 0;
+    static constexpr int kS  = kMaxSources + kSB;
+    static constexpr int kQ  = QA + QB;
+    static constexpr int kD  = QA * kMaxSources + QB * kSB;
+};
+
+// The partial source's fixed slot in group A: after every completed block, so slot order is source order (a slot
+// chosen by the block count would be a dynamic index, which puts the sources in local memory).
+constexpr int kPartial = kMaxSources - 1;
+
+// src: group A's `blocks` completed blocks at 0 .. blocks - 1 and its partial at kPartial (unused slots zero),
+// group B's sources at kMaxSources ..; normalized in place. Slot order is source order.
+template <int QA, int QB>
+__device__ __forceinline__ void mix_columns(float (&src)[Mix<QA, QB>::kS][8], int blocks,
+                                            const float (&q)[Mix<QA, QB>::kQ][8], float (&out)[Mix<QA, QB>::kQ][8],
+                                            float (&s1)[Mix<QA, QB>::kS][kWarpsH],
+                                            float (&s2)[Mix<QA, QB>::kD][kWarpsH]) {
+    using M = Mix<QA, QB>;
+    const auto in_a = [blocks](int s) { return s < blocks || s == kPartial; };
+    float sq[M::kS];
+#pragma unroll
+    for (int s = 0; s < M::kS; ++s) { sq[s] = s >= kMaxSources || in_a(s) ? fold8(src[s], src[s]) : 0.0F; }
+    cta_sum<M::kS>(sq, s1);
+#pragma unroll
+    for (int s = 0; s < M::kS; ++s) {
+        const float r = rms_factor(sq[s], static_cast<float>(kHidden));
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { src[s][j] = canon::mul_rn(src[s][j], r); }
+    }
+    float d[M::kD];
+#pragma unroll
+    for (int qi = 0; qi < QA; ++qi) {
+#pragma unroll
+        for (int s = 0; s < kMaxSources; ++s) { d[qi * kMaxSources + s] = in_a(s) ? fold8(q[qi], src[s]) : 0.0F; }
+    }
+#pragma unroll
+    for (int qi = 0; qi < QB; ++qi) {
+#pragma unroll
+        for (int s = 0; s < M::kSB; ++s) {
+            d[QA * kMaxSources + qi * M::kSB + s] = fold8(q[QA + qi], src[kMaxSources + s]);
+        }
+    }
+    cta_sum<M::kD>(d, s2);
+#pragma unroll
+    for (int qi = 0; qi < M::kQ; ++qi) {
+        const bool a       = qi < QA;
+        const int base     = a ? qi * kMaxSources : QA * kMaxSources + (qi - QA) * M::kSB;
+        const int first    = a ? 0 : kMaxSources;
+        constexpr int kMax = kMaxSources;
+        const auto active  = [&](int s) { return a ? in_a(s) : s < M::kSB; };
+        float p[kMax];
+        float m = canon::mul_rn(d[a ? base + kPartial : base], kMixScale); // an active source's score
+#pragma unroll
+        for (int s = 0; s < kMax; ++s) {
+            p[s] = active(s) ? canon::mul_rn(d[base + s], kMixScale) : 0.0F;
+            if (active(s)) { m = p[s] > m ? p[s] : m; }
+        }
+        float den = 0.0F;
+#pragma unroll
+        for (int s = 0; s < kMax; ++s) {
+            if (active(s)) {
+                p[s] = canon::exp_c(canon::add_rn(p[s], -m));
+                den  = canon::add_rn(den, p[s]);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kMax; ++s) { p[s] = active(s) ? canon::div_rn(p[s], den) : 0.0F; }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float acc = 0.0F;
+#pragma unroll
+            for (int s = 0; s < kMax; ++s) {
+                if (active(s)) { acc = canon::fma_rn(p[s], src[first + s][j], acc); }
+            }
+            out[qi][j] = acc;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------- short-conv history
+
+using detail::Column;
+using detail::column_of;
+using detail::history_source;
+using detail::ring_row;
+using detail::Source;
+
+// The static conv of the thread's 8 channels: taps w[lag][j], values x[lag][j] (lag 0 the current position).
+__device__ __forceinline__ void conv8(const float (&w)[4][8], const float (&x)[4][8], float (&out)[8]) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float wj[4] = {w[0][j], w[1][j], w[2][j], w[3][j]};
+        const float xj[4] = {x[0][j], x[1][j], x[2][j], x[3][j]};
+        out[j]            = conv_static(wj, xj);
+    }
+    round8(out);
+}
+
+// A column's combined expert output: the 8 slots folded in slot order from +0.0, rounded once.
+__device__ __forceinline__ void combine8(const std::uint16_t* experts, int t, int c, float (&v)[8]) {
+    float e[kTopK][8];
+#pragma unroll
+    for (int j = 0; j < kTopK; ++j) { load8(experts + static_cast<std::size_t>(t * kTopK + j) * kHidden + c, e[j]); }
+    zero8(v);
+#pragma unroll
+    for (int j = 0; j < kTopK; ++j) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { v[i] = canon::add_rn(v[i], e[j][i]); }
+    }
+    round8(v);
+}
+
+// The MLP tail of the previous visit for column col: out = bf16(cand + bf16(conv(combined))), the combined output
+// written to the ring.
+__device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& map, const Column& col, int c,
+                                         const float (&w)[4][8], float (&out)[8]) {
+    float x[4][8];
+    combine8(tail.experts, col.t, c, x[0]);
+#pragma unroll
+    for (int k = 1; k < 4; ++k) {
+        switch (history_source(map, col, k)) {
+        case Source::Zero: zero8(x[k]); break;
+        case Source::Call: combine8(tail.experts, col.t - k, c, x[k]); break;
+        case Source::Ring: load8(ring_row(tail.ring, col.lane, col.pos - k) + c, x[k]); break;
+        }
+    }
+    float m[8];
+    conv8(w, x, m);
+    float cand[8];
+    load8(tail.cand + static_cast<std::size_t>(col.t) * kHidden + c, cand);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { out[j] = canon::add_rn(cand[j], m[j]); }
+    round8(out);
+    if (col.lane >= 0) { store8(ring_row(tail.ring, col.lane, col.pos) + c, x[0]); }
+}
+
+// ---------------------------------------------------------------------------- the experts' activation rows
+
+// The column's MLP input (BF16 values, the thread's 8) as the experts' rows: four-over-six NVFP4 (codes, a scale word
+// per 16 elements held by a thread pair, the row amax) or MXFP8 (codes, a UE8M0 word per 32 held by 4 threads).
+__device__ __forceinline__ void quantize_row(const float (&v)[8], const ExpertRows& rows, int t,
+                                             float (&scratch)[kWarpsH]) {
+    const int g = static_cast<int>(threadIdx.x);
+    float a     = 0.0F;
+    bool nan    = false;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float m = canon::f32_from_bits(canon::f32_bits(v[j]) & 0x7FFFFFFFU);
+        a             = m > a ? m : a;
+        nan           = nan || v[j] != v[j];
+    }
+    if (rows.format == moe::ExpertFormat::Nvfp4FourOverSix) {
+        const float amax = cta_max(a, scratch);
+        if (g == 0) { rows.amax[t] = amax; }
+        const canon::FourOverSixRow row = canon::four_over_six_row(amax);
+        float block[16];
+        const bool even = (g & 1) == 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { // selects, not an index chosen at run time (which would be local memory)
+            const float partner = __shfl_xor_sync(kAll, v[j], 1);
+            block[j]            = even ? v[j] : partner;
+            block[j + 8]        = even ? partner : v[j];
+        }
+        const canon::FourOverSixBlock q = canon::four_over_six_block(block, row);
+        std::uint32_t packed            = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const std::uint32_t lo = even ? q.code[2 * i] : q.code[8 + 2 * i];
+            const std::uint32_t hi = even ? q.code[2 * i + 1] : q.code[8 + 2 * i + 1];
+            packed |= (lo | (hi << 4)) << (8 * i);
+        }
+        std::uint8_t* base = rows.rows + static_cast<std::size_t>(t) * kNvfp4RowBytes;
+        *reinterpret_cast<std::uint32_t*>(base + 4 * g) = packed;
+        if (even) { base[kHidden / 2 + g / 2] = q.scale_word; }
+    } else {
+#pragma unroll
+        for (int offset = 1; offset <= 2; offset <<= 1) {
+            const float o = __shfl_xor_sync(kAll, a, offset);
+            a             = o > a ? o : a;
+            nan           = __shfl_xor_sync(kAll, nan ? 1 : 0, offset) != 0 || nan;
+        }
+        const std::uint32_t e = canon::mxfp8_exponent(a, nan);
+        std::uint32_t lo = 0, hi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            lo |= std::uint32_t{canon::mxfp8_code(v[j], e)} << (8 * j);
+            hi |= std::uint32_t{canon::mxfp8_code(v[j + 4], e)} << (8 * j);
+        }
+        std::uint8_t* base = rows.rows + static_cast<std::size_t>(t) * kMxfp8RowBytes;
+        *reinterpret_cast<uint2*>(base + 8 * g) = make_uint2(lo, hi);
+        if ((g & 3) == 0) { base[kHidden + g / 4] = static_cast<std::uint8_t>(e); }
+    }
+}
+
+// ---------------------------------------------------------------------------- kernels
+
+__global__ void __launch_bounds__(kThreads) embed_kernel(const std::int32_t* tokens, const std::uint16_t* embedding,
+                                                         const std::uint16_t* norm, std::uint16_t* out) {
+    __shared__ float s1[1][kWarpsH];
+    const int t = static_cast<int>(blockIdx.x), c = 8 * static_cast<int>(threadIdx.x);
+    float w[8];
+    weight8(norm + c, w);
+    pdl::enter();
+    const std::int32_t token = tokens[t];
+    float x[8];
+    weight8(embedding + static_cast<std::size_t>(token) * kHidden + c, x);
+    float sq[1] = {fold8(x, x)};
+    cta_sum<1>(sq, s1);
+    const float r = rms_factor(sq[0], static_cast<float>(kHidden));
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { x[j] = canon::mul_rn(w[j], canon::mul_rn(x[j], r)); }
+    store8(out + static_cast<std::size_t>(t) * kHidden + c, x);
+}
+
+// visit_entry and final_mix. Layer0: the input unmixed; NQ: the attention mix's queries; Messages: loop passes 2-3.
+template <int NQ, bool Messages, bool Layer0>
+__global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
+    constexpr int QA = NQ, QB = Messages ? 3 : 0;
+    using M          = Mix<QA, QB>;
+    __shared__ float s1[M::kS][kWarpsH];
+    __shared__ float s2[M::kD][kWarpsH];
+    __shared__ float s3[NQ + QB][kWarpsH];
+    const int t = static_cast<int>(blockIdx.x), c = 8 * static_cast<int>(threadIdx.x);
+    const bool tail = a.tail.experts != nullptr;
+
+    float conv[4][8];
+    if (tail) {
+#pragma unroll
+        for (int lag = 0; lag < 4; ++lag) { weight8(a.tail.conv + lag * kHidden + c, conv[lag]); }
+    }
+    float q[M::kQ][8];
+    if constexpr (!Layer0) {
+#pragma unroll
+        for (int i = 0; i < QA; ++i) { weight8(a.queries + i * kHidden + c, q[i]); }
+    }
+    if constexpr (Messages) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) { weight8(a.message_queries + k * kHidden + c, q[QA + k]); }
+    }
+    float nw[NQ][8];
+    if constexpr (!Messages) {
+#pragma unroll
+        for (int i = 0; i < NQ; ++i) { weight8(a.norms[i] + c, nw[i]); }
+    }
+    pdl::enter();
+
+    const Column col = column_of(a.map, t);
+    const std::size_t row = static_cast<std::size_t>(t) * kHidden + c;
+    float h[8];
+    if (tail) {
+        mlp_tail(a.tail, a.map, col, c, conv, h);
+        store8(a.tail_out + row, h);
+    }
+    if (a.input != nullptr) { load8(a.input + row, h); }
+
+    float out[M::kQ][8];
+    if constexpr (Layer0) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { out[0][j] = h[j]; }
+    } else {
+        float src[M::kS][8];
+#pragma unroll
+        for (int s = 0; s < kPartial; ++s) {
+            if (s < a.blocks.count) {
+                load8(a.blocks.rows[s] + row, src[s]);
+            } else {
+                zero8(src[s]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { src[kPartial][j] = h[j]; }
+        if constexpr (Messages) {
+#pragma unroll
+            for (int s = 0; s < 2; ++s) { load8(a.message_sources[s] + row, src[kMaxSources + s]); }
+        }
+        mix_columns<QA, QB>(src, a.blocks.count, q, out, s1, s2);
+    }
+
+    float sq[NQ + QB];
+#pragma unroll
+    for (int i = 0; i < NQ + QB; ++i) { sq[i] = fold8(out[i], out[i]); }
+    cta_sum<NQ + QB>(sq, s3);
+    if constexpr (!Messages) {
+#pragma unroll
+        for (int i = 0; i < NQ; ++i) {
+            const float r = rms_factor(sq[i], static_cast<float>(kHidden));
+            float x[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { x[j] = canon::mul_rn(nw[i][j], canon::mul_rn(out[i][j], r)); }
+            if constexpr (NQ == 1) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    if (a.x[k] != nullptr) { store8(a.x[k] + row, x); }
+                }
+            } else {
+                store8(a.x[i] + row, x);
+            }
+        }
+    } else {
+        const std::size_t plane = static_cast<std::size_t>(gridDim.x) * kHidden;
+#pragma unroll
+        for (int i = 0; i < NQ; ++i) { store8(a.mixed + i * plane + row, out[i]); }
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            store8(a.message + k * plane + row, out[NQ + k]);
+            const int xi  = NQ == 1 ? 0 : k;
+            const float rx = rms_factor(sq[xi], static_cast<float>(kHidden));
+            const float rm = rms_factor(sq[NQ + k], static_cast<float>(kHidden));
+            float gx[8], gm[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                gx[j] = canon::mul_rn(out[xi][j], rx);
+                gm[j] = canon::mul_rn(out[NQ + k][j], rm);
+            }
+            std::uint16_t* gi = a.gate_input + (static_cast<std::size_t>(k) * gridDim.x + t) * (2 * kHidden);
+            store8(gi + c, gx);
+            store8(gi + kHidden + c, gm);
+        }
+    }
+}
+
+template <bool Messages>
+__global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs a) {
+    constexpr int QB = Messages ? 1 : 0;
+    using M          = Mix<1, QB>;
+    __shared__ float s1[M::kS][kWarpsH];
+    __shared__ float s2[M::kD][kWarpsH];
+    __shared__ float s3[1 + QB][kWarpsH];
+    __shared__ float s4[kWarpsH];
+    const int t = static_cast<int>(blockIdx.x), c = 8 * static_cast<int>(threadIdx.x);
+
+    float conv[4][8];
+#pragma unroll
+    for (int lag = 0; lag < 4; ++lag) { weight8(a.conv + lag * kHidden + c, conv[lag]); }
+    float q[M::kQ][8];
+    weight8(a.query + c, q[0]);
+    if constexpr (Messages) { weight8(a.message_query + c, q[1]); }
+    float nw[8];
+    if constexpr (!Messages) { weight8(a.norm + c, nw); }
+    pdl::enter();
+
+    const Column col = column_of(a.map, t);
+    const std::size_t row = static_cast<std::size_t>(t) * kHidden + c;
+    // The post-attention conv of W_o's output (the call holds every column's o, so in-call history is a load).
+    float x[4][8];
+    load8(a.o + row, x[0]);
+#pragma unroll
+    for (int k = 1; k < 4; ++k) {
+        switch (history_source(a.map, col, k)) {
+        case Source::Zero: zero8(x[k]); break;
+        case Source::Call: load8(a.o + row - static_cast<std::size_t>(k) * kHidden, x[k]); break;
+        case Source::Ring: load8(ring_row(a.ring, col.lane, col.pos - k) + c, x[k]); break;
+        }
+    }
+    float attn[8];
+    conv8(conv, x, attn);
+    if (col.lane >= 0) { store8(ring_row(a.ring, col.lane, col.pos) + c, x[0]); }
+
+    float cand[8];
+    if (a.boundary) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { cand[j] = attn[j]; }
+    } else {
+        float h[8];
+        load8(a.h + row, h);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { cand[j] = canon::add_rn(h[j], attn[j]); }
+    }
+    store8(a.cand + row, cand);
+
+    float src[M::kS][8];
+#pragma unroll
+    for (int s = 0; s < kPartial; ++s) {
+        if (s < a.blocks.count) {
+            load8(a.blocks.rows[s] + row, src[s]);
+        } else {
+            zero8(src[s]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { src[kPartial][j] = cand[j]; }
+    if constexpr (Messages) {
+#pragma unroll
+        for (int s = 0; s < 2; ++s) { load8(a.message_sources[s] + row, src[kMaxSources + s]); }
+    }
+    float out[M::kQ][8];
+    mix_columns<1, QB>(src, a.blocks.count, q, out, s1, s2);
+
+    float sq[1 + QB];
+#pragma unroll
+    for (int i = 0; i < 1 + QB; ++i) { sq[i] = fold8(out[i], out[i]); }
+    cta_sum<1 + QB>(sq, s3);
+    if constexpr (!Messages) {
+        const float r = rms_factor(sq[0], static_cast<float>(kHidden));
+        float xm[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { xm[j] = canon::mul_rn(nw[j], canon::mul_rn(out[0][j], r)); }
+        round8(xm);
+        store8(a.x + row, xm);
+        quantize_row(xm, a.rows, t, s4);
+    } else {
+        store8(a.mixed + row, out[0]);
+        store8(a.message + row, out[1]);
+        const float rx = rms_factor(sq[0], static_cast<float>(kHidden));
+        const float rm = rms_factor(sq[1], static_cast<float>(kHidden));
+        float gx[8], gm[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            gx[j] = canon::mul_rn(out[0][j], rx);
+            gm[j] = canon::mul_rn(out[1][j], rm);
+        }
+        std::uint16_t* gi = a.gate_input + static_cast<std::size_t>(t) * (2 * kHidden);
+        store8(gi + c, gx);
+        store8(gi + kHidden + c, gm);
+    }
+}
+
+template <int Kinds>
+__global__ void __launch_bounds__(kThreads) gate_exit_kernel(const GateExitArgs a) {
+    __shared__ float s1[Kinds][kWarpsH];
+    __shared__ float s2[kWarpsH];
+    const int t = static_cast<int>(blockIdx.x), c = 8 * static_cast<int>(threadIdx.x);
+    float nw[Kinds][8];
+#pragma unroll
+    for (int k = 0; k < Kinds; ++k) { weight8(a.norms[k] + c, nw[k]); }
+    pdl::enter();
+
+    const std::size_t plane = static_cast<std::size_t>(gridDim.x) * kHidden;
+    const std::size_t row   = static_cast<std::size_t>(t) * kHidden + c;
+    float x[Kinds][8];
+    float sq[Kinds];
+#pragma unroll
+    for (int k = 0; k < Kinds; ++k) {
+        float xv[8], m[8], f[8], g[8];
+        load8(a.mixed + (a.shared_x ? 0 : k) * plane + row, xv);
+        load8(a.message + k * plane + row, m);
+        const float* fg = a.fg + (static_cast<std::size_t>(k) * gridDim.x + t) * (2 * kHidden);
+        load8(fg + c, f);
+        load8(fg + kHidden + c, g);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { x[k][j] = message_gate(xv[j], m[j], f[j], g[j]); }
+        sq[k] = fold8(x[k], x[k]);
+    }
+    cta_sum<Kinds>(sq, s1);
+#pragma unroll
+    for (int k = 0; k < Kinds; ++k) {
+        const float r = rms_factor(sq[k], static_cast<float>(kHidden));
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { x[k][j] = canon::mul_rn(nw[k][j], canon::mul_rn(x[k][j], r)); }
+        round8(x[k]);
+        store8(a.x[k] + row, x[k]);
+    }
+    if (a.rows.rows != nullptr) { quantize_row(x[0], a.rows, t, s2); }
+}
+
+__global__ void softcap_kernel(float* logits, std::int64_t count, float cap) {
+    pdl::enter();
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
+        logits[i] = canon::softcap_c(logits[i], cap);
+    }
+}
+
+// ---------------------------------------------------------------------------- host side
+
+template <class P>
+bool aligned16(const P* p) {
+    return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
+}
+
+void check_columns(std::int32_t columns, const char* op) {
+    if (columns <= 0 || columns > 65535) { throw std::invalid_argument(std::string(op) + ": columns must be in [1, 65535]"); }
+}
+
+void check_map(const ColumnMap& map, const char* op) {
+    if (map.lane == nullptr || map.position == nullptr || map.first == nullptr) {
+        throw std::invalid_argument(std::string(op) + ": the column map is incomplete");
+    }
+}
+
+void check_ring(const Ring& ring, std::int32_t width, const char* op) {
+    if (ring.base == nullptr || ring.width != width || !aligned16(ring.base) ||
+        ring.lane_stride < std::int64_t{kRingPositions} * width || ring.lane_stride % 8 != 0) {
+        throw std::invalid_argument(std::string(op) + ": a conv ring of width " + std::to_string(width) +
+                                    " and a 16-byte lane stride of at least its positions is needed");
+    }
+}
+
+void check_blocks(const Blocks& blocks, const char* op) {
+    if (blocks.count < 0 || blocks.count > kMaxSources - 1) {
+        throw std::invalid_argument(std::string(op) + ": a mix takes at most 4 completed blocks");
+    }
+    for (int s = 0; s < blocks.count; ++s) {
+        if (blocks.rows[s] == nullptr || !aligned16(blocks.rows[s])) {
+            throw std::invalid_argument(std::string(op) + ": a block source is missing or misaligned");
+        }
+    }
+}
+
+void check_rows(const ExpertRows& rows, const char* op) {
+    if (rows.rows == nullptr || reinterpret_cast<std::uintptr_t>(rows.rows) % 8 != 0 ||
+        (rows.format == moe::ExpertFormat::Nvfp4FourOverSix && rows.amax == nullptr)) {
+        throw std::invalid_argument(std::string(op) + ": the experts' rows (and NVFP4's amax) are needed");
+    }
+}
+
+pdl::LaunchConfig columns_launch(std::int32_t columns, cudaStream_t stream) {
+    return {dim3(static_cast<unsigned>(columns)), dim3(kThreads), 0, stream};
+}
+
+void launch_entry(const EntryArgs& a, cudaStream_t stream) {
+    const bool messages = a.message_queries != nullptr;
+    const auto config   = columns_launch(a.columns, stream);
+    if (a.queries == nullptr) {
+        CUDA_CHECK(pdl::launch_consumer(config, entry_kernel<1, false, true>, a));
+    } else if (a.nq == 1) {
+        CUDA_CHECK(messages ? pdl::launch_consumer(config, entry_kernel<1, true, false>, a)
+                            : pdl::launch_consumer(config, entry_kernel<1, false, false>, a));
+    } else {
+        CUDA_CHECK(messages ? pdl::launch_consumer(config, entry_kernel<3, true, false>, a)
+                            : pdl::launch_consumer(config, entry_kernel<3, false, false>, a));
+    }
+}
+
+} // namespace
+
+void embed(const std::int32_t* tokens, std::int32_t columns, const std::uint16_t* embedding, const std::uint16_t* norm,
+           std::uint16_t* out, cudaStream_t stream) {
+    check_columns(columns, "inkling2 embed");
+    if (tokens == nullptr || embedding == nullptr || norm == nullptr || out == nullptr || !aligned16(embedding) ||
+        !aligned16(out)) {
+        throw std::invalid_argument("inkling2 embed: tokens, a 16-byte aligned table, norm and output are needed");
+    }
+    CUDA_CHECK(pdl::launch_consumer(columns_launch(columns, stream), embed_kernel, tokens, embedding, norm, out));
+}
+
+void visit_entry(const EntryArgs& a, cudaStream_t stream) {
+    constexpr const char* op = "inkling2 visit_entry";
+    check_columns(a.columns, op);
+    check_map(a.map, op);
+    const bool tail = a.tail.experts != nullptr;
+    if (tail) {
+        check_ring(a.tail.ring, kHidden, op);
+        if (a.tail.cand == nullptr || a.tail.conv == nullptr || a.tail_out == nullptr) {
+            throw std::invalid_argument("inkling2 visit_entry: a tail needs its cand, conv taps and output");
+        }
+    }
+    if (a.input == nullptr && !tail) { throw std::invalid_argument("inkling2 visit_entry: the visit needs an input"); }
+    if (a.queries != nullptr) {
+        check_blocks(a.blocks, op);
+        if (a.nq != 1 && a.nq != 3) { throw std::invalid_argument("inkling2 visit_entry: 1 or 3 mix queries"); }
+    } else if (a.message_queries != nullptr) {
+        throw std::invalid_argument("inkling2 visit_entry: layer 0 has no loop messages");
+    }
+    if (a.message_queries != nullptr) {
+        if (a.message_sources[0] == nullptr || a.message_sources[1] == nullptr || a.mixed == nullptr ||
+            a.message == nullptr || a.gate_input == nullptr) {
+            throw std::invalid_argument("inkling2 visit_entry: messages need two sources and three outputs");
+        }
+    } else {
+        const int norms = a.queries == nullptr ? 1 : a.nq;
+        for (int i = 0; i < norms; ++i) {
+            if (a.norms[i] == nullptr) { throw std::invalid_argument("inkling2 visit_entry: a norm is missing"); }
+        }
+        if (norms == 3 && (a.x[0] == nullptr || a.x[1] == nullptr || a.x[2] == nullptr)) {
+            throw std::invalid_argument("inkling2 visit_entry: a full layer writes x_q, x_k and x_v");
+        }
+        if (a.x[0] == nullptr && a.x[1] == nullptr && a.x[2] == nullptr) {
+            throw std::invalid_argument("inkling2 visit_entry: no output");
+        }
+    }
+    launch_entry(a, stream);
+}
+
+void mlp_entry(const MlpEntryArgs& a, cudaStream_t stream) {
+    constexpr const char* op = "inkling2 mlp_entry";
+    check_columns(a.columns, op);
+    check_map(a.map, op);
+    check_ring(a.ring, kHidden, op);
+    check_blocks(a.blocks, op);
+    if (a.o == nullptr || a.conv == nullptr || (!a.boundary && a.h == nullptr) || a.cand == nullptr ||
+        a.query == nullptr) {
+        throw std::invalid_argument("inkling2 mlp_entry: o, the conv taps, h, cand and the query are needed");
+    }
+    const auto config = columns_launch(a.columns, stream);
+    if (a.message_query != nullptr) {
+        if (a.message_sources[0] == nullptr || a.message_sources[1] == nullptr || a.mixed == nullptr ||
+            a.message == nullptr || a.gate_input == nullptr) {
+            throw std::invalid_argument("inkling2 mlp_entry: messages need two sources and three outputs");
+        }
+        CUDA_CHECK(pdl::launch_consumer(config, mlp_entry_kernel<true>, a));
+    } else {
+        if (a.norm == nullptr || a.x == nullptr) { throw std::invalid_argument("inkling2 mlp_entry: norm and x"); }
+        check_rows(a.rows, op);
+        CUDA_CHECK(pdl::launch_consumer(config, mlp_entry_kernel<false>, a));
+    }
+}
+
+void gate_exit(const GateExitArgs& a, cudaStream_t stream) {
+    constexpr const char* op = "inkling2 gate_exit";
+    check_columns(a.columns, op);
+    if (a.kinds != 1 && a.kinds != 3) { throw std::invalid_argument("inkling2 gate_exit: 1 or 3 kinds"); }
+    if (a.mixed == nullptr || a.message == nullptr || a.fg == nullptr) {
+        throw std::invalid_argument("inkling2 gate_exit: mixed, message and the projections are needed");
+    }
+    for (int k = 0; k < a.kinds; ++k) {
+        if (a.norms[k] == nullptr || a.x[k] == nullptr) {
+            throw std::invalid_argument("inkling2 gate_exit: a kind's norm or output is missing");
+        }
+    }
+    if (a.rows.rows != nullptr) {
+        if (a.kinds != 1) { throw std::invalid_argument("inkling2 gate_exit: the experts' rows belong to the mlp kind"); }
+        check_rows(a.rows, op);
+    }
+    const auto config = columns_launch(a.columns, stream);
+    CUDA_CHECK(a.kinds == 3 ? pdl::launch_consumer(config, gate_exit_kernel<3>, a)
+                            : pdl::launch_consumer(config, gate_exit_kernel<1>, a));
+}
+
+void final_mix(const FinalArgs& f, cudaStream_t stream) {
+    EntryArgs a;
+    a.columns  = f.columns;
+    a.map      = f.map;
+    a.tail     = f.tail;
+    a.tail_out = f.tail_out;
+    a.blocks   = f.blocks;
+    a.queries  = f.query;
+    a.nq       = 1;
+    a.norms[0] = f.norm;
+    a.x[0]     = f.out;
+    if (f.tail.experts == nullptr || f.query == nullptr) {
+        throw std::invalid_argument("inkling2 final_mix: the last visit's tail and the output query are needed");
+    }
+    visit_entry(a, stream);
+}
+
+void softcap(float* logits, std::int64_t count, float cap, cudaStream_t stream) {
+    if (logits == nullptr || count <= 0) { throw std::invalid_argument("inkling2 softcap: logits are needed"); }
+    const std::int64_t blocks = std::min<std::int64_t>((count + 255) / 256, 4 * 170);
+    CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(blocks)), dim3(256), 0, stream}, softcap_kernel, logits,
+                                    count, cap));
+}
+
+} // namespace infernix::ops::inkling2
