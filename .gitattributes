@@ -17,3 +17,5 @@
 # Binary fixtures under those paths stay untouched.
 /bench/fixtures/**/*.png binary
 /tools/freq_corpus/fixtures/**/*.i64 binary
+# An ablation sidecar's direction is raw float32: no line-ending conversion, no text diff.
+/examples/ablate/**/*.bin binary

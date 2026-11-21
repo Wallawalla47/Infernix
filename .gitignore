@@ -34,6 +34,8 @@ venv/
 *.infernix
 *.infernix.conversion.json
 /models/
+# ...except the ablation sidecars' direction files shipped as examples (a few KB each, docs/ablate.md)
+!/examples/ablate/**/*.bin
 out/
 
 # Local workspace and transient runtime output
