@@ -13,11 +13,16 @@ constexpr std::int32_t kSkinnyMaxTokens = 8;
 
 constexpr std::int32_t kSkinnySmallNRows    = 256;
 constexpr std::int32_t kSkinnySmallNPreload = 16; // chunks per lane: K <= 4096
+// K <= 4608 (Inkling 2's message-gate downs [64, 4608]): the default instance would give them 4 CTAs. A separate
+// instance, so the shapes above keep theirs.
+constexpr std::int32_t kSkinnySmallNPreloadWide = 18;
 
 template <int Tokens>
 void bf16_skinny_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     if (weight.n <= kSkinnySmallNRows && weight.k <= 8 * 32 * kSkinnySmallNPreload) {
         launch_bf16_skinny_gemv<Tokens, 2, 1, kSkinnySmallNPreload>(x, weight, out, stream);
+    } else if (weight.n <= kSkinnySmallNRows && weight.k <= 8 * 32 * kSkinnySmallNPreloadWide) {
+        launch_bf16_skinny_gemv<Tokens, 2, 1, kSkinnySmallNPreloadWide>(x, weight, out, stream);
     } else {
         launch_bf16_skinny_gemv<Tokens, 8, 2, 0>(x, weight, out, stream);
     }

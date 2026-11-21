@@ -615,6 +615,11 @@ infernix_add_family_op_test(infernix_inkling2_visit_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_visit.cu"
   LIBRARIES infernix_ops)
 
+# Inkling 2's fused projections bit for bit ops::linear's BF16 route on one visit's real shapes, widths 1-40.
+infernix_add_family_op_test(infernix_inkling2_projections_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_projections.cu"
+  LIBRARIES infernix_ops)
+
 # Inkling 2's decode and verify attention, sliding and full: the prologue bit for bit its host emulation and within
 # FP64 stage criteria, the output within an FP64 criterion over the represented K/V, single-column calls equal to a
 # 22-column call (outputs, K/V, rings), a repeated call equal.

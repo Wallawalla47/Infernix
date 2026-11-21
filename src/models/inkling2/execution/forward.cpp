@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "infernix/ops/inkling2_projections.h"
 #include "infernix/ops/inkling2_visit.h"
 #include "infernix/ops/linear.h"
 
@@ -35,6 +36,15 @@ void check_schedule(const TextConfig& c) {
 }
 
 std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
+
+// A BF16 matrix as one segment of a fused projection launch.
+void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, void* out) {
+    if (w.qtype != QType::BF16 || w.layout != QuantLayout::Contiguous || w.qdata == nullptr ||
+        args.count >= ik::kMaxProjectionSegments) {
+        throw std::invalid_argument("inkling2 forward: the fused projections take contiguous BF16 matrices");
+    }
+    args.segments[args.count++] = {static_cast<const std::uint16_t*>(w.qdata), w.n, input, out};
+}
 
 } // namespace
 
@@ -240,12 +250,22 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     ik::visit_entry(e, stream);
     if (messages) {
-        // K1b: each kind's gate projections, then the gating and norms.
+        // K1b: the three kinds' gate projections (one launch for the downs, one for forget and gain), then the gating
+        // and norms.
         const std::size_t rank = c_.loop.message_rank;
+        ik::ProjectionArgs down{}, fg{};
+        down.columns = fg.columns = T;
+        down.k                    = 2 * kH;
+        fg.k                      = static_cast<std::int32_t>(rank);
+        fg.fp32_out               = true;
         for (int k = 0; k < 3; ++k) {
-            project(b_.gate_input + k * TH * 2, op.gates[k].down, b_.z + k * T * rank, false, stream);
-            project(b_.z + k * T * rank, op.gates[k].forget_gain, b_.fg + k * TH * 2, true, stream);
+            down.x[k] = b_.gate_input + k * TH * 2;
+            fg.x[k]   = b_.z + k * T * rank;
+            add_segment(down, op.gates[k].down, k, b_.z + k * T * rank);
+            add_segment(fg, op.gates[k].forget_gain, k, b_.fg + k * TH * 2);
         }
+        ik::projections(down, stream);
+        ik::projections(fg, stream);
         ik::GateExitArgs g;
         g.columns  = T;
         g.kinds    = 3;
@@ -261,18 +281,23 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     const std::uint16_t* xk = three ? b_.x[1] : b_.x[0];
     const std::uint16_t* xv = three ? b_.x[2] : b_.x[0];
 
-    // K2: the projections (interim: BF16 linear calls; the packed multi-input GEMV replaces them).
+    // K2: every projection of the visit's inputs in one launch (the BF16 skinny route's arithmetic).
     const AttentionOperands& a = op.attention;
-    project(xq, a.query, b_.q, false, stream);
-    project(xq, a.relative, b_.r, false, stream);
-    project(xq, a.gate, b_.gate, false, stream);
-    project(xq, a.sink, b_.sink, false, stream);
-    project(xk, a.key, b_.k, false, stream);
-    project(xv, a.value, b_.v, false, stream);
+    ik::ProjectionArgs k2{};
+    k2.columns = T;
+    k2.k       = kH;
+    k2.x[0] = xq, k2.x[1] = xk, k2.x[2] = xv;
+    add_segment(k2, a.query, 0, b_.q);
+    add_segment(k2, a.relative, 0, b_.r);
+    add_segment(k2, a.gate, 0, b_.gate);
+    add_segment(k2, a.sink, 0, b_.sink);
+    add_segment(k2, a.key, 1, b_.k);
+    add_segment(k2, a.value, 2, b_.v);
     if (op.full) {
-        project(xk, a.key_taps, b_.key_taps, false, stream);
-        project(xv, a.value_taps, b_.value_taps, false, stream);
+        add_segment(k2, a.key_taps, 1, b_.key_taps);
+        add_segment(k2, a.value_taps, 2, b_.value_taps);
     }
+    ik::projections(k2, stream);
 
     // K3: attention.
     ik::AttentionArgs at;
@@ -323,8 +348,17 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     ik::mlp_entry(m, stream);
     if (messages) {
-        project(b_.gate_input, op.gates[3].down, b_.z, false, stream);
-        project(b_.z, op.gates[3].forget_gain, b_.fg, true, stream);
+        ik::ProjectionArgs down{}, fg{};
+        down.columns = fg.columns = T;
+        down.k                    = 2 * kH;
+        fg.k                      = static_cast<std::int32_t>(c_.loop.message_rank);
+        fg.fp32_out               = true;
+        down.x[0]                 = b_.gate_input;
+        fg.x[0]                   = b_.z;
+        add_segment(down, op.gates[3].down, 0, b_.z);
+        add_segment(fg, op.gates[3].forget_gain, 0, b_.fg);
+        ik::projections(down, stream);
+        ik::projections(fg, stream);
         ik::GateExitArgs g;
         g.columns  = T;
         g.kinds    = 1;

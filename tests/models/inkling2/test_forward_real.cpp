@@ -37,6 +37,7 @@
 #include "ops/common/canonical_math.h"
 
 #include <cuda_fp16.h>
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
@@ -168,7 +169,7 @@ std::vector<double> f32_values(const float* p, std::size_t n) {
 
 // ---------------------------------------------------------------------------- state
 
-// Lanes' images and the full visits' pools: one 64-position page a lane (lane l's page l), so positions below 64.
+// Lanes' images and the full visits' pools: `pages` 64-position pages a lane (lane l's page b at l * pages + b).
 struct State {
     m::StateView view;
     std::uint16_t* images = nullptr;
@@ -176,17 +177,17 @@ struct State {
     int* table = nullptr;
     std::size_t image_bytes = 0, pool_bytes = 0;
     std::vector<std::vector<std::uint8_t>> saved;
-    explicit State(const m::StateLayout& layout, int lanes = 1) {
+    explicit State(const m::StateLayout& layout, int lanes = 1, int pages = 1) {
         image_bytes = static_cast<std::size_t>(layout.lane_words) * 2 * lanes;
         cuda(cudaMalloc(&images, image_bytes), "state");
-        pool_bytes = std::size_t{ik::kKvHeads} * lanes * ik::kKeyUnit * ik::kHeadDim * 2;
+        pool_bytes = std::size_t{ik::kKvHeads} * lanes * pages * ik::kKeyUnit * ik::kHeadDim * 2;
         for (int s = 0; s < 2 * layout.full_visits; ++s) {
             std::uint16_t* p = nullptr;
             cuda(cudaMalloc(&p, pool_bytes), "pool");
             pools.push_back(p);
         }
-        std::vector<int> rows(lanes);
-        for (int l = 0; l < lanes; ++l) { rows[l] = l; }
+        std::vector<int> rows(static_cast<std::size_t>(lanes) * pages);
+        for (std::size_t i = 0; i < rows.size(); ++i) { rows[i] = static_cast<int>(i); }
         cuda(cudaMalloc(&table, rows.size() * 4), "table");
         cuda(cudaMemcpy(table, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice), "table");
         view.images     = images;
@@ -195,9 +196,9 @@ struct State {
             view.pool_k.push_back(pools[2 * s]);
             view.pool_v.push_back(pools[2 * s + 1]);
         }
-        view.pool_pages   = lanes;
+        view.pool_pages   = static_cast<std::int64_t>(lanes) * pages;
         view.table        = table;
-        view.table_stride = 1;
+        view.table_stride = pages;
         reset();
     }
     void reset() {
@@ -611,6 +612,66 @@ bool graph_replay(const m::Parameters& p, m::Forward& fw, State& state, const Re
     return ok;
 }
 
+// Diagnostic and timing (INFERNIX_INKLING2_PROFILE = width, INFERNIX_INKLING2_CONTEXT = positions, default 16):
+// the context filled by 16-column calls of the reference's ids repeated, then the `width`-column step at that
+// position captured; 200 replays timed by events (after 20 warm-up replays), then 50 between cudaProfilerStart and
+// cudaProfilerStop for `nsys profile --capture-range=cudaProfilerApi --cuda-graph-trace=node`. The replays repeat the
+// same positions (the state they write is the step's own).
+void profile_rounds(const m::Parameters& p, m::Forward& fw, State& state, const Reference& ref, int width,
+                    int context) {
+    const auto& c = p.model.config().text;
+    const std::int32_t* ids = ref.get<std::int32_t>("ids");
+    const auto plan_at = [&](int c0, int n) {
+        m::CallPlan plan;
+        for (int t = 0; t < n; ++t) {
+            plan.tokens.push_back(ids[(c0 + t) % kPositions]);
+            plan.lane.push_back(0);
+            plan.position.push_back(c0 + t);
+        }
+        plan.first = {0};
+        return plan;
+    };
+    cudaStream_t stream = nullptr;
+    cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    state.reset();
+    for (int c0 = 0; c0 < context; c0 += kT) { (void)run_call(p, fw, state, plan_at(c0, std::min(kT, context - c0)), nullptr); }
+    const m::CallPlan plan = plan_at(context, width);
+    state.save();
+    (void)run_call(p, fw, state, plan, nullptr); // warm: every first-call attribute set before the capture
+    state.restore();
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    fw.prepare(plan);
+    cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    fw.embed(stream);
+    for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+    fw.finish(state.view, stream);
+    cuda(cudaStreamEndCapture(stream, &graph), "capture");
+    cuda(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    for (int i = 0; i < 20; ++i) { cuda(cudaGraphLaunch(exec, stream), "warm"); }
+    cudaEvent_t start = nullptr, stop = nullptr;
+    cuda(cudaEventCreate(&start), "event");
+    cuda(cudaEventCreate(&stop), "event");
+    constexpr int kRuns = 200;
+    cuda(cudaEventRecord(start, stream), "event");
+    for (int i = 0; i < kRuns; ++i) { cuda(cudaGraphLaunch(exec, stream), "time"); }
+    cuda(cudaEventRecord(stop, stream), "event");
+    cuda(cudaEventSynchronize(stop), "event");
+    float ms = 0;
+    cuda(cudaEventElapsedTime(&ms, start, stop), "event");
+    std::printf("timing: %d-column step at context %d: %.4f ms a round (%.1f tokens/s)\n", width, context, ms / kRuns,
+                1000.0 * width * kRuns / ms);
+    cuda(cudaProfilerStart(), "profiler");
+    for (int i = 0; i < 50; ++i) { cuda(cudaGraphLaunch(exec, stream), "replay"); }
+    cuda(cudaStreamSynchronize(stream), "replay");
+    cuda(cudaProfilerStop(), "profiler");
+    cuda(cudaEventDestroy(start), "event");
+    cuda(cudaEventDestroy(stop), "event");
+    cuda(cudaGraphExecDestroy(exec), "destroy");
+    cuda(cudaGraphDestroy(graph), "destroy");
+    cuda(cudaStreamDestroy(stream), "stream");
+}
+
 // 5. Three lanes in one call with different token sequences and a padding column, in two calls of mixed widths:
 //    each lane's logits equal its own run alone (as the only lane of a one-lane forward) bit for bit.
 bool lanes_alone(const m::Parameters& p, m::Forward& solo, State& solo_state, const Reference& ref) {
@@ -693,6 +754,14 @@ int main() {
         m::Forward forward(parameters, 1);
         State state(forward.layout());
         const auto& c = model->config().text;
+        if (const char* width = std::getenv("INFERNIX_INKLING2_PROFILE"); width != nullptr) {
+            const char* ctx   = std::getenv("INFERNIX_INKLING2_CONTEXT");
+            const int context = ctx != nullptr ? std::max(1, std::atoi(ctx)) : kT;
+            State big(forward.layout(), 1, (context + 64) / ik::kKeyUnit + 1);
+            profile_rounds(parameters, forward, big, ref, std::max(1, std::atoi(width)), context);
+            std::printf("profiled 50 rounds\n");
+            return 0;
+        }
 
         teacher_forced(parameters, forward, state, ref);
         bool ok = true;
@@ -719,6 +788,21 @@ int main() {
             std::printf("hybrid %s: largest logit difference from the reference %.4f\n", hybrid, worst);
         }
         const auto verify = free_running(parameters, forward, state, ref, kT, std::getenv("INFERNIX_INKLING2_DRIFT") != nullptr);
+        // A bit guard for changes claimed to keep the bits: INFERNIX_INKLING2_LOGITS_OUT writes the free-running
+        // logits ([32][V] FP32); INFERNIX_INKLING2_LOGITS_GUARD requires them byte for byte.
+        if (const char* out = std::getenv("INFERNIX_INKLING2_LOGITS_OUT"); out != nullptr) {
+            std::ofstream f(out, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(verify.data()), static_cast<std::streamsize>(verify.size() * 4));
+            std::printf("wrote the free-running logits to %s\n", out);
+        }
+        if (const char* guard = std::getenv("INFERNIX_INKLING2_LOGITS_GUARD"); guard != nullptr) {
+            std::ifstream f(guard, std::ios::binary);
+            std::vector<float> want(verify.size());
+            f.read(reinterpret_cast<char*>(want.data()), static_cast<std::streamsize>(want.size() * 4));
+            const bool same = f && std::memcmp(want.data(), verify.data(), verify.size() * 4) == 0;
+            std::printf("bit guard (%s): %s\n", guard, same ? "the free-running logits byte for byte" : "DIFFERENT");
+            ok = ok && same;
+        }
         if (hybrid != nullptr && std::string(hybrid) == "perturb") {
             int flips = 0;
             for (int t = 0; t < kPositions; ++t) {

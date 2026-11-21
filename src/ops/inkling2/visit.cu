@@ -561,42 +561,37 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
     }
 }
 
-template <int Kinds>
+// One CTA per (column, kind): a kind's gating and norm need only its own vectors, so the kinds run side by side.
 __global__ void __launch_bounds__(kThreads) gate_exit_kernel(const GateExitArgs a) {
-    __shared__ float s1[Kinds][kWarpsH];
+    __shared__ float s1[1][kWarpsH];
     __shared__ float s2[kWarpsH];
-    const int t = static_cast<int>(blockIdx.x), c = 8 * static_cast<int>(threadIdx.x);
-    float nw[Kinds][8];
-#pragma unroll
-    for (int k = 0; k < Kinds; ++k) { weight8(a.norms[k] + c, nw[k]); }
+    const int t = static_cast<int>(blockIdx.x), k = static_cast<int>(blockIdx.y), c = 8 * static_cast<int>(threadIdx.x);
+    // Selects, not a parameter array indexed at run time (which would copy the parameters to local memory).
+    const std::uint16_t* norm = k == 0 ? a.norms[0] : (k == 1 ? a.norms[1] : a.norms[2]);
+    std::uint16_t* xout       = k == 0 ? a.x[0] : (k == 1 ? a.x[1] : a.x[2]);
+    float nw[8];
+    weight8(norm + c, nw);
     pdl::enter();
 
-    const std::size_t plane = static_cast<std::size_t>(gridDim.x) * kHidden;
+    const int columns       = static_cast<int>(gridDim.x);
+    const std::size_t plane = static_cast<std::size_t>(columns) * kHidden;
     const std::size_t row   = static_cast<std::size_t>(t) * kHidden + c;
-    float x[Kinds][8];
-    float sq[Kinds];
+    float x[8], xv[8], m[8], f[8], g[8];
+    load8(a.mixed + (a.shared_x ? 0 : k) * plane + row, xv);
+    load8(a.message + k * plane + row, m);
+    const float* fg = a.fg + (static_cast<std::size_t>(k) * columns + t) * (2 * kHidden);
+    load8(fg + c, f);
+    load8(fg + kHidden + c, g);
 #pragma unroll
-    for (int k = 0; k < Kinds; ++k) {
-        float xv[8], m[8], f[8], g[8];
-        load8(a.mixed + (a.shared_x ? 0 : k) * plane + row, xv);
-        load8(a.message + k * plane + row, m);
-        const float* fg = a.fg + (static_cast<std::size_t>(k) * gridDim.x + t) * (2 * kHidden);
-        load8(fg + c, f);
-        load8(fg + kHidden + c, g);
+    for (int j = 0; j < 8; ++j) { x[j] = message_gate(xv[j], m[j], f[j], g[j]); }
+    float sq[1] = {fold8(x, x)};
+    cta_sum<1>(sq, s1);
+    const float r = rms_factor(sq[0], static_cast<float>(kHidden));
 #pragma unroll
-        for (int j = 0; j < 8; ++j) { x[k][j] = message_gate(xv[j], m[j], f[j], g[j]); }
-        sq[k] = fold8(x[k], x[k]);
-    }
-    cta_sum<Kinds>(sq, s1);
-#pragma unroll
-    for (int k = 0; k < Kinds; ++k) {
-        const float r = rms_factor(sq[k], static_cast<float>(kHidden));
-#pragma unroll
-        for (int j = 0; j < 8; ++j) { x[k][j] = canon::mul_rn(nw[k][j], canon::mul_rn(x[k][j], r)); }
-        round8(x[k]);
-        store8(a.x[k] + row, x[k]);
-    }
-    if (a.rows.rows != nullptr) { quantize_row(x[0], a.rows, t, s2); }
+    for (int j = 0; j < 8; ++j) { x[j] = canon::mul_rn(nw[j], canon::mul_rn(x[j], r)); }
+    round8(x);
+    store8(xout + row, x);
+    if (a.rows.rows != nullptr) { quantize_row(x, a.rows, t, s2); }
 }
 
 __global__ void softcap_kernel(float* logits, std::int64_t count, float cap) {
@@ -758,9 +753,9 @@ void gate_exit(const GateExitArgs& a, cudaStream_t stream) {
         if (a.kinds != 1) { throw std::invalid_argument("inkling2 gate_exit: the experts' rows belong to the mlp kind"); }
         check_rows(a.rows, op);
     }
-    const auto config = columns_launch(a.columns, stream);
-    CUDA_CHECK(a.kinds == 3 ? pdl::launch_consumer(config, gate_exit_kernel<3>, a)
-                            : pdl::launch_consumer(config, gate_exit_kernel<1>, a));
+    const pdl::LaunchConfig config{dim3(static_cast<unsigned>(a.columns), static_cast<unsigned>(a.kinds)), dim3(kThreads),
+                                   0, stream};
+    CUDA_CHECK(pdl::launch_consumer(config, gate_exit_kernel, a));
 }
 
 void final_mix(const FinalArgs& f, cudaStream_t stream) {
