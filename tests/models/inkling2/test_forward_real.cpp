@@ -672,6 +672,71 @@ void profile_rounds(const m::Parameters& p, m::Forward& fw, State& state, const 
     cuda(cudaStreamDestroy(stream), "stream");
 }
 
+// Diagnostic and timing (INFERNIX_INKLING2_PREFILL_PROFILE = width): one eager prefill call of `width` columns from an
+// empty state (pseudo-random ids, so the routing varies as text does), after a warm-up call, with an event at every
+// Op boundary (Forward::set_marker): each Op kind's time summed over the 48 visits, and the call's rate. The Ops run
+// in stream order, so an Op's time is the gap since the previous boundary (PDL overlap moves a little between them).
+void profile_prefill(const m::Parameters& p, int width) {
+    const auto& c = p.model.config().text;
+    m::Forward fw(p, 1, std::max(width, m::kMaxForwardColumns));
+    State state(fw.layout(), 1, width / ik::kKeyUnit + 2);
+    m::CallPlan plan;
+    std::uint64_t lcg = 12345;
+    for (int t = 0; t < width; ++t) {
+        lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+        plan.tokens.push_back(static_cast<std::int32_t>((lcg >> 33) % 200000));
+        plan.lane.push_back(0);
+        plan.position.push_back(t);
+    }
+    plan.first = {0};
+    cudaStream_t stream = nullptr;
+    cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    const auto call = [&] {
+        fw.prepare(plan);
+        fw.embed(stream);
+        for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+        fw.finish(state.view, fw.final_inputs(), stream, width - 1, 1);
+        cuda(cudaStreamSynchronize(stream), "call");
+    };
+    call(); // warm: first-call attributes and allocations
+    state.reset();
+    std::vector<cudaEvent_t> events;
+    std::vector<std::string> names;
+    const auto record = [&](const char* name) {
+        cudaEvent_t e = nullptr;
+        cuda(cudaEventCreate(&e), "event");
+        cuda(cudaEventRecord(e, stream), "event");
+        events.push_back(e);
+        names.emplace_back(name);
+    };
+    fw.set_marker([&](const char* op) { record(op); });
+    fw.prepare(plan);
+    record("start");
+    fw.embed(stream);
+    for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+    fw.finish(state.view, fw.final_inputs(), stream, width - 1, 1);
+    cuda(cudaStreamSynchronize(stream), "call");
+    fw.set_marker(nullptr);
+    std::map<std::string, std::pair<double, int>> ops;
+    double total = 0;
+    for (std::size_t i = 1; i < events.size(); ++i) {
+        float ms = 0;
+        cuda(cudaEventElapsedTime(&ms, events[i - 1], events[i]), "event");
+        ops[names[i]].first += ms, ++ops[names[i]].second;
+        total += ms;
+    }
+    std::printf("prefill profile: one %d-column call from position 0: %.3f ms (%.1f tokens/s)\n", width, total,
+                1000.0 * width / total);
+    std::vector<std::pair<std::string, std::pair<double, int>>> rows(ops.begin(), ops.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    for (const auto& [name, v] : rows) {
+        std::printf("  %-16s %9.3f ms %5.1f %%  (%d launches' boundaries, %.1f us each)\n", name.c_str(), v.first,
+                    100.0 * v.first / total, v.second, 1000.0 * v.first / v.second);
+    }
+    for (cudaEvent_t e : events) { cuda(cudaEventDestroy(e), "event"); }
+    cuda(cudaStreamDestroy(stream), "stream");
+}
+
 // 5. Three lanes in one call with different token sequences and a padding column, in two calls of mixed widths:
 //    each lane's logits equal its own run alone (as the only lane of a one-lane forward) bit for bit.
 bool lanes_alone(const m::Parameters& p, m::Forward& solo, State& solo_state, const Reference& ref) {
@@ -769,6 +834,10 @@ int main() {
             State big(forward.layout(), 1, (context + 64) / ik::kKeyUnit + 1);
             profile_rounds(parameters, forward, big, ref, std::max(1, std::atoi(width)), context);
             std::printf("profiled 50 rounds\n");
+            return 0;
+        }
+        if (const char* width = std::getenv("INFERNIX_INKLING2_PREFILL_PROFILE"); width != nullptr) {
+            profile_prefill(parameters, std::max(1, std::atoi(width)));
             return 0;
         }
 

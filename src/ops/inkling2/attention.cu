@@ -488,7 +488,8 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         if (row >= rows) { continue; }
         const RowState& r = s.rows[row];
         if (r.start > r.end) { continue; }
-        float* st = a.ws.stats + ((static_cast<std::size_t>(r.t) * kHeads + r.head) * kFullSplits + r.slot0) * kStatWords;
+        float* st = a.ws.stats +
+                    ((static_cast<std::size_t>(r.t - a.stats_base) * kHeads + r.head) * kFullSplits + r.slot0) * kStatWords;
         if (dc == 0) {
             st[0] = r.m;
             st[1] = r.l;
@@ -512,7 +513,8 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         const RowUnits u = row_units(full, pos, first);
         const int n      = u.hi - u.lo + 1;
         const int splits = full ? (n + full_split_units(n) - 1) / full_split_units(n) : n;
-        const float* base = a.ws.stats + (static_cast<std::size_t>(t) * kHeads + head) * kFullSplits * kStatWords;
+        const float* base =
+            a.ws.stats + (static_cast<std::size_t>(t - a.stats_base) * kHeads + head) * kFullSplits * kStatWords;
         const float ms = wl < splits ? __ldcg(base + wl * kStatWords) : neg_inf();
         const float ls = wl < splits ? __ldcg(base + wl * kStatWords + 1) : 0.0F;
         float m        = ms;
@@ -560,11 +562,13 @@ std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
 struct WorkspaceLayout {
     std::size_t q, r, stats, counters, total;
 };
-WorkspaceLayout workspace_layout() {
+WorkspaceLayout workspace_layout(std::int32_t capacity) {
+    if (capacity <= 0) { throw std::invalid_argument("inkling2 attention: a workspace holds at least one column"); }
+    const std::size_t c = static_cast<std::size_t>(capacity);
     WorkspaceLayout l{};
     l.q        = 0;
-    l.r        = align256(l.q + std::size_t{kMaxAttentionColumns} * kHeads * kD * 2);
-    l.stats    = align256(l.r + std::size_t{kMaxAttentionColumns} * kHeads * kRelDim * 2);
+    l.r        = align256(l.q + c * kHeads * kD * 2);
+    l.stats    = align256(l.r + c * kHeads * kRelDim * 2);
     l.counters = align256(l.stats + std::size_t{kMaxAttentionColumns} * kHeads * kFullSplits * kStatWords * 4);
     l.total    = align256(l.counters + std::size_t{kMaxAttentionGroups} * kKvHeads * 4);
     return l;
@@ -572,12 +576,13 @@ WorkspaceLayout workspace_layout() {
 
 } // namespace
 
-std::size_t attention_workspace_bytes() { return workspace_layout().total; }
+std::size_t attention_workspace_bytes(std::int32_t capacity) { return workspace_layout(capacity).total; }
 
-AttentionWorkspace carve_attention_workspace(void* base) {
-    const WorkspaceLayout l = workspace_layout();
+AttentionWorkspace carve_attention_workspace(void* base, std::int32_t capacity) {
+    const WorkspaceLayout l = workspace_layout(capacity);
     auto* b                 = static_cast<unsigned char*>(base);
     AttentionWorkspace w;
+    w.capacity = capacity;
     w.q        = reinterpret_cast<std::uint16_t*>(b + l.q);
     w.r        = reinterpret_cast<std::uint16_t*>(b + l.r);
     w.stats    = reinterpret_cast<float*>(b + l.stats);
@@ -586,9 +591,12 @@ AttentionWorkspace carve_attention_workspace(void* base) {
 }
 
 void attention(const AttentionArgs& a, cudaStream_t stream) {
-    if (a.columns <= 0 || a.columns > kMaxAttentionColumns || a.groups < 0 || a.groups > kMaxAttentionGroups ||
+    if (a.columns <= 0 || a.columns > a.ws.capacity || a.groups < 0 ||
         (a.groups > 0 && (a.max_group_columns <= 0 || a.max_group_columns > kMaxAttentionLaneColumns))) {
-        throw std::invalid_argument("inkling2 attention: 1-128 columns in 0-16 groups of at most 16 columns each");
+        throw std::invalid_argument("inkling2 attention: 1..capacity columns in groups of at most 16 columns each");
+    }
+    if (a.host_groups == nullptr && (a.groups > kMaxAttentionGroups || a.columns > kMaxAttentionColumns)) {
+        throw std::invalid_argument("inkling2 attention: a call wider than one launch passes its groups on the host");
     }
     if (a.map.lane == nullptr || a.map.position == nullptr || a.map.first == nullptr || a.map.columns != a.columns ||
         a.groups_columns == nullptr) {
@@ -633,8 +641,30 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     }();
     (void)attribute;
     const unsigned splits = l.full ? kFullSplits : kSlidingSplits;
-    CUDA_CHECK(pdl::launch_consumer({dim3(splits, kKvHeads, static_cast<unsigned>(a.groups)), dim3(kThreads), bytes, stream},
-                                    attention_kernel, a));
+    const auto launch = [&](std::int32_t g0, std::int32_t count, std::int32_t base) {
+        AttentionArgs b   = a;
+        b.groups_columns  = a.groups_columns + 3 * g0;
+        b.groups          = count;
+        b.stats_base      = base;
+        CUDA_CHECK(pdl::launch_consumer({dim3(splits, kKvHeads, static_cast<unsigned>(count)), dim3(kThreads), bytes, stream},
+                                        attention_kernel, b));
+    };
+    if (a.host_groups == nullptr) {
+        launch(0, a.groups, 0);
+        return;
+    }
+    // Launches of consecutive groups spanning at most kMaxAttentionColumns columns (the statistics' rows) and at most
+    // kMaxAttentionGroups groups (the counters).
+    for (std::int32_t g0 = 0; g0 < a.groups;) {
+        const std::int32_t base = a.host_groups[3 * g0];
+        std::int32_t g1         = g0;
+        while (g1 < a.groups && g1 - g0 < kMaxAttentionGroups &&
+               a.host_groups[3 * g1] + a.host_groups[3 * g1 + 1] - base <= kMaxAttentionColumns) {
+            ++g1;
+        }
+        launch(g0, g1 - g0, base);
+        g0 = g1;
+    }
 }
 
 namespace {

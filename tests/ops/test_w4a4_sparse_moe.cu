@@ -16,7 +16,8 @@
 //     against FP64 h from FP64 gate/up sums (NVFP4: its BF16 h within 2^-6 of max|h|; MXFP8: its quantized h within an
 //     E4M3 half step, 2^-4 |h|, plus 2^-8 max|h|), and each output against FP64 over the kernel's own quantized h
 //     within half a BF16 ulp of the FP64 value plus 2^-16 max|y|;
-//   - column invariance: each column run alone (T = 1) gives the bits it gets among the call's 32 columns;
+//   - column invariance: each column run alone (T = 1) gives the bits it gets among the call's 32 columns, and 8
+//     sampled columns of a 300-column call (a workspace of that capacity: prefill's width) the bits they get in it;
 //   - call state: a call over the same workspace after one whose h amax are 64 times larger gives the same bits.
 
 #include "infernix/ops/w4a4_sparse_moe.h"
@@ -361,7 +362,8 @@ struct Result {
     std::vector<std::uint32_t> h_amax; // NVFP4: [T * K]
 };
 
-Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* workspace) {
+Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* workspace,
+           int capacity = moe::kMaxColumns) {
     std::vector<std::uint8_t> rows;
     std::vector<float> amax;
     for (const auto& x : call.x) {
@@ -376,7 +378,7 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     std::uint16_t* d_out = nullptr;
     const std::size_t entries = std::size_t(call.columns) * K;
     cuda_check(cudaMalloc(&d_out, entries * H * 2), "cudaMalloc");
-    const moe::Workspace ws = moe::carve_workspace(workspace, E, I);
+    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, capacity);
     const moe::Routing routing{d_exp, d_gamma};
     moe::Bank bank;
     bank.records       = db.records;
@@ -509,6 +511,31 @@ void bank_case(bool a8) {
     }
     std::printf("%s: column invariance: %d outputs differ between T = 1 and T = 32\n", name, invariance_differ);
     check(invariance_differ == 0, "a column's outputs depend on the call's other columns");
+
+    // A prefill-width call (300 columns, a workspace of that capacity: experts 0-3 take a job of 300 entries, its last
+    // CTA quantizing every one of their h rows): sampled columns alone give the bits they get in it.
+    {
+        constexpr int kWide = 300;
+        void* wide_ws       = nullptr;
+        cuda_check(cudaMalloc(&wide_ws, moe::workspace_bytes(E, I, kWide)), "cudaMalloc");
+        cuda_check(cudaMemset(wide_ws, 0, moe::workspace_bytes(E, I, kWide)), "cudaMemset");
+        const Call wide   = make_call(kWide, 13, 1.0F);
+        const Result all  = run(b, db, wide, wide_ws, kWide);
+        int wide_differ   = 0;
+        for (const int t : {0, 7, 8, 63, 150, 255, 256, 299}) {
+            Call one;
+            one.columns = 1;
+            one.x       = {wide.x[t]};
+            one.experts.assign(wide.experts.begin() + t * K, wide.experts.begin() + (t + 1) * K);
+            one.gamma.assign(wide.gamma.begin() + t * K, wide.gamma.begin() + (t + 1) * K);
+            const Result alone = run(b, db, one, workspace);
+            for (int i = 0; i < K * H; ++i) { wide_differ += alone.out[i] != all.out[std::size_t(t) * K * H + i] ? 1 : 0; }
+        }
+        std::printf("%s: a 300-column call: %d outputs of 8 sampled columns differ from the columns alone\n", name,
+                    wide_differ);
+        check(wide_differ == 0, "a column's outputs in a 300-column call differ from the column alone");
+        cuda_check(cudaFree(wide_ws), "cudaFree");
+    }
     for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den), workspace}) {
         cuda_check(cudaFree(p), "cudaFree");
     }

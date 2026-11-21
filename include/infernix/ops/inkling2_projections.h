@@ -8,7 +8,8 @@
 // and are independent of the call's other columns and of which matrices share the launch.
 //
 // Weights are immutable and loaded before the PDL wait; inputs are read after it with ordinary loads. Up to 16 columns
-// a pass (a wider call runs passes of 16).
+// a pass: a wider call with BF16 storage and K of 64, 2304, 3072 or 4608 runs its passes in one launch, each lane
+// holding its rows' every chunk in registers; any other wider call runs a launch a pass.
 
 #include <cuda_runtime.h>
 

@@ -519,13 +519,15 @@ per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`):
 their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
 rather than judges and why. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
 `INFERNIX_INKLING2_LOGITS_GUARD` compares them). `infernix_inkling2_projections_test` (GPU) requires the fused
-projections launch to equal `linear()` bit for bit on one visit's real shapes at widths 1-40, BF16 and FP32 out,
-plain and packed (bf16_p12 segments, escapes included). `infernix_qwen4_exp_forward_real_test --pack-bf16` loads
-Flash-Next packed as the Engine does. `infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2
-through the public Engine against an eager one-request Engine prefilling 16 columns a call: the golden prompt's greedy
-continuation, CUDA graphs, four sampled requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's
-logits equal to the forward test's (`INFERNIX_INKLING2_LOGITS_GUARD`) byte for byte; it reports a chat turn and a
-thinking-budget turn without judging them.
+projections launch to equal `linear()` bit for bit on one visit's real shapes (and W_o's) at widths 1-300 (past 16
+columns the wide kernel), BF16 and FP32 out, plain and packed (bf16_p12 segments, escapes included).
+`infernix_qwen4_exp_forward_real_test --pack-bf16` loads Flash-Next packed as the Engine does.
+`infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2 through the public Engine against an eager
+one-request Engine prefilling 16 columns a call: the golden prompt's greedy continuation, CUDA graphs, four sampled
+requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's logits equal to the forward test's
+(`INFERNIX_INKLING2_LOGITS_GUARD`) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
+128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of
+16 byte for byte; it reports a chat turn and a thinking-budget turn without judging them.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

@@ -49,7 +49,6 @@ constexpr int kGuThreads  = 32 * kWarps * kSplit;
 constexpr int kDepth      = 3; // stages of a warp's ring
 constexpr int kPass       = 8; // columns of one MMA (n = 8)
 constexpr int kCtaInter   = 8 * kWarps; // intermediates of a gate/up CTA (its 64 interleaved rows)
-constexpr int kEntries    = kMaxColumns * kTopK;
 
 template <class G, bool A8>
 struct Shape {
@@ -785,11 +784,16 @@ void allow_shared(Kernel kernel, std::size_t bytes) {
 
 // The workspace's planes in order (workspace_bytes and carve_workspace walk the same list).
 template <class Take>
-Workspace layout(std::int32_t experts, std::int32_t intermediate, Take&& take) {
-    const std::size_t e = static_cast<std::size_t>(experts), m = kEntries, i = static_cast<std::size_t>(intermediate);
+Workspace layout(std::int32_t experts, std::int32_t intermediate, std::int32_t capacity, Take&& take) {
+    if (capacity <= 0 || capacity > kMaxCapacity) {
+        throw std::invalid_argument("w4a4_sparse_moe: a workspace holds 1..8191 columns");
+    }
+    const std::size_t e = static_cast<std::size_t>(experts), c = static_cast<std::size_t>(capacity);
+    const std::size_t m = c * kTopK, i = static_cast<std::size_t>(intermediate);
     const std::size_t h_row = std::max<std::size_t>(i / 2 + i / 16, i + i / 32);
     Workspace w;
-    w.logits     = reinterpret_cast<float*>(take(std::size_t{kMaxColumns} * e * 4));
+    w.capacity   = capacity;
+    w.logits     = reinterpret_cast<float*>(take(c * e * 4));
     w.routed     = reinterpret_cast<std::int32_t*>(take(m * 4));
     w.gamma      = reinterpret_cast<float*>(take(m * 4));
     w.route_done = reinterpret_cast<std::uint32_t*>(take(4));
@@ -808,18 +812,18 @@ Workspace layout(std::int32_t experts, std::int32_t intermediate, Take&& take) {
 
 } // namespace
 
-std::size_t workspace_bytes(std::int32_t experts, std::int32_t intermediate) {
+std::size_t workspace_bytes(std::int32_t experts, std::int32_t intermediate, std::int32_t capacity) {
     std::size_t total = 0;
-    (void)layout(experts, intermediate, [&](std::size_t bytes) {
+    (void)layout(experts, intermediate, capacity, [&](std::size_t bytes) {
         total += align256(bytes);
         return static_cast<std::byte*>(nullptr);
     });
     return total;
 }
 
-Workspace carve_workspace(void* base, std::int32_t experts, std::int32_t intermediate) {
+Workspace carve_workspace(void* base, std::int32_t experts, std::int32_t intermediate, std::int32_t capacity) {
     auto* p = static_cast<std::byte*>(base);
-    return layout(experts, intermediate, [&](std::size_t bytes) {
+    return layout(experts, intermediate, capacity, [&](std::size_t bytes) {
         std::byte* out = p;
         p += align256(bytes);
         return out;
@@ -829,8 +833,8 @@ Workspace carve_workspace(void* base, std::int32_t experts, std::int32_t interme
 void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t* router, const float* bias,
                std::int32_t experts, std::int32_t hidden, float route_scale, const Workspace& workspace,
                cudaStream_t stream) {
-    if (hidden != Inkling::kHidden || experts <= 0 || experts > 256 || columns <= 0 || columns > kMaxColumns) {
-        throw std::invalid_argument("w4a4_sparse_moe router: H = 2304, at most 256 experts, 1..kMaxColumns columns");
+    if (hidden != Inkling::kHidden || experts <= 0 || experts > 256 || columns <= 0 || columns > workspace.capacity) {
+        throw std::invalid_argument("w4a4_sparse_moe router: H = 2304, at most 256 experts, 1..capacity columns");
     }
     const dim3 grid((experts + kRouteWarps - 1) / kRouteWarps, (columns + kRouteColumns - 1) / kRouteColumns);
     CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic, {grid, dim3(kRouteThreads), 0, stream}, route_kernel, x,
@@ -840,8 +844,8 @@ void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t
 
 void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t experts, const Workspace& workspace,
                   cudaStream_t stream) {
-    if (columns <= 0 || columns > kMaxColumns || experts <= 0 || experts > 256) {
-        throw std::invalid_argument("w4a4_sparse_moe dispatch: 1..kMaxColumns columns and at most 256 experts");
+    if (columns <= 0 || columns > workspace.capacity || experts <= 0 || experts > 256) {
+        throw std::invalid_argument("w4a4_sparse_moe dispatch: 1..capacity columns and at most 256 experts");
     }
     CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized, {dim3(1), dim3(kDispatchThreads), 0, stream},
                                 dispatch_kernel, routing, columns, experts, workspace));
@@ -854,7 +858,9 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
     if (bank.hidden != G::kHidden || bank.intermediate != G::kInter || bank.experts <= 0 || bank.experts > 256) {
         throw std::invalid_argument("w4a4_sparse_moe: the kernels are built for Inkling 2's [E, 2304, 1152] banks");
     }
-    if (x.columns <= 0 || x.columns > kMaxColumns) { throw std::invalid_argument("w4a4_sparse_moe: 1..kMaxColumns columns"); }
+    if (x.columns <= 0 || x.columns > workspace.capacity) {
+        throw std::invalid_argument("w4a4_sparse_moe: 1..capacity columns");
+    }
     const Args args{x, routing, bank, workspace, outputs};
     // A job per expert with entries: at most min(E, columns * top_k) jobs; CTAs past the job count exit.
     const int jobs = std::min(bank.experts, x.columns * kTopK);

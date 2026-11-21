@@ -73,7 +73,55 @@ void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, 
     args.segments[args.count++] = s;
 }
 
+std::int32_t max_groups(std::int32_t lanes, std::int32_t capacity) {
+    return capacity / ik::kMaxAttentionLaneColumns + lanes;
+}
+
+// The forward's device buffers in order, each through add(pointer, bytes) (the constructor places them; device_bytes
+// counts them).
+template <class Add>
+void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, ForwardBuffers& b,
+                  std::uint8_t*& moe_base, std::uint8_t*& attention_base, Add&& add) {
+    const std::size_t T = static_cast<std::size_t>(capacity);
+    const std::size_t V = c.vocab_size, rank = c.loop.message_rank, lanes = static_cast<std::size_t>(max_lanes);
+    const std::size_t row16         = T * kH * 2;
+    const std::size_t history_words = static_cast<std::size_t>(c.visits()) * history_offset(1, 0);
+    const std::size_t staging_words =
+        static_cast<std::size_t>(ik::kKvHeads) * ik::staging_ring_pages(capacity) * ik::kKeyUnit * kD;
+    add(b.tokens, T * 4), add(b.lane, T * 4), add(b.position, T * 4), add(b.first, ik::kMaxAttentionLanes * 4);
+    add(b.groups, 3 * static_cast<std::size_t>(max_groups(max_lanes, capacity)) * 4);
+    add(b.history, lanes * history_words * 2);
+    add(b.staging_k, lanes * staging_words * 2), add(b.staging_v, lanes * staging_words * 2);
+    add(b.history_rings, static_cast<std::size_t>(c.visits()) * 4 * 3 * 8);
+    add(b.e, row16), add(b.h6, row16), add(b.hp, row16);
+    for (auto*& h : b.h12) { add(h, row16); }
+    for (auto*& h : b.h18) { add(h, row16); }
+    add(b.cand, T * kH * 4);
+    for (auto*& x : b.x) { add(x, row16); }
+    add(b.q, T * kQ * 2), add(b.r, T * kR * 2), add(b.gate, T * kQ * 2), add(b.k, T * kKv * 2);
+    add(b.v, T * kKv * 2), add(b.sink, T * ik::kHeads * 2), add(b.key_taps, T * kTaps * 2);
+    add(b.value_taps, T * kTaps * 2), add(b.attention, T * kQ * 2), add(b.o, row16), add(b.xm, row16);
+    add(b.rows, T * std::max(moe::row_bytes(moe::ExpertFormat::Nvfp4FourOverSix, kH),
+                             moe::row_bytes(moe::ExpertFormat::Mxfp8, kH)));
+    add(b.amax, T * 4), add(b.experts, T * moe::kTopK * kH * 2);
+    add(b.mixed, 3 * T * kH * 4), add(b.message, 3 * T * kH * 4), add(b.fg, 3 * T * 2 * kH * 4);
+    add(b.gate_input, 3 * T * 2 * kH * 2), add(b.z, 3 * T * rank * 2);
+    add(b.final_hidden, row16), add(b.logits, std::size_t{kMaxForwardColumns} * V * 4);
+    add(moe_base, moe::workspace_bytes(static_cast<std::int32_t>(c.experts), static_cast<std::int32_t>(c.intermediate),
+                                       capacity));
+    add(attention_base, ik::attention_workspace_bytes(capacity));
+}
+
 } // namespace
+
+std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity) {
+    ForwardBuffers b;
+    std::uint8_t *moe_base = nullptr, *attention_base = nullptr;
+    std::size_t at = 0;
+    walk_buffers(config, max_lanes, capacity, b, moe_base, attention_base,
+                 [&](auto*&, std::size_t bytes) { at = align(at + bytes); });
+    return at;
+}
 
 StateLayout state_layout(const TextConfig& c) {
     check_schedule(c);
@@ -97,57 +145,32 @@ StateLayout state_layout(const TextConfig& c) {
     return out;
 }
 
-Forward::Forward(const Parameters& parameters, std::int32_t max_lanes)
-    : p_(parameters), c_(parameters.model.config().text), layout_(state_layout(c_)), max_lanes_(max_lanes) {
+Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity)
+    : p_(parameters), c_(parameters.model.config().text), layout_(state_layout(c_)), max_lanes_(max_lanes),
+      capacity_(capacity), max_groups_(max_groups(max_lanes, capacity)),
+      staging_pages_(ik::staging_ring_pages(capacity)) {
     if (max_lanes <= 0 || max_lanes > ik::kMaxAttentionLanes) {
         throw std::invalid_argument("inkling2 forward: 1-8 lanes");
     }
-    constexpr std::size_t T = kMaxForwardColumns;
-    const std::size_t V = c_.vocab_size, rank = c_.loop.message_rank;
-    std::size_t at = 0;
-    const auto take = [&at](std::size_t bytes) {
-        const std::size_t here = at;
-        at                     = align(at + bytes);
-        return here;
-    };
-    std::vector<std::pair<void**, std::size_t>> slots;
-    const auto add = [&](auto*& pointer, std::size_t bytes) {
-        slots.emplace_back(reinterpret_cast<void**>(&pointer), take(bytes));
-    };
-    const std::size_t row16 = T * kH * 2;
-    add(b_.tokens, T * 4), add(b_.lane, T * 4), add(b_.position, T * 4), add(b_.first, ik::kMaxAttentionLanes * 4);
-    add(b_.groups, 3 * ik::kMaxAttentionGroups * 4);
+    if (capacity < kMaxForwardColumns || capacity > moe::kMaxCapacity) {
+        throw std::invalid_argument("inkling2 forward: a call capacity of 128-8191 columns");
+    }
     history_words_ = static_cast<std::int64_t>(c_.visits()) * history_offset(1, 0);
-    const std::size_t lanes = static_cast<std::size_t>(max_lanes);
-    const std::size_t staging_words = static_cast<std::size_t>(ik::kKvHeads) * ik::kStagingRingPages * ik::kKeyUnit * kD;
-    add(b_.history, lanes * static_cast<std::size_t>(history_words_) * 2);
-    add(b_.staging_k, lanes * staging_words * 2), add(b_.staging_v, lanes * staging_words * 2);
-    add(b_.history_rings, static_cast<std::size_t>(c_.visits()) * 4 * 3 * 8);
-    add(b_.e, row16), add(b_.h6, row16), add(b_.hp, row16);
-    for (auto*& h : b_.h12) { add(h, row16); }
-    for (auto*& h : b_.h18) { add(h, row16); }
-    add(b_.cand, T * kH * 4);
-    for (auto*& x : b_.x) { add(x, row16); }
-    add(b_.q, T * kQ * 2), add(b_.r, T * kR * 2), add(b_.gate, T * kQ * 2), add(b_.k, T * kKv * 2);
-    add(b_.v, T * kKv * 2), add(b_.sink, T * ik::kHeads * 2), add(b_.key_taps, T * kTaps * 2);
-    add(b_.value_taps, T * kTaps * 2), add(b_.attention, T * kQ * 2), add(b_.o, row16), add(b_.xm, row16);
-    add(b_.rows, T * std::max(moe::row_bytes(moe::ExpertFormat::Nvfp4FourOverSix, kH),
-                              moe::row_bytes(moe::ExpertFormat::Mxfp8, kH)));
-    add(b_.amax, T * 4), add(b_.experts, T * moe::kTopK * kH * 2);
-    add(b_.mixed, 3 * T * kH * 4), add(b_.message, 3 * T * kH * 4), add(b_.fg, 3 * T * 2 * kH * 4);
-    add(b_.gate_input, 3 * T * 2 * kH * 2), add(b_.z, 3 * T * rank * 2);
-    add(b_.final_hidden, row16), add(b_.logits, T * V * 4);
-    std::uint8_t* moe_base = nullptr;
+    std::size_t at = 0;
+    std::vector<std::pair<void**, std::size_t>> slots;
+    std::uint8_t* moe_base       = nullptr;
     std::uint8_t* attention_base = nullptr;
-    add(moe_base, moe::workspace_bytes(static_cast<std::int32_t>(c_.experts), static_cast<std::int32_t>(c_.intermediate)));
-    add(attention_base, ik::attention_workspace_bytes());
+    walk_buffers(c_, max_lanes, capacity, b_, moe_base, attention_base, [&](auto*& pointer, std::size_t bytes) {
+        slots.emplace_back(reinterpret_cast<void**>(&pointer), at);
+        at = align(at + bytes);
+    });
     memory_ = DeviceBuffer(at);
     memory_.fill(0); // the Ops' counters and the dispatch state start at zero once
     auto* base = static_cast<std::uint8_t*>(memory_.p);
     for (auto& [pointer, offset] : slots) { *pointer = base + offset; }
     b_.moe          = moe::carve_workspace(moe_base, static_cast<std::int32_t>(c_.experts),
-                                           static_cast<std::int32_t>(c_.intermediate));
-    b_.attention_ws = ik::carve_attention_workspace(attention_base);
+                                           static_cast<std::int32_t>(c_.intermediate), capacity);
+    b_.attention_ws = ik::carve_attention_workspace(attention_base, capacity);
     // conv_history's descriptors: every visit's four rings.
     std::vector<std::int64_t> rings;
     for (std::uint32_t v = 0; v < c_.visits(); ++v) {
@@ -160,9 +183,9 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes)
 
 std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
     const std::int32_t T = call.columns(), B = call.lanes();
-    if (T <= 0 || T > kMaxForwardColumns || B <= 0 || B > max_lanes_ || call.lane.size() != call.tokens.size() ||
+    if (T <= 0 || T > capacity_ || B <= 0 || B > max_lanes_ || call.lane.size() != call.tokens.size() ||
         call.position.size() != call.tokens.size()) {
-        throw std::invalid_argument("inkling2 forward: a call of 1-128 columns over the forward's lanes");
+        throw std::invalid_argument("inkling2 forward: a call of 1..capacity columns over the forward's lanes");
     }
     std::vector<CallLane> lanes;
     std::vector<std::int32_t> starts(static_cast<std::size_t>(B), -1);
@@ -198,6 +221,7 @@ std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
     wide_conv_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kMaxLaneColumns; });
     wide_window_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kKeyUnit; });
     call_lanes_  = std::move(lanes);
+    host_groups_ = groups;
     return groups;
 }
 
@@ -238,12 +262,12 @@ void Forward::snapshot_history(const StateView& s, cudaStream_t stream) const {
 }
 
 namespace {
-ik::KvView staging_view(const ForwardBuffers& b) {
+ik::KvView staging_view(const ForwardBuffers& b, std::int32_t pages) {
     ik::KvView v;
     v.k           = b.staging_k;
     v.v           = b.staging_v;
-    v.ring_pages  = ik::kStagingRingPages;
-    v.lane_stride = std::int64_t{ik::kKvHeads} * ik::kStagingRingPages * ik::kKeyUnit * kD;
+    v.ring_pages  = pages;
+    v.lane_stride = std::int64_t{ik::kKvHeads} * pages * ik::kKeyUnit * kD;
     return v;
 }
 } // namespace
@@ -253,17 +277,17 @@ void Forward::stage_window(const StateView& s, const VisitState& vs, bool in, cu
     state.k           = s.images + vs.window_k;
     state.v           = s.images + vs.window_v;
     state.lane_stride = s.lane_words;
-    const ik::KvView staging = staging_view(b_);
+    const ik::KvView staging = staging_view(b_, staging_pages_);
     for (const CallLane& l : call_lanes_) {
         ik::WindowCopyArgs w;
         w.src_lane = w.dst_lane = l.lane;
         if (in) { // the window before the call's first column
             w.src = state, w.dst = staging;
             w.from = std::max(l.first, l.position - (ik::kWindow - 1)), w.to = l.position;
-        } else { // the state ring's positions after the call
+        } else { // the call's own positions the state ring keeps (the window before them came from it unchanged)
             const std::int32_t end = l.position + l.count;
             w.src = staging, w.dst = state;
-            w.from = std::max(l.first, end - ik::kWindowRingPages * ik::kKeyUnit), w.to = end;
+            w.from = std::max(l.position, end - ik::kWindowRingPages * ik::kKeyUnit), w.to = end;
         }
         ik::window_copy(w, stream);
     }
@@ -271,6 +295,7 @@ void Forward::stage_window(const StateView& s, const VisitState& vs, bool in, cu
 
 void Forward::embed(cudaStream_t stream) {
     ik::embed(b_.tokens, columns_, p_.embedding, p_.embedding_norm, b_.e, stream);
+    mark("embed");
 }
 
 void Forward::project(const std::uint16_t* x, const Weight& w, void* out, bool fp32, cudaStream_t stream,
@@ -345,7 +370,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     const std::size_t TH      = static_cast<std::size_t>(T) * kH;
     const ik::ColumnMap map = column_map();
     const std::uint16_t* h  = in.input;
-    if (v == 0 && wide_conv_) { snapshot_history(s, stream); } // before the call's first ring write
+    if (v == 0 && wide_conv_) { // before the call's first ring write
+        snapshot_history(s, stream);
+        mark("conv_history");
+    }
 
     // K1 (K1a): the previous visit's tail, the attention mix, the norms or the messages.
     ik::EntryArgs e;
@@ -378,6 +406,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         if (op.full) { e.x[1] = b_.x[1], e.x[2] = b_.x[2]; }
     }
     ik::visit_entry(e, stream);
+    mark("visit_entry");
     if (messages) {
         // K1b: the three kinds' gate projections (one launch for the downs, one for forget and gain), then the gating
         // and norms.
@@ -404,6 +433,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         g.fg       = b_.fg;
         for (int k = 0; k < 3; ++k) { g.norms[k] = op.norms[k], g.x[k] = b_.x[k]; }
         ik::gate_exit(g, stream);
+        mark("message_gates");
     }
     const bool three   = op.full || messages;
     const std::uint16_t* xq = b_.x[0];
@@ -427,6 +457,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         add_segment(k2, a.value_taps, 2, b_.value_taps);
     }
     ik::projections(k2, stream);
+    mark("k2_projections");
 
     // K3: attention.
     ik::AttentionArgs at;
@@ -435,6 +466,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     at.max_group_columns = max_group_columns_;
     at.map               = map;
     at.groups_columns    = b_.groups;
+    at.host_groups       = host_groups_.data();
     at.in               = {b_.q, b_.r, b_.k, b_.v, b_.sink, b_.gate, op.full ? b_.key_taps : nullptr,
                            op.full ? b_.value_taps : nullptr};
     at.layer            = a.layer;
@@ -451,7 +483,8 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         // A lane appending more than a page: its window runs over the staging ring, filled from the state's ring and
         // returned to it after.
         stage_window(s, vs, true, stream);
-        at.kv = staging_view(b_);
+        mark("window_copy");
+        at.kv = staging_view(b_, staging_pages_);
     } else {
         at.kv.k           = s.images + vs.window_k;
         at.kv.v           = s.images + vs.window_v;
@@ -460,10 +493,25 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     at.ws  = b_.attention_ws;
     at.out = b_.attention;
     ik::attention(at, stream);
-    if (staged) { stage_window(s, vs, false, stream); }
+    mark("attention");
+    if (staged) {
+        stage_window(s, vs, false, stream);
+        mark("window_copy");
+    }
 
-    // K4: W_o; K5 (K5a): its post-attention conv and residual, the MLP mix, norm and the experts' rows.
-    project(b_.attention, a.output, b_.o, false, stream);
+    // K4: W_o (a wide call: one launch of the fused projections, the skinny route's bits); K5 (K5a): its post-attention
+    // conv and residual, the MLP mix, norm and the experts' rows.
+    if (T > ik::kMaxAttentionLaneColumns) {
+        ik::ProjectionArgs wo{};
+        wo.columns = T;
+        wo.k       = kQ;
+        wo.x[0]    = b_.attention;
+        add_segment(wo, a.output, 0, b_.o);
+        ik::projections(wo, stream);
+    } else {
+        project(b_.attention, a.output, b_.o, false, stream);
+    }
+    mark("w_o");
     const ik::ExpertRows rows{op.format, b_.rows, b_.amax};
     ik::MlpEntryArgs m;
     m.columns  = T;
@@ -489,6 +537,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         m.rows = rows;
     }
     ik::mlp_entry(m, stream);
+    mark("mlp_entry");
     if (messages) {
         ik::ProjectionArgs down{}, fg{};
         down.columns = fg.columns = T;
@@ -511,11 +560,14 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         g.x[0]     = b_.xm;
         g.rows     = rows;
         ik::gate_exit(g, stream);
+        mark("message_gates");
     }
 
     // K6-K8: route and the experts (their outputs combine in the next visit's entry).
     moe::moe_route(b_.xm, T, op.router, op.router_bias, op.bank.experts, kH, c_.route_scale, b_.moe, stream);
+    mark("router");
     moe::moe_experts({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
+    mark("experts");
 }
 
 void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t stream, std::int32_t head_first,
@@ -532,17 +584,22 @@ void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t str
     f.norm     = p_.final_norm;
     f.out      = b_.final_hidden;
     ik::final_mix(f, stream);
-    // The head over the requested columns only (a prefill chunk needs none, or its last): their logits rows.
-    const std::int32_t count = head_columns < 0 ? columns_ - head_first : head_columns;
-    if (head_first < 0 || count < 0 || head_first + count > columns_) {
-        throw std::invalid_argument("inkling2 forward: the head's columns are outside the call");
+    mark("final_mix");
+    // The head over the requested columns only (a prefill chunk needs none, or its last).
+    head(head_first, head_columns < 0 ? columns_ - head_first : head_columns, stream);
+}
+
+void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) {
+    if (first < 0 || count < 0 || first + count > columns_ || count > kMaxForwardColumns) {
+        throw std::invalid_argument("inkling2 forward: the head takes at most 128 of the call's columns at a time");
     }
     if (count == 0) { return; }
-    // The rows go to the buffer's start (row r holds column head_first + r): a logits row is 8 bytes off 16-byte
-    // alignment, so an odd column's own row could not take the head's output.
-    const std::uint16_t* x = b_.final_hidden + static_cast<std::size_t>(head_first) * kH;
+    // The rows go to the buffer's start (row r holds column first + r): a logits row is 8 bytes off 16-byte alignment,
+    // so an odd column's own row could not take the head's output.
+    const std::uint16_t* x = b_.final_hidden + static_cast<std::size_t>(first) * kH;
     project(x, p_.head, b_.logits, true, stream, 0, count);
     ik::softcap(b_.logits, static_cast<std::int64_t>(count) * c_.vocab_size, c_.final_logit_softcap, stream);
+    mark("head");
 }
 
 } // namespace infernix::models::inkling2

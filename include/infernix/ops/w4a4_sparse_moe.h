@@ -26,7 +26,9 @@
 namespace infernix::ops::w4a4_moe {
 
 inline constexpr std::int32_t kTopK       = 8;
-inline constexpr std::int32_t kMaxColumns = 128; // per call: B lanes x T columns of decode and verify
+inline constexpr std::int32_t kMaxColumns = 128; // decode and verify: B lanes x T columns (a workspace may hold
+                                                 // more: its capacity)
+inline constexpr std::int32_t kMaxCapacity = 8191; // the dispatch's 16-bit entry counts: 8191 * 8 entries
 
 enum class ExpertFormat : std::uint8_t { Nvfp4FourOverSix, Mxfp8 };
 
@@ -66,24 +68,25 @@ struct Routing {
     const float* gamma          = nullptr;
 };
 
-// Device scratch of one call, carved by carve_workspace (sized for kMaxColumns columns and E experts): the router's
+// Device scratch of one call, carved by carve_workspace (sized for `capacity` columns and E experts): the router's
 // logits and routing, the dispatch (entries grouped by expert, jobs in ascending expert id), h rows, their quantized
 // form and amax, and the jobs' completion counts. The dispatch rebuilds every word a call reads and the router's last
 // CTA resets its counter, so a captured call replays correctly; the memory must be zeroed once before its first use.
 struct Workspace {
-    float* logits             = nullptr; // [kMaxColumns][E] the router's logits
-    std::int32_t* routed      = nullptr; // [kMaxColumns * kTopK] the router's experts (moe_route's Routing)
-    float* gamma              = nullptr; // [kMaxColumns * kTopK] their weights
+    std::int32_t capacity     = 0;       // the columns a call may have
+    float* logits             = nullptr; // [capacity][E] the router's logits
+    std::int32_t* routed      = nullptr; // [capacity * kTopK] the router's experts (moe_route's Routing)
+    float* gamma              = nullptr; // [capacity * kTopK] their weights
     std::uint32_t* route_done = nullptr; // [1] router CTAs done (its last CTA resets it)
     std::int32_t* counts      = nullptr; // [E]
     std::int32_t* offsets     = nullptr; // [E + 1]
-    std::int32_t* entries     = nullptr; // [kMaxColumns * kTopK]: t * kTopK + j, grouped by expert
+    std::int32_t* entries     = nullptr; // [capacity * kTopK]: t * kTopK + j, grouped by expert
     std::int32_t* jobs        = nullptr; // [E]: experts with entries, ascending
     std::int32_t* job_count   = nullptr; // [1]
     std::uint32_t* job_done   = nullptr; // [E]: per job, gate/up CTAs done (+1 once its h is quantized)
-    std::uint16_t* h          = nullptr; // [kMaxColumns * kTopK][I] BF16
-    std::uint32_t* h_amax     = nullptr; // [kMaxColumns * kTopK]: binary32 bits of max |h| (NVFP4)
-    std::uint8_t* h_rows      = nullptr; // [kMaxColumns * kTopK][row_bytes(I)]
+    std::uint16_t* h          = nullptr; // [capacity * kTopK][I] BF16
+    std::uint32_t* h_amax     = nullptr; // [capacity * kTopK]: binary32 bits of max |h| (NVFP4)
+    std::uint8_t* h_rows      = nullptr; // [capacity * kTopK][row_bytes(I)]
     // [1]: kErrorDownStalled once a down CTA's wait for its job made no progress for 2 s (zero: no error).
     std::uint32_t* error      = nullptr;
 };
@@ -103,8 +106,11 @@ void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t
     return Routing{workspace.routed, workspace.gamma};
 }
 
-[[nodiscard]] std::size_t workspace_bytes(std::int32_t experts, std::int32_t intermediate);
-[[nodiscard]] Workspace carve_workspace(void* base, std::int32_t experts, std::int32_t intermediate);
+// A workspace for calls of up to `capacity` columns (1..kMaxCapacity).
+[[nodiscard]] std::size_t workspace_bytes(std::int32_t experts, std::int32_t intermediate,
+                                         std::int32_t capacity = kMaxColumns);
+[[nodiscard]] Workspace carve_workspace(void* base, std::int32_t experts, std::int32_t intermediate,
+                                        std::int32_t capacity = kMaxColumns);
 
 // Groups the call's (column, slot) entries by expert and clears the per-entry and per-job state the expert passes
 // accumulate into (h_amax, job_done), so the call depends on nothing a previous call left.

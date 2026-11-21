@@ -122,9 +122,11 @@ int main(int argc, char** argv) {
     check(cudaMalloc(&d_bias, E * 4), "cudaMalloc");
     check(cudaMemcpy(d_bias, bias.data(), E * 4, cudaMemcpyHostToDevice), "upload");
     void* workspace = nullptr;
-    check(cudaMalloc(&workspace, moe::workspace_bytes(E, I)), "cudaMalloc");
-    check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I)), "cudaMemset");
-    const moe::Workspace ws = moe::carve_workspace(workspace, E, I);
+    // A workspace for the widest call of the sweep (prefill widths past the decode calls' 128).
+    const int capacity = std::max(moe::kMaxColumns, *std::max_element(tokens.begin(), tokens.end()));
+    check(cudaMalloc(&workspace, moe::workspace_bytes(E, I, capacity)), "cudaMalloc");
+    check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I, capacity)), "cudaMemset");
+    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, capacity);
     void* flush = nullptr;
     const std::size_t flush_bytes = std::size_t(256) << 20;
     check(cudaMalloc(&flush, flush_bytes), "cudaMalloc");

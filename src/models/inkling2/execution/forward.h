@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace infernix::models::inkling2 {
@@ -64,7 +65,7 @@ struct ForwardBuffers {
     std::int32_t *tokens = nullptr, *lane = nullptr, *position = nullptr, *first = nullptr;
     std::int32_t* groups = nullptr; // [kMaxAttentionGroups][3]: attention's column groups
     // A wide call's state copies: each lane's conv ring histories ([lanes][history_words], the image's 192 rings at
-    // kHistorySlots rows each) and its sliding visits' staging ring ([lanes][kKvHeads][kStagingRingPages][64][128] K
+    // kHistorySlots rows each) and its sliding visits' staging ring ([lanes][kKvHeads][staging pages][64][128] K
     // and V), with the {ring, history, width} descriptors conv_history reads.
     std::uint16_t* history = nullptr;
     std::uint16_t *staging_k = nullptr, *staging_v = nullptr;
@@ -104,14 +105,21 @@ struct FinalInputs {
 
 class Forward {
 public:
-    Forward(const Parameters& parameters, std::int32_t max_lanes);
+    // A forward of `max_lanes` lanes and calls of up to `capacity` columns (prefill's chunk; at least
+    // kMaxForwardColumns, the decode and verify calls' width, whose logits rows the head takes).
+    Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity = kMaxForwardColumns);
 
     // Uploads the call's tokens and column map (synchronous copies) and fixes the call's width.
     void prepare(const CallPlan& call);
-    // The same through `staging` (pinned, kUploadWords words, unused by any copy still in flight) on `stream`.
+    // The same through `staging` (pinned, upload_words() words, unused by any copy still in flight) on `stream`.
     void upload(const CallPlan& call, std::int32_t* staging, cudaStream_t stream);
-    static constexpr std::size_t kUploadWords =
-        3 * kMaxForwardColumns + ops::inkling2::kMaxAttentionLanes + 3 * ops::inkling2::kMaxAttentionGroups;
+    [[nodiscard]] std::size_t upload_words() const noexcept {
+        return 3 * static_cast<std::size_t>(capacity_) + ops::inkling2::kMaxAttentionLanes + 3 * static_cast<std::size_t>(max_groups_);
+    }
+    // The columns a call may have (decode and verify calls: at most kMaxForwardColumns).
+    [[nodiscard]] std::int32_t capacity() const noexcept { return capacity_; }
+    // The device memory a forward of these lanes and capacity allocates.
+    [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity);
     void embed(cudaStream_t stream);
     void visit(std::uint32_t visit, const StateView& state, const VisitInputs& in, cudaStream_t stream);
     void visit(std::uint32_t v, const StateView& state, cudaStream_t stream) { visit(v, state, inputs(v), stream); }
@@ -120,6 +128,12 @@ public:
     void finish(const StateView& state, const FinalInputs& in, cudaStream_t stream, std::int32_t head_first = 0,
                 std::int32_t head_columns = -1);
     void finish(const StateView& state, cudaStream_t stream) { finish(state, final_inputs(), stream); }
+    // The head again over columns [first, first + count) (at most kMaxForwardColumns) of the last finish's final
+    // hidden rows, into logits rows 0..: a wide call's logits a slice at a time.
+    void head(std::int32_t first, std::int32_t count, cudaStream_t stream);
+    // Profiling: `marker` is called with each Op's name right after its launches (null: none), so a caller can record
+    // events between them.
+    void set_marker(std::function<void(const char*)> marker) { marker_ = std::move(marker); }
 
     [[nodiscard]] const ForwardBuffers& buffers() const noexcept { return b_; }
     [[nodiscard]] const StateLayout& layout() const noexcept { return layout_; }
@@ -154,11 +168,19 @@ private:
     StateLayout layout_;
     std::int64_t history_words_ = 0; // a lane's histories
     std::int32_t max_lanes_ = 0;
+    std::int32_t capacity_  = 0;
+    std::int32_t max_groups_ = 0;
+    std::int32_t staging_pages_ = 0;
     std::int32_t columns_   = 0;
     std::int32_t lanes_     = 0;
     std::int32_t groups_    = 0;
     std::int32_t max_group_columns_ = 0;
     std::vector<CallLane> call_lanes_;
+    std::vector<std::int32_t> host_groups_; // the call's groups, as uploaded
+    std::function<void(const char*)> marker_;
+    void mark(const char* op) const {
+        if (marker_) { marker_(op); }
+    }
     bool wide_conv_   = false; // a lane has more columns than its conv rings can take without a history
     bool wide_window_ = false; // a lane appends more positions than its window ring can take: staging rings
     DeviceBuffer memory_;

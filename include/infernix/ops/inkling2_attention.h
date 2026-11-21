@@ -51,15 +51,16 @@ inline constexpr std::int32_t kMaxAttentionLanes       = 8;
 // A call's groups: each lane's columns in runs of at most kMaxAttentionLaneColumns.
 inline constexpr std::int32_t kMaxAttentionGroups =
     kMaxAttentionLanes + kMaxAttentionColumns / kMaxAttentionLaneColumns;
-// The pages of a staging ring that holds a lane's call of up to kMaxAttentionColumns positions and the window before
-// it: the first query's 1023 earlier keys and the call's own, whole pages.
-inline constexpr std::int32_t kStagingRingPages =
-    (kWindow - 1 + kMaxAttentionColumns + 2 * (kKeyUnit - 1)) / kKeyUnit + 1;
+// The pages of a staging ring that holds a lane's call of up to `columns` positions and the window before it: the
+// first query's 1023 earlier keys and the call's own, whole pages.
+[[nodiscard]] constexpr std::int32_t staging_ring_pages(std::int32_t columns) noexcept {
+    return (kWindow - 1 + columns + 2 * (kKeyUnit - 1)) / kKeyUnit + 1;
+}
 
 // One visit's keys and values: K as BF16 words, V as FP16 words, 64 positions a page of [64][128] per KV head.
 //   sliding (table null): each lane's ring [kKvHeads][ring_pages][64][128] at k (v) + lane * lane_stride (elements),
 //            position p in page (p / 64) % ring_pages (the state's ring has kWindowRingPages; a call writing more
-//            than kKeyUnit positions a lane runs over a staging ring of kStagingRingPages, window_copy filling it
+//            than kKeyUnit positions a lane runs over a staging ring of staging_ring_pages(its width), window_copy filling it
 //            from the state's ring before and returning its last positions after);
 //   full: a head-major page pool [kKvHeads][pool_pages][64][128] and each lane's block table row
 //            table[lane * table_stride + p / 64].
@@ -104,25 +105,31 @@ struct AttentionLayer {
     const std::uint16_t* value_conv     = nullptr;
 };
 
-// Call scratch: the final q and r, the splits' statistics and the per-(group, KV head) counters (each last CTA resets
-// its own). Zero the memory once before the first call.
+// Call scratch for calls of up to `capacity` columns: the final q and r, the splits' statistics of one launch of
+// attention rows (a call's groups run in launches spanning at most kMaxAttentionColumns columns each) and the
+// per-(group, KV head) counters (each last CTA resets its own). Zero the memory once before the first call.
 struct AttentionWorkspace {
-    std::uint16_t* q         = nullptr; // [kMaxAttentionColumns][24][128]
-    std::uint16_t* r         = nullptr; // [kMaxAttentionColumns][24][16]
+    std::int32_t capacity    = 0;
+    std::uint16_t* q         = nullptr; // [capacity][24][128]
+    std::uint16_t* r         = nullptr; // [capacity][24][16]
     float* stats             = nullptr; // [kMaxAttentionColumns][24][kFullSplits][132]: m, l, -, -, acc[128]
     std::uint32_t* counters  = nullptr; // [kMaxAttentionGroups][kKvHeads]
 };
-[[nodiscard]] std::size_t attention_workspace_bytes();
-[[nodiscard]] AttentionWorkspace carve_attention_workspace(void* base);
+[[nodiscard]] std::size_t attention_workspace_bytes(std::int32_t capacity = kMaxAttentionColumns);
+[[nodiscard]] AttentionWorkspace carve_attention_workspace(void* base, std::int32_t capacity = kMaxAttentionColumns);
 
 // A group is a run of one lane's columns: its rows' arithmetic is the same in any group (it depends only on each row's
 // position and lane), so a lane's columns may split into groups anywhere.
 struct AttentionArgs {
-    std::int32_t columns = 0;
-    std::int32_t groups  = 0;               // the call's groups (grid), at most kMaxAttentionGroups; 0: all padding
+    std::int32_t columns = 0;               // at most the workspace's capacity
+    std::int32_t groups  = 0;               // the call's groups; 0: all padding
     std::int32_t max_group_columns = 0;     // the most columns any group has (sizes the CTA)
     ColumnMap map;
     const std::int32_t* groups_columns = nullptr; // [groups][3]: the group's first column, column count and lane
+    // The same groups in host memory, which the call's launches of rows split by: needed when the groups span more
+    // than kMaxAttentionColumns columns or number more than kMaxAttentionGroups.
+    const std::int32_t* host_groups = nullptr;
+    std::int32_t stats_base = 0;            // set by attention() for each launch: its first column
     AttentionInputs in;
     AttentionLayer layer;
     Ring key_ring, value_ring;              // the K and V conv input rings (width 1024)

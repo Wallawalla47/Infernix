@@ -73,6 +73,11 @@ std::uint64_t elapsed_ns(Clock::time_point start) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
+// The forward's call capacity: the prefill chunk, and at least the decode and verify calls' width.
+std::int32_t forward_capacity(const ProgramOptions& o) {
+    return std::max(kMaxForwardColumns, static_cast<std::int32_t>(o.prefill_chunk));
+}
+
 std::uint32_t pages_per_lane(std::uint32_t max_context) {
     return (max_context + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit + 1;
 }
@@ -91,11 +96,11 @@ public:
     ProgramImpl(const Parameters& parameters, DeviceContext& device, ProgramOptions options)
         : p_(parameters), c_(parameters.model.config().text), device_(device), o_(std::move(options)),
           plan_(Program::plan_device(o_, parameters.model.config())),
-          forward_(parameters, static_cast<std::int32_t>(o_.max_concurrency)),
+          forward_(parameters, static_cast<std::int32_t>(o_.max_concurrency), forward_capacity(o_)),
           vocab_(static_cast<std::int32_t>(c_.vocab_size)), lanes_(o_.max_concurrency),
           sampling_(ops::sampling_workspace_capacity_bytes(vocab_, 1, static_cast<std::int32_t>(kMaximumConcurrency)) +
                     4096),
-          host_(align_256(Forward::kUploadWords * 4 * kStagingSlots) +
+          host_(align_256(forward_.upload_words() * 4 * kStagingSlots) +
                 align_256(sizeof(ops::SamplingConfig) * kMaximumConcurrency) + 3 * align_256(4 * kMaximumConcurrency)) {
         const StateLayout& layout = forward_.layout();
         const std::uint32_t pages = pages_per_lane(o_.max_context);
@@ -123,7 +128,7 @@ public:
         sampled_           = DeviceBuffer(4 * kMaximumConcurrency);
         auto* base         = static_cast<std::byte*>(host_.data());
         staging_           = reinterpret_cast<std::int32_t*>(base);
-        base += align_256(Forward::kUploadWords * 4 * kStagingSlots);
+        base += align_256(forward_.upload_words() * 4 * kStagingSlots);
         host_configs_ = reinterpret_cast<ops::SamplingConfig*>(base);
         base += align_256(sizeof(ops::SamplingConfig) * kMaximumConcurrency);
         host_positions_ = reinterpret_cast<std::int32_t*>(base);
@@ -458,12 +463,17 @@ public:
             const std::int32_t from = at + chunk <= first_target - 1
                                           ? static_cast<std::int32_t>(chunk)
                                           : static_cast<std::int32_t>(std::max<std::int64_t>(0, std::int64_t{first_target} - 1 - at));
-            run_forward(from, static_cast<std::int32_t>(chunk) - from);
-            CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+            run_forward(from, 0); // the final mix; the head runs below a slice of logits rows at a time
             for (std::int32_t c = from; c < static_cast<std::int32_t>(chunk); ++c) {
+                const std::int32_t slice = (c - from) % kMaxForwardColumns;
+                if (slice == 0) {
+                    forward_.head(c, std::min<std::int32_t>(kMaxForwardColumns, static_cast<std::int32_t>(chunk) - c),
+                                  device_.stream);
+                    CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+                }
                 const std::uint32_t position = at + static_cast<std::uint32_t>(c);
                 const std::uint32_t scored   = position + 1 - first_target;
-                CUDA_CHECK(cudaMemcpy(row.data(), forward_.buffers().logits + static_cast<std::size_t>(c - from) * vocab_,
+                CUDA_CHECK(cudaMemcpy(row.data(), forward_.buffers().logits + static_cast<std::size_t>(slice) * vocab_,
                                       row.size() * 4, cudaMemcpyDeviceToHost));
                 double max = -std::numeric_limits<double>::infinity();
                 for (const float v : row) { max = std::max(max, static_cast<double>(v)); }
@@ -591,7 +601,7 @@ private:
     void upload(const CallPlan& call) {
         slot_ = (slot_ + 1) % kStagingSlots;
         if (slot_used_[slot_]) { CUDA_CHECK(cudaEventSynchronize(slot_events_[slot_])); }
-        forward_.upload(call, staging_ + slot_ * Forward::kUploadWords, device_.stream);
+        forward_.upload(call, staging_ + slot_ * forward_.upload_words(), device_.stream);
         CUDA_CHECK(cudaEventRecord(slot_events_[slot_], device_.stream));
         slot_used_[slot_] = true;
     }
@@ -833,8 +843,8 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Inkling 2: max_concurrency must be 1-8");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk > static_cast<std::uint32_t>(kMaxForwardColumns)) {
-        throw std::invalid_argument("Inkling 2: prefill chunks are 1-128 columns");
+    if (options.prefill_chunk == 0 || options.prefill_chunk > static_cast<std::uint32_t>(kMaxPrefillChunk)) {
+        throw std::invalid_argument("Inkling 2: prefill chunks are 1-8191 columns");
     }
     const StateLayout layout   = state_layout(config.text);
     const std::uint64_t lanes  = options.max_concurrency;
@@ -844,7 +854,8 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     out.kv        = 2ULL * layout.full_visits * detail::pool_bytes(pages) + pages * 4;
     out.state     = static_cast<std::uint64_t>(layout.lane_words) * 2 * lanes;
     out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2;
-    out.workspace = ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(config.text.vocab_size), 1,
+    out.workspace = Forward::device_bytes(config.text, static_cast<std::int32_t>(lanes), detail::forward_capacity(options)) +
+                    ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(config.text.vocab_size), 1,
                                                            static_cast<std::int32_t>(kMaximumConcurrency));
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     return out;

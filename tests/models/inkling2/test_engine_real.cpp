@@ -8,8 +8,9 @@
 //    known order) give their solo tokens two at once (C = 2), all at once in reverse order (C = 4) and twice over at
 //    once (C = 8).
 // 4. Prefill chunk width: an Engine prefilling 7 columns a call gives the reference's tokens; on a 2,300-token prompt
-//    at context 4,096, chunks of 128 and of 100 (the latter beside a decoding request) give the greedy continuation
-//    and the scoring logits (19 positions across the window's wrap and the chunk edges) of chunks of 16 byte for byte.
+//    at context 4,096, chunks of 128, 4,096 (the prompt in one call) and 100 (beside a decoding request) give the
+//    greedy continuation, and chunks of 128, 100, 1,000 and 4,096 the scoring logits (19 positions across the
+//    window's wrap and the chunk edges), of chunks of 16 byte for byte.
 // 5. Scoring: a CausalScoring Engine's logits of the 32 golden ids (positions 0-30) equal the forward test's
 //    free-running logits (INFERNIX_INKLING2_LOGITS_GUARD) byte for byte.
 // Reported, not judged: a chat turn's channels, and a turn whose thinking budget (6) injects the control (the
@@ -259,10 +260,10 @@ int main() {
                 oracle_long    = engine.generate(engine.prepare_tokens(prompt), greedy(16)).generated_token_ids;
                 oracle_request = engine.generate(engine.prepare(chat(texts()[2])), sampled(2)).generated_token_ids;
             }
-            {
-                infernix::Engine engine(engine_options(artifact, 128, true, 1, kLongContext));
-                require_same("prefill chunks of 128: the long prompt's greedy continuation", oracle_long,
-                             engine.generate(engine.prepare_tokens(prompt), greedy(16)).generated_token_ids);
+            for (const std::uint32_t chunk : {128U, 4096U}) { // 4096: the whole prompt in one call
+                infernix::Engine engine(engine_options(artifact, chunk, true, 1, kLongContext));
+                require_same("prefill chunks of " + std::to_string(chunk) + ": the long prompt's greedy continuation",
+                             oracle_long, engine.generate(engine.prepare_tokens(prompt), greedy(16)).generated_token_ids);
             }
             {
                 // Chunks of 100 while another request decodes: its prompt and decode rounds interleave with the wide
@@ -278,7 +279,7 @@ int main() {
             const std::vector<std::uint32_t> positions = {0, 15, 16, 99, 100, 127, 128, 1022, 1023, 1024, 1087,
                                                           1088, 1151, 1200, 2047, 2048, 2200, 2297, 2298};
             const std::vector<float> oracle = long_scores(artifact, 16, prompt, positions);
-            for (const std::uint32_t chunk : {128U, 100U}) {
+            for (const std::uint32_t chunk : {128U, 100U, 1000U, 4096U}) {
                 const std::vector<float> wide = long_scores(artifact, chunk, prompt, positions);
                 require(wide.size() == oracle.size(), "scoring: the logits' sizes differ");
                 std::size_t differ = 0;

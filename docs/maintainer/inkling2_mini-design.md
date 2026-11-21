@@ -940,9 +940,28 @@ depends on the call, one attention route at every width, per-token quantization,
 K/V through the codec before reading it, so in-chunk and cached keys are the same represented values
 ([§9.3](#93-prefill)). The model has no recurrent layer whose kernel chunking regroups sums (its convs read a 3-position
 history), so, as TokenSpeed notes for KV-only models, a prefix resumes at any token bit for bit. Then publication and
-resumes are exact at any prefill-computed frontier, chunks can be wide (default 16K, wider while no lane decodes), and
-the prompt's last two calls merge (L23). Where an Op cannot be made invariant, the Qwen rule applies instead: a canonical
-chunk grid and grid-only publication on the reproducible route.
+resumes are exact at any prefill-computed frontier, chunks can be any width (the default is the fastest measured,
+512 columns today), and the prompt's last two calls merge (L23). Where an Op cannot be made invariant, the Qwen rule
+applies instead: a canonical chunk grid and grid-only publication on the reproducible route.
+
+Built (2026-11-21): the first prefill route keeps the decode route's arithmetic at every width instead of a second
+set of kernels. Every decode Op is already column-invariant (attention's units and splits depend only on a row's
+position and lane; the experts' exact core is per entry; the skinny projections fold each column alone), so a wide
+call gives each column the bits of single-column calls: prefill, decode and verify agree bit for bit, a prefix resumes
+exactly at any position, and the chunk width may follow scheduling. A wide call differs only in how state is reached:
+the conv rings' three history rows are snapshotted before a call with a lane of more than 29 columns and each ring
+keeps its lane's last 32 positions; a lane appending more than a page runs every sliding visit over a staging ring
+sized to the chunk (the window before it copied in by position, the last 1,088 positions copied back); attention runs
+a lane's columns in groups of 16 and its rows in launches spanning at most 128 columns; the fused projections run a
+wide call's passes inside one launch with the weights held in registers (W_o joins them in wide calls); the experts'
+workspace and the forward's buffers take the chunk as their capacity. Measured (infernix_bench, C = 1, prefill 2,048 /
+10,000): 752.8 / 736.5 tok/s at 16 columns a call, 1,166.6 / 1,140.8 at 128 (narrow passes), 1,505.5 / 1,457.9 at
+512 with the wide projections (the default chunk), 1,398.1 / 1,359.3 at 2,048. A 2,048-column call's time goes to
+K2 (41 %), the experts (30 %), W_o (12 %), the gates (7 %), attention and the router (5 % each): the skinny fold pins
+each projection to SIMT FMAs reading x once per two rows (~6 TFLOPs at K2), and the experts' exact core costs
+~3.3 µs a column per NVFP4 visit once every expert is resident. Tensor-core projections and attention would change
+the bits: they are fast paths under [model quality §6](model-quality.md#6-numerical-acceptance-policy-and-fast-paths),
+measured against this route, not built yet.
 
 ### 14.2 Pass schedule
 

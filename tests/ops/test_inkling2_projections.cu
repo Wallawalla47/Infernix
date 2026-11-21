@@ -1,9 +1,10 @@
 // Inkling 2's fused projections (include/infernix/ops/inkling2_projections.h) against ops::linear's BF16 route on the
 // same matrices: every output bit for bit (the contract's arithmetic is linear's skinny order), at the real shapes of
 // one visit (K2: query, relative, gate and sink of x_q, key and its taps of x_k, value and its taps of x_v; the three
-// message gates' downs [64, 4608]; their forget and gain [4608, 64] with FP32 out), at widths 1, 3, 8, 16, 17 and 40
-// (passes of 16 and a partial one). linear() runs 8 columns a call (its column-invariant skinny route), so the oracle
-// is linear's arithmetic itself; its accuracy is the Linear Op's qualification.
+// message gates' downs [64, 4608]; their forget and gain [4608, 64] with FP32 out; W_o [2304, 3072], which wide calls
+// run here), at widths 1, 3, 8, 16, 17, 40, 100 and 300 (passes of 16 and a partial one; past 16 columns BF16 storage
+// runs the wide kernel, the weights held across passes). linear() runs 8 columns a call (its column-invariant skinny
+// route), so the oracle is linear's arithmetic itself; its accuracy is the Linear Op's qualification.
 
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -178,11 +179,12 @@ INFERNIX_OP_TEST(inkling2_projections) {
          {{3072, 0}, {384, 0}, {3072, 0}, {24, 0}, {1024, 1}, {32, 1}, {1024, 2}, {32, 2}}},
         {"message-gate downs [64, 4608] x 3", 4608, false, {{64, 0}, {64, 1}, {64, 2}}},
         {"forget and gain [4608, 64] x 3, FP32 out", 64, true, {{4608, 0}, {4608, 1}, {4608, 2}}},
+        {"W_o [2304, 3072] (wide calls)", 3072, false, {{2304, 0}}},
     };
     std::uint32_t seed = 1;
     for (const bool packed : {false, true}) {
         for (const auto& c : cases) {
-            for (const int columns : {1, 3, 8, 16, 17, 40}) { run_case(c, columns, seed++, packed); }
+            for (const int columns : {1, 3, 8, 16, 17, 40, 100, 300}) { run_case(c, columns, seed++, packed); }
         }
     }
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
