@@ -182,7 +182,7 @@ sets itself (below), in sections that open and close: **Serving**, **Context and
 **Speculative decoding**, **N-gram table** (Qwen3.8-Flash-Next), **Prefix cache** (the Host tier,
 the SSD tier, next-turn prefill), **Offloaded experts** (models that have them), **Thinking and
 tools**, **Requests and clients**, **Sampling overrides**, **Vision**, **Numerical routes and
-speed**, **Logging and diagnostics** and **Environment variables**. A section's badge counts the
+speed**, **Ablation sidecar** (Qwen3.8-Flash-Next), **Logging and diagnostics** and **Environment variables**. A section's badge counts the
 options the configuration sets in it, so a closed section still shows that it holds settings; its
 less common options are under **More options**, which stays open while one of them is set. The
 browser remembers which sections are open. A control appears only for a model it applies to and

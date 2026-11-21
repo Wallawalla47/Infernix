@@ -186,7 +186,9 @@ models' RAM plan leaves free) and `a8_activations` (`--a8-activations`, the appr
 activation route; its speeds are not the engine's quoted ones). Schema v27 adds `lora` to `config` (`--lora`,
 empty without an adapter), `lora_adapter` to `load` (the adapter the Engine applied, as its startup log names it),
 and to `memory` `draft_screen_bytes` and `adapter_bytes` (the DFlash2 head screen and a LoRA adapter's factors,
-beside the weights' arena) and `cuda_graph_measured_bytes` (what CUDA Graph preparation took).
+beside the weights' arena) and `cuda_graph_measured_bytes` (what CUDA Graph preparation took). Schema v28 adds `ablate`
+to `config` (`--ablate`, empty without a sidecar) and `ablate_sidecar` to `load` (the sidecar the Engine applied, as
+its startup log names it).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
