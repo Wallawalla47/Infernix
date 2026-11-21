@@ -51,11 +51,17 @@ struct StateView {
 
 // One call: each column's token, lane and position (a lane's columns consecutive, positions ascending by 1; lane -1
 // pads), and each lane's first position: where its sequence begins (the first key it attends to), not its first column
-// in this call. A lane may have up to kMaxForwardColumns columns: every Op gives a column the same bits in any call,
-// so a wide call (prefill) equals single-column calls of the same positions.
+// in this call.
+//
+// Two routes, each giving a column the same bits in any call of its kind (every Op computes a column from its own
+// inputs alone): a prompt call (`prompt`: prefill and scoring, every column a prompt token) runs the tensor-core route
+// (the projections, router and experts on MMA; design §14), at any width, so any chunking of a prompt gives the same
+// bits; any other call (decode, verification, forced tokens) runs the decode route, so a verify column equals the
+// decode column. A prompt column need not equal the same position computed by the decode route.
 struct CallPlan {
     std::vector<std::int32_t> tokens, lane, position;
     std::vector<std::int32_t> first;
+    bool prompt = false;
     [[nodiscard]] std::int32_t columns() const noexcept { return static_cast<std::int32_t>(tokens.size()); }
     [[nodiscard]] std::int32_t lanes() const noexcept { return static_cast<std::int32_t>(first.size()); }
 };
@@ -183,6 +189,7 @@ private:
     }
     bool wide_conv_   = false; // a lane has more columns than its conv rings can take without a history
     bool wide_window_ = false; // a lane appends more positions than its window ring can take: staging rings
+    bool prompt_      = false; // the call's route (CallPlan::prompt)
     DeviceBuffer memory_;
     ForwardBuffers b_;
 };

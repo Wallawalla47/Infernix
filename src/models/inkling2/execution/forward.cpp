@@ -7,6 +7,7 @@
 #include "infernix/ops/linear.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -78,6 +79,19 @@ void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, 
         throw std::invalid_argument("inkling2 forward: the fused projections take BF16, bf16_p12 or Q8 matrices");
     }
     args.segments[args.count++] = s;
+}
+
+// A prompt call's fused projections run on tensor cores (projections_mma, BF16 storage); a decode-route call, and a Q8
+// matrix (--q8-weights: no Q8 tensor-core route yet), the fold (projections).
+bool use_mma(bool prompt, const ik::ProjectionArgs& a) {
+    return prompt && a.segments[0].weight != nullptr && a.k % 64 == 0;
+}
+void project_fused(bool prompt, const ik::ProjectionArgs& a, cudaStream_t stream) {
+    if (use_mma(prompt, a)) {
+        ik::projections_mma(a, stream);
+    } else {
+        ik::projections(a, stream);
+    }
 }
 
 std::int32_t max_groups(std::int32_t lanes, std::int32_t capacity) {
@@ -227,6 +241,7 @@ std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
     max_group_columns_ = widest;
     wide_conv_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kMaxLaneColumns; });
     wide_window_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kKeyUnit; });
+    prompt_      = call.prompt;
     call_lanes_  = std::move(lanes);
     host_groups_ = groups;
     return groups;
@@ -429,8 +444,8 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
             add_segment(down, op.gates[k].down, k, b_.z + k * T * rank);
             add_segment(fg, op.gates[k].forget_gain, k, b_.fg + k * TH * 2);
         }
-        ik::projections(down, stream);
-        ik::projections(fg, stream);
+        project_fused(prompt_, down, stream);
+        project_fused(prompt_, fg, stream);
         ik::GateExitArgs g;
         g.columns  = T;
         g.kinds    = 3;
@@ -463,7 +478,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         add_segment(k2, a.key_taps, 1, b_.key_taps);
         add_segment(k2, a.value_taps, 2, b_.value_taps);
     }
-    ik::projections(k2, stream);
+    project_fused(prompt_, k2, stream);
     mark("k2_projections");
 
     // K3: attention.
@@ -508,13 +523,13 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
 
     // K4: W_o (a wide call: one launch of the fused projections, the skinny route's bits); K5 (K5a): its post-attention
     // conv and residual, the MLP mix, norm and the experts' rows.
-    if (T > ik::kMaxAttentionLaneColumns || q8(a.output)) { // ops::linear has no route for Q8 at W_o's shape
-        ik::ProjectionArgs wo{};
-        wo.columns = T;
-        wo.k       = kQ;
-        wo.x[0]    = b_.attention;
-        add_segment(wo, a.output, 0, b_.o);
-        ik::projections(wo, stream);
+    ik::ProjectionArgs wo{};
+    wo.columns = T;
+    wo.k       = kQ;
+    wo.x[0]    = b_.attention;
+    add_segment(wo, a.output, 0, b_.o);
+    if (T > ik::kMaxAttentionLaneColumns || q8(a.output) || use_mma(prompt_, wo)) { // ops::linear: no Q8 route at W_o's shape
+        project_fused(prompt_, wo, stream);
     } else {
         project(b_.attention, a.output, b_.o, false, stream);
     }
@@ -555,8 +570,8 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         fg.x[0]                   = b_.z;
         add_segment(down, op.gates[3].down, 0, b_.z);
         add_segment(fg, op.gates[3].forget_gain, 0, b_.fg);
-        ik::projections(down, stream);
-        ik::projections(fg, stream);
+        project_fused(prompt_, down, stream);
+        project_fused(prompt_, fg, stream);
         ik::GateExitArgs g;
         g.columns  = T;
         g.kinds    = 1;
@@ -570,10 +585,28 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         mark("message_gates");
     }
 
-    // K6-K8: route and the experts (their outputs combine in the next visit's entry).
-    moe::moe_route(b_.xm, T, op.router, op.router_bias, op.bank.experts, kH, c_.route_scale, b_.moe, stream);
-    mark("router");
-    moe::moe_experts({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
+    // K6-K8: route and the experts (their outputs combine in the next visit's entry). A prompt call: the router's logits
+    // on tensor cores (FP32), the selection by column, the experts' grouped block-scaled GEMMs.
+    if (prompt_) {
+        ik::ProjectionArgs router{};
+        router.columns  = T;
+        router.k        = kH;
+        router.x[0]     = b_.xm;
+        router.fp32_out = true;
+        ik::ProjectionSegment s;
+        s.weight = op.router;
+        s.rows   = op.bank.experts;
+        s.out    = b_.moe.logits;
+        router.segments[router.count++] = s;
+        ik::projections_mma(router, stream);
+        moe::moe_select(b_.moe.logits, T, op.router_bias, op.bank.experts, c_.route_scale, b_.moe, stream);
+        mark("router");
+        moe::moe_experts_prompt({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
+    } else {
+        moe::moe_route(b_.xm, T, op.router, op.router_bias, op.bank.experts, kH, c_.route_scale, b_.moe, stream);
+        mark("router");
+        moe::moe_experts({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
+    }
     mark("experts");
 }
 

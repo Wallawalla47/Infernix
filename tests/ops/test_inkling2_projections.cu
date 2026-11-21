@@ -232,6 +232,116 @@ void run_q8(const Case& c, int columns, std::uint32_t seed) {
     for (auto* p : alone) { cudaFree(p); }
 }
 
+// The tensor-core projections (projections_mma: ops::linear's MMA arithmetic, k16 steps in ascending K chained through
+// the FP32 accumulator). Oracle: FP64 over the BF16 operands (every product exact). Criterion, fixed before the first
+// run: |err| <= (K / 16 + 5) 2^-23 sum |w x| (one rounding of the accumulator a step, plus a 5-level tree inside a
+// step, at a unit that also covers truncating internal adds) plus BF16 rounding of the output (2^-8 |y|). Every
+// column must equal the same column projected alone (a 1-column call: the narrow tile shape) bit for bit, so the bits
+// depend neither on the call's width nor on its tile shape. Wide calls check a sample of their columns.
+void run_mma(const Case& c, int columns, std::uint32_t seed) {
+    std::mt19937 gen(seed);
+    const int word = c.fp32 ? 4 : 2;
+    std::uint16_t* x[3];
+    std::vector<std::uint16_t> xh[3];
+    for (int i = 0; i < 3; ++i) {
+        x[i]  = dalloc<std::uint16_t>(static_cast<std::size_t>(columns) * c.k);
+        xh[i] = random_bf16(static_cast<std::size_t>(columns) * c.k, 1.0F, gen);
+        cuda_check(cudaMemcpy(x[i], xh[i].data(), xh[i].size() * 2, cudaMemcpyHostToDevice), "upload");
+    }
+    ik::ProjectionArgs args;
+    args.columns  = columns;
+    args.k        = c.k;
+    args.fp32_out = c.fp32;
+    for (int i = 0; i < 3; ++i) { args.x[i] = x[i]; }
+    std::vector<std::vector<std::uint16_t>> wh;
+    std::vector<std::uint16_t*> weights;
+    for (const auto& [rows, input] : c.segments) {
+        auto* w   = dalloc<std::uint16_t>(static_cast<std::size_t>(rows) * c.k);
+        auto host = random_bf16(static_cast<std::size_t>(rows) * c.k, 0.03F, gen);
+        for (std::size_t i = 0; i < host.size(); i += 997) {
+            host[i] = (i / 997) % 3 == 0 ? std::uint16_t{0} : canon::f32_to_bf16_rn((i / 997) % 3 == 1 ? 3.0F : 1.0e-9F);
+        }
+        cuda_check(cudaMemcpy(w, host.data(), host.size() * 2, cudaMemcpyHostToDevice), "upload");
+        weights.push_back(w);
+        wh.push_back(std::move(host));
+        ik::ProjectionSegment seg;
+        seg.rows   = rows;
+        seg.input  = input;
+        seg.weight = w;
+        seg.out    = dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * rows * word);
+        args.segments[args.count++] = seg;
+    }
+    ik::projections_mma(args, nullptr);
+    // The checked columns: all up to 40, else the first 3, the last 2 and 5 between.
+    std::vector<int> checked;
+    if (columns <= 40) {
+        for (int t = 0; t < columns; ++t) { checked.push_back(t); }
+    } else {
+        checked = {0, 1, 2, columns / 7, columns / 3, columns / 2, (2 * columns) / 3, columns - 9, columns - 2, columns - 1};
+    }
+    std::vector<void*> alone;
+    for (int s = 0; s < args.count; ++s) {
+        alone.push_back(dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * args.segments[s].rows * word));
+    }
+    for (const int t : checked) {
+        ik::ProjectionArgs one = args;
+        one.columns            = 1;
+        for (int i = 0; i < 3; ++i) { one.x[i] = x[i] + static_cast<std::size_t>(t) * c.k; }
+        for (int s = 0; s < args.count; ++s) {
+            one.segments[s].out =
+                static_cast<std::uint8_t*>(alone[s]) + static_cast<std::size_t>(t) * args.segments[s].rows * word;
+        }
+        ik::projections_mma(one, nullptr);
+    }
+    cuda_check(cudaDeviceSynchronize(), "projections_mma");
+    long outside = 0, differ = 0, total = 0;
+    double worst = 0;
+    const double depth = c.k / 16 + 5;
+    for (int s = 0; s < args.count; ++s) {
+        const int rows = args.segments[s].rows, input = c.segments[s].second;
+        const std::size_t n = static_cast<std::size_t>(columns) * rows;
+        std::vector<std::uint8_t> got(n * word), solo(n * word);
+        cuda_check(cudaMemcpy(got.data(), args.segments[s].out, got.size(), cudaMemcpyDeviceToHost), "download");
+        cuda_check(cudaMemcpy(solo.data(), alone[s], solo.size(), cudaMemcpyDeviceToHost), "download");
+        for (const int t : checked) {
+            const std::uint16_t* xt = xh[input].data() + static_cast<std::size_t>(t) * c.k;
+            for (int r = 0; r < rows; ++r) {
+                const std::uint16_t* wr = wh[s].data() + static_cast<std::size_t>(r) * c.k;
+                double y = 0, a = 0;
+                for (int j = 0; j < c.k; ++j) {
+                    const double p = static_cast<double>(canon::bf16_to_f32(wr[j])) * canon::bf16_to_f32(xt[j]);
+                    y += p, a += std::fabs(p);
+                }
+                const std::size_t i = static_cast<std::size_t>(t) * rows + r;
+                double g = 0;
+                if (c.fp32) {
+                    float f = 0;
+                    std::memcpy(&f, &got[i * 4], 4);
+                    g = f;
+                } else {
+                    std::uint16_t b = 0;
+                    std::memcpy(&b, &got[i * 2], 2);
+                    g = canon::bf16_to_f32(b);
+                }
+                const double tol = depth * 0x1p-23 * a + (c.fp32 ? 0.0 : 0x1p-8 * std::fabs(y)) + 1e-30;
+                const double err = std::fabs(g - y);
+                outside += err > tol ? 1 : 0;
+                worst = std::max(worst, a > 0 ? err / (depth * 0x1p-23 * a + (c.fp32 ? 0.0 : 0x1p-8 * std::fabs(y))) : 0.0);
+                differ += std::memcmp(&got[i * word], &solo[i * word], word) != 0 ? 1 : 0;
+                ++total;
+            }
+        }
+    }
+    std::printf("%-44s MMA  T = %4d: %ld of %ld outside the bound (worst %.3f of it), %ld differ from the column "
+                "alone\n",
+                c.name, columns, outside, total, worst, differ);
+    if (outside != 0 || differ != 0) { ++g_failures; }
+    for (auto* p : x) { cudaFree(p); }
+    for (auto* p : weights) { cudaFree(p); }
+    for (int s = 0; s < args.count; ++s) { cudaFree(args.segments[s].out); }
+    for (auto* p : alone) { cudaFree(p); }
+}
+
 void run_case(const Case& c, int columns, std::uint32_t seed, bool packed) {
     std::mt19937 gen(seed);
     const int word = c.fp32 ? 4 : 2;
@@ -326,6 +436,14 @@ INFERNIX_OP_TEST(inkling2_projections) {
     const std::vector<Case> q8_cases = {cases[0], cases[1], cases[3], {"head rows [4096, 2304], FP32 out", 2304, true, {{4096, 0}}}};
     for (const auto& c : q8_cases) {
         for (const int columns : {1, 3, 8, 16, 17, 40, 100}) { run_q8(c, columns, seed++); }
+    }
+    // The tensor-core projections at the same shapes, the router's [128, 2304] FP32 and the head's arithmetic, at
+    // narrow and wide widths (tile shapes: <= 16 columns, few rows, wide).
+    const std::vector<Case> mma_cases = {cases[0], cases[1], cases[2], cases[3],
+                                         {"router [128, 2304], FP32 out", 2304, true, {{128, 0}}},
+                                         {"head rows [4096, 2304], FP32 out", 2304, true, {{4096, 0}}}};
+    for (const auto& c : mma_cases) {
+        for (const int columns : {1, 3, 16, 17, 40, 300, 2048}) { run_mma(c, columns, seed++); }
     }
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

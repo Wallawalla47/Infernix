@@ -541,6 +541,166 @@ void bank_case(bool a8) {
     }
 }
 
+// ---------------------------------------------------------------------------- the prompt route (NVFP4)
+
+// moe_experts_prompt at prefill widths. Criteria (fixed before the first run): h within 2^-6 of max|h| of FP64 h from
+// FP64 gate/up sums (as the narrow route); each output within half a BF16 ulp of FP64 over the kernel's own quantized
+// h, plus the FP32 tensor-core sum's bound (K / 64 + 5) 2^-23 sum |w h| scaled, plus 2^-16 max|y|; every sampled
+// column alone (a 1-column prompt call) gives the bits it gets in the call; outputs differing from the exact narrow
+// route are counted and reported, not judged (another arithmetic).
+void prompt_case() {
+    const HostBank b = make_bank(false, 41U);
+    DeviceBank db{upload(b.records), upload(b.amax), upload(std::vector<float>{b.den[0], b.den[1]})};
+    constexpr int kWide = 300;
+    void* workspace     = nullptr;
+    const std::size_t bytes = moe::workspace_bytes(E, I, kWide);
+    cuda_check(cudaMalloc(&workspace, bytes), "cudaMalloc");
+    cuda_check(cudaMemset(workspace, 0, bytes), "cudaMemset");
+    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, kWide);
+    moe::Bank bank;
+    bank.records       = db.records;
+    bank.record_stride = b.stride;
+    bank.format        = moe::ExpertFormat::Nvfp4FourOverSix;
+    bank.amax          = db.amax;
+    bank.denominators  = db.den;
+    bank.experts       = E;
+    bank.hidden        = H;
+    bank.intermediate  = I;
+    struct Out {
+        std::vector<std::uint16_t> out, h;
+        std::vector<std::uint8_t> plane;
+        std::vector<std::uint32_t> h_amax;
+        std::vector<std::int32_t> entries;
+    };
+    const auto run_prompt = [&](const Call& call, bool narrow) {
+        std::vector<std::uint8_t> rows;
+        std::vector<float> amax;
+        for (const auto& x : call.x) {
+            const QuantRow q = quantize_a4(x);
+            rows.insert(rows.end(), q.bytes.begin(), q.bytes.end());
+            amax.push_back(q.amax);
+        }
+        std::uint8_t* d_rows = upload(rows);
+        float* d_amax        = upload(amax);
+        std::int32_t* d_exp  = upload(call.experts);
+        float* d_gamma       = upload(call.gamma);
+        const std::size_t entries = std::size_t(call.columns) * K;
+        std::uint16_t* d_out      = nullptr;
+        cuda_check(cudaMalloc(&d_out, entries * H * 2), "cudaMalloc");
+        const moe::Routing routing{d_exp, d_gamma};
+        moe::moe_dispatch(routing, call.columns, E, ws, nullptr);
+        const moe::Activations x{d_rows, d_amax, call.columns};
+        narrow ? moe::moe_experts(x, routing, bank, ws, d_out, nullptr)
+               : moe::moe_experts_prompt(x, routing, bank, ws, d_out, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "prompt call");
+        Out o;
+        o.out     = download(d_out, entries * H);
+        o.h       = download(ws.h, entries * I);
+        o.plane   = download(ws.h_plane, entries * moe::kPromptHRowBytes);
+        o.h_amax  = download(ws.h_amax, entries);
+        o.entries = download(ws.entries, entries);
+        for (void* p : {static_cast<void*>(d_rows), static_cast<void*>(d_amax), static_cast<void*>(d_exp),
+                        static_cast<void*>(d_gamma), static_cast<void*>(d_out)}) {
+            cuda_check(cudaFree(p), "cudaFree");
+        }
+        return o;
+    };
+    const Call call   = make_call(kWide, 13, 1.0F);
+    const Out got     = run_prompt(call, false);
+    const Out again   = run_prompt(call, false);
+    const Out narrow  = run_prompt(call, true);
+    check(got.out == again.out, "a repeated prompt call gives the same bits");
+    // The h plane's rows are in dispatch order: entry -> position.
+    std::vector<int> position(std::size_t(kWide) * K);
+    for (std::size_t p = 0; p < got.entries.size(); ++p) { position[got.entries[p]] = static_cast<int>(p); }
+    double worst_h = 0, worst_y = 0;
+    long narrow_differ = 0, checked = 0;
+    std::vector<Matrix> cache_gu(E), cache_dn(E);
+    std::vector<bool> decoded(E, false);
+    for (const int t : {0, 1, 7, 63, 150, 255, 299}) {
+        const QuantRow xq = quantize_a4(call.x[t]);
+        for (int j = 0; j < K; ++j) {
+            const int e = call.experts[t * K + j], entry = t * K + j;
+            if (!decoded[e]) {
+                cache_gu[e] = decode(b, e, false);
+                cache_dn[e] = decode(b, e, true);
+                decoded[e]  = true;
+            }
+            const EntryResult r = oracle(b, cache_gu[e], cache_dn[e], e, xq, call.gamma[entry]);
+            double h_max = 0, h_err = 0;
+            for (int i = 0; i < I; ++i) { h_max = std::max(h_max, std::fabs(r.h64[i])); }
+            for (int i = 0; i < I; ++i) {
+                h_err = std::max(h_err, std::fabs(canon::bf16_to_f32(got.h[std::size_t(entry) * I + i]) - r.h64[i]) / h_max);
+            }
+            worst_h = std::max(worst_h, h_err);
+            // The kernel's quantized h from its plane row (block b at plane_block(b): byte j low/high = elements j and
+            // 4 + j, byte 4 + j = 8 + j and 12 + j; scales after the 576 code bytes) in the natural row format.
+            const std::uint8_t* row = got.plane.data() + std::size_t(position[entry]) * moe::kPromptHRowBytes;
+            std::vector<std::uint8_t> hq(I / 2 + I / 16, 0);
+            for (int blk = 0; blk < I / 16; ++blk) {
+                const int pos = (blk & ~3) | ((blk & 1) << 1) | ((blk & 2) >> 1);
+                std::uint8_t c[16];
+                for (int jj = 0; jj < 4; ++jj) {
+                    c[jj]      = row[8 * pos + jj] & 0xF;
+                    c[4 + jj]  = row[8 * pos + jj] >> 4;
+                    c[8 + jj]  = row[8 * pos + 4 + jj] & 0xF;
+                    c[12 + jj] = row[8 * pos + 4 + jj] >> 4;
+                }
+                for (int jj = 0; jj < 8; ++jj) { hq[8 * blk + jj] = c[2 * jj] | (c[2 * jj + 1] << 4); }
+                hq[I / 2 + blk] = row[I / 2 + pos];
+            }
+            const float h_amax = canon::f32_from_bits(got.h_amax[entry]);
+            const std::vector<double> y64 = down64(b, cache_dn[e], e, hq.data(), h_amax);
+            // sum |w h| of each output, for the FP32 sum's bound.
+            std::vector<double> mag(H, 0.0);
+            for (int rr = 0; rr < H; ++rr) {
+                double m = 0;
+                for (int k = 0; k < I; ++k) {
+                    const std::uint8_t byte = hq[k / 2];
+                    const double hv = 0.5 * canon::e2m1_x2((k & 1) ? byte >> 4 : byte & 0xF) *
+                                      canon::e4m3_value(hq[I / 2 + k / 16]) * (double(h_amax) / 1536.0);
+                    const double w = 0.5 * canon::e2m1_x2(cache_dn[e].code[std::size_t(rr) * I + k]) *
+                                     canon::e4m3_value(cache_dn[e].scale[std::size_t(rr) * (I / 16) + k / 16]) *
+                                     (double(b.amax[2 * e + 1]) / b.den[1]);
+                    m += std::fabs(w * hv);
+                }
+                mag[rr] = m;
+            }
+            double y_max = 0;
+            for (int i = 0; i < H; ++i) { y_max = std::max(y_max, std::fabs(y64[i])); }
+            for (int i = 0; i < H; ++i) {
+                const std::uint16_t gpu = got.out[std::size_t(entry) * H + i];
+                const double half_ulp   = y64[i] == 0.0 ? 0.0 : std::ldexp(1.0, std::ilogb(y64[i]) - 8);
+                const double bound      = half_ulp + (I / 64 + 5) * std::ldexp(mag[i], -23) + std::ldexp(y_max, -16);
+                worst_y = std::max(worst_y, std::fabs(canon::bf16_to_f32(gpu) - y64[i]) / bound);
+                narrow_differ += gpu != narrow.out[std::size_t(entry) * H + i] ? 1 : 0;
+                ++checked;
+            }
+        }
+    }
+    // Column invariance: sampled columns alone.
+    int alone_differ = 0;
+    for (const int t : {0, 7, 63, 150, 299}) {
+        Call one;
+        one.columns = 1;
+        one.x       = {call.x[t]};
+        one.experts.assign(call.experts.begin() + t * K, call.experts.begin() + (t + 1) * K);
+        one.gamma.assign(call.gamma.begin() + t * K, call.gamma.begin() + (t + 1) * K);
+        const Out alone = run_prompt(one, false);
+        for (int i = 0; i < K * H; ++i) { alone_differ += alone.out[i] != got.out[std::size_t(t) * K * H + i] ? 1 : 0; }
+    }
+    std::printf("NVFP4 prompt route (300 columns): h vs FP64 worst %.3e (criterion 2^-6 = %.3e); outputs vs FP64 over the "
+                "kernel's h worst %.3f of the bound (criterion 1); %d outputs of 5 columns differ from the columns alone; "
+                "%ld of %ld checked outputs differ from the exact narrow route (reported)\n",
+                worst_h, std::ldexp(1.0, -6), worst_y, alone_differ, narrow_differ, checked);
+    check(worst_h <= std::ldexp(1.0, -6), "prompt route: h is further from FP64 than its criterion");
+    check(worst_y <= 1.0, "prompt route: an output is outside its bound from FP64 over the kernel's h");
+    check(alone_differ == 0, "prompt route: a column's outputs depend on the call's other columns");
+    for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den), workspace}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
+}
+
 // ---------------------------------------------------------------------------- router
 
 void router_case() {
@@ -659,6 +819,7 @@ INFERNIX_OP_TEST(w4a4_sparse_moe) {
     router_case();
     bank_case(false);
     bank_case(true);
+    prompt_case();
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

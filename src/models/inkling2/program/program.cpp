@@ -225,6 +225,7 @@ public:
         CallPlan call;
         // first: the sequence's first position (every lane's sequence starts at 0), not the call's first column.
         call.first.assign(index + 1, 0);
+        call.prompt = true;
         for (std::uint32_t i = 0; i < chunk; ++i) {
             call.tokens.push_back(lane.tokens[lane.processed + i]);
             call.lane.push_back(static_cast<std::int32_t>(index));
@@ -452,7 +453,8 @@ public:
         for (std::uint32_t at = 0; at < n - 1;) {
             const std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, n - 1 - at);
             CallPlan call;
-            call.first = {0};
+            call.first  = {0};
+            call.prompt = true;
             for (std::uint32_t i = 0; i < chunk; ++i) {
                 call.tokens.push_back(tokens[at + i]);
                 call.lane.push_back(0);

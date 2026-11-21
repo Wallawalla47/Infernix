@@ -979,9 +979,23 @@ workspace and the forward's buffers take the chunk as their capacity. Measured (
 512 with the wide projections (the default chunk), 1,398.1 / 1,359.3 at 2,048. A 2,048-column call's time goes to
 K2 (41 %), the experts (30 %), W_o (12 %), the gates (7 %), attention and the router (5 % each): the skinny fold pins
 each projection to SIMT FMAs reading x once per two rows (~6 TFLOPs at K2), and the experts' exact core costs
-~3.3 µs a column per NVFP4 visit once every expert is resident. Tensor-core projections and attention would change
-the bits: they are fast paths under [model quality §6](model-quality.md#6-numerical-acceptance-policy-and-fast-paths),
-measured against this route, not built yet.
+~3.3 µs a column per NVFP4 visit once every expert is resident.
+
+**The prompt route (2026-11-21).** Prefill and scoring calls (`CallPlan::prompt`) now run their own arithmetic on
+tensor cores at every width, while decode, verification and forced tokens keep the decode route: the owner's agreed
+reproducible-route contract lets a prompt token differ from the same position computed by decode, and requires only
+that each route give a column the same bits in any call (so any chunking of a prompt is exact, and verify columns
+equal decode columns). The fused projections (K2, W_o, the gates' downs and forget/gain) and the router's FP32 logits
+run `projections_mma` (ops::linear's MMA arithmetic: each output's k16 steps in ascending K chained through the FP32
+accumulator, no split of K; FP64 oracle: worst 0.06 of a (K/16 + 5) 2^-23 Σ|wx| bound at FP32 output); each column's
+selection by a warp; the NVFP4 experts offloaded_sparse_moe's grouped `mxf4nvf4` pipeline at Inkling's geometry with
+this Op's epilogues (bf16(acc · rs), the softcapped SwiGLU · γ, four-over-six h by warp, bf16(acc · rs_h); FP64 oracle
+over the kernel's own h within half a BF16 ulp plus the FP32 sum's bound: worst 0.992 of it; on the op test's random
+banks it matched the exact narrow route on every checked output). The MXFP8 layers and attention still run the decode
+route's kernels on prompt calls. A 2,048-column call (forward test, one eager call): 1,552 ms → 221 ms (9,264
+tok/s): experts 83.5 ms, attention 76.9, K2 23.4, W_o 9.0, gates 8.7, router 8.0. A narrow instance of the projections'
+MMA arithmetic in the decode round lost to the fold at widths 1 and 2 (+20.8 %, +18.0 %) and won at 8 (−6.4 %), so the
+decode route keeps the fold.
 
 ### 14.2 Pass schedule
 

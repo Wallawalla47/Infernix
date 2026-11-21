@@ -52,4 +52,12 @@ struct ProjectionArgs {
 
 void projections(const ProjectionArgs& args, cudaStream_t stream);
 
+// The same segments on tensor cores (BF16 storage only, K a multiple of 64; every weight, input and output 16-byte
+// aligned and each output row a multiple of 16 bytes), in ops::linear's MMA arithmetic: rows are the A operand of
+// mma.m16n8k16, columns the B operand, and each (row, column) accumulates its k16 steps in ascending K from zero in FP32
+// through the MMA's accumulator, K never split. A column's bits depend only on its row and its own input: not on the
+// call's width, its other columns or matrices, nor on the tile shape the launch picks. Other bits than projections()'s
+// fold.
+void projections_mma(const ProjectionArgs& args, cudaStream_t stream);
+
 } // namespace infernix::ops::inkling2

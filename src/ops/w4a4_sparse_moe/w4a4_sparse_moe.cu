@@ -23,6 +23,7 @@
 #include "ops/common/canonical_math.h"
 #include "ops/common/mma.cuh"
 #include "ops/ggml/ggml_tile.cuh"
+#include "ops/w4a4_sparse_moe/expert_math.cuh"
 
 #include <cuda_runtime.h>
 
@@ -85,12 +86,7 @@ struct Shape {
 
 __device__ __forceinline__ float bf16f(std::uint16_t v) { return canon::bf16_to_f32(v); }
 
-__device__ __forceinline__ std::uint16_t swiglu(std::uint16_t g, std::uint16_t u, float gamma, float gate_cap,
-                                                float up_cap) {
-    const float gate = bf16f(g), up = bf16f(u);
-    const float a    = canon::mul_rn(canon::softcap_c(gate, gate_cap), canon::sigmoid_c(gate));
-    return canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(a, canon::softcap_c(up, up_cap)), gamma));
-}
+using detail::swiglu;
 
 __device__ __forceinline__ std::uint64_t global_ns() {
     std::uint64_t now;
@@ -278,32 +274,8 @@ __global__ void __launch_bounds__(kRouteThreads) route_kernel(const std::uint16_
     if (last == 0) { return; }
     __threadfence();
     for (int t = warp; t < columns; t += kRouteWarps) {
-        float* k = keys[warp];
-        for (int e = lane; e < experts; e += 32) {
-            const float s = canon::sigmoid_c(__ldcg(ws.logits + static_cast<std::size_t>(t) * experts + e));
-            k[e]          = canon::add_rn(s, bias[e]);
-        }
-        __syncwarp();
-        for (int e = lane; e < experts; e += 32) {
-            const float key = k[e];
-            int rank        = 0;
-            for (int f = 0; f < experts; ++f) {
-                const float other = k[f];
-                rank += (other > key || (other == key && f < e)) ? 1 : 0;
-            }
-            if (rank < kTopK) {
-                ws.routed[t * kTopK + rank] = e;
-                sel[warp][rank] = canon::sigmoid_c(__ldcg(ws.logits + static_cast<std::size_t>(t) * experts + e));
-            }
-        }
-        __syncwarp();
-        if (lane < kTopK) {
-            const float* s  = sel[warp];
-            const float sum = canon::add_rn(canon::add_rn(canon::add_rn(s[0], s[2]), canon::add_rn(s[1], s[3])),
-                                            canon::add_rn(canon::add_rn(s[4], s[6]), canon::add_rn(s[5], s[7])));
-            ws.gamma[t * kTopK + lane] = canon::mul_rn(canon::div_rn(s[lane], sum), route_scale);
-        }
-        __syncwarp();
+        detail::select_column(ws.logits + static_cast<std::size_t>(t) * experts, bias, experts, route_scale, keys[warp],
+                              sel[warp], lane, ws.routed + t * kTopK, ws.gamma + t * kTopK);
     }
     __syncthreads();
     dispatch_block(ws.routed, columns, experts, ws, cursor);
@@ -807,6 +779,11 @@ Workspace layout(std::int32_t experts, std::int32_t intermediate, std::int32_t c
     w.h_amax     = reinterpret_cast<std::uint32_t*>(take(m * 4));
     w.h_rows     = reinterpret_cast<std::uint8_t*>(take(m * h_row));
     w.error      = reinterpret_cast<std::uint32_t*>(take(4));
+    w.x_plane    = reinterpret_cast<std::uint8_t*>(take(m * kPromptXRowBytes));
+    w.h_plane    = reinterpret_cast<std::uint8_t*>(take(m * kPromptHRowBytes));
+    w.tiles      = reinterpret_cast<std::int32_t*>(take(2 * (e + m / 64 + 1) * 4));
+    w.pass_tiles = reinterpret_cast<std::int32_t*>(take(2 * 4));
+    w.job_records = reinterpret_cast<const std::uint8_t**>(take(e * sizeof(void*)));
     return w;
 }
 
@@ -840,6 +817,34 @@ void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t
     CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic, {grid, dim3(kRouteThreads), 0, stream}, route_kernel, x,
                                 columns, router, bias, experts, route_scale, workspace));
     check_launch("router");
+}
+
+namespace {
+// The prompt route's selection: a warp per column, eight a CTA.
+__global__ void __launch_bounds__(kRouteThreads) select_kernel(const float* __restrict__ logits, int columns,
+                                                               const float* __restrict__ bias, int experts,
+                                                               float route_scale, Workspace ws) {
+    __shared__ float keys[kRouteWarps][256];
+    __shared__ float sel[kRouteWarps][kTopK];
+    const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
+    pdl::wait_for_dependencies();
+    const int t = static_cast<int>(blockIdx.x) * kRouteWarps + warp;
+    if (t >= columns) { return; }
+    detail::select_column(logits + static_cast<std::size_t>(t) * experts, bias, experts, route_scale, keys[warp],
+                          sel[warp], lane, ws.routed + t * kTopK, ws.gamma + t * kTopK);
+}
+} // namespace
+
+void moe_select(const float* logits, std::int32_t columns, const float* bias, std::int32_t experts, float route_scale,
+                const Workspace& workspace, cudaStream_t stream) {
+    if (experts <= 0 || experts > 256 || columns <= 0 || columns > workspace.capacity) {
+        throw std::invalid_argument("w4a4_sparse_moe select: at most 256 experts, 1..capacity columns");
+    }
+    const dim3 grid((columns + kRouteWarps - 1) / kRouteWarps);
+    CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic, {grid, dim3(kRouteThreads), 0, stream}, select_kernel,
+                                logits, columns, bias, experts, route_scale, workspace));
+    check_launch("select");
+    moe_dispatch(routed_routing(workspace), columns, experts, workspace, stream);
 }
 
 void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t experts, const Workspace& workspace,

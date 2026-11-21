@@ -22,6 +22,15 @@
 // 4. Graphs: a 16-column call and a 1-column step captured whole (PDL dependents) and replayed three times from the
 //    same state give the eager logits bit for bit.
 // 5. Lanes: three lanes (different tokens, mixed widths, a padding column) in one call give each lane's solo logits.
+// 6. The bit guard (INFERNIX_INKLING2_LOGITS_GUARD = a file of free-running logits): the decode route's logits byte
+//    for byte, for changes claimed to keep them.
+// 7. The prompt route (CallPlan::prompt: tensor-core projections, router and experts): the 32 positions as one prompt
+//    call give the bits of prompt calls of 8, and the greedy continuation equals the reference's. Reported: its
+//    argmax elsewhere and its largest logit difference from the reference and from the decode route.
+//
+// Timing (environment): INFERNIX_INKLING2_PROFILE = width (the captured decode round, INFERNIX_INKLING2_CONTEXT
+// positions before it); INFERNIX_INKLING2_PREFILL_PROFILE = width (one prompt call, each Op's time;
+// INFERNIX_INKLING2_PREFILL_DECODE runs it on the decode route instead, for comparison).
 //
 // Diagnostics (environment): INFERNIX_INKLING2_DRIFT prints the free-running drift per visit and the NLL detail;
 // INFERNIX_INKLING2_HYBRID = blocks | input | perturb runs a hybrid (the reference's blocks and message sources, or its
@@ -467,7 +476,8 @@ double drift(const std::vector<double>& got, const Reference& ref, const std::st
 // Diagnostic hybrids (INFERNIX_INKLING2_HYBRID): "blocks" runs the forward's own inputs with the reference's block and
 // message sources; "input" the reference's visit inputs with the forward's own blocks and message sources.
 std::vector<float> free_running(const m::Parameters& p, m::Forward& fw, State& state, const Reference& ref, int width,
-                                bool report = false, const std::string& hybrid = {}, int perturb_offset = 0) {
+                                bool report = false, const std::string& hybrid = {}, int perturb_offset = 0,
+                                bool prompt = false) {
     const auto& c = p.model.config().text;
     state.reset();
     std::vector<float> out;
@@ -476,7 +486,9 @@ std::vector<float> free_running(const m::Parameters& p, m::Forward& fw, State& s
     std::vector<std::unique_ptr<DeviceRows>> rblocks;
     for (int i = 0; i < 4; ++i) { rblocks.push_back(std::make_unique<DeviceRows>(static_cast<std::size_t>(width) * H)); }
     for (int c0 = 0; c0 < kPositions; c0 += width) {
-        fw.prepare(call_plan(ref, c0, width));
+        m::CallPlan plan = call_plan(ref, c0, width);
+        plan.prompt      = prompt;
+        fw.prepare(plan);
         fw.embed(nullptr);
         if (hybrid == "perturb") {
             // One BF16 ulp up in every 97th element of each column's embedding: the model's own sensitivity.
@@ -712,7 +724,8 @@ void profile_prefill(const m::Parameters& p, int width) {
         plan.lane.push_back(0);
         plan.position.push_back(t);
     }
-    plan.first = {0};
+    plan.first  = {0};
+    plan.prompt = std::getenv("INFERNIX_INKLING2_PREFILL_DECODE") == nullptr; // the decode route only for comparison
     cudaStream_t stream = nullptr;
     cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     const auto call = [&] {
@@ -1024,6 +1037,40 @@ int main() {
                 std::printf(" %s:%+.3f", offset.c_str(), value.get<double>() - spread.at("reference").get<double>());
             }
             std::printf("\n");
+        }
+        // 7. The prompt route (CallPlan::prompt: the tensor-core projections, router and experts): the 32 positions as
+        //    one prompt call and as prompt calls of 8 give the same logits bit for bit, and the greedy continuation
+        //    (the argmax from the last prompt position on) equals the reference's. Reported: the largest logit
+        //    difference from the reference and from the decode route.
+        {
+            const auto one   = free_running(parameters, forward, state, ref, kPositions, false, {}, 0, true);
+            const auto eight = free_running(parameters, forward, state, ref, 8, false, {}, 0, true);
+            const bool same  = std::memcmp(one.data(), eight.data(), one.size() * 4) == 0;
+            std::printf("prompt route: one 32-column call = calls of 8: %s\n", same ? "bit for bit" : "DIFFERENT");
+            ok = ok && same;
+            double vs_ref = 0, vs_decode = 0;
+            int prompt_differ = 0;
+            for (int t = 0; t < kPositions; ++t) {
+                const float* g = one.data() + static_cast<std::size_t>(t) * V;
+                const float* r = rl + static_cast<std::size_t>(t) * V;
+                const float* d = verify.data() + static_cast<std::size_t>(t) * V;
+                std::size_t ga = 0, ra = 0;
+                for (std::size_t i = 0; i < V; ++i) {
+                    vs_ref    = std::max(vs_ref, std::fabs(double{g[i]} - r[i]));
+                    vs_decode = std::max(vs_decode, std::fabs(double{g[i]} - d[i]));
+                    if (g[i] > g[ga]) { ga = i; }
+                    if (r[i] > r[ra]) { ra = i; }
+                }
+                if (ga != ra) {
+                    ++prompt_differ;
+                    std::printf("  prompt route position %d: argmax %zu, the reference's %zu%s\n", t, ga, ra,
+                                t >= kLastPrompt ? "  FAIL (greedy continuation)" : "");
+                    ok = ok && t < kLastPrompt;
+                }
+            }
+            std::printf("prompt route: %d of %d argmax differ from the reference (none allowed from position %d); largest "
+                        "logit difference %.4f from the reference, %.4f from the decode route\n",
+                        prompt_differ, kPositions, kLastPrompt, vs_ref, vs_decode);
         }
         ok = graph_replay(parameters, forward, state, ref) && ok;
         ok = lanes_alone(parameters, forward, state, ref) && ok;

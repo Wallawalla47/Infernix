@@ -89,7 +89,19 @@ struct Workspace {
     std::uint8_t* h_rows      = nullptr; // [capacity * kTopK][row_bytes(I)]
     // [1]: kErrorDownStalled once a down CTA's wait for its job made no progress for 2 s (zero: no error).
     std::uint32_t* error      = nullptr;
+    // The prompt route's planes (moe_experts_prompt): every dispatched entry's A4(x) and A4(h) rows in dispatch order
+    // (the grouped GEMM's tensor-map layout: kPromptXRowBytes and kPromptHRowBytes a row), its work tiles and each
+    // job's record.
+    std::uint8_t* x_plane             = nullptr; // [capacity * kTopK][kPromptXRowBytes]
+    std::uint8_t* h_plane             = nullptr; // [capacity * kTopK][kPromptHRowBytes]
+    std::int32_t* tiles               = nullptr; // [2 * (E + capacity * kTopK / 64 + 1)]
+    std::int32_t* pass_tiles          = nullptr; // [2]
+    const std::uint8_t** job_records  = nullptr; // [E]
 };
+
+// The prompt route's plane rows (NVFP4 layers, H = 2304, I = 1152): codes then E4M3 scales, 16-byte strides.
+inline constexpr std::int32_t kPromptXRowBytes = 2304 / 2 + 2304 / 16;     // 1,296
+inline constexpr std::int32_t kPromptHRowBytes = 1152 / 2 + 80;            // 576 code bytes, an 80-byte scale map
 
 // The router of `columns` columns of x (BF16 [T][H], the MoE input), then the dispatch (moe_dispatch's) of its routing
 // in its last CTA: logits l_e = sum_k x_k W[e, k] in binary32 (BF16 products are exact; one fixed order per column: a
@@ -120,5 +132,23 @@ void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t exp
 // The routed experts of the dispatched entries: outputs BF16 [columns * kTopK][H].
 void moe_experts(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,
                  std::uint16_t* outputs, cudaStream_t stream);
+
+// The prompt route (a prefill call's columns, any width). Its arithmetic differs from the narrow route's in the
+// router's logits and the experts' sums, and each column is still computed from its own inputs alone, so a prompt
+// column's outputs never depend on the call's width or other columns.
+//
+// moe_select: each column's selection (moe_route's keys, ranks and gamma) from logits FP32 [T][E] computed by the
+// caller, into the workspace's routing, then the dispatch.
+void moe_select(const float* logits, std::int32_t columns, const float* bias, std::int32_t experts, float route_scale,
+                const Workspace& workspace, cudaStream_t stream);
+
+// moe_experts_prompt: NVFP4 layers on block-scaled tensor cores (mma mxf4nvf4, a grouped GEMM over the dispatched
+// entries): a gate/up or down output is bf16(acc * rs) with acc the FP32 tensor-core sum of the decoded block
+// products in one fixed K order (the narrow route's exact int64 sum rounded once, up to the accumulation's rounding)
+// and rs the narrow route's row scale; h and its four-over-six rows as the narrow route forms them. MXFP8 layers run
+// the narrow route's kernels (their arithmetic is one fixed K order per column at every width). Outputs as
+// moe_experts'.
+void moe_experts_prompt(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,
+                        std::uint16_t* outputs, cudaStream_t stream);
 
 } // namespace infernix::ops::w4a4_moe
