@@ -62,6 +62,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--a8-activations", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
+    ServeOptionArity{"--ablate"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
     ServeOptionArity{"--log-stats-panel"},
@@ -437,6 +438,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             beside its head in the artifact\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
+           "  --ablate FILE              Qwen3.8-Flash-Next runtime ablation sidecar\n"
+           "                             (docs/serving.md, \"Runtime ablation\"): a sidecar.json\n"
+           "                             naming a direction file and per-layer alpha tables;\n"
+           "                             each cut layer removes the direction's component from\n"
+           "                             its attention and/or MLP residual writes. Absent:\n"
+           "                             byte-identical to the standard engine. Not combinable\n"
+           "                             with --lossless; startup-fixed (graphs bake the hooks)\n"
            "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
            "                             (default 1); startup-fixed, extends the allowed\n"
            "                             ceiling only, not --max-context\n"
@@ -936,6 +944,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.context_cost_presets.empty()) {
                 throw std::invalid_argument("--context-cost-presets must not be empty");
             }
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = require_value("--ablate");
+            if (options.ablate_sidecar_path.empty()) { throw std::invalid_argument("--ablate must not be empty"); }
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));

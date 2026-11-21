@@ -14,6 +14,7 @@ import {
   Image as ImageIcon,
   Layers,
   Puzzle,
+  Scissors,
   ScrollText,
   Sparkles,
   Wrench,
@@ -924,6 +925,25 @@ const LORA: FormSection = {
   ],
 };
 
+const ABLATE: FormSection = {
+  id: "ablate",
+  title: "Ablation sidecar",
+  description: "A direction cut out of the model's residual writes at load (refusal removal)",
+  icon: Scissors,
+  when: flashNext,
+  controls: [
+    {
+      kind: "text",
+      flag: "--ablate",
+      label: "Ablation sidecar",
+      help: "An ablation sidecar's sidecar.json, with the direction file it names beside it: a direction removed from the attention and MLP outputs of the layers it lists, at the strength it gives each. Fitted to one artifact; the start refuses a malformed sidecar, and --lossless. docs/ablate.md",
+      placeholder: "none",
+      mono: true,
+      wide: true,
+    },
+  ],
+};
+
 const LOGGING: FormSection = {
   id: "logging",
   title: "Logging and diagnostics",
@@ -1012,6 +1032,7 @@ export const FORM_SECTIONS: readonly FormSection[] = [
   VISION,
   ROUTES,
   LORA,
+  ABLATE,
   LOGGING,
 ];
 

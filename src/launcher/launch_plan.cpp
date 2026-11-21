@@ -229,7 +229,7 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
         warnings.push_back(*serve.error);
     }
     for (const char* flag : {"--draft-model", "--ngram-volume", "--chat-template", "--expert-stripe", "--lora",
-                             "--context-cost-presets"}) {
+                             "--context-cost-presets", "--ablate"}) {
         if (const std::optional<std::string> value = flag_value(args, flag)) {
             std::error_code error;
             if (!std::filesystem::exists(utf8_path(*value), error)) {
@@ -272,6 +272,9 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
     }
     if (has_flag(args, "--lora") && (model.needs_ngram_volume || model.num_experts.has_value())) {
         warnings.push_back("--lora adapts dense Qwen3.5 models (the 27B) only; this model's MLPs are experts");
+    }
+    if (has_flag(args, "--ablate") && model.family != "qwen3.8-flash-next") {
+        warnings.push_back("--ablate cuts Qwen3.8-Flash-Next only; this model refuses it");
     }
     if (has_flag(args, "--draft-model") && !model.accepts_draft_model) {
         warnings.push_back("--draft-model applies to Qwen3.8-Flash-Next only; this artifact bundles its drafters");

@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 27;
+inline constexpr int kSchemaVersion                   = 28;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -54,6 +54,7 @@ enum class OutputFormat { Table, Json, Csv };
 struct BenchOptions {
     std::string artifact_path;
     std::string lora_path; // --lora: EngineOptions::lora_path
+    std::string ablate_sidecar_path; // --ablate: EngineOptions::ablate_sidecar_path
     std::string ngram_volume_path;
     infernix::NgramResidency ngram_residency = infernix::NgramResidency::Auto;
     std::string expert_stripe_path;
@@ -206,6 +207,7 @@ struct BenchEnvironment {
     // How the expert cache started: "calibrated" (the default seed), "off" (empty) or the state file.
     std::string expert_state = "calibrated";
     std::string lora_path; // --lora, empty without an adapter
+    std::string ablate_sidecar_path; // --ablate, empty without a sidecar
     std::uint64_t ram_free_bytes = infernix::kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes;
     std::optional<ExpertRamLayout> expert_ram_layout;

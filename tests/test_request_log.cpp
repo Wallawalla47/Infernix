@@ -183,6 +183,8 @@ int main() {
         check(server.at("artifact").at("formats") == Json::array({"q4_g64_fp16", "q8_g32_fp16"}),
               "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
+    failures += check(server.at("artifact").at("ablate_sidecar").is_null(),
+                      "server_start names no ablation sidecar when none was applied");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&

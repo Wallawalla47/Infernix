@@ -568,6 +568,9 @@ std::string format_server_start_json(
                                                           {"lora_adapter", load.lora_adapter.empty()
                                                                                ? Json(nullptr)
                                                                                : Json(load.lora_adapter)},
+                                                          {"ablate_sidecar", load.ablate_sidecar.empty()
+                                                                                 ? Json(nullptr)
+                                                                                 : Json(load.ablate_sidecar)},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const infernix::ContextCacheOptions& cache       = engine_options.context_cache;

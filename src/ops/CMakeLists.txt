@@ -20,6 +20,7 @@ infernix_cuda_non_rdc_archive(infernix_nvfp4_non_rdc)
 target_link_libraries(infernix_nvfp4_non_rdc PRIVATE infernix_core infernix_cuda_runtime CUDA::cuda_driver)
 
 include(basic_sources.cmake)
+include("${CMAKE_CURRENT_LIST_DIR}/ablate_direction/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize/sources.cmake")

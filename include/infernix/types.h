@@ -717,6 +717,10 @@ struct EngineOptions {
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
+    // Qwen3.8-Flash-Next ablation sidecar (docs/ablate.md): a sidecar.json naming a
+    // direction file and a per-layer alpha table. Empty (no --ablate): nothing loads, nothing
+    // hooks, behavior byte-identical to the standard engine.
+    std::filesystem::path ablate_sidecar_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
     // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
     // before the first request (warm start), written at stop and every 10 minutes between requests.
@@ -2597,6 +2601,9 @@ struct LoadSummary {
     // EngineOptions::lora_path: the adapter applied, as "<directory>: <modules, rank, scale, factor type, base>";
     // empty without one.
     std::string lora_adapter;
+    // EngineOptions::ablate_sidecar_path: the sidecar applied, as "<sidecar.json>: <format, direction, lanes cut,
+    // provenance>" (the startup log's line); empty without one.
+    std::string ablate_sidecar;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;

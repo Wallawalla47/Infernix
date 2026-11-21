@@ -9,6 +9,7 @@ add_library(infernix_artifact STATIC
   views.cpp
   safetensors.cpp
   peft_lora.cpp
+  ablate_sidecar.cpp
 )
 infernix_internal_includes(infernix_artifact)
 target_link_libraries(infernix_artifact PUBLIC infernix_core infernix::json)

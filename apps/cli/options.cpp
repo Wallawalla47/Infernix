@@ -84,6 +84,7 @@ constexpr std::array kCliOptions{
     CliOption{"--messages"},
     CliOption{"--chat-template"},
     CliOption{"--lora"},
+    CliOption{"--ablate"},
     CliOption{"--ngram-volume"},
     CliOption{"--ngram-residency"},
     CliOption{"--expert-state"},
@@ -195,7 +196,8 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE] [--lora PATH] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
+           "       [--chat-template FILE] [--lora PATH] [--ablate FILE] [--ngram-volume FILE]\n"
+           "       [--ngram-residency auto|ram|volume]\n"
            "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--a16-activations]\n"
            "       [--a8-activations]\n"
            "       [--embedding-host]\n"
@@ -377,6 +379,9 @@ std::string usage_text(const char* argv0) {
            "                           adapter directory (or its adapter_model.safetensors,\n"
            "                           adapter_config.json beside it); Qwen3.5 dense models\n"
            "                           (the 27Bs); --lossless computes it as PEFT does (docs/lora.md)\n"
+           "  --ablate FILE            apply an ablation sidecar at runtime: its sidecar.json,\n"
+           "                           the direction file beside it; Qwen3.8-Flash-Next\n"
+           "                           (docs/ablate.md)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"
            "                           only), Qwen3.8-Flash-Next dflash2: one-request rounds\n"
@@ -472,6 +477,8 @@ Options parse_options(int argc, char** argv) {
             options.chat_template_path = value(arg);
         } else if (arg == "--lora") {
             options.lora_path = value(arg);
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = value(arg);
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value(arg);
         } else if (arg == "--ngram-residency") {

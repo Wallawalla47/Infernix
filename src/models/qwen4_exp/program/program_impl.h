@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen4_exp/program/program.h"
+#include "models/qwen4_exp/load/ablate.h"
 
 #include "core/arena.h"
 #include "core/cuda_vmm.h"
@@ -1043,7 +1044,7 @@ public:
         const std::int32_t rounds = round_columns(o, d, lanes);
         std::size_t bytes =
             execution::Forward::workspace_bytes(c, std::max(columns, rounds), dim(o.max_context), o.kv_cache,
-                                                wide_a16(o)) +
+                                                wide_a16(o), !o.ablate_sidecar_path.empty()) +
             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         // A prefill projection's input encoded for its prefill route, K up to the GDN/QSA value width (the output
         // projections' input): f16-accumulate-prefill's FP16 columns, or the two E4M3 planes of --a8-activations'
@@ -1313,6 +1314,13 @@ public:
         if (!c_.lossless) {
             planner_ = execution::Forward::planner(parameters_, device_, *work_, dim(options_.max_context),
                                                    options_.fast_paths, options_.kv_cache);
+            // The planner measures the forward the engine runs: with an ablation sidecar a cut MLP lane forms the MoE
+            // output instead of injecting it (Forward::layer_impl's mlp_cut), so the planner's walks must carry the
+            // same cut or the wide arena is sized for the uncut forward and overflows at the first cut layer. No
+            // upload: plans run no kernels.
+            if (!options_.ablate_sidecar_path.empty()) {
+                planner_->set_ablate_sidecar(bind_ablate(options_.ablate_sidecar_path, c_));
+            }
             // The chunk's wide arena by the forward's plan (the device plan's figure is the formula's, made before
             // the parameters bound).
             if (wide_work_ > 0) { wide_work_ = wide_need(chunk_); }
@@ -1807,6 +1815,14 @@ public:
         }
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), dim(options_.max_context), options_.fast_paths);
+        // Ablation sidecar (--ablate, docs/ablate.md): set before graph capture so the captured
+        // lanes bake the hook launches; an empty path loads nothing and hooks nothing.
+        if (!options_.ablate_sidecar_path.empty()) {
+            AblateBinding sidecar = bind_ablate(options_.ablate_sidecar_path, c_);
+            sidecar.upload();
+            diagnostic("ablation sidecar " + options_.ablate_sidecar_path.string() + ": " + sidecar.describe());
+            forward_->set_ablate_sidecar(std::move(sidecar));
+        }
         if (dflash2_) { create_dflash2_drafter(); }
         if (free_after_frames) {
             // What startup takes from the device after the frames' sizing, before the graphs (the sizing planned for

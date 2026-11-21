@@ -2,11 +2,15 @@
 #include "runtime/engine/expert_memory.h"
 #include "runtime/engine/model_instance.h"
 
+#include <cuda_runtime.h>
+
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -501,6 +505,45 @@ int main() {
             infernix::runtime::validate_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(!rejected, "--vram-headroom-mib was refused with offloaded experts");
+    }
+    // A saved prefix cache belongs to the sidecar as it does to the artifact: adding --ablate, or changing the direction
+    // file it names, changes the fingerprint, so KV saved without the cut (or with another) is never reused under it.
+    {
+        const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix_ablate_fingerprint_test";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        std::ofstream(dir / "sidecar.json") << R"({"format":"ablate-direction-v2","direction_file":"d.f32.bin"})";
+        std::ofstream(dir / "d.f32.bin", std::ios::binary) << std::string(16, '\0');
+        EngineOptions options;
+        options.artifact_path = "model.infernix";
+        const cudaDeviceProp device{};
+        const std::string plain = infernix::runtime::hybrid_cache_fingerprint(options, "sig", device);
+        options.ablate_sidecar_path = dir / "sidecar.json";
+        const std::string cut = infernix::runtime::hybrid_cache_fingerprint(options, "sig", device);
+        std::ofstream(dir / "d.f32.bin", std::ios::binary) << std::string(32, '\0');
+        const std::string recut = infernix::runtime::hybrid_cache_fingerprint(options, "sig", device);
+        failures += check(plain != cut, "--ablate left the saved prefix cache's fingerprint unchanged");
+        failures += check(cut != recut, "a changed direction file left the saved prefix cache's fingerprint unchanged");
+        failures += check(cut.find("d.f32.bin") != std::string::npos, "the fingerprint does not name the direction file");
+        std::filesystem::remove_all(dir);
+    }
+    // --ablate: only Qwen3.8-Flash-Next wires the cut in; every other architecture refuses it rather than serve uncut.
+    {
+        EngineOptions options;
+        options.artifact_path       = "model.infernix";
+        options.ablate_sidecar_path = "sidecar.json";
+        for (const auto architecture : {infernix::models::Architecture::Qwen3_5, infernix::models::Architecture::Qwen3_5Moe,
+                                        infernix::models::Architecture::Qwen4Exp}) {
+            bool rejected = false;
+            try {
+                infernix::runtime::validate_engine_options(options, architecture,
+                                                           architecture == infernix::models::Architecture::Qwen4Exp);
+            } catch (const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find("--ablate") != std::string::npos;
+            }
+            failures += check(rejected == (architecture != infernix::models::Architecture::Qwen4Exp),
+                              "--ablate was misjudged for its architecture");
+        }
     }
     // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts: MTP keeps its drafter (its gated
     // drafts beat plain decode there), DFlash2 decodes without one (no policy beat plain decode); a fixed

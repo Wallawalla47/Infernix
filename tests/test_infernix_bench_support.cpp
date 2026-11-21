@@ -548,7 +548,7 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 27, "report schema v27");
+    failures += expect(report.at("schema_version") == 28, "report schema v28");
     failures += expect(report.at("config").at("lora") == "" && report.at("load").at("lora_adapter") == "" &&
                            report.at("memory").at("adapter_bytes") == 0 &&
                            report.at("memory").at("draft_screen_bytes") == 0,
@@ -570,6 +570,18 @@ int test_report_contract() {
     failures += expect(lora_table.find(", LoRA adapter ") != std::string::npos &&
                            lora_table.find(" lora=C:/adapters/pi") != std::string::npos,
                        "the table names the adapter in its memory and config lines");
+    failures += expect(report.at("config").at("ablate") == "" && report.at("load").at("ablate_sidecar") == "",
+                       "no ablation sidecar: an empty path and no sidecar named");
+    auto ablate_env                = env;
+    ablate_env.ablate_sidecar_path = "C:/sidecars/refusal/sidecar.json";
+    ablate_env.load.ablate_sidecar = "C:/sidecars/refusal/sidecar.json: v2, one shared direction";
+    const Json ablate = Json::parse(qb::format_json(ablate_env, "infernix_bench --ablate C:/sidecars/refusal/sidecar.json", results));
+    failures += expect(ablate.at("config").at("ablate") == "C:/sidecars/refusal/sidecar.json" &&
+                           ablate.at("load").at("ablate_sidecar") == ablate_env.load.ablate_sidecar,
+                       "report records the ablation sidecar and what the Engine applied");
+    failures += expect(qb::format_table(ablate_env, results).find(" ablate=C:/sidecars/refusal/sidecar.json") !=
+                           std::string::npos,
+                       "the table names the sidecar in its config line");
     failures += expect(report.at("config").at("expert_state") == "calibrated" &&
                            report.at("config").at("ram_free_mib") == 4096,
                        "report records the expert seed and the RAM kept free");

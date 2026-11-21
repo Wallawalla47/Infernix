@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
         infernix::EngineOptions engine_options;
         engine_options.artifact_path   = options.artifact_path;
         engine_options.lora_path       = options.lora_path;
+        engine_options.ablate_sidecar_path = options.ablate_sidecar_path;
         engine_options.device          = options.device;
         engine_options.max_context     = max_context;
         engine_options.max_concurrency = options.concurrency;
@@ -311,6 +312,7 @@ int main(int argc, char** argv) {
         env.ngram_residency              = options.ngram_residency;
         env.expert_stripe_path           = options.expert_stripe_path;
         env.lora_path                    = options.lora_path;
+        env.ablate_sidecar_path          = options.ablate_sidecar_path;
         env.expert_state                 = options.expert_state_off           ? std::string("off")
                                            : options.expert_state_path.empty() ? std::string("calibrated")
                                                                                : options.expert_state_path;
