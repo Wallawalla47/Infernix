@@ -7,6 +7,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/linear/bf16_p12/bf16_p12_kernels.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -33,8 +34,15 @@ struct Params {
     std::int32_t cols; // its columns (<= Tokens)
 };
 
-template <int Tokens, int Warps, int RowsPerWarp, class Out>
+// A chunk of 8 weights as stored: BF16 words, or bf16_p12 code bytes and exponent nibbles.
+struct P12Raw {
+    uint2 code;
+    unsigned nib;
+};
+
+template <int Tokens, int Warps, int RowsPerWarp, bool P12, class Out>
 __global__ void __launch_bounds__(Warps * 32) projections_kernel(const Params p) {
+    using Raw      = std::conditional_t<P12, P12Raw, uint4>;
     const int lane = static_cast<int>(threadIdx.x & 31U), warp = static_cast<int>(threadIdx.x >> 5);
     const int cta  = static_cast<int>(blockIdx.x);
     int s          = 0;
@@ -42,29 +50,51 @@ __global__ void __launch_bounds__(Warps * 32) projections_kernel(const Params p)
     const ProjectionSegment seg = p.seg[s];
     const int first             = ((cta - p.cta_begin[s]) * Warps + warp) * RowsPerWarp;
     const int chunks            = p.k / 8;
-    const uint4* rows[RowsPerWarp];
+    std::size_t base[RowsPerWarp];
+    ::infernix::ops::detail::P12Row prow[RowsPerWarp];
 #pragma unroll
     for (int r = 0; r < RowsPerWarp; ++r) {
-        rows[r] = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(min(first + r, seg.rows - 1)) * p.k);
+        const int row = min(first + r, seg.rows - 1);
+        base[r]       = static_cast<std::size_t>(row) * chunks;
+        if constexpr (P12) { prow[r] = ::infernix::ops::detail::p12_row(seg.words, row); }
     }
-    uint4 w[kAhead][RowsPerWarp];
+    const auto load = [&](int r, int chunk) {
+        if constexpr (P12) {
+            return P12Raw{__ldcs(static_cast<const uint2*>(seg.codes) + base[r] + chunk),
+                          __ldcs(static_cast<const unsigned*>(seg.nibbles) + base[r] + chunk)};
+        } else {
+            return __ldcs(reinterpret_cast<const uint4*>(seg.weight) + base[r] + chunk);
+        }
+    };
+    const auto decode = [&](const Raw& raw, int r, int chunk) {
+        if constexpr (P12) {
+            return ::infernix::ops::detail::p12_decode_chunk(raw.code, raw.nib, prow[r], chunk, seg.escapes);
+        } else {
+            (void)r, (void)chunk;
+            return raw;
+        }
+    };
+    Raw w[kAhead][RowsPerWarp];
 #pragma unroll
     for (int a = 0; a < kAhead; ++a) {
         const int chunk = lane + 32 * a;
         if (chunk < chunks) {
 #pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) { w[a][r] = __ldcs(rows[r] + chunk); }
+            for (int r = 0; r < RowsPerWarp; ++r) { w[a][r] = load(r, chunk); }
         }
     }
     pdl::enter_streaming();
 
     const std::uint16_t* x = p.x[seg.input] + static_cast<std::size_t>(p.c0) * p.k;
     float sums[RowsPerWarp][Tokens] = {};
-    for (int base = 0; base < chunks; base += 32 * kAhead) {
+    for (int start = 0; start < chunks; start += 32 * kAhead) {
 #pragma unroll
         for (int a = 0; a < kAhead; ++a) {
-            const int chunk = base + lane + 32 * a;
+            const int chunk = start + lane + 32 * a;
             if (chunk >= chunks) { break; }
+            uint4 wd[RowsPerWarp];
+#pragma unroll
+            for (int r = 0; r < RowsPerWarp; ++r) { wd[r] = decode(w[a][r], r, chunk); }
 #pragma unroll
             for (int t = 0; t < Tokens; ++t) {
                 if (t >= p.cols) { break; }
@@ -72,7 +102,7 @@ __global__ void __launch_bounds__(Warps * 32) projections_kernel(const Params p)
                 const __nv_bfloat162* xv = reinterpret_cast<const __nv_bfloat162*>(&xp);
 #pragma unroll
                 for (int r = 0; r < RowsPerWarp; ++r) {
-                    const __nv_bfloat162* wv = reinterpret_cast<const __nv_bfloat162*>(&w[a][r]);
+                    const __nv_bfloat162* wv = reinterpret_cast<const __nv_bfloat162*>(&wd[r]);
 #pragma unroll
                     for (int i = 0; i < 4; ++i) {
                         const float2 wf = __bfloat1622float2(wv[i]);
@@ -85,7 +115,7 @@ __global__ void __launch_bounds__(Warps * 32) projections_kernel(const Params p)
             const int next = chunk + 32 * kAhead;
             if (next < chunks) {
 #pragma unroll
-                for (int r = 0; r < RowsPerWarp; ++r) { w[a][r] = __ldcs(rows[r] + next); }
+                for (int r = 0; r < RowsPerWarp; ++r) { w[a][r] = load(r, next); }
             }
         }
     }
@@ -109,15 +139,26 @@ __global__ void __launch_bounds__(Warps * 32) projections_kernel(const Params p)
     }
 }
 
-template <int Warps, int RowsPerWarp, class Out>
+template <int Warps, int RowsPerWarp, bool P12, class Out>
 void launch_pass(const Params& p, int tokens, unsigned grid, cudaStream_t stream) {
     const pdl::LaunchConfig config{dim3(grid), dim3(Warps * 32), 0, stream};
     switch (tokens) {
-    case 1: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<1, Warps, RowsPerWarp, Out>, p)); break;
-    case 2: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<2, Warps, RowsPerWarp, Out>, p)); break;
-    case 4: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<4, Warps, RowsPerWarp, Out>, p)); break;
-    case 8: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<8, Warps, RowsPerWarp, Out>, p)); break;
-    default: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<16, Warps, RowsPerWarp, Out>, p)); break;
+    case 1: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<1, Warps, RowsPerWarp, P12, Out>, p)); break;
+    case 2: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<2, Warps, RowsPerWarp, P12, Out>, p)); break;
+    case 4: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<4, Warps, RowsPerWarp, P12, Out>, p)); break;
+    case 8: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<8, Warps, RowsPerWarp, P12, Out>, p)); break;
+    default: CUDA_CHECK(pdl::launch_consumer(config, projections_kernel<16, Warps, RowsPerWarp, P12, Out>, p)); break;
+    }
+}
+
+template <bool P12>
+void launch_storage(const Params& p, bool small, bool fp32, int tokens, unsigned grid, cudaStream_t stream) {
+    if (small) {
+        fp32 ? launch_pass<2, 1, P12, float>(p, tokens, grid, stream)
+             : launch_pass<2, 1, P12, __nv_bfloat16>(p, tokens, grid, stream);
+    } else {
+        fp32 ? launch_pass<8, 2, P12, float>(p, tokens, grid, stream)
+             : launch_pass<8, 2, P12, __nv_bfloat16>(p, tokens, grid, stream);
     }
 }
 
@@ -133,11 +174,16 @@ void projections(const ProjectionArgs& a, cudaStream_t stream) {
         throw std::invalid_argument("inkling2 projections: 1-8 segments, positive columns, K a multiple of 8");
     }
     std::int32_t widest = 0;
+    const bool packed   = a.segments[0].codes != nullptr;
     for (int s = 0; s < a.count; ++s) {
         const ProjectionSegment& g = a.segments[s];
-        if (g.weight == nullptr || g.rows <= 0 || g.input < 0 || g.input > 2 || a.x[g.input] == nullptr ||
-            g.out == nullptr || !aligned16(g.weight) || !aligned16(a.x[g.input])) {
-            throw std::invalid_argument("inkling2 projections: a segment's weight, input or output is missing or misaligned");
+        const bool storage = packed ? g.codes != nullptr && g.nibbles != nullptr && g.words != nullptr &&
+                                          g.escapes != nullptr && g.weight == nullptr
+                                    : g.codes == nullptr && g.weight != nullptr && aligned16(g.weight);
+        if (!storage || g.rows <= 0 || g.input < 0 || g.input > 2 || a.x[g.input] == nullptr || g.out == nullptr ||
+            !aligned16(a.x[g.input])) {
+            throw std::invalid_argument("inkling2 projections: a segment's weight (one storage for the call), input or "
+                                        "output is missing or misaligned");
         }
         widest = std::max(widest, g.rows);
     }
@@ -161,13 +207,8 @@ void projections(const ProjectionArgs& a, cudaStream_t stream) {
         p.cols = std::min(kMaxPass, a.columns - c0);
         const int tokens = p.cols == 1 ? 1 : p.cols == 2 ? 2 : p.cols <= 4 ? 4 : p.cols <= 8 ? 8 : 16;
         const auto grid  = static_cast<unsigned>(ctas);
-        if (small) {
-            a.fp32_out ? launch_pass<2, 1, float>(p, tokens, grid, stream)
-                       : launch_pass<2, 1, __nv_bfloat16>(p, tokens, grid, stream);
-        } else {
-            a.fp32_out ? launch_pass<8, 2, float>(p, tokens, grid, stream)
-                       : launch_pass<8, 2, __nv_bfloat16>(p, tokens, grid, stream);
-        }
+        packed ? launch_storage<true>(p, small, a.fp32_out, tokens, grid, stream)
+               : launch_storage<false>(p, small, a.fp32_out, tokens, grid, stream);
     }
 }
 

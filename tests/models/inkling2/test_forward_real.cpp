@@ -749,7 +749,16 @@ int main() {
         DeviceContext device(0);
         const Reference ref(reference);
         artifact::Reader reader(artifact_path);
-        auto model = m::materialize_model(m::plan_load(reader, {}), device);
+        // INFERNIX_INKLING2_PACK: the projections packed to bf16_p12 at load (the same bits: the bit guard holds).
+        models::LoadOptions load_options;
+        load_options.pack_bf16 = std::getenv("INFERNIX_INKLING2_PACK") != nullptr;
+        auto model = m::materialize_model(m::plan_load(reader, load_options), device);
+        if (load_options.pack_bf16) {
+            std::printf("packed %zu matrices at load: %.2f GB of BF16 -> %.2f GB, %llu escapes, %.0f ms\n",
+                        model->packed().parents.size(), model->packed().source_bytes / 1e9,
+                        model->packed().storage.bytes / 1e9, static_cast<unsigned long long>(model->packed().escapes),
+                        1000.0 * model->packed().seconds);
+        }
         const m::Parameters parameters(*model);
         m::Forward forward(parameters, 1);
         State state(forward.layout());

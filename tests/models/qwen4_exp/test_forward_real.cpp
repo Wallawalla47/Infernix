@@ -36,7 +36,8 @@
 // nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations; and
 // --stream-experts, anywhere, leaves the expert banks in the artifact and reads each layer's records
 // into a pinned buffer before the layer runs (artifacts whose experts exceed the pinned ceiling, such
-// as the FP8 import; not with --cpu-columns).
+// as the FP8 import; not with --cpu-columns); --pack-bf16, anywhere, packs the BF16 matrices to bf16_p12 at load as
+// the Engine does (its skinny route, up to 8 columns, gives the BF16 route's bits: a short TOKENS compares exactly).
 // Otherwise the test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
@@ -1115,6 +1116,10 @@ int main(int argc, char** argv) {
             }
             if (arg == "--stream-experts") {
                 load.stream_experts = true;
+                continue;
+            }
+            if (arg == "--pack-bf16") { // the Engine's load-time bf16_p12 packing (LoadOptions::pack_bf16)
+                load.pack_bf16 = true;
                 continue;
             }
             if (arg.rfind("--", 0) != 0) {

@@ -7,6 +7,8 @@
 
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "core/weight_view.h"
+#include "infernix/ops/bf16_p12.h"
 #include "infernix/ops/inkling2_projections.h"
 #include "infernix/ops/linear.h"
 #include "ops/common/canonical_math.h"
@@ -67,7 +69,35 @@ struct Case {
     std::vector<std::pair<int, int>> segments; // (rows, input)
 };
 
-void run_case(const Case& c, int columns, std::uint32_t seed) {
+// The matrix packed on the device as bf16_p12 planes: (codes, nibbles, row words, escapes).
+struct Packed {
+    std::uint8_t* base = nullptr;
+    const void* codes = nullptr;
+    const void* nibbles = nullptr;
+    const unsigned* words = nullptr;
+    const unsigned* escapes = nullptr;
+};
+Packed pack(const std::uint16_t* src, int n, int k) {
+    void* scratch = dalloc<std::uint8_t>(infernix::ops::bf16_p12_pack_scratch_bytes(n));
+    auto* d_escapes = dalloc<std::uint32_t>(1);
+    infernix::ops::bf16_p12_count(src, n, k, scratch, d_escapes, nullptr);
+    std::uint32_t escapes = 0;
+    cuda_check(cudaMemcpy(&escapes, d_escapes, 4, cudaMemcpyDeviceToHost), "escapes");
+    const infernix::WeightGeometry g = infernix::bf16_p12_geometry(n, k, escapes);
+    Packed p;
+    p.base = dalloc<std::uint8_t>(g.bytes);
+    infernix::ops::bf16_p12_pack(src, n, k, escapes, scratch, p.base, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "pack");
+    cudaFree(scratch);
+    cudaFree(d_escapes);
+    p.codes   = p.base;
+    p.nibbles = p.base + g.high_offset;
+    p.words   = reinterpret_cast<const unsigned*>(p.base + g.scale_offset);
+    p.escapes = reinterpret_cast<const unsigned*>(p.base + g.escape_offset);
+    return p;
+}
+
+void run_case(const Case& c, int columns, std::uint32_t seed, bool packed) {
     std::mt19937 gen(seed);
     const int word = c.fp32 ? 4 : 2;
     std::uint16_t* x[3];
@@ -82,17 +112,33 @@ void run_case(const Case& c, int columns, std::uint32_t seed) {
     args.fp32_out = c.fp32;
     for (int i = 0; i < 3; ++i) { args.x[i] = x[i]; }
     std::vector<std::uint16_t*> weights;
+    std::vector<std::uint8_t*> packs;
     std::vector<void*> outs, wants;
     for (const auto& [rows, input] : c.segments) {
         auto* w = dalloc<std::uint16_t>(static_cast<std::size_t>(rows) * c.k);
-        const auto host = random_bf16(static_cast<std::size_t>(rows) * c.k, 0.03F, gen);
+        auto host = random_bf16(static_cast<std::size_t>(rows) * c.k, 0.03F, gen);
+        // A few weights outside a row's 15-exponent window (zeros and wide magnitudes): the packed rows' escapes.
+        for (std::size_t i = 0; i < host.size(); i += 997) {
+            host[i] = (i / 997) % 3 == 0 ? std::uint16_t{0} : canon::f32_to_bf16_rn((i / 997) % 3 == 1 ? 3.0e4F : 1.0e-9F);
+        }
         cuda_check(cudaMemcpy(w, host.data(), host.size() * 2, cudaMemcpyHostToDevice), "upload");
         weights.push_back(w);
         void* out  = dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * rows * word);
         void* want = dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * rows * word);
         outs.push_back(out);
         wants.push_back(want);
-        args.segments[args.count++] = {w, rows, input, out};
+        ik::ProjectionSegment seg;
+        seg.rows  = rows;
+        seg.input = input;
+        seg.out   = out;
+        if (packed) {
+            const Packed p = pack(w, rows, c.k);
+            packs.push_back(p.base);
+            seg.codes = p.codes, seg.nibbles = p.nibbles, seg.words = p.words, seg.escapes = p.escapes;
+        } else {
+            seg.weight = w;
+        }
+        args.segments[args.count++] = seg;
         // The oracle: linear() in calls of 8 columns.
         const Weight weight = bf16_weight(w, rows, c.k);
         for (int c0 = 0; c0 < columns; c0 += 8) {
@@ -114,10 +160,12 @@ void run_case(const Case& c, int columns, std::uint32_t seed) {
         for (std::size_t i = 0; i < bytes; i += word) { differ += std::memcmp(&got[i], &want[i], word) != 0 ? 1 : 0; }
         total += static_cast<long>(bytes / word);
     }
-    std::printf("%-44s T = %2d: %ld of %ld outputs differ from linear()\n", c.name, columns, differ, total);
+    std::printf("%-44s %s T = %2d: %ld of %ld outputs differ from linear()\n", c.name, packed ? "p12 " : "BF16", columns,
+                differ, total);
     if (differ != 0) { ++g_failures; }
     for (auto* p : x) { cudaFree(p); }
     for (auto* p : weights) { cudaFree(p); }
+    for (auto* p : packs) { cudaFree(p); }
     for (auto* p : outs) { cudaFree(p); }
     for (auto* p : wants) { cudaFree(p); }
 }
@@ -132,8 +180,10 @@ INFERNIX_OP_TEST(inkling2_projections) {
         {"forget and gain [4608, 64] x 3, FP32 out", 64, true, {{4608, 0}, {4608, 1}, {4608, 2}}},
     };
     std::uint32_t seed = 1;
-    for (const auto& c : cases) {
-        for (const int columns : {1, 3, 8, 16, 17, 40}) { run_case(c, columns, seed++); }
+    for (const bool packed : {false, true}) {
+        for (const auto& c : cases) {
+            for (const int columns : {1, 3, 8, 16, 17, 40}) { run_case(c, columns, seed++, packed); }
+        }
     }
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

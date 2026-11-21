@@ -18,11 +18,19 @@ namespace infernix::ops::inkling2 {
 
 inline constexpr std::int32_t kMaxProjectionSegments = 8;
 
+// A matrix as BF16 rows, or as its bf16_p12 planes (core/weight.h QuantLayout::P12Rows: per chunk of 8 weights 8 code
+// bytes and a word of exponent nibbles; per row a word of base and escape start, rows + 1 of them; the parent's escape
+// list), which decode to the same BF16 words, so a segment's outputs do not depend on its storage. Every segment of a
+// call has the same storage.
 struct ProjectionSegment {
-    const std::uint16_t* weight = nullptr; // BF16 [rows][K], 16-byte aligned
+    const std::uint16_t* weight = nullptr; // BF16 [rows][K], 16-byte aligned (null for packed planes)
     std::int32_t rows           = 0;
     std::int32_t input          = 0;       // which of the call's inputs (0 .. 2)
     void* out                   = nullptr; // [T][rows] BF16 or FP32
+    const void* codes           = nullptr; // bf16_p12: the matrix's first row in each plane
+    const void* nibbles         = nullptr;
+    const unsigned* words       = nullptr;
+    const unsigned* escapes     = nullptr;
 };
 
 struct ProjectionArgs {

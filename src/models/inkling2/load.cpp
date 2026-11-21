@@ -6,6 +6,7 @@
 #include "artifact/views.h"
 #include "core/weight_view.h"
 
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -169,6 +170,47 @@ void check_expert_uses(const std::vector<PendingWeight>& pending, const TextWeig
     }
 }
 
+// The artifact objects load-time packing takes (LoadOptions::pack_bf16; models/bf16_packing.h): BF16 [n, k] matrices
+// every parameter on which is read only through an Op that takes bf16_p12 (the fused projections: each visit's K2
+// parent and small parent, the message gates' downs and forget/gain; ops::linear: W_o and the head). Routers, the
+// embedding and the direct tensors stay BF16.
+std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
+                                                     const artifact::Reader& reader) {
+    std::vector<bool> packed(pending.size(), false);
+    const auto mark = [&](std::initializer_list<WeightId> ids) {
+        for (const WeightId id : ids) {
+            if (id.valid()) { packed.at(id.index) = true; }
+        }
+    };
+    mark({w.output_head});
+    for (const LayerWeights& layer : w.layers) {
+        const AttentionWeights& a = layer.attention;
+        // The K2 parent's sink and conv taps with it: one projections launch takes one storage.
+        mark({a.query, a.relative, a.gate, a.key, a.value, a.sink, a.key_taps, a.value_taps, a.output});
+        if (layer.messages) {
+            for (const MessageGateWeights& g : layer.messages->gates) { mark({g.down, g.forget, g.gain}); }
+        }
+    }
+    std::map<std::size_t, bool> objects; // object -> every parameter on it packable
+    for (std::size_t i = 0; i < pending.size(); ++i) {
+        const bool ok = packed[i] && pending[i].reference.residency == Residency::Device;
+        for (const auto& part : pending[i].reference.binding.parts) {
+            auto [it, fresh] = objects.emplace(part.object.index, ok);
+            if (!fresh) { it->second = it->second && ok; }
+        }
+    }
+    std::vector<artifact::ObjectHandle> out;
+    for (const auto& [index, ok] : objects) {
+        const artifact::ObjectHandle handle{index};
+        const auto& g = reader.geometry(handle);
+        if (ok && g.format == QType::BF16 && g.layout == QuantLayout::Contiguous && g.shape.size() == 2 &&
+            g.shape[1] % 8 == 0 && g.shape[0] <= static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            out.push_back(handle);
+        }
+    }
+    return out;
+}
+
 FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config) {
     const auto resource = [&](std::string_view role) {
         const auto bytes = binder.host_object(binder.resource("text", role));
@@ -202,6 +244,8 @@ struct LoadPlan::Impl {
     LoadOptions options;
     TextWeights weights;
     std::vector<PendingWeight> pending;
+    std::vector<artifact::ObjectHandle> packed_objects; // LoadOptions::pack_bf16: loaded transient, packed at load
+    std::uint64_t packed_bytes = 0;
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
@@ -215,7 +259,7 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 const Config& LoadPlan::config() const { return impl_->config; }
 const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 const artifact::MaterializationPlan& LoadPlan::materialization() const { return impl_->materialization; }
-std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity_bytes; }
+std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity_bytes + impl_->packed_bytes; }
 std::uint32_t LoadPlan::public_token_count() const { return impl_->resources.public_token_count; }
 
 bool is_inkling2(const artifact::Reader& reader) {
@@ -232,7 +276,14 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text);
     check_expert_uses(bindings.weights, out->weights, out->config.text);
-    out->pending         = std::move(bindings.weights);
+    out->pending = std::move(bindings.weights);
+    if (options.pack_bf16) {
+        out->packed_objects = packable_objects(out->weights, out->pending, reader);
+        for (const auto object : out->packed_objects) {
+            binder.mark_device_transient(object);
+            out->packed_bytes += models::packed_estimate(reader.geometry(object));
+        }
+    }
     out->materialization = std::move(binder).finish();
     out->info.name            = reader.directory().metadata.value("name", std::string("Inkling2LoopForCausalLM"));
     out->info.metadata_json   = reader.directory().metadata.dump();
@@ -242,9 +293,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 }
 
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
-             FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing)
-    : backing_(std::move(backing)), config_(std::move(config)), options_(options), weights_(std::move(weights)),
-      bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)) {}
+             FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed)
+    : backing_(std::move(backing)), packed_(std::move(packed)), config_(std::move(config)), options_(options),
+      weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)) {}
 
 Model::~Model() = default;
 
@@ -262,9 +313,14 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         weight.view   = artifact::bind_view(item.reference, backing);
         bound.push_back(std::move(weight));
     }
+    PackedWeights packed = models::pack_bf16_objects(backing, data->packed_objects, {}, device);
+    if (!data->packed_objects.empty()) {
+        for (auto& weight : bound) { models::repoint(weight.view, packed); }
+        backing.release_transient();
+    }
     return std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
                                             std::move(bound), std::move(data->resources), std::move(data->info),
-                                            std::move(backing)));
+                                            std::move(backing), std::move(packed)));
 }
 
 } // namespace infernix::models::inkling2

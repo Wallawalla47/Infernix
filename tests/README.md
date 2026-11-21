@@ -517,7 +517,11 @@ non-canonical turn departs) and checks the refusals of this slice and the contex
 `infernix_inkling2_forward_real_test` (GPU) runs the forward on `INFERNIX_INKLING2_ARTIFACT` against a CPU reference's
 per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
 their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
-rather than judges and why.
+rather than judges and why. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
+`INFERNIX_INKLING2_LOGITS_GUARD` compares them). `infernix_inkling2_projections_test` (GPU) requires the fused
+projections launch to equal `linear()` bit for bit on one visit's real shapes at widths 1-40, BF16 and FP32 out,
+plain and packed (bf16_p12 segments, escapes included). `infernix_qwen4_exp_forward_real_test --pack-bf16` loads
+Flash-Next packed as the Engine does.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

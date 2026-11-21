@@ -494,101 +494,19 @@ std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const
     return out;
 }
 
-std::uint64_t align_256(std::uint64_t bytes) { return (bytes + 255) / 256 * 256; }
-
-// A packed object's device bytes for planning, its escapes bounded by one weight in 1,024 (recipe A's projections
-// escape about one in 5,000).
-std::uint64_t packed_estimate(const WeightGeometry& g) {
-    return align_256(bf16_p12_geometry(g.shape[0], g.shape[1], g.elements / 1024).bytes);
-}
-
-// Packs the transient BF16 objects (count pass, one block for every plane, pack pass), points the bound views at the
-// packed parents and frees the BF16 copies. `host_objects` are packed through a device staging block into pinned host
-// memory (one block, mapped for the device).
+// Packs the transient BF16 objects (models/bf16_packing.h: count pass, one block for every plane, pack pass), points
+// the bound views at the packed parents and frees the BF16 copies. `host_objects` are packed through a device staging
+// block into pinned host memory (one block, mapped for the device).
 PackedWeights pack_objects(artifact::MaterializedArtifact& backing, const std::vector<artifact::ObjectHandle>& objects,
                            const std::vector<artifact::ObjectHandle>& host_objects, std::vector<BoundWeight>& bound,
                            DeviceContext& device) {
-    PackedWeights out;
+    PackedWeights out = pack_bf16_objects(backing, objects, host_objects, device);
     if (objects.empty() && host_objects.empty()) { return out; }
     const auto start = std::chrono::steady_clock::now();
-    struct Item {
-        const WeightParent* source;
-        std::int32_t n, k;
-        bool host;
-        std::uint64_t scratch, escapes, offset;
-    };
-    std::vector<Item> items;
-    std::uint64_t scratch_bytes = 0;
-    for (const auto* list : {&objects, &host_objects}) {
-        for (const auto handle : *list) {
-            const WeightParent& parent = backing.device_parent(handle);
-            const auto n = static_cast<std::int32_t>(parent.geometry.shape[0]);
-            const auto k = static_cast<std::int32_t>(parent.geometry.shape[1]);
-            items.push_back({&parent, n, k, list == &host_objects, scratch_bytes, 0, 0});
-            scratch_bytes += align_256(ops::bf16_p12_pack_scratch_bytes(n));
-        }
-    }
-    auto lap = [last = start]() mutable {
-        const auto now = std::chrono::steady_clock::now();
-        const double s = std::chrono::duration<double>(now - last).count();
-        last           = now;
-        return s;
-    };
-    // Every count enqueued, then one read of all of them.
-    DeviceBuffer scratch(scratch_bytes + 4 * items.size());
-    auto* scratch_base = static_cast<std::byte*>(scratch.p);
-    auto* counts       = reinterpret_cast<std::uint32_t*>(scratch_base + scratch_bytes);
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        const auto& item = items[i];
-        ops::bf16_p12_count(item.source->device, item.n, item.k, scratch_base + item.scratch, counts + i, device.stream);
-    }
-    std::vector<std::uint32_t> escapes(items.size());
-    CUDA_CHECK(cudaMemcpyAsync(escapes.data(), counts, 4 * items.size(), cudaMemcpyDeviceToHost, device.stream));
-    CUDA_CHECK(cudaStreamSynchronize(device.stream));
-    std::uint64_t total = 0, host_total = 0;
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        auto& item       = items[i];
-        item.escapes     = escapes[i];
-        auto& end        = item.host ? host_total : total;
-        item.offset      = end;
-        end              = align_256(end + bf16_p12_geometry(item.n, item.k, item.escapes).bytes);
-        out.source_bytes += item.source->geometry.bytes;
-        out.escapes += item.escapes;
-    }
-    out.phase_seconds[0] = lap();
-    out.storage          = DeviceBuffer(total);
-    DeviceBuffer staging(host_total);
-    if (host_total != 0) {
-        out.host_storage = std::make_unique<RegisteredHostBuffer>(host_total);
-        out.host_storage->pin();
-        out.host_bytes = host_total;
-    }
-    out.phase_seconds[1] = lap();
-    std::unordered_map<const WeightParent*, const WeightParent*> packed;
-    for (const auto& item : items) {
-        auto* at = static_cast<std::byte*>(item.host ? staging.p : out.storage.p) + item.offset;
-        ops::bf16_p12_pack(item.source->device, item.n, item.k, item.escapes, scratch_base + item.scratch, at,
-                           device.stream);
-        auto parent      = std::make_unique<WeightParent>();
-        parent->geometry = bf16_p12_geometry(item.n, item.k, item.escapes);
-        parent->data     = item.host ? out.host_storage->data() + item.offset : at;
-        parent->device   = item.host ? out.host_storage->device_data() + item.offset : at;
-        packed.emplace(item.source, parent.get());
-        out.parents.push_back(std::move(parent));
-    }
-    if (host_total != 0) {
-        CUDA_CHECK(cudaMemcpyAsync(out.host_storage->data(), staging.p, host_total, cudaMemcpyDeviceToHost, device.stream));
-    }
-    CUDA_CHECK(cudaStreamSynchronize(device.stream));
-    out.phase_seconds[2] = lap();
-    for (auto& weight : bound) {
-        for (auto& part : weight.view.parts) {
-            if (const auto found = packed.find(part.parent); found != packed.end()) { part.parent = found->second; }
-        }
-    }
+    for (auto& weight : bound) { repoint(weight.view, out); }
     backing.release_transient();
-    out.phase_seconds[3] = lap();
-    out.seconds          = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    out.phase_seconds[3] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    out.seconds += out.phase_seconds[3];
     return out;
 }
 

@@ -1,6 +1,6 @@
 # Immutable loading and mutable execution have separate compile owners.
 # --ablate (docs/ablate.md): the sidecar's binding is Model data for every architecture, its device cuts Parameters.
-add_library(infernix_model_loading STATIC registry.cpp ablate/binding.cpp)
+add_library(infernix_model_loading STATIC registry.cpp ablate/binding.cpp bf16_packing.cpp)
 infernix_internal_includes(infernix_model_loading)
 target_link_libraries(infernix_model_loading PUBLIC infernix_artifact infernix_text infernix_ops)
 

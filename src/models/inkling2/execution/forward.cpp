@@ -37,13 +37,26 @@ void check_schedule(const TextConfig& c) {
 
 std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 
-// A BF16 matrix as one segment of a fused projection launch.
+// A BF16 or bf16_p12 matrix as one segment of a fused projection launch.
 void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, void* out) {
-    if (w.qtype != QType::BF16 || w.layout != QuantLayout::Contiguous || w.qdata == nullptr ||
-        args.count >= ik::kMaxProjectionSegments) {
-        throw std::invalid_argument("inkling2 forward: the fused projections take contiguous BF16 matrices");
+    if (w.qdata == nullptr || args.count >= ik::kMaxProjectionSegments) {
+        throw std::invalid_argument("inkling2 forward: a fused projection segment is missing");
     }
-    args.segments[args.count++] = {static_cast<const std::uint16_t*>(w.qdata), w.n, input, out};
+    ik::ProjectionSegment s;
+    s.rows  = w.n;
+    s.input = input;
+    s.out   = out;
+    if (w.qtype == QType::BF16 && w.layout == QuantLayout::Contiguous) {
+        s.weight = static_cast<const std::uint16_t*>(w.qdata);
+    } else if (w.qtype == QType::BF16_P12 && w.layout == QuantLayout::P12Rows) {
+        s.codes   = w.qdata;
+        s.nibbles = w.qhigh;
+        s.words   = static_cast<const unsigned*>(w.scales);
+        s.escapes = static_cast<const unsigned*>(w.escapes);
+    } else {
+        throw std::invalid_argument("inkling2 forward: the fused projections take BF16 or bf16_p12 matrices");
+    }
+    args.segments[args.count++] = s;
 }
 
 } // namespace
