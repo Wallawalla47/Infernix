@@ -117,8 +117,8 @@ TextConfig text(const Json& value, bool mtp) {
     TextConfig out;
     out.architecture = resolve_architecture(
         architecture(value), artifact::require_id(value.at("model_type"), "model_type"));
-    if (out.architecture == Architecture::Qwen4Exp) {
-        throw ArtifactError("Qwen4Exp is not a Qwen3.5 architecture");
+    if (out.architecture != Architecture::Qwen3_5 && out.architecture != Architecture::Qwen3_5Moe) {
+        throw ArtifactError(std::string(architecture_name(out.architecture)) + " is not a Qwen3.5 architecture");
     }
     out.hidden_size             = dimension(value, "hidden_size");
     out.vocab_size              = dimension(value, "vocab_size");

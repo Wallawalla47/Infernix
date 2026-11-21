@@ -17,6 +17,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/inkling2_instance.h"
 #include "runtime/engine/qwen4_exp_instance.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 
@@ -93,6 +94,15 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
     std::optional<models::qwen3_5::BundledDrafters> drafters;
     std::vector<std::filesystem::path> dflash2_companions;
     std::exception_ptr unreadable;
+    bool inkling2 = false;
+    try {
+        const artifact::Reader reader(engine_options.artifact_path);
+        inkling2 = runtime::artifact_is_inkling2(reader);
+    } catch (const std::exception&) {}
+    if (inkling2) { // its own options (runtime/engine/inkling2_instance.h); none of the Qwen families' defaults apply
+        architecture = models::Architecture::Inkling2Loop;
+        return runtime::normalize_inkling2_options(std::move(engine_options));
+    }
     try {
         const artifact::Reader reader(engine_options.artifact_path);
         if (runtime::artifact_is_qwen4_exp(reader)) {
@@ -209,15 +219,18 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 
 class PreparedPrompt::Impl {
 public:
-    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         models::qwen3_5::PreparedPrompt prepared)
+    // The prompt of the Engine's model family: Qwen3.5's frontend (Qwen3.5 and Qwen3.8-Flash-Next) or Inkling 2's.
+    using Value = std::variant<models::qwen3_5::PreparedPrompt, models::inkling2::PreparedPrompt>;
+
+    template <class Prepared>
+    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode, Prepared prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    models::qwen3_5::PreparedPrompt value;
+    Value value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -238,7 +251,8 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 }
 
 std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
-    return impl_ != nullptr ? impl_->value.token_ids() : std::span<const TokenId>{};
+    if (impl_ == nullptr) { return {}; }
+    return std::visit([](const auto& value) { return value.token_ids(); }, impl_->value);
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
@@ -329,11 +343,26 @@ public:
     // Qwen3.8-Flash-Next: the common cores over its own Program.
     using Qwen4ExpCore        = runtime::EngineCore<runtime::Qwen4ExpInstance>;
     using Qwen4ExpScoringCore = runtime::CausalScoreCore<runtime::Qwen4ExpInstance>;
+    // Inkling 2: the common cores over its own frontend and Program.
+    using Inkling2Core        = runtime::EngineCore<runtime::Inkling2Instance>;
+    using Inkling2ScoringCore = runtime::CausalScoreCore<runtime::Inkling2Instance>;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
-                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Qwen4ExpScoringCore>>;
+                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Qwen4ExpScoringCore>,
+                              std::unique_ptr<Inkling2Core>, std::unique_ptr<Inkling2ScoringCore>>;
     template <class CoreState>
     static constexpr bool kScoring = std::is_same_v<CoreState, std::unique_ptr<ScoringCore>> ||
-                                     std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>>;
+                                     std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>> ||
+                                     std::is_same_v<CoreState, std::unique_ptr<Inkling2ScoringCore>>;
+
+    // The core's prepared prompt, taken from the facade's variant.
+    template <class CoreState>
+    static auto take_prompt(PreparedPrompt::Impl::Value& value) {
+        using Prompt = typename CoreState::element_type::PreparedPrompt;
+        if (!std::holds_alternative<Prompt>(value)) {
+            throw std::invalid_argument("PreparedPrompt was prepared by another model family's Engine");
+        }
+        return std::move(std::get<Prompt>(value));
+    }
 
     explicit Impl(EngineOptions engine_options,
                   std::shared_ptr<runtime::expert_offload::HostSlotPool> slot_pool = nullptr)
@@ -345,6 +374,23 @@ public:
         if (options.lossless) {
             ops::lossless_set_noise(options.lossless_noise_seed, options.lossless_noise_units,
                                     options.lossless_noise_scale);
+        }
+        if (architecture == models::Architecture::Inkling2Loop) {
+            auto constructed    = runtime::construct_inkling2(options, device);
+            options             = std::move(constructed.options);
+            inkling             = std::move(constructed.instance);
+            load                = std::move(constructed.load);
+            model_metadata      = std::move(constructed.model_metadata);
+            load.cuda_sync_mode = device.sync_mode();
+            sampling_defaults   = inkling->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+            if (options.purpose == EnginePurpose::CausalScoring) {
+                core = std::make_unique<Inkling2ScoringCore>(*inkling, device);
+            } else {
+                core = std::make_unique<Inkling2Core>(*inkling, device, options);
+            }
+            finalize_phase.complete();
+            return;
         }
         if (architecture == models::Architecture::Qwen4Exp) {
             auto constructed  = runtime::construct_qwen4_exp(options, device, nullptr, std::move(slot_pool));
@@ -429,6 +475,7 @@ public:
 
     void report_prefix_cache_save() const noexcept {
         try {
+            if (inkling) { return; } // no prefix cache (persists_prefix_cache is false)
             if (qwen4) {
                 report_prefix_cache_save(qwen4->program->prefix_shutdown_save());
             } else {
@@ -462,17 +509,24 @@ public:
         }
     }
 
-    [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
-        return qwen4 != nullptr ? qwen4->frontend : active->frontend;
+    // Calls `f` with the model family's frontend (Qwen3.5's for Qwen3.5 and Qwen3.8-Flash-Next, Inkling 2's).
+    template <class F>
+    decltype(auto) with_frontend(F&& f) const {
+        if (inkling != nullptr) { return std::forward<F>(f)(inkling->frontend); }
+        return std::forward<F>(f)(qwen4 != nullptr ? qwen4->frontend : active->frontend);
     }
 
-    [[nodiscard]] std::uint32_t capacity() const { return qwen4 != nullptr ? qwen4->capacity : active->capacity; }
+    [[nodiscard]] std::uint32_t capacity() const {
+        if (inkling != nullptr) { return inkling->capacity; }
+        return qwen4 != nullptr ? qwen4->capacity : active->capacity;
+    }
 
     models::Architecture architecture = models::Architecture::Qwen3_5; // set by normalize
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
+    std::unique_ptr<runtime::Inkling2Instance> inkling;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -574,7 +628,9 @@ EnginePlan Engine::plan(EngineOptions engine_options) {
     // reads is the free memory a start would read.
     DeviceContext device = initialize_device(options, false);
     EnginePlan plan;
-    if (architecture == models::Architecture::Qwen4Exp) {
+    if (architecture == models::Architecture::Inkling2Loop) {
+        (void)runtime::construct_inkling2(options, device, &plan);
+    } else if (architecture == models::Architecture::Qwen4Exp) {
         (void)runtime::construct_qwen4_exp(options, device, &plan);
     } else {
         (void)runtime::construct_model(options, device, &plan);
@@ -589,16 +645,18 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->frontend().prepare(std::move(input), control);
-    PromptSummary info = prepared.summary();
-    const SamplingMode sampling_mode =
-        info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    if (info.prompt_tokens > impl_->capacity()) {
-        throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
-    }
-    const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
-                                                                 std::move(prepared)));
+    return impl_->with_frontend([&](const auto& frontend) {
+        auto prepared      = frontend.prepare(std::move(input), control);
+        PromptSummary info = prepared.summary();
+        const SamplingMode sampling_mode =
+            info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
+        if (info.prompt_tokens > impl_->capacity()) {
+            throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
+        }
+        const PromptPreparationStats preparation = prepared.preparation_stats();
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
+                                                                     std::move(prepared)));
+    });
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
@@ -610,34 +668,36 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
         throw RequestError(ContextLengthDetails{.prompt_tokens = token_ids.size(),
                                                 .max_context   = impl_->capacity()});
     }
-    auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
-    PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > impl_->capacity()) {
-        throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
-    }
-    const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-        info, preparation, SamplingMode::Thinking, std::move(prepared)));
+    return impl_->with_frontend([&](const auto& frontend) {
+        auto prepared      = frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+        PromptSummary info = prepared.summary();
+        if (info.prompt_tokens > impl_->capacity()) {
+            throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
+        }
+        const PromptPreparationStats preparation = prepared.preparation_stats();
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            info, preparation, SamplingMode::Thinking, std::move(prepared)));
+    });
 }
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().tokenize_text(text);
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.tokenize_text(text); });
 }
 
 std::string Engine::detokenize(std::span<const TokenId> token_ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().detokenize(token_ids);
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.detokenize(token_ids); });
 }
 
 std::string Engine::detokenize_bytes(std::span<const TokenId> token_ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().detokenize_bytes(token_ids);
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.detokenize_bytes(token_ids); });
 }
 
 ChatTokens Engine::tokenize_chat(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().tokenize_chat(std::move(input));
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.tokenize_chat(std::move(input)); });
 }
 
 ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
@@ -682,7 +742,7 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
         [&](auto& core) -> ScoreResult {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (Impl::kScoring<CoreState>) {
-                return core->score(std::move(prompt.impl_->value), first_target,
+                return core->score(Impl::take_prompt<CoreState>(prompt.impl_->value), first_target,
                                    std::move(options));
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -702,7 +762,8 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().count_tokens(std::move(input), control);
+    return impl_->with_frontend(
+        [&](const auto& frontend) { return frontend.count_tokens(std::move(input), control); });
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -795,7 +856,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission =
-                    core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
+                    core->submit(Impl::take_prompt<CoreState>(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
                                  pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
@@ -876,17 +937,17 @@ DeviceMemoryReading Engine::device_memory() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().media_cache_summary();
+    return impl_->with_frontend([](const auto& frontend) { return frontend.media_cache_summary(); });
 }
 
 ChatTemplateRoleSupport Engine::chat_template_role_support() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().chat_template_role_support();
+    return impl_->with_frontend([](const auto& frontend) { return frontend.chat_template_role_support(); });
 }
 
 VisionImageBudget Engine::vision_image_budget() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().vision_image_budget();
+    return impl_->with_frontend([](const auto& frontend) { return frontend.vision_image_budget(); });
 }
 
 RuntimeStats Engine::runtime_stats() const {

@@ -14,6 +14,7 @@
 #include "infernix/types.h"
 #include "models/inkling2/frontend/output_session.h"
 #include "models/inkling2/model.h"
+#include "models/inkling2/ngram.h"
 
 #include <cstdint>
 #include <memory>
@@ -48,6 +49,12 @@ public:
     [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept { return data_ != nullptr; }
     [[nodiscard]] const PreparedPromptData& data() const { return *data_; }
+    // No n-gram archive (ngram.h): nothing to bind.
+    [[nodiscard]] std::unique_ptr<NgramArchive::Request> bind_ngram(NgramArchive&, const NgramSessionHints&) const {
+        return nullptr;
+    }
+    // The prompt's data, moved out (the Program's plan takes it).
+    [[nodiscard]] std::unique_ptr<PreparedPromptData> take() && noexcept { return std::move(data_); }
 
 private:
     std::unique_ptr<PreparedPromptData> data_;

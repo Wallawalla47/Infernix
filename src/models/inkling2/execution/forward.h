@@ -49,7 +49,8 @@ struct StateView {
 };
 
 // One call: each column's token, lane and position (a lane's columns consecutive, positions ascending by 1; lane -1
-// pads), and each lane's first position.
+// pads), and each lane's first position: where its sequence begins (the first key it attends to), not its first column
+// in this call.
 struct CallPlan {
     std::vector<std::int32_t> tokens, lane, position;
     std::vector<std::int32_t> first;
@@ -99,10 +100,16 @@ public:
 
     // Uploads the call's tokens and column map (synchronous copies) and fixes the call's width.
     void prepare(const CallPlan& call);
+    // The same through `staging` (pinned, kUploadWords words, unused by any copy still in flight) on `stream`.
+    void upload(const CallPlan& call, std::int32_t* staging, cudaStream_t stream);
+    static constexpr std::size_t kUploadWords = 3 * kMaxForwardColumns + 3 * ops::inkling2::kMaxAttentionLanes;
     void embed(cudaStream_t stream);
     void visit(std::uint32_t visit, const StateView& state, const VisitInputs& in, cudaStream_t stream);
     void visit(std::uint32_t v, const StateView& state, cudaStream_t stream) { visit(v, state, inputs(v), stream); }
-    void finish(const StateView& state, const FinalInputs& in, cudaStream_t stream);
+    // The output mix and the head over columns [head_first, head_first + head_columns) (-1: through the last column;
+    // 0: no head, as a prefill chunk that samples nothing), their logits in rows 0.. of buffers().logits.
+    void finish(const StateView& state, const FinalInputs& in, cudaStream_t stream, std::int32_t head_first = 0,
+                std::int32_t head_columns = -1);
     void finish(const StateView& state, cudaStream_t stream) { finish(state, final_inputs(), stream); }
 
     [[nodiscard]] const ForwardBuffers& buffers() const noexcept { return b_; }
@@ -116,7 +123,11 @@ private:
     // the layer's own input).
     [[nodiscard]] ops::inkling2::Blocks blocks(std::uint32_t layer, std::uint32_t pass, bool include_current) const;
     [[nodiscard]] std::uint16_t* tail_out(std::uint32_t visit) const;
-    void project(const std::uint16_t* x, const Weight& w, void* out, bool fp32, cudaStream_t stream) const;
+    // Validates the call, fixes its width and returns each attention lane's (first column, count).
+    std::vector<std::int32_t> layout_call(const CallPlan& call);
+    // Columns [from, from + columns) (-1: through the last) of x through w.
+    void project(const std::uint16_t* x, const Weight& w, void* out, bool fp32, cudaStream_t stream,
+                 std::int32_t from = 0, std::int32_t columns = -1) const;
     [[nodiscard]] ops::inkling2::Ring ring(const StateView& s, std::int64_t offset, std::int32_t width) const;
 
     const Parameters& p_;

@@ -130,7 +130,7 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes)
     b_.attention_ws = ik::carve_attention_workspace(attention_base);
 }
 
-void Forward::prepare(const CallPlan& call) {
+std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
     const std::int32_t T = call.columns(), B = call.lanes();
     if (T <= 0 || T > kMaxForwardColumns || B <= 0 || B > max_lanes_ || call.lane.size() != call.tokens.size() ||
         call.position.size() != call.tokens.size()) {
@@ -152,25 +152,44 @@ void Forward::prepare(const CallPlan& call) {
     if (widest > ik::kMaxAttentionLaneColumns) {
         throw std::invalid_argument("inkling2 forward: at most 16 columns a lane");
     }
+    columns_          = T;
+    lanes_            = B;
+    max_lane_columns_ = widest;
+    return lane_columns;
+}
+
+void Forward::prepare(const CallPlan& call) {
+    const std::vector<std::int32_t> lane_columns = layout_call(call);
     const auto copy = [](void* dst, const std::vector<std::int32_t>& src) {
         CUDA_CHECK(cudaMemcpy(dst, src.data(), src.size() * 4, cudaMemcpyHostToDevice));
     };
     copy(b_.tokens, call.tokens), copy(b_.lane, call.lane), copy(b_.position, call.position);
     copy(b_.first, call.first), copy(b_.lane_columns, lane_columns);
-    columns_          = T;
-    lanes_            = B;
-    max_lane_columns_ = widest;
+}
+
+void Forward::upload(const CallPlan& call, std::int32_t* staging, cudaStream_t stream) {
+    const std::vector<std::int32_t> lane_columns = layout_call(call);
+    std::int32_t* at = staging;
+    const auto copy = [&](void* dst, const std::vector<std::int32_t>& src) {
+        std::copy(src.begin(), src.end(), at);
+        CUDA_CHECK(cudaMemcpyAsync(dst, at, src.size() * 4, cudaMemcpyHostToDevice, stream));
+        at += src.size();
+    };
+    copy(b_.tokens, call.tokens), copy(b_.lane, call.lane), copy(b_.position, call.position);
+    copy(b_.first, call.first), copy(b_.lane_columns, lane_columns);
 }
 
 void Forward::embed(cudaStream_t stream) {
     ik::embed(b_.tokens, columns_, p_.embedding, p_.embedding_norm, b_.e, stream);
 }
 
-void Forward::project(const std::uint16_t* x, const Weight& w, void* out, bool fp32, cudaStream_t stream) const {
+void Forward::project(const std::uint16_t* x, const Weight& w, void* out, bool fp32, cudaStream_t stream,
+                      std::int32_t from, std::int32_t columns) const {
     const std::int32_t K = w.k, N = w.n;
     const std::size_t word = fp32 ? 4 : 2;
-    for (std::int32_t first = 0; first < columns_; first += kSlice) {
-        const std::int32_t count = std::min(kSlice, columns_ - first);
+    const std::int32_t end = columns < 0 ? columns_ : from + columns;
+    for (std::int32_t first = from; first < end; first += kSlice) {
+        const std::int32_t count = std::min(kSlice, end - first);
         Tensor xt(const_cast<std::uint16_t*>(x) + static_cast<std::size_t>(first) * K, DType::BF16, {K, count});
         Tensor ot(static_cast<std::uint8_t*>(out) + static_cast<std::size_t>(first) * N * word,
                   fp32 ? DType::FP32 : DType::BF16, {N, count});
@@ -389,7 +408,8 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     moe::moe_experts({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
 }
 
-void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t stream) {
+void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t stream, std::int32_t head_first,
+                     std::int32_t head_columns) {
     const std::uint32_t last = c_.visits() - 1;
     ik::FinalArgs f;
     f.columns  = columns_;
@@ -402,8 +422,17 @@ void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t str
     f.norm     = p_.final_norm;
     f.out      = b_.final_hidden;
     ik::final_mix(f, stream);
-    project(b_.final_hidden, p_.head, b_.logits, true, stream);
-    ik::softcap(b_.logits, static_cast<std::int64_t>(columns_) * c_.vocab_size, c_.final_logit_softcap, stream);
+    // The head over the requested columns only (a prefill chunk needs none, or its last): their logits rows.
+    const std::int32_t count = head_columns < 0 ? columns_ - head_first : head_columns;
+    if (head_first < 0 || count < 0 || head_first + count > columns_) {
+        throw std::invalid_argument("inkling2 forward: the head's columns are outside the call");
+    }
+    if (count == 0) { return; }
+    // The rows go to the buffer's start (row r holds column head_first + r): a logits row is 8 bytes off 16-byte
+    // alignment, so an odd column's own row could not take the head's output.
+    const std::uint16_t* x = b_.final_hidden + static_cast<std::size_t>(head_first) * kH;
+    project(x, p_.head, b_.logits, true, stream, 0, count);
+    ik::softcap(b_.logits, static_cast<std::int64_t>(count) * c_.vocab_size, c_.final_logit_softcap, stream);
 }
 
 } // namespace infernix::models::inkling2

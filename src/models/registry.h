@@ -4,7 +4,7 @@
 
 namespace infernix::models {
 
-enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp };
+enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp, Inkling2Loop };
 
 [[nodiscard]] Architecture resolve_architecture(std::string_view architecture,
                                                 std::string_view model_type);
