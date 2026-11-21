@@ -810,8 +810,9 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         }
     }
     if constexpr (!A8) { a4_mma_fill_scaled(sm.scaled, kSingleThreads); }
+    // Dependents launch once the gate/up stream is done (below): launched beside this grid they would pack onto the
+    // SMs it leaves free and run there (pdl::enter's note).
     pdl::wait_for_dependencies();
-    pdl::trigger_dependents();
     if (router) {
         float acc = 0.0F;
 #pragma unroll
@@ -956,6 +957,7 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     }
     __syncwarp();
     if (lane == 0) { release_add(counters + 2 + job); }
+    pdl::trigger_dependents();
     // The job's h, once its 144 row groups are counted (the down weights keep streaming meanwhile).
     __syncthreads();
     if (tid == 0) { sm.stalled = wait_count(counters + 2 + job, kSingleRowGroups, a.e.ws.error) ? 0 : 1; }

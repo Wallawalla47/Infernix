@@ -106,7 +106,7 @@ std::int32_t max_groups(std::int32_t lanes, std::int32_t capacity) {
 // The forward's device buffers in order, each through add(pointer, bytes) (the constructor places them; device_bytes
 // counts them).
 template <class Add>
-void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, ForwardBuffers& b,
+void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, bool features, ForwardBuffers& b,
                   std::uint8_t*& moe_base, std::uint8_t*& attention_base, Add&& add) {
     const std::size_t T = static_cast<std::size_t>(capacity);
     const std::size_t V = c.vocab_size, rank = c.loop.message_rank, lanes = static_cast<std::size_t>(max_lanes);
@@ -133,6 +133,7 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
     add(b.mixed, 3 * T * kH * 4), add(b.message, 3 * T * kH * 4), add(b.fg, 3 * T * 2 * kH * 4);
     add(b.gate_input, 3 * T * 2 * kH * 2), add(b.z, 3 * T * rank * 2);
     add(b.final_hidden, row16), add(b.logits, std::size_t{kMaxForwardColumns} * V * 4);
+    if (features) { add(b.features, 4 * row16); }
     add(moe_base, moe::workspace_bytes(static_cast<std::int32_t>(c.experts), static_cast<std::int32_t>(c.intermediate),
                                        capacity));
     add(attention_base, ik::attention_workspace_bytes(capacity));
@@ -140,11 +141,11 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
 
 } // namespace
 
-std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity) {
+std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity, bool features) {
     ForwardBuffers b;
     std::uint8_t *moe_base = nullptr, *attention_base = nullptr;
     std::size_t at = 0;
-    walk_buffers(config, max_lanes, capacity, b, moe_base, attention_base,
+    walk_buffers(config, max_lanes, capacity, features, b, moe_base, attention_base,
                  [&](auto*&, std::size_t bytes) { at = align(at + bytes); });
     return at;
 }
@@ -186,7 +187,8 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     std::vector<std::pair<void**, std::size_t>> slots;
     std::uint8_t* moe_base       = nullptr;
     std::uint8_t* attention_base = nullptr;
-    walk_buffers(c_, max_lanes, capacity, b_, moe_base, attention_base, [&](auto*& pointer, std::size_t bytes) {
+    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), b_, moe_base, attention_base,
+                 [&](auto*& pointer, std::size_t bytes) {
         slots.emplace_back(reinterpret_cast<void**>(&pointer), at);
         at = align(at + bytes);
     });
@@ -320,6 +322,17 @@ void Forward::stage_window(const StateView& s, const VisitState& vs, bool in, cu
     }
 }
 
+void Forward::tap(std::uint32_t visit, const std::uint16_t* rows, cudaStream_t stream) const {
+    const std::vector<std::uint32_t>& targets = p_.model.config().dspark->target_layer_ids;
+    for (std::size_t j = 0; j < targets.size(); ++j) {
+        if (targets[j] != visit) { continue; }
+        // The rows (the partial block sums entering the visit; the final-normed state for visit == visits()) into
+        // feature slot j of every column.
+        CUDA_CHECK(cudaMemcpy2DAsync(b_.features + j * kH, targets.size() * kH * 2, rows, kH * 2, kH * 2,
+                                     static_cast<std::size_t>(columns_), cudaMemcpyDeviceToDevice, stream));
+    }
+}
+
 void Forward::embed(cudaStream_t stream) {
     ik::embed(b_.tokens, columns_, p_.embedding, p_.embedding_norm, b_.e, stream);
     mark("embed");
@@ -434,6 +447,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     ik::visit_entry(e, stream);
     mark("visit_entry");
+    if (b_.features != nullptr) { tap(v, h, stream); } // h: the partial block sum entering the visit
     if (messages) {
         // K1b: the three kinds' gate projections (one launch for the downs, one for forget and gain), then the gating
         // and norms.
@@ -630,6 +644,7 @@ void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t str
     f.out      = b_.final_hidden;
     ik::final_mix(f, stream);
     mark("final_mix");
+    if (b_.features != nullptr) { tap(c_.visits(), b_.final_hidden, stream); }
     // The head over the requested columns only (a prefill chunk needs none, or its last).
     head(head_first, head_columns < 0 ? columns_ - head_first : head_columns, stream);
 }
@@ -655,6 +670,21 @@ void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) 
     }
     ik::softcap(b_.logits, static_cast<std::int64_t>(count) * c_.vocab_size, c_.final_logit_softcap, stream);
     mark("head");
+}
+
+void Forward::project_head(const std::uint16_t* x, std::int32_t count, float* out, cudaStream_t stream) const {
+    if (count <= 0 || count > kMaxForwardColumns) { throw std::invalid_argument("inkling2 forward: 1-128 head rows"); }
+    if (q8(p_.head)) {
+        ik::ProjectionArgs h{};
+        h.columns  = count;
+        h.k        = kH;
+        h.x[0]     = x;
+        h.fp32_out = true;
+        add_segment(h, p_.head, 0, out);
+        ik::projections(h, stream);
+    } else {
+        project(x, p_.head, out, true, stream, 0, count);
+    }
 }
 
 } // namespace infernix::models::inkling2

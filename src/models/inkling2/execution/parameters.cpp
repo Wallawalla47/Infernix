@@ -132,6 +132,41 @@ LayerOperands layer_operands(const Model& model, const LayerWeights& w, const Te
     return out;
 }
 
+DSparkOperands dspark_operands(const Model& model, const DSparkWeights& w, const DSparkConfig& c) {
+    DSparkOperands out;
+    out.feature_weights = bf16(model, w.feature_weights);
+    out.mask_embedding  = bf16(model, w.mask_embedding);
+    out.final_norm      = bf16(model, w.final_norm);
+    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+        const DSparkLayerWeights& l = w.layers[i];
+        DSparkLayerOperands o;
+        o.sliding             = c.layer_types.at(i) == AttentionKind::Sliding;
+        o.context_norm        = bf16(model, l.context_norm);
+        o.input_norm          = bf16(model, l.input_norm);
+        o.post_attention_norm = bf16(model, l.post_attention_norm);
+        o.query               = linear(model, l.query);
+        o.key                 = linear(model, l.key);
+        o.value               = linear(model, l.value);
+        o.context_key         = linear(model, l.context_key);
+        o.context_value       = linear(model, l.context_value);
+        o.query_norm          = bf16(model, l.query_norm);
+        o.key_norm            = bf16(model, l.key_norm);
+        o.context_key_norm    = bf16(model, l.context_key_norm);
+        o.output              = linear(model, l.output);
+        o.gate                = linear(model, l.gate);
+        o.up                  = linear(model, l.up);
+        o.down                = linear(model, l.down);
+        out.layers.push_back(o);
+    }
+    out.markov_context_norm    = bf16(model, w.markov_context_norm);
+    out.markov_embedding       = bf16(model, w.markov_embedding);
+    out.markov_projection      = linear(model, w.markov_projection);
+    out.markov_projection_bias = bf16(model, w.markov_projection_bias);
+    out.fold                   = linear(model, w.fold);
+    out.fold_bias              = bf16(model, w.fold_bias);
+    return out;
+}
+
 } // namespace
 
 Parameters::Parameters(const Model& source) : model(source) {
@@ -152,6 +187,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     head           = linear(model, w.output_head);
     layers.reserve(w.layers.size());
     for (std::uint32_t i = 0; i < w.layers.size(); ++i) { layers.push_back(layer_operands(model, w.layers[i], c, i)); }
+    if (w.dspark) { dspark = dspark_operands(model, *w.dspark, *model.config().dspark); }
 }
 
 } // namespace infernix::models::inkling2

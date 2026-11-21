@@ -156,6 +156,45 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
     return out;
 }
 
+// The DSpark drafter's parameters (tools/convert/inkling2_loop.py dspark(): names, shapes and the Uses' inputs).
+DSparkWeights bind_dspark(Bindings& b, const DSparkConfig& d, const TextConfig& c) {
+    const std::uint64_t h = c.hidden_size, v = c.vocab_size, rank = d.markov_rank;
+    const std::uint64_t q = std::uint64_t{d.heads} * d.head_dim, kv = std::uint64_t{d.kv_heads} * d.head_dim;
+    const std::uint64_t features = d.target_layer_ids.size();
+    DSparkWeights out;
+    out.feature_weights = b.direct("dspark/feature_weights", {d.layers + 1, features});
+    out.mask_embedding  = b.direct("dspark/mask_embedding", {h});
+    out.final_norm      = b.direct("dspark/final_norm", {h});
+    for (std::uint32_t i = 0; i < d.layers; ++i) {
+        const std::string p = "dspark/layers/" + std::to_string(i) + "/", a = p + "attention/", f = p + "mlp/";
+        DSparkLayerWeights l;
+        l.context_norm        = b.direct(p + "context_norm", {h});
+        l.input_norm          = b.direct(p + "input_norm", {h});
+        l.post_attention_norm = b.direct(p + "post_attention_norm", {h});
+        l.query               = b.parameter(a + "query", {q, h}, p + "hidden_input");
+        l.key                 = b.parameter(a + "key", {kv, h}, p + "hidden_input");
+        l.value               = b.parameter(a + "value", {kv, h}, p + "hidden_input");
+        l.context_key         = b.parameter(a + "context_key", {kv, h}, p + "context_input");
+        l.context_value       = b.parameter(a + "context_value", {kv, h}, p + "context_input");
+        l.query_norm          = b.direct(a + "query_norm", {d.head_dim});
+        l.key_norm            = b.direct(a + "key_norm", {d.head_dim});
+        l.context_key_norm    = b.direct(a + "context_key_norm", {d.head_dim});
+        l.output              = b.parameter(a + "output", {h, q}, a + "mixed");
+        l.gate                = b.parameter(f + "gate", {d.intermediate, h}, f + "input");
+        l.up                  = b.parameter(f + "up", {d.intermediate, h}, f + "input");
+        l.down                = b.parameter(f + "down", {h, d.intermediate}, f + "product");
+        out.layers.push_back(l);
+    }
+    const std::string mk = "dspark/markov/";
+    out.markov_context_norm    = b.direct(mk + "context_norm", {h});
+    out.markov_embedding       = b.direct(mk + "embedding", {v, rank});
+    out.markov_projection      = b.parameter(mk + "projection", {3 * rank, 2 * rank + 2 * h}, mk + "input");
+    out.markov_projection_bias = b.direct(mk + "projection_bias", {3 * rank});
+    out.fold                   = b.parameter(mk + "fold", {v, rank}, mk + "latent");
+    out.fold_bias              = b.direct(mk + "fold_bias", {v});
+    return out;
+}
+
 // The stored experts must carry the arithmetic the config names: their Use permits it, and an A16Only Use (a
 // recipe that withheld the trained activation rule) is refused rather than run in another arithmetic.
 void check_expert_uses(const std::vector<PendingWeight>& pending, const TextWeights& weights, const TextConfig& c) {
@@ -300,6 +339,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->resources = bind_resources(binder, out->config.text);
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text);
+    if (out->config.dspark) { out->weights.dspark = bind_dspark(bindings, *out->config.dspark, out->config.text); }
     check_expert_uses(bindings.weights, out->weights, out->config.text);
     out->pending = std::move(bindings.weights);
     if (options.pack_bf16) {

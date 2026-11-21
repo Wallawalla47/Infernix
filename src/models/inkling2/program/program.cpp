@@ -5,7 +5,9 @@
 #include "core/device.h"
 #include "infernix/ops/inkling2_attention.h"
 #include "infernix/ops/sampling.h"
+#include "models/inkling2/execution/dspark.h"
 #include "models/inkling2/execution/forward.h"
+#include "runtime/speculative/draft_length.h"
 
 #include <algorithm>
 #include <chrono>
@@ -40,9 +42,11 @@ struct ContractAccess {
     static std::uint32_t lane(const SequenceHandle& s) noexcept { return s.lane_; }
     static std::uint64_t epoch(const SequenceHandle& s) noexcept { return s.epoch_; }
 
+    // `counts` empty: one token a row (stride 1); else row r's counts[r] tokens at tokens[r * stride ..].
     static PendingBatch batch(const void* owner, std::uint64_t transaction, std::span<const SequenceHandle> rows,
                               std::span<const TokenId> tokens, runtime::ExecutionTiming timing,
-                              std::span<const runtime::PendingRowFailure> failures) {
+                              std::span<const runtime::PendingRowFailure> failures,
+                              std::span<const std::int32_t> counts = {}, std::uint32_t stride = 1) {
         PendingBatch b;
         b.owner_       = owner;
         b.transaction_ = transaction;
@@ -52,7 +56,8 @@ struct ContractAccess {
             b.row_failures_[i] = failures[i];
         }
         b.tokens_     = tokens;
-        b.row_stride_ = 1;
+        b.row_counts_ = counts;
+        b.row_stride_ = stride;
         b.timing_     = timing;
         return b;
     }
@@ -137,6 +142,14 @@ public:
         host_sampled_ = reinterpret_cast<std::int32_t*>(base);
         base += align_256(4 * kMaximumConcurrency);
         nonfinite_ = reinterpret_cast<std::int32_t*>(base);
+        if (o_.dspark && !o_.causal_scoring) {
+            if (!p_.dspark) { throw std::invalid_argument("Inkling 2: --spec dspark needs the drafter's parameters"); }
+            if (o_.draft_tokens < 1 || o_.draft_tokens > static_cast<std::uint32_t>(ops::inkling2::kMarkovSteps)) {
+                throw std::invalid_argument("Inkling 2: DSpark drafts 1-7 tokens a round");
+            }
+            drafter_ = std::make_unique<Drafter>(p_, forward_, static_cast<std::int32_t>(lanes_.size()), o_.max_context,
+                                                 forward_capacity(o_));
+        }
         if (o_.use_cuda_graph && !o_.causal_scoring) { capture_decode_graphs(); }
     }
 
@@ -185,6 +198,7 @@ public:
         lane.prompt_tokens = base.impl_->summary.prompt_tokens;
         lane.options       = base.impl_->options;
         lane.penalties     = lane.options.sampling.presence_penalty != 0.0F || lane.options.sampling.frequency_penalty != 0.0F;
+        lane.calibration.reset();
         // A fresh state: the conv rings' history before position 0 is zero, and the window's rows are rewritten.
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint16_t*>(images_.p) +
                                        static_cast<std::size_t>(lane_id.value) * forward_.layout().lane_words,
@@ -234,6 +248,7 @@ public:
         }
         upload(call);
         run_forward(static_cast<std::int32_t>(chunk) - 1, last ? 1 : 0);
+        if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(chunk), device_.stream); } // the chunk's context rows
         lane.processed += chunk;
         PrefillProgress out;
         out.summary                 = {.prompt_tokens = lane.prompt_tokens};
@@ -257,10 +272,15 @@ public:
         return out;
     }
 
-    PendingBatch decode(std::span<const SequenceHandle> sequences, runtime::TokenMaskProvider* masks) {
+    PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
+                        runtime::TokenMaskProvider* masks) {
         const auto start = Clock::now();
         if (pending_) { throw std::logic_error("Inkling 2: a pending batch awaits its commit"); }
         if (sequences.empty() || sequences.size() > lanes_.size()) { throw std::invalid_argument("Inkling 2: a decode of 1-8 rows"); }
+        // A row's round licenses at most its remaining generated tokens: a DSpark round needs two of them.
+        const std::uint32_t remaining = budgets.empty() ? 0U : budgets[0].generated_tokens_remaining;
+        if (remaining >= 2 && dspark_round(sequences, masks)) { return decode_dspark(sequences[0], remaining, masks, start); }
+        if (drafter_ && sequences.size() == 1) { ++lanes_[lane_of(sequences[0])].fallback; } // a plain round of a drafting row
         std::vector<std::uint32_t> rows;
         for (const SequenceHandle& s : sequences) { rows.push_back(lane_of(s)); }
         // A lane's columns are consecutive and lanes ascend in the call; rows keep the Engine's order.
@@ -294,7 +314,7 @@ public:
         if (uniform && o_.use_cuda_graph) {
             decode_graph(static_cast<std::int32_t>(order.back()) + 1, columns, rows, logit_rows, masks);
         } else {
-            run_forward(0, columns);
+            run_decode_call(columns);
             sample(sequences, rows, logit_rows, ops::kSamplePurposeDecode, masks);
         }
         for (const std::uint32_t index : order) {
@@ -352,11 +372,23 @@ public:
                                                      : runtime::CommitDisposition::CancelledReleased;
                 continue;
             }
-            if (d.accepted_tokens != 1) { throw std::logic_error("Inkling 2: a row commits exactly one token"); }
-            lane.tokens.push_back(sampled_tokens_[row]);
+            if (pending_draft_.active) {
+                // A DSpark row: its accepted prefix; the lane holds positions F .. F + accepted - 1, its last token
+                // pending.
+                if (d.accepted_tokens == 0 || d.accepted_tokens > static_cast<std::uint32_t>(row_counts_[0])) {
+                    throw std::logic_error("Inkling 2: a DSpark row commits 1 .. its licensed tokens");
+                }
+                for (std::uint32_t i = 0; i < d.accepted_tokens; ++i) { lane.tokens.push_back(sampled_tokens_[i]); }
+                lane.processed = pending_draft_.first + d.accepted_tokens;
+            } else {
+                if (d.accepted_tokens != 1) { throw std::logic_error("Inkling 2: a row commits exactly one token"); }
+                lane.tokens.push_back(sampled_tokens_[row]);
+            }
             out.rows[row].disposition =
                 d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
+            speculative_of(lane, out.rows[row]);
         }
+        pending_draft_ = {};
         const std::uint64_t ns = elapsed_ns(start);
         for (std::size_t row = 0; row < rows.size(); ++row) {
             Lane& lane = lanes_[ContractAccess::lane(rows[row])];
@@ -389,6 +421,7 @@ public:
         out.status    = runtime::ConsumeStatus::Consumed;
         ContractAccess::consume(pending);
         pending_.reset();
+        pending_draft_ = {};
         return out;
     }
 
@@ -398,6 +431,9 @@ public:
         const std::uint32_t index = ContractAccess::lane(sequence);
         out.timings               = timings(lanes_[index]);
         out.status                = runtime::ConsumeStatus::Consumed;
+        CommitRowResult stats;
+        speculative_of(lanes_[index], stats);
+        out.speculative = std::move(stats.speculative);
         release(index);
         return out;
     }
@@ -408,6 +444,9 @@ public:
         const std::uint32_t index = ContractAccess::lane(sequence);
         out.timings               = timings(lanes_[index]);
         out.status                = runtime::ConsumeStatus::Consumed;
+        CommitRowResult stats;
+        speculative_of(lanes_[index], stats);
+        out.speculative = std::move(stats.speculative);
         release(index);
         return out;
     }
@@ -561,6 +600,16 @@ private:
         runtime::ResolvedExecutionOptions options;
         bool penalties = false;
         std::uint64_t prefill_ns = 0, decode_ns = 0, decode_share_ns = 0;
+        // DSpark: the drafts' acceptance by probability decile (draft_length.h) and the request's counters.
+        runtime::speculative::DraftCalibration calibration;
+        std::uint64_t policy_rounds = 0;
+        std::uint64_t rounds = 0, drafted = 0, accepted = 0, fallback = 0;
+        std::array<std::uint64_t, ops::inkling2::kMarkovSteps> accepted_at{}; // rounds accepting draft i
+    };
+    // A DSpark round's row awaiting its commit: the lane, the anchor's position and the tokens it licenses.
+    struct PendingDraft {
+        bool active        = false;
+        std::uint32_t lane = 0, first = 0;
     };
     enum class PendingKind : std::uint8_t { Prefill, Decode };
 
@@ -616,6 +665,190 @@ private:
         forward_.finish(view_, forward_.final_inputs(), device_.stream, head_first, head_columns);
     }
 
+    // A decode or verify call: the Forward with the head over every column, then (DSpark) its columns' context rows
+    // (a rejected verify column's rows are overwritten before anything reads them).
+    void run_decode_call(std::int32_t columns) {
+        run_forward(0, columns);
+        if (drafter_) { drafter_->append(0, columns, device_.stream); }
+    }
+
+    // ---------------------------------------------------------------- DSpark (design §13)
+    static constexpr double kAcceptanceWeight     = 0.1;  // the calibration's EWMA weight
+    static constexpr std::uint64_t kProbeInterval = 8;    // one draft more every 8 rounds keeps longer deciles measured
+    // Costs in plain one-row rounds (2026-11-21, the forward test's decode round at 4K: +0.11-0.13 a verify column;
+    // the draft's ~1 ms of a ~6 ms round).
+    static constexpr double kDraftCost    = 0.12;
+    static constexpr double kProposalCost = 0.18;
+
+    // A round drafts when one row decodes with its one pending input, the drafter has its context (F >= 1), the
+    // position after the anchor fits the context, and nothing per position constrains the draw (penalties, a
+    // grammar, a reasoning ban): verification samples each column as plain decoding would.
+    [[nodiscard]] bool dspark_round(std::span<const SequenceHandle> sequences, runtime::TokenMaskProvider* masks) const {
+        if (!drafter_ || sequences.size() != 1) { return false; }
+        const Lane& lane = lanes_[lane_of(sequences[0])];
+        if (lane.penalties || lane.processed == 0 || lane.tokens.size() != lane.processed + 1U ||
+            lane.processed + 1U >= o_.max_context) {
+            return false;
+        }
+        // A reasoning ban is fine: every column samples under it, and the round ends at the first close it draws.
+        return masks == nullptr || !masks->constrained(0);
+    }
+
+    PendingBatch decode_dspark(SequenceHandle sequence, std::uint32_t remaining, runtime::TokenMaskProvider* masks,
+                               Clock::time_point start) {
+        const std::uint32_t index = lane_of(sequence);
+        Lane& lane                = lanes_[index];
+        const auto F              = static_cast<std::int32_t>(lane.processed);
+        // Drafts whose positions fit the context and whose round (drafts + 1 tokens) fits the row's budget.
+        const std::int32_t steps =
+            std::min({static_cast<std::int32_t>(o_.draft_tokens), static_cast<std::int32_t>(o_.max_context) - 1 - F,
+                      static_cast<std::int32_t>(std::min<std::uint32_t>(remaining - 1U, ops::inkling2::kMarkovSteps))});
+        // The drafts: the block, the head over its rows and the Markov steps, read back before the verify call.
+        drafter_->stage({F, lane.tokens[static_cast<std::size_t>(F)], static_cast<std::int32_t>(index)});
+        if (o_.use_cuda_graph) {
+            draft_graph(steps).launch(device_.stream);
+        } else {
+            drafter_->draft(steps, device_.stream);
+            drafter_->download(steps, device_.stream);
+        }
+        {
+            const auto wait = Clock::now();
+            CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+            wait_ns_ += elapsed_ns(wait);
+        }
+        std::array<TokenId, ops::inkling2::kMarkovSteps> drafts{};
+        std::array<float, ops::inkling2::kMarkovSteps> probabilities{};
+        for (std::int32_t i = 0; i < steps; ++i) {
+            drafts[static_cast<std::size_t>(i)]        = drafter_->host_tokens()[i];
+            probabilities[static_cast<std::size_t>(i)] = drafter_->host_probabilities()[i];
+        }
+        std::int32_t k = steps;
+        if (o_.draft_tokens_auto) {
+            k = runtime::speculative::calibrated_draft_length(
+                lane.calibration, std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)), steps,
+                kDraftCost, kProposalCost);
+            if (++lane.policy_rounds % kProbeInterval == 0) { k = std::min(k + 1, steps); }
+        }
+        // The verify call: the pending input and the k drafts at F .. F + k, every column sampled as decoding would.
+        CallPlan call;
+        call.first.assign(index + 1, 0);
+        const std::int32_t columns = k + 1;
+        std::array<std::uint32_t, kMaximumConcurrency> rows{};
+        std::array<std::int32_t, kMaximumConcurrency> logit_rows{}, positions{};
+        for (std::int32_t i = 0; i < columns; ++i) {
+            call.tokens.push_back(i == 0 ? lane.tokens[static_cast<std::size_t>(F)] : drafts[static_cast<std::size_t>(i - 1)]);
+            call.lane.push_back(static_cast<std::int32_t>(index));
+            call.position.push_back(F + i);
+            rows[static_cast<std::size_t>(i)]       = index;
+            logit_rows[static_cast<std::size_t>(i)] = i;
+            positions[static_cast<std::size_t>(i)]  = F + i;
+        }
+        upload(call);
+        const auto n = static_cast<std::size_t>(columns);
+        // Every column samples under the row's reasoning ban (an open reasoning excludes its end tokens).
+        const runtime::ReasoningBan ban = masks != nullptr ? masks->reasoning_ban(0) : runtime::ReasoningBan{};
+        stage_sample({rows.data(), n}, {logit_rows.data(), n}, ops::kSamplePurposeDecode, masks, {positions.data(), n},
+                     true);
+        if (o_.use_cuda_graph) {
+            verify_graph(index, columns).launch(device_.stream);
+        } else {
+            run_decode_call(columns);
+            launch_sample(n, {logit_rows.data(), n}, ops::kSamplePurposeDecode);
+        }
+        finish_sample(n);
+        // The accepted prefix: draft i stands while it equals the target's own draw at its position.
+        std::int32_t a = 0;
+        while (a < k && drafts[static_cast<std::size_t>(a)] == sampled_tokens_[static_cast<std::size_t>(a)] &&
+               failures_[static_cast<std::size_t>(a)] == runtime::PendingRowFailure::None) {
+            ++a;
+        }
+        runtime::PendingRowFailure failure = runtime::PendingRowFailure::None;
+        for (std::int32_t i = 0; i <= a; ++i) {
+            if (failures_[static_cast<std::size_t>(i)] != runtime::PendingRowFailure::None) {
+                failure = failures_[static_cast<std::size_t>(i)];
+                break;
+            }
+        }
+        failures_[0] = failure;
+        lane.calibration.observe(std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)),
+                                 static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(a), kAcceptanceWeight);
+        // The round ends at the first reasoning close it draws: later columns sampled under the ban the close lifts.
+        if (ban.active()) {
+            for (std::int32_t i = 0; i < a; ++i) {
+                if (sampled_tokens_[static_cast<std::size_t>(i)] == ban.close) {
+                    a = i;
+                    break;
+                }
+            }
+        }
+        ++lane.rounds;
+        lane.drafted += static_cast<std::uint64_t>(k);
+        lane.accepted += static_cast<std::uint64_t>(a);
+        for (std::int32_t i = 0; i < a; ++i) { ++lane.accepted_at[static_cast<std::size_t>(i)]; }
+        row_counts_[0]   = a + 1;
+        pending_draft_   = {true, index, static_cast<std::uint32_t>(F)};
+        const std::uint64_t transaction = ++transaction_;
+        const std::uint64_t ns          = elapsed_ns(start);
+        lane.decode_ns += ns;
+        lane.decode_share_ns += ns;
+        pending_      = transaction;
+        pending_kind_ = PendingKind::Decode;
+        return ContractAccess::batch(this, transaction, {&sequence, 1}, {sampled_tokens_.data(), kMaximumConcurrency},
+                                     timing_since(start), {failures_.data(), 1}, {row_counts_.data(), 1},
+                                     static_cast<std::uint32_t>(kMaximumConcurrency));
+    }
+
+    // The captured draft of `steps` drafts (its round words copied in from pinned memory, the drafts copied out).
+    DecodeGraphExecutable& draft_graph(std::int32_t steps) {
+        auto found = draft_graphs_.find(steps);
+        if (found == draft_graphs_.end()) {
+            DecodeGraphDefinition definition;
+            definition.capture(device_.stream, [&] {
+                drafter_->draft(steps, device_.stream);
+                drafter_->download(steps, device_.stream);
+            });
+            DecodeGraphExecutable exec;
+            exec.instantiate(definition);
+            found = draft_graphs_.emplace(steps, std::move(exec)).first;
+        }
+        return found->second;
+    }
+
+    // The captured verify call of one lane and `columns` columns (its call plan, configs and positions uploaded
+    // before the launch): the forward, the context rows and the sample of every column.
+    DecodeGraphExecutable& verify_graph(std::uint32_t lane, std::int32_t columns) {
+        const std::uint64_t key = (1ULL << 63) | static_cast<std::uint64_t>(lane) << 32 | static_cast<std::uint32_t>(columns);
+        auto found = graphs_.find(key);
+        if (found == graphs_.end()) {
+            std::vector<std::int32_t> identity(static_cast<std::size_t>(columns));
+            for (std::int32_t i = 0; i < columns; ++i) { identity[static_cast<std::size_t>(i)] = i; }
+            DecodeGraphDefinition definition;
+            definition.capture(device_.stream, [&] {
+                run_decode_call(columns);
+                launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode);
+            });
+            DecodeGraphExecutable exec;
+            exec.instantiate(definition);
+            found = graphs_.emplace(key, std::move(exec)).first;
+        }
+        return found->second;
+    }
+
+    // A lane's speculative counters and statistics for the Engine.
+    void speculative_of(const Lane& lane, CommitRowResult& row) const {
+        if (!drafter_) { return; }
+        row.speculative_counters = {lane.rounds, lane.drafted, lane.accepted, lane.fallback};
+        SpeculativeStats& s      = row.speculative;
+        s.backend                = SpeculativeBackend::DSpark;
+        s.enabled                = true;
+        s.draft_window           = o_.draft_tokens;
+        s.rounds                 = lane.rounds;
+        s.drafted_tokens         = lane.drafted;
+        s.accepted_tokens        = lane.accepted;
+        s.fallback_steps         = lane.fallback;
+        s.accepted_per_position.assign(lane.accepted_at.begin(), lane.accepted_at.begin() + o_.draft_tokens);
+    }
+
     // Samples one token a row from the logits rows `logit_rows` (each row's lane `lanes[row]`), into
     // sampled_tokens_ and failures_ (synchronous).
     void sample(std::span<const SequenceHandle> rows, std::span<const std::uint32_t> lanes, std::span<const std::int32_t> logit_rows,
@@ -631,8 +864,11 @@ private:
 
     // The rows' configs and positions to pinned memory, and the logits rows gathered: everything a sample needs
     // before its launch (outside a graph).
+    // `positions`: each row's draw key (a verify call's columns); empty: the lane's. `mask_row_zero`: every row takes the
+    // masks' row 0 (a verify call's columns of one row).
     void stage_sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> logit_rows, std::int32_t purpose,
-                      runtime::TokenMaskProvider* masks) {
+                      runtime::TokenMaskProvider* masks, std::span<const std::int32_t> positions = {},
+                      bool mask_row_zero = false) {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const Lane& lane                       = lanes_[lanes[row]];
             const ResolvedSamplingParameters& s    = lane.options.sampling;
@@ -648,7 +884,7 @@ private:
             nonfinite_[row]          = 0;
             config.nonfinite         = &nonfinite_[row];
             if (masks != nullptr) {
-                const runtime::ReasoningBan ban = masks->reasoning_ban(row);
+                const runtime::ReasoningBan ban = masks->reasoning_ban(mask_row_zero ? 0 : row);
                 config.reasoning_close          = ban.close;
                 config.reasoning_ends[0]        = ban.ends[0];
                 config.reasoning_ends[1]        = ban.ends[1];
@@ -657,9 +893,10 @@ private:
             host_configs_[row] = config;
             // Prefill keys the draw by the prompt's next position (the lane has processed the prompt), decode by its
             // last input token's (the lane's last token, processed by this call).
-            host_positions_[row] = static_cast<std::int32_t>(purpose == ops::kSamplePurposePrefill
-                                                                 ? lane.processed
-                                                                 : static_cast<std::uint32_t>(lane.tokens.size()) - 1U);
+            host_positions_[row] = !positions.empty() ? positions[row]
+                                   : static_cast<std::int32_t>(purpose == ops::kSamplePurposePrefill
+                                                                   ? lane.processed
+                                                                   : static_cast<std::uint32_t>(lane.tokens.size()) - 1U);
         }
         CUDA_CHECK(cudaMemcpyAsync(configs_.p, host_configs_, sizeof(ops::SamplingConfig) * lanes.size(),
                                    cudaMemcpyHostToDevice, device_.stream));
@@ -717,7 +954,7 @@ private:
         bool identity = true;
         for (std::size_t i = 0; i < rows.size(); ++i) { identity = identity && logit_rows[i] == static_cast<std::int32_t>(i); }
         if (!identity) {
-            run_forward(0, columns);
+            run_decode_call(columns);
             launch_sample(rows.size(), logit_rows, ops::kSamplePurposeDecode);
             finish_sample(rows.size());
             return;
@@ -736,7 +973,7 @@ private:
         for (std::int32_t i = 0; i < columns; ++i) { identity[static_cast<std::size_t>(i)] = i; }
         DecodeGraphDefinition definition;
         definition.capture(device_.stream, [&] {
-            run_forward(0, columns);
+            run_decode_call(columns);
             launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode);
         });
         DecodeGraphExecutable exec;
@@ -793,6 +1030,10 @@ private:
     ProgramOptions o_;
     ProgramDevicePlan plan_;
     Forward forward_;
+    std::unique_ptr<Drafter> drafter_; // --spec dspark
+    std::map<std::int32_t, DecodeGraphExecutable> draft_graphs_;
+    PendingDraft pending_draft_;
+    std::array<std::int32_t, kMaximumConcurrency> row_counts_{};
     std::int32_t vocab_ = 0;
     std::vector<Lane> lanes_;
     DeviceBuffer images_, table_, counts_, configs_, positions_, sampled_, gathered_;
@@ -857,9 +1098,15 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     out.kv        = 2ULL * layout.full_visits * detail::pool_bytes(pages) + pages * 4;
     out.state     = static_cast<std::uint64_t>(layout.lane_words) * 2 * lanes;
     out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2;
-    out.workspace = Forward::device_bytes(config.text, static_cast<std::int32_t>(lanes), detail::forward_capacity(options)) +
+    const bool dspark = options.dspark && !options.causal_scoring;
+    out.workspace = Forward::device_bytes(config.text, static_cast<std::int32_t>(lanes), detail::forward_capacity(options),
+                                          dspark) +
                     ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(config.text.vocab_size), 1,
                                                            static_cast<std::int32_t>(kMaximumConcurrency));
+    if (dspark) {
+        out.workspace += Drafter::device_bytes(static_cast<std::int32_t>(lanes), options.max_context,
+                                               detail::forward_capacity(options), config.text.vocab_size);
+    }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     return out;
 }
@@ -895,9 +1142,9 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     return impl_->advance_prefill(sequence, masks);
 }
 
-PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget>,
+PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
                              runtime::ExecutionTiming*, runtime::TokenMaskProvider* masks) {
-    return impl_->decode(sequences, masks);
+    return impl_->decode(sequences, budgets, masks);
 }
 
 runtime::ExecutionTiming Program::append_forced_tokens(std::span<const SequenceHandle> sequences,

@@ -166,14 +166,20 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.purpose != EnginePurpose::Generation && options.purpose != EnginePurpose::CausalScoring) {
             throw ArtifactError("unknown loading purpose");
         }
-        if (options.speculative != SpeculativeBackend::None) {
+        if (options.speculative != SpeculativeBackend::None && options.speculative != SpeculativeBackend::DSpark) {
             throw ArtifactError("Inkling 2's drafter is DSpark (--spec dspark)");
         }
         if (options.vision) { throw ArtifactError("the artifact has no vision component"); }
         Config out;
         out.text = text(directory.component("text").config);
         // A stored drafter must fit the model even when it is not bound.
-        if (directory.components.contains("dspark")) { (void)dspark(directory.component("dspark").config, out.text); }
+        if (directory.components.contains("dspark")) {
+            DSparkConfig drafter = dspark(directory.component("dspark").config, out.text);
+            if (options.speculative == SpeculativeBackend::DSpark) { out.dspark = std::move(drafter); }
+        } else if (options.speculative == SpeculativeBackend::DSpark) {
+            throw ArtifactError("--spec dspark: the artifact has no dspark component (convert with --components "
+                                "text,dspark)");
+        }
         return out;
     } catch (const ArtifactError&) {
         throw;

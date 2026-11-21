@@ -1,0 +1,93 @@
+#pragma once
+
+// Inkling 2's DSpark drafter (design docs/maintainer/inkling2_mini-design.md §13; the reference arithmetic in .local's
+// DSPARK_SPEC): its device state and a round's two parts.
+//
+// - append: the context rows of a forward call's columns (the taps it left in buffers().features): each layer's mixed,
+//   normed context (dspark_mix) through its context K and V projections, the K head-normed and rotated at the
+//   column's position, both into the layer's cache of the column's lane; the Markov context (mix row 3) into the lane's
+//   ring by position. Position p's rows are its committed target row's once p is committed; later rows overwrite a
+//   rejected verify column's before anything reads them.
+// - draft: the block of 8 rows at positions F .. F + 7 (the anchor's normed target embedding, then the mask
+//   embedding) through the 3 layers and the final norm, the target head over rows 1 .. steps (FP32, no softcap), and
+//   the Markov head's steps: `steps` greedy drafts and their probabilities, in device memory. The round's words
+//   (DSparkRound: F, the anchor, the lane) are copied from pinned memory first, so a captured draft replays per round.
+//
+// Every BF16 projection runs projections_dmma (at most 16 columns) or projections_mma (wider: a prefill chunk's
+// context rows). The drafter decides only proposals; verification decides every output.
+
+#include "core/arena.h"
+#include "infernix/ops/inkling2_dspark.h"
+#include "infernix/ops/inkling2_projections.h"
+#include "models/inkling2/execution/forward.h"
+#include "models/inkling2/execution/parameters.h"
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace infernix::models::inkling2 {
+
+class Drafter {
+public:
+    // `capacity`: the widest forward call whose context rows are appended at once (the forward's capacity).
+    Drafter(const Parameters& parameters, const Forward& forward, std::int32_t lanes, std::uint32_t max_context,
+            std::int32_t capacity);
+    Drafter(const Drafter&)            = delete;
+    Drafter& operator=(const Drafter&) = delete;
+
+    // The device memory a drafter of these lanes, context and capacity allocates.
+    [[nodiscard]] static std::size_t device_bytes(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity,
+                                                  std::uint32_t vocab);
+
+    // The context rows of columns [first, first + count) of the forward's last call (its positions and lanes).
+    void append(std::int32_t first, std::int32_t count, cudaStream_t stream);
+
+    // The round's words, staged in pinned memory before `draft` (or its graph) runs.
+    void stage(const ops::inkling2::DSparkRound& round) noexcept { *host_round_ = round; }
+    // A round's drafts for the staged lane and anchor: tokens()[0 .. steps) and probabilities()[0 .. steps).
+    void draft(std::int32_t steps, cudaStream_t stream);
+    // The drafts copied to pinned memory (after draft, on the same stream): host_tokens() / host_probabilities().
+    void download(std::int32_t steps, cudaStream_t stream);
+    [[nodiscard]] const std::int32_t* host_tokens() const noexcept { return host_tokens_; }
+    [[nodiscard]] const float* host_probabilities() const noexcept { return host_probabilities_; }
+
+private:
+    void project(ops::inkling2::ProjectionArgs& args, cudaStream_t stream) const;
+
+    const Parameters& p_;
+    const DSparkOperands& d_;
+    const Forward& forward_;
+    std::int32_t lanes_ = 0, capacity_ = 0, full_slots_ = 0, full_splits_ = 0;
+    std::uint32_t vocab_ = 0;
+    DeviceBuffer memory_;
+    PinnedHostBuffer pinned_;
+    // Caches: per layer K and V, [lanes][8][slots][128] BF16; the Markov context ring [lanes][16][H].
+    std::uint16_t* cache_k_[3] = {};
+    std::uint16_t* cache_v_[3] = {};
+    std::int64_t lane_words_[3] = {};
+    std::uint16_t* f_ring_ = nullptr;
+    // Append workspace: the mixed contexts [3][capacity][H], their K and V [3][capacity][1024].
+    std::uint16_t* mixed_[3] = {};
+    std::uint16_t* ctx_k_[3] = {};
+    std::uint16_t* ctx_v_[3] = {};
+    // Draft workspace.
+    ops::inkling2::DSparkRound* round_ = nullptr;
+    std::uint16_t *block_in_ = nullptr, *residual_ = nullptr, *normed_ = nullptr; // [8][H]
+    std::uint16_t *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *qr_ = nullptr;   // [8][3072], [8][1024] x 2, [8][3072]
+    std::uint16_t *attention_ = nullptr, *a_ = nullptr, *y_ = nullptr;           // [8][3072], [8][H], [8][H]
+    std::uint16_t *gate_ = nullptr, *up_ = nullptr, *h_ = nullptr;               // [8][9216]
+    std::uint16_t* final_ = nullptr;                                             // [8][H]
+    float* base_ = nullptr;                                                      // [7][V]
+    float* attention_scratch_ = nullptr;
+    float* markov_scratch_ = nullptr;
+    std::int32_t* tokens_ = nullptr;
+    float* probabilities_ = nullptr;
+    float* inv_freq_ = nullptr; // the RoPE table [64]
+    ops::inkling2::DSparkRound* host_round_ = nullptr;
+    std::int32_t* host_tokens_ = nullptr;
+    float* host_probabilities_ = nullptr;
+};
+
+} // namespace infernix::models::inkling2

@@ -392,6 +392,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    DSpark, // Inkling 2's DFlash-style block drafter with its Markov head (the artifact's dspark component)
 };
 
 // Automatic tree verification considers, besides the chain, trees of these many columns

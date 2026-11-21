@@ -10,6 +10,7 @@
 #include "models/inkling2/model.h"
 
 #include <array>
+#include <optional>
 #include <cstdint>
 #include <vector>
 
@@ -48,6 +49,30 @@ struct LayerOperands {
     ops::w4a4_moe::Bank bank;
 };
 
+// The DSpark drafter's operands (bound with --spec dspark).
+struct DSparkLayerOperands {
+    bool sliding = false;
+    const std::uint16_t *context_norm = nullptr, *input_norm = nullptr, *post_attention_norm = nullptr; // BF16 [H]
+    Weight query, key, value;           // the block's projections (one parent)
+    Weight context_key, context_value;  // the context features' projections (one parent)
+    const std::uint16_t *query_norm = nullptr, *key_norm = nullptr, *context_key_norm = nullptr; // BF16 [d]
+    Weight output;                      // [H, heads * d]
+    Weight gate, up, down;              // SwiGLU [I, H], [I, H], [H, I]
+};
+
+struct DSparkOperands {
+    const std::uint16_t* feature_weights = nullptr; // BF16 [layers + 1][features] (softmax per row)
+    const std::uint16_t* mask_embedding  = nullptr; // BF16 [H]
+    const std::uint16_t* final_norm      = nullptr; // BF16 [H]
+    std::vector<DSparkLayerOperands> layers;
+    const std::uint16_t* markov_context_norm    = nullptr; // BF16 [H]
+    const std::uint16_t* markov_embedding       = nullptr; // BF16 [V][rank]
+    Weight markov_projection;                              // [3 rank, 2 rank + 2 H]
+    const std::uint16_t* markov_projection_bias = nullptr; // BF16 [3 rank]
+    Weight fold;                                           // [V, rank]
+    const std::uint16_t* fold_bias              = nullptr; // BF16 [V]
+};
+
 struct Parameters {
     explicit Parameters(const Model& model);
 
@@ -58,6 +83,7 @@ struct Parameters {
     const float* output_query           = nullptr;
     Weight head;                                   // BF16 [V][H], FP32 logits
     std::vector<LayerOperands> layers;
+    std::optional<DSparkOperands> dspark; // --spec dspark
 };
 
 } // namespace infernix::models::inkling2

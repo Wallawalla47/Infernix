@@ -1367,6 +1367,8 @@ void validate_target_options(const execution::Parameters& parameters,
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         break;
+    case SpeculativeBackend::DSpark:
+        throw std::invalid_argument("--spec dspark drafts for Inkling 2 artifacts only");
     }
     const bool tree_table = tree_table_enabled(options.speculative.draft_tree_nodes);
     if (tree_table || options.speculative.draft_tree_auto) {

@@ -279,6 +279,11 @@ struct ProgramOptions {
     // Columns a prefill call takes of one lane (1..kMaxPrefillChunk); the forward's call capacity follows it.
     std::uint32_t prefill_chunk = kDefaultPrefillChunk;
     bool use_cuda_graph         = true;
+    // --spec dspark (the drafter bound in the Parameters): a decode round of one row drafts draft_tokens (1-7) and
+    // verifies all of them, or (draft_tokens_auto) the count their calibrated probabilities make worth it.
+    bool dspark                 = false;
+    std::uint32_t draft_tokens  = 7;
+    bool draft_tokens_auto      = true;
     DiagnosticObserver diagnostics;
 };
 

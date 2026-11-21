@@ -586,6 +586,7 @@ void resolve_auto_speculative_backend(EngineOptions& options, models::Architectu
     case SpeculativeBackend::Mtp: break;
     case SpeculativeBackend::DFlash: chosen = "dflash"; break;
     case SpeculativeBackend::DFlash2: chosen = "dflash2"; break;
+    case SpeculativeBackend::DSpark: chosen = "dspark"; break;
     case SpeculativeBackend::None:
         // Nothing to draft with: plain decode, and every drafter setting goes with the drafter (copy
         // proposals stay where the model verifies them alone).

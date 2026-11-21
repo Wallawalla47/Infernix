@@ -799,6 +799,17 @@ exact, no serial arg-max), γ, and per-expert job lists. Padded rows of a graph 
 - **MXFP8 W8A8 (layers 20-23).** Native `mxf8f6f4` block-scaled MMA, FP32 accumulation in one fixed K order per column;
   same epilogues.
 - **Layout.** The converter stores each expert's codes and scales in the narrow kernels' tile order (value-preserving).
+- **One column in one launch (`moe_single`, 2026-11-21).** A decode call of one column runs the router and both expert
+  passes as one persistent grid of 144 CTAs (one an SM, the residency checked once by the occupancy API; otherwise the
+  three launches): the router's rows on CTAs 0-15 in route_kernel's order, every CTA selecting the column itself, a
+  job's 144 gate/up and down row groups on 18 CTAs of 8 warps, each warp streaming its gate/up row group over all of K
+  and then its down row group through one 9-stage cp.async ring, so the down weights stream while the CTA waits for
+  its job's h; each CTA forms the job's quantized h row itself. Bits equal the three launches' (op test: routing and
+  outputs byte for byte, graphs interleaving both paths; the forward test's decode guard). Measured (RTX 5090): the op
+  bench at T = 1 (8 cold layers a graph) NVFP4 44.4 → 35.2 µs, MXFP8 58.5 → 49.6 µs (808 → 1,019 and 1,123 → 1,327
+  GB/s); the decode round −3.0 % at 4K context (6.107 → 5.921 ms), −3.4 % at 128 (5.818 → 5.622 ms), about −0.19 ms a
+  round against the op bench's −0.44 ms. Verify and multi-request calls keep the three launches (at T = 8 the experts
+  already stream near their floor).
 
 ### 10.4 Wide routes (prefill)
 
@@ -847,7 +858,11 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   default route: in the captured round (4K context) -9.3 % at one column, -7.1 % at two, -1.4 % at eight; through
   infernix_bench (Inkling corpus; two interleaved invocations at C = 1, one at C = 4 and 8) tg128 167.1 → 185.2 tok/s at
   C = 1, 399.8 → 419.4 at C = 4, 531.4 → 549.5 at C = 8; pp2048 1,504.5 → 1,512.3, pp10000 1,457.0 → 1,463.3; load
-  +0.03 s (the conversion 12-16 ms); device weights 17,792.6 → 17,173.6 MiB, 620 MiB more VRAM free after load. On the perplexity corpus's quick
+  +0.03 s (the conversion 12-16 ms); device weights 17,792.6 → 17,173.6 MiB, 620 MiB more VRAM free after load.
+  Re-measured at 4dc97419 (the default's decode projections on decode-width tensor-core MMA, the prompt route's on
+  tensor cores, the single-column MoE in one launch; the Q8 matrices on the prompt route's Q8 MMA, still on the fold at
+  decode widths): tg128 176.6 → 199.4 tok/s at C = 1, 423.2 → 438.6 at C = 4, 601.0 → 586.3 at C = 8 (now a loss: a Q8
+  decode-width MMA would close it); pp2048 16,362 → 16,010, pp10000 16,276 → 15,928. On the perplexity corpus's quick
   set (291,842 tokens, context 4,096 / stride 2,048): perplexity 4.0348 → 4.0328, KL(BF16 ‖ Q8) mean 0.0107 (p99
   0.108), top-1 agreement 96.0 % (code 98.2 %, the prose and Chinese streams 95.1-95.6 %). Its FP16 group scales on the
   real matrices: none rounds to zero, 47 of 29.3 M are subnormal.
@@ -915,14 +930,23 @@ calibrated-length policy (`runtime/speculative/`) and later tree verification. C
 
 ### 13.3 Taps
 
-K1 of visits 5, 23 and 41 copies its input row, and the final mix its output, into a feature buffer per committed
-column (4 × 4.6 KB), consumed by the drafter's context append and by `f_rnn` from the last committed column. With
-DSpark on, the last visit cannot be trimmed to the logit columns in prefill (every column's final state is a feature).
+After K1 of visits 5, 23 and 41 the raw partial block sum `h` entering the visit (the attention residual's running
+partial, BF16 as stored: not the mixed or normed attention input), and after the output mix the final-normed state (the
+head's input row), go into a feature buffer per column (4 × 4.6 KB), consumed by the drafter's context append and by
+`f_rnn` from the last committed column. With DSpark on, every column's final state is a feature (the forward computes
+the output mix over every column anyway).
+
+**Rounding points** (the reference's, `.local` DSPARK_SPEC; the drafter decides only proposals): α = bf16(softmax);
+the mix unrounded, the context norm and the context K's head norm rounded to BF16 (the K before RoPE); the anchor row
+is the target's *normed* embedding, the mask rows raw; in the Markov step u, g, the new state bf16(kept + blend), ℓ, the
+fold bias, the correction, the BF16 sum base + correction and the capped logit are each rounded to BF16. Every
+reference drafts by argmax (lowest id on ties): the proposal is one-hot, and verification keeps a draft only when it
+equals the target's own draw at its position, so speculation never changes the output.
 
 ### 13.4 Draft length and verification
 
-- Proposal distribution: the softcapped Markov logits (sampled) or their argmax (greedy); a proposal's confidence is its
-  probability there, at no extra cost.
+- Proposal: the argmax of the softcapped Markov logits (lowest id on ties), as every reference drafts; a proposal's
+  confidence is its softmax probability there (1 / Σ exp(L − L_max)), at no extra cost.
 - Length: the per-request length calibrated by confidence deciles (L21), with this model's cost line `t = a + bK` measured
   at M6; device-side IF nodes skip the remaining Markov steps once the confidence falls below the calibrated cut.
 - Verification: chains. Trees lost on the Flash-Next MoE (L21) and the expert union makes them costlier here; they are

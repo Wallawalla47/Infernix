@@ -69,6 +69,34 @@ struct LayerWeights {
     MoeWeights moe;
 };
 
+// One DSpark drafter layer (design §13): the block's q, k, v (one parent, bound to its hidden input), the context's
+// k and v (one parent, bound to the layer's mixed context features), the per-head norms, o, and the SwiGLU MLP.
+struct DSparkLayerWeights {
+    WeightId context_norm, input_norm, post_attention_norm; // BF16 [H]
+    WeightId query, key, value;                             // [heads * d, H], [kv * d, H], [kv * d, H]
+    WeightId context_key, context_value;                    // [kv * d, H]
+    WeightId query_norm, key_norm, context_key_norm;        // BF16 [d]
+    WeightId output;                                        // [H, heads * d]
+    WeightId gate, up, down;                                // [I, H], [I, H], [H, I]
+};
+
+// The DSpark drafter: the context features' mixing weights (softmax per row: a row per layer, then the Markov head's),
+// the block's mask embedding, the final norm, the layers and the Markov RNN head (its token embedding, the joint
+// projection [3 rank, 2 rank + 2 H] and bias, the fold of the target head through its output projection [V, rank]
+// and its bias [V]).
+struct DSparkWeights {
+    WeightId feature_weights; // [layers + 1, features]
+    WeightId mask_embedding;  // BF16 [H]
+    WeightId final_norm;      // BF16 [H]
+    std::vector<DSparkLayerWeights> layers;
+    WeightId markov_context_norm;     // BF16 [H]
+    WeightId markov_embedding;        // BF16 [V, rank]
+    WeightId markov_projection;       // [3 rank, 2 rank + 2 H]
+    WeightId markov_projection_bias;  // [3 rank]
+    WeightId fold;                    // [V, rank]
+    WeightId fold_bias;               // [V]
+};
+
 struct TextWeights {
     WeightId token_embedding; // BF16 [V, H]
     WeightId embedding_norm;  // BF16 [H]
@@ -76,6 +104,7 @@ struct TextWeights {
     WeightId final_norm;      // BF16 [H]
     WeightId output_query;    // FP32 [H]
     std::vector<LayerWeights> layers;
+    std::optional<DSparkWeights> dspark; // bound with --spec dspark
 };
 
 } // namespace infernix::models::inkling2

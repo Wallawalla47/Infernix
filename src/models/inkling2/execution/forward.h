@@ -88,6 +88,9 @@ struct ForwardBuffers {
     float *mixed = nullptr, *message = nullptr, *fg = nullptr; // [3][columns][H], [3][columns][H], [3][columns][2H]
     std::uint16_t *gate_input = nullptr, *z = nullptr;          // [3][columns][2H], [3][columns][rank]
     std::uint16_t* final_hidden = nullptr;
+    // DSpark's context features (--spec dspark): each column's partial block sums entering the drafter's target visits
+    // (5, 23, 41) and its final-normed state, BF16 [columns][4][H]; null without the drafter.
+    std::uint16_t* features = nullptr;
     float* logits = nullptr;          // [columns][V]
     ops::w4a4_moe::Workspace moe;
     ops::inkling2::AttentionWorkspace attention_ws;
@@ -125,7 +128,8 @@ public:
     // The columns a call may have (decode and verify calls: at most kMaxForwardColumns).
     [[nodiscard]] std::int32_t capacity() const noexcept { return capacity_; }
     // The device memory a forward of these lanes and capacity allocates.
-    [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity);
+    [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity,
+                                                  bool features = false);
     void embed(cudaStream_t stream);
     void visit(std::uint32_t visit, const StateView& state, const VisitInputs& in, cudaStream_t stream);
     void visit(std::uint32_t v, const StateView& state, cudaStream_t stream) { visit(v, state, inputs(v), stream); }
@@ -137,6 +141,9 @@ public:
     // The head again over columns [first, first + count) (at most kMaxForwardColumns) of the last finish's final
     // hidden rows, into logits rows 0..: a wide call's logits a slice at a time.
     void head(std::int32_t first, std::int32_t count, cudaStream_t stream);
+    // The head's raw products W_head x (FP32, no softcap) of `count` BF16 rows x [count][H] (at most
+    // kMaxForwardColumns) into out [count][V]: the DSpark drafter's base logits.
+    void project_head(const std::uint16_t* x, std::int32_t count, float* out, cudaStream_t stream) const;
     // Profiling: `marker` is called with each Op's name right after its launches (null: none), so a caller can record
     // events between them.
     void set_marker(std::function<void(const char*)> marker) { marker_ = std::move(marker); }
@@ -163,6 +170,8 @@ private:
     // A wide call's state copies: the conv ring histories (before visit 0) and a sliding visit's staging ring.
     void snapshot_history(const StateView& s, cudaStream_t stream) const;
     void stage_window(const StateView& s, const VisitState& vs, bool in, cudaStream_t stream) const;
+    // DSpark's context features: `rows` (a visit's input, or the final state) into the feature slot of its tap, if any.
+    void tap(std::uint32_t visit, const std::uint16_t* rows, cudaStream_t stream) const;
 
     // A lane's columns in the call.
     struct CallLane {

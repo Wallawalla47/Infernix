@@ -16,6 +16,10 @@
 // 6. --q8-weights (approximate 8-bit weights): refused with --reproducible; under it, an eager Engine at chunks of 16
 //    serving one request at a time is the reference, and graphs (alone and C = 4 in reverse order), chunks of 7, and
 //    the long prompt in one 4,096-column call give its tokens.
+// 7. DSpark (--spec dspark, auto and 7 drafts, graphs and eager; INFERNIX_INKLING2_NO_DSPARK skips it): speculative
+//    tokens equal plain decoding's (the golden continuation, a 160-token greedy reply raw and parsed: the parsed one
+//    samples under its reasoning ban, the four sampled requests alone
+//    and C = 2); the acceptance is reported.
 // Reported, not judged: a chat turn's channels, a turn whose thinking budget (6) injects the control (the mixed-width
 // decode after forced tokens), and how long --q8-weights' tokens agree with the BF16 weights'.
 //
@@ -251,6 +255,58 @@ int main() {
         {
             infernix::Engine engine(engine_options(artifact, 7, true, 8));
             require_alone("prefill chunks of 7", engine, reference_tokens);
+        }
+        if (std::getenv("INFERNIX_INKLING2_NO_DSPARK") == nullptr) {
+            // 7. DSpark: verification keeps a draft only when it equals the target's own draw at its position, so
+            // speculative output is plain decoding's, token for token (greedy and sampled, auto and fixed lengths,
+            // graphs and eager); C = 2 decodes plainly while still appending the drafter's context. Reported: the
+            // acceptance.
+            Tokens plain_long, plain_reasoning;
+            infernix::RequestOptions long_greedy = greedy(160);
+            // Parsed output: while the reply's reasoning is open every column samples under its reasoning ban.
+            infernix::RequestOptions reasoning = greedy(160);
+            reasoning.output.raw               = false;
+            {
+                infernix::Engine engine(engine_options(artifact, 0, true, 1));
+                plain_long = engine.generate(engine.prepare(chat(texts()[1])), long_greedy).generated_token_ids;
+                plain_reasoning = engine.generate(engine.prepare(chat(texts()[0])), reasoning).generated_token_ids;
+            }
+            for (const bool automatic : {true, false}) {
+                for (const bool graphs : {true, false}) {
+                    if (!graphs && automatic) { continue; }
+                    infernix::EngineOptions options = engine_options(artifact, 0, graphs, 2);
+                    options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                    options.speculative.draft_tokens_auto = automatic;
+                    options.speculative.draft_tokens      = 7;
+                    infernix::Engine engine(options);
+                    const std::string label = std::string("dspark (") + (automatic ? "auto" : "7 drafts") +
+                                              (graphs ? ", graphs" : ", eager") + ")";
+                    require_same(label + ": greedy continuation of the golden prompt", continuation,
+                                 engine.generate(engine.prepare_tokens(prompt), greedy(8)).generated_token_ids);
+                    const auto result = engine.generate(engine.prepare(chat(texts()[1])), long_greedy);
+                    require_same(label + ": a 160-token greedy reply", plain_long, result.generated_token_ids);
+                    const auto parsed = engine.generate(engine.prepare(chat(texts()[0])), reasoning);
+                    require_same(label + ": a 160-token parsed greedy reply (reasoning ban)", plain_reasoning,
+                                 parsed.generated_token_ids);
+                    std::cout << label << ": parsed reply " << parsed.speculative.rounds << " rounds, "
+                              << parsed.speculative.accepted_tokens << " of " << parsed.speculative.drafted_tokens
+                              << " drafts accepted, " << parsed.speculative.fallback_steps << " plain steps\n";
+                    const infernix::SpeculativeStats& s = result.speculative;
+                    std::cout << label << ": " << s.rounds << " rounds, " << s.drafted_tokens << " drafted, "
+                              << s.accepted_tokens << " accepted ("
+                              << (s.drafted_tokens == 0 ? 0.0 : 100.0 * s.accepted_tokens / s.drafted_tokens)
+                              << " %), " << s.fallback_steps << " plain steps; accepted by position";
+                    for (const auto n : s.accepted_per_position) { std::cout << ' ' << n; }
+                    std::cout << '\n';
+                    require_alone(label, engine, reference_tokens);
+                    if (graphs && automatic) {
+                        auto second = engine.submit(engine.prepare(chat(texts()[1])), sampled(1));
+                        auto first  = engine.submit(engine.prepare(chat(texts()[0])), sampled(0));
+                        require_same(label + ", C = 2, request 1", reference_tokens[1], second.wait().generated_token_ids);
+                        require_same(label + ", C = 2, request 0", reference_tokens[0], first.wait().generated_token_ids);
+                    }
+                }
+            }
         }
         {
             // Wide prefill calls (128 and 100 columns: the conv rings' history snapshot, the window's staging ring,

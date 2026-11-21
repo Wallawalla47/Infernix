@@ -28,7 +28,11 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
             .causal_scoring  = options.purpose == EnginePurpose::CausalScoring,
             .prefill_chunk   = options.prefill_chunk,
             .use_cuda_graph  = options.use_cuda_graph,
-            .diagnostics     = options.diagnostic_observer};
+            .dspark            = options.speculative.backend == SpeculativeBackend::DSpark &&
+                      options.purpose == EnginePurpose::Generation,
+            .draft_tokens      = options.speculative.draft_tokens == 0 ? 7U : options.speculative.draft_tokens,
+            .draft_tokens_auto = options.speculative.draft_tokens_auto,
+            .diagnostics       = options.diagnostic_observer};
 }
 
 std::string read_text(const std::filesystem::path& path) {
@@ -73,13 +77,22 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
         options.context_cache.enabled = false;
         report(options, "Inkling 2: the prefix cache is not available yet; it is off");
     }
-    if (options.speculative.backend != SpeculativeBackend::None || options.speculative.backend_auto) {
-        if (!options.speculative.backend_auto) {
-            throw std::invalid_argument("Inkling 2: speculative decoding (DSpark) is a later milestone");
+    SpeculativeOptions& spec = options.speculative;
+    if (spec.backend_auto) {
+        spec.backend      = SpeculativeBackend::None;
+        spec.backend_auto = false;
+        report(options, "Inkling 2: --spec auto decodes without a drafter (--spec dspark drafts with the bundled one)");
+    }
+    if (spec.backend == SpeculativeBackend::DSpark) {
+        refuse(options.purpose != EnginePurpose::Generation, "DSpark drafts for generation only");
+        refuse(spec.proposal_head != ProposalHead::Full, "--lm-head-draft is not available with DSpark yet");
+        if (spec.draft_tokens_auto) {
+            if (spec.draft_tokens == 0 || spec.draft_tokens > 7) { spec.draft_tokens = 7; } // the block less its anchor
+        } else {
+            refuse(spec.draft_tokens == 0 || spec.draft_tokens > 7, "--spec dspark drafts 1-7 tokens a round");
         }
-        options.speculative.backend      = SpeculativeBackend::None;
-        options.speculative.backend_auto = false;
-        report(options, "Inkling 2: --spec auto decodes without a drafter (DSpark is a later milestone)");
+    } else if (spec.backend != SpeculativeBackend::None) {
+        throw std::invalid_argument("Inkling 2's drafter is DSpark (--spec dspark)");
     }
     options.speculative.ngram_archive_bytes = 0;
     options.speculative.ngram_session_bytes = 0;
