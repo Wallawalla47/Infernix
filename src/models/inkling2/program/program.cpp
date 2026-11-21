@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -434,6 +435,7 @@ public:
         CommitRowResult stats;
         speculative_of(lanes_[index], stats);
         out.speculative = std::move(stats.speculative);
+        report_rounds(lanes_[index]);
         release(index);
         return out;
     }
@@ -603,7 +605,9 @@ private:
         // DSpark: the drafts' acceptance by probability decile (draft_length.h) and the request's counters.
         runtime::speculative::DraftCalibration calibration;
         std::uint64_t policy_rounds = 0;
+        std::int32_t step_cap = ops::inkling2::kMarkovSteps; // the calibrated length's Markov steps a round drafts
         std::uint64_t rounds = 0, drafted = 0, accepted = 0, fallback = 0;
+        double draft_ms = 0, gap_ms = 0, verify_ms = 0; // device-side sums over the rounds (CUDA events)
         std::array<std::uint64_t, ops::inkling2::kMarkovSteps> accepted_at{}; // rounds accepting draft i
     };
     // A DSpark round's row awaiting its commit: the lane, the anchor's position and the tokens it licenses.
@@ -700,17 +704,22 @@ private:
         Lane& lane                = lanes_[index];
         const auto F              = static_cast<std::int32_t>(lane.processed);
         // Drafts whose positions fit the context and whose round (drafts + 1 tokens) fits the row's budget.
+        // With the calibrated length the Markov head drafts at most two more steps than the last round verified (each
+        // step reads the whole folded vocabulary): room for the policy's probe of one more.
+        const std::int32_t most = o_.draft_tokens_auto ? lane.step_cap : static_cast<std::int32_t>(o_.draft_tokens);
         const std::int32_t steps =
-            std::min({static_cast<std::int32_t>(o_.draft_tokens), static_cast<std::int32_t>(o_.max_context) - 1 - F,
+            std::min({most, static_cast<std::int32_t>(o_.max_context) - 1 - F,
                       static_cast<std::int32_t>(std::min<std::uint32_t>(remaining - 1U, ops::inkling2::kMarkovSteps))});
         // The drafts: the block, the head over its rows and the Markov steps, read back before the verify call.
         drafter_->stage({F, lane.tokens[static_cast<std::size_t>(F)], static_cast<std::int32_t>(index)});
+        CUDA_CHECK(cudaEventRecord(round_events_[0], device_.stream));
         if (o_.use_cuda_graph) {
             draft_graph(steps).launch(device_.stream);
         } else {
             drafter_->draft(steps, device_.stream);
             drafter_->download(steps, device_.stream);
         }
+        CUDA_CHECK(cudaEventRecord(round_events_[1], device_.stream));
         {
             const auto wait = Clock::now();
             CUDA_CHECK(cudaStreamSynchronize(device_.stream));
@@ -728,6 +737,8 @@ private:
                 lane.calibration, std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)), steps,
                 kDraftCost, kProposalCost);
             if (++lane.policy_rounds % kProbeInterval == 0) { k = std::min(k + 1, steps); }
+            const auto window = static_cast<std::int32_t>(o_.draft_tokens);
+            lane.step_cap     = std::clamp(k + 2, std::min(2, window), window);
         }
         // The verify call: the pending input and the k drafts at F .. F + k, every column sampled as decoding would.
         CallPlan call;
@@ -749,13 +760,22 @@ private:
         const runtime::ReasoningBan ban = masks != nullptr ? masks->reasoning_ban(0) : runtime::ReasoningBan{};
         stage_sample({rows.data(), n}, {logit_rows.data(), n}, ops::kSamplePurposeDecode, masks, {positions.data(), n},
                      true);
+        CUDA_CHECK(cudaEventRecord(round_events_[2], device_.stream));
         if (o_.use_cuda_graph) {
             verify_graph(index, columns).launch(device_.stream);
         } else {
             run_decode_call(columns);
             launch_sample(n, {logit_rows.data(), n}, ops::kSamplePurposeDecode);
         }
+        CUDA_CHECK(cudaEventRecord(round_events_[3], device_.stream));
         finish_sample(n);
+        {
+            float draft = 0, gap = 0, verify = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&draft, round_events_[0], round_events_[1]));
+            CUDA_CHECK(cudaEventElapsedTime(&gap, round_events_[1], round_events_[2]));
+            CUDA_CHECK(cudaEventElapsedTime(&verify, round_events_[2], round_events_[3]));
+            lane.draft_ms += draft, lane.gap_ms += gap, lane.verify_ms += verify;
+        }
         // The accepted prefix: draft i stands while it equals the target's own draw at its position.
         std::int32_t a = 0;
         while (a < k && drafts[static_cast<std::size_t>(a)] == sampled_tokens_[static_cast<std::size_t>(a)] &&
@@ -832,6 +852,22 @@ private:
             found = graphs_.emplace(key, std::move(exec)).first;
         }
         return found->second;
+    }
+
+    // A request's DSpark rounds at its end (Debug): their counts and the mean device time of a round's parts.
+    void report_rounds(const Lane& lane) const noexcept {
+        if (!drafter_ || lane.rounds == 0 || !o_.diagnostics.callback) { return; }
+        try {
+            const double n = static_cast<double>(lane.rounds);
+            char text[256];
+            std::snprintf(text, sizeof(text),
+                          "Inkling 2 DSpark: %llu rounds (%llu plain), %llu of %llu drafts accepted; a round's draft "
+                          "%.3f ms, host gap %.3f ms, verify call %.3f ms (device means)",
+                          static_cast<unsigned long long>(lane.rounds), static_cast<unsigned long long>(lane.fallback),
+                          static_cast<unsigned long long>(lane.accepted), static_cast<unsigned long long>(lane.drafted),
+                          lane.draft_ms / n, lane.gap_ms / n, lane.verify_ms / n);
+            o_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Debug, .message = text});
+        } catch (...) {}
     }
 
     // A lane's speculative counters and statistics for the Engine.
@@ -1063,6 +1099,19 @@ private:
         cudaEvent_t operator[](int i) const { return events[static_cast<std::size_t>(i)]; }
     } slot_events_;
     std::array<bool, kStagingSlots> slot_used_{};
+    // A DSpark round's timing: before the draft, after it, before the verify call, after it (timing events).
+    struct RoundEvents {
+        std::array<cudaEvent_t, 4> events{};
+        RoundEvents() {
+            for (auto& e : events) { CUDA_CHECK(cudaEventCreate(&e)); }
+        }
+        ~RoundEvents() {
+            for (auto e : events) { cudaEventDestroy(e); }
+        }
+        RoundEvents(const RoundEvents&)            = delete;
+        RoundEvents& operator=(const RoundEvents&) = delete;
+        cudaEvent_t operator[](int i) const { return events[static_cast<std::size_t>(i)]; }
+    } round_events_;
     int slot_ = 0;
     std::optional<std::uint32_t> binding_;
     std::optional<std::uint64_t> pending_;
