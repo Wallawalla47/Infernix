@@ -61,12 +61,13 @@ void projections(const ProjectionArgs& args, cudaStream_t stream);
 // width, its other columns or matrices, nor on the tile shape the launch picks. Other bits than projections()'s fold.
 void projections_mma(const ProjectionArgs& args, cudaStream_t stream);
 
-// The decode route's projections on tensor cores (BF16 storage, K a multiple of 32; a call of any width runs launches
-// of up to 16 columns): K's 32-blocks in S equal runs, each a chain of m16n8k16 MMAs from zero over its blocks in
-// ascending order (in a block, elements 8t .. 8t + 3 in the first MMA's slots 2t, 2t + 1, 2t + 8, 2t + 9 and
-// 8t + 4 .. 8t + 7 in the second's, t = lane % 4), the runs' partials added in order. S (1-16) is a function of K and
-// the call's segments' row counts only (enough warps for the launch), so for a given set of segments a column's bits
-// depend on its row and its input alone, the same at every width. Other bits than projections_mma's.
+// The decode route's projections on tensor cores (BF16 or Q8 storage, one a call; K a multiple of 32; a call of any
+// width runs launches of up to 16 columns): K's 32-blocks in S equal runs, each a chain of m16n8k16 MMAs from zero over
+// its blocks in ascending order (in a block, elements 8t .. 8t + 3 in the first MMA's slots 2t, 2t + 1, 2t + 8, 2t + 9
+// and 8t + 4 .. 8t + 7 in the second's, t = lane % 4; Q8: a block's two MMAs from zero over its codes (as BF16, exact),
+// then acc = fma(the block's sum, the row's group scale, acc)), the runs' partials added in order. S (1-16) is a function
+// of K and the call's segments' row counts only (enough warps for the launch), so for a given set of segments a column's
+// bits depend on its row and its input alone, the same at every width. Other bits than projections_mma's.
 void projections_dmma(const ProjectionArgs& args, cudaStream_t stream);
 
 } // namespace infernix::ops::inkling2

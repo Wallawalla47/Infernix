@@ -116,9 +116,10 @@ double f16_value(std::uint16_t h) {
 // output (<= 2^-8 |y|, one ulp's half on either side of a rounding). Every column of the call must also equal the
 // same column projected alone (T = 1, the narrow kernel) bit for bit: width invariance, and wide = narrow.
 using ProjectionsFn = void (*)(const ik::ProjectionArgs&, cudaStream_t);
-// fn: the fold (projections, bound (K / 32 + 5) 2^-24 sum|wx|) or the prompt route's MMA (projections_mma, (K / 16 + 5)
-// 2^-23 sum|wx|: per 32-group an MMA sum then an fma with its scale).
-void run_q8(const Case& c, int columns, std::uint32_t seed, ProjectionsFn fn = ik::projections, bool mma = false) {
+// fn: the fold (projections, bound (K / 32 + 5) 2^-24 sum|wx|) or an MMA route (projections_mma, the prompt route's, and
+// projections_dmma, the decode route's: (K / 16 + 5) 2^-23 sum|wx|: per 32-group an MMA sum then an fma with its scale).
+void run_q8(const Case& c, int columns, std::uint32_t seed, ProjectionsFn fn = ik::projections, bool mma = false,
+            const char* label = nullptr) {
     std::mt19937 gen(seed);
     const int word = c.fp32 ? 4 : 2;
     std::uint16_t* x[3];
@@ -227,7 +228,7 @@ void run_q8(const Case& c, int columns, std::uint32_t seed, ProjectionsFn fn = i
     }
     std::printf("%-44s %s T = %2d: %ld of %ld outside the bound (worst |err| / sum|wx| %.2e), %ld differ from the "
                 "column alone\n",
-                c.name, mma ? "Q8MMA" : "Q8  ", columns, outside, total, worst, differ);
+                c.name, label != nullptr ? label : (mma ? "Q8MMA" : "Q8  "), columns, outside, total, worst, differ);
     if (outside != 0 || differ != 0) { ++g_failures; }
     for (auto* p : x) { cudaFree(p); }
     for (auto* p : blocks) { cudaFree(p); }
@@ -441,6 +442,10 @@ INFERNIX_OP_TEST(inkling2_projections) {
         for (const int columns : {1, 3, 8, 16, 17, 40, 100}) { run_q8(c, columns, seed++); }
         // The prompt route's Q8 tensor-core arithmetic.
         for (const int columns : {1, 3, 16, 17, 100, 300}) { run_q8(c, columns, seed++, ik::projections_mma, true); }
+        // The decode route's Q8 tensor-core arithmetic (projections_dmma).
+        for (const int columns : {1, 2, 3, 8, 9, 16, 17, 40}) {
+            run_q8(c, columns, seed++, ik::projections_dmma, true, "Q8DMMA");
+        }
     }
     // The tensor-core projections at the same shapes, the router's [128, 2304] FP32 and the head's arithmetic, at
     // narrow and wide widths (tile shapes: <= 16 columns, few rows, wide).

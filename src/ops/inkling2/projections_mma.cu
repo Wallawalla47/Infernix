@@ -343,7 +343,25 @@ void launch_shape(const MmaParams& p, bool small, cudaStream_t stream, std::int3
 // added in order. A column's bits depend on its row and its input alone (the same at every width up to 16).
 constexpr int kDmmaAhead = 4; // blocks in flight a warp
 
-template <int Splits, int NT, class Out>
+// Q8: the thread's 8 codes of a 32-block (elements 8t .. 8t + 7) as the BF16 words of the k-slots BF16 storage would
+// hold (codes are exact in BF16).
+__device__ __forceinline__ uint4 q8_words(uint2 c) {
+    const std::uint32_t b[2] = {c.x, c.y};
+    std::uint32_t w[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const std::uint32_t pair = b[i / 2] >> (16 * (i % 2));
+        const auto lo = static_cast<float>(static_cast<std::int8_t>(pair & 0xFFU));
+        const auto hi = static_cast<float>(static_cast<std::int8_t>((pair >> 8) & 0xFFU));
+        w[i]          = std::uint32_t{__bfloat16_as_ushort(__float2bfloat16_rn(lo))} |
+               (std::uint32_t{__bfloat16_as_ushort(__float2bfloat16_rn(hi))} << 16);
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+// BF16 storage: a block's two MMAs chain into acc. Q8 storage: they run from zero over the codes, and
+// acc = fma(the block's sum, the row's group scale, acc) (projections_mma's Q8 form at a block a group).
+template <int Splits, int NT, class Out, bool Q8>
 __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const MmaParams p) {
     __shared__ float partial[Splits][32][NT * 4];
     const int lane = static_cast<int>(threadIdx.x & 31U), warp = static_cast<int>(threadIdx.x >> 5);
@@ -356,15 +374,35 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
     const int m0 = (tile - p.tile_begin[s]) * 16;
     const int r0 = min(m0 + g, M - 1), r1 = min(m0 + g + 8, M - 1);
     const int blocks = K / 32 / Splits, b0 = warp * blocks;
-    const uint4* w0 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r0) * K) + t;
-    const uint4* w1 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r1) * K) + t;
+    const uint4* w0 = nullptr;
+    const uint4* w1 = nullptr;
+    const uint2 *c0 = nullptr, *c1 = nullptr;     // Q8: the rows' codes (8 bytes a thread a block)
+    const std::uint16_t *s0 = nullptr, *s1 = nullptr; // Q8: the rows' group scales
+    if constexpr (Q8) {
+        c0 = reinterpret_cast<const uint2*>(seg.codes + static_cast<std::size_t>(r0) * seg.stride) + t;
+        c1 = reinterpret_cast<const uint2*>(seg.codes + static_cast<std::size_t>(r1) * seg.stride) + t;
+        s0 = seg.scales + static_cast<std::size_t>(r0) * (seg.stride / 32);
+        s1 = seg.scales + static_cast<std::size_t>(r1) * (seg.stride / 32);
+    } else {
+        w0 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r0) * K) + t;
+        w1 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r1) * K) + t;
+    }
     uint4 a0[kDmmaAhead], a1[kDmmaAhead];
+    float sc0[kDmmaAhead], sc1[kDmmaAhead];
+    const auto fetch = [&](int i, int b) {
+        if constexpr (Q8) {
+            a0[i]  = q8_words(__ldcs(c0 + 4 * b));
+            a1[i]  = q8_words(__ldcs(c1 + 4 * b));
+            sc0[i] = __half2float(__ushort_as_half(__ldg(s0 + b)));
+            sc1[i] = __half2float(__ushort_as_half(__ldg(s1 + b)));
+        } else {
+            a0[i] = __ldcs(w0 + 4 * b);
+            a1[i] = __ldcs(w1 + 4 * b);
+        }
+    };
 #pragma unroll
     for (int i = 0; i < kDmmaAhead; ++i) {
-        if (i < blocks) {
-            a0[i] = __ldcs(w0 + 4 * (b0 + i));
-            a1[i] = __ldcs(w1 + 4 * (b0 + i));
-        }
+        if (i < blocks) { fetch(i, b0 + i); }
     }
     pdl::enter_streaming();
     // The thread's input columns: g (and g + 8 with NT = 2); past the call's columns, zeros.
@@ -387,14 +425,21 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
             for (int n = 0; n < NT; ++n) { xv[n] = live[n] ? x[n][4 * (b0 + b)] : make_uint4(0U, 0U, 0U, 0U); }
 #pragma unroll
             for (int n = 0; n < NT; ++n) {
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].x, a1[j].x, a0[j].y, a1[j].y, xv[n].x, xv[n].y);
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].z, a1[j].z, a0[j].w, a1[j].w, xv[n].z, xv[n].w);
+                if constexpr (Q8) {
+                    float gs[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+                    mma_bf16(gs[0], gs[1], gs[2], gs[3], a0[j].x, a1[j].x, a0[j].y, a1[j].y, xv[n].x, xv[n].y);
+                    mma_bf16(gs[0], gs[1], gs[2], gs[3], a0[j].z, a1[j].z, a0[j].w, a1[j].w, xv[n].z, xv[n].w);
+                    acc[n][0] = __fmaf_rn(gs[0], sc0[j], acc[n][0]);
+                    acc[n][1] = __fmaf_rn(gs[1], sc0[j], acc[n][1]);
+                    acc[n][2] = __fmaf_rn(gs[2], sc1[j], acc[n][2]);
+                    acc[n][3] = __fmaf_rn(gs[3], sc1[j], acc[n][3]);
+                } else {
+                    mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].x, a1[j].x, a0[j].y, a1[j].y, xv[n].x, xv[n].y);
+                    mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].z, a1[j].z, a0[j].w, a1[j].w, xv[n].z, xv[n].w);
+                }
             }
             const int next = b + kDmmaAhead;
-            if (next < blocks) {
-                a0[j] = __ldcs(w0 + 4 * (b0 + next));
-                a1[j] = __ldcs(w1 + 4 * (b0 + next));
-            }
+            if (next < blocks) { fetch(j, b0 + next); }
         }
     }
     pdl::trigger_dependents();
@@ -427,7 +472,11 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
 template <int Splits, int NT, class Out>
 void launch_dmma(const MmaParams& p, std::int32_t tiles, cudaStream_t stream) {
     const pdl::LaunchConfig config{dim3(static_cast<unsigned>(tiles)), dim3(Splits * 32), 0, stream};
-    CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out>, p));
+    if (p.seg[0].codes != nullptr) {
+        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, true>, p));
+    } else {
+        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, false>, p));
+    }
 }
 
 // The runs of K a call splits into: a function of its segments' shapes only (never its width), enough warps for ~2,048
@@ -467,19 +516,30 @@ MmaParams mma_params(const ProjectionArgs& a, int k_multiple, const char* what) 
     p.count   = a.count;
     p.k       = a.k;
     p.columns = a.columns;
+    // One storage for the call: BF16, or Q8 (codes 8-byte aligned a row, stride a multiple of 128).
+    const bool q8 = a.segments[0].q8_scales != nullptr;
     for (int s = 0; s < a.count; ++s) {
         const ProjectionSegment& g = a.segments[s];
         const auto* x              = (g.input >= 0 && g.input <= 2) ? a.x[g.input] : nullptr;
         const std::size_t word     = a.fp32_out ? 4 : 2;
-        if (g.weight == nullptr || g.codes != nullptr || g.rows <= 0 || x == nullptr || g.out == nullptr ||
-            reinterpret_cast<std::uintptr_t>(g.weight) % 16 != 0 || reinterpret_cast<std::uintptr_t>(x) % 16 != 0 ||
+        const bool storage = q8 ? (g.weight == nullptr && g.codes != nullptr && g.q8_scales != nullptr &&
+                                   g.nibbles == nullptr && g.q8_stride >= a.k && g.q8_stride % 128 == 0 &&
+                                   reinterpret_cast<std::uintptr_t>(g.codes) % 16 == 0)
+                                : (g.weight != nullptr && g.codes == nullptr &&
+                                   reinterpret_cast<std::uintptr_t>(g.weight) % 16 == 0);
+        if (!storage || g.rows <= 0 || x == nullptr || g.out == nullptr || reinterpret_cast<std::uintptr_t>(x) % 16 != 0 ||
             reinterpret_cast<std::uintptr_t>(g.out) % 16 != 0 || (g.rows * word) % 16 != 0) {
             throw std::invalid_argument(std::string("inkling2 ") + what +
-                                        ": BF16 segments only, with 16-byte aligned weights, inputs, outputs and output "
-                                        "rows");
+                                        ": BF16 or Q8 segments (one storage a call), with 16-byte aligned weights, inputs, "
+                                        "outputs and output rows");
         }
         p.seg[s] = {reinterpret_cast<const __nv_bfloat16*>(g.weight), reinterpret_cast<const __nv_bfloat16*>(x), g.out,
                     g.rows};
+        if (q8) {
+            p.seg[s].codes  = static_cast<const std::uint8_t*>(g.codes);
+            p.seg[s].scales = g.q8_scales;
+            p.seg[s].stride = g.q8_stride;
+        }
     }
     return p;
 }

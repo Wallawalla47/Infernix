@@ -80,14 +80,13 @@ void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, 
     args.segments[args.count++] = s;
 }
 
-// The fused projections: a prompt call's on projections_mma (BF16 or Q8 storage); a decode-route call's (decode,
-// verification, forced tokens; any width) on projections_dmma with BF16 storage, and with Q8 storage (--q8-weights: no
-// Q8 decode-width tensor-core route yet) the fold (projections).
+// The fused projections: a prompt call's on projections_mma, a decode-route call's (decode, verification, forced
+// tokens; any width) on projections_dmma (BF16 or Q8 storage both); bf16_p12 segments on the fold (projections).
 bool use_mma(bool prompt, const ik::ProjectionArgs& a) {
     return prompt && (a.segments[0].weight != nullptr || a.segments[0].q8_scales != nullptr) && a.k % 64 == 0;
 }
 bool use_dmma(bool prompt, const ik::ProjectionArgs& a) {
-    return !prompt && a.segments[0].weight != nullptr && a.k % 32 == 0;
+    return !prompt && (a.segments[0].weight != nullptr || a.segments[0].q8_scales != nullptr) && a.k % 32 == 0;
 }
 void project_fused(bool prompt, const ik::ProjectionArgs& a, cudaStream_t stream) {
     if (use_mma(prompt, a)) {
