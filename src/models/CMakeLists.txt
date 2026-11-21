@@ -4,7 +4,7 @@ add_library(infernix_model_loading STATIC registry.cpp ablate/binding.cpp)
 infernix_internal_includes(infernix_model_loading)
 target_link_libraries(infernix_model_loading PUBLIC infernix_artifact infernix_text infernix_ops)
 
-add_library(infernix_model_runtime STATIC ablate/parameters.cpp)
+add_library(infernix_model_runtime STATIC ablate/parameters.cpp output_text.cpp)
 infernix_internal_includes(infernix_model_runtime)
 target_link_libraries(infernix_model_runtime
   PUBLIC infernix_model_loading infernix_ops infernix_runtime_support

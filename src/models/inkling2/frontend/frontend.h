@@ -1,0 +1,91 @@
+#pragma once
+
+// Inkling 2's frontend (design docs/maintainer/inkling2_mini-design.md §17): the official chat template through
+// Infernix's Jinja engine, tokenized with the render's literal spans (client text never becomes an added token), and
+// the output session (output_session.h) of each turn.
+//
+// This slice renders text conversations for a new assistant turn: system/developer, user, assistant (with reasoning
+// and tool calls) and tool turns, declared tools and the template's thinking effort (PromptOptions::reasoning_effort,
+// enable_thinking false = "none", or a chat_template_kwargs reasoning_effort string or number in [0, 0.99]). It
+// refuses what later milestones add: images (the vision tower), continuing a final assistant message, the next-turn
+// history prefill, constrained output and required or named tool choices (the constrained route), and the
+// reasoning-loop guard.
+
+#include "infernix/types.h"
+#include "models/inkling2/frontend/output_session.h"
+#include "models/inkling2/model.h"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace infernix::models::inkling2 {
+
+struct FrontendOptions {
+    std::uint32_t max_context = 2'048;
+    // Thinking text injected before the thinking close when a request reaches its thinking budget; empty injects the
+    // close alone.
+    std::string thinking_budget_message;
+};
+
+struct PreparedPromptData {
+    std::vector<TokenId> token_ids;
+    std::shared_ptr<const ToolNames> tools; // null: the prompt declares no tools
+    PromptPreparationStats stats;
+};
+
+class PreparedPrompt {
+public:
+    PreparedPrompt() noexcept = default;
+    explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept : data_(std::move(data)) {}
+
+    [[nodiscard]] PromptSummary summary() const;
+    [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
+    [[nodiscard]] explicit operator bool() const noexcept { return data_ != nullptr; }
+    [[nodiscard]] const PreparedPromptData& data() const { return *data_; }
+
+private:
+    std::unique_ptr<PreparedPromptData> data_;
+};
+
+class Frontend {
+public:
+    Frontend(const FrontendResources& resources, FrontendOptions options);
+
+    [[nodiscard]] PreparedPrompt prepare(PromptInput input, const PreparationControl& control = {}) const;
+    [[nodiscard]] std::uint32_t count_tokens(PromptInput input, const PreparationControl& control = {}) const;
+    [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity = true) const;
+    [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
+    [[nodiscard]] std::string detokenize_bytes(std::span<const TokenId> token_ids) const;
+    [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
+                                                    const OutputOptions& output                       = {},
+                                                    const ThinkingControlOptions& thinking            = {},
+                                                    const std::optional<OutputConstraint>& constraint = {},
+                                                    const ToolChoice& tool_choice                     = {}) const;
+    [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
+    [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
+    // The template renders a system turn at any position (developer turns render as system turns).
+    [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const noexcept { return {}; }
+    [[nodiscard]] VisionImageBudget vision_image_budget() const noexcept { return {}; }
+    [[nodiscard]] MediaCacheSummary media_cache_summary() const noexcept { return {}; }
+    void warm_constraints() const noexcept {}
+
+    // The rendered prompt text and its token ids (tests and tools).
+    struct Rendered {
+        std::string text;
+        std::vector<TokenId> ids;
+    };
+    [[nodiscard]] Rendered render(const PromptInput& input, std::size_t max_tokens) const;
+
+private:
+    struct Impl;
+    std::shared_ptr<const Impl> impl_;
+};
+
+} // namespace infernix::models::inkling2

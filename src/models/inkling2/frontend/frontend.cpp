@@ -1,0 +1,331 @@
+#include "models/inkling2/frontend/frontend.h"
+
+#include "text/jinja.h"
+#include "text/tokenizer.h"
+#include "text/unicode.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <stdexcept>
+#include <utility>
+
+namespace infernix::models::inkling2 {
+namespace {
+
+using Json  = nlohmann::ordered_json;
+using Clock = std::chrono::steady_clock;
+
+std::string_view role_name(ChatRole role) {
+    switch (role) {
+    case ChatRole::System:
+    case ChatRole::Developer: // the template has no developer role: an instruction renders as a system turn
+        return "system";
+    case ChatRole::User:
+        return "user";
+    case ChatRole::Assistant:
+        return "assistant";
+    case ChatRole::Tool:
+        return "tool";
+    }
+    throw std::invalid_argument("unknown chat role");
+}
+
+Json parse_object(std::string_view json, std::string_view what) {
+    if (json.empty()) { return Json::object(); }
+    Json value;
+    try {
+        value = Json::parse(json);
+    } catch (const nlohmann::json::exception& error) {
+        throw std::invalid_argument(std::string(what) + " is not valid JSON: " + error.what());
+    }
+    if (!value.is_object()) { throw std::invalid_argument(std::string(what) + " must be a JSON object"); }
+    return value;
+}
+
+// One message as the template reads it (its OpenAI-shaped fields).
+Json message_json(const ChatMessage& message) {
+    Json out    = Json::object();
+    out["role"] = role_name(message.role);
+    for (const MessagePart& part : message.parts) {
+        if (part.kind == MessagePartKind::Media) {
+            throw RequestError(RequestErrorKind::InvalidMedia,
+                               "Inkling 2 takes no images yet (its vision tower is a later milestone)");
+        }
+    }
+    if (message.parts.size() == 1) {
+        out["content"] = message.parts.front().text;
+    } else if (message.parts.empty()) {
+        out["content"] = "";
+    } else {
+        Json parts = Json::array();
+        for (const MessagePart& part : message.parts) { parts.push_back({{"type", "text"}, {"text", part.text}}); }
+        out["content"] = std::move(parts);
+    }
+    if (!message.reasoning_content.empty()) { out["reasoning_content"] = message.reasoning_content; }
+    if (!message.tool_calls.empty()) {
+        Json calls = Json::array();
+        for (const ToolCall& call : message.tool_calls) {
+            Json entry = Json::object();
+            if (!call.id.empty()) { entry["id"] = call.id; }
+            entry["type"]     = "function";
+            entry["function"] = {{"name", call.name},
+                                 {"arguments", parse_object(call.arguments_json, "tool call arguments")}};
+            calls.push_back(std::move(entry));
+        }
+        out["tool_calls"] = std::move(calls);
+    }
+    if (!message.tool_call_id.empty()) { out["tool_call_id"] = message.tool_call_id; }
+    return out;
+}
+
+std::string tool_name(const Json& tool) {
+    const Json& fn = tool.contains("function") ? tool.at("function") : tool;
+    if (!fn.is_object() || !fn.contains("name") || !fn.at("name").is_string()) {
+        throw std::invalid_argument("a tool declaration needs a string name");
+    }
+    return fn.at("name").get<std::string>();
+}
+
+} // namespace
+
+struct Frontend::Impl {
+    std::shared_ptr<const text::Tokenizer> tokenizer;
+    text::JinjaTemplate tmpl;
+    OutputMarkers markers;
+    StopPolicy defaults;
+    ModelSamplingDefaults sampling;
+    std::shared_ptr<const std::vector<TokenId>> thinking_control;
+    std::uint32_t max_context = 0;
+
+    Impl(const FrontendResources& resources, const FrontendOptions& options)
+        : tokenizer(resources.tokenizer),
+          tmpl(std::string(resources.chat_template_jinja), "chat_template.jinja"),
+          max_context(options.max_context) {
+        if (tokenizer == nullptr) { throw std::invalid_argument("inkling2 frontend: no tokenizer"); }
+        if (max_context == 0) { throw std::invalid_argument("frontend max_context must be nonzero"); }
+        const auto id = [&](const char* spelling) {
+            const auto* token = tokenizer->find_added_token(spelling);
+            if (token == nullptr) { throw std::invalid_argument(std::string("inkling2 tokenizer lacks ") + spelling); }
+            return static_cast<TokenId>(token->id);
+        };
+        markers.message_model = id("<|message_model|>");
+        markers.thinking      = id("<|content_thinking|>");
+        markers.content       = {id("<|content_text|>"), id("<|content_tool_error|>"), id("<|content_invoke_tool_text|>")};
+        markers.tool_call     = id("<|content_invoke_tool_json|>");
+        markers.end_message   = id("<|end_message|>");
+        markers.end_of_turn   = id("<|content_model_end_sampling|>");
+        for (const int token : tokenizer->default_stop_token_ids()) { defaults.token_ids.push_back(token); }
+        if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), markers.end_of_turn) ==
+            defaults.token_ids.end()) {
+            throw std::invalid_argument("inkling2 generation_config.json must stop at <|content_model_end_sampling|>");
+        }
+        // generation_config.json sets temperature 1 alone; the sampler takes at most 20 candidates.
+        const SamplingPreset preset{.temperature = 1.0F, .top_k = 20, .top_p = 1.0F};
+        sampling = {.thinking = preset, .non_thinking = preset};
+        std::vector<TokenId> control;
+        if (!options.thinking_budget_message.empty()) {
+            for (const int token : tokenizer->encode(options.thinking_budget_message, {.parse_added_tokens = false})) {
+                control.push_back(token);
+            }
+        }
+        control.push_back(markers.end_message);
+        thinking_control = std::make_shared<const std::vector<TokenId>>(std::move(control));
+    }
+
+    // The template's context: messages, the declared tools and the thinking effort.
+    [[nodiscard]] Json context(const PromptInput& input) const {
+        const PromptOptions& options = input.options;
+        if (options.continuation != PromptContinuationMode::NewAssistantTurn) {
+            throw std::invalid_argument("Inkling 2 renders a new assistant turn only (no continuation modes yet)");
+        }
+        Json out = parse_object(options.chat_template_kwargs_json, "chat_template_kwargs");
+        if (options.reasoning_effort) {
+            out["reasoning_effort"] = reasoning_effort_name(*options.reasoning_effort);
+        } else if (options.enable_thinking == false) {
+            out["reasoning_effort"] = "none"; // the template's lowest effort (it does not turn thinking off)
+        }
+        Json messages = Json::array();
+        for (const ChatMessage& message : input.messages) { messages.push_back(message_json(message)); }
+        out["messages"] = std::move(messages);
+        if (!options.tool_jsons.empty()) {
+            Json tools = Json::array();
+            for (const std::string& tool : options.tool_jsons) { tools.push_back(parse_object(tool, "a tool declaration")); }
+            out["tools"] = std::move(tools);
+        } else {
+            out.erase("tools");
+        }
+        return out;
+    }
+
+    [[nodiscard]] Rendered render(const PromptInput& input, std::size_t max_tokens) const {
+        const Json ctx = context(input);
+        text::TemplateOutput rendered;
+        try {
+            rendered = tmpl.render(ctx);
+        } catch (const RequestError&) {
+            throw;
+        } catch (const std::exception& error) {
+            throw std::invalid_argument(std::string("chat template: ") + error.what());
+        }
+        Rendered out;
+        out.ids = tokenizer
+                      ->encode_with_boundaries(rendered.text, {}, {.parse_added_tokens = true, .max_tokens = max_tokens},
+                                               rendered.literal_spans)
+                      .input_ids;
+        out.text = std::move(rendered.text);
+        return out;
+    }
+
+    // The calls a turn may make: the declared and deferred tools, less the withdrawn ones; any name when the client
+    // keeps its own.
+    [[nodiscard]] std::shared_ptr<const ToolNames> tool_names(const PromptOptions& options) const {
+        auto names  = std::make_shared<ToolNames>();
+        names->open = options.open_tool_names;
+        for (const auto* list : {&options.tool_jsons, &options.deferred_tool_jsons}) {
+            for (const std::string& tool : *list) { names->declared.insert(tool_name(parse_object(tool, "a tool declaration"))); }
+        }
+        for (const std::string& withdrawn : options.withdrawn_tool_names) { names->declared.erase(withdrawn); }
+        if (names->declared.empty() && !names->open) { return nullptr; }
+        return names;
+    }
+
+    [[nodiscard]] StopPolicy merge(const StopPolicy& caller) const {
+        StopPolicy result;
+        result.publish_stop_token = caller.publish_stop_token;
+        const auto append_token   = [&](TokenId token) {
+            if (!tokenizer->is_valid_token(token)) {
+                throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " + std::to_string(token));
+            }
+            if (std::find(result.token_ids.begin(), result.token_ids.end(), token) == result.token_ids.end()) {
+                result.token_ids.push_back(token);
+            }
+        };
+        if (caller.include_model_defaults) {
+            for (const TokenId token : defaults.token_ids) { append_token(token); }
+        }
+        for (const TokenId token : caller.token_ids) { append_token(token); }
+        for (const StopString& stop : caller.strings) {
+            if (stop.text.empty()) { throw std::invalid_argument("stop string must not be empty"); }
+            (void)text::unicode_internal::utf8_codepoints(stop.text, "stop string");
+            const auto duplicate = std::find_if(result.strings.begin(), result.strings.end(), [&](const StopString& s) {
+                return s.text == stop.text && s.channel == stop.channel && s.include_in_output == stop.include_in_output;
+            });
+            if (duplicate == result.strings.end()) { result.strings.push_back(stop); }
+        }
+        return result;
+    }
+};
+
+PromptSummary PreparedPrompt::summary() const {
+    if (!data_) { throw std::logic_error("prepared prompt is empty"); }
+    return {.starts_in_reasoning = false, .prompt_tokens = static_cast<std::uint32_t>(data_->token_ids.size())};
+}
+
+PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
+    return data_ ? data_->stats : PromptPreparationStats{};
+}
+
+std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    return data_ ? std::span<const TokenId>(data_->token_ids) : std::span<const TokenId>{};
+}
+
+Frontend::Frontend(const FrontendResources& resources, FrontendOptions options)
+    : impl_(std::make_shared<const Impl>(resources, options)) {}
+
+Frontend::Rendered Frontend::render(const PromptInput& input, std::size_t max_tokens) const {
+    return impl_->render(input, max_tokens);
+}
+
+PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl&) const {
+    const auto start   = Clock::now();
+    const auto limit   = static_cast<std::size_t>(impl_->max_context) + 1U;
+    Rendered rendered  = impl_->render(input, limit);
+    const auto encoded = Clock::now();
+    if (rendered.ids.size() > impl_->max_context) {
+        throw RequestError(ContextLengthDetails{.prompt_tokens = rendered.ids.size(),
+                                                .max_context   = impl_->max_context,
+                                                .exact         = rendered.ids.size() < limit});
+    }
+    auto data       = std::make_unique<PreparedPromptData>();
+    data->token_ids = std::move(rendered.ids);
+    data->tools     = impl_->tool_names(input.options);
+    data->stats.seconds          = std::chrono::duration<double>(Clock::now() - start).count();
+    data->stats.tokenize_seconds = std::chrono::duration<double>(encoded - start).count();
+    return PreparedPrompt(std::move(data));
+}
+
+std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl&) const {
+    const auto limit = static_cast<std::size_t>(impl_->max_context) + 1U;
+    const Rendered rendered = impl_->render(input, limit);
+    if (rendered.ids.size() > impl_->max_context) {
+        throw RequestError(ContextLengthDetails{.prompt_tokens = rendered.ids.size(),
+                                                .max_context   = impl_->max_context,
+                                                .exact         = rendered.ids.size() < limit});
+    }
+    return static_cast<std::uint32_t>(rendered.ids.size());
+}
+
+PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool) const {
+    const auto start = Clock::now();
+    if (token_ids.size() > impl_->max_context) {
+        throw RequestError(ContextLengthDetails{.prompt_tokens = token_ids.size(), .max_context = impl_->max_context});
+    }
+    for (const TokenId token : token_ids) {
+        if (!impl_->tokenizer->is_valid_token(token)) {
+            throw std::out_of_range("prompt token is outside the checkpoint vocabulary: " + std::to_string(token));
+        }
+    }
+    auto data           = std::make_unique<PreparedPromptData>();
+    data->token_ids     = std::move(token_ids);
+    data->stats.seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    return PreparedPrompt(std::move(data));
+}
+
+std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
+    const std::vector<int> ids = impl_->tokenizer->encode(text, {.parse_added_tokens = false});
+    return {ids.begin(), ids.end()};
+}
+
+std::string Frontend::detokenize(std::span<const TokenId> token_ids) const { return impl_->tokenizer->decode(token_ids); }
+
+std::string Frontend::detokenize_bytes(std::span<const TokenId> token_ids) const {
+    return impl_->tokenizer->decode_bytes(token_ids);
+}
+
+OutputSession Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
+                                            const OutputOptions& output, const ThinkingControlOptions& thinking,
+                                            const std::optional<OutputConstraint>& constraint,
+                                            const ToolChoice& tool_choice) const {
+    if (!prompt) { throw std::invalid_argument("output session needs a prepared prompt"); }
+    if (constraint) {
+        const RequestErrorKind kind = constraint->kind == OutputConstraintKind::Grammar  ? RequestErrorKind::InvalidGrammar
+                                      : constraint->kind == OutputConstraintKind::Choice ? RequestErrorKind::InvalidChoice
+                                      : constraint->kind == OutputConstraintKind::Regex  ? RequestErrorKind::InvalidRegex
+                                                                                         : RequestErrorKind::UnsupportedJsonSchema;
+        throw RequestError(kind, "constrained output is not available for Inkling 2 yet");
+    }
+    if (tool_choice.mode == ToolChoiceMode::Required || tool_choice.allowed_names) {
+        throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                           "required or named tool choices are not available for Inkling 2 yet", {},
+                           RequestErrorSource::Tools);
+    }
+    OutputSession::Settings settings;
+    settings.tokenizer        = impl_->tokenizer;
+    settings.markers          = impl_->markers;
+    settings.policy           = impl_->merge(caller_stop);
+    settings.output           = output;
+    settings.thinking         = thinking;
+    settings.thinking_control = impl_->thinking_control;
+    // tool_choice none: the turn's calls are its text. The free route parses calls unconstrained (the constrained
+    // tool route, ToolConstraintMode::Basic's protection, is a later slice).
+    settings.tools = tool_choice.mode == ToolChoiceMode::None ? nullptr : prompt.data().tools;
+    return OutputSession(std::move(settings));
+}
+
+const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+
+const ModelSamplingDefaults& Frontend::sampling_defaults() const noexcept { return impl_->sampling; }
+
+} // namespace infernix::models::inkling2

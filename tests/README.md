@@ -504,6 +504,16 @@ the prologue bit for bit its emulation, the output against FP64 over the represe
 `infernix_inkling2_chat_template_test` (CPU only) renders `tools/chat_templates/inkling2.jinja` (the checkpoint's,
 byte for byte) through the Jinja engine against transformers' `apply_chat_template`
 (`tests/fixtures/inkling2/chat_template_golden.json`, from `generate_chat_template_golden.py`).
+Three CPU tests run on the real tokenizer (`INFERNIX_TEST_INKLING_TOKENIZER_DIR`, as the tokenizer test):
+`infernix_inkling2_prompt_real_test` tokenizes those renders with the Jinja engine's literal spans and requires
+Hugging Face's ids (the golden's `ids`) for every conversation whose client text spells no marker, and for one whose
+client strings all spell markers exactly the added tokens of its twin; `infernix_inkling2_output_session_real_test`
+feeds the generated turns of `tests/fixtures/inkling2/output_session_golden.json` (`generate_output_golden.py`: the
+checkpoint's `response_template` through transformers' `ResponseParser`, markers by token identity) to the output
+session one token a round, in rounds of 2 to 16 with a discarded preview each, and whole, and checks its stop
+strings, thinking budget, reasoning ban and raw output; `infernix_inkling2_frontend_real_test` converts the golden
+conversations to Engine requests (their ids again), echoes each generated turn back as history (reporting where a
+non-canonical turn departs) and checks the refusals of this slice and the context limit.
 `infernix_inkling2_forward_real_test` (GPU) runs the forward on `INFERNIX_INKLING2_ARTIFACT` against a CPU reference's
 per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
 their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports

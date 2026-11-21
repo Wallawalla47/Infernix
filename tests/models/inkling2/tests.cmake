@@ -6,6 +6,30 @@ infernix_add_test(infernix_inkling2_tokenizer_golden_real_test
   NEEDS_SOURCE_DIR)
 set_tests_properties(infernix_inkling2_tokenizer_golden_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# The output session against the response_template's reference parser (transformers) on the real tokenizer (CPU only):
+# skips without INFERNIX_TEST_INKLING_TOKENIZER_DIR.
+infernix_add_test(infernix_inkling2_output_session_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_output_session_real.cpp"
+  LIBRARIES infernix_model_runtime infernix_text infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_inkling2_output_session_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The prompt's ids (template + literal spans) against Hugging Face's, and client text that spells markers (CPU only):
+# skips without INFERNIX_TEST_INKLING_TOKENIZER_DIR.
+infernix_add_test(infernix_inkling2_prompt_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prompt_real.cpp"
+  LIBRARIES infernix_jinja infernix_text infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_inkling2_prompt_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The frontend: requests against Hugging Face's ids, the echo of generated turns, refusals (CPU only): skips without
+# INFERNIX_TEST_INKLING_TOKENIZER_DIR.
+infernix_add_test(infernix_inkling2_frontend_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend_real.cpp"
+  LIBRARIES infernix_model_runtime infernix_text infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_inkling2_frontend_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # The forward on a real artifact against the CPU reference's per-visit dump (teacher-forced stages, free-running
 # argmax, decode = verify): skips without INFERNIX_INKLING2_ARTIFACT and INFERNIX_INKLING2_REFERENCE.
 infernix_add_test(infernix_inkling2_forward_real_test
