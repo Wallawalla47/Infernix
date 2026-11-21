@@ -57,41 +57,6 @@ inline bool a4_nmma_call(const MoeExpertSource& source, int columns, const moe::
            columns <= moe::kMaxColumns && layout.h_blocks != nullptr && layout.x_acts == nullptr;
 }
 
-// D = A B on int8 tensor cores, k16: rows g and g + 8 of A (a0, a1) times column g of B (b0), K = 4 t .. 4 t + 3.
-__device__ __forceinline__ void mma_k16_ss(int (&d)[4], int a0, int a1, int b0) {
-    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a0), "r"(a1), "r"(b0), "r"(0));
-}
-
-// The doubled codes of a block's elements 4 t .. 4 t + 3 from its packed bytes 2 t and 2 t + 1 (element 2 j in byte j's
-// low nibble, 2 j + 1 in its high one).
-__device__ __forceinline__ int nmma4_x_quad(std::uint32_t pair) {
-    const std::uint32_t spread = (pair & 0xFU) | ((pair & 0xF0U) << 4) | ((pair & 0xF00U) << 8) | ((pair & 0xF000U) << 12);
-    return static_cast<int>(canon::e2m1_x2_quad(spread));
-}
-
-// One unit's contribution to thread (g, t)'s sums: rows g and g + 8 of the unit against column g's codes `b`, the
-// rows' weight scales through `scaled`, the columns 2 t and 2 t + 1's activation scales sa0 and sa1.
-__device__ __forceinline__ void nmma4_unit(const std::uint8_t* unit, int b, const std::int32_t* scaled, int sa0, int sa1,
-                                           int g, int t, long long (&s)[4]) {
-    const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * t + 4 * g);
-    const int a0 = static_cast<int>(canon::e2m1_x2_quad(word & 0x0F0F0F0FU));        // row g
-    const int a1 = static_cast<int>(canon::e2m1_x2_quad((word >> 4) & 0x0F0F0F0FU)); // row g + 8
-    int d[4];
-    mma_k16_ss(d, a0, a1, b);
-    const int w_lo = scaled[unit[128 + g]], w_hi = scaled[unit[136 + g]];
-    // |P_b| <= 2,304 and Sw < 2^18: P_b * Sw fits int32 (unit_sums's fold, per block instead of per quarter).
-    s[0] += static_cast<long long>(d[0] * w_lo) * sa0;
-    s[1] += static_cast<long long>(d[1] * w_lo) * sa1;
-    s[2] += static_cast<long long>(d[2] * w_hi) * sa0;
-    s[3] += static_cast<long long>(d[3] * w_hi) * sa1;
-}
-
-__device__ __forceinline__ void nmma4_fill_scaled(std::int32_t* scaled, int threads) {
-    for (int i = static_cast<int>(threadIdx.x); i < 256; i += threads) { scaled[i] = canon::e4m3_scaled(static_cast<unsigned>(i)); }
-}
-
 struct Nmma4Args {
     const std::uint16_t* x;      // [T][hidden] BF16
     MoeDispatch dispatch;
@@ -220,7 +185,7 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
         issue(k);
         ggml::tile::cp_async_commit();
     }
-    nmma4_fill_scaled(sm.scaled, kNmma4GuThreads);
+    a4_mma_fill_scaled(sm.scaled, kNmma4GuThreads);
     if (a.x_rows != nullptr) {
         // The job's columns' A4(x) rows from encode_nmma4_kernel (this pass's primary) while the rings fill.
         pdl::wait_for_dependencies();
@@ -254,7 +219,7 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
 #pragma unroll
         for (int u = 0; u < kNmma4StageUnits; ++u) {
             const int b = st * kNmma4StageUnits + u; // within the half
-            nmma4_unit(stage + u * moe::kUnitBytes, nmma4_x_quad(*reinterpret_cast<const unsigned short*>(xg + 8 * b)),
+            a4_mma_unit(stage + u * moe::kUnitBytes, a4_x_quad(*reinterpret_cast<const unsigned short*>(xg + 8 * b)),
                        sm.scaled, sm.scaled[xs0[b]], sm.scaled[xs1[b]], g, t, s);
         }
         __syncwarp(); // every lane is done with this stage before a later issue refills it
@@ -366,7 +331,7 @@ __global__ void __launch_bounds__(kNmma4Threads) down_nmma4_kernel(Nmma4Args a) 
     const auto* src = reinterpret_cast<const std::uint32_t*>(a.h_blocks + static_cast<std::size_t>(first) * G::kHBlocks);
     auto* dst       = reinterpret_cast<std::uint32_t*>(&sm.h[0][0]);
     for (int i = static_cast<int>(threadIdx.x); i < count * G::kHBlocks * kWords; i += kNmma4Threads) { dst[i] = __ldcg(src + i); }
-    nmma4_fill_scaled(sm.scaled, kNmma4Threads);
+    a4_mma_fill_scaled(sm.scaled, kNmma4Threads);
     ggml::tile::cp_async_wait<0>();
     __syncthreads(); // the h blocks, the scale table and every lane's weight copies
     const canon::A4Block* hg  = sm.h[min(g, count - 1)];
@@ -377,7 +342,7 @@ __global__ void __launch_bounds__(kNmma4Threads) down_nmma4_kernel(Nmma4Args a) 
 #pragma unroll 8
     for (int b = 0; b < G::kDownBlocks; ++b) {
         const int codes = *reinterpret_cast<const int*>(hg[b].c2 + 4 * t);
-        nmma4_unit(units + b * moe::kUnitBytes, codes, sm.scaled, hs0[b].scale_scaled, hs1[b].scale_scaled, g, t, s);
+        a4_mma_unit(units + b * moe::kUnitBytes, codes, sm.scaled, hs0[b].scale_scaled, hs1[b].scale_scaled, g, t, s);
     }
     auto* out = reinterpret_cast<std::uint16_t*>(a.outputs);
 #pragma unroll

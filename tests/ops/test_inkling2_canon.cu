@@ -5,7 +5,7 @@
 // Oracles:
 //   - every unary function on the GPU against the same header on the CPU, bit for bit, exhaustively over the 65,536
 //     BF16 inputs (the experts' gate and up values are BF16), and against FP64 (std::expm1, std::tanh, 1 / (1 + e^-x)):
-//     at most 2 ulp of the binary32 result; inputs below 2^-120 (where x / cap is subnormal) to an absolute 2^-140;
+//     at most 2 ulp of the binary32 result (log_c over the positive inputs); inputs below 2^-120 (where x / cap is subnormal) to an absolute 2^-140;
 //     results beyond binary32's range are the infinity;
 //   - four_over_six_block on the GPU against the CPU, bit for bit, and both against the independent reference
 //     (tests/fixtures/inkling2/four_over_six.json, from the CPU reference's torch implementation, written by
@@ -41,7 +41,7 @@ void check(bool ok, const char* what) {
     }
 }
 
-constexpr int kFunctions = 5; // expm1, tanh, sigmoid, softcap 4, softcap 25
+constexpr int kFunctions = 6; // expm1, tanh, sigmoid, softcap 4, softcap 25, log
 
 __device__ __host__ float apply(int f, float x) {
     switch (f) {
@@ -49,7 +49,8 @@ __device__ __host__ float apply(int f, float x) {
     case 1: return canon::tanh_c(x);
     case 2: return canon::sigmoid_c(x);
     case 3: return canon::softcap_c(x, 4.0F);
-    default: return canon::softcap_c(x, 25.0F);
+    case 4: return canon::softcap_c(x, 25.0F);
+    default: return canon::log_c(x);
     }
 }
 
@@ -66,7 +67,8 @@ double exact(int f, double x) {
     case 1: return std::tanh(x);
     case 2: return 1.0 / (1.0 + std::exp(-x));
     case 3: return 4.0 * std::tanh(x / 4.0);
-    default: return 25.0 * std::tanh(x / 25.0);
+    case 4: return 25.0 * std::tanh(x / 25.0);
+    default: return std::log(x);
     }
 }
 
@@ -87,7 +89,7 @@ void unary_functions() {
     std::vector<std::uint32_t> gpu(kFunctions * 65536);
     cuda_check(cudaMemcpy(gpu.data(), device, gpu.size() * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy");
     cuda_check(cudaFree(device), "cudaFree");
-    const char* names[kFunctions] = {"expm1_c", "tanh_c", "sigmoid_c", "softcap_c(4)", "softcap_c(25)"};
+    const char* names[kFunctions] = {"expm1_c", "tanh_c", "sigmoid_c", "softcap_c(4)", "softcap_c(25)", "log_c"};
     for (int f = 0; f < kFunctions; ++f) {
         int mismatches  = 0;
         double worst    = 0.0;
@@ -99,7 +101,7 @@ void unary_functions() {
                 std::printf("  %s(%.9g = 0x%04x): CPU 0x%08x, GPU 0x%08x\n", names[f], x, i, canon::f32_bits(y),
                             gpu[f * 65536 + i]);
             }
-            if (!std::isfinite(x)) { continue; }
+            if (!std::isfinite(x) || (f == 5 && x <= 0.0F)) { continue; }
             const double reference = exact(f, static_cast<double>(x));
             if (std::fabs(reference) > 3.4028234663852886e38) { // beyond binary32: the rounded result is the infinity
                 check(std::isinf(y) && (y > 0) == (reference > 0), "an overflowing result is the infinity");
@@ -109,7 +111,7 @@ void unary_functions() {
                 check(std::isinf(y) && (y > 0) == (reference > 0), "an overflowing result is the infinity");
                 continue;
             }
-            if (std::fabs(x) < 0x1p-120F) {
+            if (f != 5 && std::fabs(x) < 0x1p-120F) {
                 // BF16 subnormals and the least normals: x / cap is subnormal in binary32, whose fixed 2^-149 spacing
                 // bounds every form's accuracy; the bound here is absolute.
                 check(std::fabs(static_cast<double>(y) - reference) <= 0x1p-140, "a tiny input's result is within 2^-140");

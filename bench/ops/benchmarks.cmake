@@ -66,6 +66,7 @@ infernix_add_op_bench(infernix_sampling_select_bench SOURCES "${CMAKE_CURRENT_LI
 infernix_add_op_bench(infernix_top_logprobs_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/top_logprobs_bench.cu")
 infernix_add_op_bench(infernix_sparse_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sparse_moe_bench.cu")
 infernix_add_op_bench(infernix_offloaded_moe_wide_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/offloaded_moe_wide_bench.cu")
+infernix_add_op_bench(infernix_w4a4_sparse_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/w4a4_sparse_moe_bench.cu")
 infernix_add_op_bench(infernix_ggml_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/ggml_linear_bench.cu")
 infernix_add_op_bench(infernix_resident_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/resident_moe_bench.cu")
 infernix_add_op_bench(infernix_hyper_connection_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hyper_connection_bench.cu")

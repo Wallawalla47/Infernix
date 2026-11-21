@@ -16,6 +16,7 @@
 #include "core/pdl.cuh"
 #include "core/temporary_switches.h"
 
+#include "ops/common/a4_mma.cuh"
 #include "ops/common/canonical_math.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"

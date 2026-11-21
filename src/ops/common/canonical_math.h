@@ -381,6 +381,42 @@ INFERNIX_CANON_HD float sigmoid_c(float x) {
     return div_rn(e, add_rn(1.0F, e));
 }
 
+// ln(x) for a positive normal or subnormal x: x = m 2^k with m in [sqrt(1/2), sqrt(2)), f = m - 1 (exact, Sterbenz),
+// ln(1 + f) = 2s (1 + s^2/3 + s^4/5 + ... + s^12/13), s = f / (2 + f) (|s| < 0.172: the truncation is below 2^-30
+// relative), then k ln2 split in two (the high part's product exact for |k| < 2^11). x = 0 gives -inf, x < 0 and NaN the
+// canonical NaN, +inf itself.
+INFERNIX_CANON_HD float log_c(float x) {
+    if (x != x || x < 0.0F) { return f32_from_bits(kCanonicalNan); }
+    if (x == 0.0F) { return f32_from_bits(0xFF800000U); }
+    if (f32_bits(x) == 0x7F800000U) { return x; }
+    std::uint32_t bits = f32_bits(x);
+    int k              = 0;
+    if (bits < 0x00800000U) { // subnormal: scale by 2^25 exactly
+        bits = f32_bits(mul_rn(x, 33554432.0F));
+        k    = -25;
+    }
+    k += static_cast<int>(bits >> 23) - 127;
+    float m = f32_from_bits((bits & 0x007FFFFFU) | 0x3F800000U); // [1, 2)
+    if (m > 1.41421353816986083984375F) {                          // fl32(sqrt 2)
+        m = mul_rn(m, 0.5F);
+        ++k;
+    }
+    const float f  = add_rn(m, -1.0F);
+    const float s  = div_rn(f, add_rn(2.0F, f));
+    const float s2 = mul_rn(s, s);
+    float p        = 1.0F / 13.0F;
+    p              = fma_rn(p, s2, 1.0F / 11.0F);
+    p              = fma_rn(p, s2, 1.0F / 9.0F);
+    p              = fma_rn(p, s2, 1.0F / 7.0F);
+    p              = fma_rn(p, s2, 1.0F / 5.0F);
+    p              = fma_rn(p, s2, 1.0F / 3.0F);
+    const float s3 = mul_rn(s, s2);
+    const float l  = fma_rn(mul_rn(2.0F, s3), p, mul_rn(2.0F, s)); // 2s + 2s^3 p(s^2)
+    const float kf = static_cast<float>(k);
+    // ln2 = 0.693145751953125 (11 bits: k * it exact) + 1.428606765330187e-06
+    return add_rn(mul_rn(kf, 0.693145751953125F), fma_rn(kf, 1.428606765330187045e-06F, l));
+}
+
 // cap * tanh(x / cap) with the division correctly rounded (a power-of-two cap makes it exact). A NaN result is the
 // canonical NaN (CUDA arithmetic on a NaN gives its own).
 INFERNIX_CANON_HD float softcap_c(float x, float cap) {
@@ -442,6 +478,51 @@ INFERNIX_CANON_HD float four_over_six_candidate(const float (&x)[16], std::uint8
     return err[0];
 }
 } // namespace detail
+
+// ---------------------------------------------------------------------------- MXFP8 activations
+
+// Inkling 2's MXFP8 activation rule (vLLM's _mxfp8_block) for one group of 32 values: raw = amax * fl32(1 / 448); the
+// UE8M0 exponent rounds raw up to a power of two through its bits, ((bits(raw) + 0x7FFFFF) & 0x7F800000) >> 23, at
+// most 254, 0 when raw <= 2^-127, 255 for a NaN; scale = max(2^(e - 127), 2^-127) (exactly representable as binary32
+// for e >= 1, the least subnormal for e = 0); codes e4m3(clamp(x * inverse, -448, 448)) with inverse = 2^127 for e = 0
+// and rcp_rn(scale) otherwise (exact: a power of two). The value of a code is e4m3(c) * 2^(e - 127).
+struct Mxfp8Group {
+    std::uint8_t code[32]; // E4M3FN words (sign in bit 7)
+    std::uint8_t exponent;
+};
+
+// e4m3 encode with round-to-nearest-even and saturation of a signed binary32 (|x| <= 448 after the clamp).
+INFERNIX_CANON_HD std::uint8_t e4m3_signed_rn(float x) {
+    const std::uint32_t sign = (f32_bits(x) >> 31) != 0 ? 0x80U : 0U;
+    return static_cast<std::uint8_t>(sign | e4m3_rn_satfinite(f32_from_bits(f32_bits(x) & 0x7FFFFFFFU)));
+}
+
+INFERNIX_CANON_HD Mxfp8Group mxfp8_group(const float (&x)[32]) {
+    Mxfp8Group out{};
+    float amax = 0.0F;
+    bool nan   = false;
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 32; ++j) {
+        nan          = nan || x[j] != x[j];
+        const float a = f32_from_bits(f32_bits(x[j]) & 0x7FFFFFFFU);
+        amax         = a > amax ? a : amax;
+    }
+    const float raw = mul_rn(amax, 1.0F / 448.0F);
+    std::uint32_t e = ((f32_bits(raw) + 0x007FFFFFU) & 0x7F800000U) >> 23;
+    e               = raw <= 0x1p-127F ? 0U : (e < 254U ? e : 254U);
+    if (nan) { e = 255U; }
+    out.exponent = static_cast<std::uint8_t>(e);
+    if (e == 255U) { return out; } // a NaN group: codes zero (vLLM's inverse 0), its scale word NaN
+    const float scale   = e == 0U ? 0x1p-127F : f32_from_bits(e << 23);
+    const float inverse = e == 0U ? 0x1p127F : div_rn(1.0F, scale);
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 32; ++j) {
+        float v     = mul_rn(x[j], inverse);
+        v           = v < -448.0F ? -448.0F : (v > 448.0F ? 448.0F : v);
+        out.code[j] = e4m3_signed_rn(v);
+    }
+    return out;
+}
 
 // One block of 16 BF16-valued activations x (as binary32) under `row`.
 INFERNIX_CANON_HD FourOverSixBlock four_over_six_block(const float (&x)[16], const FourOverSixRow& row) {
