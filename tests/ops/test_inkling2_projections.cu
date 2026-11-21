@@ -449,6 +449,8 @@ INFERNIX_OP_TEST(inkling2_projections) {
                                          {"head rows [4096, 2304], FP32 out", 2304, true, {{4096, 0}}}};
     for (const auto& c : mma_cases) {
         for (const int columns : {1, 3, 16, 17, 40, 300, 2048}) { run_mma(c, columns, seed++); }
+        // The decode-width MMA arithmetic (projections_dmma) at decode and verify widths.
+        for (const int columns : {1, 2, 3, 8, 9, 16, 17, 40, 128}) { run_mma(c, columns, seed++, ik::projections_dmma, "DMMA"); }
     }
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

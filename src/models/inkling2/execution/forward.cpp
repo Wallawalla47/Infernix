@@ -81,13 +81,19 @@ void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, 
 }
 
 // The fused projections: a prompt call's on projections_mma (BF16 or Q8 storage); a decode-route call's (decode,
-// verification, forced tokens) on the fold (projections).
+// verification, forced tokens; any width) on projections_dmma with BF16 storage, and with Q8 storage (--q8-weights: no
+// Q8 decode-width tensor-core route yet) the fold (projections).
 bool use_mma(bool prompt, const ik::ProjectionArgs& a) {
     return prompt && (a.segments[0].weight != nullptr || a.segments[0].q8_scales != nullptr) && a.k % 64 == 0;
+}
+bool use_dmma(bool prompt, const ik::ProjectionArgs& a) {
+    return !prompt && a.segments[0].weight != nullptr && a.k % 32 == 0;
 }
 void project_fused(bool prompt, const ik::ProjectionArgs& a, cudaStream_t stream) {
     if (use_mma(prompt, a)) {
         ik::projections_mma(a, stream);
+    } else if (use_dmma(prompt, a)) {
+        ik::projections_dmma(a, stream);
     } else {
         ik::projections(a, stream);
     }
@@ -520,18 +526,14 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         mark("window_copy");
     }
 
-    // K4: W_o (a wide call: one launch of the fused projections, the skinny route's bits); K5 (K5a): its post-attention
+    // K4: W_o (project_fused: the call's route's arithmetic); K5 (K5a): its post-attention
     // conv and residual, the MLP mix, norm and the experts' rows.
     ik::ProjectionArgs wo{};
     wo.columns = T;
     wo.k       = kQ;
     wo.x[0]    = b_.attention;
     add_segment(wo, a.output, 0, b_.o);
-    if (T > ik::kMaxAttentionLaneColumns || q8(a.output) || use_mma(prompt_, wo)) { // ops::linear: no Q8 route at W_o's shape
-        project_fused(prompt_, wo, stream);
-    } else {
-        project(b_.attention, a.output, b_.o, false, stream);
-    }
+    project_fused(prompt_, wo, stream);
     mark("w_o");
     const ik::ExpertRows rows{op.format, b_.rows, b_.amax};
     ik::MlpEntryArgs m;

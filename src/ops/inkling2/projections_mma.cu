@@ -334,7 +334,178 @@ void launch_shape(const MmaParams& p, bool small, cudaStream_t stream, std::int3
     }
 }
 
+// ---------------------------------------------------------------------------- decode-width MMA projections
+
+// projections_dmma (calls of up to 16 columns): a CTA per 16-row tile of Splits warps; warp q accumulates the q-th of
+// Splits equal runs of K's 32-blocks as a chain of m16n8k16 MMAs from zero, blocks in ascending order, two MMAs a block
+// (k-step 0: elements 8t .. 8t + 3 of the block into slots 2t, 2t + 1, 2t + 8, 2t + 9, t = lane % 4; k-step 1: elements
+// 8t + 4 .. 8t + 7), so a thread's weights and inputs of a block are one 16-byte load each; then the runs' partials
+// added in order. A column's bits depend on its row and its input alone (the same at every width up to 16).
+constexpr int kDmmaAhead = 4; // blocks in flight a warp
+
+template <int Splits, int NT, class Out>
+__global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const MmaParams p) {
+    __shared__ float partial[Splits][32][NT * 4];
+    const int lane = static_cast<int>(threadIdx.x & 31U), warp = static_cast<int>(threadIdx.x >> 5);
+    const int g = lane >> 2, t = lane & 3;
+    const int tile = static_cast<int>(blockIdx.x);
+    int s          = 0;
+    while (s + 1 < p.count && tile >= p.tile_begin[s + 1]) { ++s; }
+    const MmaSegment seg = p.seg[s];
+    const int K = p.k, M = seg.rows, T = p.columns;
+    const int m0 = (tile - p.tile_begin[s]) * 16;
+    const int r0 = min(m0 + g, M - 1), r1 = min(m0 + g + 8, M - 1);
+    const int blocks = K / 32 / Splits, b0 = warp * blocks;
+    const uint4* w0 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r0) * K) + t;
+    const uint4* w1 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r1) * K) + t;
+    uint4 a0[kDmmaAhead], a1[kDmmaAhead];
+#pragma unroll
+    for (int i = 0; i < kDmmaAhead; ++i) {
+        if (i < blocks) {
+            a0[i] = __ldcs(w0 + 4 * (b0 + i));
+            a1[i] = __ldcs(w1 + 4 * (b0 + i));
+        }
+    }
+    pdl::enter_streaming();
+    // The thread's input columns: g (and g + 8 with NT = 2); past the call's columns, zeros.
+    const uint4* x[NT];
+    bool live[NT];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+        const int c = g + 8 * n;
+        live[n]     = c < T;
+        x[n]        = reinterpret_cast<const uint4*>(seg.x + static_cast<std::size_t>(live[n] ? c : 0) * K) + t;
+    }
+    float acc[NT][4] = {};
+    for (int i = 0; i < blocks; i += kDmmaAhead) {
+#pragma unroll
+        for (int j = 0; j < kDmmaAhead; ++j) {
+            const int b = i + j;
+            if (b >= blocks) { break; }
+            uint4 xv[NT];
+#pragma unroll
+            for (int n = 0; n < NT; ++n) { xv[n] = live[n] ? x[n][4 * (b0 + b)] : make_uint4(0U, 0U, 0U, 0U); }
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].x, a1[j].x, a0[j].y, a1[j].y, xv[n].x, xv[n].y);
+                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].z, a1[j].z, a0[j].w, a1[j].w, xv[n].z, xv[n].w);
+            }
+            const int next = b + kDmmaAhead;
+            if (next < blocks) {
+                a0[j] = __ldcs(w0 + 4 * (b0 + next));
+                a1[j] = __ldcs(w1 + 4 * (b0 + next));
+            }
+        }
+    }
+    pdl::trigger_dependents();
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { partial[warp][lane][4 * n + e] = acc[n][e]; }
+    }
+    __syncthreads();
+    if (warp != 0) { return; }
+    Out* out = static_cast<Out*>(seg.out);
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            float v = partial[0][lane][4 * n + e];
+#pragma unroll
+            for (int q = 1; q < Splits; ++q) { v = v + partial[q][lane][4 * n + e]; }
+            const int row = m0 + g + (e >= 2 ? 8 : 0), col = 8 * n + 2 * t + (e & 1);
+            if (row >= M || col >= T) { continue; }
+            if constexpr (std::is_same_v<Out, float>) {
+                out[static_cast<std::size_t>(col) * M + row] = v;
+            } else {
+                out[static_cast<std::size_t>(col) * M + row] = __float2bfloat16_rn(v);
+            }
+        }
+    }
+}
+
+template <int Splits, int NT, class Out>
+void launch_dmma(const MmaParams& p, std::int32_t tiles, cudaStream_t stream) {
+    const pdl::LaunchConfig config{dim3(static_cast<unsigned>(tiles)), dim3(Splits * 32), 0, stream};
+    CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out>, p));
+}
+
+// The runs of K a call splits into: a function of its segments' shapes only (never its width), enough warps for ~2,048
+// in the launch (loads in flight on every SM), each run at least 4 blocks.
+int dmma_splits(std::int32_t k, std::int32_t tiles) {
+    const int blocks = k / 32;
+    int splits       = 1;
+    while (splits < 16 && tiles * splits < 2048 && blocks % (2 * splits) == 0 && blocks / (2 * splits) >= 4) {
+        splits *= 2;
+    }
+    return splits;
+}
+
+template <int NT, class Out>
+void dmma_width(const MmaParams& p, std::int32_t tiles, int splits, cudaStream_t stream) {
+    switch (splits) {
+    case 1: launch_dmma<1, NT, Out>(p, tiles, stream); break;
+    case 2: launch_dmma<2, NT, Out>(p, tiles, stream); break;
+    case 4: launch_dmma<4, NT, Out>(p, tiles, stream); break;
+    case 8: launch_dmma<8, NT, Out>(p, tiles, stream); break;
+    default: launch_dmma<16, NT, Out>(p, tiles, stream); break;
+    }
+}
+
+template <class Out>
+void dmma_shape(const MmaParams& p, std::int32_t tiles, cudaStream_t stream) {
+    const int splits = dmma_splits(p.k, tiles);
+    p.columns <= 8 ? dmma_width<1, Out>(p, tiles, splits, stream) : dmma_width<2, Out>(p, tiles, splits, stream);
+}
+
+MmaParams mma_params(const ProjectionArgs& a, int k_multiple, const char* what) {
+    if (a.columns <= 0 || a.k <= 0 || a.k % k_multiple != 0 || a.count <= 0 || a.count > kMaxProjectionSegments) {
+        throw std::invalid_argument(std::string("inkling2 ") + what + ": 1-8 segments, positive columns, K a multiple of " +
+                                    std::to_string(k_multiple));
+    }
+    MmaParams p{};
+    p.count   = a.count;
+    p.k       = a.k;
+    p.columns = a.columns;
+    for (int s = 0; s < a.count; ++s) {
+        const ProjectionSegment& g = a.segments[s];
+        const auto* x              = (g.input >= 0 && g.input <= 2) ? a.x[g.input] : nullptr;
+        const std::size_t word     = a.fp32_out ? 4 : 2;
+        if (g.weight == nullptr || g.codes != nullptr || g.rows <= 0 || x == nullptr || g.out == nullptr ||
+            reinterpret_cast<std::uintptr_t>(g.weight) % 16 != 0 || reinterpret_cast<std::uintptr_t>(x) % 16 != 0 ||
+            reinterpret_cast<std::uintptr_t>(g.out) % 16 != 0 || (g.rows * word) % 16 != 0) {
+            throw std::invalid_argument(std::string("inkling2 ") + what +
+                                        ": BF16 segments only, with 16-byte aligned weights, inputs, outputs and output "
+                                        "rows");
+        }
+        p.seg[s] = {reinterpret_cast<const __nv_bfloat16*>(g.weight), reinterpret_cast<const __nv_bfloat16*>(x), g.out,
+                    g.rows};
+    }
+    return p;
+}
+
 } // namespace
+
+void projections_dmma(const ProjectionArgs& a, cudaStream_t stream) {
+    MmaParams p = mma_params(a, 32, "projections_dmma");
+    std::int32_t tiles = 0;
+    for (int s = 0; s < a.count; ++s) {
+        p.tile_begin[s] = tiles;
+        tiles += (a.segments[s].rows + 15) / 16;
+    }
+    p.tile_begin[a.count] = tiles;
+    // A call wider than 16 columns runs launches of 16 (each column's arithmetic is its own: the same bits).
+    const std::size_t word = a.fp32_out ? 4 : 2;
+    for (std::int32_t c0 = 0; c0 < a.columns; c0 += 16) {
+        MmaParams q = p;
+        q.columns   = std::min<std::int32_t>(16, a.columns - c0);
+        for (int s = 0; s < a.count; ++s) {
+            q.seg[s].x   = p.seg[s].x + static_cast<std::size_t>(c0) * a.k;
+            q.seg[s].out = static_cast<std::uint8_t*>(p.seg[s].out) + static_cast<std::size_t>(c0) * p.seg[s].rows * word;
+        }
+        a.fp32_out ? dmma_shape<float>(q, tiles, stream) : dmma_shape<__nv_bfloat16>(q, tiles, stream);
+    }
+}
 
 void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
     if (a.columns <= 0 || a.k <= 0 || a.k % 64 != 0 || a.count <= 0 || a.count > kMaxProjectionSegments) {

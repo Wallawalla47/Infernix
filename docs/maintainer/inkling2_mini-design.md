@@ -1015,6 +1015,22 @@ route.
   16,014.5. One prompt call on each route (forward test): 32 columns 26.0 against 32.9 ms on the decode route, 128
   30.0 against 97.9, 512 46.3 against 351.8.
 
+**The decode route's projections (2026-11-21).** Decode, verification and forced-token calls run the fused projections
+(K2, W_o, the gates' downs and forget/gain; BF16 storage) on `projections_dmma`: K's 32-blocks in S equal runs, each
+a chain of m16n8k16 MMAs from zero over its blocks in ascending order, the runs' partials added in order. S (1-16) is
+a function of K and the call's segments' row counts only (about 2,048 warps a launch), and a call wider than 16
+columns runs launches of 16, so a column's bits depend on its row and input alone (verify columns equal decode
+columns). The weights stream once per launch by 16-byte `ld.global.cs` loads, four blocks ahead (FP64 oracle: worst
+0.965 of a (K/16 + 5) 2^-23 Σ|wx| bound at widths 1-128). It replaced the SIMT fold, and W_o's `ops::linear` call at
+widths up to 16. A first instance of `projections_mma`'s arithmetic at decode widths had lost to the fold at widths 1
+and 2 (+20.8 %, +18.0 %; −6.4 % at 8), and a first dmma with 4 runs for K ≥ 512 lost at width 1 (+2.8 %); with S
+chosen per shape the decode round at 4K context (forward test, graphs; K2 and gates on dmma, W_o still on
+`ops::linear`) went 6.190 → 6.099 ms at width 1 (−1.5 %), 6.967 → 6.868 at 2 (−1.4 %), 8.937 → 8.227 at 4 (−7.9 %),
+12.399 → 10.574 at 8 (−14.7 %). The decode route's bits changed with it: the forward test's free-running logits moved
+by a mean KL of 0.27 (max 3.4) from the fold's, through the routing's amplification of last-bit differences (the
+teacher-forced stages stay within their bounds; greedy agreement with the reference from position 23 holds).
+`--q8-weights` keeps the fold at decode widths (no Q8 decode-width MMA yet).
+
 ### 14.2 Pass schedule
 
 For a chunk of C columns: prelude visits over all C, then each core pass over all C, then the coda. Per-column workspace
