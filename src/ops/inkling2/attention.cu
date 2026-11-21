@@ -14,6 +14,7 @@
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/canonical_math.h"
+#include "ops/inkling2/attention_common.cuh"
 #include "ops/inkling2/column.cuh"
 #include "ops/inkling2/visit_math.h"
 
@@ -37,26 +38,23 @@ using detail::ring_row;
 using detail::Source;
 using detail::writes_ring;
 
+using detail::ex2;
+using detail::kD;
+using detail::kInvSqrtD;
+using detail::kKvWidth;
+using detail::kLog2e;
+using detail::kQWidth;
+using detail::kRWidth;
+using detail::kv_row;
+using detail::neg_inf;
+
 constexpr unsigned kAll        = 0xFFFFFFFFU;
-constexpr int kD               = kHeadDim;
-constexpr int kKvWidth         = kKvHeads * kD;     // 1024
-constexpr int kQWidth          = kHeads * kD;       // 3072
-constexpr int kRWidth          = kHeads * kRelDim;  // 384
 constexpr int kStatWords       = 132;
 constexpr int kAccOffset       = 4;
-constexpr float kInvSqrtD      = static_cast<float>(0.08838834764831845);
-constexpr float kLog2e         = static_cast<float>(1.4426950408889634);
 constexpr float kClipQK        = static_cast<float>(22.627416997969522);
 constexpr float kClipR         = 8.0F;
 
 __device__ __forceinline__ float bf16f(std::uint16_t v) { return canon::bf16_to_f32(v); }
-__device__ __forceinline__ float neg_inf() { return canon::f32_from_bits(0xFF800000U); }
-
-__device__ __forceinline__ float ex2(float x) {
-    float y;
-    asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
 
 __device__ __forceinline__ void unpack4(uint2 w, float (&v)[4]) {
     v[0] = canon::f32_from_bits(w.x << 16);
@@ -89,20 +87,6 @@ __device__ __forceinline__ float head_sum(const float (&a)[4], const float (&b)[
 #pragma unroll
     for (int offset = 16; offset >= 1; offset >>= 1) { acc = canon::add_rn(acc, __shfl_xor_sync(kAll, acc, offset)); }
     return acc;
-}
-
-// The element offset of a position's row of 128 in a visit's K or V.
-__device__ __forceinline__ std::size_t kv_row(const KvView& kv, int lane, int head, int pos) {
-    if (kv.table == nullptr) {
-        // The state's ring at its constant page count (decode), a staging ring at its own.
-        const int pages = kv.ring_pages == kWindowRingPages ? kWindowRingPages : kv.ring_pages;
-        const int page  = kv.ring_pages == kWindowRingPages ? (pos / kKeyUnit) % kWindowRingPages
-                                                            : (pos / kKeyUnit) % kv.ring_pages;
-        return lane * kv.lane_stride +
-               ((static_cast<std::size_t>(head) * pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
-    }
-    const std::int64_t page = kv.table[static_cast<std::int64_t>(lane) * kv.table_stride + pos / kKeyUnit];
-    return ((static_cast<std::size_t>(head) * kv.pool_pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
 }
 
 // ---------------------------------------------------------------------------- prologue
@@ -590,14 +574,7 @@ AttentionWorkspace carve_attention_workspace(void* base, std::int32_t capacity) 
     return w;
 }
 
-void attention(const AttentionArgs& a, cudaStream_t stream) {
-    if (a.columns <= 0 || a.columns > a.ws.capacity || a.groups < 0 ||
-        (a.groups > 0 && (a.max_group_columns <= 0 || a.max_group_columns > kMaxAttentionLaneColumns))) {
-        throw std::invalid_argument("inkling2 attention: 1..capacity columns in groups of at most 16 columns each");
-    }
-    if (a.host_groups == nullptr && (a.groups > kMaxAttentionGroups || a.columns > kMaxAttentionColumns)) {
-        throw std::invalid_argument("inkling2 attention: a call wider than one launch passes its groups on the host");
-    }
+void detail::check_attention_args(const AttentionArgs& a) {
     if (a.map.lane == nullptr || a.map.position == nullptr || a.map.first == nullptr || a.map.columns != a.columns ||
         a.groups_columns == nullptr) {
         throw std::invalid_argument("inkling2 attention: the call's column map and its groups are needed");
@@ -630,8 +607,24 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     if (a.ws.q == nullptr || a.ws.stats == nullptr || a.out == nullptr) {
         throw std::invalid_argument("inkling2 attention: the workspace and the output are needed");
     }
+}
+
+void detail::launch_attention_prologue(const AttentionArgs& a, cudaStream_t stream) {
     CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(a.columns), kKvHeads), dim3(kPrologueThreads), 0, stream},
                                     prologue_kernel, a));
+}
+
+void attention(const AttentionArgs& a, cudaStream_t stream) {
+    if (a.columns <= 0 || a.columns > a.ws.capacity || a.groups < 0 ||
+        (a.groups > 0 && (a.max_group_columns <= 0 || a.max_group_columns > kMaxAttentionLaneColumns))) {
+        throw std::invalid_argument("inkling2 attention: 1..capacity columns in groups of at most 16 columns each");
+    }
+    if (a.host_groups == nullptr && (a.groups > kMaxAttentionGroups || a.columns > kMaxAttentionColumns)) {
+        throw std::invalid_argument("inkling2 attention: a call wider than one launch passes its groups on the host");
+    }
+    detail::check_attention_args(a);
+    const AttentionLayer& l = a.layer;
+    detail::launch_attention_prologue(a, stream);
     if (a.groups == 0) { return; } // every column is padding: the prologue wrote their zero outputs
     const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns);
     static const bool attribute = [] {

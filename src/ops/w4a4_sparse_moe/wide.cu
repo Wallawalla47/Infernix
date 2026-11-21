@@ -1,6 +1,7 @@
 // Inkling 2's routed experts on the prompt route (include/infernix/ops/w4a4_sparse_moe.h moe_experts_prompt): the NVFP4
 // layers as offloaded_sparse_moe's grouped block-scaled GEMM (ops/offloaded_sparse_moe/cuda/wide_expert.cuh, at
-// Inkling's expert geometry) with this Op's own epilogues; the MXFP8 layers on the narrow kernels.
+// Inkling's expert geometry) with this Op's own epilogues; the MXFP8 layers as this file's grouped block-scaled FP8
+// GEMM (below).
 //
 //   plan       one CTA: each job's 64-entry tiles and its record
 //   gather x   every dispatched entry's A4(x) row (the MoE mixer's four-over-six codes and scales of its column) in the
@@ -240,6 +241,179 @@ __global__ void __launch_bounds__(kHWarps * 32) quantize_h_kernel(Workspace ws, 
     if (lane == 0) { ws.h_amax[entry] = mag; }
 }
 
+// ---------------------------------------------------------------------------- MXFP8 (layers 20-23)
+//
+// A grouped GEMM over the same tiles on block-scaled FP8 tensor cores (mma m16n8k32 kind::mxf8f6f4, UE8M0 per 32):
+// a CTA of 8 warps takes 128 rows (one 16-row group a warp, the record's units as A fragments as the narrow kernels
+// read them) by a tile's 64 entries (B from shared memory: the entries' E4M3 codes and UE8M0 words, 4 blocks a stage),
+// accumulating each output in FP32 over K's 32-blocks in ascending order. Gate/up: g, u = bf16(acc), h = the softcapped
+// SwiGLU times gamma into the entry's BF16 h row; then each h row's MXFP8 groups (canon::mxfp8_group, a warp an entry)
+// into the x plane's row of its position (free in an MXFP8 layer); down: y = bf16(acc) into the entry's output row.
+
+constexpr int kA8Unit       = 528; // 512 code bytes in A-fragment order, 16 UE8M0 row words
+constexpr int kA8Warps      = 8;
+constexpr int kA8Threads    = kA8Warps * 32;
+constexpr int kA8Blocks     = 4;   // K blocks of 32 a stage
+constexpr int kA8RowStride  = 32 * kA8Blocks + 16; // a staged entry's codes, padded (conflict-free B reads)
+constexpr int kA8XRowBytes  = kHidden + kHidden / 32; // the mixer's MXFP8 x row: codes then UE8M0 words (2,376)
+constexpr int kA8HScales    = kInter;                // an h plane row: 1,152 codes then 36 words
+constexpr int kA8RowBlocks  = 2304 / 128;            // 18 for gate/up (2 I rows) and for down (H rows)
+constexpr std::uint64_t kA8GateUpBytes = std::uint64_t{2 * kInter / 16} * (kHidden / 32) * kA8Unit;
+
+struct A8Smem {
+    std::uint8_t codes[2][kTile][kA8RowStride];
+    std::uint8_t scales[2][kTile][kA8Blocks];
+};
+
+struct A8Call {
+    Workspace ws;
+    const std::uint8_t* records;
+    std::uint64_t record_stride;
+    const std::uint8_t* x_rows; // gate/up: the columns' MXFP8 rows
+    const float* gamma;
+    float gate_cap, up_cap;
+    std::uint16_t* outputs;
+};
+
+template <bool Down>
+__global__ void __launch_bounds__(kA8Threads, 2) a8_grouped_kernel(const A8Call c) {
+    __shared__ __align__(16) A8Smem sm;
+    constexpr int kBlocks   = Down ? kInter / 32 : kHidden / 32; // K blocks: 36 or 72
+    constexpr int kStages   = kBlocks / kA8Blocks;              // 9 or 18
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int work = c.ws.pass_tiles[1] * kA8RowBlocks;
+    for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
+        const int tile = w / kA8RowBlocks, rb = w % kA8RowBlocks;
+        const int job = c.ws.tiles[2 * tile], column = c.ws.tiles[2 * tile + 1];
+        const int expert = c.ws.jobs[job];
+        const int first  = c.ws.offsets[expert] + column;
+        const int count  = min(kTile, c.ws.offsets[expert + 1] - first);
+        const int rg     = rb * kA8Warps + warp; // this warp's row group
+        const std::uint8_t* units = c.records + static_cast<std::size_t>(expert) * c.record_stride +
+                                    (Down ? kA8GateUpBytes : 0) + static_cast<std::size_t>(rg) * kBlocks * kA8Unit;
+        // The stage's B: each entry's codes and words of K blocks 4s .. 4s + 3 (past the tile's entries: its last).
+        const auto stage_b = [&](int buf, int s) {
+            for (int i = tid; i < kTile * (kA8Blocks * 32 / 8); i += kA8Threads) {
+                const int e = i / (kA8Blocks * 4), part = i % (kA8Blocks * 4);
+                const int p = first + min(e, count - 1);
+                const std::uint8_t* row = Down ? c.ws.x_plane + static_cast<std::size_t>(p) * kPromptXRowBytes
+                                               : c.x_rows + static_cast<std::size_t>(c.ws.entries[p] / kTopK) * kA8XRowBytes;
+                ops::cp_async<8>(&sm.codes[buf][e][8 * part], row + 128 * s + 8 * part);
+            }
+            for (int e = tid; e < kTile; e += kA8Threads) {
+                const int p = first + min(e, count - 1);
+                const std::uint8_t* row = Down ? c.ws.x_plane + static_cast<std::size_t>(p) * kPromptXRowBytes
+                                               : c.x_rows + static_cast<std::size_t>(c.ws.entries[p] / kTopK) * kA8XRowBytes;
+                ops::cp_async<4>(&sm.scales[buf][e][0], row + (Down ? kA8HScales : kHidden) + kA8Blocks * s);
+            }
+            ops::cp_commit();
+        };
+        float acc[8][4];
+#pragma unroll
+        for (int n = 0; n < 8; ++n) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0F; }
+        __syncthreads(); // the previous work item's last stage is read
+        stage_b(0, 0);
+        for (int s = 0; s < kStages; ++s) {
+            const int buf = s & 1;
+            // This stage's weights: the warp's unit of each of its 4 blocks, as the narrow kernels read a unit.
+            uint4 a[kA8Blocks];
+            unsigned sfa[kA8Blocks];
+#pragma unroll
+            for (int b = 0; b < kA8Blocks; ++b) {
+                const std::uint8_t* unit = units + static_cast<std::size_t>(kA8Blocks * s + b) * kA8Unit;
+                a[b]   = __ldcs(reinterpret_cast<const uint4*>(unit) + lane);
+                sfa[b] = unit[512 + ((t & 1) != 0 ? g + 8 : g)];
+            }
+            if (s + 1 < kStages) {
+                stage_b(buf ^ 1, s + 1);
+                ops::cp_wait<1>();
+            } else {
+                ops::cp_wait<0>();
+            }
+            __syncthreads();
+#pragma unroll
+            for (int b = 0; b < kA8Blocks; ++b) {
+#pragma unroll
+                for (int n = 0; n < 8; ++n) {
+                    const std::uint8_t* col = sm.codes[buf][8 * n + g] + 32 * b;
+                    const unsigned b0 = *reinterpret_cast<const unsigned*>(col + 4 * t);
+                    const unsigned b1 = *reinterpret_cast<const unsigned*>(col + 16 + 4 * t);
+                    mma_fp8_e4m3_block_scaled<0, 0>(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a[b].x, a[b].y, a[b].z,
+                                                     a[b].w, b0, b1, sfa[b], sm.scales[buf][8 * n + g][b]);
+                }
+            }
+            __syncthreads(); // the stage is refilled two steps on
+        }
+        // Accumulator (n, i): row 16 rg + g (+ 8 for i >= 2), entry 8 n + 2 t + (i & 1) of the tile.
+        if constexpr (Down) {
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int e = 8 * n + 2 * t + (i & 1);
+                    if (e >= count) { continue; }
+                    const int entry = c.ws.entries[first + e];
+                    c.outputs[static_cast<std::size_t>(entry) * kHidden + 16 * rg + g + (i < 2 ? 0 : 8)] =
+                        canon::f32_to_bf16_rn(acc[n][i]);
+                }
+            }
+        } else {
+            // Row 2j is intermediate j's gate, 2j + 1 its up: even-g lanes hold gates, lane + 4 the matching ups.
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                std::uint16_t y[4], up[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { y[i] = canon::f32_to_bf16_rn(acc[n][i]); }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
+                if ((g & 1) != 0) { continue; }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int e = 8 * n + 2 * t + (i & 1);
+                    if (e >= count) { continue; }
+                    const int entry = c.ws.entries[first + e];
+                    const int j     = (16 * rg + g + (i < 2 ? 0 : 8)) / 2;
+                    c.ws.h[static_cast<std::size_t>(entry) * kInter + j] =
+                        detail::swiglu(y[i], up[i], c.gamma[entry], c.gate_cap, c.up_cap);
+                }
+            }
+        }
+    }
+}
+
+// A warp per dispatched entry: its BF16 h row's MXFP8 groups (lane l: groups l and l + 32) into the x plane's row.
+__global__ void __launch_bounds__(kHWarps * 32) quantize_h_a8_kernel(Workspace ws, int entries) {
+    constexpr int kGroups = kInter / 32; // 36
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int p    = static_cast<int>(blockIdx.x) * kHWarps + static_cast<int>(threadIdx.x) / 32;
+    if (p >= entries) { return; }
+    const std::uint16_t* row = ws.h + static_cast<std::size_t>(ws.entries[p]) * kInter;
+    std::uint8_t* dst        = ws.x_plane + static_cast<std::size_t>(p) * kPromptXRowBytes;
+    for (int grp = lane; grp < kGroups; grp += 32) {
+        float v[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) { v[j] = canon::bf16_to_f32(row[32 * grp + j]); }
+        const canon::Mxfp8Group q = canon::mxfp8_group(v);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            reinterpret_cast<std::uint32_t*>(dst + 32 * grp)[j] =
+                q.code[4 * j] | (static_cast<std::uint32_t>(q.code[4 * j + 1]) << 8) |
+                (static_cast<std::uint32_t>(q.code[4 * j + 2]) << 16) | (static_cast<std::uint32_t>(q.code[4 * j + 3]) << 24);
+        }
+        dst[kA8HScales + grp] = q.exponent;
+    }
+}
+
+int a8_ctas() {
+    static const int ctas = [] {
+        int device = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        return 2 * sms;
+    }();
+    return ctas;
+}
+
 #ifdef _WIN32
 TmaDescriptorStaging<wide::Descriptors>& descriptor_staging() {
     static TmaDescriptorStaging<wide::Descriptors> staging;
@@ -275,17 +449,24 @@ wide::Descriptors make_descriptors(const Workspace& ws) {
 
 void moe_experts_prompt(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& ws,
                         std::uint16_t* outputs, cudaStream_t stream) {
-    if (bank.format == ExpertFormat::Mxfp8) {
-        moe_experts(x, routing, bank, ws, outputs, stream);
-        return;
-    }
     if (bank.hidden != kHidden || bank.intermediate != kInter || bank.experts <= 0 || bank.experts > 256 ||
         x.columns <= 0 || x.columns > ws.capacity) {
-        throw std::invalid_argument("w4a4_sparse_moe prompt: Inkling 2's [E, 2304, 1152] NVFP4 banks, 1..capacity columns");
+        throw std::invalid_argument("w4a4_sparse_moe prompt: Inkling 2's [E, 2304, 1152] banks, 1..capacity columns");
     }
     const int entries = x.columns * kTopK;
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(ws, bank.records, bank.record_stride, bank.experts);
     check_launch("plan");
+    if (bank.format == ExpertFormat::Mxfp8) {
+        const A8Call call{ws, bank.records, bank.record_stride, x.rows, routing.gamma, bank.gate_softcap, bank.up_softcap,
+                          outputs};
+        a8_grouped_kernel<false><<<a8_ctas(), kA8Threads, 0, stream>>>(call);
+        check_launch("MXFP8 gate/up");
+        quantize_h_a8_kernel<<<(entries + kHWarps - 1) / kHWarps, kHWarps * 32, 0, stream>>>(ws, entries);
+        check_launch("MXFP8 quantize h");
+        a8_grouped_kernel<true><<<a8_ctas(), kA8Threads, 0, stream>>>(call);
+        check_launch("MXFP8 down");
+        return;
+    }
     const int gather_ctas = std::min((entries * (kHidden / 16) + kGatherThreads - 1) / kGatherThreads, 4096);
     gather_x_kernel<<<gather_ctas, kGatherThreads, 0, stream>>>(x.rows, ws, entries);
     check_launch("gather x");

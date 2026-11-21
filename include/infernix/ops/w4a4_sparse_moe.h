@@ -145,8 +145,9 @@ void moe_select(const float* logits, std::int32_t columns, const float* bias, st
 // moe_experts_prompt: NVFP4 layers on block-scaled tensor cores (mma mxf4nvf4, a grouped GEMM over the dispatched
 // entries): a gate/up or down output is bf16(acc * rs) with acc the FP32 tensor-core sum of the decoded block
 // products in one fixed K order (the narrow route's exact int64 sum rounded once, up to the accumulation's rounding)
-// and rs the narrow route's row scale; h and its four-over-six rows as the narrow route forms them. MXFP8 layers run
-// the narrow route's kernels (their arithmetic is one fixed K order per column at every width). Outputs as
+// and rs the narrow route's row scale; h and its four-over-six rows as the narrow route forms them. MXFP8 layers: a
+// grouped GEMM on block-scaled FP8 tensor cores (mma mxf8f6f4, UE8M0 per 32), each output the FP32 sum over K's
+// 32-blocks in ascending order, g, u = bf16(acc), h's MXFP8 groups as the narrow route's, y = bf16(acc). Outputs as
 // moe_experts'.
 void moe_experts_prompt(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,
                         std::uint16_t* outputs, cudaStream_t stream);

@@ -139,4 +139,13 @@ struct AttentionArgs {
 };
 void attention(const AttentionArgs& args, cudaStream_t stream);
 
+// The prompt route (a prefill or scoring call: one lane's consecutive columns, any width; its groups on the host): the
+// same prologue, then a row's scores, softmax and P x V on tensor cores over its fixed absolute 64-key units in
+// ascending order (attention_prompt.cu): S = q k^T by BF16 MMA (FP32, from zero over the head dimension), the decode
+// route's bias, s and t; per unit m_u over visible keys (a unit with none leaves the row unchanged), m = max, c =
+// ex2(m_old - m), p = ex2(t - m) rounded to FP16 for P x V by FP16 MMA (FP32), l = l c + the row sum of p (the four
+// lanes' partial sums in xor order), acc = acc c + P V; then l += ex2(sink log2 e - m) and a = bf16(bf16(acc / l) *
+// sigmoid(gate)). Other bits than attention()'s; a column's bits depend only on its position and lane.
+void attention_prompt(const AttentionArgs& args, cudaStream_t stream);
+
 } // namespace infernix::ops::inkling2

@@ -514,7 +514,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     at.ws  = b_.attention_ws;
     at.out = b_.attention;
-    ik::attention(at, stream);
+    prompt_ ? ik::attention_prompt(at, stream) : ik::attention(at, stream);
     mark("attention");
     if (staged) {
         stage_window(s, vs, false, stream);

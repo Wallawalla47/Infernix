@@ -526,11 +526,205 @@ void run_case(bool full, std::uint32_t seed) {
     }
 }
 
+// ---------------------------------------------------------------------------- the prompt route
+
+// attention_prompt on one lane's prompt call of 150 columns at positions 1000-1149 (three CTA tiles of up to 64 columns;
+// sliding windows across 17 units, full rows over all units from the lane's first position 37). Sliding KV is a
+// staging ring of staging_ring_pages(150) pages (the forward's for a wide call); the conv inputs before the call come
+// from a history snapshot (as the forward's for a wide call). Criteria (fixed before the first run): each output
+// within half a BF16 ulp of FP64 (scores over the kernel's stored q, r and represented K/V, the bias at its pinned
+// BF16 boundary, softmax with the sink) plus sigmoid(gate) times (one ulp of the inner BF16 a + 2^-11 of the row's
+// largest |v|: p is rounded to FP16 for P x V) plus 2^-16 of the row's largest |v|; the call as calls of 37, 64 and 49
+// columns from the same initial state gives the same bits; a repeated call the same bits.
+void prompt_case(bool full, std::uint32_t seed) {
+    constexpr int T = 150, P0 = 1000, First = 37;
+    const int pages = ik::staging_ring_pages(T);
+    std::mt19937 gen(seed);
+    const auto normal = [&](std::size_t n, float sd) {
+        std::normal_distribution<float> d(0.0F, sd);
+        std::vector<std::uint16_t> out(n);
+        for (auto& x : out) { x = b16(d(gen)); }
+        return out;
+    };
+    // Projections and layer as make_problem's.
+    auto q = normal(std::size_t(T) * QW, 1.0F), r = normal(std::size_t(T) * RW, 1.0F);
+    auto k = normal(std::size_t(T) * KVW, 1.0F), v = normal(std::size_t(T) * KVW, 1.0F);
+    auto sink = normal(std::size_t(T) * NH, 2.0F), gate = normal(std::size_t(T) * QW, 1.5F);
+    auto ktaps = normal(std::size_t(T) * NKV * 4, 0.3F), vtaps = normal(std::size_t(T) * NKV * 4, 0.3F);
+    auto qscale = normal(std::size_t(NH) * D, 0.15F);
+    for (std::size_t i = 0; i < qscale.size(); ++i) { qscale[i] = b16(f(qscale[i]) + ((i / D) % 4 == 0 ? 3.0F : 1.0F)); }
+    auto rscale = normal(std::size_t(NH) * RD, 0.5F);
+    for (auto& x : rscale) { x = b16(f(x) + 2.0F); }
+    auto table = normal(std::size_t(RD) * ik::kRelativeExtent, 0.4F);
+    auto kconv = normal(std::size_t(4) * KVW, 0.4F), vconv = normal(std::size_t(4) * KVW, 0.4F);
+    auto kring = normal(std::size_t(R) * KVW, 1.0F), vring = normal(std::size_t(R) * KVW, 1.0F);
+    const std::size_t kv_words = full ? std::size_t(NKV) * kPoolPages * U * D : std::size_t(NKV) * pages * U * D;
+    auto kv_k = normal(kv_words, 1.0F), kv_v = normal(kv_words, 1.0F);
+    for (auto& x : kv_v) { x = h16(f(x)); }
+    std::vector<int> block_table;
+    if (full) {
+        std::vector<int> order(kPoolPages);
+        for (int i = 0; i < kPoolPages; ++i) { order[i] = i; }
+        std::shuffle(order.begin(), order.end(), gen);
+        block_table.assign(kTableStride, -1);
+        for (int b = 0; b <= (P0 + T - 1) / U; ++b) { block_table[b] = order[b]; }
+    }
+    const auto row_of = [&](int head, int pos) -> std::size_t {
+        if (!full) { return ((std::size_t(head) * pages + (pos / U) % pages) * U + pos % U) * D; }
+        return ((std::size_t(head) * kPoolPages + block_table[pos / U]) * U + pos % U) * D;
+    };
+    // Device state.
+    std::uint16_t *dq = upload(q), *dr = upload(r), *dk = upload(k), *dv = upload(v), *dsink = upload(sink);
+    std::uint16_t *dgate = upload(gate), *dktaps = upload(ktaps), *dvtaps = upload(vtaps);
+    std::uint16_t *dqs = upload(qscale), *drs = upload(rscale), *dtable = upload(table), *dkc = upload(kconv),
+                  *dvc = upload(vconv);
+    std::uint16_t *dkr = upload(kring), *dvr = upload(vring), *dkk = upload(kv_k), *dvv = upload(kv_v);
+    std::uint16_t *dkh = dalloc<std::uint16_t>(std::size_t(ik::kHistorySlots) * KVW),
+                  *dvh = dalloc<std::uint16_t>(std::size_t(ik::kHistorySlots) * KVW);
+    std::uint16_t* dout = dalloc<std::uint16_t>(std::size_t(T) * QW);
+    int* dbt = full ? upload(block_table) : dalloc<int>(1);
+    int *dlane = dalloc<int>(T), *dpos = dalloc<int>(T), *dfirst = upload(std::vector<int>{First});
+    int* dgroups = dalloc<int>(3 * (T / 16 + 2));
+    void* dws = dalloc<unsigned char>(ik::attention_workspace_bytes(T));
+    const auto reset = [&] {
+        upload_to(dkk, kv_k), upload_to(dvv, kv_v), upload_to(dkr, kring), upload_to(dvr, vring);
+    };
+    struct Got {
+        std::vector<std::uint16_t> out, q, r, kk, vv;
+    };
+    // Columns [c0, c0 + n) of the call as one prompt call.
+    const auto run_prompt = [&](int c0, int n) {
+        // The history snapshot: ring rows of positions P0 + c0 - 4 .. - 1 at slots pos & 3.
+        const auto kr = download(dkr, kring.size()), vr = download(dvr, vring.size());
+        std::vector<std::uint16_t> kh(std::size_t(ik::kHistorySlots) * KVW), vh(kh.size());
+        for (int back = 1; back <= ik::kHistorySlots; ++back) {
+            const int pos = P0 + c0 - back;
+            std::copy_n(kr.data() + std::size_t(pos & (R - 1)) * KVW, KVW, kh.data() + std::size_t(pos & 3) * KVW);
+            std::copy_n(vr.data() + std::size_t(pos & (R - 1)) * KVW, KVW, vh.data() + std::size_t(pos & 3) * KVW);
+        }
+        upload_to(dkh, kh), upload_to(dvh, vh);
+        const auto slice = [&](const std::vector<std::uint16_t>& src, int width) {
+            return std::vector<std::uint16_t>(src.begin() + std::size_t(c0) * width, src.begin() + std::size_t(c0 + n) * width);
+        };
+        upload_to(dq, slice(q, QW)), upload_to(dr, slice(r, RW)), upload_to(dk, slice(k, KVW)), upload_to(dv, slice(v, KVW));
+        upload_to(dsink, slice(sink, NH)), upload_to(dgate, slice(gate, QW));
+        upload_to(dktaps, slice(ktaps, NKV * 4)), upload_to(dvtaps, slice(vtaps, NKV * 4));
+        std::vector<int> lane(n, 0), pos(n), groups;
+        for (int i = 0; i < n; ++i) { pos[i] = P0 + c0 + i; }
+        for (int done = 0; done < n; done += ik::kMaxAttentionLaneColumns) {
+            groups.insert(groups.end(), {done, std::min(ik::kMaxAttentionLaneColumns, n - done), 0});
+        }
+        upload_to(dlane, lane), upload_to(dpos, pos), upload_to(dgroups, groups);
+        ik::AttentionArgs a;
+        a.columns           = n;
+        a.groups            = static_cast<int>(groups.size() / 3);
+        a.max_group_columns = std::min(n, ik::kMaxAttentionLaneColumns);
+        a.map               = {dlane, dpos, dfirst, n};
+        a.groups_columns    = dgroups;
+        a.host_groups       = groups.data();
+        a.in                = {dq, dr, dk, dv, dsink, dgate, full ? dktaps : nullptr, full ? dvtaps : nullptr};
+        a.layer             = {full, dqs, drs, dtable, dkc, dvc};
+        a.key_ring          = {dkr, KVW, std::int64_t{R} * KVW, dkh, std::int64_t{ik::kHistorySlots} * KVW};
+        a.value_ring        = {dvr, KVW, std::int64_t{R} * KVW, dvh, std::int64_t{ik::kHistorySlots} * KVW};
+        a.kv.k              = dkk;
+        a.kv.v              = dvv;
+        a.kv.ring_pages     = pages;
+        a.kv.lane_stride    = std::int64_t{NKV} * pages * U * D;
+        a.kv.table          = full ? dbt : nullptr;
+        a.kv.table_stride   = full ? kTableStride : 0;
+        a.kv.pool_pages     = full ? kPoolPages : 0;
+        a.ws                = ik::carve_attention_workspace(dws, T);
+        a.out               = dout;
+        ik::attention_prompt(a, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "attention_prompt");
+        Got g;
+        g.out = download(dout, std::size_t(n) * QW);
+        g.q   = download(a.ws.q, std::size_t(n) * QW);
+        g.r   = download(a.ws.r, std::size_t(n) * RW);
+        g.kk  = download(dkk, kv_k.size());
+        g.vv  = download(dvv, kv_v.size());
+        return g;
+    };
+    reset();
+    const Got got = run_prompt(0, T);
+    // FP64 over the kernel's own q, r and represented K/V.
+    Tally tally{full ? "full prompt attention vs FP64" : "sliding prompt attention vs FP64"};
+    for (int t = 0; t < T; ++t) {
+        const int pos = P0 + t;
+        for (int h = 0; h < NH; ++h) {
+            const int kvh = h / G;
+            const std::uint16_t* qv = got.q.data() + (std::size_t(t) * NH + h) * D;
+            const std::uint16_t* rv = got.r.data() + (std::size_t(t) * NH + h) * RD;
+            const int lo = std::max(First, full ? 0 : std::max(0, pos - (ik::kWindow - 1)));
+            std::vector<double> score;
+            std::vector<std::size_t> rows;
+            double vmax = 0;
+            for (int j = lo; j <= pos; ++j) {
+                const std::size_t at = row_of(kvh, j);
+                double dot = 0;
+                for (int e = 0; e < D; ++e) { dot += double{f(qv[e])} * f(got.kk[at + e]); }
+                const int dist = pos - j;
+                double bias    = 0;
+                if (dist < ik::kRelativeExtent) {
+                    float acc = 0;
+                    for (int i = 0; i < RD; ++i) {
+                        acc = canon::fma_rn(f(rv[i]), f(table[std::size_t(i) * ik::kRelativeExtent + dist]), acc);
+                    }
+                    bias = bf(acc);
+                }
+                score.push_back(dot / std::sqrt(128.0) + bias);
+                rows.push_back(at);
+                for (int e = 0; e < D; ++e) { vmax = std::max(vmax, std::fabs(double{hf(got.vv[at + e])})); }
+            }
+            const double s_sink = f(sink[std::size_t(t) * NH + h]);
+            double m = s_sink;
+            for (double s : score) { m = std::max(m, s); }
+            double den = std::exp(s_sink - m);
+            for (double& s : score) { den += (s = std::exp(s - m)); }
+            for (int e = 0; e < D; ++e) {
+                double acc = 0;
+                for (std::size_t j = 0; j < score.size(); ++j) { acc += score[j] * hf(got.vv[rows[j] + e]); }
+                const double a64 = acc / den;
+                const double sg  = 1.0 / (1.0 + std::exp(-double{f(gate[std::size_t(t) * QW + h * D + e])}));
+                const double y   = f(got.out[std::size_t(t) * QW + h * D + e]);
+                tally.ratio(std::fabs(y - a64 * sg) /
+                            (0.5 * ulp_bf16(a64 * sg) + sg * (ulp_bf16(a64) + 0x1p-11 * vmax) + 0x1p-16 * vmax));
+            }
+        }
+    }
+    tally.report();
+    reset();
+    const Got again = run_prompt(0, T);
+    Tally repeat{"  repeated prompt call"};
+    repeat.exact(again.out.data(), got.out.data(), got.out.size());
+    repeat.report();
+    reset();
+    Tally chunks{full ? "  full: calls of 37, 64, 49 = one call" : "  sliding: calls of 37, 64, 49 = one call"};
+    int c0 = 0;
+    for (const int n : {37, 64, 49}) {
+        const Got part = run_prompt(c0, n);
+        chunks.exact(part.out.data(), got.out.data() + std::size_t(c0) * QW, std::size_t(n) * QW);
+        c0 += n;
+    }
+    chunks.report();
+    for (void* x : {static_cast<void*>(dq), static_cast<void*>(dr), static_cast<void*>(dk), static_cast<void*>(dv),
+                    static_cast<void*>(dsink), static_cast<void*>(dgate), static_cast<void*>(dktaps),
+                    static_cast<void*>(dvtaps), static_cast<void*>(dqs), static_cast<void*>(drs), static_cast<void*>(dtable),
+                    static_cast<void*>(dkc), static_cast<void*>(dvc), static_cast<void*>(dkr), static_cast<void*>(dvr),
+                    static_cast<void*>(dkk), static_cast<void*>(dvv), static_cast<void*>(dkh), static_cast<void*>(dvh),
+                    static_cast<void*>(dout), static_cast<void*>(dbt), static_cast<void*>(dlane), static_cast<void*>(dpos),
+                    static_cast<void*>(dfirst), static_cast<void*>(dgroups), dws}) {
+        cudaFree(x);
+    }
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(inkling2_attention) {
     run_case(false, 7);
     run_case(true, 8);
+    prompt_case(false, 17);
+    prompt_case(true, 18);
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
