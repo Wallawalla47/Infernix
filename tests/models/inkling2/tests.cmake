@@ -31,7 +31,7 @@ infernix_add_test(infernix_inkling2_frontend_real_test
 set_tests_properties(infernix_inkling2_frontend_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # Through the public Engine (the Program's first slice), against an eager one-request Engine: the golden greedy
-# continuation, graphs, request invariance at C = 4 and 8, prefill chunk width, and a scoring Engine's logits against
+# continuation, graphs, request invariance at C = 2, 4 and 8, prefill chunk width, and a scoring Engine's logits against
 # the forward test's (INFERNIX_INKLING2_LOGITS_GUARD). Skips without INFERNIX_INKLING2_ARTIFACT and
 # INFERNIX_INKLING2_REFERENCE.
 infernix_add_test(infernix_inkling2_engine_real_test

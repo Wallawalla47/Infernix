@@ -5,7 +5,8 @@
 //    8 ids (the forward's free-running argmax at positions 23-30, which the bit guard's logits confirm).
 // 2. Graphs: the Engine with CUDA graphs gives the reference's tokens.
 // 3. Request invariance: four sampled requests (temperature 1, a seed each, 24-48 tokens so lanes drop out mid-run in a
-//    known order) give their solo tokens all at once in reverse order (C = 4) and twice over at once (C = 8).
+//    known order) give their solo tokens two at once (C = 2), all at once in reverse order (C = 4) and twice over at
+//    once (C = 8).
 // 4. Prefill chunk width: an Engine prefilling 7 columns a call gives the reference's tokens.
 // 5. Scoring: a CausalScoring Engine's logits of the 32 golden ids (positions 0-30) equal the forward test's
 //    free-running logits (INFERNIX_INKLING2_LOGITS_GUARD) byte for byte.
@@ -169,6 +170,13 @@ int main() {
             require_same("graphs: greedy continuation of the golden prompt", continuation,
                          engine.generate(engine.prepare_tokens(prompt), greedy(8)).generated_token_ids);
             require_alone("graphs alone", engine, reference_tokens);
+            {
+                // C = 2: requests 1 and 0 at once (request 0 finishes first, its lane emptying under request 1).
+                auto second = engine.submit(engine.prepare(chat(texts()[1])), sampled(1));
+                auto first  = engine.submit(engine.prepare(chat(texts()[0])), sampled(0));
+                require_same("C = 2, request 1", reference_tokens[1], second.wait().generated_token_ids);
+                require_same("C = 2, request 0", reference_tokens[0], first.wait().generated_token_ids);
+            }
             std::vector<infernix::GenerationHandle> handles;
             for (std::size_t i = texts().size(); i-- > 0;) {
                 handles.push_back(engine.submit(engine.prepare(chat(texts()[i])), sampled(i)));

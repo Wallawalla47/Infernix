@@ -523,7 +523,7 @@ projections launch to equal `linear()` bit for bit on one visit's real shapes at
 plain and packed (bf16_p12 segments, escapes included). `infernix_qwen4_exp_forward_real_test --pack-bf16` loads
 Flash-Next packed as the Engine does. `infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2
 through the public Engine against an eager one-request Engine prefilling 16 columns a call: the golden prompt's greedy
-continuation, CUDA graphs, four sampled requests at C = 4 and C = 8, prefill chunks of 7, and a CausalScoring Engine's
+continuation, CUDA graphs, four sampled requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's
 logits equal to the forward test's (`INFERNIX_INKLING2_LOGITS_GUARD`) byte for byte; it reports a chat turn and a
 thinking-budget turn without judging them.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back

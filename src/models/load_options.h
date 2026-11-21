@@ -67,8 +67,9 @@ struct LoadOptions {
     // (runtime/expert_offload/drafter_pool.h), where the model can pool them: Qwen4Exp, and Qwen3.5 with offloaded
     // experts, each with its measured slot count (Config::mtp_expert_slots). False: the bank is device-resident.
     bool mtp_expert_pool = false;
-    // Qwen4Exp off the lossless route: the BF16 weights whose every reader takes bf16_p12 are packed losslessly at
-    // load (core/weight.h), and their BF16 copies freed.
+    // Qwen4Exp and Inkling 2 off the lossless route: BF16 weights whose every reader takes bf16_p12 are packed
+    // losslessly at load (core/weight.h), and their BF16 copies freed (Inkling 2: the head only, the set measured
+    // faster).
     bool pack_bf16 = false;
     // Qwen4Exp --a8-activations with fast paths: a GGUF import's hyper-connection matrices are repacked to Q8 at load
     // (execution::Parameters' hc_q8), so its mixers stay BF16 for that repack; every other artifact's mixers pack.
@@ -159,7 +160,8 @@ struct LoadOptions {
             // width-invariant and sampling Gumbel-max). No speculation is lossless.
             .mtp_expert_pool = !options.lossless && options.purpose == EnginePurpose::Generation &&
                                options.speculative.backend == SpeculativeBackend::Mtp,
-            .pack_bf16       = architecture == Architecture::Qwen4Exp && !options.lossless,
+            .pack_bf16 = (architecture == Architecture::Qwen4Exp || architecture == Architecture::Inkling2Loop) &&
+                         !options.lossless,
             .hc_q8_repack    = architecture == Architecture::Qwen4Exp && options.a8_activations && !options.lossless &&
                             options.fast_paths};
 }

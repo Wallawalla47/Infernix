@@ -170,27 +170,15 @@ void check_expert_uses(const std::vector<PendingWeight>& pending, const TextWeig
     }
 }
 
-// The artifact objects load-time packing takes (LoadOptions::pack_bf16; models/bf16_packing.h): BF16 [n, k] matrices
-// every parameter on which is read only through an Op that takes bf16_p12 (the fused projections: each visit's K2
-// parent and small parent, the message gates' downs and forget/gain; ops::linear: W_o and the head). Routers, the
-// embedding and the direct tensors stay BF16.
+// The artifact objects load-time packing takes (LoadOptions::pack_bf16; models/bf16_packing.h): the BF16 matrices
+// whose packed route measured faster in the decode round. Every projection's reader takes bf16_p12 (the fused
+// projections and ops::linear), but packed alone at 4K, C = 1 (11-21, the round 6.305 ms unpacked) the head saves
+// 0.129 ms, while each visit's K2 parent costs 0.070 ms more, W_o 0.044 ms and the message gates 0.269 ms, although
+// the op sweep has K2 and W_o faster at one column. So only the head packs.
 std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
                                                      const artifact::Reader& reader) {
     std::vector<bool> packed(pending.size(), false);
-    const auto mark = [&](std::initializer_list<WeightId> ids) {
-        for (const WeightId id : ids) {
-            if (id.valid()) { packed.at(id.index) = true; }
-        }
-    };
-    mark({w.output_head});
-    for (const LayerWeights& layer : w.layers) {
-        const AttentionWeights& a = layer.attention;
-        // The K2 parent's sink and conv taps with it: one projections launch takes one storage.
-        mark({a.query, a.relative, a.gate, a.key, a.value, a.sink, a.key_taps, a.value_taps, a.output});
-        if (layer.messages) {
-            for (const MessageGateWeights& g : layer.messages->gates) { mark({g.down, g.forget, g.gain}); }
-        }
-    }
+    if (w.output_head.valid()) { packed.at(w.output_head.index) = true; }
     std::map<std::size_t, bool> objects; // object -> every parameter on it packable
     for (std::size_t i = 0; i < pending.size(); ++i) {
         const bool ok = packed[i] && pending[i].reference.residency == Residency::Device;

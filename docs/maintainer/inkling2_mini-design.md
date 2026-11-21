@@ -399,7 +399,7 @@ RTX 5090 and this design's 158.5 tok/s at 4K, measured with the clocks stuck at 
 
 | Idea | Source | Use here |
 |---|---|---|
-| At ≤ 16 rows a depth mix or residual update spreads each row over one-warp blocks; each block keeps its warp's sums and every reader adds them in the one-block kernel's warp order, so the values are the one-block kernel's bits (with batched controllers and a sorted route: decode 88.9 → 111.4 tok/s on an RTX 3090) | `kernels.cu` `mix_split_terms_kernel` / `mix_split_rows_kernel`, `residual_split_kernel` | the visit kernels run one CTA a column; the pinned order (288 groups, bfly32, a fold over 9 warps) allows the same split with one-warp blocks of 256 channels. Measured before built (M5): one warp's share of a row alone on an SM against the 288-thread CTA; its ceiling is the visit kernels' share of a round |
+| At ≤ 16 rows a depth mix or residual update spreads each row over one-warp blocks; each block keeps its warp's sums and every reader adds them in the one-block kernel's warp order, so the values are the one-block kernel's bits (with batched controllers and a sorted route: decode 88.9 → 111.4 tok/s on an RTX 3090) | `kernels.cu` `mix_split_terms_kernel` / `mix_split_rows_kernel`, `residual_split_kernel` | the visit kernels run one CTA a column; the pinned order (288 groups, bfly32, a fold over 9 warps) allows the same split with one-warp blocks of 256 channels. Measured, not built (2026-11-21, `infernix_inkling2_visit_bench` at T = 1 launched one warp wide): one warp's share takes 0.60-0.86× the 288-thread CTA's time, ~0.23 ms a 6.3 ms round in all, but a split mix needs every block's partial sums before its weighted sum, so it adds a dependent launch per mix (two a visit), and a dependent launch with almost no work costs ~3.1-3.7 µs here: ~0.29 ms added against ~0.23 ms saved |
 | A sliding visit's prefill attends over a staging ring: the window before the chunk copied in, the chunk's keys appended, the window that ends the chunk copied back to the sequence's ring | `executor.cpp` `visit()` (`ring_copy`, `prefill_ring`) | the M8 prefill route over the StateImage's 17-page window ring ([§9.3](#93-prefill)) |
 | A named tool choice forced by the prompt: it ends with `<|message_model|>NAME<|content_invoke_tool_json|>`, the turn resumes inside the call's JSON and the decoder starts in it | `inkling_output.h` `InklingToolCallDecoder` | needs the tool choice at preparation (PromptOptions has none today); with it, a required choice of one name needs no grammar |
 | The prompt opens the answer's text block for typed decisions and reranking (the token read is the answer's) | `docs/inkling2.md` | a readout recipe for the frontend, if typed decisions come to this family |
@@ -811,6 +811,11 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   packed GEMV gives the BF16 skinny route's bits at T ≤ 8 and runs 16 columns a pass under `A16ColumnInvariant`, so packing
   changes no reproducible-route bit. There is no second BF16 copy: prefill and wide verify (B × T of 33-1,024 columns) pay
   the packed routes' 0.67-0.96× on those projections, a few percent of prefill time.
+  Measured (2026-11-21, inkling2-mini, 4K context, C = 1, each group packed alone against a 6.305 ms round): the head
+  saves 0.129 ms (its sweep predicted 0.125), but the K2 parents cost 0.070 ms more, W_o 0.044 ms and the message
+  gates 0.269 ms, although the op sweep (each launch on its own cold copy) had K2 at 0.80× and W_o at 0.71× BF16's time
+  at T = 1. Only the head packs (the embedding stays BF16: its gather does not take the packed form yet). Why K2 and
+  W_o lose inside the round is not established.
 - **K2.** A multi-input packed GEMV: row ranges bound to one of three input vectors (one pointer on the 20 pass-1 sliding
   visits, three elsewhere); new tuned routes for Inkling's shapes (`bf16_p12_linear_tuned` registers only measured shapes).
 - **K4.** GEMV 2304 × 3072 (packed or BF16 per M1) with the post-attention conv and residual in the epilogue (each output
