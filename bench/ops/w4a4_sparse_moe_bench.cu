@@ -4,6 +4,7 @@
 // between two of its calls). Random weights and router: each call routes T columns to their own top 8.
 //
 //   infernix_w4a4_sparse_moe_bench [--format nvfp4|mxfp8] [--tokens 1,2,4,8,16,32] [--repeat 20] [--warmup 3]
+//                                  [--part all|route|experts|single] [--layers 8]   (single: moe_single, T = 1)
 //
 // Per T: the median and minimum call time, the distinct experts the call reads and their record bytes, and the
 // effective bandwidth over those bytes (the floor a weight-streaming kernel approaches).
@@ -54,7 +55,7 @@ int main(int argc, char** argv) {
     bool a8 = false;
     std::vector<int> tokens = {1, 2, 4, 8, 16, 32};
     int repeat = 20, warmup = 3;
-    std::string part = "all"; // all | route | experts
+    std::string part = "all"; // all | route | experts | single (moe_single: T = 1)
     int layers = 8;            // layer calls a graph (each its own bank: cold weights, as consecutive visits)
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -198,6 +199,11 @@ int main(int argc, char** argv) {
         for (int l = 0; l < layers; ++l) {
             moe::Bank layer_bank = bank;
             layer_bank.records   = d_banks[l];
+            if (part == "single") { // the router and experts of one column in one launch (T = 1 only)
+                moe::moe_single(d_x, moe::Activations{d_rows, d_row_amax, T}, d_router, d_bias, 8.0F, layer_bank, ws,
+                                d_out, stream);
+                continue;
+            }
             if (part != "experts") { moe::moe_route(d_x, T, d_router, d_bias, E, H, 8.0F, ws, stream); }
             if (part == "experts") { moe::moe_dispatch(moe::routed_routing(ws), T, E, ws, stream); }
             if (part != "route") {

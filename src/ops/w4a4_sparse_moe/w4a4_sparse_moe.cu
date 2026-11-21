@@ -739,6 +739,340 @@ __global__ void __launch_bounds__(Shape<G, true>::kDownThreads) down_a8_kernel(A
     }
 }
 
+// ---------------------------------------------------------------------------- one column in one launch
+
+// moe_single: a single column's router and experts as one persistent grid of kSingleCtas CTAs, one an SM, so every CTA
+// is resident and the grid's waits complete. CTAs 0-15 compute the router's logits (route_kernel's rows: a warp a row,
+// its order); every CTA waits for them and selects the column's experts itself (select_column's rule, a thread an
+// expert); CTA c then takes job
+// c / 18 (jobs in ascending expert id) and its warps the row groups (c % 18) * 8 + warp, each streaming its gate/up row
+// group over all of K (NVFP4: the exact int64 sum of both halves; MXFP8: the two halves' FP32 chains added half 0 +
+// half 1, as gate_up_a8_kernel) and then its down row group through one cp.async ring, so the down weights stream
+// while the CTA waits for its job's h. h goes to global as BF16; once the job's 144 row groups are counted, each of
+// its 18 CTAs forms the job's quantized h row itself (the same four-over-six blocks or MXFP8 groups) and runs its down
+// row groups. Every value is the separate kernels' bit for bit. The last CTA to finish resets the counters.
+constexpr int kSingleWarps      = 8;
+constexpr int kSingleThreads    = 32 * kSingleWarps;
+constexpr int kSingleDepth      = 9;                                // stages of a warp's ring
+constexpr int kSingleRowGroups  = 2 * Inkling::kInter / 16;         // a job's gate/up row groups = down's (H / 16)
+constexpr int kSingleCtasPerJob = kSingleRowGroups / kSingleWarps;  // 18
+constexpr int kSingleCtas       = kTopK * kSingleCtasPerJob;        // 144
+constexpr int kSingleExperts    = 128;
+constexpr int kRouterCtas       = kSingleExperts / kSingleWarps;    // 16
+static_assert(Inkling::kHidden / 16 == kSingleRowGroups && kSingleRowGroups % kSingleWarps == 0, "row groups a CTA");
+static_assert(kRouterCtas <= kSingleCtas, "the router's rows on the grid's first CTAs");
+// Workspace::single: [0] router CTAs done, [1] CTAs finished, [2 + job] the job's gate/up row groups done.
+constexpr int kSingleCounters = 2 + kTopK;
+
+struct SingleArgs {
+    Args e;                          // the experts' operands (e.routing unused: the routing is the grid's own)
+    const std::uint16_t* x = nullptr; // the router's input row, BF16 [H]
+    const std::uint16_t* router = nullptr;
+    const float* bias = nullptr;
+    float route_scale = 0.0F;
+};
+
+template <class G, bool A8>
+struct SingleSmem {
+    using S = Shape<G, A8>;
+    alignas(16) std::uint8_t ring[kSingleWarps][kSingleDepth][S::kStageBytes];
+    alignas(16) std::uint8_t x[S::kXStride];
+    alignas(16) std::uint8_t h[S::kHStride];
+    std::int32_t scaled[256];
+    float keys[kSingleExperts];
+    float sel[kTopK];
+    std::int32_t routed[kTopK];
+    float gamma[kTopK];
+    std::int32_t job_slot[kTopK];
+    std::uint32_t red[kSingleWarps];
+    float h_amax;
+    int stalled;
+};
+
+template <class G, bool A8>
+__global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleArgs a) {
+    using S = Shape<G, A8>;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm      = *reinterpret_cast<SingleSmem<G, A8>*>(smem_raw);
+    const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
+    const int g = lane / 4, t = lane % 4;
+    const int cta = static_cast<int>(blockIdx.x);
+    std::uint32_t* const counters = a.e.ws.single;
+    // The router's rows (CTAs 0-15, a warp a row): the weights before the dependency wait, lane l holding elements
+    // 8 (l + 32 j) .. + 7, as route_kernel.
+    const bool router = cta < kRouterCtas;
+    const int row     = cta * kSingleWarps + warp;
+    uint4 w[kRouteChunks];
+    if (router) {
+#pragma unroll
+        for (int j = 0; j < kRouteChunks; ++j) {
+            w[j] = *reinterpret_cast<const uint4*>(a.router + static_cast<std::size_t>(row) * G::kHidden + 8 * (lane + 32 * j));
+        }
+    }
+    if constexpr (!A8) { a4_mma_fill_scaled(sm.scaled, kSingleThreads); }
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    if (router) {
+        float acc = 0.0F;
+#pragma unroll
+        for (int j = 0; j < kRouteChunks; ++j) {
+            const uint4 xv = *reinterpret_cast<const uint4*>(a.x + 8 * (lane + 32 * j));
+            const std::uint32_t wa[4] = {w[j].x, w[j].y, w[j].z, w[j].w}, xa[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                acc = __fmaf_rn(canon::f32_from_bits(wa[q] << 16), canon::f32_from_bits(xa[q] << 16), acc);
+                acc = __fmaf_rn(canon::f32_from_bits(wa[q] & 0xFFFF0000U), canon::f32_from_bits(xa[q] & 0xFFFF0000U), acc);
+            }
+        }
+#pragma unroll
+        for (int o = 16; o >= 1; o /= 2) { acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFU, acc, o)); }
+        if (lane == 0) { a.e.ws.logits[row] = acc; }
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence();
+            release_add(counters + 0);
+        }
+    }
+    // The column's activation row (the gate/up's B operand) while the router finishes.
+    for (int i = tid; i < S::kXRowBytes / 8; i += kSingleThreads) {
+        reinterpret_cast<uint2*>(sm.x)[i] = reinterpret_cast<const uint2*>(a.e.x.rows)[i];
+    }
+    if (tid == 0) { sm.stalled = wait_count(counters + 0, kRouterCtas, a.e.ws.error) ? 0 : 1; }
+    __syncthreads();
+    if (sm.stalled != 0) { return; }
+    // The column's selection (select_column's rule, a thread an expert): keys sigmoid_c(l_e) + bias_e, the top 8 by
+    // key (ties to the lower index) in slots of descending key, gamma_j = (s_j / sum8(s)) * route_scale.
+    static_assert(kSingleExperts <= kSingleThreads, "a thread an expert");
+    float sig = 0.0F;
+    if (tid < kSingleExperts) {
+        sig          = canon::sigmoid_c(__ldcg(a.e.ws.logits + tid));
+        sm.keys[tid] = canon::add_rn(sig, a.bias[tid]);
+    }
+    __syncthreads();
+    if (tid < kSingleExperts) {
+        const float key = sm.keys[tid];
+        int rank        = 0;
+        for (int f = 0; f < kSingleExperts; ++f) {
+            const float other = sm.keys[f];
+            rank += (other > key || (other == key && f < tid)) ? 1 : 0;
+        }
+        if (rank < kTopK) {
+            sm.routed[rank] = tid;
+            sm.sel[rank]    = sig;
+        }
+    }
+    __syncthreads();
+    if (tid < kTopK) {
+        const float sum = canon::add_rn(canon::add_rn(canon::add_rn(sm.sel[0], sm.sel[2]), canon::add_rn(sm.sel[1], sm.sel[3])),
+                                        canon::add_rn(canon::add_rn(sm.sel[4], sm.sel[6]), canon::add_rn(sm.sel[5], sm.sel[7])));
+        sm.gamma[tid] = canon::mul_rn(canon::div_rn(sm.sel[tid], sum), a.route_scale);
+    }
+    __syncthreads();
+    // Jobs in ascending expert id: job k is the slot whose expert has k smaller ones among the eight.
+    if (tid < kTopK) {
+        int rank = 0;
+#pragma unroll
+        for (int j = 0; j < kTopK; ++j) { rank += sm.routed[j] < sm.routed[tid] ? 1 : 0; }
+        sm.job_slot[rank] = tid;
+        if (cta == 0) { // the call's routing, as moe_route leaves it
+            a.e.ws.routed[tid] = sm.routed[tid];
+            a.e.ws.gamma[tid]  = sm.gamma[tid];
+        }
+    }
+    __syncthreads();
+    const int job    = cta / kSingleCtasPerJob;
+    const int slot   = sm.job_slot[job]; // the entry: slot j of column 0
+    const int expert = sm.routed[slot];
+    const float gamma = sm.gamma[slot];
+    const int group  = (cta % kSingleCtasPerJob) * kSingleWarps + warp;
+    const std::uint8_t* record = a.e.bank.records + static_cast<std::size_t>(expert) * a.e.bank.record_stride;
+    const std::uint8_t* gu     = record + static_cast<std::size_t>(group) * S::kGateUpBlocks * S::kUnit;
+    const std::uint8_t* dn     = record + S::kGateUpBytes + static_cast<std::size_t>(group) * S::kDownBytes;
+    constexpr int kGu = S::kGateUpBlocks / S::kStageUnits, kDn = S::kDownBlocks / S::kStageUnits, kTotal = kGu + kDn;
+    static_assert(kGu % 2 == 0 && (kGu / 2) * S::kStageUnits == S::kHalfBlocks && kTotal >= kSingleDepth,
+                  "the K halves are whole stages; a full ring");
+    auto& ring       = sm.ring[warp];
+    const auto issue = [&](int stage) {
+        const std::uint8_t* src = stage < kGu ? gu + static_cast<std::size_t>(stage) * S::kStageBytes
+                                              : dn + static_cast<std::size_t>(stage - kGu) * S::kStageBytes;
+        for (int i = lane; i < S::kStageBytes / 16; i += 32) {
+            tile::cp_async16(ring[stage % kSingleDepth] + 16 * i, src + 16 * i, 16);
+        }
+    };
+#pragma unroll
+    for (int k = 0; k < kSingleDepth - 1; ++k) {
+        issue(k);
+        tile::cp_async_commit();
+    }
+    // Stage st's units (gate/up blocks st * units .., or down blocks (st - kGu) * units ..) into acc / s.
+    const auto step = [&](int st, float (&acc)[4], long long (&s)[4]) {
+        tile::cp_async_wait<kSingleDepth - 2>();
+        __syncwarp();
+        if (st + kSingleDepth - 1 < kTotal) { issue(st + kSingleDepth - 1); }
+        tile::cp_async_commit();
+        const std::uint8_t* stage = ring[st % kSingleDepth];
+        const bool down           = st >= kGu;
+        const std::uint8_t* b_row = down ? sm.h : sm.x;
+        const int scales          = down ? S::kHScales : S::kXScales;
+        const int first           = (down ? st - kGu : st) * S::kStageUnits;
+#pragma unroll
+        for (int u = 0; u < S::kStageUnits; ++u) {
+            const int b = first + u;
+            if constexpr (A8) {
+                a8_mma_unit(stage + u * S::kUnit, b_row + 32 * b, b_row[scales + b], lane, g, t, acc);
+            } else {
+                const int sa = sm.scaled[b_row[scales + b]];
+                a4_mma_unit(stage + u * S::kUnit, a4_x_quad(*reinterpret_cast<const unsigned short*>(b_row + 8 * b + 2 * t)),
+                            sm.scaled, sa, sa, g, t, s);
+            }
+        }
+        __syncwarp();
+    };
+    // Gate/up: NVFP4 one exact sum s over both halves; MXFP8 c0 over half 0's blocks, c1 over half 1's.
+    float c0[4] = {0.0F, 0.0F, 0.0F, 0.0F}, c1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    long long s[4] = {0, 0, 0, 0};
+    for (int st = 0; st < kGu / 2; ++st) { step(st, c0, s); }
+    for (int st = kGu / 2; st < kGu; ++st) { step(st, c1, s); }
+    std::uint16_t y[4], up[4];
+    if constexpr (A8) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { y[i] = canon::f32_to_bf16_rn(canon::add_rn(c0[i], c1[i])); }
+    } else {
+        const float rs = detail::nvfp4_row_scale(a.e.x.amax[0], a.e.bank.amax[2 * expert],
+                                                 detail::nvfp4_rcp(a.e.bank.denominators[0]));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            y[i] = canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(canon::i64_to_f32_rn(s[i]), 1.0F / 1048576.0F), rs));
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
+    // Column 0's intermediates (t = 0): gate rows g (even) and g + 8, their up rows from lane + 4.
+    std::uint16_t* h_row = a.e.ws.h + static_cast<std::size_t>(slot) * G::kInter;
+    if (t == 0 && (g & 1) == 0) {
+        h_row[group * 8 + g / 2]     = swiglu(y[0], up[0], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+        h_row[group * 8 + g / 2 + 4] = swiglu(y[2], up[2], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+        __threadfence();
+    }
+    __syncwarp();
+    if (lane == 0) { release_add(counters + 2 + job); }
+    // The job's h, once its 144 row groups are counted (the down weights keep streaming meanwhile).
+    __syncthreads();
+    if (tid == 0) { sm.stalled = wait_count(counters + 2 + job, kSingleRowGroups, a.e.ws.error) ? 0 : 1; }
+    __syncthreads();
+    if (sm.stalled != 0) {
+        tile::cp_async_wait<0>();
+        return;
+    }
+    if constexpr (A8) {
+        // MXFP8: each 32 intermediates one group (gate_up_a8_kernel's).
+        if (tid < G::kInter / 32) {
+            float values[32];
+#pragma unroll
+            for (int j = 0; j < 32; ++j) { values[j] = bf16f(__ldcg(h_row + 32 * tid + j)); }
+            const canon::Mxfp8Group q = canon::mxfp8_group(values);
+            auto* words               = reinterpret_cast<std::uint32_t*>(sm.h + 32 * tid);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                words[j] = q.code[4 * j] | (static_cast<std::uint32_t>(q.code[4 * j + 1]) << 8) |
+                           (static_cast<std::uint32_t>(q.code[4 * j + 2]) << 16) |
+                           (static_cast<std::uint32_t>(q.code[4 * j + 3]) << 24);
+            }
+            sm.h[S::kHScales + tid] = q.exponent;
+        }
+    } else {
+        // NVFP4: the row's amax (the largest magnitude's bits), then four-over-six by block halves on thread pairs
+        // (gate_up_a4_kernel's last-CTA quantization).
+        std::uint32_t m = 0;
+        for (int k = tid; k < G::kInter; k += kSingleThreads) {
+            m = max(m, canon::f32_bits(bf16f(__ldcg(h_row + k))) & 0x7FFFFFFFU);
+        }
+#pragma unroll
+        for (int o = 16; o >= 1; o /= 2) { m = max(m, __shfl_xor_sync(0xFFFFFFFFU, m, o)); }
+        if (lane == 0) { sm.red[warp] = m; }
+        __syncthreads();
+        if (tid == 0) {
+            std::uint32_t all = 0;
+#pragma unroll
+            for (int i = 0; i < kSingleWarps; ++i) { all = max(all, sm.red[i]); }
+            sm.h_amax = canon::f32_from_bits(all);
+        }
+        __syncthreads();
+        constexpr int kBlocks = G::kInter / 16;
+        static_assert(2 * kBlocks <= kSingleThreads, "one round of block halves");
+        const int i    = tid;
+        const bool on  = i < 2 * kBlocks;
+        const int half = i & 1, b = on ? i >> 1 : 0;
+        const canon::FourOverSixRow fos = canon::four_over_six_row(on ? sm.h_amax : 1.0F);
+        float xv[8] = {};
+        float mag   = 0.0F;
+        if (on) {
+            const uint4 q = __ldcg(reinterpret_cast<const uint4*>(h_row + 16 * b) + half);
+            const std::uint32_t hw[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                xv[2 * j]     = canon::f32_from_bits(hw[j] << 16);
+                xv[2 * j + 1] = canon::f32_from_bits(hw[j] & 0xFFFF0000U);
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float mj = canon::f32_from_bits(canon::f32_bits(xv[j]) & 0x7FFFFFFFU);
+                mag            = mj > mag ? mj : mag;
+            }
+        }
+        const float other = __shfl_xor_sync(0xFFFFFFFFU, mag, 1);
+        const canon::FourOverSixWords words = canon::four_over_six_words(other > mag ? other : mag, fos);
+        std::uint8_t c6[8], c4[8];
+        const float e6 = canon::four_over_six_half(xv, words.six, fos, c6);
+        const float e4 = canon::four_over_six_half(xv, words.four, fos, c4);
+        const float p6 = __shfl_xor_sync(0xFFFFFFFFU, e6, 1), p4 = __shfl_xor_sync(0xFFFFFFFFU, e4, 1);
+        const float err6 = half == 0 ? canon::add_rn(e6, p6) : canon::add_rn(p6, e6);
+        const float err4 = half == 0 ? canon::add_rn(e4, p4) : canon::add_rn(p4, e4);
+        const bool four  = err4 < err6;
+        if (on) {
+            std::uint32_t packed = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const std::uint32_t lo = four ? c4[2 * j] : c6[2 * j];
+                const std::uint32_t hi = four ? c4[2 * j + 1] : c6[2 * j + 1];
+                packed |= (lo | (hi << 4)) << (8 * j);
+            }
+            *reinterpret_cast<std::uint32_t*>(sm.h + 8 * b + 4 * half) = packed;
+            if (half == 0) { sm.h[S::kHScales + b] = four ? words.four : words.six; }
+        }
+    }
+    __syncthreads();
+    // Down: one chain over K = I (MXFP8 one FP32 chain in block order; NVFP4 the exact sum).
+    float cd[4]     = {0.0F, 0.0F, 0.0F, 0.0F};
+    long long sd[4] = {0, 0, 0, 0};
+    for (int st = kGu; st < kTotal; ++st) { step(st, cd, sd); }
+    tile::cp_async_wait<0>();
+    if (t == 0) {
+        std::uint16_t lo, hi;
+        if constexpr (A8) {
+            lo = canon::f32_to_bf16_rn(cd[0]);
+            hi = canon::f32_to_bf16_rn(cd[2]);
+        } else {
+            const float rs = detail::nvfp4_row_scale(sm.h_amax, a.e.bank.amax[2 * expert + 1],
+                                                     detail::nvfp4_rcp(a.e.bank.denominators[1]));
+            lo = canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(canon::i64_to_f32_rn(sd[0]), 1.0F / 1048576.0F), rs));
+            hi = canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(canon::i64_to_f32_rn(sd[2]), 1.0F / 1048576.0F), rs));
+        }
+        std::uint16_t* out = a.e.outputs + static_cast<std::size_t>(slot) * G::kHidden + group * 16 + g;
+        out[0] = lo;
+        out[8] = hi;
+    }
+    // The last CTA resets the counters for the next call (every CTA has passed every wait).
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        if (acq_rel_add(counters + 1) == gridDim.x - 1U) {
+#pragma unroll
+            for (int i = 0; i < kSingleCounters; ++i) { counters[i] = 0U; }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------- launches
 
 std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
@@ -779,6 +1113,7 @@ Workspace layout(std::int32_t experts, std::int32_t intermediate, std::int32_t c
     w.h_amax     = reinterpret_cast<std::uint32_t*>(take(m * 4));
     w.h_rows     = reinterpret_cast<std::uint8_t*>(take(m * h_row));
     w.error      = reinterpret_cast<std::uint32_t*>(take(4));
+    w.single     = reinterpret_cast<std::uint32_t*>(take(kSingleCounters * 4));
     w.x_plane    = reinterpret_cast<std::uint8_t*>(take(m * kPromptXRowBytes));
     w.h_plane    = reinterpret_cast<std::uint8_t*>(take(m * kPromptHRowBytes));
     w.tiles      = reinterpret_cast<std::int32_t*>(take(2 * (e + m / 64 + 1) * 4));
@@ -855,6 +1190,55 @@ void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t exp
     CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized, {dim3(1), dim3(kDispatchThreads), 0, stream},
                                 dispatch_kernel, routing, columns, experts, workspace));
     check_launch("dispatch");
+}
+
+namespace {
+template <bool A8>
+bool single_fits() {
+    using G = Inkling;
+    allow_shared(single_kernel<G, A8>, sizeof(SingleSmem<G, A8>));
+    int device = 0, sms = 0, blocks = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, single_kernel<G, A8>, kSingleThreads,
+                                                             sizeof(SingleSmem<G, A8>)));
+    return blocks >= 1 && static_cast<long long>(blocks) * sms >= kSingleCtas;
+}
+} // namespace
+
+bool moe_single_supported(ExpertFormat format) {
+    static const bool a4 = single_fits<false>();
+    static const bool a8 = single_fits<true>();
+    return format == ExpertFormat::Mxfp8 ? a8 : a4;
+}
+
+void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint16_t* router, const float* bias,
+                float route_scale, const Bank& bank, const Workspace& workspace, std::uint16_t* outputs,
+                cudaStream_t stream) {
+    using G = Inkling;
+    if (bank.hidden != G::kHidden || bank.intermediate != G::kInter || bank.experts != kSingleExperts ||
+        rows.columns != 1 || workspace.capacity < 1) {
+        throw std::invalid_argument("w4a4_sparse_moe single: one column of Inkling 2's [128, 2304, 1152] banks");
+    }
+    if (!moe_single_supported(bank.format)) {
+        throw std::invalid_argument("w4a4_sparse_moe single: the device cannot hold its grid resident");
+    }
+    SingleArgs args;
+    args.e           = Args{rows, Routing{workspace.routed, workspace.gamma}, bank, workspace, outputs};
+    args.x           = x;
+    args.router      = router;
+    args.bias        = bias;
+    args.route_scale = route_scale;
+    if (bank.format == ExpertFormat::Nvfp4FourOverSix) {
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
+                                    {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, false>), stream},
+                                    single_kernel<G, false>, args));
+    } else {
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
+                                    {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, true>), stream},
+                                    single_kernel<G, true>, args));
+    }
+    check_launch("single");
 }
 
 void moe_experts(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,

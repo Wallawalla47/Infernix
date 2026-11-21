@@ -89,6 +89,8 @@ struct Workspace {
     std::uint8_t* h_rows      = nullptr; // [capacity * kTopK][row_bytes(I)]
     // [1]: kErrorDownStalled once a down CTA's wait for its job made no progress for 2 s (zero: no error).
     std::uint32_t* error      = nullptr;
+    // [10]: moe_single's counters (router CTAs, finished CTAs, each job's gate/up row groups), reset by its last CTA.
+    std::uint32_t* single     = nullptr;
     // The prompt route's planes (moe_experts_prompt): every dispatched entry's A4(x) and A4(h) rows in dispatch order
     // (the grouped GEMM's tensor-map layout: kPromptXRowBytes and kPromptHRowBytes a row), its work tiles and each
     // job's record.
@@ -132,6 +134,17 @@ void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t exp
 // The routed experts of the dispatched entries: outputs BF16 [columns * kTopK][H].
 void moe_experts(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,
                  std::uint16_t* outputs, cudaStream_t stream);
+
+// A decode call of one column (128 experts) in one launch: moe_route's routing (workspace.routed and gamma for the
+// column; not its dispatch) and moe_experts' outputs, bit for bit, as one persistent grid of 144 CTAs (one an SM; the
+// router's rows on the first 16, every CTA then selecting the column itself, a job's 144 gate/up and down row groups on
+// 18 CTAs of 8 warps, each warp streaming both through one ring). x: the router's BF16 row; rows: the column's
+// quantized row. Needs moe_single_supported(bank.format): the device holds the grid resident (otherwise moe_route and
+// moe_experts).
+[[nodiscard]] bool moe_single_supported(ExpertFormat format);
+void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint16_t* router, const float* bias,
+                float route_scale, const Bank& bank, const Workspace& workspace, std::uint16_t* outputs,
+                cudaStream_t stream);
 
 // The prompt route (a prefill call's columns, any width). Its arithmetic differs from the narrow route's in the
 // router's logits and the experts' sums, and each column is still computed from its own inputs alone, so a prompt

@@ -603,6 +603,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         moe::moe_select(b_.moe.logits, T, op.router_bias, op.bank.experts, c_.route_scale, b_.moe, stream);
         mark("router");
         moe::moe_experts_prompt({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
+    } else if (T == 1 && moe::moe_single_supported(op.bank.format)) {
+        // One column: the router and the experts in one launch (the same bits).
+        moe::moe_single(b_.xm, {b_.rows, b_.amax, T}, op.router, op.router_bias, c_.route_scale, op.bank, b_.moe,
+                        b_.experts, stream);
     } else {
         moe::moe_route(b_.xm, T, op.router, op.router_bias, op.bank.experts, kH, c_.route_scale, b_.moe, stream);
         mark("router");

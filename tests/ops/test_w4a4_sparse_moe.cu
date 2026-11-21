@@ -18,7 +18,9 @@
 //     within half a BF16 ulp of the FP64 value plus 2^-16 max|y|;
 //   - column invariance: each column run alone (T = 1) gives the bits it gets among the call's 32 columns, and 8
 //     sampled columns of a 300-column call (a workspace of that capacity: prefill's width) the bits they get in it;
-//   - call state: a call over the same workspace after one whose h amax are 64 times larger gives the same bits.
+//   - call state: a call over the same workspace after one whose h amax are 64 times larger gives the same bits;
+//   - the single-column launch (moe_single): its routing and outputs equal moe_route + moe_experts byte for byte, for 4
+//     columns, eagerly and in graphs interleaving the two paths.
 
 #include "infernix/ops/w4a4_sparse_moe.h"
 #include "ops/common/canonical_math.h"
@@ -824,10 +826,118 @@ void router_case() {
     }
 }
 
+// ---------------------------------------------------------------------------- one column in one launch
+
+// moe_single against moe_route + moe_experts over the same workspace: routing and outputs byte for byte, for several
+// columns; eagerly and in a CUDA graph that interleaves the two paths (single, separate, single: each leaves the
+// workspace's state as the other needs it), replayed three times.
+void single_case(bool a8) {
+    const char* name   = a8 ? "MXFP8" : "NVFP4";
+    const auto format  = a8 ? moe::ExpertFormat::Mxfp8 : moe::ExpertFormat::Nvfp4FourOverSix;
+    if (!moe::moe_single_supported(format)) {
+        std::printf("%s single-column launch: not supported on this device (the separate kernels run instead)\n", name);
+        return;
+    }
+    const HostBank b = make_bank(a8, a8 ? 83U : 43U);
+    DeviceBank db{upload(b.records), upload(b.amax), upload(std::vector<float>{b.den[0], b.den[1]})};
+    moe::Bank bank;
+    bank.records       = db.records;
+    bank.record_stride = b.stride;
+    bank.format        = format;
+    bank.amax          = db.amax;
+    bank.denominators  = db.den;
+    bank.experts       = E;
+    bank.hidden        = H;
+    bank.intermediate  = I;
+    std::mt19937 rng(a8 ? 97 : 47);
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    std::vector<std::uint16_t> w(std::size_t(E) * H);
+    for (auto& v : w) { v = canon::f32_to_bf16_rn(normal(rng) * 0.02F); }
+    std::vector<float> bias(E);
+    for (float& v : bias) { v = normal(rng) * 0.01F; }
+    std::uint16_t* d_w = upload(w);
+    float* d_bias      = upload(bias);
+    void* workspace    = nullptr;
+    cuda_check(cudaMalloc(&workspace, moe::workspace_bytes(E, I)), "cudaMalloc");
+    cuda_check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I)), "cudaMemset");
+    const moe::Workspace ws = moe::carve_workspace(workspace, E, I);
+    std::uint16_t *d_ref = nullptr, *d_one = nullptr;
+    cuda_check(cudaMalloc(&d_ref, std::size_t(K) * H * 2), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_one, std::size_t(K) * H * 2), "cudaMalloc");
+    int differ = 0, routing_differ = 0, graph_differ = 0;
+    for (int column = 0; column < 4; ++column) {
+        std::vector<float> xf(H);
+        std::vector<std::uint16_t> x(H);
+        for (int k = 0; k < H; ++k) {
+            x[k]  = canon::f32_to_bf16_rn(normal(rng) * (column == 3 ? 8.0F : 1.0F));
+            xf[k] = canon::bf16_to_f32(x[k]);
+        }
+        const QuantRow q     = a8 ? quantize_a8(xf) : quantize_a4(xf);
+        std::uint16_t* d_x   = upload(x);
+        std::uint8_t* d_rows = upload(q.bytes);
+        float* d_amax        = upload(std::vector<float>{q.amax});
+        const moe::Activations rows{d_rows, d_amax, 1};
+        const auto separate = [&](cudaStream_t s) {
+            moe::moe_route(d_x, 1, d_w, d_bias, E, H, 8.0F, ws, s);
+            moe::moe_experts(rows, moe::routed_routing(ws), bank, ws, d_ref, s);
+        };
+        const auto single = [&](cudaStream_t s) { moe::moe_single(d_x, rows, d_w, d_bias, 8.0F, bank, ws, d_one, s); };
+        separate(nullptr);
+        cuda_check(cudaDeviceSynchronize(), "separate");
+        const auto ref        = download(d_ref, std::size_t(K) * H);
+        const auto ref_routed = download(ws.routed, K);
+        const auto ref_gamma  = download(ws.gamma, K);
+        cuda_check(cudaMemset(ws.routed, 0xFF, K * 4), "clear");
+        single(nullptr);
+        cuda_check(cudaDeviceSynchronize(), "single");
+        const auto one = download(d_one, std::size_t(K) * H);
+        for (std::size_t i = 0; i < one.size(); ++i) { differ += one[i] != ref[i] ? 1 : 0; }
+        routing_differ += download(ws.routed, K) != ref_routed || download(ws.gamma, K) != ref_gamma ? 1 : 0;
+        // A graph: single, separate, single (each path after the other), replayed three times.
+        cudaStream_t stream;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+        single(stream);
+        separate(stream);
+        single(stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (int replay = 0; replay < 3; ++replay) {
+            cuda_check(cudaMemsetAsync(d_one, 0xFF, std::size_t(K) * H * 2, stream), "clear");
+            cuda_check(cudaMemsetAsync(d_ref, 0xFF, std::size_t(K) * H * 2, stream), "clear");
+            cuda_check(cudaGraphLaunch(exec, stream), "replay");
+            cuda_check(cudaStreamSynchronize(stream), "replay");
+            graph_differ += download(d_one, std::size_t(K) * H) != ref || download(d_ref, std::size_t(K) * H) != ref ? 1 : 0;
+        }
+        cuda_check(cudaGraphExecDestroy(exec), "destroy");
+        cuda_check(cudaGraphDestroy(graph), "destroy");
+        cuda_check(cudaStreamDestroy(stream), "stream");
+        for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rows), static_cast<void*>(d_amax)}) {
+            cuda_check(cudaFree(p), "cudaFree");
+        }
+    }
+    const bool error_clear = download(ws.error, 1)[0] == 0U;
+    std::printf("%s single-column launch (4 columns): %d of %d outputs differ from moe_route + moe_experts, routing "
+                "differs in %d columns, %d graph replays (single, separate, single) differ, error word %s\n",
+                name, differ, 4 * K * H, routing_differ, graph_differ, error_clear ? "clear" : "SET");
+    check(differ == 0 && routing_differ == 0, "the single-column launch differs from moe_route + moe_experts");
+    check(graph_differ == 0, "a graph interleaving the single-column launch and the separate kernels differs");
+    check(error_clear, "the single-column launch set the error word");
+    for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den),
+                    static_cast<void*>(d_w), static_cast<void*>(d_bias), static_cast<void*>(d_ref),
+                    static_cast<void*>(d_one), workspace}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(w4a4_sparse_moe) {
     router_case();
+    single_case(false);
+    single_case(true);
     bank_case(false);
     bank_case(true);
     prompt_case(false);
