@@ -94,9 +94,12 @@ __device__ __forceinline__ float head_sum(const float (&a)[4], const float (&b)[
 // The element offset of a position's row of 128 in a visit's K or V.
 __device__ __forceinline__ std::size_t kv_row(const KvView& kv, int lane, int head, int pos) {
     if (kv.table == nullptr) {
-        const int page = (pos / kKeyUnit) % kv.ring_pages;
+        // The state's ring at its constant page count (decode), a staging ring at its own.
+        const int pages = kv.ring_pages == kWindowRingPages ? kWindowRingPages : kv.ring_pages;
+        const int page  = kv.ring_pages == kWindowRingPages ? (pos / kKeyUnit) % kWindowRingPages
+                                                            : (pos / kKeyUnit) % kv.ring_pages;
         return lane * kv.lane_stride +
-               ((static_cast<std::size_t>(head) * kv.ring_pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
+               ((static_cast<std::size_t>(head) * pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
     }
     const std::int64_t page = kv.table[static_cast<std::int64_t>(lane) * kv.table_stride + pos / kKeyUnit];
     return ((static_cast<std::size_t>(head) * kv.pool_pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
@@ -281,16 +284,19 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     const int split = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y), group = static_cast<int>(blockIdx.z);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, wl = tid & 31;
     const bool full = a.layer.full;
-    pdl::enter();
+    // The call plan (groups, column map) is uploaded before the forward's first kernel, so it is read before the wait,
+    // off the dependent chain to the keys.
     const int c0    = a.groups_columns[3 * group], count = a.groups_columns[3 * group + 1];
     const int lane  = a.groups_columns[3 * group + 2];
     if (count == 0) { return; }
     const int rows  = kGroupHeads * count;
     const int first = a.map.first[lane];
+    const int pos0  = a.map.position[c0];
+    pdl::enter();
     const Smem s    = carve(smem_raw, kGroupHeads * a.max_group_columns);
 
     // Rows: their units of this split.
-    const int lane_lo = row_units(full, a.map.position[c0], first).lo;
+    const int lane_lo = row_units(full, pos0, first).lo;
     if (tid < rows) {
         RowState& r = s.rows[tid];
         r.t         = c0 + tid / kGroupHeads;
