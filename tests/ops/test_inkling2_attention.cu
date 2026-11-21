@@ -215,7 +215,7 @@ struct Outputs {
     std::vector<std::uint16_t> out, q, r, kv_k, kv_v, kring, vring;
 };
 
-Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, Device& d) {
+Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, Device& d, bool fused = false) {
     const int T = static_cast<int>(subset.size());
     std::vector<int> lane, pos, groups;
     int widest = 1;
@@ -269,6 +269,7 @@ Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, 
     a.kv.pool_pages   = p.full ? kPoolPages : 0;
     a.ws               = ik::carve_attention_workspace(d.ws);
     a.out              = d.out;
+    a.fused            = fused;
     ik::attention(a, nullptr);
     cuda_check(cudaDeviceSynchronize(), "attention");
     Outputs o;
@@ -513,6 +514,37 @@ void run_case(bool full, std::uint32_t seed) {
     inv.exact(one.kring.data(), got.kring.data(), got.kring.size());
     inv.exact(one.vring.data(), got.vring.data(), got.vring.size());
     inv.report();
+
+    // The prologue inside the attention launch (fused): the same bits. Over a call without padding whose lanes are one
+    // group each (lanes 0, 2 and 3: the forward fuses exactly such calls), and one column at a time.
+    std::vector<int> grouped;
+    for (int t = 0; t < T; ++t) {
+        if (call.lane[t] == 0 || call.lane[t] == 2 || call.lane[t] == 3) { grouped.push_back(t); }
+    }
+    reset_state(p, d);
+    const Outputs plain = run(p, call, grouped, d);
+    reset_state(p, d);
+    const Outputs fused = run(p, call, grouped, d, true);
+    Tally fu{full ? "  full: the fused prologue = the prologue kernel" : "  sliding: the fused prologue = the prologue kernel"};
+    fu.exact(fused.out.data(), plain.out.data(), plain.out.size());
+    fu.exact(fused.q.data(), plain.q.data(), plain.q.size());
+    fu.exact(fused.r.data(), plain.r.data(), plain.r.size());
+    fu.exact(fused.kv_k.data(), plain.kv_k.data(), plain.kv_k.size());
+    fu.exact(fused.kv_v.data(), plain.kv_v.data(), plain.kv_v.size());
+    fu.exact(fused.kring.data(), plain.kring.data(), plain.kring.size());
+    fu.exact(fused.vring.data(), plain.vring.data(), plain.vring.size());
+    reset_state(p, d);
+    Outputs one_fused;
+    for (int t = 0; t < T; ++t) {
+        if (call.lane[t] < 0) { continue; }
+        one_fused = run(p, call, {t}, d, true);
+        fu.exact(one_fused.out.data(), got.out.data() + std::size_t(t) * QW, QW);
+    }
+    fu.exact(one_fused.kv_k.data(), got.kv_k.data(), got.kv_k.size());
+    fu.exact(one_fused.kv_v.data(), got.kv_v.data(), got.kv_v.size());
+    fu.exact(one_fused.kring.data(), got.kring.data(), got.kring.size());
+    fu.exact(one_fused.vring.data(), got.vring.data(), got.vring.size());
+    fu.report();
 
     for (void* x : {static_cast<void*>(d.q), static_cast<void*>(d.r), static_cast<void*>(d.k), static_cast<void*>(d.v),
                     static_cast<void*>(d.sink), static_cast<void*>(d.gate), static_cast<void*>(d.ktaps),

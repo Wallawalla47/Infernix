@@ -199,6 +199,8 @@ private:
     bool wide_conv_   = false; // a lane has more columns than its conv rings can take without a history
     bool wide_window_ = false; // a lane appends more positions than its window ring can take: staging rings
     bool prompt_      = false; // the call's route (CallPlan::prompt)
+    bool padding_     = false; // the call has padding columns (lane -1)
+    bool one_group_lanes_ = true; // every lane's columns are one attention group (at most 16)
     DeviceBuffer memory_;
     ForwardBuffers b_;
 };

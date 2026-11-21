@@ -93,35 +93,23 @@ __device__ __forceinline__ float head_sum(const float (&a)[4], const float (&b)[
 
 constexpr int kPrologueThreads = 5 * 32;
 
-__global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const AttentionArgs a) {
-    const int t = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y);
-    const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31U);
-    const int ch   = kv * kD + 4 * lane; // the lane's K / V channels
-    const int head = kv * kGroupHeads + (warp - 2);
-    float w[4][4];
-    float scale[4] = {};
-    float rscale   = 0.0F;
-    if (warp < 2) {
-        const std::uint16_t* conv = warp == 0 ? a.layer.key_conv : a.layer.value_conv;
+// The conv taps of a KV head's lane channels 4 lane .. + 3 (which: 0 K, 1 V), [lag][channel].
+__device__ __forceinline__ void kv_conv_weights(const AttentionArgs& a, int kv, int which, int lane, float (&w)[4][4]) {
+    const std::uint16_t* conv = which == 0 ? a.layer.key_conv : a.layer.value_conv;
 #pragma unroll
-        for (int lag = 0; lag < 4; ++lag) { weight4(conv + lag * kKvWidth + ch, w[lag]); }
-    } else {
-        weight4(a.layer.query_scale + head * kD + 4 * lane, scale);
-        if (lane < kRelDim) { rscale = bf16f(__ldg(a.layer.relative_scale + head * kRelDim + lane)); }
-    }
-    pdl::enter();
+    for (int lag = 0; lag < 4; ++lag) { weight4(conv + lag * kKvWidth + kv * kD + 4 * lane, w[lag]); }
+}
 
-    const Column col = column_of(a.map, t);
-    if (col.lane < 0) {
-        for (int i = static_cast<int>(threadIdx.x); i < kGroupHeads * kD; i += kPrologueThreads) {
-            a.out[static_cast<std::size_t>(t) * kQWidth + kv * kGroupHeads * kD + i] = 0;
-        }
-        return;
-    }
-    const float tau_p = a.layer.full ? tau(col.pos) : 1.0F;
-    if (warp < 2) {
-        const std::uint16_t* raw = warp == 0 ? a.in.k : a.in.v;
-        const Ring& ring         = warp == 0 ? a.key_ring : a.value_ring;
+// Column col's new key (which 0) or value (which 1) row of KV head kv, lane channels 4 lane .. + 3: the short conv of
+// its raw input and history, rounded; a key clipped by its head norm, a value RMS-normed to FP16. Stores the cache row
+// and (writes_ring) the raw input's ring row; returns the stored words (BF16 K or FP16 V bits).
+__device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& col, int kv, int which, int lane,
+                                        const float (&w)[4][4]) {
+    const int ch = kv * kD + 4 * lane;
+    const int t  = col.t;
+    {
+        const std::uint16_t* raw = which == 0 ? a.in.k : a.in.v;
+        const Ring& ring         = which == 0 ? a.key_ring : a.value_ring;
         float x[4][4];
         load4(raw + static_cast<std::size_t>(t) * kKvWidth + ch, x[0]);
 #pragma unroll
@@ -137,7 +125,7 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
         }
         float c[4];
         if (a.layer.full) {
-            const std::uint16_t* taps = (warp == 0 ? a.in.key_taps : a.in.value_taps) +
+            const std::uint16_t* taps = (which == 0 ? a.in.key_taps : a.in.value_taps) +
                                         static_cast<std::size_t>(t) * (kKvHeads * 4) + kv * 4;
             const float tap[4] = {bf16f(taps[0]), bf16f(taps[1]), bf16f(taps[2]), bf16f(taps[3])};
 #pragma unroll
@@ -157,23 +145,32 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
         round4(c);
         const float sum = head_sum(c, c);
         const std::size_t at = kv_row(a.kv, col.lane, kv, col.pos) + 4 * lane;
-        if (warp == 0) {
+        uint2 stored;
+        if (which == 0) {
             const float f = clip_factor(sum, kClipQK);
 #pragma unroll
             for (int j = 0; j < 4; ++j) { c[j] = canon::mul_rn(c[j], f); }
-            *reinterpret_cast<uint2*>(a.kv.k + at) = pack4(c);
+            stored = pack4(c);
+            *reinterpret_cast<uint2*>(a.kv.k + at) = stored;
         } else {
             const float r = rms_factor(sum, static_cast<float>(kD));
             std::uint16_t h[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) { h[j] = f16_bits(bf16f(canon::f32_to_bf16_rn(canon::mul_rn(c[j], r)))); }
-            *reinterpret_cast<uint2*>(a.kv.v + at) =
-                make_uint2(std::uint32_t{h[0]} | (std::uint32_t{h[1]} << 16), std::uint32_t{h[2]} | (std::uint32_t{h[3]} << 16));
+            stored = make_uint2(std::uint32_t{h[0]} | (std::uint32_t{h[1]} << 16), std::uint32_t{h[2]} | (std::uint32_t{h[3]} << 16));
+            *reinterpret_cast<uint2*>(a.kv.v + at) = stored;
         }
         if (writes_ring(a.map, col)) { *reinterpret_cast<uint2*>(ring_row(ring, col.lane, col.pos) + ch) = pack4(x[0]); }
-        return;
+        return stored;
     }
-    // q: scaled, clipped, rounded; full visits times tau, rounded again.
+}
+
+// Column col's query (lane dims 4 lane .. + 3, BF16 words) and relative row (lane < 16) of query head `head`: scaled,
+// clipped, rounded; full visits times tau, rounded again.
+__device__ __forceinline__ void new_qr(const AttentionArgs& a, const Column& col, int head, int lane,
+                                       const float (&scale)[4], float rscale, uint2& q_out, std::uint16_t& r_out) {
+    const int t       = col.t;
+    const float tau_p = a.layer.full ? tau(col.pos) : 1.0F;
     float q[4];
     load4(a.in.q + static_cast<std::size_t>(t) * kQWidth + head * kD + 4 * lane, q);
 #pragma unroll
@@ -187,7 +184,7 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
         for (int j = 0; j < 4; ++j) { q[j] = canon::mul_rn(q[j], tau_p); }
         round4(q);
     }
-    *reinterpret_cast<uint2*>(a.ws.q + (static_cast<std::size_t>(t) * kHeads + head) * kD + 4 * lane) = pack4(q);
+    q_out = pack4(q);
     // r: the fold of its 16 squares in order.
     float rv = lane < kRelDim ? canon::mul_rn(bf16f(a.in.r[static_cast<std::size_t>(t) * kRWidth + head * kRelDim + lane]),
                                               rscale)
@@ -200,9 +197,45 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
     }
     rv = bf16f(canon::f32_to_bf16_rn(canon::mul_rn(rv, clip_factor(sum, kClipR))));
     if (a.layer.full) { rv = bf16f(canon::f32_to_bf16_rn(canon::mul_rn(rv, tau_p))); }
-    if (lane < kRelDim) {
-        a.ws.r[(static_cast<std::size_t>(t) * kHeads + head) * kRelDim + lane] = canon::f32_to_bf16_rn(rv);
+    r_out = canon::f32_to_bf16_rn(rv);
+}
+
+__device__ __forceinline__ void qr_scales(const AttentionArgs& a, int head, int lane, float (&scale)[4], float& rscale) {
+    weight4(a.layer.query_scale + head * kD + 4 * lane, scale);
+    rscale = lane < kRelDim ? bf16f(__ldg(a.layer.relative_scale + head * kRelDim + lane)) : 0.0F;
+}
+
+// A CTA per (column, KV head): warps 0 and 1 its new K and V rows, warps 2-4 its 3 query heads' q and r into the
+// workspace. Padding columns write zero outputs and nothing else.
+__global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const AttentionArgs a) {
+    const int t = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y);
+    const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31U);
+    const int head = kv * kGroupHeads + (warp - 2);
+    float w[4][4]  = {};
+    float scale[4] = {};
+    float rscale   = 0.0F;
+    if (warp < 2) {
+        kv_conv_weights(a, kv, warp, lane, w);
+    } else {
+        qr_scales(a, head, lane, scale, rscale);
     }
+    pdl::enter();
+    const Column col = column_of(a.map, t);
+    if (col.lane < 0) {
+        for (int i = static_cast<int>(threadIdx.x); i < kGroupHeads * kD; i += kPrologueThreads) {
+            a.out[static_cast<std::size_t>(t) * kQWidth + kv * kGroupHeads * kD + i] = 0;
+        }
+        return;
+    }
+    if (warp < 2) {
+        (void)new_kv(a, col, kv, warp, lane, w);
+        return;
+    }
+    uint2 q;
+    std::uint16_t r;
+    new_qr(a, col, head, lane, scale, rscale, q, r);
+    *reinterpret_cast<uint2*>(a.ws.q + (static_cast<std::size_t>(t) * kHeads + head) * kD + 4 * lane) = q;
+    if (lane < kRelDim) { a.ws.r[(static_cast<std::size_t>(t) * kHeads + head) * kRelDim + lane] = r; }
 }
 
 // ---------------------------------------------------------------------------- attention
@@ -311,17 +344,34 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         }
         range[0] = lo, range[1] = hi;
     }
-    // The rows' q and r.
-    for (int i = tid; i < rows * (kD / 8); i += kThreads) {
-        const int row = i / (kD / 8), chunk = i % (kD / 8);
-        const int t = c0 + row / kGroupHeads, head = kv * kGroupHeads + row % kGroupHeads;
-        *reinterpret_cast<uint4*>(s.q + row * kRowStride + 8 * chunk) =
-            *reinterpret_cast<const uint4*>(a.ws.q + (static_cast<std::size_t>(t) * kHeads + head) * kD + 8 * chunk);
-    }
-    for (int i = tid; i < rows * kRelDim; i += kThreads) {
-        const int row = i / kRelDim, e = i % kRelDim;
-        const int t = c0 + row / kGroupHeads, head = kv * kGroupHeads + row % kGroupHeads;
-        s.r[i] = bf16f(a.ws.r[(static_cast<std::size_t>(t) * kHeads + head) * kRelDim + e]);
+    // The rows' q and r: from the prologue's workspace, or (fused) computed here in its arithmetic, a warp a row.
+    if (a.fused) {
+        for (int row = warp; row < rows; row += kWarps) {
+            const int t = c0 + row / kGroupHeads, head = kv * kGroupHeads + row % kGroupHeads;
+            float scale[4], rscale;
+            qr_scales(a, head, wl, scale, rscale);
+            uint2 q;
+            std::uint16_t r;
+            new_qr(a, column_of(a.map, t), head, wl, scale, rscale, q, r);
+            *reinterpret_cast<uint2*>(s.q + row * kRowStride + 4 * wl) = q;
+            if (wl < kRelDim) { s.r[row * kRelDim + wl] = bf16f(r); }
+            if (split == 0) { // the workspace's q and r too, as the prologue kernel leaves them
+                *reinterpret_cast<uint2*>(a.ws.q + (static_cast<std::size_t>(t) * kHeads + head) * kD + 4 * wl) = q;
+                if (wl < kRelDim) { a.ws.r[(static_cast<std::size_t>(t) * kHeads + head) * kRelDim + wl] = r; }
+            }
+        }
+    } else {
+        for (int i = tid; i < rows * (kD / 8); i += kThreads) {
+            const int row = i / (kD / 8), chunk = i % (kD / 8);
+            const int t = c0 + row / kGroupHeads, head = kv * kGroupHeads + row % kGroupHeads;
+            *reinterpret_cast<uint4*>(s.q + row * kRowStride + 8 * chunk) =
+                *reinterpret_cast<const uint4*>(a.ws.q + (static_cast<std::size_t>(t) * kHeads + head) * kD + 8 * chunk);
+        }
+        for (int i = tid; i < rows * kRelDim; i += kThreads) {
+            const int row = i / kRelDim, e = i % kRelDim;
+            const int t = c0 + row / kGroupHeads, head = kv * kGroupHeads + row % kGroupHeads;
+            s.r[i] = bf16f(a.ws.r[(static_cast<std::size_t>(t) * kHeads + head) * kRelDim + e]);
+        }
     }
     __syncthreads();
 
@@ -341,6 +391,21 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         }
         cp_async_wait_all();
         __syncthreads();
+        if (a.fused) {
+            // The group's new keys and values whose positions lie in this unit: computed here (the prologue's
+            // arithmetic: each stores its cache and ring rows; a full visit's unit read by two CTAs stores them twice,
+            // the same words) and patched into the tile, which the copy may have read before or after the store.
+            for (int i = warp; i < 2 * count; i += kWarps) {
+                const int t = c0 + (i >> 1), which = i & 1;
+                const int pos = a.map.position[t];
+                if (pos < b * kKeyUnit || pos >= (b + 1) * kKeyUnit) { continue; }
+                float w[4][4];
+                kv_conv_weights(a, kv, which, wl, w);
+                const uint2 v = new_kv(a, column_of(a.map, t), kv, which, wl, w);
+                *reinterpret_cast<uint2*>((which == 0 ? s.k : s.v) + (pos - b * kKeyUnit) * kRowStride + 4 * wl) = v;
+            }
+            __syncthreads();
+        }
 
         // Scores: thread (sc_rg, key) for rows sc_rg + 8 m.
         {
@@ -624,7 +689,8 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     }
     detail::check_attention_args(a);
     const AttentionLayer& l = a.layer;
-    detail::launch_attention_prologue(a, stream);
+    if (a.fused && a.groups == 0) { throw std::invalid_argument("inkling2 attention: a fused call has no padding column"); }
+    if (!a.fused) { detail::launch_attention_prologue(a, stream); }
     if (a.groups == 0) { return; } // every column is padding: the prologue wrote their zero outputs
     const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns);
     static const bool attribute = [] {

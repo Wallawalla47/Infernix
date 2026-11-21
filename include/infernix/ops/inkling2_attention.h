@@ -136,6 +136,11 @@ struct AttentionArgs {
     KvView kv;
     AttentionWorkspace ws;
     std::uint16_t* out = nullptr;           // a [T][24 * 128] (padding columns: zero)
+    // attention(): the prologue inside the attention launch (a call without padding columns whose every lane is one
+    // group: a lane's second group would read keys its first group's CTAs store): each CTA computes its
+    // rows' q and r, and the CTA(s) reading a unit the call's new keys and values in it (stored as the prologue
+    // stores them), the same bits (the first split's CTAs also write ws.q and ws.r). attention_prompt ignores it.
+    bool fused = false;
 };
 void attention(const AttentionArgs& args, cudaStream_t stream);
 

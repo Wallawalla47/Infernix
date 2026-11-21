@@ -249,6 +249,13 @@ std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
     wide_conv_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kMaxLaneColumns; });
     wide_window_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kKeyUnit; });
     prompt_      = call.prompt;
+    std::int32_t live = 0;
+    one_group_lanes_  = true;
+    for (const CallLane& l : lanes) {
+        live += l.count;
+        one_group_lanes_ = one_group_lanes_ && l.count <= ik::kMaxAttentionLaneColumns;
+    }
+    padding_ = live < T;
     call_lanes_  = std::move(lanes);
     host_groups_ = groups;
     return groups;
@@ -533,6 +540,9 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     at.ws  = b_.attention_ws;
     at.out = b_.attention;
+    // The decode route's prologue inside attention's launch: padding columns need its zeros, and a lane in two groups
+    // its keys before the second group reads them.
+    at.fused = !padding_ && one_group_lanes_;
     prompt_ ? ik::attention_prompt(at, stream) : ik::attention(at, stream);
     mark("attention");
     if (staged) {
