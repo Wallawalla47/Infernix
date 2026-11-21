@@ -352,7 +352,7 @@ from the first implementation.
 | L6 | Projection epilogues writing q/k/v/z in their consumers' layouts +1.8 %; fusions that kept overlap won (FN §19.3.20a) | K2 writes q, k, v, r, gate and sink straight into the attention's layouts |
 | L7 | PDL pair boundaries cost ~0 µs at ≤ 2 CTAs/SM; a cooperative barrier 1.4-2.0 µs; streaming kernels trigger after their main loop (entry trigger ~10 % slower), short kernels at entry only when their grid covers ≤ half the SMs (FN §4.1, §19.3.33; [op development §4.3](op-development.md#43-kernel-and-common-facilities)) | every chain link follows these trigger rules; weights are fetched before `griddepcontrol.wait` |
 | L8 | ptxas hoists `LDG.E.CONSTANT` loads above `griddepcontrol.wait` | data from the previous kernel is read with coherent loads; the PDL SASS audit covers every new kernel |
-| L9 | Narrow W4A4: register-resident row pairs for 1-3 columns (35.4 → 30.8 µs at T = 1), s8 `mma.m16n8k16` on doubled codes for 4-8 (ties the floor); E2M1 decode by `cvt.rn.f16x2.e2m1x2` (a `constexpr` table compiled to local memory: 0.58 TB/s) (FN §19.3.21, §19.3.52-53) | the narrow expert route starts from these kernels ([§10.3](#103-narrow-routes-decode-verify)) |
+| L9 | Narrow W4A4: s8 `mma.m16n8k16` on doubled codes at every width (bc8bd7da retired the register-resident row pairs for 1-3 columns: under VRAM pressure they fell into a slow state that outlasted the process, 80-130 against ~185 tok/s; the tensor-core kernels measured 30.8 → 34.8 µs at T = 1 and faster at T = 2-3); E2M1 decode by `cvt.rn.f16x2.e2m1x2` (a `constexpr` table compiled to local memory: 0.58 TB/s) (FN §19.3.21, §19.3.52-53) | the narrow expert route starts from the tensor-core kernels ([§10.3](#103-narrow-routes-decode-verify)) |
 | L10 | Encode x once per (job, column): each CTA quantizing its own x was slower at 2-3 columns; at T = 1 the row-pair kernel hides an in-kernel encode behind its weight loads (FN §19.3.44) | x is quantized once in the MoE mixer; h's quantization point is chosen by an M5 op benchmark ([§10.3](#103-narrow-routes-decode-verify)) |
 | L11 | Down as a PDL dependent copying its weights before the wait +3.3 %; down CTAs polling their own job's completion 77.9 → 69.7 µs at 4 columns; one fused ticketed gate/up+down grid lost 0.5 % (FN §19.3.21) | K8 polls per-job counters; gate/up and down stay two kernels |
 | L12 | Expert kernels cost per job, not per column; verify rounds average 1.2-1.5 columns per expert; padding columns must route no expert (FN §19.2, §19.3.24; 122B: 47.8 → 79.6 tok/s from a padding mask) | padded rows of a graph batch route nothing; job planning is per expert |
@@ -404,7 +404,7 @@ W_o as stored unless its packed route wins:
 | K2 parents (q, k, v, r, gate, sink), 48 visits | 1.90 GB | 1.43 GB |
 | W_o, 48 visits | 0.68 GB | 0.68 GB (0.51 if packed) |
 | Experts (44 NVFP4 + 4 MXFP8 visits × 8) | 1.84 GB | 1.84 GB |
-| Head (200,064 rows: the real 200,058 rounded up to the packed head's multiple of 16) | 0.92 GB | 0.69 GB |
+| Head (the real 200,058 rows) | 0.92 GB | 0.69 GB |
 | Routers, message gates, small tensors (BF16) | 0.14 GB | 0.14 GB |
 | Window KV (40 visits × 1024 keys), INT8 / BF16 | 0.09 / 0.17 GB | same |
 | **Total, INT8 KV, short context** | **5.57 GB** | **4.87 GB** |
@@ -519,7 +519,7 @@ per visit:  [attention mixer] → [projection q,k,v,r,gate,sink(,taps)] → [att
 | Program | `src/models/inkling2_loop/program/` | planning, stores, transactions, graphs, prefix binding; implements `runtime::EngineProgramContract` |
 | State layout | `src/models/inkling2_loop/state/` | StateImage parts ([§7.2](#72-stateimage)) |
 | Frontend | `src/models/inkling2_loop/frontend/` | pre-tokenizer and pipeline validation, renderer, output session, image preprocessing |
-| Shared BPE core | `src/text/bpe*` (extracted) | the byte-level BPE merge loop, byte map and added-token split move out of `qwen3_5/frontend/tokenizer.cpp`, which then uses them; each family keeps its pre-tokenizer and validation. Two explicit consumers justify the extraction |
+| Shared BPE core | `src/text/tokenizer.{h,cpp}` (moved from `qwen3_5/frontend/`) | the byte-level BPE tokenizer with two fixed pipelines (`TokenizerPipeline::Qwen`: NFC and Qwen's split; `Inkling`: no normalizer, the o200k-style split with case classes, `ignore_merges`), each pipeline's description in `tokenizer.json` checked against it. Two explicit consumers justify the move |
 | Ops | `src/ops/relbias_attention/`, `src/ops/w4a4_sparse_moe/`, `src/ops/attn_res_mix/`, `src/ops/short_conv/`; contracts in `include/infernix/ops/` | [§9](#9-attention-ops)-[§12](#12-residual-mixing-message-gates-and-short-convolutions) |
 | Kernel cores reused | `ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh`, `narrow_rows_a4.cuh`, `wide_expert.cuh`; `ops/linear/bf16_p12/`; `ops/common/{rowsplit_ring,mbarrier,mma}.cuh`; `ops/kernel/sampling.cuh` | the expert cores move to `ops/common/` once two Ops use them; the offloaded Op keeps its planning |
 | Runtime reuse | `src/runtime/prefix_cache/`, `src/runtime/speculative/` (calibrated length), Scheduler, EngineCore | model-agnostic, unchanged |
@@ -616,7 +616,7 @@ launched ~1,440 kernels).
 | Kernel | Reads | Does | Writes |
 |---|---|---|---|
 | K1 attention mixer | previous visit's per-expert partials (8 × H FP32 per column), conv ring, block sources | expert combine in slot order → BF16; post-MLP conv + residual; block bookkeeping; attention mix (1 or 3 queries); norm(s); DSpark tap copy on visits 5, 23, 41 | x_q (and x_k, x_v), BF16 |
-| K2 projection | x_q, x_k, x_v; packed W (8,600 rows, + 64 dynamic-tap rows on full visits) | multi-input GEMV: row ranges take their own input vector; FP32 accumulate; epilogue writes each output in its consumer's layout (L6) | q, k, v, r, gate, sink, taps |
+| K2 projection | x_q, x_k, x_v; packed W (8,576 rows; the sink's 24 and the full visits' 64 dynamic-tap rows in a small parent) | multi-input GEMV: row ranges take their own input vector; FP32 accumulate; epilogue writes each output in its consumer's layout (L6) | q, k, v, r, gate, sink, taps |
 | K3 attention | K2 outputs, ring or pages | per-KV-head prologue: K/V conv (ring history), clips, v-norm, τ, append; relative-bias vector; split-K over keys; the last split CTA combines with the sink and multiplies σ(gate) | a, BF16 [3072] |
 | K4 output projection | a, packed W_o | GEMV, epilogue: post-attention conv (per channel, ring), residual add or restart | h (BF16), conv ring |
 | K5 MoE mixer | h, block sources | MLP mix, norm, four-over-six (or MXFP8) quantization of x | A4(x), BF16 x for the router |
@@ -750,7 +750,7 @@ exact, no serial arg-max), γ, and per-expert job lists. Padded rows of a graph 
 
 ### 10.3 Narrow routes (decode, verify)
 
-- **NVFP4 W4A4.** Row pairs for 1-3 columns per job and the tensor-core `narrow_a4_mma` core for 4-8 (L9), bit-equal to
+- **NVFP4 W4A4.** The tensor-core `narrow_a4_mma` core at every width (L9: the row pairs were retired), bit-equal to
   the exact int64 sum, adapted to a per-column outer scale and a per-expert weight factor in the epilogue in the pinned
   order ([§2.5](#25-rounding-points-pinned-at-m0)). kMaxColumns ≥ B_max × T_max = 128, so every decode and verify call
   stays narrow and its bits never depend on other requests. A job of 9-16 columns runs two passes over
@@ -780,7 +780,7 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
 ## 11. Dense projections and the head
 
 - **Packing (L4).** A matrix loads as `bf16_p12` only when every reader takes the packed form and M1's per-shape sweep
-  shows the packed routes faster at the decode and verify widths: expected for the K2 parents [8,600 (+64) × 2304]
+  shows the packed routes faster at the decode and verify widths: expected for the K2 parents [8,576 × 2304]
   (Flash-Next's similar shapes: 1.26× at T = 1-4, 1.13-1.19× at 5-16) and the head; W_o [2304 × 3072] only if a direct
   MMA wins (Flash-Next's output projections needed one to reach 1.00-1.06×); routers and gates stay BF16. The embedding is
   packed for VRAM (its reader is a row gather). Packing runs on the GPU after upload (~30 ms on Flash-Next). The skinny
@@ -791,11 +791,12 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   visits, three elsewhere); new tuned routes for Inkling's shapes (`bf16_p12_linear_tuned` registers only measured shapes).
 - **K4.** GEMV 2304 × 3072 (packed or BF16 per M1) with the post-attention conv and residual in the epilogue (each output
   channel needs only its own history).
-- **Few-row matrices (L3).** Router (128), sink (24, inside K2), relative (384, inside K2), taps (64), gate-down (64 per
-  gate): one row per warp, every load before the FMAs.
-- **Head.** Packed GEMV over 200,064 rows (`projection_fp32` takes packed heads whose row count is a multiple of 16: the
-  200,058 real rows plus 6 zero rows, masked before the softcap), softcap 30 in the epilogue, FP32 logits; the
-  checkpoint's other padded rows are never stored; one read for all T columns; evict-first loads (read once per step).
+- **Few-row matrices (L3).** Router (128), sink (24) and taps (64) in the small parent beside K2 (8,600 rows would not
+  be a multiple of 16), relative (384, inside K2), gate-down (64 per gate): one row per warp, every load before the FMAs.
+- **Head.** Packed GEMV over the 200,058 real rows (the last 16-row group predicated: `projection_fp32` takes only
+  multiples of 16, so the head kernel handles the tail rather than padding with zero rows, which would score 0 and need
+  a mask), softcap 30 in the epilogue, FP32 logits; the checkpoint's padded rows (non-zero, unreachable) are never
+  stored; one read for all T columns; evict-first loads (read once per step).
 
 ---
 
@@ -1003,24 +1004,34 @@ fixture where summation order is visible ([op development §6.3](op-development.
 
 ### 18.1 Recipe
 
-`inkling2_mini`: every tensor bit-exact; experts as `nvfp4_e2m1_g16_e4m3` with `amax/denominator` as each expert's FP32
-global scale, and `fp8_e4m3fn_g32_e8m0` (MXFP8); BF16 elsewhere (packed at load, not in the file); FP32 queries and router
-bias. Derived: the message queries merged to [12, 4, H] in (q, k, v, mlp) order; the head cut to 200,064 rows (the real
-200,058 plus 6 zero rows, a multiple of 16 for the packed head) and the embedding to 200,058; DSpark `Fold` and `fold_bias` computed in FP64 and stored rounded as the reference does (D2 may
-store FP8). The `.conversion.json` report lists every tensor's hash and the `bf16_p12` census (bits per weight and escape
-rate per matrix).
+`inkling2_mini` (`tools/convert/inkling2_loop.py`): every tensor bit-exact. The NVFP4 experts are `nvfp4_mul` banks whose
+multiplier plane is `fl32(amax / denominator)` for generic decoders, with the checkpoint's exact FP32 `amax` [128, 2] and
+denominators [2] stored beside them (`moe/expert_amax`, `moe/expert_denominators`) for the pinned row scale
+`(amax_x · amax_w) · rcp_rn(1536 · den)`; the MXFP8 experts are `fp8_e4m3fn_g32_e8m0` banks; BF16 elsewhere (packed at
+load, not in the file); FP32 queries and router bias. The text config names each layer's expert arithmetic
+(`expert_formats`: four-over-six W4A4 or MXFP8 W8A8), and the expert Uses permit it (`AllowA4`, `AllowA8`, no static
+input scales: the activation scales are per token by the model's own rule). Value-preserving transforms only: each loop
+layer's cross-pass queries as [4, H] in (q, k, v, mlp) order; the embedding, head and Markov embedding cut to the real
+200,058 rows (every token id below that is assigned; the padded rows are non-zero but unreachable); static convs
+lag-major [k, C], row 0 the current token; DSpark `Fold` and `fold_bias` derived as `refresh_fold` does at load (FP64
+products copied into BF16; D2 may store FP8). `tools/convert/verify_inkling2.py` re-derives every bound word from the
+checkpoint with its own reader and fails on any difference or unconsumed checkpoint tensor (the vision tower comes with
+M7).
 
 ### 18.2 Layouts
 
-Experts in the narrow kernels' tile order (codes and scales), gate/up interleaving kept (the fused epilogue wants it);
-attention matrices concatenated per layer into the K2 parent [8,600 (+64) × 2304] and W_o; controller weights stacked per
-layer; the head row-major. All value-preserving.
+NVFP4 experts in `nvfp4_expert_rg16_v1`, the Flash-Next narrow kernels' layout; MXFP8 experts in `mxfp8_expert_rg16_v1`
+(16-row groups of 528-byte units per 32-element K block: 512 code bytes in `mma.m16n8k32` A-fragment order, then the 16
+rows' UE8M0 scales; provisional until M3's op benchmark against row-major g32), both with the checkpoint's gate/up row
+interleaving (2i gate, 2i + 1 up). Attention matrices grouped per layer into the K2 parent [8,576 × 2304] (q, r, gate,
+k, v) and a small parent (sink, taps); the four message gates' down projections one parent, each gate's forget and gain
+another; the head row-major.
 
 ### 18.3 Frontend resources
 
 `tokenizer.json`, `tokenizer_config.json` (with `response_template`), `chat_template.jinja`, `generation_config.json`,
-`processor_config.json`, validated at conversion against the pipeline the runtime implements (as
-`tools/convert/resources.py` does for Qwen).
+kept byte for byte (the Qwen resource normalizers do not run on this family); `processor_config.json` joins with the
+vision tower (M7).
 
 ---
 
@@ -1062,7 +1073,10 @@ workspace [M4 measures the real headroom].
 ## 21. Implementation plan
 
 Each milestone ends with its tests passing; every performance choice left open has an op benchmark before integration
-(L27). Work happens in a worktree off main; nothing merges with a temporary switch left in.
+(L27). Work happens in a worktree off main; nothing merges with a temporary switch left in. Order of work: M0, M1, M3,
+M4, M5, M6, then M2, M7-M9. The lossless route follows the fast one because the FP64 Op oracles and a private CPU
+reference forward (teacher-forced against the Transformers PR's golden completion: 29 of 30 tokens, the miss a 0.15
+margin) qualify M3-M5 without it, and its kernels run inside the Program M4 builds.
 
 | Milestone | Content | Exit |
 |---|---|---|

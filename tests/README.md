@@ -474,13 +474,29 @@ shape guard (a table serves only its exact geometry), the conversion to the warm
 missing, foreign or damaged file falls back to it and `--expert-state off` starts empty.
 `tests/test_expert_cache_calibrated_order.py` covers its generator (`tools/expert_cache_replay/calibrated_order.py`).
 
-`infernix_qwen3_5_tokenizer_golden_real_test` compares the tokenizer's ids with Hugging Face
-`tokenizers` on about 2,600 adversarial strings (whitespace families, combining marks, ZWJ emoji,
-numbers, paths, code, special-token spellings; `tests/fixtures/qwen3_5/tokenizer_golden.json`). It needs
+`infernix_qwen3_5_tokenizer_golden_real_test` compares the tokenizer's ids (`src/text/tokenizer.cpp`, Qwen
+pipeline) with Hugging Face `tokenizers` on about 2,600 adversarial strings (the shared corpus
+`tests/text/tokenizer_corpus.py`: whitespace families, combining marks, ZWJ emoji, numbers, paths, code,
+special-token spellings; plus contractions under Unicode case folding; `tests/fixtures/qwen3_5/tokenizer_golden.json`). It needs
 the tokenizer files the golden was made from, not an artifact: `py -3.11 -I
 tests/models/qwen3_5/generate_tokenizer_golden.py <artifact> <golden.json> <dir>` writes them from any
 Qwen3.5-family artifact (and regenerates the golden), and `INFERNIX_TEST_TOKENIZER_DIR=<dir>` runs the
 test (skipped without it, and for a tokenizer.json of another size).
+`infernix_inkling2_tokenizer_golden_real_test` does the same for Inkling 2's pipeline (no normalizer, the
+o200k-style split with case classes, `ignore_merges`): `py -3.11 -I tests/models/inkling2/generate_tokenizer_golden.py
+<checkpoint or artifact> <golden.json> <dir>` writes the fixture (`tests/fixtures/inkling2/tokenizer_golden.json`:
+the shared corpus plus letter-case runs, folded contractions, digit and slash runs) and the resource directory,
+`INFERNIX_TEST_INKLING_TOKENIZER_DIR=<dir>` runs it, and every case must also decode back to its text. With
+`--sweep` the generator writes every codepoint in blocks of 64 in eight joinings (139,008 strings, about 200 MB, not
+committed), which `INFERNIX_TEST_INKLING_TOKENIZER_GOLDEN=<file>` runs in place of the fixture.
+`infernix_inkling2_load_plan_real_test` (CPU only) runs the loader's plan on `INFERNIX_INKLING2_ARTIFACT` (an
+`inkling2_mini` conversion): the config, every binding's name, shape, format and Use, and the tokenizer over exactly
+the model's vocabulary. `infernix_inkling2_canon_test` (GPU) checks the canonical functions Inkling's experts and
+router add (`expm1_c`, `tanh_c`, `sigmoid_c`, `softcap_c`, four-over-six NVFP4 activations): GPU bits equal the CPU
+header's exhaustively over BF16, each within 2 ulp of FP64, and four-over-six against the torch reference's fixture
+(`tests/models/inkling2/generate_four_over_six_fixture.py`). `tests/convert/test_inkling2.py` converts a synthetic
+checkpoint and checks every word, and `tools/convert/verify_inkling2.py` re-checks a real artifact against its
+checkpoint with its own reader.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's
