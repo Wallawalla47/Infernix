@@ -263,6 +263,32 @@ std::uint64_t maximum_main_page_groups(std::uint32_t concurrency, std::uint32_t 
 constexpr std::size_t kGraphExecutableAllowance                = 2ULL * kMiB;
 constexpr std::size_t kGraphExecutableAllowanceColumnInvariant = 3ULL * kMiB;
 constexpr std::size_t kGraphDriverAllowance                    = 16ULL * kMiB;
+// --lora: each adapted site (lora_sites) adds its shrink and its projection's adapter nodes to every executable.
+// Measured 2026-11-21 (RTX 5090, driver 621.01, CUDA 13.4, Qwen3.8-27B NVFP4-QAD, INT8 KV, a rank-32 adapter on all
+// seven projections: 160 sites; the zero adapter, which runs every kernel an adapter does), the graphs' growth over
+// the same start without it: default route 2, 4 and 4 MiB at max concurrency 1, 2 and 4 (26-41 executables, at most
+// 0.15 MiB each), reproducible 2, 10 and 16 MiB (5-20 executables, at most 1.0 MiB each), lossless 8 MiB (one
+// executable at max concurrency 1). The allowance keeps about twice that a site.
+constexpr std::size_t kGraphLoraSiteAllowance                 = 2ULL * 1024;
+constexpr std::size_t kGraphLoraSiteAllowanceColumnInvariant  = 12ULL * 1024;
+constexpr std::size_t kGraphLoraSiteAllowanceLossless         = 96ULL * 1024;
+
+// --lora: the text layers' adapted sites (an adapted input's shrink and its projection's term), each of which every
+// captured forward runs.
+std::uint64_t lora_sites(const execution::Parameters& parameters) {
+    std::uint64_t sites = 0;
+    for (const auto& block : parameters.text.layers) {
+        if (const auto* attention = std::get_if<execution::AttentionParameters>(&block.mixer)) {
+            sites += (attention->lora_input || attention->lossless_lora_input ? 1U : 0U) +
+                     (attention->lora_output || attention->lossless_lora_output ? 1U : 0U);
+        }
+        if (const auto* dense = std::get_if<execution::DenseParameters>(&block.ffn)) {
+            sites += (dense->lora_gate_up || dense->lossless_lora_gate_up ? 1U : 0U) +
+                     (dense->lora_down || dense->lossless_lora_down ? 1U : 0U);
+        }
+    }
+    return sites;
+}
 
 // Number of executables one family instantiates for one batch size: one per topology class.
 std::uint32_t graph_topology_classes(const std::vector<GraphExecutionProfile>& profiles) {
@@ -593,6 +619,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                          dimension(config.attention->num_key_value_heads)},
                                         plan.kv_storage, envelope, batch_size, min_width, max_width,
                                         device_execution));
+                    // --lora: o_proj's U (attention_output_lora), held under the output projection's scratch.
+                    if (attention->lora_output) {
+                        (void)layout.alloc(DType::BF16, {attention->lora_output->a.rows, last});
+                    }
                     add_scratch(layout, attention->output, first, last, wide_verification);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
@@ -1496,9 +1526,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                (split_batches ? impl->max_concurrency : 1U);
             }
         }
-        const std::size_t per_executable = impl->execution_schedule.column_invariant_decode
-                                               ? kGraphExecutableAllowanceColumnInvariant
-                                               : kGraphExecutableAllowance;
+        const std::size_t lora_per_site = impl->execution_schedule.lossless ? kGraphLoraSiteAllowanceLossless
+                                          : impl->execution_schedule.column_invariant_decode
+                                              ? kGraphLoraSiteAllowanceColumnInvariant
+                                              : kGraphLoraSiteAllowance;
+        const std::size_t per_executable =
+            (impl->execution_schedule.column_invariant_decode ? kGraphExecutableAllowanceColumnInvariant
+                                                              : kGraphExecutableAllowance) +
+            static_cast<std::size_t>(lora_per_site * lora_sites(*impl->parameters));
         impl->graph_allowance_bytes = checked_add(
             kGraphDriverAllowance, checked_mul(per_executable, executables, "CUDA Graph executable allowance"),
             "CUDA Graph allowance");

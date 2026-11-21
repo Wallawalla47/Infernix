@@ -5,30 +5,32 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/common/epilogue.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 namespace {
 
 template <class Geometry>
-void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream, const LoraAddend* lora) {
     using Schedule =
         Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
-    launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        nvfp4_a16_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n},
-        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}}, stream);
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, weight.n}}, [&](auto epilogue) {
+        launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            nvfp4_a16_operands(x, weight), LinearBf16Output{data, weight.n}, epilogue, stream);
+    });
 }
 
 } // namespace
 
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, const LoraAddend* lora) {
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
-        launch<Nvfp4N5120K6144>(x, weight, residual, stream);
+        launch<Nvfp4N5120K6144>(x, weight, residual, stream, lora);
         return;
     case Nvfp4GeometryId::N5120K17408:
-        launch<Nvfp4N5120K17408>(x, weight, residual, stream);
+        launch<Nvfp4N5120K17408>(x, weight, residual, stream, lora);
         return;
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:

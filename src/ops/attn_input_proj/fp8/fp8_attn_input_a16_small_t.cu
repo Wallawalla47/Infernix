@@ -2,40 +2,46 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 void fp8_attn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                     Tensor& k, Tensor& v, cudaStream_t stream) {
+                                     Tensor& k, Tensor& v, cudaStream_t stream, const LoraAddend* lora) {
     // The tiles run 4 K-warps over the same K slices and reduce them in the same order, and the
     // MMA's columns are independent; wider calls run as 64-column slices.
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    const auto launch = [&]<int T>() {
-        with_fp8_scale_word(weight, [&]<class Scale>() {
-            launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Fp8SlicedInstance<T, 4, 1>, 5120>>(
-                fp8_a16_operands<Scale>(x, weight), output, LinearIdentityEpilogue{}, stream);
-        });
-    };
-    if (x.ne[1] <= 8) return launch.template operator()<8>();
-    if (x.ne[1] <= 16) return launch.template operator()<16>();
-    if (x.ne[1] <= 32) return launch.template operator()<32>();
-    launch.template operator()<64>();
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        const auto launch = [&]<int T>() {
+            with_fp8_scale_word(weight, [&]<class Scale>() {
+                launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Fp8SlicedInstance<T, 4, 1>, 5120>>(
+                    fp8_a16_operands<Scale>(x, weight), output, epilogue, stream);
+            });
+        };
+        if (x.ne[1] <= 8) return launch.template operator()<8>();
+        if (x.ne[1] <= 16) return launch.template operator()<16>();
+        if (x.ne[1] <= 32) return launch.template operator()<32>();
+        launch.template operator()<64>();
+    });
 }
 
 void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                         Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+                                         Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream,
+                                         const LoraAddend* lora) {
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    const auto launch = [&]<class Schedule>() {
-        with_fp8_scale_word(weight, [&]<class Scale>() {
-            launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, 5120>>(
-                fp8_a16_operands<Scale>(x, weight), output, LinearIdentityEpilogue{}, stream);
-        });
-    };
-    if (x.ne[1] <= 16) return launch.template operator()<Fp8SlicedInstance<16, 4, 1>>();
-    if (x.ne[1] <= 24) return launch.template operator()<Fp8SlicedInstance<32, 4, 2>>();
-    launch.template operator()<Fp8SlicedInstance<32, 4, 1>>();
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        const auto launch = [&]<class Schedule>() {
+            with_fp8_scale_word(weight, [&]<class Scale>() {
+                launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, 5120>>(
+                    fp8_a16_operands<Scale>(x, weight), output, epilogue, stream);
+            });
+        };
+        if (x.ne[1] <= 16) return launch.template operator()<Fp8SlicedInstance<16, 4, 1>>();
+        if (x.ne[1] <= 24) return launch.template operator()<Fp8SlicedInstance<32, 4, 2>>();
+        launch.template operator()<Fp8SlicedInstance<32, 4, 1>>();
+    });
 }
 } // namespace infernix::ops::detail

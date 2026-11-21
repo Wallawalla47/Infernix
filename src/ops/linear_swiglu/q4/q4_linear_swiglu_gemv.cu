@@ -7,6 +7,7 @@
 #include "core/device.h" // CUDA_CHECK
 #include "core/pdl.cuh"
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -71,10 +72,11 @@ struct Q4SwiGluSmallTEpilogue {
     }
 };
 
-using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t, const LoraAddend*);
 
 template <int ActiveCols>
-void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
+                           const LoraAddend* lora) {
     // Wider tiles are shared-memory limited before six CTAs can be resident.
     // Match launch bounds to that limit instead of forcing register spills.
     constexpr int kMinBlocks = ActiveCols <= 8    ? 6
@@ -84,10 +86,12 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
     using Schedule =
         Q4A16SlicedKMmaSchedule<16, (ActiveCols + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
                                 kMinBlocks, kK, ActiveCols, Q4SlicedKReduction::Pairwise>;
-    launch_q4_a16_sliced_k_mma<Schedule>(
-        q4_linear_operands(x, w),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
-        Q4SwiGluSmallTEpilogue{}, stream, Q4SwiGluSmallTRows<>{});
+    // --lora: the sliced-K kernels add the term to the gate and up fragments (their B rows by weight row).
+    with_lora_epilogue(lora, Q4SwiGluSmallTEpilogue{}, [&](auto epilogue) {
+        launch_q4_a16_sliced_k_mma<Schedule>(q4_linear_operands(x, w),
+                                             LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+                                             epilogue, stream, Q4SwiGluSmallTRows<>{});
+    });
 }
 
 template <std::size_t... Offsets>
@@ -119,10 +123,12 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
     pipe_commit();
 }
 
+// `lora`: LoraNone, or the term over the gate/up parent's rows (lora_device.cuh).
+template <class Lora>
 __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
                                                   const std::uint8_t* __restrict__ codes,
                                                   const std::uint8_t* __restrict__ scales,
-                                                  __nv_bfloat16* __restrict__ out) {
+                                                  __nv_bfloat16* __restrict__ out, Lora lora) {
     constexpr int kStages   = 3;
     constexpr int kPrefetch = kStages - 1;
     __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
@@ -150,6 +156,15 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     const std::uint8_t* up_scale_row =
         scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
+    [[maybe_unused]] LoraWarpStage<2, 1>* lora_stage = nullptr;
+    if constexpr (kLoraTerm<Lora>) {
+        // The gate and up rows' B and their U columns stage in shared memory beside the main loop.
+        __shared__ LoraWarpStage<2, 1> lora_stages[kWarpsPerBlock];
+        lora_stage             = &lora_stages[warp];
+        const int term_rows[2] = {out_row, out_row + kIntermediate};
+        lora_stage_warp_b(lora, term_rows, *lora_stage);
+        lora_stage_warp_u(lora, term_rows, 0, 1, *lora_stage);
+    }
 
     float gate_acc = 0.0f;
     float up_acc   = 0.0f;
@@ -207,41 +222,54 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 
     gate_acc = warp_reduce_sum(gate_acc);
     up_acc   = warp_reduce_sum(up_acc);
+    if constexpr (kLoraTerm<Lora>) {
+        // --lora: the gate and up rows' terms (one chain each: two segments), every lane; lane 0 holds the sums.
+        const int term_rows[2] = {out_row, out_row + kIntermediate};
+        float add[2][1];
+        bool has[2];
+        lora_warp_rows_staged<2, 1>(lora, term_rows, 0, 1, add, has, *lora_stage);
+        gate_acc = lora_add(gate_acc, add[0][0], has[0]);
+        up_acc   = lora_add(up_acc, add[1][0], has[1]);
+    }
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
 } // namespace
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                       cudaStream_t stream) {
+                                       cudaStream_t stream, const LoraAddend* lora) {
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
     const int grid = kIntermediate / kPairsPerBlock;
     // A programmatic dependent of the norm: the groupwise 27B's Q4 / Q5 decode and verification projections, INT8 KV,
     // 3 rotated reps: plain decode +0.46 %, DFlash2 +0.91 % (candidates §58). Same bits.
-    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlockThreads), 0, stream},
-                                q4_linear_swiglu_gemv_pair_kernel, static_cast<const __nv_bfloat16*>(x.data),
-                                static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-                                static_cast<__nv_bfloat16*>(out.data)));
+    with_lora_term(lora, 0, [&](auto term) {
+        CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlockThreads), 0, stream},
+                                        q4_linear_swiglu_gemv_pair_kernel<decltype(term)>,
+                                        static_cast<const __nv_bfloat16*>(x.data),
+                                        static_cast<const std::uint8_t*>(w.qdata),
+                                        static_cast<const std::uint8_t*>(w.scales),
+                                        static_cast<__nv_bfloat16*>(out.data), term));
+    });
 }
 
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                           cudaStream_t stream) {
+                                           cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
+    kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream, lora);
 }
 
 // Every instance is the same sliced-K schedule but for its token capacity (8 K-warps, pairwise
 // reduction, StaticK): capacity and the token slicing of launch_q4_a16_sliced_k_mma change only
 // staging and predication, so a column's bits do not depend on the call's width.
 void q4_linear_swiglu_small_t_invariant_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                               cudaStream_t stream) {
+                                               cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[1] < 1) { throw std::invalid_argument("Q4 LinearSwiGLU column-invariant route requires T >= 1"); }
     const std::size_t instance = std::min<std::size_t>(kSmallTLaunchers.size() - 1, static_cast<std::size_t>((x.ne[1] - 1) / 8));
-    kSmallTLaunchers[instance](x, w, out, stream);
+    kSmallTLaunchers[instance](x, w, out, stream, lora);
 }
 
 } // namespace infernix::ops::detail

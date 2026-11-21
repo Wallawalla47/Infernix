@@ -2,6 +2,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/lora.h"
 #include "infernix/ops/rmsnorm.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/input_projection_test_common.h"
@@ -222,6 +223,103 @@ int run_case(const Weight& weight, const quantized_weight::PackedWeight& host, i
     return failures;
 }
 
+// --lora (include/infernix/ops/lora.h): the adapter form against rmsnorm(), lora_shrink(h) and
+// attn_input_proj(+term) (qualified with its term by the lora Op test), and the h it stores against
+// rmsnorm()'s. q_proj's rank-32 A feeds the query and gate rows, v_proj's the value rows; key is
+// unadapted.
+int run_lora_case(const Weight& weight, int tokens, bool zero_b = false) {
+    constexpr int kRank   = 32;
+    constexpr int kQRows  = 6144;
+    constexpr int kKvRows = 1024;
+    const auto uniform    = [](std::size_t count, std::uint32_t seed, float bound) {
+        std::vector<float> values = make_bf16_activation(static_cast<std::int32_t>(count), 1, seed);
+        float peak                = 0.0F;
+        for (const float v : values) { peak = std::max(peak, std::fabs(v)); }
+        for (float& v : values) { v = v / peak * bound; }
+        return bf16_bits(values);
+    };
+    DeviceBuffer a_buffer = to_device(uniform(static_cast<std::size_t>(2 * kRank) * kHidden, 71U, 0.03F));
+    DeviceBuffer b_buffer = to_device(zero_b ? std::vector<std::uint16_t>(static_cast<std::size_t>(kParentRows) * kRank, 0)
+                                          : uniform(static_cast<std::size_t>(kParentRows) * kRank, 72U, 0.05F));
+    ops::LoraSite site;
+    site.a               = {a_buffer.p, 2 * kRank, kHidden};
+    site.addend.b        = b_buffer.p;
+    site.addend.rank     = kRank;
+    site.addend.u_rows   = 2 * kRank;
+    site.addend.segments = 4;
+    site.addend.segment[0] = {kQRows, 0, 2.0F};
+    site.addend.segment[1] = {kQRows + kKvRows, -1, 0.0F};
+    site.addend.segment[2] = {2 * kQRows + kKvRows, 0, 2.0F};
+    site.addend.segment[3] = {kParentRows, kRank, 1.5F};
+
+    const auto value_bits        = bf16_bits(make_bf16_activation(kHidden, tokens, 913U + tokens));
+    const auto gain_bits         = bf16_bits(make_bf16_activation(kHidden, 1, 121U));
+    DeviceBuffer residual_buffer = to_device(value_bits);
+    DeviceBuffer gain_buffer     = to_device(gain_bits);
+    DeviceBuffer hidden_buffer(static_cast<std::size_t>(kHidden) * tokens * 2);
+    DeviceBuffer stored_buffer(hidden_buffer.bytes);
+    DeviceBuffer u_buffer(static_cast<std::size_t>(2 * kRank) * tokens * 2);
+    Tensor residual(residual_buffer.p, DType::BF16, {kHidden, tokens});
+    Tensor gain(gain_buffer.p, DType::BF16, {kHidden});
+    Tensor hidden(hidden_buffer.p, DType::BF16, {kHidden, tokens});
+    Tensor stored(stored_buffer.p, DType::BF16, {kHidden, tokens});
+    Tensor u(u_buffer.p, DType::BF16, {2 * kRank, tokens});
+
+    const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::AllowA4, tokens, tokens);
+    DeviceArena reference_workspace(capacity);
+    DeviceArena fused_workspace(capacity + (u_buffer.bytes + 255) / 256 * 256);
+    std::vector<DeviceBuffer> reference(4), fused(4);
+    const int rows[4] = {kQRows, kQRows, kKvRows, kKvRows};
+    std::vector<Tensor> rt, ft;
+    for (int i = 0; i < 4; ++i) {
+        reference[i] = DeviceBuffer(static_cast<std::size_t>(rows[i]) * tokens * 2);
+        fused[i]     = DeviceBuffer(reference[i].bytes);
+        rt.emplace_back(reference[i].p, DType::BF16, std::initializer_list<std::int32_t>{rows[i], tokens});
+        ft.emplace_back(fused[i].p, DType::BF16, std::initializer_list<std::int32_t>{rows[i], tokens});
+    }
+    ops::rmsnorm(residual, gain, kEps, true, hidden, nullptr);
+    ops::lora_shrink(hidden, site.a, u, nullptr);
+    ops::LoraAddend term = site.addend;
+    term.u               = u.data;
+    ops::attn_input_proj(hidden, weight, rt[0], rt[1], rt[2], rt[3], ops::LinearPolicy::AllowA4,
+                         reference_workspace, nullptr, &term);
+    ops::attn_input_proj_fused_rmsnorm_nvfp4(residual, gain, kEps, weight, ft[0], ft[1], ft[2], ft[3],
+                                             ops::LinearPolicy::AllowA4, fused_workspace, nullptr,
+                                             &site, &stored);
+    cuda_synchronize();
+    const std::string suffix = std::string(zero_b ? " zero-B lora T=" : " lora T=") + std::to_string(tokens);
+    int failures = compare_bytes("h" + suffix, static_cast<const std::uint8_t*>(hidden_buffer.p),
+                                 static_cast<const std::uint8_t*>(stored_buffer.p), hidden_buffer.bytes);
+    const char* names[4] = {"q", "gate", "k", "v"};
+    for (int i = 0; i < 4; ++i) {
+        failures += compare_bytes(names[i] + suffix, static_cast<const std::uint8_t*>(reference[i].p),
+                                  static_cast<const std::uint8_t*>(fused[i].p), reference[i].bytes);
+    }
+    if (zero_b) {
+        std::vector<DeviceBuffer> plain(4);
+        std::vector<Tensor> pt;
+        for (int i = 0; i < 4; ++i) {
+            plain[i] = DeviceBuffer(reference[i].bytes);
+            pt.emplace_back(plain[i].p, DType::BF16, std::initializer_list<std::int32_t>{rows[i], tokens});
+        }
+        DeviceArena plain_workspace(capacity);
+        ops::attn_input_proj_fused_rmsnorm_nvfp4(residual, gain, kEps, weight, pt[0], pt[1], pt[2], pt[3],
+                                                 ops::LinearPolicy::AllowA4, plain_workspace, nullptr);
+        cuda_synchronize();
+        for (int i = 0; i < 4; ++i) {
+            failures += compare_bytes(std::string("no-adapter ") + names[i] + suffix,
+                                      static_cast<const std::uint8_t*>(plain[i].p),
+                                      static_cast<const std::uint8_t*>(fused[i].p), plain[i].bytes);
+        }
+    }
+    if (fused_workspace.used() != 0) {
+        std::cerr << "attention input workspace scope was not released" << suffix << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(attn_input_proj_fused_rmsnorm) {
@@ -249,6 +347,10 @@ INFERNIX_OP_TEST(attn_input_proj_fused_rmsnorm) {
         for (const int tokens : {129, 256, 257, 300, 512, 513, 700, 1024, 1500, 2048, 3584, 4096}) {
             failures += run_case(weight, parent.host, tokens, measure);
         }
+        // --lora: a ragged 256-token tile, the 128-token tiles and a production prefill chunk.
+        for (const int tokens : {129, 300, 3584}) { failures += run_lora_case(weight, tokens); }
+        // B = 0: the adapter form returns the no-adapter call's bits.
+        for (const int tokens : {129, 256, 257, 300, 513, 3584}) { failures += run_lora_case(weight, tokens, true); }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "fused attention input test: " << error.what() << '\n';

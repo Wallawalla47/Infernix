@@ -66,6 +66,8 @@ std::string render_plan_json(const infernix::EnginePlan& plan) {
               {"graph_allowance_bytes", optional_json(vram.graph_allowance_bytes)},
               {"expert_cache_bytes", optional_json(vram.expert_cache_bytes)},
               {"expert_frames", optional_json(vram.expert_frames)},
+              {"draft_screen_bytes", optional_json(vram.draft_screen_bytes)},
+              {"adapter_bytes", optional_json(vram.adapter_bytes)},
               {"headroom_bytes", vram.headroom_bytes},
               {"planned_bytes", vram.planned_bytes},
               {"left_bytes", vram.left_bytes}}},

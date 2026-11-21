@@ -80,7 +80,7 @@ ctest --test-dir build -R infernix_sampling_test --output-on-failure
 
 The op tests under `tests/ops` link into one executable per family (`infernix_ops_<family>_test`:
 `elementwise`, `recurrent`, `sampling`, `attention`, `projection`, `offloaded_moe`, `lossless`,
-`linear`, `linear_fused`) instead of one each, which saves a link of the Ops library per test. Each
+`linear`, `linear_fused`, `lora`) instead of one each, which saves a link of the Ops library per test. Each
 test keeps its own entry point (`INFERNIX_OP_TEST(name)`, `tests/ops/op_family.h`) and its CTest
 entries and names (`infernix_<name>_test`). The executable runs one test by name with that test's own
 arguments, `infernix_ops_<family>_test <name> [arguments]`, and `--list` names the family's tests.
@@ -95,6 +95,19 @@ INFERNIX_OP_REPORT_STATS=1 \
 Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
 actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
 statistics still drive the normal verdict. Passing tests remain quiet without it.
+
+The `lora` family covers `--lora` ([LoRA adapters](../docs/lora.md)). `infernix_lora_mma_position_test`
+checks the hardware assumption the canonical term rests on: a BF16 tensor-core MMA element's result does not depend
+on its position in the fragment or on which operand role carries its inputs. `infernix_lora_test` checks
+`lora_shrink` against an FP64 oracle and its canonical bits (a column's `U` whatever the call's width and schedule),
+then every adapted Op, format and route at the 27B's shapes on zero base weights, where the output is the term
+alone against its FP64 oracle (through the SwiGLU, the residual add and the four-way attention split; an unadapted
+segment must stay exactly zero; ranks 48 and 64 on the routes that stage the term's operands in shared memory), that a
+column's bits under `A16ColumnInvariant` do not depend on the call's width with the term, and that a zero `B` (PEFT's
+initial adapter) on non-zero weights returns the no-adapter call's bits on every route. The fused dense MLP and fused-norm attention tests compare their adapter forms bit for
+bit with the separate Ops. On the host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT
+configuration handling (patterns, rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module
+binding and its refusals.
 
 `infernix_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and

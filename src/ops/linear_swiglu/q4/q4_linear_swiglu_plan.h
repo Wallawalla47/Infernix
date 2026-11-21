@@ -3,6 +3,7 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -56,9 +57,9 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
 
 void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
                                    Tensor& out, WorkspaceArena& ws, cudaStream_t stream,
-                                   bool column_invariant = false);
+                                   bool column_invariant = false, const LoraAddend* lora = nullptr);
 void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                                cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact,
-                               bool column_invariant = false);
+                               bool column_invariant = false, const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

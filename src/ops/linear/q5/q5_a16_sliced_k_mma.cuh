@@ -2,6 +2,7 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 
@@ -151,6 +152,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
         else
             cp_commit();
     }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B rows and U columns into L2 while the K loop runs.
+        lora_prefetch_tile(
+            epilogue.lora, R,
+            [&](int i) {
+                const int r = row_policy.weight_row(row_begin, i);
+                return r < rows ? r : rows - 1;
+            },
+            token_begin + token0, min(tokens - token0, Schedule::kTokenCapacity), tid, Schedule::kThreads);
+    }
     constexpr int kUnroll = Schedule::kStaticK ? (Schedule::kStaticK / 64 + W - 1) / W : 1;
 #pragma unroll kUnroll
     for (int tile = 0; tile < tiles; ++tile) {
@@ -249,6 +260,74 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
             }
         }
         __syncthreads();
+    }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: warp 0's reduced fragments plus the term (canonical chains), then the stores below.
+        if (warp == 0) {
+            float sums[MT][NT][4];
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    float4 sum;
+                    if constexpr (kPairwise)
+                        sum = make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3]);
+                    else
+                        sum = load_vec<float4>(shared.partial[0][mi][ni][lane]);
+#pragma unroll
+                    for (int part = kPairwise ? 2 : 1; part < W; part += kPairwise ? 2 : 1) {
+                        const float4 value = load_vec<float4>(shared.partial[part][mi][ni][lane]);
+                        sum.x += value.x;
+                        sum.y += value.y;
+                        sum.z += value.z;
+                        sum.w += value.w;
+                    }
+                    sums[mi][ni][0] = sum.x;
+                    sums[mi][ni][1] = sum.y;
+                    sums[mi][ni][2] = sum.z;
+                    sums[mi][ni][3] = sum.w;
+                }
+            }
+            const int slice_end = min(tokens, token0 + Schedule::kTokenCapacity);
+            lora_add_rows_tile<MT, NT>(
+                epilogue.lora, sums,
+                [&](int mm, int i) {
+                    const int r = row_policy.weight_row(row_begin, mm * 16 + i);
+                    return r < rows ? r : rows - 1;
+                },
+                [&](int mn, int j) {
+                    const int t = token0 + mn * 8 + j;
+                    return t < slice_end ? token_begin + t : -1;
+                });
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const float4 sum    = make_float4(sums[mi][ni][0], sums[mi][ni][1], sums[mi][ni][2], sums[mi][ni][3]);
+                    const int r0        = row_begin + mi * 16 + gid;
+                    const int t0        = token0 + ni * 8 + 2 * lid;
+                    const int token_end = token_begin + slice_end;
+                    if constexpr (requires {
+                                      epilogue.store_fragment(output, r0, token_begin + t0, sum, rows, token_end);
+                                  }) {
+                        epilogue.store_fragment(output, r0, token_begin + t0, sum, rows, token_end);
+                    } else {
+                        const auto store = [&](int row, int token, float value) {
+                            if (token - token0 < Schedule::kTokenCapacity && (Full || row < rows) &&
+                                (FullTokens || token < tokens)) {
+                                const int global_token = token_begin + token;
+                                output.store(row, global_token, epilogue.apply(row, global_token, value));
+                            }
+                        };
+                        store(r0, t0, sum.x);
+                        store(r0, t0 + 1, sum.y);
+                        store(r0 + 8, t0, sum.z);
+                        store(r0 + 8, t0 + 1, sum.w);
+                    }
+                }
+            }
+        }
+        return;
     }
     if (warp == 0) {
 #pragma unroll

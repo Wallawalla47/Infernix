@@ -31,6 +31,10 @@ std::size_t planned_free_after_weights(std::size_t free_now, std::uint64_t weigh
     return free_now > taken ? static_cast<std::size_t>(free_now - taken) : 0;
 }
 
+std::uint64_t planned_beside_weights_bytes(const EnginePlanVram& vram) noexcept {
+    return vram.draft_screen_bytes.value_or(0) + vram.adapter_bytes.value_or(0);
+}
+
 std::optional<KvCapacityResolution> plan_capacity(EnginePlan& plan, const KvCapacityPolicy& policy,
                                                   const SequenceCapacityCurve& curve,
                                                   std::size_t free_after_weights, std::size_t headroom) {
@@ -43,7 +47,7 @@ std::optional<KvCapacityResolution> plan_capacity(EnginePlan& plan, const KvCapa
     try {
         const KvCapacityResolution resolution = resolve_kv_capacity(policy, curve, free_after_weights, headroom);
         vram.kv_tokens     = resolution.resolved_tokens;
-        vram.planned_bytes = vram.weights_bytes + resolution.runtime_reservation_bytes;
+        vram.planned_bytes = vram.weights_bytes + planned_beside_weights_bytes(vram) + resolution.runtime_reservation_bytes;
         const std::uint64_t used =
             static_cast<std::uint64_t>(resolution.runtime_reservation_bytes) + vram.headroom_bytes;
         vram.left_bytes = free_after_weights > used ? free_after_weights - used : 0;
@@ -51,7 +55,7 @@ std::optional<KvCapacityResolution> plan_capacity(EnginePlan& plan, const KvCapa
     } catch (const std::invalid_argument& refusal) {
         vram.kv_tokens     = 0;
         vram.kv_bytes      = 0;
-        vram.planned_bytes = vram.weights_bytes + curve.minimum_device_reservation_bytes;
+        vram.planned_bytes = vram.weights_bytes + planned_beside_weights_bytes(vram) + curve.minimum_device_reservation_bytes;
         vram.left_bytes    = 0;
         plan_refuse(plan, refusal.what());
         return std::nullopt;

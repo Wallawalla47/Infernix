@@ -6,13 +6,14 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/fp8/fp8_a16_gemv.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
 namespace infernix::ops::detail {
 
 void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                  Tensor& k, Tensor& v, cudaStream_t stream) {
+                                  Tensor& k, Tensor& v, cudaStream_t stream, const LoraAddend* lora) {
     using Geometry = Fp8N14336K5120;
     // Keep six CTAs resident with the four-segment output (39 registers, no spills).
     using Schedule = Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 6>;
@@ -23,9 +24,11 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
         static_cast<__nv_bfloat16*>(v.data),
     };
     // BF16 row words, or FP32 ones (fp8_e4m3fn_row_f32: ModelOpt's per-tensor scales kept exactly).
-    with_fp8_scale_word(weight, [&]<class Scale>() {
-        launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
-            fp8_a16_operands<Scale>(x, weight), output, LinearIdentityEpilogue{}, stream);
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        with_fp8_scale_word(weight, [&]<class Scale>() {
+            launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+                fp8_a16_operands<Scale>(x, weight), output, epilogue, stream);
+        });
     });
 }
 

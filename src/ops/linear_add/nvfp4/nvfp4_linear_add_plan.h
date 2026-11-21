@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 
 #include <cuda_runtime.h>
@@ -21,50 +22,62 @@ namespace infernix::ops::detail {
 
 // `wide_k`: the 8 K-warp K=17408 tiles at 5-16 tokens (LinearRoutes::WideDownTile; see launch_matrix).
 void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual, bool wide_k,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 // A8Only: x encoded by ggml_a8.h's codec, then the 8-bit tiles (nvfp4_linear_add_a8.cu).
 void nvfp4_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 // A16ColumnInvariant: one K-warp count per K for every T (8 at K=6144, 4 at K=17408), so a
 // column's arithmetic does not depend on the call's other columns. Calls of 17+ columns (32+ at
 // K=17408) run the slice-major ring tile of that count, narrower ones the sliced-K tiles; the two give
 // the same bits (both are exposed for that test).
 void nvfp4_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                       cudaStream_t stream);
+                                       cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 void nvfp4_linear_add_invariant_sliced_launch(const Tensor& x, const Weight& weight,
-                                              Tensor& residual, cudaStream_t stream);
+                                              Tensor& residual, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 // T >= 17.
 void nvfp4_linear_add_invariant_ring_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                            cudaStream_t stream);
+                                            cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                     cudaStream_t stream);
+                                     cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                Nvfp4A4Workspace workspace, cudaStream_t stream);
+                                Nvfp4A4Workspace workspace, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 // The A4 route's activation scale layout for a call of `tokens` columns: Tiled256 where it takes the TMA tile, else
 // row-major (the MMA tiles).
 [[nodiscard]] Nvfp4ScaleLayout nvfp4_linear_add_a4_scale_layout(std::int32_t tokens);
 // The A4 GEMM from one plane already written in nvfp4_linear_add_a4_scale_layout(tokens) for `tokens` columns: the
 // fused dense MLP's prompt profile (its SwiGLU epilogue wrote the plane).
 void nvfp4_linear_add_a4_planes_launch(const Weight& weight, Tensor& residual, Nvfp4A4Workspace planes,
-                                       std::int32_t tokens, cudaStream_t stream);
+                                       std::int32_t tokens, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 // AllowA4Residual: the workspace's planes (two or three) into one accumulator, MMA tiles only.
 void nvfp4_linear_add_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                         Nvfp4A4Workspace workspace, cudaStream_t stream);
+                                         Nvfp4A4Workspace workspace, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 // The same GEMM from planes already written (row-major, kNvfp4A4ResidualTerms) for `tokens` columns: the fused
 // dense MLP's down projection (its SwiGLU epilogue wrote the planes).
 void nvfp4_linear_add_a4_residual_planes_launch(const Weight& weight, Tensor& residual,
                                                 Nvfp4A4Workspace planes, std::int32_t tokens,
-                                                cudaStream_t stream);
+                                                cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 // `wide_down_tile`: LinearRoutes::WideDownTile (the batched-decode fast path's A16 tiles).
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
-                               bool wide_down_tile);
+                               bool wide_down_tile,
+    const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

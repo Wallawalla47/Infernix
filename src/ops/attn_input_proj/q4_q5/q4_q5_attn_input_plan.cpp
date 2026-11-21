@@ -59,7 +59,7 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
 void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& x,
                                    const Weight& query_key_weight, const Weight& gate_value_weight,
                                    Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                                   cudaStream_t stream, bool column_invariant) {
+                                   cudaStream_t stream, bool column_invariant, const LoraAddend* lora) {
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
                                        x.ne[1]};
     const Q4Q5AttnInputPlan resolved = q4_q5_attn_input_resolve_plan(problem, column_invariant);
@@ -70,27 +70,27 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     switch (plan.schedule) {
     case Q4Q5AttnInputScheduleId::ParentSplitFixed:
         q4_q5_attn_input_small_t_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                        stream);
+                                        stream, lora);
         return;
     case Q4Q5AttnInputScheduleId::MixedR32C32S2:
         q4_q5_attn_input_mixed_r32_c32_s2_launch(x, query_key_weight, gate_value_weight, q, gate, k,
-                                                 v, stream);
+                                                 v, stream, lora);
         return;
     case Q4Q5AttnInputScheduleId::MixedR32C64S3:
         q4_q5_attn_input_mixed_r32_c64_s3_launch(x, query_key_weight, gate_value_weight, q, gate, k,
-                                                 v, stream);
+                                                 v, stream, lora);
         return;
     case Q4Q5AttnInputScheduleId::MixedRingC128:
         q4_q5_attn_input_mixed_ring_c128_launch(x, query_key_weight, gate_value_weight, q, gate,
-                                                  k, v, stream);
+                                                  k, v, stream, lora);
         return;
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
-                                                       gate, k, v, stream);
+                                                       gate, k, v, stream, lora);
         return;
     case Q4Q5AttnInputScheduleId::ColumnInvariant:
         q4_q5_attn_input_column_invariant_launch(x, query_key_weight, gate_value_weight, q, gate,
-                                                 k, v, stream);
+                                                 k, v, stream, lora);
         return;
     }
     throw std::logic_error("Q4/Q5 attention input: unknown schedule");
@@ -98,12 +98,12 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
 
 void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
                                const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
-                               Tensor& v, cudaStream_t stream, bool column_invariant) {
+                               Tensor& v, cudaStream_t stream, bool column_invariant, const LoraAddend* lora) {
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
                                        x.ne[1]};
     const Q4Q5AttnInputPlan plan = q4_q5_attn_input_resolve_plan(problem, column_invariant);
     q4_q5_attn_input_execute_plan(plan, x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                  stream, column_invariant);
+                                  stream, column_invariant, lora);
 }
 
 } // namespace infernix::ops::detail

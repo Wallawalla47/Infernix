@@ -49,6 +49,8 @@ struct ServeOptions {
     // the plan to FILE as JSON (serve/plan_report.h) and exit.
     std::filesystem::path plan_path;
     std::string artifact_path;
+    // --lora PATH: a LoRA adapter applied at runtime (EngineOptions::lora_path).
+    std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;

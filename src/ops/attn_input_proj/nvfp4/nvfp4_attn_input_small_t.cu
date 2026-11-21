@@ -5,6 +5,7 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <array>
 #include <cstddef>
@@ -15,7 +16,7 @@ namespace infernix::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
-                        cudaStream_t);
+                        cudaStream_t, const LoraAddend*);
 
 // The four-output epilogue shifts the measured low-T warp crossover relative to contiguous Linear,
 // so Attention owns this production mapping even though both routes share the compute body.
@@ -36,16 +37,16 @@ struct Nvfp4AttentionSmallTProductionSchedule {
 
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                  Tensor& v, cudaStream_t stream) {
+                  Tensor& v, cudaStream_t stream, const LoraAddend* lora) {
     using Geometry = Nvfp4N14336K5120;
     using Schedule = typename Nvfp4AttentionSmallTProductionSchedule<ActiveTokens>::Type;
-    launch_nvfp4_a16_simt<
-        Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
-        nvfp4_a16_operands(x, weight),
-        Nvfp4AttentionInputOutput{
-            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
-            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)},
-        LinearIdentityEpilogue{}, stream);
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_nvfp4_a16_simt<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
+            nvfp4_a16_operands(x, weight),
+            Nvfp4AttentionInputOutput{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                                      static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)},
+            epilogue, stream);
+    });
 }
 
 template <std::size_t... Offsets>
@@ -58,8 +59,8 @@ constexpr auto kLaunchers = make_launchers(std::make_index_sequence<2 - 2 + 1>{}
 } // namespace
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                     Tensor& k, Tensor& v, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - 2](x, weight, q, gate, k, v, stream);
+                                     Tensor& k, Tensor& v, cudaStream_t stream, const LoraAddend* lora) {
+    kLaunchers[x.ne[1] - 2](x, weight, q, gate, k, v, stream, lora);
 }
 
 } // namespace infernix::ops::detail

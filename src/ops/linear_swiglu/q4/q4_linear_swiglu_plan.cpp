@@ -4,6 +4,7 @@
 #include "infernix/ops/linear.h"
 #include "infernix/ops/silu_mul.h"
 #include "core/layout.h"
+#include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_w4a8.h"
 
@@ -191,46 +192,54 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
 }
 
 void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
-                                   Tensor& out, WorkspaceArena& ws, cudaStream_t stream, bool column_invariant) {
+                                   Tensor& out, WorkspaceArena& ws, cudaStream_t stream, bool column_invariant,
+                                   const LoraAddend* lora) {
     const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q4LinearSwiGluPlan resolved = q4_linear_swiglu_resolve_plan(problem, plan.routes, column_invariant);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q4 linear_swiglu: plan does not match the exact problem");
     }
 
+    // --lora: every route takes the term on its gate and up values before the SwiGLU (the Materialized route before
+    // the gate/up projection's BF16 store).
     switch (plan.schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
-        q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);
+        q4_linear_swiglu_gemv_pair_launch(x, w, out, stream, lora);
         return;
     case Q4LinearSwiGluScheduleId::SmallTTiled:
-        q4_linear_swiglu_small_t_tiled_launch(x, w, out, stream);
+        q4_linear_swiglu_small_t_tiled_launch(x, w, out, stream, lora);
         return;
     case Q4LinearSwiGluScheduleId::Materialized: {
         auto scratch_scope = ws.scope();
         Tensor gate_up = allocate_materialized_workspace(ws, problem.gate_up_rows, problem.cols);
-        linear(x, w, gate_up, stream);
+        if (lora != nullptr && lora->present()) {
+            q4_lora_dispatch(x, w, gate_up, *lora, stream);
+        } else {
+            linear(x, w, gate_up, stream);
+        }
         silu_mul(gate_up.slice(0, 0, problem.output_rows),
                  gate_up.slice(0, problem.output_rows, problem.output_rows), out, stream);
         return;
     }
     case Q4LinearSwiGluScheduleId::MmaRingR64C128:
-        q4_linear_swiglu_mma_ring_r64_c128_launch(x, w, out, stream);
+        q4_linear_swiglu_mma_ring_r64_c128_launch(x, w, out, stream, lora);
         return;
     case Q4LinearSwiGluScheduleId::W4A8:
-        q4_linear_swiglu_w4a8_launch(x, w, out, ws, stream);
+        q4_linear_swiglu_w4a8_launch(x, w, out, ws, stream, lora);
         return;
     case Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant:
-        q4_linear_swiglu_small_t_invariant_launch(x, w, out, stream);
+        q4_linear_swiglu_small_t_invariant_launch(x, w, out, stream, lora);
         return;
     }
     throw std::logic_error("q4 linear_swiglu: unknown schedule");
 }
 
 void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                               cudaStream_t stream, LinearRoutes routes, bool column_invariant) {
+                               cudaStream_t stream, LinearRoutes routes, bool column_invariant,
+                               const LoraAddend* lora) {
     const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q4LinearSwiGluPlan plan = q4_linear_swiglu_resolve_plan(problem, routes, column_invariant);
-    q4_linear_swiglu_execute_plan(plan, x, w, out, ws, stream, column_invariant);
+    q4_linear_swiglu_execute_plan(plan, x, w, out, ws, stream, column_invariant, lora);
 }
 
 } // namespace infernix::ops::detail

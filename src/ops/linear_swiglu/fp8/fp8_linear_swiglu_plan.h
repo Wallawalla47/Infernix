@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -19,18 +20,24 @@ namespace infernix::ops::detail {
                                                                      std::int32_t max_tokens);
 
 void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                     cudaStream_t stream);
+                                     cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 void fp8_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                      cudaStream_t stream);
-void fp8_linear_swiglu_matrix_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+                                      cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
+void fp8_linear_swiglu_matrix_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t,
+    const LoraAddend* lora = nullptr);
 // A16ColumnInvariant: one sliced-K schedule (4 K-warps) for every T, so a column's arithmetic does
 // not depend on the call's other columns.
-void fp8_linear_swiglu_invariant_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void fp8_linear_swiglu_invariant_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t,
+    const LoraAddend* lora = nullptr);
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                 WorkspaceArena& workspace, cudaStream_t stream);
+                                 WorkspaceArena& workspace, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 // AllowA8Residual: two E4M3 activation planes into two accumulators (MMA tiles).
 void fp8_linear_swiglu_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                          WorkspaceArena& workspace, cudaStream_t stream);
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 // Qwen3.5-122B-A10B's FP8 shared expert, fp8_e4m3fn_row_f32 [2048,3072] -> [1024,T]: A16 only (its
 // checkpoint keeps the shared expert's activations 16-bit), and one column-invariant schedule family.
@@ -40,6 +47,6 @@ void fp8_linear_swiglu_n2048_invariant_launch(const Tensor& x, const Weight& wei
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

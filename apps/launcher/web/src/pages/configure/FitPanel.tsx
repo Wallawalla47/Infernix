@@ -268,10 +268,19 @@ export function FitCard({
   // The vision tower takes VRAM the default context was sized without (a 27B's default context no
   // longer fits beside it), so turning it on checks at once and offers the context that fits.
   const hadVision = useRef(args.includes("--vision"));
+  // A LoRA adapter's factors take VRAM beside the weights (304 MiB for a rank-32 adapter on a 27B's every
+  // projection), so setting or changing one checks at once too.
+  const loraOf = (list: string[]) => {
+    const at = list.indexOf("--lora");
+    return at >= 0 && at + 1 < list.length ? list[at + 1] : "";
+  };
+  const hadLora = useRef(loraOf(args));
   useEffect(() => {
     const hasVision = args.includes("--vision");
-    if (hasVision && !hadVision.current && !plan.isPending) run();
+    const lora = loraOf(args);
+    if (((hasVision && !hadVision.current) || (lora !== "" && lora !== hadLora.current)) && !plan.isPending) run();
     hadVision.current = hasVision;
+    hadLora.current = lora;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- runs on edits to the parameters only
   }, [args]);
 

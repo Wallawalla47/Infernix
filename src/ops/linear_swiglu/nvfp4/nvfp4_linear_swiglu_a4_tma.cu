@@ -1,33 +1,53 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <stdexcept>
 #include <type_traits>
 
 namespace infernix::ops::detail {
 void launch_nvfp4_linear_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* output,
-                                       cudaStream_t stream) {
+                                       cudaStream_t stream, const LoraAddend* lora) {
     using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4PromptWeightPromotion>, 5120>;
-    launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2},
-                               SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
+    with_lora_epilogue(lora, SwiGluTokenMajorMmaEpilogue{}, [&](auto epilogue) {
+        launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2}, epilogue, stream,
+                                   SwiGluTokenMajorMmaRows<S>{});
+    });
 }
 
 void launch_nvfp4_linear_swiglu_a4_tma_planes(const Nvfp4A4Operands& p, Nvfp4A4Workspace product,
                                               float down_input_scale_divisor, Nvfp4ScaleLayout product_layout,
-                                              cudaStream_t stream, int row_major_from) {
+                                              cudaStream_t stream, int row_major_from, const LoraAddend* lora,
+                                              __nv_bfloat16* product_out) {
     using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4PromptWeightPromotion>, 5120>;
     const auto run = [&]<Nvfp4ScaleLayout Layout>(std::integral_constant<Nvfp4ScaleLayout, Layout>) {
-        SwiGluA4PlanesEpilogue<1, Layout> epilogue{};
-        epilogue.row_major_from      = row_major_from;
-        epilogue.codes               = product.codes;
-        epilogue.scales              = product.scales;
-        epilogue.code_plane          = 0;
-        epilogue.scale_plane         = 0;
-        epilogue.input_scale_divisor = down_input_scale_divisor;
-        epilogue.down_input_rows     = p.rows / 2;
-        launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{nullptr, p.rows / 2}, epilogue, stream,
-                                   SwiGluTokenMajorMmaRows<S>{});
+        const auto fill = [&](auto& epilogue) {
+            epilogue.row_major_from      = row_major_from;
+            epilogue.codes               = product.codes;
+            epilogue.scales              = product.scales;
+            epilogue.code_plane          = 0;
+            epilogue.scale_plane         = 0;
+            epilogue.input_scale_divisor = down_input_scale_divisor;
+            epilogue.down_input_rows     = p.rows / 2;
+        };
+        if (product_out == nullptr) {
+            if (lora != nullptr) {
+                throw std::invalid_argument("nvfp4 linear_swiglu TMA planes: an adapter needs the stored product");
+            }
+            SwiGluA4PlanesEpilogue<1, Layout> epilogue{};
+            fill(epilogue);
+            launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{nullptr, p.rows / 2}, epilogue, stream,
+                                       SwiGluTokenMajorMmaRows<S>{});
+            return;
+        }
+        SwiGluA4PlanesProductEpilogue<1, Layout> epilogue{};
+        fill(epilogue);
+        epilogue.product = product_out;
+        with_lora_epilogue(lora, epilogue, [&](auto e) {
+            launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{nullptr, p.rows / 2}, e, stream,
+                                       SwiGluTokenMajorMmaRows<S>{});
+        });
     };
     if (product.terms != 1 ||
         product.scale_bytes < static_cast<std::size_t>(nvfp4_a4_padded_tokens(p.tokens)) * (p.rows / 32)) {
@@ -44,11 +64,13 @@ void launch_nvfp4_linear_swiglu_a4_tma_planes(const Nvfp4A4Operands& p, Nvfp4A4W
 }
 
 void launch_nvfp4_linear_swiglu_a4_residual_tma(const Nvfp4A4Operands& p, __nv_bfloat16* output,
-                                                cudaStream_t stream) {
+                                                cudaStream_t stream, const LoraAddend* lora) {
     using S = Nvfp4ScheduleInstance<
         Nvfp4A4TmaMmaSchedule<128, 3, 1, CU_TENSOR_MAP_L2_PROMOTION_NONE, kNvfp4A4ResidualTerms>,
         5120>;
-    launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2},
-                               SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
+    with_lora_epilogue(lora, SwiGluTokenMajorMmaEpilogue{}, [&](auto epilogue) {
+        launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2}, epilogue, stream,
+                                   SwiGluTokenMajorMmaRows<S>{});
+    });
 }
 } // namespace infernix::ops::detail

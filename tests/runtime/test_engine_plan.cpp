@@ -88,6 +88,29 @@ int main() {
                           "a refused capacity plans the smallest reservation and leaves nothing");
     }
 
+    // ---- the draft screen and a LoRA adapter beside the weights: in planned_bytes, both ways ----
+    {
+        EnginePlan plan;
+        plan.vram.weights_bytes      = 20000;
+        plan.vram.draft_screen_bytes = 3000;
+        plan.vram.adapter_bytes      = 2000;
+        const SequenceCapacityCurve curve = curve_for(8192, 1);
+        // A start's free memory after the weights also excludes them (allocated before the KV sizing).
+        const std::size_t free_bytes = planned_free_after_weights(60000, plan.vram.weights_bytes, 5000);
+        failures += check(free_bytes == 35000, "the free memory a start sizes against excludes the screen and adapter");
+        const auto resolved = plan_capacity(plan, KvCapacityPolicy::automatic(), curve, free_bytes, 1000);
+        failures += check(resolved && plan.vram.planned_bytes == 20000 + 3000 + 2000 + resolved->runtime_reservation_bytes,
+                          "planned bytes: weights, screen, adapter and the reservation");
+        EnginePlan refused;
+        refused.vram.weights_bytes = 20000;
+        refused.vram.adapter_bytes = 2000;
+        const SequenceCapacityCurve large = curve_for(65536, 1);
+        (void)plan_capacity(refused, KvCapacityPolicy::automatic(), large, 40000, 1000);
+        failures += check(!refused.fits &&
+                              refused.vram.planned_bytes == 20000 + 2000 + large.minimum_device_reservation_bytes,
+                          "a refused plan counts the adapter beside the smallest reservation");
+    }
+
     // ---- an explicit capacity carries no headroom; the first refusal is kept ----
     {
         EnginePlan plan;

@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "ops/linear/q5/q5_simt_launch.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -13,22 +14,25 @@ namespace infernix::ops::detail {
 namespace {
 
 template <int Cols, int Stride>
-void launch_split2(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
+void launch_split2(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream,
+                   const LoraAddend* lora) {
     using Schedule    = Q5A16DirectSimtSchedule<1, Cols, 2, 8, 16, Stride, true>;
     auto* data        = static_cast<__nv_bfloat16*>(residual_out.data);
     const auto stride = std::int64_t(residual_out.nb[1] / sizeof(__nv_bfloat16));
-    launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, w),
-                                        LinearBf16StridedOutput{data, stride, 0},
-                                        LinearResidualAddEpilogue{{data, stride, 0}}, stream,
-                                        pdl::Dependency::Programmatic); // candidates §58
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, stride, 0}}, [&](auto epilogue) {
+        launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, w), LinearBf16StridedOutput{data, stride, 0},
+                                            epilogue, stream,
+                                            pdl::Dependency::Programmatic); // candidates §58
+    });
 }
 
 template <int Cols>
-void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
+void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream,
+                    const LoraAddend* lora) {
     if (w.k == 6144) {
-        launch_split2<Cols, 6144>(x, w, residual_out, stream);
+        launch_split2<Cols, 6144>(x, w, residual_out, stream, lora);
     } else if (w.k == 17408) {
-        launch_split2<Cols, 17408>(x, w, residual_out, stream);
+        launch_split2<Cols, 17408>(x, w, residual_out, stream, lora);
     } else {
         throw std::invalid_argument("q5 linear_add split2: unsupported exact K");
     }
@@ -54,8 +58,8 @@ void dispatch_cols(std::int32_t cols, Launch&& launch) {
 } // namespace
 
 void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                       cudaStream_t stream) {
-    dispatch_cols(x.ne[1], [&]<int Cols>() { dispatch_shape<Cols>(x, w, residual_out, stream); });
+                                       cudaStream_t stream, const LoraAddend* lora) {
+    dispatch_cols(x.ne[1], [&]<int Cols>() { dispatch_shape<Cols>(x, w, residual_out, stream, lora); });
     CUDA_CHECK(cudaGetLastError());
 }
 

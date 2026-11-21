@@ -36,6 +36,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-stripe"},
     ServeOptionArity{"--expert-state"},
     ServeOptionArity{"--chat-template"},
+    ServeOptionArity{"--lora"},
     ServeOptionArity{"--claude-code-prompt"},
     ServeOptionArity{"--rope-yarn-factor"},
     ServeOptionArity{"--max-context"},
@@ -407,6 +408,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             other name is 404 model_not_found)\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
            "                             startup; must match a template the target accepts\n"
+           "  --lora PATH                apply a LoRA adapter at runtime: a Hugging Face PEFT\n"
+           "                             adapter directory (or its adapter_model.safetensors,\n"
+           "                             adapter_config.json beside it). Every attention and\n"
+           "                             dense MLP projection it targets computes W x + s B(A x)\n"
+           "                             exactly; the artifact is unchanged. Qwen3.5 dense models\n"
+           "                             (the 27Bs); --lossless computes it as PEFT does (docs/lora.md)\n"
            "  --claude-code-prompt as-sent|local\n"
            "                             Anthropic Messages from Claude Code: keep its system\n"
            "                             prompt (as-sent, default) or replace its Claude-\n"
@@ -841,6 +848,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.chat_template_path.empty()) {
                 throw std::invalid_argument("--chat-template must not be empty");
             }
+        } else if (arg == "--lora") {
+            options.lora_path = std::filesystem::path(std::string(require_value("--lora")));
+            if (options.lora_path.empty()) { throw std::invalid_argument("--lora must not be empty"); }
         } else if (arg == "--claude-code-prompt") {
             const std::string_view value = require_value("--claude-code-prompt");
             if (value == "as-sent") {

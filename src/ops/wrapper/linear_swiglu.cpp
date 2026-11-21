@@ -105,16 +105,28 @@ bool dense_mlp_fused_rmsnorm_nvfp4_eligible(const Weight& gate_up_weight, Linear
            down_weight.k == 17408;
 }
 
-std::size_t dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(std::int32_t max_tokens) {
-    if (max_tokens < 1) {
-        throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4 workspace: invalid token extent");
+std::size_t dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(std::int32_t max_tokens, std::int32_t lora_gate_up_rows,
+                                                          std::int32_t lora_down_rows) {
+    if (max_tokens < 1 || lora_gate_up_rows < 0 || lora_down_rows < 0) {
+        throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4 workspace: invalid token extent or LoRA rows");
     }
-    return detail::nvfp4_dense_mlp_fused_rmsnorm_workspace_bytes(max_tokens);
+    return detail::nvfp4_dense_mlp_fused_rmsnorm_workspace_bytes(max_tokens, lora_gate_up_rows, lora_down_rows);
 }
 
 void dense_mlp_fused_rmsnorm_nvfp4(Tensor& residual, const Tensor& norm_weight, float eps, const Weight& gate_up_weight,
                                    const Weight& down_weight, LinearPolicy policy, WorkspaceArena& ws,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const LoraSite* gate_up_lora, const LoraSite* down_lora) {
+    // A site's U is the Op's own (it sets addend.u); the rest must describe the parent's term over A's rows.
+    const auto validate_site = [&](const LoraSite& site, std::int32_t parent_rows, std::int32_t input_rows) {
+        LoraAddend addend = site.addend;
+        addend.u          = site.a.a;
+        if (site.a.a == nullptr || site.a.k != input_rows || addend.u_rows != site.a.rows) {
+            throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4: a LoRA site's A does not match its input");
+        }
+        validate_lora_addend(addend, parent_rows, residual.ne[1]);
+    };
+    if (gate_up_lora != nullptr) { validate_site(*gate_up_lora, 34816, 5120); }
+    if (down_lora != nullptr) { validate_site(*down_lora, 5120, 17408); }
     const std::int32_t tokens = residual.ne[1];
     if (!dense_mlp_fused_rmsnorm_nvfp4_eligible(gate_up_weight, policy, down_weight, policy, tokens)) {
         throw std::invalid_argument("dense_mlp_fused_rmsnorm_nvfp4: unsupported projections, policy or T");
@@ -134,7 +146,7 @@ void dense_mlp_fused_rmsnorm_nvfp4(Tensor& residual, const Tensor& norm_weight, 
     (void)detail::validate_nvfp4_weight(gate_up_weight, "dense_mlp_fused_rmsnorm_nvfp4 gate/up");
     (void)detail::validate_nvfp4_weight(down_weight, "dense_mlp_fused_rmsnorm_nvfp4 down");
     detail::nvfp4_dense_mlp_fused_rmsnorm_launch(residual, norm_weight, eps, gate_up_weight, down_weight, policy, ws,
-                                                 stream);
+                                                 stream, gate_up_lora, down_lora);
 }
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -144,8 +156,15 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                                                   LinearPolicy::A16Only, min_tokens, max_tokens);
 }
 
+bool linear_swiglu_lora_supported(QType qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+                                  LinearPolicy policy) {
+    (void)policy; // every route of these formats takes the term
+    return gate_up_rows == 34816 && input_rows == 5120 &&
+           (qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::Q4_G64_FP16);
+}
+
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes) {
+                   WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes, const LoraAddend* lora) {
     validate_policy(policy);
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("linear_swiglu: invalid route flags");
@@ -153,14 +172,28 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
+    if (lora != nullptr) {
+        if (!linear_swiglu_lora_supported(gate_up_weight.qtype, gate_up_weight.n, gate_up_weight.k, policy)) {
+            throw std::invalid_argument("linear_swiglu: this gate/up parent takes no LoRA term");
+        }
+        validate_lora_addend(*lora, gate_up_weight.n, x.ne[1]);
+    }
     if (column_invariant(policy) &&
         !linear_swiglu_column_invariant_route(gate_up_weight.qtype, gate_up_weight.n,
                                               gate_up_weight.k)) {
-        // No dedicated column-invariant route: the exact one-column route, once per column.
+        // No dedicated column-invariant route: the exact one-column route, once per column (the term's U column
+        // with it).
         for (std::int32_t column = 0; column < x.ne[1]; ++column) {
             const Tensor x_column = x.slice(1, column, 1);
             Tensor out_column     = out.slice(1, column, 1);
-            linear_swiglu(x_column, gate_up_weight, out_column, LinearPolicy::A16Only, ws, stream);
+            LoraAddend column_lora;
+            if (lora != nullptr) {
+                column_lora   = *lora;
+                column_lora.u = static_cast<const std::uint16_t*>(lora->u) +
+                                static_cast<std::int64_t>(column) * lora->u_rows;
+            }
+            linear_swiglu(x_column, gate_up_weight, out_column, LinearPolicy::A16Only, ws, stream,
+                          LinearRoutes::Exact, lora != nullptr ? &column_lora : nullptr);
         }
         return;
     }
@@ -225,13 +258,13 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
     if (fp8_weight) {
         (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
-        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream, lora);
         return;
     }
 
     if (nvfp4_weight) {
         (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
-        detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream, lora);
         return;
     }
 
@@ -243,7 +276,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (q8_weight) {
         detail::q8_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
     } else {
-        detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream, routes, column_invariant(policy));
+        detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream, routes, column_invariant(policy), lora);
     }
 }
 

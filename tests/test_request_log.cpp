@@ -144,6 +144,8 @@ int main() {
                    .handoff_active_bytes    = 0,
                    .handoff_peak_bytes      = 150,
     };
+    memory.draft_screen_bytes                = 357;
+    memory.adapter_bytes                     = 304;
     memory.minimum_runtime_reservation_bytes = 1300;
     memory.kv_capacity_increment_bytes       = 100;
     memory.runtime_reservation_bytes         = 1600;
@@ -281,6 +283,9 @@ int main() {
                           server.at("memory").at("vram_headroom_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
+    failures += check(server.at("memory").at("draft_screen_bytes") == 357 &&
+                          server.at("memory").at("adapter_bytes") == 304,
+                      "server_start memory names the draft screen and the LoRA adapter beside the weights");
     failures += check(!server.at("memory").contains("host_context_capacity_bytes"),
                       "the removed Host context ledger is still reported");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,

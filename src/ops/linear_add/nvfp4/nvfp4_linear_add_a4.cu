@@ -7,6 +7,7 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_tma_tail.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <stdexcept>
 
@@ -46,29 +47,30 @@ constexpr bool uses_tma(std::int32_t tokens) { return tokens > 512; }
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
-                 std::int32_t tokens, cudaStream_t stream) {
-    launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n},
-        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}}, stream,
-        {}, pdl::Dependency::Programmatic);
+                 std::int32_t tokens, cudaStream_t stream, const LoraAddend* lora) {
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, weight.n}}, [&](auto epilogue) {
+        launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
+            LinearBf16Output{data, weight.n}, epilogue, stream, {}, pdl::Dependency::Programmatic);
+    });
 }
 
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
-                    std::int32_t tokens, cudaStream_t stream) {
+                    std::int32_t tokens, cudaStream_t stream, const LoraAddend* lora) {
     if (Geometry::kInputRows == 17408 && tokens <= 8) {
-        launch_gemm<Geometry, M32N32K512>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M32N32K512>(weight, residual, workspace, tokens, stream, lora);
     } else if (tokens <= 64) {
-        launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream, lora);
     } else if (tokens <= 128) {
-        launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream, lora);
     } else if (tokens <= 176) {
-        launch_gemm<Geometry, M64N64Pair>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M64N64Pair>(weight, residual, workspace, tokens, stream, lora);
     } else if (tokens <= 256) {
-        launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream, lora);
     } else { // at most 512 tokens: larger calls take the TMA route
-        launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream, lora);
     }
 }
 
@@ -91,52 +93,49 @@ using ResidualM64N128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1, Cache::cg, 
 // K=17408, RTX 5090).
 template <class Geometry, int Terms>
 void launch_residual_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
-                             std::int32_t tokens, cudaStream_t stream) {
+                             std::int32_t tokens, cudaStream_t stream, const LoraAddend* lora) {
     if (tokens <= 16) {
         if constexpr (Geometry::kInputRows == 17408) {
-            launch_gemm<Geometry, ResidualM16N32K512<Terms>>(weight, residual, workspace, tokens,
-                                                             stream);
+            launch_gemm<Geometry, ResidualM16N32K512<Terms>>(weight, residual, workspace, tokens, stream, lora);
         } else {
-            launch_gemm<Geometry, ResidualM16N64<Terms>>(weight, residual, workspace, tokens,
-                                                         stream);
+            launch_gemm<Geometry, ResidualM16N64<Terms>>(weight, residual, workspace, tokens, stream, lora);
         }
     } else if (tokens <= 64) {
-        launch_gemm<Geometry, ResidualM32N64<Terms>>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, ResidualM32N64<Terms>>(weight, residual, workspace, tokens, stream, lora);
     } else if (tokens <= 128) {
-        launch_gemm<Geometry, ResidualM64N64<Terms>>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, ResidualM64N64<Terms>>(weight, residual, workspace, tokens, stream, lora);
     } else {
-        launch_gemm<Geometry, ResidualM64N128<Terms>>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, ResidualM64N128<Terms>>(weight, residual, workspace, tokens, stream, lora);
     }
 }
 
 template <class Geometry>
 void launch_residual_terms(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
-                           std::int32_t tokens, cudaStream_t stream) {
+                           std::int32_t tokens, cudaStream_t stream, const LoraAddend* lora) {
     if (workspace.terms != kNvfp4A4ResidualTerms) {
         throw std::invalid_argument("nvfp4 linear_add A4 residual: unexpected activation planes");
     }
-    launch_residual_problem<Geometry, kNvfp4A4ResidualTerms>(weight, residual, workspace, tokens,
-                                                             stream);
+    launch_residual_problem<Geometry, kNvfp4A4ResidualTerms>(weight, residual, workspace, tokens, stream, lora);
 }
 
 } // namespace
 
 void nvfp4_linear_add_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                         Nvfp4A4Workspace workspace, cudaStream_t stream) {
+                                         Nvfp4A4Workspace workspace, cudaStream_t stream, const LoraAddend* lora) {
     launch_nvfp4_a4_quantize(x, weight, workspace, Nvfp4ScaleLayout::RowMajor, stream);
-    nvfp4_linear_add_a4_residual_planes_launch(weight, residual, workspace, x.ne[1], stream);
+    nvfp4_linear_add_a4_residual_planes_launch(weight, residual, workspace, x.ne[1], stream, lora);
 }
 
 void nvfp4_linear_add_a4_residual_planes_launch(const Weight& weight, Tensor& residual,
                                                 Nvfp4A4Workspace planes, std::int32_t tokens,
-                                                cudaStream_t stream) {
+                                                cudaStream_t stream, const LoraAddend* lora) {
     Nvfp4A4Workspace& workspace = planes;
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
-        launch_residual_terms<Nvfp4N5120K6144>(weight, residual, workspace, tokens, stream);
+        launch_residual_terms<Nvfp4N5120K6144>(weight, residual, workspace, tokens, stream, lora);
         return;
     case Nvfp4GeometryId::N5120K17408:
-        launch_residual_terms<Nvfp4N5120K17408>(weight, residual, workspace, tokens, stream);
+        launch_residual_terms<Nvfp4N5120K17408>(weight, residual, workspace, tokens, stream, lora);
         return;
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:
@@ -151,19 +150,19 @@ Nvfp4ScaleLayout nvfp4_linear_add_a4_scale_layout(std::int32_t tokens) {
 }
 
 void nvfp4_linear_add_a4_planes_launch(const Weight& weight, Tensor& residual, Nvfp4A4Workspace planes,
-                                       std::int32_t tokens, cudaStream_t stream) {
+                                       std::int32_t tokens, cudaStream_t stream, const LoraAddend* lora) {
     if (planes.terms != 1) { throw std::invalid_argument("nvfp4 linear_add A4: one activation plane"); }
     if (uses_tma(tokens)) {
         launch_nvfp4_a4_tma_linear_add(nvfp4_a4_operands(weight, planes, tokens, Nvfp4ScaleLayout::Tiled256),
-                                       static_cast<__nv_bfloat16*>(residual.data), stream);
+                                       static_cast<__nv_bfloat16*>(residual.data), stream, lora);
         return;
     }
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
-        launch_problem<Nvfp4N5120K6144>(weight, residual, planes, tokens, stream);
+        launch_problem<Nvfp4N5120K6144>(weight, residual, planes, tokens, stream, lora);
         return;
     case Nvfp4GeometryId::N5120K17408:
-        launch_problem<Nvfp4N5120K17408>(weight, residual, planes, tokens, stream);
+        launch_problem<Nvfp4N5120K17408>(weight, residual, planes, tokens, stream, lora);
         return;
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:
@@ -174,23 +173,26 @@ void nvfp4_linear_add_a4_planes_launch(const Weight& weight, Tensor& residual, N
 }
 
 void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                Nvfp4A4Workspace workspace, cudaStream_t stream) {
+                                Nvfp4A4Workspace workspace, cudaStream_t stream, const LoraAddend* lora) {
     const std::int32_t tokens = x.ne[1];
     // ZK-09: the whole 256-token tiles on the TMA route, a remainder past them whose tile would add a wave on the MMA
-    // tiles (nvfp4_tma_tail).
+    // tiles (nvfp4_tma_tail). The term's U columns follow each part.
     if (const std::int32_t tail = nvfp4_tma_tail(tokens, static_cast<std::int32_t>(weight.n), 512);
         tail > 0 && workspace.terms == 1) {
         const std::int32_t wide = tokens - tail;
         launch_nvfp4_a4_quantize(x.slice(1, 0, wide), weight, workspace, Nvfp4ScaleLayout::Tiled256, stream);
-        nvfp4_linear_add_a4_planes_launch(weight, residual, workspace, wide, stream);
+        nvfp4_linear_add_a4_planes_launch(weight, residual, workspace, wide, stream, lora);
         const Nvfp4A4Workspace tail_plane = nvfp4_a4_tail_plane(workspace, weight.k, wide);
         launch_nvfp4_a4_quantize(x.slice(1, wide, tail), weight, tail_plane, Nvfp4ScaleLayout::RowMajor, stream);
         Tensor residual_tail = residual.slice(1, wide, tail);
-        nvfp4_linear_add_a4_planes_launch(weight, residual_tail, tail_plane, tail, stream);
+        LoraAddend tail_lora;
+        if (lora != nullptr) { tail_lora = lora_columns_from(*lora, wide); }
+        nvfp4_linear_add_a4_planes_launch(weight, residual_tail, tail_plane, tail, stream,
+                                          lora != nullptr ? &tail_lora : nullptr);
         return;
     }
     launch_nvfp4_a4_quantize(x, weight, workspace, nvfp4_linear_add_a4_scale_layout(tokens), stream);
-    nvfp4_linear_add_a4_planes_launch(weight, residual, workspace, tokens, stream);
+    nvfp4_linear_add_a4_planes_launch(weight, residual, workspace, tokens, stream, lora);
 }
 
 } // namespace infernix::ops::detail

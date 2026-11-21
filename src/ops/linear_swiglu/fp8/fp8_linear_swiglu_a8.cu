@@ -2,6 +2,7 @@
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -16,15 +17,17 @@ std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
 }
 
 void fp8_linear_swiglu_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
+                                          WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
     auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k, 0, true);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
     const auto launch = [&]<class Schedule>() {
         using S = Fp8ScheduleInstance<Schedule, 5120>;
-        launch_fp8_a8_mma<S>(fp8_a8_operands(weight, scratch, x.ne[1]),
-                             LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2},
-                             SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
+        with_lora_epilogue(lora, SwiGluTokenMajorMmaEpilogue{}, [&](auto epilogue) {
+            launch_fp8_a8_mma<S>(fp8_a8_operands(weight, scratch, x.ne[1]),
+                                 LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2}, epilogue,
+                                 stream, SwiGluTokenMajorMmaRows<S>{});
+        });
     };
     // 32-token tiles to 32 columns and at 65-96 (four waves of 816 CTAs beat three of 544).
     const std::int32_t tokens = x.ne[1];
@@ -35,7 +38,7 @@ void fp8_linear_swiglu_a8_residual_launch(const Tensor& x, const Weight& weight,
 }
 
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                 WorkspaceArena& workspace, cudaStream_t stream) {
+                                 WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
     auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_swiglu_partial_capacity_bytes(x.ne[1]));
@@ -44,12 +47,13 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2};
     const auto launch = [&]<class Schedule>() {
         using S = Fp8ScheduleInstance<Schedule, 5120>;
-        if constexpr (S::kTmaSwizzle)
-            launch_fp8_a8_tma_mma<S>(operands, output, SwiGluTokenMajorMmaEpilogue{}, stream,
-                                     scratch.partials, SwiGluTokenMajorMmaRows<S>{});
-        else
-            launch_fp8_a8_mma<S>(operands, output, SwiGluTokenMajorMmaEpilogue{}, stream,
-                                 SwiGluTokenMajorMmaRows<S>{});
+        with_lora_epilogue(lora, SwiGluTokenMajorMmaEpilogue{}, [&](auto epilogue) {
+            if constexpr (S::kTmaSwizzle)
+                launch_fp8_a8_tma_mma<S>(operands, output, epilogue, stream, scratch.partials,
+                                         SwiGluTokenMajorMmaRows<S>{});
+            else
+                launch_fp8_a8_mma<S>(operands, output, epilogue, stream, SwiGluTokenMajorMmaRows<S>{});
+        });
     };
     if (x.ne[1] <= 16) return launch.template operator()<Fp8A8T16R64K128>();
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R128K128>();
@@ -62,4 +66,5 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
     launch.template operator()<Bulk>();
 }
+
 } // namespace infernix::ops::detail

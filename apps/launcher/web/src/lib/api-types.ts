@@ -641,6 +641,7 @@ export interface MetricsSnapshot {
 export type MemoryPartKey =
   | "weights"
   | "drafter"
+  | "adapter"
   | "experts"
   | "kv_cache"
   | "state"

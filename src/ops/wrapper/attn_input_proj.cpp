@@ -97,8 +97,14 @@ void validate_policy(LinearPolicy policy, QType qtype) {
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const LoraAddend* lora = nullptr) {
     validate_policy(policy, weight.qtype);
+    if (lora != nullptr) {
+        if (!attn_input_proj_lora_supported(weight.qtype, weight.n, weight.k)) {
+            throw std::invalid_argument("attn_input_proj: this parent takes no LoRA term");
+        }
+        validate_lora_addend(*lora, weight.n, x.ne[1]);
+    }
     if (weight.qtype == QType::BF16) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -132,7 +138,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
         }
-        detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
+        detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream, lora);
         return;
     }
 
@@ -154,7 +160,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 attn_input_proj: unsupported weight shape");
         }
-        detail::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
+        detail::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream, lora);
         return;
     }
 
@@ -259,11 +265,19 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                     stream);
 }
 
+bool attn_input_proj_lora_supported(QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows) {
+    return parent_rows == 14336 && input_rows == 5120 && (parent_qtype == QType::NVFP4 || is_fp8_row(parent_qtype));
+}
+
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     LinearPolicy policy, cudaStream_t stream) {
+                     LinearPolicy policy, cudaStream_t stream, const LoraAddend* lora) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("attn_input_proj: invalid compute policy");
+    }
+    if (lora != nullptr) {
+        // The two parents' rows are the single parent's query/key then gate/value halves.
+        validate_lora_addend(*lora, 14336, x.ne[1]);
     }
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
@@ -278,14 +292,14 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                      stream, column_invariant(policy));
+                                      stream, column_invariant(policy), lora);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
-                     WorkspaceArena& workspace, cudaStream_t stream) {
+                     WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
     dispatch_single_parent(x, query_key_gate_value_weight, q, gate, k, v, policy, &workspace,
-                           stream);
+                           stream, lora);
 }
 
 bool attn_input_proj_fused_rmsnorm_nvfp4_eligible(const Weight& weight, LinearPolicy policy,
@@ -298,7 +312,8 @@ bool attn_input_proj_fused_rmsnorm_nvfp4_eligible(const Weight& weight, LinearPo
 void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& norm_weight,
                                          float eps, const Weight& projection_weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
-                                         WorkspaceArena& workspace, cudaStream_t stream) {
+                                         WorkspaceArena& workspace, cudaStream_t stream,
+                                         const LoraSite* lora, const Tensor* normalized) {
     const std::int32_t tokens = residual.ne[1];
     if (!attn_input_proj_fused_rmsnorm_nvfp4_eligible(projection_weight, policy, tokens)) {
         throw std::invalid_argument("fused rmsnorm attn_input_proj: unsupported route");
@@ -318,8 +333,20 @@ void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& n
     require_matrix(k, 1024, tokens, "k");
     require_matrix(v, 1024, tokens, "v");
     detail::validate_nvfp4_weight(projection_weight, "fused rmsnorm attn_input_proj");
+    if (lora != nullptr) {
+        if (normalized == nullptr) {
+            throw std::invalid_argument("fused rmsnorm attn_input_proj: a LoRA site needs the normalized output");
+        }
+        require_matrix(*normalized, 5120, tokens, "normalized");
+        if (lora->a.a == nullptr || lora->a.k != 5120 || lora->a.rows != lora->addend.u_rows) {
+            throw std::invalid_argument("fused rmsnorm attn_input_proj: LoRA A does not match the input");
+        }
+        LoraAddend addend = lora->addend;
+        addend.u          = lora->a.a; // the call binds U in its workspace
+        validate_lora_addend(addend, projection_weight.n, tokens);
+    }
     detail::nvfp4_attn_input_fused_rmsnorm_launch(residual, norm_weight, eps, projection_weight, q,
-                                                  gate, k, v, workspace, stream);
+                                                  gate, k, v, workspace, stream, lora, normalized);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

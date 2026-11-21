@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 
 #include <cuda_runtime.h>
@@ -20,22 +21,28 @@ namespace infernix::ops::detail {
 // A16ColumnInvariant: one sliced-K schedule family (8 K-warps) for every T, so a column's
 // arithmetic does not depend on the call's other columns.
 void nvfp4_attn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                       Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+                                       Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                 Tensor& k, Tensor& v, cudaStream_t stream);
+                                 Tensor& k, Tensor& v, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 // A8Only: x encoded by ggml_a8.h's codec, then the 8-bit tiles (nvfp4_attn_input_a8.cu).
 void nvfp4_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                                Tensor& v, WorkspaceArena& workspace, cudaStream_t stream);
+                                Tensor& v, WorkspaceArena& workspace, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                    Tensor& k, Tensor& v, cudaStream_t stream);
+                                    Tensor& k, Tensor& v, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                     Tensor& k, Tensor& v, cudaStream_t stream);
+                                     Tensor& k, Tensor& v, cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, Nvfp4A4Workspace workspace,
-                                cudaStream_t stream);
+                                cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 // Shared by the ordinary A4 launcher and the fused RMSNorm entry: the TMA cutoff and the tiled
 // activation-scale plane that route reads. The quantizer that feeds the TMA route must write the
@@ -60,15 +67,20 @@ void launch_nvfp4_attn_input_fused_rmsnorm_quantize(const Tensor& residual,
                                                     const Tensor& norm_weight, float eps,
                                                     float input_scale_divisor,
                                                     Nvfp4A4Workspace workspace,
-                                                    Nvfp4ScaleLayout layout, cudaStream_t stream);
+                                                    Nvfp4ScaleLayout layout, cudaStream_t stream,
+                                                    void* normalized = nullptr);
 
+// With a LoRA site the norm also stores h to `normalized` (BF16 [5120, T]) and the projection takes the
+// term over U = A h (U in the workspace, before the planes).
 void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor& residual, const Tensor& norm_weight,
                                            float eps, const Weight& weight, Tensor& q, Tensor& gate,
                                            Tensor& k, Tensor& v, WorkspaceArena& workspace,
-                                           cudaStream_t stream);
+                                           cudaStream_t stream, const LoraSite* lora = nullptr,
+                                           const Tensor* normalized = nullptr);
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
-                               cudaStream_t stream);
+                               cudaStream_t stream,
+    const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

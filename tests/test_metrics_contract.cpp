@@ -380,6 +380,7 @@ int main() {
         MetricsJsonSnapshot held = snapshot;
         auto& m                  = held.stats.memory;
         m.device.weights         = 6000;
+        m.device.adapter         = 300;
         m.device.experts         = 24000;
         m.device.expert_frames   = 87;
         m.device.kv              = 1700;
@@ -406,11 +407,13 @@ int main() {
                           "memory.device totals");
         std::vector<std::string> keys;
         for (const Json& part : device["parts"]) { keys.push_back(part["key"].get<std::string>()); }
-        failures += check(keys == std::vector<std::string>{"weights", "experts", "kv_cache", "mtp_kv", "cuda_graphs"},
+        failures += check(keys == std::vector<std::string>{"weights", "adapter", "experts", "kv_cache", "mtp_kv",
+                                                            "cuda_graphs"},
                           "memory.device lists the parts that hold memory, in order");
-        failures += check(device["parts"][3]["bytes"] == 90 && !device["parts"][3].contains("used_bytes"),
+        failures += check(device["parts"][1]["bytes"] == 300, "memory.device names a LoRA adapter's factors");
+        failures += check(device["parts"][4]["bytes"] == 90 && !device["parts"][4].contains("used_bytes"),
                           "memory.device names the MTP drafter's KV pool beside the KV cache");
-        failures += check(device["parts"][1]["count"] == 87 && device["parts"][2]["used_bytes"] == 400 &&
+        failures += check(device["parts"][2]["count"] == 87 && device["parts"][3]["used_bytes"] == 400 &&
                               !device["parts"][0].contains("used_bytes") && !device["parts"][0].contains("count"),
                           "memory.device experts' frames and the KV cache's used pages");
         const Json& host = full["host"];

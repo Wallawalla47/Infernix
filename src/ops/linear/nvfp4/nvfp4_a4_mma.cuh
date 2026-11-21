@@ -9,6 +9,7 @@
 #include "core/pdl.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/vector_output.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -193,6 +194,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     const int row_begin         = static_cast<int>(blockIdx.x) * kRowsPerBlock;
     const int kKTiles           = k / Schedule::kBlockK;
     constexpr int kWaitGroups   = Schedule::kStages - 1;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        lora_prefetch_tile(
+            epilogue.lora, Schedule::kBlockRows, [&](int i) { return row_policy.weight_row(row_begin, i, rows); },
+            token_begin, min(Schedule::kBlockTokens, tokens - token_begin), static_cast<int>(threadIdx.x),
+            Schedule::kThreads);
+    }
 
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
@@ -318,6 +325,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     };
     static_assert(RowPolicy::kContiguous || collective,
                   "reordered rows require a collective epilogue");
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The scaled values (the explicit rounded multiply below), the term, then the epilogue scaling by 1 (exact).
+#pragma unroll
+        for (int mt = 0; mt < Schedule::kMmaTokens; ++mt)
+#pragma unroll
+            for (int mr = 0; mr < Schedule::kMmaRows; ++mr)
+#pragma unroll
+                for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] = __fmul_rn(accumulators[mt][mr][v], alpha);
+        const int token_base = token_begin + warp_m * Schedule::kWarpTokens;
+        lora_add_tokens_tile<Schedule::kMmaTokens, Schedule::kMmaRows>(
+            epilogue.lora, accumulators,
+            [&](int mt, int i) {
+                const int token = token_base + mt * 16 + i;
+                return token < tokens ? token : -1;
+            },
+            [&](int mr, int j) { return row_policy.weight_row(row_begin, warp_n * Schedule::kWarpRows + mr * 8 + j, rows); });
+        alpha = 1.0F;
+    }
     // Scale with an explicit rounded multiply: the residual add after it must not contract into one
     // FMA in the FullTokens instance only, or a column's bits would depend on whether its tile is
     // full (NInfer Neroued/ninfer#374). Every A4 route rounds the product, then the sum.

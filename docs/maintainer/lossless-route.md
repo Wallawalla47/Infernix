@@ -86,6 +86,19 @@ Notation: `bf16(v)` and `fp32(v)` are the correctly rounded value of the exact r
 - shared expert: its MLP, `s = bf16(bf16(sigmoid(bf16(x w_gate))) out_shared)`;
 - `out = bf16(experts + s)`.
 
+**LoRA adapter** (`--lora`; PEFT's `lora.Linear` at v0.17.1 as `PeftModel.from_pretrained` loads it, the
+default `autocast_adapter_dtype=True`): the adapter's factors are upcast to FP32 (BF16 and F16 factors exactly;
+F32 ones as stored), and an adapted projection's input x (BF16) is cast to FP32 (exact). With y = the base
+projection's BF16 output above, A [r, K], B [N, r] and the module's scale s (`lora_alpha / r`, or
+`/ sqrt(r)` with rsLoRA, a Python float): `u = fp32(A x)` and `d = fp32(B u)` (each an exact sum rounded once to
+binary32), `t = fp32(d fp32(s))` (PyTorch multiplies a binary32 tensor by a Python scalar in binary32), and the
+adapted output is `bf16(fp32(y + t))` (the BF16 output promoted exactly, the binary32 sum rounded once, cast back
+to BF16 by PEFT's `result.to(torch_result_dtype)`). It applies to the full-attention q_proj (its query and gate
+rows), k_proj, v_proj and o_proj and to the dense MLP's gate, up and down projections, each before the next
+operation that reads the projection's output (the norms and RoPE, the sigmoid gate, SiLU, the residual add).
+Owner's veto point: this follows PEFT's default load; an adapter loaded with `autocast_adapter_dtype=False`
+would compute in BF16 instead.
+
 **Decoder layer.** `h = bf16(residual + mixer(norm(residual)))`, then the same for the MLP or MoE.
 
 **Head.** `norm(h)`, then logits `fp32(h W_head)` (each an exact sum rounded to binary32: the scoring

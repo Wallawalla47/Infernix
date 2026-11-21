@@ -13,6 +13,7 @@ import {
   HardDrive,
   Image as ImageIcon,
   Layers,
+  Puzzle,
   ScrollText,
   Sparkles,
   Wrench,
@@ -28,6 +29,8 @@ const offloaded = (model: ModelArtifact) => model.offloaded_experts;
 const flashNext = (model: ModelArtifact) => model.needs_ngram_volume;
 const qwen35 = (model: ModelArtifact) => !model.needs_ngram_volume;
 const vision = (model: ModelArtifact) => model.has_vision;
+/** Qwen3.5 with dense MLPs (the 27B): the models --lora adapts. */
+const denseQwen35 = (model: ModelArtifact) => qwen35(model) && !model.num_experts;
 const fp4Local = (model: ModelArtifact) => /fp4[-_]?local/i.test(`${model.recipe ?? ""} ${model.name} ${model.file_name}`);
 /** Flash-Next conversions whose routed experts are NVIDIA's W4A4 NVFP4 (recipe A and Dense8). */
 const w4a4Experts = (model: ModelArtifact) =>
@@ -902,6 +905,25 @@ const ROUTES: FormSection = {
   ],
 };
 
+const LORA: FormSection = {
+  id: "lora",
+  title: "LoRA adapter",
+  description: "A fine-tune applied on top of the model's weights at load",
+  icon: Puzzle,
+  when: denseQwen35,
+  controls: [
+    {
+      kind: "text",
+      flag: "--lora",
+      label: "LoRA adapter",
+      help: "A Hugging Face PEFT LoRA adapter for this base model: its folder (adapter_model.safetensors with adapter_config.json beside it) or the .safetensors file. Plain LoRA on the attention and MLP projections; GGUF adapters are not read. The lossless route computes it as PEFT does.",
+      placeholder: "none",
+      mono: true,
+      wide: true,
+    },
+  ],
+};
+
 const LOGGING: FormSection = {
   id: "logging",
   title: "Logging and diagnostics",
@@ -989,6 +1011,7 @@ export const FORM_SECTIONS: readonly FormSection[] = [
   SAMPLING,
   VISION,
   ROUTES,
+  LORA,
   LOGGING,
 ];
 

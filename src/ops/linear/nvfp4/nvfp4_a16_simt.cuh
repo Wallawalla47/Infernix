@@ -245,6 +245,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
         parent[r] = nvfp4_a16_parent_row<Schedule>(rb, local0 + r, rows, policy);
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, Schedule::kBlockTokens>;
+    [[maybe_unused]] LoraStage* lora_stage = nullptr;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The finishing warp's term operands (B rows, U columns) stage in shared memory beside the main loop.
+        __shared__ LoraStage lora_stages[Schedule::kWarpsPerCta / Schedule::kWarpsPerRow];
+        lora_stage = &lora_stages[rg];
+        if (wr == 0) {
+            lora_stage_warp_b(epilogue.lora, parent, *lora_stage);
+            lora_stage_warp_u(epilogue.lora, parent, token0, live, *lora_stage);
+        }
+    }
     float acc[Schedule::kRowsPerWarp][Schedule::kBlockTokens][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_simt_rows<Geometry, ActiveTokens, Schedule>(
         x, codes, scales, shared, alpha, parent, local0, token0, wr, lane, acc, live);
@@ -274,6 +285,20 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                         lane < Schedule::kWarpsPerRow ? shared.partials[rg][r][t][lane] : 0.0f;
                     totals[r][t] = warp_reduce_sum(sum);
                 }
+        }
+    }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The coefficients carry alpha: totals are the scaled values. The finishing warp adds the term (warp-wide).
+        static_assert(Schedule::kBlockTokens <= 8, "LoRA term: at most 8 columns a SIMT tile");
+        if (wr == 0) {
+            float add[Schedule::kRowsPerWarp][Schedule::kBlockTokens];
+            bool has[Schedule::kRowsPerWarp];
+            lora_warp_rows_staged<Schedule::kRowsPerWarp, Schedule::kBlockTokens>(epilogue.lora, parent, token0, live,
+                                                                                add, has, *lora_stage);
+#pragma unroll
+            for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+#pragma unroll
+                for (int t = 0; t < Schedule::kBlockTokens; ++t) totals[r][t] = lora_add(totals[r][t], add[r][t], has[r]);
         }
     }
     if (wr == 0 && lane == 0) {

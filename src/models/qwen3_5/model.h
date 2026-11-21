@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen3_5/load/lora.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen3_5/weights.h"
 #include "infernix/ops/weight_input.h"
@@ -78,6 +79,9 @@ public:
     [[nodiscard]] bool offloaded_experts() const noexcept { return !expert_banks_.empty(); }
     // The pinned routed banks' CSF tables (runtime::expert_offload::compress_banks; empty: the records as stored).
     [[nodiscard]] const runtime::expert_offload::CsfTables& csf_tables() const noexcept { return csf_tables_; }
+    // The LoRA adapter (LoadOptions::lora) bound to the text layers, or null. Its factors are read from the adapter's
+    // file by execution::Parameters, which owns their device form.
+    [[nodiscard]] const LoraBinding* lora() const noexcept { return lora_ ? &*lora_ : nullptr; }
     // With LoadOptions::stream_experts: where each routed record lies in the artifact (the SSD tier
     // reads them in place); null otherwise.
     [[nodiscard]] const runtime::expert_offload::ExpertStore* expert_store() const noexcept {
@@ -96,7 +100,7 @@ private:
           std::vector<runtime::expert_offload::ExpertBank> shared_expert_banks,
           std::vector<std::vector<float>> shared_expert_multipliers,
           std::optional<runtime::expert_offload::ExpertStore> expert_store,
-          runtime::expert_offload::CsfTables csf_tables);
+          runtime::expert_offload::CsfTables csf_tables, std::optional<LoraBinding> lora);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     std::optional<VisionOverlayAssets> overlay_vision_;
@@ -114,6 +118,7 @@ private:
     // Owns the streamed banks' multipliers (their planes point into it).
     std::optional<runtime::expert_offload::ExpertStore> expert_store_;
     runtime::expert_offload::CsfTables csf_tables_; // expert_banks_' CSF tables
+    std::optional<LoraBinding> lora_;
 };
 
 } // namespace infernix::models::qwen3_5

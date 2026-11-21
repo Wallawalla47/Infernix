@@ -187,4 +187,31 @@ struct SwiGluA4PlanesEpilogue : SwiGluTokenMajorMmaEpilogue {
         }
     }
 };
+// The planes epilogue that also stores the BF16 product, the bytes SwiGluTokenMajorMmaEpilogue stores: the fused dense
+// MLP with a LoRA adapter, whose down projection's shrink reads the product (`product`, [T][down_input_rows]).
+template <int Terms, Nvfp4ScaleLayout Layout = Nvfp4ScaleLayout::RowMajor>
+struct SwiGluA4PlanesProductEpilogue : SwiGluA4PlanesEpilogue<Terms, Layout> {
+    __nv_bfloat16* product = nullptr;
+
+    template <class S, bool Full, class Output>
+    __device__ __forceinline__ void
+    finish_tile(Output output, unsigned char* scratch, float (&acc)[S::kMmaTokens][S::kMmaRows][4], int row_begin,
+                int token_begin, int rows, int token_end) const {
+        // The planes first; the staged tile stays in `scratch` (nothing writes it after stage()).
+        SwiGluA4PlanesEpilogue<Terms, Layout>::template finish_tile<S, Full>(output, scratch, acc, row_begin,
+                                                                            token_begin, rows, token_end);
+        constexpr int tile_rows = S::kBlockRows / 2;
+        constexpr int stride    = tile_rows + 8;
+        constexpr int threads   = S::kThreads - SwiGluTokenMajorMmaEpilogue::kProducers<S>;
+        const int tid           = static_cast<int>(threadIdx.x) - SwiGluTokenMajorMmaEpilogue::kProducers<S>;
+        const auto* final_tile  = reinterpret_cast<const __nv_bfloat16*>(scratch);
+        const LinearBf16Output stored{product, this->down_input_rows};
+        for (int item = tid; item < S::kBlockTokens * (tile_rows / 8); item += threads) {
+            const int token = item / (tile_rows / 8), row = (item % (tile_rows / 8)) * 8;
+            if (Full || token_begin + token < token_end)
+                linear_store_bf16_vector(stored, row_begin + row, token_begin + token,
+                                         load_vec<uint4>(final_tile + token * stride + row));
+        }
+    }
+};
 } // namespace infernix::ops::detail

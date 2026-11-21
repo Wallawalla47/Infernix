@@ -1,16 +1,30 @@
 #pragma once
 
 #include "core/device.h"
+#include "infernix/ops/lora.h"
 #include "models/qwen3_5/execution/parameters.h"
+
+#include <optional>
 
 namespace infernix::models::qwen3_5::execution {
 
+// Bytes of one BF16 [rows, columns] arena allocation (a LoRA U).
+[[nodiscard]] std::size_t lora_u_bytes(std::int32_t rows, std::int32_t columns);
+
+// The projection's workspace for every T in [first, last], with a LoRA input's U (--lora) before it.
 [[nodiscard]] std::size_t
 attention_projection_workspace_bytes(const AttentionParameters& parameters, std::int32_t first,
                                      std::int32_t last);
+// With --lora (parameters.lora_input) the projection also takes q_proj/k_proj/v_proj's term over U = A hidden,
+// allocated from `workspace` first.
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream);
+// --lora: o_proj's term over U = A input (input: the gated attention output of exactly the columns the output
+// projection runs over), U allocated from `workspace`; nullopt without an o_proj adapter.
+[[nodiscard]] std::optional<ops::LoraAddend> attention_output_lora(const AttentionParameters& parameters,
+                                                                   const Tensor& input, WorkspaceArena& workspace,
+                                                                   cudaStream_t stream);
 
 void text_rope(const Tensor& positions, const RopeConfig& config, const ops::PreparedRope& prepared,
                Tensor& query, DeviceExecutionView execution);

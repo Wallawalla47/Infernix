@@ -6,6 +6,7 @@
 #include "ops/linear/common/vector_output.cuh"
 #include "ops/linear/fp8/fp8_operands.h"
 #include "ops/linear/fp8/fp8_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <type_traits>
 
@@ -171,70 +172,62 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
     const int accumulator_row   = 2 * (lane & 3);
     constexpr int output_stride = BN + 8;
     auto* shared_output         = reinterpret_cast<__nv_bfloat16*>(shared_raw);
-#pragma unroll
-    for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-        const int token0 =
-            token_begin + warp_token * Schedule::kWarpTokens + mma_token * 16 + accumulator_token;
-        const int token1 = token0 + 8;
-        // A16 tiles carry unscaled activations and pass no per-token scales.
-        const auto activation_scale = [&](int token) {
-            if constexpr (kTokenScales) {
-                return (FullTokens || token < tokens) ? __ldg(activation_scales + token) : 0.0F;
-            } else {
-                return 1.0F;
-            }
-        };
-        const float activation_scale0 = activation_scale(token0);
-        const float activation_scale1 = activation_scale(token1);
+    constexpr bool kLora = kLoraEpilogue<Epilogue>;
+    if constexpr (kLora && !collective) {
+        // --lora, a fragment-wise epilogue: per fragment column its term operands, then per fragment the scaled
+        // values plus the term, finished and stored at once, so the accumulators retire as they go (the operations
+        // of each element are the scaling pass's, lora_add_tokens_tile's and the epilogue's, as in the else branch).
+        const int token_base = token_begin + warp_token * Schedule::kWarpTokens;
 #pragma unroll
         for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-            const int local_row0  = warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;
+            const int column_row  = warp_row * Schedule::kWarpRows + mma_row * 8;
+            const int local_row0  = column_row + accumulator_row;
             const int parent_row0 = row_policy.weight_row(row_begin, local_row0, rows);
             const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1, rows);
-            const float2 weight_scale = [&] {
-                if constexpr (requires { RowPolicy::kUnscaled; }) {
-                    return make_float2(1.0F, 1.0F);
-                } else {
-                    if constexpr (requires { RowPolicy::kContiguousPairs; }) {
-                        if constexpr (RowPolicy::kContiguousPairs) {
-                            if constexpr (std::is_same_v<Scale, float>)
-                                return load_ldg<float2>(weight_scales + parent_row0);
-                            else
-                                return bf16x2_bits_to_float2(
-                                    load_ldg<std::uint32_t>(weight_scales + parent_row0));
-                        }
+            float2 weight_scale   = make_float2(1.0F, 1.0F);
+            if constexpr (!requires { RowPolicy::kUnscaled; }) {
+                weight_scale = make_float2(fp8_widen(weight_scales[parent_row0]),
+                                           fp8_widen(weight_scales[parent_row1]));
+            }
+            const LoraTokensColumn column = lora_tokens_column(
+                epilogue.lora, row_policy.weight_row(row_begin, column_row, rows),
+                row_policy.weight_row(row_begin, column_row + accumulator_token, rows));
+#pragma unroll
+            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+                const int token0 = token_base + mma_token * 16 + accumulator_token;
+                const int token1 = token0 + 8;
+                const auto activation_scale = [&](int token) {
+                    if constexpr (kTokenScales) {
+                        return (FullTokens || token < tokens) ? __ldg(activation_scales + token) : 0.0F;
+                    } else {
+                        return 1.0F;
                     }
-                    return make_float2(fp8_widen(weight_scales[parent_row0]),
-                                       fp8_widen(weight_scales[parent_row1]));
+                };
+                const float activation_scale0 = activation_scale(token0);
+                const float activation_scale1 = activation_scale(token1);
+                const auto& acc = accumulators[mma_token][mma_row];
+                float value00   = __fmul_rn(__fmul_rn(acc[0], activation_scale0), weight_scale.x);
+                float value01   = __fmul_rn(__fmul_rn(acc[1], activation_scale0), weight_scale.y);
+                float value10   = __fmul_rn(__fmul_rn(acc[2], activation_scale1), weight_scale.x);
+                float value11   = __fmul_rn(__fmul_rn(acc[3], activation_scale1), weight_scale.y);
+                if (column.uo >= 0) {
+                    float c[4];
+                    lora_tokens_fragment(epilogue.lora, column, token0 < tokens ? token0 : -1,
+                                         token1 < tokens ? token1 : -1, c);
+                    value00 = __fadd_rn(value00, __fmul_rn(c[0], column.scale));
+                    value01 = __fadd_rn(value01, __fmul_rn(c[1], column.scale));
+                    value10 = __fadd_rn(value10, __fmul_rn(c[2], column.scale));
+                    value11 = __fadd_rn(value11, __fmul_rn(c[3], column.scale));
                 }
-            }();
-            // Scale with explicit rounded multiplies: a residual add after them must not contract
-            // into one FMA in the FullTokens instance only, or a token's bits would depend on
-            // whether its tile is full (upstream Neroued/ninfer#374). Every route that finishes
-            // here, and the TMA split-K reduce, rounds the products, then the sum.
-            float value00 = __fmul_rn(
-                __fmul_rn(accumulators[mma_token][mma_row][0], activation_scale0), weight_scale.x);
-            float value01 = __fmul_rn(
-                __fmul_rn(accumulators[mma_token][mma_row][1], activation_scale0), weight_scale.y);
-            float value10 = __fmul_rn(
-                __fmul_rn(accumulators[mma_token][mma_row][2], activation_scale1), weight_scale.x);
-            float value11 = __fmul_rn(
-                __fmul_rn(accumulators[mma_token][mma_row][3], activation_scale1), weight_scale.y);
-            if constexpr (collective) {
-                accumulators[mma_token][mma_row][0] = value00;
-                accumulators[mma_token][mma_row][1] = value01;
-                accumulators[mma_token][mma_row][2] = value10;
-                accumulators[mma_token][mma_row][3] = value11;
-            } else {
                 if (FullTokens || token0 < tokens) {
-                    const float2 value = fp8_apply_row_pair(epilogue, parent_row0, parent_row1,
-                                                            token0, make_float2(value00, value01));
+                    const float2 value = fp8_apply_row_pair(epilogue, parent_row0, parent_row1, token0,
+                                                            make_float2(value00, value01));
                     value00            = value.x;
                     value01            = value.y;
                 }
                 if (FullTokens || token1 < tokens) {
-                    const float2 value = fp8_apply_row_pair(epilogue, parent_row0, parent_row1,
-                                                            token1, make_float2(value10, value11));
+                    const float2 value = fp8_apply_row_pair(epilogue, parent_row0, parent_row1, token1,
+                                                            make_float2(value10, value11));
                     value10            = value.x;
                     value11            = value.y;
                 }
@@ -244,6 +237,129 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     shared_output + (token1 - token_begin) * output_stride + local_row0);
                 *destination0 = __floats2bfloat162_rn(value00, value01);
                 *destination1 = __floats2bfloat162_rn(value10, value11);
+            }
+        }
+    } else {
+        // --lora with a collective epilogue: the loop below first runs as the scaling pass (the same rounded
+        // multiplies), the term is added to the scaled values, and the loop then runs again with unit scales (exact)
+        // to finish them.
+        if constexpr (kLora) {
+#pragma unroll
+            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+                const int token0 =
+                    token_begin + warp_token * Schedule::kWarpTokens + mma_token * 16 + accumulator_token;
+                const int token1 = token0 + 8;
+                const auto activation_scale = [&](int token) {
+                    if constexpr (kTokenScales) {
+                        return (FullTokens || token < tokens) ? __ldg(activation_scales + token) : 0.0F;
+                    } else {
+                        return 1.0F;
+                    }
+                };
+                const float activation_scale0 = activation_scale(token0);
+                const float activation_scale1 = activation_scale(token1);
+#pragma unroll
+                for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
+                    const int local_row0  = warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;
+                    const int parent_row0 = row_policy.weight_row(row_begin, local_row0, rows);
+                    const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1, rows);
+                    float2 weight_scale   = make_float2(1.0F, 1.0F);
+                    if constexpr (!requires { RowPolicy::kUnscaled; }) {
+                        weight_scale = make_float2(fp8_widen(weight_scales[parent_row0]),
+                                                   fp8_widen(weight_scales[parent_row1]));
+                    }
+                    auto& acc = accumulators[mma_token][mma_row];
+                    acc[0]    = __fmul_rn(__fmul_rn(acc[0], activation_scale0), weight_scale.x);
+                    acc[1]    = __fmul_rn(__fmul_rn(acc[1], activation_scale0), weight_scale.y);
+                    acc[2]    = __fmul_rn(__fmul_rn(acc[2], activation_scale1), weight_scale.x);
+                    acc[3]    = __fmul_rn(__fmul_rn(acc[3], activation_scale1), weight_scale.y);
+                }
+            }
+            const int token_base = token_begin + warp_token * Schedule::kWarpTokens;
+            lora_add_tokens_tile<Schedule::kMmaTokens, Schedule::kMmaRows>(
+                epilogue.lora, accumulators,
+                [&](int mt, int i) {
+                    const int token = token_base + mt * 16 + i;
+                    return token < tokens ? token : -1;
+                },
+                [&](int mr, int j) {
+                    return row_policy.weight_row(row_begin, warp_row * Schedule::kWarpRows + mr * 8 + j, rows);
+                });
+        }
+#pragma unroll
+        for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+            const int token0 =
+                token_begin + warp_token * Schedule::kWarpTokens + mma_token * 16 + accumulator_token;
+            const int token1 = token0 + 8;
+            // A16 tiles carry unscaled activations and pass no per-token scales.
+            const auto activation_scale = [&](int token) {
+                if constexpr (kTokenScales && !kLora) {
+                    return (FullTokens || token < tokens) ? __ldg(activation_scales + token) : 0.0F;
+                } else {
+                    return 1.0F;
+                }
+            };
+            const float activation_scale0 = activation_scale(token0);
+            const float activation_scale1 = activation_scale(token1);
+#pragma unroll
+            for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
+                const int local_row0  = warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;
+                const int parent_row0 = row_policy.weight_row(row_begin, local_row0, rows);
+                const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1, rows);
+                const float2 weight_scale = [&] {
+                    if constexpr (kLora || requires { RowPolicy::kUnscaled; }) {
+                        return make_float2(1.0F, 1.0F);
+                    } else {
+                        if constexpr (requires { RowPolicy::kContiguousPairs; }) {
+                            if constexpr (RowPolicy::kContiguousPairs) {
+                                if constexpr (std::is_same_v<Scale, float>)
+                                    return load_ldg<float2>(weight_scales + parent_row0);
+                                else
+                                    return bf16x2_bits_to_float2(
+                                        load_ldg<std::uint32_t>(weight_scales + parent_row0));
+                            }
+                        }
+                        return make_float2(fp8_widen(weight_scales[parent_row0]),
+                                           fp8_widen(weight_scales[parent_row1]));
+                    }
+                }();
+                // Scale with explicit rounded multiplies: a residual add after them must not contract
+                // into one FMA in the FullTokens instance only, or a token's bits would depend on
+                // whether its tile is full (upstream Neroued/ninfer#374). Every route that finishes
+                // here, and the TMA split-K reduce, rounds the products, then the sum.
+                float value00 = __fmul_rn(
+                    __fmul_rn(accumulators[mma_token][mma_row][0], activation_scale0), weight_scale.x);
+                float value01 = __fmul_rn(
+                    __fmul_rn(accumulators[mma_token][mma_row][1], activation_scale0), weight_scale.y);
+                float value10 = __fmul_rn(
+                    __fmul_rn(accumulators[mma_token][mma_row][2], activation_scale1), weight_scale.x);
+                float value11 = __fmul_rn(
+                    __fmul_rn(accumulators[mma_token][mma_row][3], activation_scale1), weight_scale.y);
+                if constexpr (collective) {
+                    accumulators[mma_token][mma_row][0] = value00;
+                    accumulators[mma_token][mma_row][1] = value01;
+                    accumulators[mma_token][mma_row][2] = value10;
+                    accumulators[mma_token][mma_row][3] = value11;
+                } else {
+                    if (FullTokens || token0 < tokens) {
+                        const float2 value = fp8_apply_row_pair(epilogue, parent_row0, parent_row1,
+                                                                token0, make_float2(value00, value01));
+                        value00            = value.x;
+                        value01            = value.y;
+                    }
+                    if (FullTokens || token1 < tokens) {
+                        const float2 value = fp8_apply_row_pair(epilogue, parent_row0, parent_row1,
+                                                                token1, make_float2(value10, value11));
+                        value10            = value.x;
+                        value11            = value.y;
+                    }
+                    auto* destination0 = reinterpret_cast<__nv_bfloat162*>(
+                        shared_output + (token0 - token_begin) * output_stride + local_row0);
+                    auto* destination1 = reinterpret_cast<__nv_bfloat162*>(
+                        shared_output + (token1 - token_begin) * output_stride + local_row0);
+                    *destination0 = __floats2bfloat162_rn(value00, value01);
+                    *destination1 = __floats2bfloat162_rn(value10, value11);
+                }
             }
         }
     }

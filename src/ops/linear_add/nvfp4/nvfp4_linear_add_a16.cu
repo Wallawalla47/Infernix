@@ -2,18 +2,21 @@
 #include "ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
 template <int K>
-void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, bool wide_k, cudaStream_t stream) {
+void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, bool wide_k, cudaStream_t stream,
+                   const LoraAddend* lora) {
     const int tokens  = x.ne[1];
     const auto p      = nvfp4_a16_operands(x, weight);
     const auto output = LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
-    const auto epilogue =
+    const auto base_epilogue =
         LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}};
+    with_lora_epilogue(lora, base_epilogue, [&](auto epilogue) {
     if constexpr (K == 6144) {
         if (tokens <= 8) {
             launch_nvfp4_a16_sliced_k_mma<
@@ -52,13 +55,13 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, bool
             return;
         }
         if (tokens <= 128) {
-            launch_nvfp4_a16_mma<
+            launch_nvfp4_a16_mma_any<
                 Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>, 6144>>(
                 p, output, epilogue, stream);
             return;
         }
         {
-            launch_nvfp4_a16_mma<
+            launch_nvfp4_a16_mma_any<
                 Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 6144>>(
                 p, output, epilogue, stream);
             return;
@@ -116,41 +119,43 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, bool
             return;
         }
         if (tokens <= 128) {
-            launch_nvfp4_a16_mma<
+            launch_nvfp4_a16_mma_any<
                 Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<32, 64, 128, 32, 16, 2, 2>, 17408>>(
                 p, output, epilogue, stream);
             return;
         }
         {
-            launch_nvfp4_a16_mma<
+            launch_nvfp4_a16_mma_any<
                 Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 17408>>(
                 p, output, epilogue, stream);
             return;
         }
     }
+    });
 }
 } // namespace
 
 void nvfp4_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                       cudaStream_t stream) {
+                                       cudaStream_t stream, const LoraAddend* lora) {
     // The slice-major ring tile, bit-identical to the sliced-K tiles, where it is faster (2026-10-25): [5120,6144]
     // from 17 columns (0.45-0.68x), [5120,17408] from 32 (1.23x at 17, 1.06x at 24, 0.93x at 32, 0.52-0.85x
     // beyond); the reproducible route's DFlash2 decode +19 %.
     if (x.ne[1] >= (weight.k == 17408 ? 32 : 17)) {
-        nvfp4_linear_add_invariant_ring_launch(x, weight, residual, stream);
+        nvfp4_linear_add_invariant_ring_launch(x, weight, residual, stream, lora);
         return;
     }
-    nvfp4_linear_add_invariant_sliced_launch(x, weight, residual, stream);
+    nvfp4_linear_add_invariant_sliced_launch(x, weight, residual, stream, lora);
 }
 
 namespace {
 template <int KSlices, int K>
 void launch_invariant_ring(const Tensor& x, const Weight& weight, Tensor& residual,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, const LoraAddend* lora) {
     const auto p      = nvfp4_a16_operands(x, weight);
     const auto output = LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
-    const auto epilogue =
+    const auto base_epilogue =
         LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}};
+    with_lora_epilogue(lora, base_epilogue, [&](auto epilogue) {
     // N=5120: 32-row tiles give 160 CTAs a token tile, two an SM; above 64 columns 64-row tiles
     // keep 160 CTAs over two token tiles with half the activation reads.
     if (x.ne[1] <= 32) {
@@ -166,28 +171,33 @@ void launch_invariant_ring(const Tensor& x, const Weight& weight, Tensor& residu
             Nvfp4ScheduleInstance<Nvfp4A16SliceRingSchedule<KSlices, 64, 64, 4, 2, 4, 2>, K>>(
             p, output, epilogue, stream);
     }
+    });
 }
 } // namespace
 
 void nvfp4_linear_add_invariant_ring_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                            cudaStream_t stream) {
+                                            cudaStream_t stream, const LoraAddend* lora) {
     // The K-warp counts of the sliced-K tiles below: 8 at K=6144, 4 at K=17408.
     if (x.ne[1] < 17) throw std::invalid_argument("nvfp4 linear_add ring tile: T must be 17 or more");
-    if (weight.k == 6144) return launch_invariant_ring<8, 6144>(x, weight, residual, stream);
-    if (weight.k == 17408) return launch_invariant_ring<4, 17408>(x, weight, residual, stream);
+    if (weight.k == 6144) return launch_invariant_ring<8, 6144>(x, weight, residual, stream, lora);
+    if (weight.k == 17408) return launch_invariant_ring<4, 17408>(x, weight, residual, stream, lora);
     throw std::invalid_argument("nvfp4 linear_add: unsupported column-invariant problem");
 }
 
 void nvfp4_linear_add_invariant_sliced_launch(const Tensor& x, const Weight& weight,
-                                              Tensor& residual, cudaStream_t stream) {
+                                              Tensor& residual, cudaStream_t stream, const LoraAddend* lora) {
     // Tiles of one K-warp count walk the same K slices and reduce them in the same order, and the
     // MMA's columns are independent: the tile width only sets how many columns share a launch,
     // and wider calls run as 64-column slices.
     const int tokens  = x.ne[1];
     const auto p      = nvfp4_a16_operands(x, weight);
     const auto output = LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
-    const auto epilogue =
+    const auto base_epilogue =
         LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}};
+    if (weight.k != 6144 && weight.k != 17408) {
+        throw std::invalid_argument("nvfp4 linear_add: unsupported column-invariant problem");
+    }
+    with_lora_epilogue(lora, base_epilogue, [&](auto epilogue) {
     if (weight.k == 6144) {
         if (tokens <= 8)
             return launch_nvfp4_a16_sliced_k_mma<
@@ -218,24 +228,24 @@ void nvfp4_linear_add_invariant_sliced_launch(const Tensor& x, const Weight& wei
             Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 4, 2>, 17408>>(p, output, epilogue,
                                                                          stream);
     }
-    throw std::invalid_argument("nvfp4 linear_add: unsupported column-invariant problem");
+    });
 }
 
 void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual, bool wide_k,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[1] == 1) {
-        nvfp4_linear_add_decode_launch(x, weight, residual, stream);
+        nvfp4_linear_add_decode_launch(x, weight, residual, stream, lora);
         return;
     }
     // At K=17408 the SIMT kernel ties the 8 K-warp tile at 3-4 tokens (34-36 us) and loses at 5; it
     // keeps 5 tokens beside the 4 K-warp tiles.
     if (x.ne[1] <= (weight.k == 6144 ? 2 : (wide_k ? 4 : 5))) {
-        nvfp4_linear_add_small_t_launch(x, weight, residual, stream);
+        nvfp4_linear_add_small_t_launch(x, weight, residual, stream, lora);
         return;
     }
     if (weight.k == 6144)
-        launch_matrix<6144>(x, weight, residual, wide_k, stream);
+        launch_matrix<6144>(x, weight, residual, wide_k, stream, lora);
     else
-        launch_matrix<17408>(x, weight, residual, wide_k, stream);
+        launch_matrix<17408>(x, weight, residual, wide_k, stream, lora);
 }
 } // namespace infernix::ops::detail

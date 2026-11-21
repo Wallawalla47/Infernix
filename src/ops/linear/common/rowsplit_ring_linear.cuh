@@ -15,6 +15,7 @@
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_ring.cuh"
 #include "ops/common/token_slices.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -65,8 +66,29 @@ void rowsplit_ring_linear_kernel(const __nv_bfloat16* __restrict__ x, typename F
         return;
     }
 
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B rows and U columns into L2 while the ring runs (consumer threads).
+        lora_prefetch_tile(
+            epilogue.lora, BM, [&](int i) { return row0 + i < rows ? row0 + i : rows - 1; }, token_begin + col0,
+            Full ? BN : min(BN, cols - col0), static_cast<int>(threadIdx.x), Tile::THREADS);
+    }
     float acc[MT][NT][4] = {};
     Ring::consume(acc, k_tiles);
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: the term on each consumer warp's fragments (canonical chains), before any epilogue form below.
+        const int warp = static_cast<int>(threadIdx.x) >> 5;
+        const int wm = warp / Tile::WARPS_N, wn = warp % Tile::WARPS_N;
+        lora_add_rows_tile<MT, NT>(
+            epilogue.lora, acc,
+            [&](int mm, int i) {
+                const int r = row0 + wm * Tile::WM + mm * 16 + i;
+                return r < rows ? r : rows - 1;
+            },
+            [&](int mn, int j) {
+                const int t = col0 + wn * Tile::WN + mn * 8 + j;
+                return t < cols ? token_begin + t : -1;
+            });
+    }
 
     using Schedule = RowSplitRingSchedule<Ring, Tile>;
     if constexpr (requires {

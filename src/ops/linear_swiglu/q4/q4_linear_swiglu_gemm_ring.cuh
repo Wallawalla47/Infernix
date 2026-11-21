@@ -9,6 +9,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_ring.cuh"
 #include "ops/linear/q4/q4_ring_codec.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -16,11 +17,14 @@
 
 namespace infernix::ops::detail {
 
-template <class Cfg, int Stages, int ProducerWarps, bool FullTiles>
+// `lora`: LoraNone, or the term over the gate/up parent's rows (gate rows [0, intermediate), up rows after) and the
+// launch's columns (lora_device.cuh).
+template <class Cfg, int Stages, int ProducerWarps, bool FullTiles, class Lora = LoraNone>
 __global__ __launch_bounds__(RowSplitRing<Cfg, Stages, ProducerWarps>::kThreads, Cfg::MIN_BLOCKS)
 void q4_linear_swiglu_ring_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                                   const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
-                                  std::int32_t intermediate, std::int32_t k, std::int32_t t, std::int32_t padded_k) {
+                                  std::int32_t intermediate, std::int32_t k, std::int32_t t, std::int32_t padded_k,
+                                  Lora lora) {
     using Ring       = RowSplitRing<Cfg, Stages, ProducerWarps>;
     constexpr int BN = Cfg::BN, WN = Cfg::WN, MT = Cfg::MT, NT = Cfg::NT, PM = Cfg::BM / 2;
     static_assert(Cfg::BM % 64 == 0 && Cfg::WM == 64 && MT == 4, "folded gate/up mapping requires 64-row warp tiles");
@@ -42,12 +46,33 @@ void q4_linear_swiglu_ring_kernel(const __nv_bfloat16* __restrict__ x, const std
         return;
     }
 
+    // --lora: a fragment mm of warp row wm holds outputs m0 + 32 wm + 16 (mm & 1) + i, gate (mm < 2) or up rows.
+    const auto lora_row = [m0, intermediate](int wm, int mm, int i) {
+        const int output = m0 + wm * 32 + (mm & 1) * 16 + i;
+        return (output < intermediate ? output : intermediate - 1) + (mm >> 1) * intermediate;
+    };
+    (void)lora_row;
+    if constexpr (kLoraTerm<Lora>) {
+        // The term's B rows and U columns into L2 while the ring runs (consumer threads).
+        lora_prefetch_tile(
+            lora, Cfg::BM, [&](int i) { return lora_row(i >> 6, (i & 63) >> 4, i & 15); }, t0,
+            FullTiles ? BN : min(BN, t - t0), static_cast<int>(threadIdx.x), Cfg::THREADS);
+    }
     float acc[MT][NT][4] = {};
     Ring::consume(acc, NKT);
 
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
     const int wm = warp / Cfg::WARPS_N, wn = warp % Cfg::WARPS_N;
     const int gid = lane >> 2, lid = lane & 3;
+    if constexpr (kLoraTerm<Lora>) {
+        // --lora: the term on the gate and up fragments (canonical chains), before the SwiGLU.
+        lora_add_rows_tile<MT, NT>(
+            lora, acc, [&](int mm, int i) { return lora_row(wm, mm, i); },
+            [&](int mn, int j) {
+                const int c = t0 + wn * WN + mn * 8 + j;
+                return c < t ? c : -1;
+            });
+    }
 #pragma unroll
     for (int mi = 0; mi < MT / 2; ++mi) {
         const int r0 = m0 + wm * 32 + mi * 16 + gid;

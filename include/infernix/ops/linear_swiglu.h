@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -97,7 +98,15 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream,
-                   LinearRoutes routes = LinearRoutes::Exact);
+                   LinearRoutes routes = LinearRoutes::Exact, const LoraAddend* lora = nullptr);
+
+/**
+ * Whether linear_swiglu takes a LoRA term (include/infernix/ops/lora.h) for this parent and policy at every T: each
+ * gate and up value p becomes fl32(p + fl32(c * s)) before the SwiGLU (the canonical addend), every route of the
+ * format and policy. NVFP4 [34816,5120], row-scaled FP8 [34816,5120] and groupwise Q4 [34816,5120] parents.
+ */
+[[nodiscard]] bool linear_swiglu_lora_supported(QType qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+                                                LinearPolicy policy);
 
 /**
  * A16-only convenience form. Q4/Q8, NVFP4 and row-scaled FP8 retain their complete positive-T
@@ -123,8 +132,11 @@ inline constexpr std::int32_t kDenseMlpFusedPromptMinTokens = 129;
                                                           const Weight& down_weight, LinearPolicy down_policy,
                                                           std::int32_t tokens);
 
-// Caller-owned transient capacity of dense_mlp_fused_rmsnorm_nvfp4 for every T up to max_tokens (either policy).
-[[nodiscard]] std::size_t dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(std::int32_t max_tokens);
+// Caller-owned transient capacity of dense_mlp_fused_rmsnorm_nvfp4 for every T up to max_tokens (either policy), with
+// LoRA sites of these A rows (0: none).
+[[nodiscard]] std::size_t dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(std::int32_t max_tokens,
+                                                                        std::int32_t lora_gate_up_rows = 0,
+                                                                        std::int32_t lora_down_rows    = 0);
 
 /**
  * Op: dense MLP with its input norm, fused (NVFP4 A4 or A4 residual activations)
@@ -146,8 +158,13 @@ inline constexpr std::int32_t kDenseMlpFusedPromptMinTokens = 129;
  *   output. The workspace (dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes) overlaps no input. Three launches,
  *   capturable in a CUDA Graph; no persistent state.
  */
+// LoRA (include/infernix/ops/lora.h): with a gate/up site and/or a down site each projection takes its term over
+// U = A of its BF16 input, the bits of rmsnorm(), lora_shrink(), linear_swiglu(+term), lora_shrink() and
+// linear_add(+term); the norm then also stores h and the SwiGLU epilogue the product (the shrinks' inputs), in the
+// workspace (dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes with the sites' rows). Five or six launches.
 void dense_mlp_fused_rmsnorm_nvfp4(Tensor& residual, const Tensor& norm_weight, float eps, const Weight& gate_up_weight,
                                    const Weight& down_weight, LinearPolicy policy, WorkspaceArena& ws,
-                                   cudaStream_t stream);
+                                   cudaStream_t stream, const LoraSite* gate_up_lora = nullptr,
+                                   const LoraSite* down_lora = nullptr);
 
 } // namespace infernix::ops

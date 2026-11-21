@@ -38,10 +38,10 @@ Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     return tokens >= 5 ? Fp8LinearSwiGluRoute::A8 : Fp8LinearSwiGluRoute::A16;
 }
 
-void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    if (x.ne[1] == 1) return fp8_linear_swiglu_decode_launch(x, weight, out, stream);
-    if (x.ne[1] <= 4) return fp8_linear_swiglu_small_t_launch(x, weight, out, stream);
-    fp8_linear_swiglu_matrix_launch(x, weight, out, stream);
+void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream, const LoraAddend* lora) {
+    if (x.ne[1] == 1) return fp8_linear_swiglu_decode_launch(x, weight, out, stream, lora);
+    if (x.ne[1] <= 4) return fp8_linear_swiglu_small_t_launch(x, weight, out, stream, lora);
+    fp8_linear_swiglu_matrix_launch(x, weight, out, stream, lora);
 }
 
 } // namespace
@@ -64,26 +64,29 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const LoraAddend* lora) {
     if (weight.qtype == QType::FP8_E4M3FN_ROW_F32) {
+        if (lora != nullptr) {
+            throw std::invalid_argument("fp8 linear_swiglu: the [2048,3072] shared expert takes no LoRA term");
+        }
         // The 122B shared expert: 16-bit activations under every policy.
         if (column_invariant(policy)) { return fp8_linear_swiglu_n2048_invariant_launch(x, weight, out, stream); }
         return fp8_linear_swiglu_n2048_a16_launch(x, weight, out, stream);
     }
     const Fp8LinearSwiGluRoute route = resolve_route(policy, x.ne[1]);
     if (route == Fp8LinearSwiGluRoute::ColumnInvariantA16) {
-        fp8_linear_swiglu_invariant_launch(x, weight, out, stream);
+        fp8_linear_swiglu_invariant_launch(x, weight, out, stream, lora);
         return;
     }
     if (route == Fp8LinearSwiGluRoute::A16) {
-        launch_a16(x, weight, out, stream);
+        launch_a16(x, weight, out, stream, lora);
         return;
     }
     if (route == Fp8LinearSwiGluRoute::A8Residual) {
-        fp8_linear_swiglu_a8_residual_launch(x, weight, out, workspace, stream);
+        fp8_linear_swiglu_a8_residual_launch(x, weight, out, workspace, stream, lora);
         return;
     }
-    fp8_linear_swiglu_a8_launch(x, weight, out, workspace, stream);
+    fp8_linear_swiglu_a8_launch(x, weight, out, workspace, stream, lora);
 }
 
 } // namespace infernix::ops::detail

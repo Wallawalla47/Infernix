@@ -13,6 +13,7 @@
 #include "core/device.h"
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
+#include "infernix/ops/lora.h"
 #include "infernix/ops/rmsnorm.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
@@ -28,7 +29,9 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace infernix;
@@ -194,6 +197,160 @@ int run_case(const Weight& gate_up, const Weight& down, int tokens, ops::LinearP
     return failures;
 }
 
+// --lora (include/infernix/ops/lora.h): the adapter form against the composition rmsnorm(), lora_shrink(h),
+// linear_swiglu(+term), lora_shrink(product), linear_add(+term), each Op qualified with its term by the lora Op test.
+// Gate/up stacks two rank-32 A's (gate rows read U rows 0-31, up rows 32-63); down has one. Both sites, and each
+// alone (the other projection then runs unadapted).
+struct LoraFactors {
+    DeviceBuffer a_gate_up, b_gate_up, a_down, b_down;
+    ops::LoraSite gate_up, down;
+};
+
+std::vector<std::uint16_t> uniform_bf16(std::size_t count, std::uint32_t seed, float bound) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-bound, bound);
+    std::vector<std::uint16_t> out(count);
+    for (auto& v : out) { v = f32_to_bf16(dist(rng)); }
+    return out;
+}
+
+LoraFactors make_lora_factors(bool zero_b = false) {
+    constexpr int kRank = 32;
+    LoraFactors f;
+    f.a_gate_up = to_device(uniform_bf16(static_cast<std::size_t>(2 * kRank) * kHidden, 61U, 0.03F));
+    f.b_gate_up = to_device(zero_b ? std::vector<std::uint16_t>(static_cast<std::size_t>(kGateUpRows) * kRank, 0) : uniform_bf16(static_cast<std::size_t>(kGateUpRows) * kRank, 62U, 0.05F));
+    f.a_down    = to_device(uniform_bf16(static_cast<std::size_t>(kRank) * kIntermediate, 63U, 0.03F));
+    f.b_down    = to_device(zero_b ? std::vector<std::uint16_t>(static_cast<std::size_t>(kHidden) * kRank, 0) : uniform_bf16(static_cast<std::size_t>(kHidden) * kRank, 64U, 0.05F));
+    f.gate_up.a = {f.a_gate_up.p, 2 * kRank, kHidden};
+    f.gate_up.addend.b        = f.b_gate_up.p;
+    f.gate_up.addend.rank     = kRank;
+    f.gate_up.addend.u_rows   = 2 * kRank;
+    f.gate_up.addend.segments = 2;
+    f.gate_up.addend.segment[0] = {kIntermediate, 0, 2.0F};
+    f.gate_up.addend.segment[1] = {kGateUpRows, kRank, 0.5F};
+    f.down.a = {f.a_down.p, kRank, kIntermediate};
+    f.down.addend.b        = f.b_down.p;
+    f.down.addend.rank     = kRank;
+    f.down.addend.u_rows   = kRank;
+    f.down.addend.segments = 1;
+    f.down.addend.segment[0] = {kHidden, 0, 1.25F};
+    return f;
+}
+
+int run_lora_case(const Weight& gate_up, const Weight& down, const LoraFactors& factors, int tokens,
+                  ops::LinearPolicy policy, bool with_gate_up, bool with_down) {
+    const ops::LoraSite* gate_up_site = with_gate_up ? &factors.gate_up : nullptr;
+    const ops::LoraSite* down_site    = with_down ? &factors.down : nullptr;
+    const int gate_up_rows            = with_gate_up ? factors.gate_up.a.rows : 0;
+    const int down_rows               = with_down ? factors.down.a.rows : 0;
+    const std::string suffix = std::string(" lora") + (with_gate_up ? " gate_up" : "") + (with_down ? " down" : "") +
+                               (policy == kPrompt ? " prompt" : " rounds") + " T=" + std::to_string(tokens);
+    const auto residual_bits  = bf16_bits(make_bf16_activation(kHidden, tokens, 5051U + tokens));
+    const auto gain_bits      = bf16_bits(make_bf16_activation(kHidden, 1, 229U));
+    DeviceBuffer reference_io = to_device(residual_bits);
+    DeviceBuffer fused_io     = to_device(residual_bits);
+    DeviceBuffer gain_buffer  = to_device(gain_bits);
+    Tensor reference(reference_io.p, DType::BF16, {kHidden, tokens});
+    Tensor fused(fused_io.p, DType::BF16, {kHidden, tokens});
+    Tensor gain(gain_buffer.p, DType::BF16, {kHidden});
+
+    const std::size_t capacity =
+        std::max(ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, kGateUpRows, kHidden, policy, tokens, tokens),
+                 ops::linear_add_workspace_capacity_bytes(QType::NVFP4, kHidden, kIntermediate, policy, tokens, tokens));
+    DeviceArena reference_workspace(capacity + static_cast<std::size_t>(kHidden + kIntermediate + 128) * tokens * 2 +
+                                    (1U << 16));
+    DeviceArena fused_workspace(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(tokens, gate_up_rows, down_rows));
+
+    // The composition.
+    {
+        Tensor hidden  = reference_workspace.alloc(DType::BF16, {kHidden, tokens});
+        Tensor product = reference_workspace.alloc(DType::BF16, {kIntermediate, tokens});
+        ops::rmsnorm(reference, gain, kEps, true, hidden, nullptr);
+        ops::LoraAddend gate_up_term = factors.gate_up.addend, down_term = factors.down.addend;
+        if (with_gate_up) {
+            Tensor u = reference_workspace.alloc(DType::BF16, {gate_up_rows, tokens});
+            ops::lora_shrink(hidden, factors.gate_up.a, u, nullptr);
+            gate_up_term.u = u.data;
+        }
+        {
+            auto scope = reference_workspace.scope();
+            ops::linear_swiglu(hidden, gate_up, product, policy, reference_workspace, nullptr,
+                               ops::LinearRoutes::Exact, with_gate_up ? &gate_up_term : nullptr);
+        }
+        if (with_down) {
+            Tensor u = reference_workspace.alloc(DType::BF16, {down_rows, tokens});
+            ops::lora_shrink(product, factors.down.a, u, nullptr);
+            down_term.u = u.data;
+        }
+        auto scope = reference_workspace.scope();
+        ops::linear_add(product, down, reference, policy, reference_workspace, nullptr, ops::LinearRoutes::Exact,
+                        with_down ? &down_term : nullptr);
+    }
+    ops::dense_mlp_fused_rmsnorm_nvfp4(fused, gain, kEps, gate_up, down, policy, fused_workspace, nullptr, gate_up_site,
+                                       down_site);
+    cuda_synchronize();
+    int failures = compare_bytes("residual" + suffix, reference_io.p, fused_io.p, reference_io.bytes);
+    // The term is observable: the unadapted call differs.
+    {
+        DeviceBuffer plain_io = to_device(residual_bits);
+        Tensor plain(plain_io.p, DType::BF16, {kHidden, tokens});
+        DeviceArena plain_workspace(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(tokens));
+        ops::dense_mlp_fused_rmsnorm_nvfp4(plain, gain, kEps, gate_up, down, policy, plain_workspace, nullptr);
+        cuda_synchronize();
+        if (from_device<std::uint16_t>(plain_io.p, residual_bits.size()) ==
+            from_device<std::uint16_t>(fused_io.p, residual_bits.size())) {
+            std::cerr << "the adapter changed nothing" << suffix << '\n';
+            ++failures;
+        }
+    }
+    // Captured in a CUDA Graph (the decode graphs' programmatic launches).
+    if (policy == kRounds && tokens == 16) {
+        DeviceBuffer graph_io = to_device(residual_bits);
+        Tensor graph_residual(graph_io.p, DType::BF16, {kHidden, tokens});
+        DeviceContext device;
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        definition.capture(device.stream, [&] {
+            ops::dense_mlp_fused_rmsnorm_nvfp4(graph_residual, gain, kEps, gate_up, down, policy, fused_workspace,
+                                               device.stream, gate_up_site, down_site);
+        });
+        graph.instantiate(definition);
+        graph.launch(device.stream);
+        cuda_synchronize(device.stream);
+        failures += compare_bytes("graph residual" + suffix, reference_io.p, graph_io.p, reference_io.bytes);
+    }
+    if (fused_workspace.used() != 0) {
+        std::cerr << "dense MLP workspace scope was not released" << suffix << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
+// A trained adapter's initial state (B = 0): the fused call's adapter form returns the no-adapter call's bits (its
+// norm/quantize kernel that also stores h, its tiles' adapter instances).
+int run_zero_b_case(const Weight& gate_up, const Weight& down, const LoraFactors& zero, int tokens,
+                    ops::LinearPolicy policy, bool with_gate_up, bool with_down) {
+    const std::string suffix = std::string(" zero-B identity") + (with_gate_up ? " gate_up" : "") +
+                               (with_down ? " down" : "") + (policy == kPrompt ? " prompt" : " rounds") +
+                               " T=" + std::to_string(tokens);
+    const auto residual_bits = bf16_bits(make_bf16_activation(kHidden, tokens, 6067U + tokens));
+    const auto gain_bits     = bf16_bits(make_bf16_activation(kHidden, 1, 231U));
+    DeviceBuffer plain_io    = to_device(residual_bits);
+    DeviceBuffer adapted_io  = to_device(residual_bits);
+    DeviceBuffer gain_buffer = to_device(gain_bits);
+    Tensor plain(plain_io.p, DType::BF16, {kHidden, tokens});
+    Tensor adapted(adapted_io.p, DType::BF16, {kHidden, tokens});
+    Tensor gain(gain_buffer.p, DType::BF16, {kHidden});
+    DeviceArena plain_workspace(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(tokens));
+    DeviceArena adapted_workspace(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(
+        tokens, with_gate_up ? zero.gate_up.a.rows : 0, with_down ? zero.down.a.rows : 0));
+    ops::dense_mlp_fused_rmsnorm_nvfp4(plain, gain, kEps, gate_up, down, policy, plain_workspace, nullptr);
+    ops::dense_mlp_fused_rmsnorm_nvfp4(adapted, gain, kEps, gate_up, down, policy, adapted_workspace, nullptr,
+                                       with_gate_up ? &zero.gate_up : nullptr, with_down ? &zero.down : nullptr);
+    cuda_synchronize();
+    return compare_bytes("residual" + suffix, plain_io.p, adapted_io.p, plain_io.bytes);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(dense_mlp_fused_rmsnorm) {
@@ -235,6 +392,27 @@ INFERNIX_OP_TEST(dense_mlp_fused_rmsnorm) {
         // prefill's 4,096-column calls (and one ragged past them).
         for (const int tokens : {129, 136, 192, 193, 255, 256, 257, 300, 512, 513, 777, 1024, 1088, 2048, 4096, 4160}) {
             failures += run_case(gate_up, down, tokens, kPrompt);
+        }
+        // --lora: both sites over both profiles' tiles; each site alone at a round and a prompt width.
+        const LoraFactors factors = make_lora_factors();
+        for (const int tokens : {5, 9, 16, 33, 64, 96}) {
+            failures += run_lora_case(gate_up, down, factors, tokens, kRounds, true, true);
+        }
+        for (const int tokens : {129, 257, 513, 1088, 4160}) {
+            failures += run_lora_case(gate_up, down, factors, tokens, kPrompt, true, true);
+        }
+        for (const auto [gu, dn] : {std::pair{true, false}, std::pair{false, true}}) {
+            failures += run_lora_case(gate_up, down, factors, 33, kRounds, gu, dn);
+            failures += run_lora_case(gate_up, down, factors, 513, kPrompt, gu, dn);
+        }
+        const LoraFactors zero = make_lora_factors(true);
+        for (const auto [gu, dn] : {std::pair{true, true}, std::pair{true, false}, std::pair{false, true}}) {
+            for (const int tokens : {5, 8, 9, 16, 17, 33, 64, 96}) {
+                failures += run_zero_b_case(gate_up, down, zero, tokens, kRounds, gu, dn);
+            }
+            for (const int tokens : {129, 257, 513, 1088}) {
+                failures += run_zero_b_case(gate_up, down, zero, tokens, kPrompt, gu, dn);
+            }
         }
         failures += gate_up_parent.verify_preserved("gate/up weight");
         failures += down_parent.verify_preserved("down weight");

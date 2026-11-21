@@ -13,6 +13,7 @@ run the CLI or HTTP server.
 | [Qwen3.8-Flash-Next](qwen3_8-flash-next.md) | requirements, conversion (recipes A and B, the GSQ-RCO IQ3_S GGUF import), recommended flags, the n-gram table in RAM, measured speed and quality of the offloaded-expert model |
 | [Qwen3.5-122B-A10B](qwen3_5-122b.md) | Ornith-1.5-122B-NVFP4 and its UNCENSORED export with offloaded experts (in progress): requirements, conversion and verification, running, measured speed |
 | [Ngram copy proposals](ngram.md) | optional copy acceleration alongside MTP, DFlash or DFlash2 at any concurrency |
+| [LoRA adapters](lora.md) | `--lora`: a Hugging Face PEFT adapter applied to the Qwen3.8-27B artifacts at runtime; what it may adapt, how the term is computed, memory |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Quality](quality.md) | output quality of Infernix and other engines against the exact model (KL divergence on WikiText-2): results, statistics, engine settings, and how to repeat the runs |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |

@@ -34,10 +34,14 @@ void plan_refuse(EnginePlan& plan, std::string refusal);
 [[nodiscard]] std::size_t planned_free_after_weights(std::size_t free_now, std::uint64_t weights_bytes,
                                                      std::uint64_t beside_weights_bytes = 0) noexcept;
 
+// The device memory beside the weights' arena a plan counts in planned_bytes: the draft screen and the adapter
+// (EnginePlanVram::draft_screen_bytes, adapter_bytes).
+[[nodiscard]] std::uint64_t planned_beside_weights_bytes(const EnginePlanVram& vram) noexcept;
+
 // Qwen3.5 family: resolves `policy` on `curve` against `free_after_weights` with `headroom` as a start
 // does (resolve_kv_capacity) and records the curve, the resolution and the device totals in plan.vram
-// (weights_bytes must be set). Returns the resolution, or empty after plan_refuse with the start's
-// own message when it does not fit.
+// (weights_bytes, and draft_screen_bytes / adapter_bytes where the start has them, must be set). Returns the
+// resolution, or empty after plan_refuse with the start's own message when it does not fit.
 [[nodiscard]] std::optional<KvCapacityResolution> plan_capacity(EnginePlan& plan, const KvCapacityPolicy& policy,
                                                                 const SequenceCapacityCurve& curve,
                                                                 std::size_t free_after_weights, std::size_t headroom);

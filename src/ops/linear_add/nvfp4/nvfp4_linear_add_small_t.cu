@@ -5,6 +5,7 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/common/epilogue.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <array>
 #include <cstddef>
@@ -14,20 +15,21 @@
 namespace infernix::ops::detail {
 namespace {
 
-using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t, const LoraAddend*);
 
 template <class Geometry, int ActiveTokens>
-void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream,
+                  const LoraAddend* lora) {
     using Schedule = Nvfp4A16SimtSchedule<
         (ActiveTokens <= 16 && ActiveTokens >= (Geometry::kInputRows == 6144 ? 14 : 8)) ? 16 : 4, 1,
         2, (ActiveTokens >= 17 && ActiveTokens <= 20) ? 8 : 16, ActiveTokens, 1,
         Nvfp4SimtActivationAccess::TokenPacked, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
         1, Nvfp4SimtBlockOrder::RowsContiguous, 1>;
-    launch_nvfp4_a16_simt<
-        Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
-        nvfp4_a16_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n},
-        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}}, stream);
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, weight.n}}, [&](auto epilogue) {
+        launch_nvfp4_a16_simt<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
+            nvfp4_a16_operands(x, weight), LinearBf16Output{data, weight.n}, epilogue, stream);
+    });
 }
 
 template <class Geometry, std::size_t... Offsets>
@@ -49,17 +51,17 @@ constexpr auto kResidual17408Launchers = make_launchers<Nvfp4N5120K17408>();
 } // namespace
 
 void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, const LoraAddend* lora) {
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
     if (x.ne[1] < 2 || index >= kResidual17408Launchers.size()) {
         throw std::invalid_argument("nvfp4 linear_add: the small-T kernel serves 2-5 tokens");
     }
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
-        kResidual6144Launchers[index](x, weight, residual, stream);
+        kResidual6144Launchers[index](x, weight, residual, stream, lora);
         return;
     case Nvfp4GeometryId::N5120K17408:
-        kResidual17408Launchers[index](x, weight, residual, stream);
+        kResidual17408Launchers[index](x, weight, residual, stream, lora);
         return;
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:

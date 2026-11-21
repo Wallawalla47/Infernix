@@ -13,6 +13,7 @@
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_operands.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -121,7 +122,20 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
         static_cast<int>(blockIdx.x) * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, 1>;
+    [[maybe_unused]] LoraStage* lora_stage = nullptr;
+    [[maybe_unused]] int term_rows[Schedule::kRowsPerWarp];
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B rows (immutable) stage before the wait, its U columns after it.
+        __shared__ LoraStage lora_stages[Schedule::kWarpsPerCta];
+        lora_stage = &lora_stages[warp];
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row)
+            term_rows[local_row] = row_policy.weight_row(row_begin, local_row, rows);
+        lora_stage_warp_b(epilogue.lora, term_rows, *lora_stage);
+    }
     pdl::enter_streaming(); // launched as a programmatic dependent
+    if constexpr (kLoraEpilogue<Epilogue>) { lora_stage_warp_u(epilogue.lora, term_rows, 0, 1, *lora_stage); }
 
 #pragma unroll Schedule::kPhaseUnroll
     for (int phase = 0; phase < kPhases; ++phase) {
@@ -145,6 +159,45 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
 
     const auto destination = linear_output_tile<kStoredRowsPerCta>(
         output, static_cast<int>(blockIdx.x) * kStoredRowsPerCta);
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The rows' values as the no-adapter kernel forms them and the term (warp-wide): paired rows take it on the
+        // gate and up values before the SwiGLU, single rows on the epilogue's result (lora_epilogue_apply).
+        int parent[Schedule::kRowsPerWarp];
+        float totals[Schedule::kRowsPerWarp];
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            parent[local_row] = row_policy.weight_row(row_begin, local_row, rows);
+            float total       = 0.0F;
+#pragma unroll
+            for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) { total += accumulators[local_row][chain]; }
+            totals[local_row] = warp_reduce_sum(total);
+        }
+        float add[Schedule::kRowsPerWarp][1];
+        bool has[Schedule::kRowsPerWarp];
+        lora_warp_rows_staged<Schedule::kRowsPerWarp, 1>(epilogue.lora, parent, 0, 1, add, has, *lora_stage);
+        if (lane == 0) {
+            if constexpr (PairRows) {
+#pragma unroll
+                for (int local_row = 0; local_row < kStoredRowsPerWarp; ++local_row) {
+                    const int up_row = kStoredRowsPerWarp + local_row;
+                    const float gate = totals[local_row] * fp8_widen(__ldg(row_scales + parent[local_row]));
+                    const float up   = totals[up_row] * fp8_widen(__ldg(row_scales + parent[up_row]));
+                    epilogue.apply_pair(destination, row_begin + local_row, 0,
+                                        lora_add(gate, add[local_row][0], has[local_row]),
+                                        lora_add(up, add[up_row][0], has[up_row]));
+                }
+            } else {
+#pragma unroll
+                for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+                    const float value = totals[local_row] * fp8_widen(__ldg(row_scales + parent[local_row]));
+                    destination.store(parent[local_row], 0,
+                                      lora_epilogue_apply(epilogue, parent[local_row], 0, value, add[local_row][0],
+                                                          has[local_row]));
+                }
+            }
+        }
+        return;
+    }
     if constexpr (PairRows) {
         float totals[Schedule::kRowsPerWarp];
 #pragma unroll

@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/arena.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -61,9 +62,10 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
                                 Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream,
-                                bool column_invariant = false, bool ksplit = false);
+                                bool column_invariant = false, bool ksplit = false,
+                                const LoraAddend* lora = nullptr);
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
                             WorkspaceArena& ws, cudaStream_t stream, bool column_invariant = false,
-                            bool ksplit = false);
+                            bool ksplit = false, const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

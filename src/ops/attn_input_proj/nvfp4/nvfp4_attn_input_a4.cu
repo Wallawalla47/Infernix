@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_a4_tma_launch.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -22,20 +23,21 @@ using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 
 template <class Schedule>
 void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                 Nvfp4A4Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
-    launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
-        Nvfp4AttentionInputOutput{
-            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
-            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)},
-        LinearIdentityEpilogue{}, stream);
+                 Nvfp4A4Workspace workspace, std::int32_t tokens, cudaStream_t stream, const LoraAddend* lora) {
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
+            Nvfp4AttentionInputOutput{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                                      static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)},
+            epilogue, stream);
+    });
 }
 
 } // namespace
 
 void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, Nvfp4A4Workspace workspace,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const LoraAddend* lora) {
     const std::int32_t tokens = x.ne[1];
     // This projection selects its own route; the fused RMSNorm entry reads the same predicate and
     // scale layout from the plan header.
@@ -45,13 +47,13 @@ void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q
         launch_nvfp4_a4_tma_attention(
             nvfp4_a4_operands(weight, workspace, tokens, layout),
             static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(gate.data),
-            static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(v.data), stream);
+            static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(v.data), stream, lora);
     } else if (tokens <= 64) {
-        launch_gemm<M32N64>(weight, q, gate, k, v, workspace, tokens, stream);
+        launch_gemm<M32N64>(weight, q, gate, k, v, workspace, tokens, stream, lora);
     } else if (tokens <= 96) {
-        launch_gemm<M32N128>(weight, q, gate, k, v, workspace, tokens, stream);
+        launch_gemm<M32N128>(weight, q, gate, k, v, workspace, tokens, stream, lora);
     } else { // at most 128 tokens: wider calls take the TMA route
-        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
+        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream, lora);
     }
 }
 

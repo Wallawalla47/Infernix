@@ -174,8 +174,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
     linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream);
 }
 
+bool linear_add_lora_supported(QType qtype, std::int32_t output_rows, std::int32_t input_rows) {
+    return output_rows == 5120 && (input_rows == 6144 || input_rows == 17408) &&
+           (qtype == QType::NVFP4 || is_fp8_row(qtype) || qtype == QType::Q5_G64_FP16);
+}
+
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
-                WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes) {
+                WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes, const LoraAddend* lora) {
     validate_policy(policy);
     if (!valid_linear_routes(routes)) { throw std::invalid_argument("linear_add: unknown route flags"); }
     const std::int32_t t = x.ne[1];
@@ -185,12 +190,22 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     if (overlaps(x, residual_out)) {
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
     }
+    if (lora != nullptr) {
+        if (!linear_add_lora_supported(w.qtype, w.n, w.k)) {
+            throw std::invalid_argument("linear_add: this weight takes no LoRA term");
+        }
+        validate_lora_addend(*lora, w.n, t);
+    }
     if (column_invariant(policy) && !linear_add_column_invariant_route(w.qtype, w.n, w.k)) {
-        // No dedicated column-invariant route: the exact one-column route, once per column.
+        // No dedicated column-invariant route: the exact one-column route, once per column (the term's U column
+        // with it).
         for (std::int32_t column = 0; column < t; ++column) {
             const Tensor x_column = x.slice(1, column, 1);
             Tensor residual_column = residual_out.slice(1, column, 1);
-            linear_add(x_column, w, residual_column, LinearPolicy::A16Only, ws, stream);
+            LoraAddend column_lora;
+            if (lora != nullptr) { column_lora = lora_columns_from(*lora, column); }
+            linear_add(x_column, w, residual_column, LinearPolicy::A16Only, ws, stream, LinearRoutes::Exact,
+                       lora != nullptr ? &column_lora : nullptr);
         }
         return;
     }
@@ -232,7 +247,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
         detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream, column_invariant(policy),
-                                       has_route(routes, LinearRoutes::Q5KSplit));
+                                       has_route(routes, LinearRoutes::Q5KSplit), lora);
         return;
     }
 
@@ -264,7 +279,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
         detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream,
-                                          has_route(routes, LinearRoutes::WideDownTile));
+                                          has_route(routes, LinearRoutes::WideDownTile), lora);
         return;
     }
 
@@ -277,7 +292,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
-        detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream, lora);
         return;
     }
 

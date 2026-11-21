@@ -69,6 +69,25 @@ void launch_nvfp4_a16_mma(const Nvfp4A16Operands& p, Output output, Epilogue epi
     });
 }
 
+// --lora: the A16 MMA tiles' adapter instances, compiled in their own translation unit
+// (src/ops/lora/nvfp4_a16_mma_lora.cu explicitly instantiates each one a projection uses). A translation unit that
+// held a tile's adapter instance beside its no-adapter instance compiled the no-adapter kernel differently (the
+// K=6144 output projection's and two 5,120-input tiles' schedules, 2026-11-21): launch_nvfp4_a16_mma_any keeps those
+// units' no-adapter kernels the code they were.
+template <class Schedule, class Output, class Epilogue, class Rows>
+void launch_nvfp4_a16_mma_lora(const Nvfp4A16Operands& p, Output output, Epilogue epilogue, cudaStream_t stream,
+                               Rows rows);
+
+template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
+void launch_nvfp4_a16_mma_any(const Nvfp4A16Operands& p, Output output, Epilogue epilogue, cudaStream_t stream,
+                              Rows rows = {}) {
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        launch_nvfp4_a16_mma_lora<Schedule, Output, Epilogue, Rows>(p, output, epilogue, stream, rows);
+    } else {
+        launch_nvfp4_a16_mma<Schedule>(p, output, epilogue, stream, rows);
+    }
+}
+
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
                                    cudaStream_t stream, Rows rows = {}) {

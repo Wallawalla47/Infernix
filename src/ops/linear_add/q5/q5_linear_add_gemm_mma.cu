@@ -9,6 +9,7 @@
 #include "ops/linear/common/rowsplit_ring_linear.cuh"
 #include "ops/linear/q5/q5_mma_launch.cuh"
 #include "ops/linear/q5/q5_ring_codec.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -110,30 +111,35 @@ void launch_ring(const Tensor& x, const Weight& w, Tensor& residual_out, Epilogu
 }
 
 template <class Schedule>
-void launch_pointwise(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+void launch_pointwise(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream,
+                      const LoraAddend* lora) {
     auto* data        = static_cast<__nv_bfloat16*>(residual.data);
     const auto stride = std::int64_t(residual.nb[1] / sizeof(__nv_bfloat16));
-    launch_q5_a16_mma<Schedule>(q5_linear_operands(x, w), LinearBf16StridedOutput{data, stride, 0},
-                                LinearResidualAddEpilogue{{data, stride, 0}}, stream);
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, stride, 0}}, [&](auto epilogue) {
+        launch_q5_a16_mma<Schedule>(q5_linear_operands(x, w), LinearBf16StridedOutput{data, stride, 0}, epilogue,
+                                    stream);
+    });
 }
 } // namespace
 
 void q5_linear_add_mma_r32_t32_k128_launch(const Tensor& x, const Weight& w, Tensor& residual,
-                                           cudaStream_t stream) {
-    launch_pointwise<q5_instances::MmaR32T32K128S2A2>(x, w, residual, stream);
+                                           cudaStream_t stream, const LoraAddend* lora) {
+    launch_pointwise<q5_instances::MmaR32T32K128S2A2>(x, w, residual, stream, lora);
 }
 
 void q5_linear_add_mma_r32_t128_launch(const Tensor& x, const Weight& w, Tensor& residual,
-                                       cudaStream_t stream) {
-    launch_pointwise<q5_instances::MmaR32T128>(x, w, residual, stream);
+                                       cudaStream_t stream, const LoraAddend* lora) {
+    launch_pointwise<q5_instances::MmaR32T128>(x, w, residual, stream, lora);
 }
 
 void q5_linear_add_ring_t128_launch(const Tensor& x, const Weight& w, Tensor& residual,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, const LoraAddend* lora) {
     // RTX 5090, q5_linear_add_bench (CUDA graph, cold L2, A B B A, equal output hashes), against the 64-row MMA
     // tile this route ran before, K = 17408 / K = 6144: 384 columns -4.8 / -5.8 %, 512 -6.0 / -7.3 %, 896 -5.2 /
     // -5.6 %, 1,024 -5.5 / -6.5 %, 2,048 -6.8 / -6.6 %, 4,096 -7.5 / -6.9 %, 8,192 -7.6 / -7.7 % (2026-11-10). The
     // 161-256 column route (32-row tiles) measured 18-26 % slower on the ring and keeps its kernel.
-    launch_ring(x, w, residual, Q5LinearAddTileEpilogue{}, stream);
+    // --lora: the ring adds the term to its fragments before this tile epilogue (rowsplit_ring_linear.cuh).
+    with_lora_epilogue(lora, Q5LinearAddTileEpilogue{},
+                       [&](auto epilogue) { launch_ring(x, w, residual, epilogue, stream); });
 }
 } // namespace infernix::ops::detail

@@ -3,6 +3,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 
@@ -347,6 +348,17 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                                                  Q4RowSplitStorage::kScaleBytesPerGroup;
     const __nv_bfloat16* activation =
         Schedule::kActivationAccess == Q4GemvActivationAccess::CtaSharedFullK ? shared_x : x;
+    [[maybe_unused]] LoraWarpStage<1, 1>* lora_stage = nullptr;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B row and U column stage in shared memory beside the main loop (after the start's wait).
+        __shared__ LoraWarpStage<1, 1> lora_stages[kBlockRows];
+        lora_stage = &lora_stages[row_in_cta];
+        if (warp_in_row == 0) {
+            const int term_rows[1] = {row < rows ? row : -1};
+            lora_stage_warp_b(epilogue.lora, term_rows, *lora_stage);
+            lora_stage_warp_u(epilogue.lora, term_rows, 0, 1, *lora_stage);
+        }
+    }
 
     float accumulator = 0.0f;
     if constexpr (Schedule::kLaneMapping == Q4GemvLaneMapping::PackedByte2 &&
@@ -369,7 +381,30 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 
     accumulator = warp_reduce_sum(accumulator);
-    if constexpr (kWarpsPerRow == 1) {
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: the row's value (lane 0 of its first warp) plus its term (that warp's MMA chain), then the epilogue.
+        static_assert(!JoinPdl, "a LoRA term reads U, which a joining launch reads before its wait");
+        float value = accumulator;
+        if constexpr (kWarpsPerRow > 1) {
+            if (lane == 0) { row_partials[row_in_cta][warp_in_row] = accumulator; }
+            __syncthreads();
+            value = 0.0f;
+#pragma unroll
+            for (int warp = 0; warp < kWarpsPerRow; ++warp) { value += row_partials[row_in_cta][warp]; }
+        }
+        if (warp_in_row == 0) {
+            const int term_rows[1] = {row < rows ? row : -1};
+            float add[1][1];
+            bool has[1];
+            lora_warp_rows_staged<1, 1>(epilogue.lora, term_rows, 0, 1, add, has, *lora_stage);
+            value = lora_add(value, add[0][0], has[0]);
+            if (lane == 0 && row < rows) {
+                const float values[1]{value};
+                linear_finish_row(output, epilogue, row, 0, values, 1);
+            }
+        }
+        return;
+    } else if constexpr (kWarpsPerRow == 1) {
         if (lane == 0 && row < rows) {
             const float values[1]{accumulator};
             linear_finish_row(output, epilogue, row, 0, values, 1);

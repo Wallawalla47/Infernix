@@ -9,6 +9,7 @@
 #include "ops/linear/fp8/fp8_a16_simt.cuh"
 #include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <stdexcept>
 
@@ -16,10 +17,10 @@ namespace infernix::ops::detail {
 // `operands`: the weight's BF16 or (K 6144: fp8_e4m3fn_row_f32, NVIDIA's QAD 27B) FP32 row words.
 template <int K, class Operands>
 void launch_matrix(const Tensor& x, const Operands& operands, const Weight& weight, Tensor& residual,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, const LoraAddend* lora) {
     auto* data          = static_cast<__nv_bfloat16*>(residual.data);
     const LinearBf16Output output{data, weight.n};
-    const LinearResidualAddEpilogue epilogue{{data, weight.n}};
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, weight.n}}, [&](auto epilogue) {
     // The short-K residual projection retains its lower-latency SIMT decode capacities.
     if constexpr (K == 6144) {
         if (x.ne[1] <= 4) {
@@ -64,15 +65,19 @@ void launch_matrix(const Tensor& x, const Operands& operands, const Weight& weig
         return tma.template operator()<Fp8A16RingT32R128>();
     if (tokens <= 192) return tma.template operator()<Fp8A16RingT32R64S3>();
     tma.template operator()<Fp8A16RingT64R128>();
+    });
 }
 
 void fp8_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, const LoraAddend* lora) {
     // The tiles run 8 K-warps over the same K slices and reduce them in the same order, and the
     // MMA's columns are independent; wider calls run as 64-column slices.
     auto* data          = static_cast<__nv_bfloat16*>(residual.data);
     const LinearBf16Output output{data, weight.n};
-    const LinearResidualAddEpilogue epilogue{{data, weight.n}};
+    if (weight.k != 6144 && weight.k != 17408) {
+        throw std::invalid_argument("fp8 linear_add: unsupported column-invariant problem");
+    }
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, weight.n}}, [&](auto epilogue) {
     const auto launch = [&]<int K>(const auto& operands) {
         if (x.ne[1] <= 8)
             return launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Fp8SlicedInstance<8, 8, 2>, K>>(
@@ -88,18 +93,18 @@ void fp8_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tens
         return with_fp8_a16_operands(
             x, weight, [&](const auto& operands) { launch.template operator()<6144>(operands); });
     }
-    if (weight.k == 17408) return launch.template operator()<17408>(fp8_a16_operands(x, weight));
-    throw std::invalid_argument("fp8 linear_add: unsupported column-invariant problem");
+    launch.template operator()<17408>(fp8_a16_operands(x, weight));
+    });
 }
 
 void fp8_linear_add_matrix_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const LoraAddend* lora) {
     if (weight.k == 6144) {
         with_fp8_a16_operands(x, weight, [&](const auto& operands) {
-            launch_matrix<6144>(x, operands, weight, residual, stream);
+            launch_matrix<6144>(x, operands, weight, residual, stream, lora);
         });
     } else {
-        launch_matrix<17408>(x, fp8_a16_operands(x, weight), weight, residual, stream);
+        launch_matrix<17408>(x, fp8_a16_operands(x, weight), weight, residual, stream, lora);
     }
 }
 } // namespace infernix::ops::detail

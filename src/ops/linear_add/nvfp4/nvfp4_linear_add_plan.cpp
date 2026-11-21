@@ -70,19 +70,19 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
-                               cudaStream_t stream, bool wide_down_tile) {
+                               cudaStream_t stream, bool wide_down_tile, const LoraAddend* lora) {
     const Nvfp4LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Nvfp4LinearAddRoute::ColumnInvariantA16) {
-        nvfp4_linear_add_invariant_launch(x, weight, residual, stream);
+        nvfp4_linear_add_invariant_launch(x, weight, residual, stream, lora);
         return;
     }
     if (route == Nvfp4LinearAddRoute::A16) {
         // The faster 8 K-warp tiles change the reduction order: their fast path's route flag only.
-        nvfp4_linear_add_a16_launch(x, weight, residual, wide_down_tile, stream);
+        nvfp4_linear_add_a16_launch(x, weight, residual, wide_down_tile, stream, lora);
         return;
     }
     if (route == Nvfp4LinearAddRoute::A8) {
-        nvfp4_linear_add_a8_launch(x, weight, residual, workspace, stream);
+        nvfp4_linear_add_a8_launch(x, weight, residual, workspace, stream, lora);
         return;
     }
     auto scope = workspace.scope();
@@ -90,11 +90,11 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
         nvfp4_linear_add_a4_residual_launch(
             x, weight, residual,
             allocate_nvfp4_a4_workspace(workspace, x.ne[1], weight.k, kNvfp4A4ResidualTerms),
-            stream);
+            stream, lora);
         return;
     }
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(workspace, x.ne[1], weight.k);
-    nvfp4_linear_add_a4_launch(x, weight, residual, scratch, stream);
+    nvfp4_linear_add_a4_launch(x, weight, residual, scratch, stream, lora);
 }
 
 } // namespace infernix::ops::detail

@@ -45,6 +45,7 @@ struct LoadPlan::Impl {
     InstanceInfo info;
     std::uint64_t embedding_bytes = 0; // offloaded experts: the token embedding's stored bytes (pinned)
     std::uint64_t mtp_expert_pinned = 0; // the MTP drafter's routed experts' stored bytes, pinned behind the drafter pool
+    std::optional<LoraBinding> lora;     // LoadOptions::lora
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -234,6 +235,15 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->vision_overlay =
             compute_vision_overlay_layout(out->weights, out->pending, out->materialization);
     }
+    if (!options.lora.empty()) {
+        // The adapter adapts a dense model's text projections on every route (the lossless route in PEFT's FP32
+        // arithmetic, lossless-route.md §2).
+        if (!std::holds_alternative<DenseConfig>(out->config.text.ffn)) {
+            throw artifact::ArtifactError("--lora adapts dense Qwen3.5 models; this artifact's MLPs are mixtures of "
+                                          "experts");
+        }
+        out->lora = bind_lora(options.lora, out->config.text);
+    }
     out->info.name = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
     out->info.metadata_json   = reader.directory().metadata.dump();
@@ -341,7 +351,7 @@ std::unique_ptr<Model> plan_model(LoadPlan&& plan) {
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::nullopt, std::move(backing), std::move(parts.banks),
         std::move(parts.shared_banks), std::move(parts.shared_multipliers), std::move(parts.store),
-        runtime::expert_offload::CsfTables{}));
+        runtime::expert_offload::CsfTables{}, std::move(data->lora)));
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
@@ -413,7 +423,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::move(overlay),
         std::move(backing), std::move(parts.banks), std::move(parts.shared_banks),
-        std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables)));
+        std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables), std::move(data->lora)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

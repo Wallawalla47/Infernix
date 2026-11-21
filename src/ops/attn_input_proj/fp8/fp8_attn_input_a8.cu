@@ -2,6 +2,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -19,15 +20,17 @@ std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
 
 void fp8_attn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                        Tensor& gate, Tensor& key, Tensor& value,
-                                       Fp8A8Workspace workspace, cudaStream_t stream) {
+                                       Fp8A8Workspace workspace, cudaStream_t stream, const LoraAddend* lora) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
     const auto launch = [&]<class Schedule>() {
-        launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(
-            fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream,
-            {}, pdl::Dependency::Programmatic);
+        with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+            launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(fp8_a8_operands(weight, workspace, x.ne[1]),
+                                                                  output, epilogue, stream, {},
+                                                                  pdl::Dependency::Programmatic);
+        });
     };
     // 32-token tiles to 32 columns, 32x128 tiles at 65-104 (58-62 against 78-83 us for 32x64 at
     // 65-96, 89-91 against 105 for 64x128 at 97-104), and 64x128 tiles otherwise (RTX 5090).
@@ -39,7 +42,7 @@ void fp8_attn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Te
 
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& key, Tensor& value, Fp8A8Workspace workspace,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, const LoraAddend* lora) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
@@ -50,12 +53,12 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
         const auto operands = fp8_a8_operands<Scale>(weight, workspace, x.ne[1]);
         const auto launch   = [&]<class Schedule>() {
             using S = Fp8ScheduleInstance<Schedule, 5120>;
-            if constexpr (S::kTmaSwizzle)
-                launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
-                                           workspace.partials);
-            else
-                launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream, {},
-                                     pdl::Dependency::Programmatic);
+            with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+                if constexpr (S::kTmaSwizzle)
+                    launch_fp8_a8_tma_mma<S>(operands, output, epilogue, stream, workspace.partials);
+                else
+                    launch_fp8_a8_mma<S>(operands, output, epilogue, stream, {}, pdl::Dependency::Programmatic);
+            });
         };
         if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
         if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();

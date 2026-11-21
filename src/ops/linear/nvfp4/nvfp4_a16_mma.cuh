@@ -11,6 +11,7 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_shared.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -57,6 +58,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 
     const int row_begin   = static_cast<int>(blockIdx.x) * (BM / (RowPolicy::kPaired ? 2 : 1));
     const int token_begin = token_offset + static_cast<int>(blockIdx.y) * BN;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        lora_prefetch_tile(
+            epilogue.lora, BM, [&](int i) { return row_policy.weight_row(row_begin, i, M); }, token_begin,
+            min(BN, tokens - token_begin), tid, THREADS);
+    }
 
     float accumulators[MT][NT][4] = {};
 
@@ -200,6 +206,37 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     }
 
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        const auto row_of = [&](int mi, int i) { return row_policy.weight_row(row_begin, wm * WM + mi * 16 + i, M); };
+        const auto token_of = [&](int ni, int j) {
+            const int token = token_begin + wn * WN + ni * 8 + j;
+            return token < tokens ? token : -1;
+        };
+        constexpr bool kSingle =
+            !RowPolicy::kPaired && !requires {
+                epilogue.template finish_tile<Schedule, FullTokens>(
+                    linear_output_tile<BM>(output, row_begin), shared_raw, accumulators, row_begin, token_begin, M,
+                    tokens);
+            };
+        if constexpr (kSingle) {
+            // The epilogue on the kernel's own v * alpha (its residual add may fuse the product), then the term.
+            lora_finish_rows_tile<MT, NT>(epilogue, accumulators, row_of, token_of,
+                                          [&](int, int, float v) { return v * alpha; });
+            lora_store_rows_tile<MT, NT>(linear_output_tile<BM>(output, row_begin), accumulators, row_of, token_of);
+            return;
+        } else {
+            // Gate and up: the scaled values (one rounded multiply, the SwiGLU's own product) and the term; the
+            // epilogue below then scales by 1 (exact).
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) accumulators[mi][ni][e] = __fmul_rn(accumulators[mi][ni][e], alpha);
+            lora_add_rows_tile<MT, NT>(epilogue.lora, accumulators, row_of, token_of);
+            alpha = 1.0F;
+        }
+    }
     const auto destination =
         linear_output_tile<BM / (RowPolicy::kPaired ? 2 : 1)>(output, row_begin);
     if constexpr (requires {

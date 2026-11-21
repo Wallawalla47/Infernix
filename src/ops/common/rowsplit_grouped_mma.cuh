@@ -7,11 +7,13 @@
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
+#include "ops/lora/lora_device.cuh"
 #include "core/tensor.h"
 
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace infernix::ops::detail {
 
@@ -32,12 +34,23 @@ enum class RowSplitGroupedMmaCodec : std::uint8_t {
     Q5,
 };
 
+// --lora: the term of a grouped call (include/infernix/ops/lora.h), one addend over the call's logical rows: job j's
+// row r is logical row row_base[j] + r. Its U columns are the call's (a token slice passes lora_columns_from).
+// Kernels take LoraNone (no term; the kernel as it was) or this.
+struct RowSplitGroupedLora {
+    LoraDeviceAddend addend;
+    std::int32_t row_base[4] = {};
+};
+template <class Lora>
+inline constexpr bool kRowSplitGroupedLora = std::is_same_v<Lora, RowSplitGroupedLora>;
+
 template <class Cfg, bool FullTiles, RowSplitGroupedMmaCodec Codec = RowSplitGroupedMmaCodec::Mixed,
-          int Jobs = 4>
+          int Jobs = 4, class Lora = LoraNone>
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_grouped_mma_kernel(
     const __nv_bfloat16* __restrict__ x, RowSplitGroupedMmaJob job0, RowSplitGroupedMmaJob job1,
     RowSplitGroupedMmaJob job2, RowSplitGroupedMmaJob job3, std::int32_t k, std::int32_t t,
-    std::int32_t padded_k) {
+    std::int32_t padded_k, Lora lora) {
+    constexpr bool kLora = kRowSplitGroupedLora<Lora>;
     constexpr int BM   = Cfg::BM;
     constexpr int BN   = Cfg::BN;
     constexpr int BK   = Cfg::BK;
@@ -62,27 +75,35 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     const int tiles0 = div_up(job0.n, BM);
     int tile         = static_cast<int>(blockIdx.x);
     RowSplitGroupedMmaJob job;
+    int lora_row_base = 0; // --lora: the job's first logical row
     if constexpr (Jobs == 2) {
         if (tile < tiles0) {
             job = job0;
+            if constexpr (kLora) { lora_row_base = lora.row_base[0]; }
         } else {
             tile -= tiles0;
             job = job1;
+            if constexpr (kLora) { lora_row_base = lora.row_base[1]; }
         }
     } else {
         const int tiles1 = div_up(job1.n, BM);
         const int tiles2 = div_up(job2.n, BM);
         if (tile < tiles0) {
             job = job0;
+            if constexpr (kLora) { lora_row_base = lora.row_base[0]; }
         } else if ((tile -= tiles0) < tiles1) {
             job = job1;
+            if constexpr (kLora) { lora_row_base = lora.row_base[1]; }
         } else if ((tile -= tiles1) < tiles2) {
             job = job2;
+            if constexpr (kLora) { lora_row_base = lora.row_base[2]; }
         } else {
             tile -= tiles2;
             job = job3;
+            if constexpr (kLora) { lora_row_base = lora.row_base[3]; }
         }
     }
+    (void)lora_row_base;
 
     const int kg   = padded_k >> 6;
     const int tid  = static_cast<int>(threadIdx.x);
@@ -281,6 +302,12 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
         if (s < NKT) { stage_load(s, s); }
         infernix::ops::cp_commit();
     }
+    if constexpr (kLora) {
+        // The term's B rows and U columns into L2 while the K loop runs.
+        lora_prefetch_tile(
+            lora.addend, BM, [&](int i) { return lora_row_base + (m0 + i < job.n ? m0 + i : job.n - 1); }, t0,
+            min(BN, t - t0), tid, Cfg::THREADS);
+    }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
@@ -321,6 +348,19 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
         infernix::ops::cp_commit();
     }
 
+    if constexpr (kLora) {
+        // --lora: the term on every warp's fragments (canonical chains), before the BF16 stores.
+        lora_add_rows_tile<MT, NT>(
+            lora.addend, acc,
+            [&](int mm, int i) {
+                const int r = m0 + wm * WM + mm * 16 + i;
+                return lora_row_base + (r < job.n ? r : job.n - 1);
+            },
+            [&](int mn, int j) {
+                const int c = t0 + wn * WN + mn * 8 + j;
+                return c < t ? c : -1;
+            });
+    }
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
         const int r0 = m0 + wm * WM + mi * 16 + gid;

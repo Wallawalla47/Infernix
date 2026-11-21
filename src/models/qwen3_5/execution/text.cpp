@@ -1045,9 +1045,11 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto* single = std::get_if<LinearParameters>(&p.projection);
     if (single != nullptr &&
         ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight, single->policy, T)) {
+        // --lora: the norm also stores h (the shrink's input) and the projection takes the term.
         ops::attn_input_proj_fused_rmsnorm_nvfp4(
             x, w.input_norm, config_.rms_norm_eps, single->weight, q_flat, gate_flat, k_flat,
-            v_flat, single->policy, work_, s);
+            v_flat, single->policy, work_, s, p.lora_input ? &*p.lora_input : nullptr,
+            p.lora_input ? &h : nullptr);
     } else {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
@@ -1133,9 +1135,11 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             text_kv_layer(static_cast<std::uint32_t>(fidx)),
             execution_schedule_.apply(*active_causal_attention_envelope_), work_, tail, ctx_.execution_view());
         ops::sigmoid_mul(gate.slice(2, skipped, kept), tail, s);
-        Tensor columns = x.slice(1, skipped, kept);
-        ops::linear_add(tail.view({dimension(config_.attention->query_width()), kept}), p.output.weight, columns,
-                        residual_projection_policy(p.output, false), work_, s, ops::LinearRoutes::Exact);
+        Tensor columns       = x.slice(1, skipped, kept);
+        const Tensor gated   = tail.view({dimension(config_.attention->query_width()), kept});
+        const auto lora      = attention_output_lora(p, gated, work_, s);
+        ops::linear_add(gated, p.output.weight, columns, residual_projection_policy(p.output, false), work_, s,
+                        ops::LinearRoutes::Exact, lora ? &*lora : nullptr);
         return;
     } else {
         ops::causal_softmax_attention(
@@ -1152,17 +1156,21 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     Tensor mixed = a.view({dimension(config_.attention->query_width()), T});
     if (output_columns_ > 0) { // YC-01: only the last columns' output is read past this layer
-        Tensor columns = x.slice(1, T - output_columns_, output_columns_);
-        ops::linear_add(mixed.slice(1, T - output_columns_, output_columns_), p.output.weight, columns,
-                        residual_projection_policy(p.output, false), work_, s, ops::LinearRoutes::Exact);
+        Tensor columns     = x.slice(1, T - output_columns_, output_columns_);
+        const Tensor gated = mixed.slice(1, T - output_columns_, output_columns_);
+        const auto lora    = attention_output_lora(p, gated, work_, s);
+        ops::linear_add(gated, p.output.weight, columns, residual_projection_policy(p.output, false), work_, s,
+                        ops::LinearRoutes::Exact, lora ? &*lora : nullptr);
         return;
     }
+    const auto lora = attention_output_lora(p, mixed, work_, s);
     ops::linear_add(mixed, p.output.weight, x,
                     residual_projection_policy(
                         p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
                     work_, s,
                     ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
-                                        : ops::LinearRoutes::Exact);
+                                        : ops::LinearRoutes::Exact,
+                    lora ? &*lora : nullptr);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {

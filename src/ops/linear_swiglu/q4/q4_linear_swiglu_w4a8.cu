@@ -20,6 +20,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -165,10 +166,14 @@ __device__ __forceinline__ int tile_offset(int row, int byte) {
 // ---------------------------------------------------------------------------------------------
 // The fused gate/up W4A8 GEMM with the SwiGLU epilogue.
 
-__global__ __launch_bounds__(kThreads, 2) void q4_linear_swiglu_w4a8_kernel(
+// `lora`: LoraNone, or the term over the gate/up parent's rows and the call's columns (lora_device.cuh). The adapter
+// instance runs one CTA an SM: at two (64 registers) it spilled 48 B; at one it keeps everything in registers, as
+// fast (groupwise 27B pp2048, 2026-11-21: -0.01 %).
+template <class Lora>
+__global__ __launch_bounds__(kThreads, kLoraTerm<Lora> ? 1 : 2) void q4_linear_swiglu_w4a8_kernel(
     const std::int8_t* __restrict__ xq, const float* __restrict__ xs,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out, std::int32_t intermediate, std::int32_t k, std::int32_t t) {
+    __nv_bfloat16* __restrict__ out, std::int32_t intermediate, std::int32_t k, std::int32_t t, Lora lora) {
     __shared__ __align__(16) std::int8_t a_tile[kStages][kTileTokens * kGroupK];
     __shared__ __align__(16) std::int8_t b_tile[kStages][2][kTileRows * kGroupK];
     __shared__ __align__(16) float w_scale[kStages][2][kTileRows];
@@ -337,6 +342,44 @@ __global__ __launch_bounds__(kThreads, 2) void q4_linear_swiglu_w4a8_kernel(
     const int token_hi   = token_lo + 8;
     const float scale_lo = token_lo < t ? xs[token_lo] : 0.0F;
     const float scale_hi = token_hi < t ? xs[token_hi] : 0.0F;
+    if constexpr (kLoraTerm<Lora>) {
+        // --lora: the scaled gate and up values (one rounded multiply each, as below) plus their terms (canonical
+        // chains, tokens as M), then the SwiGLU.
+        float gate[1][kRowTiles][4], up[1][kRowTiles][4];
+#pragma unroll
+        for (int mr = 0; mr < kRowTiles; ++mr) {
+            gate[0][mr][0] = __fmul_rn(gate_acc[mr][0], scale_lo);
+            gate[0][mr][1] = __fmul_rn(gate_acc[mr][1], scale_lo);
+            gate[0][mr][2] = __fmul_rn(gate_acc[mr][2], scale_hi);
+            gate[0][mr][3] = __fmul_rn(gate_acc[mr][3], scale_hi);
+            up[0][mr][0]   = __fmul_rn(up_acc[mr][0], scale_lo);
+            up[0][mr][1]   = __fmul_rn(up_acc[mr][1], scale_lo);
+            up[0][mr][2]   = __fmul_rn(up_acc[mr][2], scale_hi);
+            up[0][mr][3]   = __fmul_rn(up_acc[mr][3], scale_hi);
+        }
+        const auto token_of = [&](int, int i) {
+            const int token = tok0 + warp_token * 16 + i;
+            return token < t ? token : -1;
+        };
+        lora_add_tokens_tile<1, kRowTiles>(lora, gate, token_of, [&](int mr, int j) {
+            return row0 + warp_row * kWarpRows + mr * 8 + j;
+        });
+        lora_add_tokens_tile<1, kRowTiles>(lora, up, token_of, [&](int mr, int j) {
+            return intermediate + row0 + warp_row * kWarpRows + mr * 8 + j;
+        });
+#pragma unroll
+        for (int mr = 0; mr < kRowTiles; ++mr) {
+            const int row = row0 + warp_row * kWarpRows + mr * 8 + 2 * tig;
+            if (token_lo < t) {
+                store_vec(out + static_cast<std::int64_t>(token_lo) * intermediate + row,
+                          pack_bf16x2(silu(gate[0][mr][0]) * up[0][mr][0], silu(gate[0][mr][1]) * up[0][mr][1]));
+            }
+            if (token_hi < t) {
+                store_vec(out + static_cast<std::int64_t>(token_hi) * intermediate + row,
+                          pack_bf16x2(silu(gate[0][mr][2]) * up[0][mr][2], silu(gate[0][mr][3]) * up[0][mr][3]));
+            }
+        }
+    } else {
 #pragma unroll
     for (int mr = 0; mr < kRowTiles; ++mr) {
         const int row = row0 + warp_row * kWarpRows + mr * 8 + 2 * tig;
@@ -357,12 +400,13 @@ __global__ __launch_bounds__(kThreads, 2) void q4_linear_swiglu_w4a8_kernel(
                       pack_bf16x2(silu(g0) * u0, silu(g1) * u1));
         }
     }
+    }
 }
 
 } // namespace
 
 void q4_linear_swiglu_w4a8_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const LoraAddend* lora) {
     const std::int32_t k            = x.ne[0];
     const std::int32_t t            = x.ne[1];
     const std::int32_t intermediate = out.ne[0];
@@ -380,10 +424,12 @@ void q4_linear_swiglu_w4a8_launch(const Tensor& x, const Weight& w, Tensor& out,
 
     const dim3 grid(static_cast<unsigned>(div_up(t, kTileTokens)),
                     static_cast<unsigned>(intermediate / kTileRows));
-    q4_linear_swiglu_w4a8_kernel<<<grid, kThreads, 0, stream>>>(
-        scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-        intermediate, k, t);
+    with_lora_term(lora, 0, [&](auto term) {
+        q4_linear_swiglu_w4a8_kernel<decltype(term)><<<grid, kThreads, 0, stream>>>(
+            scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+            intermediate, k, t, term);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

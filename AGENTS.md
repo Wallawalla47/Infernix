@@ -61,7 +61,9 @@ Keep these ownership boundaries visible when selecting a design:
 
 - The v3 container (`.infernix`, or `.ninfer` from NInfer) is the only C++ product artifact; CLI,
   serving, and inference benchmarks use the public Engine. Infernix has no Python model-inference
-  route or installed/exported C++ SDK.
+  route or installed/exported C++ SDK. A runtime LoRA adapter (`--lora`, [LoRA adapters](docs/lora.md))
+  is read from its own Hugging Face PEFT files (`adapter_model.safetensors` and `adapter_config.json`)
+  beside the artifact; it is not converted or stored in one.
 - The launcher (`infernix-launcher`, `src/launcher`, web UI in `apps/launcher/web`) runs no
   inference: it supervises one `infernix-serve` process per loaded model, proxies its HTTP
   endpoints, switches models on request, downloads artifacts and keeps per-model launch parameters.

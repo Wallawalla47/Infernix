@@ -102,24 +102,27 @@ constexpr std::int32_t kWaveCols       = 512;
 constexpr std::int32_t kNarrowTailCols = 192;
 
 void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                  WorkspaceArena& ws, cudaStream_t stream) {
+                                  WorkspaceArena& ws, cudaStream_t stream, const LoraAddend* lora) {
     const std::int32_t cols = x.ne[1];
     const std::int32_t wide = (cols / kWaveCols) * kWaveCols;
     const std::int32_t tail = cols - wide;
     if (wide == 0 || tail == 0 || tail > kNarrowTailCols) {
-        q5_linear_add_ring_t128_launch(x, w, residual_out, stream);
+        q5_linear_add_ring_t128_launch(x, w, residual_out, stream, lora);
         return;
     }
 
     const Tensor x_wide = x.slice(1, 0, wide);
     Tensor out_wide     = residual_out.slice(1, 0, wide);
-    q5_linear_add_ring_t128_launch(x_wide, w, out_wide, stream);
+    q5_linear_add_ring_t128_launch(x_wide, w, out_wide, stream, lora);
 
     const Tensor x_tail = x.slice(1, wide, tail);
     Tensor out_tail     = residual_out.slice(1, wide, tail);
+    // The tail's term reads U from its first column.
+    LoraAddend tail_lora;
+    if (lora != nullptr) { tail_lora = lora_columns_from(*lora, wide); }
     q5_linear_add_execute_plan(
         q5_linear_add_resolve_plan({residual_out.ne[0], x.ne[0], w.padded_shape[1], x_tail.ne[1]}),
-        x_tail, w, out_tail, ws, stream);
+        x_tail, w, out_tail, ws, stream, false, false, lora != nullptr ? &tail_lora : nullptr);
 }
 
 } // namespace
@@ -205,7 +208,7 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
                                 Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream,
-                                bool column_invariant, bool ksplit) {
+                                bool column_invariant, bool ksplit, const LoraAddend* lora) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem, column_invariant, ksplit);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
@@ -215,50 +218,50 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 
     switch (plan.schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:
-        q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
+        q5_linear_add_split2_exact_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR16T8W4S2:
-        q5_linear_add_sliced_r16_t8_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r16_t8_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR16T16W4S2:
-        q5_linear_add_sliced_r16_t16_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r16_t16_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR16T24W4S2:
-        q5_linear_add_sliced_r16_t24_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r16_t24_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR32T32W4S2:
-        q5_linear_add_sliced_r32_t32_w4_s2_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r32_t32_w4_s2_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise:
-        q5_linear_add_sliced_r32_t24_pairwise_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r32_t24_pairwise_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR32T32W4S1:
-        q5_linear_add_sliced_r32_t32_w4_s1_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r32_t32_w4_s1_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR32T32W2S2:
-        q5_linear_add_sliced_r32_t32_w2_s2_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r32_t32_w2_s2_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedR32T64W2S1:
-        q5_linear_add_sliced_r32_t64_w2_s1_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_r32_t64_w2_s1_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::MmaResidualR32T32K128:
-        q5_linear_add_mma_r32_t32_k128_launch(x, w, residual_out, stream);
+        q5_linear_add_mma_r32_t32_k128_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::MmaResidualR32T128:
-        q5_linear_add_mma_r32_t128_launch(x, w, residual_out, stream);
+        q5_linear_add_mma_r32_t128_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::RingResidualT128:
-        q5_linear_add_ring_t128_launch(x, w, residual_out, stream);
+        q5_linear_add_ring_t128_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::RingResidualT128Tail:
-        launch_wide_with_narrow_tail(x, w, residual_out, ws, stream);
+        launch_wide_with_narrow_tail(x, w, residual_out, ws, stream, lora);
         return;
     case Q5LinearAddScheduleId::SlicedColumnInvariant:
-        q5_linear_add_sliced_invariant_launch(x, w, residual_out, stream);
+        q5_linear_add_sliced_invariant_launch(x, w, residual_out, stream, lora);
         return;
     case Q5LinearAddScheduleId::KSplitW8:
     case Q5LinearAddScheduleId::KSplitColumnInvariant:
-        q5_linear_add_ksplit_launch(x, w, residual_out, stream);
+        q5_linear_add_ksplit_launch(x, w, residual_out, stream, lora);
         return;
     }
     throw std::logic_error("q5 linear_add: unknown schedule");
@@ -266,10 +269,10 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
                             WorkspaceArena& ws, cudaStream_t stream, bool column_invariant,
-                            bool ksplit) {
+                            bool ksplit, const LoraAddend* lora) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem, column_invariant, ksplit);
-    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream, column_invariant, ksplit);
+    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream, column_invariant, ksplit, lora);
 }
 
 } // namespace infernix::ops::detail

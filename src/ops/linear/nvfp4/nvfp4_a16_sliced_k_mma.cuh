@@ -11,6 +11,7 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_shared.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -117,6 +118,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int b_k_offset              = ((lane >> 3) & 1) << 3;
     const int warp_k0                 = warp * kTileK;
     float accumulators[kTokenMmas][4] = {};
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        if (warp == 0) {
+            int rows16[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) { rows16[i] = row_policy.weight_row(row0, i, operands.rows); }
+            lora_prefetch_warp(epilogue.lora, rows16, token_begin, live_columns);
+        }
+    }
 
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
@@ -202,6 +211,60 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     }
     __syncthreads();
 
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        if (warp == 0) {
+            // The reduced sums; gate and up are scaled (one rounded multiply, the SwiGLU's own product) and take the
+            // term before the SwiGLU, a single value takes it on the epilogue's result of the kernel's own
+            // sum * alpha (the residual's add may fuse the product).
+            const auto destination = linear_output_tile<kBlockRows / (RowPolicy::kPaired ? 2 : 1)>(output, row0);
+            const float alpha      = operands.alpha;
+            float values[1][kTokenMmas][4];
+#pragma unroll
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                float4 sum = make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
+                                         accumulators[token_mma][2], accumulators[token_mma][3]);
+#pragma unroll
+                for (int split = 2; split < kWarps; split += 2) {
+                    const float4 value =
+                        load_vec<float4>(partial + ((split * kTokenMmas + token_mma) * 32 + lane) * 4);
+                    sum.x += value.x;
+                    sum.y += value.y;
+                    sum.z += value.z;
+                    sum.w += value.w;
+                }
+                values[0][token_mma][0] = sum.x;
+                values[0][token_mma][1] = sum.y;
+                values[0][token_mma][2] = sum.z;
+                values[0][token_mma][3] = sum.w;
+            }
+            const auto row_of   = [&](int, int i) { return row_policy.weight_row(row0, i, operands.rows); };
+            const auto token_of = [&](int mn, int j) {
+                return mn * 8 + j < live_columns ? token_begin + mn * 8 + j : -1;
+            };
+            if constexpr (RowPolicy::kPaired) {
+#pragma unroll
+                for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) values[0][token_mma][e] = __fmul_rn(values[0][token_mma][e], alpha);
+                lora_add_rows_tile<1, kTokenMmas>(epilogue.lora, values, row_of, token_of);
+#pragma unroll
+                for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                    const float* v        = values[0][token_mma];
+                    const int local_token = token_mma * 8 + 2 * lid;
+                    const int token0      = token_begin + local_token;
+                    const int row_a       = row_policy.weight_row(row0, gid, operands.rows);
+                    if (local_token < live_columns) epilogue.apply_pair(destination, row_a, token0, v[0], v[2]);
+                    if (local_token + 1 < live_columns)
+                        epilogue.apply_pair(destination, row_a, token0 + 1, v[1], v[3]);
+                }
+            } else {
+                lora_finish_rows_tile<1, kTokenMmas>(epilogue, values, row_of, token_of,
+                                                     [&](int, int, float v) { return v * alpha; });
+                lora_store_rows_tile<1, kTokenMmas>(destination, values, row_of, token_of);
+            }
+        }
+        return;
+    }
     if (warp == 0) {
         const auto destination =
             linear_output_tile<kBlockRows / (RowPolicy::kPaired ? 2 : 1)>(output, row0);

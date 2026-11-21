@@ -5,6 +5,7 @@
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/vector_output.cuh"
+#include "ops/lora/lora_device.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -263,12 +264,25 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int block = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     // The scales and codes are immutable: a programmatic dependent stages the scales before it waits.
     nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared, block, rows, policy);
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, 1>;
+    [[maybe_unused]] LoraStage* lora_stage = nullptr;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B rows (immutable) stage before the wait, after the scales' own copies have been waited for.
+        __shared__ LoraStage lora_stages[Schedule::kWarpsPerCta];
+        lora_stage = &lora_stages[warp];
+        int term_rows[Schedule::kRowsPerWarp];
+#pragma unroll
+        for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+            term_rows[r] = nvfp4_a16_parent_row<Schedule>(block, warp * Schedule::kRowsPerWarp + r, rows, policy);
+        lora_stage_warp_b(epilogue.lora, term_rows, *lora_stage);
+    }
     pdl::enter_streaming();
     const int local0 = warp * Schedule::kRowsPerWarp;
     int parent[Schedule::kRowsPerWarp];
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
         parent[r] = nvfp4_a16_parent_row<Schedule>(block, local0 + r, rows, policy);
+    if constexpr (kLoraEpilogue<Epilogue>) { lora_stage_warp_u(epilogue.lora, parent, 0, 1, *lora_stage); }
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent, local0, lane,
                                            accumulators);
@@ -280,6 +294,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 #pragma unroll
         for (int c = 0; c < Schedule::kAccumulatorChains; ++c) sum += accumulators[r][c];
         totals[r] = warp_reduce_sum(sum);
+    }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The coefficients carry alpha, so totals are the scaled values: add the term (every lane, warp-wide MMA).
+        float add[Schedule::kRowsPerWarp][1];
+        bool has[Schedule::kRowsPerWarp];
+        lora_warp_rows_staged<Schedule::kRowsPerWarp, 1>(epilogue.lora, parent, 0, 1, add, has, *lora_stage);
+#pragma unroll
+        for (int r = 0; r < Schedule::kRowsPerWarp; ++r) { totals[r] = lora_add(totals[r], add[r][0], has[r]); }
     }
     if (lane == 0) {
 #pragma unroll

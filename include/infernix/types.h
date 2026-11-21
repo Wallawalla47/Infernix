@@ -710,6 +710,10 @@ inline constexpr const char* kExpertRamLayoutDefaults = "exclusive for Qwen3.8-F
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    // A LoRA adapter applied at runtime (--lora): a Hugging Face PEFT adapter's directory, or its
+    // adapter_model.safetensors with adapter_config.json beside it. Every projection it targets computes
+    // W x + s B (A x) exactly (include/infernix/ops/lora.h); the artifact is unchanged. Qwen3.5 dense models only.
+    std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
@@ -2091,6 +2095,7 @@ struct MemoryUsage {
     struct Device {
         std::uint64_t weights       = 0; // the model's device weights, the drafter's excepted
         std::uint64_t drafter       = 0; // a separate drafter's weights, and the drafters' columns, rings and pools
+        std::uint64_t adapter       = 0; // a LoRA adapter's factors (--lora; its per-call U is in `workspace`)
         std::uint64_t experts       = 0; // the VRAM expert cache's frames that hold experts
         std::uint32_t expert_frames = 0;
         std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
@@ -2141,6 +2146,9 @@ struct MemorySummary {
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
+    // Beside the weights' arena: the DFlash2 drafter's proposal-head screen, and a LoRA adapter's factors (--lora).
+    std::size_t draft_screen_bytes = 0;
+    std::size_t adapter_bytes      = 0;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     std::optional<VisionWorkspaceMemorySummary> vision_workspace;
@@ -2197,10 +2205,14 @@ struct EnginePlanVram {
     // Offloaded experts: the VRAM expert cache's frames and bytes.
     std::optional<std::uint64_t> expert_cache_bytes;
     std::optional<std::uint32_t> expert_frames;
+    // Qwen3.5 family, beside the weights' arena: the DFlash2 drafter's proposal-head screen, and a LoRA adapter's
+    // factors (--lora; the adapter's per-call workspace is in workspace_bytes). Empty when the start has none.
+    std::optional<std::uint64_t> draft_screen_bytes;
+    std::optional<std::uint64_t> adapter_bytes;
     // Left free for the display and other programs (--vram-headroom-mib or the automatic headroom).
     std::uint64_t headroom_bytes = 0;
-    // Everything planned on the device (weights, the Program's reservation, expert frames), and what
-    // the free memory leaves beside it and the headroom (0 when it does not fit).
+    // Everything planned on the device (weights, the draft screen, the adapter, the Program's reservation, expert
+    // frames), and what the free memory leaves beside it and the headroom (0 when it does not fit).
     std::uint64_t planned_bytes = 0;
     std::uint64_t left_bytes    = 0;
 };
@@ -2582,6 +2594,9 @@ struct ModelMetadata {
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    // EngineOptions::lora_path: the adapter applied, as "<directory>: <modules, rank, scale, factor type, base>";
+    // empty without one.
+    std::string lora_adapter;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;

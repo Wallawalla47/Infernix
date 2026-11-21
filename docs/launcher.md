@@ -109,7 +109,7 @@ One page, top to bottom:
   available (how full it is says little: models with offloaded experts fill it on purpose). A
   temperature past its limit is also named beside **All gauges** while its dial is not shown.
 - **Memory**: what the loaded `infernix-serve` holds, as one bar for VRAM and one for RAM: its
-  parts (model weights, the drafter, experts with their count, model state, the KV cache, the prefix
+  parts (model weights, the drafter, a LoRA adapter, experts with their count, model state, the KV cache, the prefix
   cache, workspace, CUDA graphs, staging, the n-gram table, the n-gram archive; the KV cache and the
   prefix cache side by side, since they trade pages with every request, so only their shared boundary
   moves), then
@@ -219,14 +219,15 @@ and **Download as .sh** (in the **⋮** menu) write the configuration as a `.bat
 every argument quoted for cmd) or `.sh` that runs `infernix-serve` directly, with its model id.
 
 **Will it fit?** asks the installed `infernix-serve` to size the configuration without loading it
-(`infernix-serve --plan`): the VRAM it would take (weights, KV cache and the context it holds,
-workspace, CUDA graphs, expert cache, headroom), the RAM (experts, pinned prefix cache, n-gram
+(`infernix-serve --plan`): the VRAM it would take (weights, DFlash2's draft screen, a LoRA adapter, KV cache and
+the context it holds, workspace, CUDA graphs, expert cache, headroom), the RAM (experts, pinned prefix cache, n-gram
 table, what stays free), and the largest `--max-context` that fits. A configuration that does not
 fit gets the same suggestions as a failed load ([Watchdog](#watchdog)). The plan reads the GPU as it
 is now, so a loaded model's memory counts against it; unload first to plan for an empty GPU.
 Turning on **Vision** checks at once: the vision tower takes VRAM a 27B's default context was sized
 without, so the default context no longer fits beside it (on a 32 GB GPU the official NVFP4 27B
-fits 177,856 tokens with `--vision` against 222,272 without).
+fits 177,856 tokens with `--vision` against 222,272 without). Setting or changing the **LoRA adapter** checks at
+once too: its factors take VRAM beside the weights (304 MiB for a rank-32 adapter on every projection of a 27B).
 
 **Speculative decoding.** **Off** writes `--spec off` when the server lists `off` among its `--spec`
 values (such a server speculates when `--spec` is absent, and the field then shows **Auto**);

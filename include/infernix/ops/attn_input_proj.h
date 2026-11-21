@@ -3,6 +3,7 @@
 #include "core/weight.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -40,7 +41,16 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     LinearPolicy policy, cudaStream_t stream);
+                     LinearPolicy policy, cudaStream_t stream, const LoraAddend* lora = nullptr);
+
+/**
+ * Whether the single-parent projection takes a LoRA term (include/infernix/ops/lora.h) at every policy and T: each
+ * projected value p becomes fl32(p + fl32(c * s)) before its BF16 store (the canonical addend), the term's rows in the
+ * parent's physical order query, key, gate, value. NVFP4 and row-scaled FP8 [14336,5120] parents; the paired Q4/Q5
+ * projection takes the term with its two parents as the single parent's halves.
+ */
+[[nodiscard]] bool attn_input_proj_lora_supported(QType parent_qtype, std::int32_t parent_rows,
+                                                  std::int32_t input_rows);
 
 /**
  * Computes the single-parent Q/K/output-gate/V projection.
@@ -90,7 +100,7 @@ attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
-                     WorkspaceArena& workspace, cudaStream_t stream);
+                     WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 /**
  * Whether the single-parent NVFP4 [14336,5120] projection uses its AllowA4 TMA route.
@@ -111,11 +121,19 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
  * caller-owned workspace capacity as attn_input_proj_workspace_capacity_bytes() for this parent
  * and T; the workspace must not overlap any input, weight, or output. No hidden tensor is written.
  * The Op has no persistent state side effect.
+ *
+ * LoRA (include/infernix/ops/lora.h): with a site (`lora`, A [rows, 5120] and the projection's term)
+ * the norm also stores h, the bits rmsnorm() writes, to `normalized` (contiguous BF16 [5120,T],
+ * overlapping nothing else), and the projection takes the term over U = A h: the bits of rmsnorm(),
+ * lora_shrink() and attn_input_proj(+term). The workspace then also holds U
+ * (lora_u bytes before the projection's capacity).
  */
 void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& norm_weight,
                                          float eps, const Weight& projection_weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
-                                         WorkspaceArena& workspace, cudaStream_t stream);
+                                         WorkspaceArena& workspace, cudaStream_t stream,
+                                         const LoraSite* lora = nullptr,
+                                         const Tensor* normalized = nullptr);
 
 /**
  * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.

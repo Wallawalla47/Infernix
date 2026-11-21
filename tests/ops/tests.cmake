@@ -164,6 +164,11 @@ set_tests_properties(infernix_ggml_linear_a8_wide_test PROPERTIES TIMEOUT 900)
 infernix_add_family_op_test(infernix_lossless_linear_test FAMILY lossless
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_linear.cpp"
   LIBRARIES infernix_ops)
+# --lora on the lossless route: u = fp32(A x), d = fp32(B u) and y = bf16(fp32(y + fp32(d s))) against an exact
+# host oracle (wide-integer sums, rounded once).
+infernix_add_family_op_test(infernix_lossless_lora_test FAMILY lossless
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_lora.cpp"
+  LIBRARIES infernix_ops)
 # Its correctly rounded binary32/BF16 functions against an exact decimal oracle (every BF16 input and
 # random binary32 ones); the Python driver writes the vectors and runs the executable. Both exact
 # oracles keep their deterministic output in oracle-cache/, keyed by their sources and Python version,
@@ -566,6 +571,17 @@ set_tests_properties(infernix_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)
 # (2026-10-22), so they run alone; the rest of the layer test runs beside other tests.
 add_test(NAME infernix_offloaded_moe_layer_idle_test COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --idle-only)
 set_tests_properties(infernix_offloaded_moe_layer_idle_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+# LoRA (include/infernix/ops/lora.h): the MMA element assumption the canonical arithmetic rests on; the shrink against
+# its oracle and its canonical bits; every adapted Op's term on zero base weights at the 27B shapes and routes; and
+# A16ColumnInvariant column bits with the term.
+infernix_add_family_op_test(infernix_lora_mma_position_test FAMILY lora
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_mma_position.cu"
+  LIBRARIES infernix_ops)
+infernix_add_family_op_test(infernix_lora_test FAMILY lora
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_lora_test PROPERTIES TIMEOUT 3600 RESOURCE_LOCK gpu_memory)
 
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

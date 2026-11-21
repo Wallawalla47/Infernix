@@ -8,6 +8,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -15,12 +16,14 @@
 
 namespace infernix::ops::detail {
 
-template <class Cfg, bool FullTiles>
+// `lora`: LoraNone, or the term over the gate/up parent's rows (gate rows [0, intermediate), up rows after) and the
+// launch's columns (lora_device.cuh).
+template <class Cfg, bool FullTiles, class Lora = LoraNone>
 __global__
 __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split_half_pair_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
-    std::int32_t intermediate, std::int32_t k, std::int32_t t, std::int32_t padded_k) {
+    std::int32_t intermediate, std::int32_t k, std::int32_t t, std::int32_t padded_k, Lora lora) {
     constexpr int BM   = Cfg::BM;
     constexpr int BN   = Cfg::BN;
     constexpr int BK   = Cfg::BK;
@@ -161,6 +164,16 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
         if (s < NKT) { stage_load(s, s); }
         infernix::ops::cp_commit();
     }
+    // --lora: fragment mm holds outputs m0 + 16 (mm & 1) + i, gate (mm < 2) or up rows.
+    const auto lora_row = [m0, intermediate](int mm, int i) {
+        const int output = m0 + (mm & 1) * 16 + i;
+        return (output < intermediate ? output : intermediate - 1) + (mm >> 1) * intermediate;
+    };
+    (void)lora_row;
+    if constexpr (kLoraTerm<Lora>) {
+        lora_prefetch_tile(
+            lora, BM, [&](int i) { return lora_row(i >> 4, i & 15); }, t0, min(BN, t - t0), tid, Cfg::THREADS);
+    }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
@@ -202,6 +215,15 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
         infernix::ops::cp_commit();
     }
 
+    if constexpr (kLoraTerm<Lora>) {
+        // --lora: the term on the gate and up fragments (canonical chains), before the SwiGLU.
+        lora_add_rows_tile<MT, NT>(
+            lora, acc, lora_row,
+            [&](int mn, int j) {
+                const int c = t0 + wn * WN + mn * 8 + j;
+                return c < t ? c : -1;
+            });
+    }
 #pragma unroll
     for (int mi = 0; mi < MT / 2; ++mi) {
         const int r0 = m0 + mi * 16 + gid;

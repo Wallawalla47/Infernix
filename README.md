@@ -153,6 +153,8 @@ Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer
   ([serving](docs/serving.md#documents-pdfs-and-citations)).
 - **Conversion**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources; Q4-Q8, FP8, NVFP4 and
   mixed recipes.
+- **LoRA adapters**: `--lora` applies a Hugging Face PEFT adapter to the Qwen3.8-27B artifacts at runtime,
+  read from its own files ([LoRA adapters](docs/lora.md)).
 - **Windows and Linux**: native MSVC and GCC builds, WSL2 included.
 
 ## Benchmarks

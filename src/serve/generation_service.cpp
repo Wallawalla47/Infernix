@@ -383,6 +383,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
                                             DiagnosticObserver diagnostic_observer) {
     infernix::EngineOptions engine_options;
     engine_options.artifact_path            = options.artifact_path;
+    engine_options.lora_path                = options.lora_path;
     engine_options.chat_template_path       = options.chat_template_path;
     engine_options.ngram_volume_path        = options.ngram_volume_path;
     engine_options.ngram_residency          = options.ngram_residency;

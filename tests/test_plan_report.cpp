@@ -47,6 +47,8 @@ int main() {
     resident.vram.page_group_tokens         = 64U;
     resident.vram.workspace_bytes           = 1500000000ULL;
     resident.vram.graph_allowance_bytes     = 300000000ULL;
+    resident.vram.draft_screen_bytes        = 357600000ULL;
+    resident.vram.adapter_bytes             = 318767104ULL;
     resident.vram.headroom_bytes            = 1073741824ULL;
     resident.vram.planned_bytes             = 29000000000ULL;
     resident.vram.left_bytes                = 1900000000ULL;
@@ -69,7 +71,8 @@ int main() {
                           root["gpu"]["total_bytes"] == 34190917632ULL && root["gpu"]["budget_bytes"].is_null(),
                       "gpu: name, sizes as integers, no OS budget");
     const Json& vram = root["vram"];
-    failures += check(keys(vram) == std::vector<std::string>{"bytes_per_page_group", "expert_cache_bytes",
+    failures += check(keys(vram) == std::vector<std::string>{"adapter_bytes", "bytes_per_page_group",
+                                                              "draft_screen_bytes", "expert_cache_bytes",
                                                               "expert_frames", "graph_allowance_bytes",
                                                               "headroom_bytes", "kv_bytes", "kv_tokens", "left_bytes",
                                                               "minimum_reservation_bytes", "page_group_tokens",
@@ -79,6 +82,8 @@ int main() {
                           vram["bytes_per_page_group"] == 2228224 && vram["page_group_tokens"] == 64 &&
                           vram["expert_frames"].is_null() && vram["expert_cache_bytes"].is_null(),
                       "vram: the curve's slope, no expert cache");
+    failures += check(vram["draft_screen_bytes"] == 357600000ULL && vram["adapter_bytes"] == 318767104ULL,
+                      "vram: the draft screen and the LoRA adapter beside the weights");
     const Json& ram = root["ram"];
     failures += check(keys(ram) == std::vector<std::string>{"available_bytes", "expert_ram_layout", "experts_bytes",
                                                              "host_context_bytes", "left_bytes", "ngram_bytes",
@@ -101,6 +106,8 @@ int main() {
     offloaded.vram.page_group_tokens     = std::nullopt;
     offloaded.vram.expert_frames         = 0U;
     offloaded.vram.expert_cache_bytes    = 0ULL;
+    offloaded.vram.draft_screen_bytes    = std::nullopt;
+    offloaded.vram.adapter_bytes         = std::nullopt;
     offloaded.ram.experts_bytes          = 60000000000ULL;
     offloaded.ram.pinned_bytes           = 61000000000ULL;
     offloaded.ram.ngram_bytes            = 2000000000ULL;
@@ -114,6 +121,8 @@ int main() {
     failures += check(refused["gpu"]["budget_bytes"] == 31000000000ULL, "the OS budget when known");
     failures += check(refused["vram"]["bytes_per_page_group"].is_null() && refused["vram"]["expert_frames"] == 0,
                       "Flash-Next: no page-group slope; zero frames is a number, not null");
+    failures += check(refused["vram"]["draft_screen_bytes"].is_null() && refused["vram"]["adapter_bytes"].is_null(),
+                      "no draft screen or adapter: null");
     failures += check(refused["ram"]["tier"] == "ssd" && refused["ram"]["ngram_residency"] == "ram" &&
                           refused["ram"]["expert_ram_layout"] == "exclusive" &&
                           refused["ram"]["experts_bytes"] == 60000000000ULL,

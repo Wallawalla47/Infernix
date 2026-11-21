@@ -219,6 +219,41 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_a8_ring_kernel(
 
     const auto destination = linear_output_tile<BM / (RowPolicy::kPaired ? 2 : 1)>(output, row_begin);
     const float alpha      = operands.alpha;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        const auto row_of = [&](int mi, int i) { return row_policy.weight_row(row_begin, wm * WM + mi * 16 + i, M); };
+        const auto token_of = [&](int ni, int j) {
+            const int token = token_begin + wn * WN + ni * 8 + j;
+            return token < tokens ? token : -1;
+        };
+        if constexpr (requires { RowPolicy::kThreadPaired; }) {
+            // Gate and up: the scaled values (one rounded multiply, the SwiGLU's own product), the term, the SwiGLU.
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) accumulators[mi][ni][e] = __fmul_rn(accumulators[mi][ni][e], alpha);
+            lora_add_rows_tile<MT, NT>(epilogue.lora, accumulators, row_of, token_of);
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                const int out_row = row_policy.output_row(row_begin, wm * WM + mi * 16 + gid);
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const int token0 = token_begin + wn * WN + ni * 8 + 2 * lid;
+                    const auto& v    = accumulators[mi][ni];
+                    if (FullTokens || token0 < tokens) epilogue.apply_pair(destination, out_row, token0, v[0], v[2]);
+                    if (FullTokens || token0 + 1 < tokens)
+                        epilogue.apply_pair(destination, out_row, token0 + 1, v[1], v[3]);
+                }
+            }
+        } else {
+            static_assert(!RowPolicy::kPaired, "paired rows require the thread-paired MMA rows");
+            // The epilogue on the kernel's own v * alpha (its residual add may fuse the product), then the term.
+            lora_finish_store_rows_tile<MT, NT>(epilogue, destination, accumulators, row_of, token_of,
+                                                [&](int, int, float v) { return v * alpha; });
+        }
+        return;
+    }
     if constexpr (requires { RowPolicy::kThreadPaired; }) {
         // Each m16 tile pairs C-fragment rows g (gate) and g+8 (up) of one output row.
 #pragma unroll

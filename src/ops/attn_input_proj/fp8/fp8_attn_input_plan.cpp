@@ -35,13 +35,13 @@ Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                Tensor& v, cudaStream_t stream) {
+                Tensor& v, cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[1] == 1)
-        fp8_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
+        fp8_attn_input_decode_launch(x, weight, q, gate, k, v, stream, lora);
     else if (x.ne[1] <= kFp8AttnInputLastSmallMmaT)
-        fp8_attn_input_a16_small_mma_launch(x, weight, q, gate, k, v, stream);
+        fp8_attn_input_a16_small_mma_launch(x, weight, q, gate, k, v, stream, lora);
     else
-        fp8_attn_input_a16_gemm_launch(x, weight, q, gate, k, v, stream);
+        fp8_attn_input_a16_gemm_launch(x, weight, q, gate, k, v, stream, lora);
 }
 
 // A static input scale (fp8_e4m3fn_row_f32) has no two-term residual encoding.
@@ -75,15 +75,15 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(QType qtype, LinearPolicy po
 
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, const LoraAddend* lora) {
     const Fp8AttnInputRoute route = resolve_route(policy, x.ne[1]);
     require_static_route(weight.qtype, route);
     if (route == Fp8AttnInputRoute::ColumnInvariantA16) {
-        fp8_attn_input_invariant_launch(x, weight, q, gate, k, v, stream);
+        fp8_attn_input_invariant_launch(x, weight, q, gate, k, v, stream, lora);
         return;
     }
     if (route == Fp8AttnInputRoute::A16) {
-        launch_a16(x, weight, q, gate, k, v, stream);
+        launch_a16(x, weight, q, gate, k, v, stream, lora);
         return;
     }
     if (workspace == nullptr) {
@@ -93,12 +93,12 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
     if (route == Fp8AttnInputRoute::A8Residual) {
         fp8_attn_input_a8_residual_launch(
             x, weight, q, gate, k, v,
-            allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k, 0, true), stream);
+            allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k, 0, true), stream, lora);
         return;
     }
     const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
         *workspace, x.ne[1], weight.k, fp8_attn_input_partial_capacity_bytes(x.ne[1]));
-    fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream);
+    fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream, lora);
 }
 
 std::size_t fp8_attn_input_n17408_workspace_capacity_bytes(LinearPolicy policy,

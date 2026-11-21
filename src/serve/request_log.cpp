@@ -565,6 +565,9 @@ std::string format_server_start_json(
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
                                                           {"device_object_count", load.device_object_count},
                                                           {"host_object_count", load.host_object_count},
+                                                          {"lora_adapter", load.lora_adapter.empty()
+                                                                               ? Json(nullptr)
+                                                                               : Json(load.lora_adapter)},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const infernix::ContextCacheOptions& cache       = engine_options.context_cache;
@@ -633,6 +636,8 @@ std::string format_server_start_json(
              {"greedy", options.greedy}};
     record["memory"] =
         Json{{"weights", arena_json(memory.weights)},
+             {"draft_screen_bytes", memory.draft_screen_bytes},
+             {"adapter_bytes", memory.adapter_bytes},
              {"sequence", arena_json(memory.sequence)},
              {"workspace", arena_json(memory.workspace)},
              {"vision_workspace", vision_workspace_json(memory.vision_workspace)},

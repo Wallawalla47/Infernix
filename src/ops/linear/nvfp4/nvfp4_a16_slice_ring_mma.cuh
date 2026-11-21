@@ -28,6 +28,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/output.cuh"
+#include "ops/lora/lora_device.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
@@ -211,6 +212,11 @@ nvfp4_a16_slice_ring_mma_kernel(Nvfp4A16Operands operands, Output output, Epilog
     const int warp_row   = warp % Schedule::kWarpsRows;
     const int warp_token = warp / Schedule::kWarpsRows;
     const int gid        = lane >> 2;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        lora_prefetch_tile(
+            epilogue.lora, BR, [&](int i) { return row_policy.weight_row(row_begin, i, operands.rows); }, token_begin,
+            min(BT, tokens - token_begin), tid, Schedule::kConsumerWarps * 32);
+    }
     float chain[MT][NT][4] = {};
     float kept[MT][NT][4]  = {};
     float total[MT][NT][4] = {};
@@ -249,6 +255,42 @@ nvfp4_a16_slice_ring_mma_kernel(Nvfp4A16Operands operands, Output output, Epilog
 
     const auto destination =
         linear_output_tile<BR / (RowPolicy::kPaired ? 2 : 1)>(output, row_begin);
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        const int token_base = token_begin + warp_token * Schedule::kWarpTokens;
+        const auto row_of    = [&](int mi, int i) {
+            return row_policy.weight_row(row_begin, warp_row * Schedule::kWarpRows + mi * 16 + i, operands.rows);
+        };
+        const auto token_of = [&](int ni, int j) { return token_base + ni * 8 + j < tokens ? token_base + ni * 8 + j : -1; };
+        if constexpr (requires { RowPolicy::kThreadPaired; }) {
+            // Gate and up: the scaled values (one rounded multiply, the SwiGLU's own product), the term, the SwiGLU.
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) total[mi][ni][e] = __fmul_rn(total[mi][ni][e], operands.alpha);
+            lora_add_rows_tile<MT, NT>(epilogue.lora, total, row_of, token_of);
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                const int out_row = row_policy.output_row(row_begin, warp_row * Schedule::kWarpRows + mi * 16 + gid);
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const int token0 = token_base + ni * 8 + 2 * (lane & 3);
+                    const auto& v    = total[mi][ni];
+                    if (token0 < tokens) epilogue.apply_pair(destination, out_row, token0, v[0], v[2]);
+                    if (token0 + 1 < tokens) epilogue.apply_pair(destination, out_row, token0 + 1, v[1], v[3]);
+                }
+            }
+        } else {
+            static_assert(!RowPolicy::kPaired, "paired rows require a thread-paired row policy");
+            // The epilogue on the kernel's own v * alpha (its residual add may fuse the product), then the term.
+            const float alpha = operands.alpha;
+            lora_finish_rows_tile<MT, NT>(epilogue, total, row_of, token_of,
+                                          [&](int, int, float v) { return v * alpha; });
+            lora_store_rows_tile<MT, NT>(destination, total, row_of, token_of);
+        }
+        return;
+    }
     const float alpha = operands.alpha;
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {

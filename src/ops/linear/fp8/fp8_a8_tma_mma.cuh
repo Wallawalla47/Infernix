@@ -324,6 +324,119 @@ __global__ void fp8_a8_tma_split_k_reduce(Fp8A8OperandsT<Scale> p, const float* 
     }
 }
 
+// The split-K tail's reduce in the adapter instance (--lora): the same sums, products and epilogue as
+// fp8_a8_tma_split_k_reduce, with the canonical term (lora_device.cuh) added to the scaled values first. The term's
+// MMA chains need a warp, so each warp reduces whole fragments of 16 tokens x 8 rows (the MMA's C layout: lane
+// 4 g + q holds tokens g and g + 8 of rows 2 q and 2 q + 1); a paired (SwiGLU) tile reduces a gate fragment and its
+// up fragment together.
+template <class Schedule, class Output, class Epilogue, class RowPolicy, class Scale>
+__global__ void fp8_a8_tma_split_k_reduce_lora(Fp8A8OperandsT<Scale> p, const float* partials, Output output,
+                                               Epilogue epilogue, RowPolicy row_policy, Fp8TmaSplitKPlan plan,
+                                               int token_offset, int count) {
+    static_assert(kLoraEpilogue<Epilogue>);
+    constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
+    constexpr int stored_rows = BR / (RowPolicy::kPaired ? 2 : 1);
+    constexpr int units_rows  = stored_rows / 8;
+    constexpr int units       = (BT / 16) * units_rows;
+    static_assert(BT % 16 == 0 && stored_rows % 8 == 0 && units % Schedule::kReductionBlocks == 0);
+    constexpr int units_per_block = units / Schedule::kReductionBlocks;
+    const int tail  = blockIdx.x / Schedule::kReductionBlocks;
+    const int chunk = blockIdx.x % Schedule::kReductionBlocks;
+    int row_tile, token_tile;
+    fp8_mma_tile_coordinates<Schedule>(plan.full_tiles + tail, p.rows / BR, div_up(count, BT), row_tile, token_tile);
+    const int first = plan.first_part(tail), parts = plan.parts(tail);
+    const int row_begin    = row_tile * stored_rows;
+    const auto tile_output = linear_output_tile<stored_rows>(output, row_begin);
+    const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = static_cast<int>(blockDim.x) >> 5;
+    const int g = lane >> 2, q = lane & 3;
+    const int token_end = token_offset + count;
+    // The tile's local weight row of output row `output_row` (gate; its up row is half a warp tile further).
+    const auto local_row = [](int output_row) {
+        if constexpr (RowPolicy::kPaired) {
+            constexpr int half_warp = Schedule::kWarpRows / 2;
+            return (output_row / half_warp) * Schedule::kWarpRows + output_row % half_warp;
+        } else {
+            return output_row;
+        }
+    };
+    for (int unit = chunk * units_per_block + warp; unit < (chunk + 1) * units_per_block; unit += warps) {
+        const int token_local0 = (unit / units_rows) * 16;
+        const int output_row0  = (unit % units_rows) * 8;
+        const int token_lo = token_offset + token_tile * BT + token_local0 + g, token_hi = token_lo + 8;
+        // The scaled sums of local rows `row` and row + 1 at this lane's two tokens: c[0], c[1] (token g) and c[2],
+        // c[3] (token g + 8).
+        const auto fragment = [&](int row, float (&c)[4]) {
+            const int parent = row_policy.weight_row(row_begin, row, p.rows);
+            const float scale_a = fp8_widen(p.scales[parent]), scale_b = fp8_widen(p.scales[parent + 1]);
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int token_local = token_local0 + g + 8 * half;
+                const int token       = token_offset + token_tile * BT + token_local;
+                float2 sum{};
+                if (token < token_end) {
+                    for (int part = 0; part < parts; ++part) {
+                        const auto value = *reinterpret_cast<const float2*>(
+                            partials + std::size_t(first + part) * BT * BR + token_local * BR + row);
+                        sum.x += value.x;
+                        sum.y += value.y;
+                    }
+                }
+                const float x_scale = token < token_end ? p.x_scales[token] : 0.0f;
+                c[2 * half]         = __fmul_rn(__fmul_rn(sum.x, x_scale), scale_a);
+                c[2 * half + 1]     = __fmul_rn(__fmul_rn(sum.y, x_scale), scale_b);
+            }
+        };
+        const auto token_of = [&](int, int i) {
+            const int token = token_offset + token_tile * BT + token_local0 + i;
+            return token < token_end ? token : -1;
+        };
+        const int gate_row0 = local_row(output_row0);
+        float gate[1][1][4];
+        fragment(gate_row0 + 2 * q, gate[0][0]);
+        lora_add_tokens_tile<1, 1>(epilogue.lora, gate, token_of, [&](int, int j) {
+            return row_policy.weight_row(row_begin, gate_row0 + j, p.rows);
+        });
+        const int row = row_begin + output_row0 + 2 * q;
+        float2 values[2];
+        if constexpr (RowPolicy::kPaired) {
+            constexpr int half_warp = Schedule::kWarpRows / 2;
+            float up[1][1][4];
+            fragment(gate_row0 + half_warp + 2 * q, up[0][0]);
+            lora_add_tokens_tile<1, 1>(epilogue.lora, up, token_of, [&](int, int j) {
+                return row_policy.weight_row(row_begin, gate_row0 + half_warp + j, p.rows);
+            });
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int token = half == 0 ? token_lo : token_hi;
+                values[half]    = make_float2(epilogue.apply_pair(row, token, gate[0][0][2 * half], up[0][0][2 * half]),
+                                              epilogue.apply_pair(row + 1, token, gate[0][0][2 * half + 1],
+                                                                  up[0][0][2 * half + 1]));
+            }
+        } else {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int token = half == 0 ? token_lo : token_hi;
+                values[half]    = fp8_apply_row_pair(epilogue, row, row + 1, token,
+                                                     make_float2(gate[0][0][2 * half], gate[0][0][2 * half + 1]));
+            }
+        }
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int token = half == 0 ? token_lo : token_hi;
+            if (token < token_end) {
+                if constexpr (std::is_same_v<Output, LinearBf16Output>) {
+                    *reinterpret_cast<__nv_bfloat162*>(tile_output.at(row, token)) =
+                        __floats2bfloat162_rn(values[half].x, values[half].y);
+                } else {
+                    tile_output.store(row, token, values[half].x);
+                    tile_output.store(row + 1, token, values[half].y);
+                }
+            }
+        }
+    }
+}
+
 template <class Schedule, class Output, class Epilogue, class RowPolicy = Fp8IdentityRows,
           class Scale = __nv_bfloat16>
 void launch_fp8_a8_tma_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilogue epilogue,
@@ -356,9 +469,15 @@ void launch_fp8_a8_tma_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilog
                     parameter, p, output, epilogue, row_policy, offset, count, plan, partials);
                 CUDA_CHECK(cudaGetLastError());
                 if constexpr (Split) {
-                    fp8_a8_tma_split_k_reduce<Schedule>
-                        <<<plan.tail_tiles * Schedule::kReductionBlocks, 256, 0, stream>>>(
-                            p, partials, output, epilogue, row_policy, plan, offset, count);
+                    if constexpr (kLoraEpilogue<Epilogue>) {
+                        fp8_a8_tma_split_k_reduce_lora<Schedule>
+                            <<<plan.tail_tiles * Schedule::kReductionBlocks, 256, 0, stream>>>(
+                                p, partials, output, epilogue, row_policy, plan, offset, count);
+                    } else {
+                        fp8_a8_tma_split_k_reduce<Schedule>
+                            <<<plan.tail_tiles * Schedule::kReductionBlocks, 256, 0, stream>>>(
+                                p, partials, output, epilogue, row_policy, plan, offset, count);
+                    }
                     CUDA_CHECK(cudaGetLastError());
                 }
             };

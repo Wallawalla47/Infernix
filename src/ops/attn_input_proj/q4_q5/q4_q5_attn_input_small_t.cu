@@ -11,6 +11,7 @@
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
 #include "ops/linear/q5/q5_sliced_k_launch.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -22,82 +23,80 @@ namespace {
 
 constexpr std::int32_t kSplitRow = 6144;
 constexpr std::int32_t kHidden   = 5120;
+// The parents' rows in the term's logical order [q, k, gate, v]: query/key first, gate/value after.
+constexpr std::int32_t kParentRows = 7168;
 
 using Q4AttnSimtR8T4Schedule = Q4A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
+auto q4_projection_output(Tensor& q, Tensor& key) {
+    return LinearBf16SplitOutput2<kSplitRow>{
+        {static_cast<__nv_bfloat16*>(q.data), static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
+        {static_cast<__nv_bfloat16*>(key.data), static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}};
+}
+
+// `lora` below: the parent's own term (lora_row_range of the call's), or null.
 void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                    cudaStream_t stream) {
-    launch_q4_a16_gemv<q4_instances::GemvR1W8K5120>(
-        q4_linear_operands(x, weight),
-        LinearBf16SplitOutput2<kSplitRow>{
-            {static_cast<__nv_bfloat16*>(q.data),
-             static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
-            {static_cast<__nv_bfloat16*>(key.data),
-             static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}},
-        LinearIdentityEpilogue{}, stream, pdl::Dependency::Programmatic); // candidates §58
+                    cudaStream_t stream, const LoraAddend* lora) {
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_q4_a16_gemv<q4_instances::GemvR1W8K5120>(q4_linear_operands(x, weight), q4_projection_output(q, key),
+                                                        epilogue, stream,
+                                                        pdl::Dependency::Programmatic); // candidates §58
+    });
 }
 
 template <class Schedule>
 void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                    cudaStream_t stream) {
-    launch_q4_a16_simt<Schedule>(
-        q4_linear_operands(x, weight),
-        LinearBf16SplitOutput2<kSplitRow>{
-            {static_cast<__nv_bfloat16*>(q.data),
-             static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
-            {static_cast<__nv_bfloat16*>(key.data),
-             static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}},
-        LinearIdentityEpilogue{}, stream);
+                    cudaStream_t stream, const LoraAddend* lora) {
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_q4_a16_simt<Schedule>(q4_linear_operands(x, weight), q4_projection_output(q, key), epilogue, stream);
+    });
 }
 
 template <std::int32_t Capacity>
 void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const LoraAddend* lora) {
     using Schedule = Q4A16SlicedKMmaSchedule<16, (Capacity + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
                                              6, kHidden, Capacity>;
-    launch_q4_a16_sliced_k_mma<Schedule>(
-        q4_linear_operands(x, weight),
-        LinearBf16SplitOutput2<kSplitRow>{
-            {static_cast<__nv_bfloat16*>(q.data),
-             static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
-            {static_cast<__nv_bfloat16*>(key.data),
-             static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}},
-        LinearIdentityEpilogue{}, stream);
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_q4_a16_sliced_k_mma<Schedule>(q4_linear_operands(x, weight), q4_projection_output(q, key), epilogue,
+                                             stream);
+    });
 }
 
 void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, const LoraAddend* lora) {
     if (weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("attention Q4 K-split requires padded K == hidden");
     }
     switch (x.ne[1]) {
     case 7:
-        launch_q4_sliced_exact<7>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<7>(x, weight, q, key, stream, lora);
         return;
     case 8:
-        launch_q4_sliced_exact<8>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<8>(x, weight, q, key, stream, lora);
         return;
     case 9:
-        launch_q4_sliced_exact<9>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<9>(x, weight, q, key, stream, lora);
         return;
     case 10:
-        launch_q4_sliced_exact<10>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<10>(x, weight, q, key, stream, lora);
         return;
     case 11:
-        launch_q4_sliced_exact<11>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<11>(x, weight, q, key, stream, lora);
         return;
     case 12:
-        launch_q4_sliced_exact<12>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<12>(x, weight, q, key, stream, lora);
         return;
     default:
         throw std::invalid_argument("attention Q4 K-split band covers T in [7,12]");
     }
 }
 
-void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream) {
+void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream,
+               const LoraAddend* lora) {
     switch (x.ne[1]) {
     case 1:
-        launch_q4_gemv(x, weight, q, key, stream);
+        launch_q4_gemv(x, weight, q, key, stream, lora);
         return;
     case 7:
     case 8:
@@ -112,14 +111,14 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
         // boundary at 13 is right for the grouped-vs-row-split question, but it hid this: the split
         // form with a K-split Q4 parent is 24-29% faster than both. T=2..6 keep the SIMT tile,
         // where a 16-wide K-split tile would waste more MMA work than it saves.
-        launch_q4_sliced_band(x, weight, q, key, stream);
+        launch_q4_sliced_band(x, weight, q, key, stream, lora);
         return;
     case 2:
     case 3:
     case 4:
     case 5:
     case 6:
-        launch_q4_simt<Q4AttnSimtR8T4Schedule>(x, weight, q, key, stream);
+        launch_q4_simt<Q4AttnSimtR8T4Schedule>(x, weight, q, key, stream, lora);
         return;
     default:
         throw std::invalid_argument("attention Q4 split-output requires T in [1,12]");
@@ -135,48 +134,50 @@ auto q5_projection_output(Tensor& first, Tensor& second) {
 }
 
 void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                    cudaStream_t stream) {
-    launch_q5_a16_gemv<q5_instances::GemvR16W1G16S2XK5120>(q5_linear_operands(x, weight),
-                                                           q5_projection_output(gate, value),
-                                                           LinearIdentityEpilogue{}, stream,
-                                                           pdl::Dependency::Programmatic); // candidates §58
+                    cudaStream_t stream, const LoraAddend* lora) {
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_q5_a16_gemv<q5_instances::GemvR16W1G16S2XK5120>(q5_linear_operands(x, weight),
+                                                               q5_projection_output(gate, value), epilogue, stream,
+                                                               pdl::Dependency::Programmatic); // candidates §58
+    });
 }
 
 template <int Cols>
 void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, const LoraAddend* lora) {
     using Schedule = Q5A16DirectSimtSchedule<1, Cols, 4, 4, 10, kHidden, true>;
-    launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, weight),
-                                        q5_projection_output(gate, value), LinearIdentityEpilogue{},
-                                        stream);
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, weight), q5_projection_output(gate, value),
+                                            epilogue, stream);
+    });
 }
 
 void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const LoraAddend* lora) {
     switch (x.ne[1]) {
     case 2:
-        launch_q5_split4<2>(x, weight, gate, value, stream);
+        launch_q5_split4<2>(x, weight, gate, value, stream, lora);
         return;
     case 3:
-        launch_q5_split4<3>(x, weight, gate, value, stream);
+        launch_q5_split4<3>(x, weight, gate, value, stream, lora);
         return;
     case 4:
-        launch_q5_split4<4>(x, weight, gate, value, stream);
+        launch_q5_split4<4>(x, weight, gate, value, stream, lora);
         return;
     case 5:
-        launch_q5_split4<5>(x, weight, gate, value, stream);
+        launch_q5_split4<5>(x, weight, gate, value, stream, lora);
         return;
     case 6:
-        launch_q5_split4<6>(x, weight, gate, value, stream);
+        launch_q5_split4<6>(x, weight, gate, value, stream, lora);
         return;
     case 7:
-        launch_q5_split4<7>(x, weight, gate, value, stream);
+        launch_q5_split4<7>(x, weight, gate, value, stream, lora);
         return;
     case 8:
-        launch_q5_split4<8>(x, weight, gate, value, stream);
+        launch_q5_split4<8>(x, weight, gate, value, stream, lora);
         return;
     case 9:
-        launch_q5_split4<9>(x, weight, gate, value, stream);
+        launch_q5_split4<9>(x, weight, gate, value, stream, lora);
         return;
     default:
         throw std::invalid_argument("attention Q5 split4 requires T in [2,9]");
@@ -185,16 +186,18 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate,
 
 template <int ColsPerTile>
 void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, const LoraAddend* lora) {
     using Schedule = Q5A16SimtSchedule<8, ColsPerTile, 1, 16, 2, Cache::ca, 1>;
-    launch_q5_a16_simt<Schedule>(q5_linear_operands(x, weight), q5_projection_output(gate, value),
-                                 LinearIdentityEpilogue{}, stream);
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_q5_a16_simt<Schedule>(q5_linear_operands(x, weight), q5_projection_output(gate, value), epilogue,
+                                     stream);
+    });
 }
 
 void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-               cudaStream_t stream) {
+               cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[1] == 1) {
-        launch_q5_gemv(x, weight, gate, value, stream);
+        launch_q5_gemv(x, weight, gate, value, stream, lora);
         return;
     }
     if (x.ne[1] <= 9) {
@@ -202,7 +205,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         // their partial sums through shared memory, with the column count as a compile-time
         // template argument so the kernel covers exactly the live columns. The fused projections
         // use the same shape up to 6, so the Q5 parent has one mechanism from 2 to 9.
-        launch_q5_split4_exact(x, weight, gate, value, stream);
+        launch_q5_split4_exact(x, weight, gate, value, stream, lora);
         return;
     }
     if (x.ne[1] <= 12) {
@@ -210,7 +213,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         // weight planes staged in shared memory and activations read from the input tensor.
         // Retained in this interval on complete-Op measurements; both shapes are legal at every
         // count in [2,12].
-        launch_q5_simt<4>(x, weight, gate, value, stream);
+        launch_q5_simt<4>(x, weight, gate, value, stream, lora);
         return;
     }
     throw std::invalid_argument("attention Q5 split-output requires T in [1,12]");
@@ -223,62 +226,83 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
 // predication, so a column's bits do not depend on the call's width.
 template <std::int32_t Capacity>
 void launch_q4_sliced_capacity(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                               cudaStream_t stream) {
-    launch_q4_sliced_exact<Capacity>(x, weight, q, key, stream);
+                               cudaStream_t stream, const LoraAddend* lora) {
+    launch_q4_sliced_exact<Capacity>(x, weight, q, key, stream, lora);
 }
 
 void launch_q4_invariant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, const LoraAddend* lora) {
     if (weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("attention Q4 K-split requires padded K == hidden");
     }
     const std::int32_t cols = x.ne[1];
-    if (cols <= 1) return launch_q4_sliced_capacity<1>(x, weight, q, key, stream);
-    if (cols <= 2) return launch_q4_sliced_capacity<2>(x, weight, q, key, stream);
-    if (cols <= 4) return launch_q4_sliced_capacity<4>(x, weight, q, key, stream);
-    if (cols <= 6) return launch_q4_sliced_capacity<6>(x, weight, q, key, stream);
-    if (cols <= 12) return launch_q4_sliced_band(x, weight, q, key, stream);
-    if (cols <= 16) return launch_q4_sliced_capacity<16>(x, weight, q, key, stream);
-    if (cols <= 24) return launch_q4_sliced_capacity<24>(x, weight, q, key, stream);
-    launch_q4_sliced_capacity<32>(x, weight, q, key, stream);
+    if (cols <= 1) return launch_q4_sliced_capacity<1>(x, weight, q, key, stream, lora);
+    if (cols <= 2) return launch_q4_sliced_capacity<2>(x, weight, q, key, stream, lora);
+    if (cols <= 4) return launch_q4_sliced_capacity<4>(x, weight, q, key, stream, lora);
+    if (cols <= 6) return launch_q4_sliced_capacity<6>(x, weight, q, key, stream, lora);
+    if (cols <= 12) return launch_q4_sliced_band(x, weight, q, key, stream, lora);
+    if (cols <= 16) return launch_q4_sliced_capacity<16>(x, weight, q, key, stream, lora);
+    if (cols <= 24) return launch_q4_sliced_capacity<24>(x, weight, q, key, stream, lora);
+    launch_q4_sliced_capacity<32>(x, weight, q, key, stream, lora);
 }
 
 template <class Schedule>
 void launch_q5_sliced(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, const LoraAddend* lora) {
     static_assert(Schedule::kKWarps == 4 && Schedule::kReduction == Q5SlicedKReduction::Linear);
-    launch_q5_a16_sliced_k_mma<Schedule>(q5_linear_operands(x, weight),
-                                         q5_projection_output(gate, value),
-                                         LinearIdentityEpilogue{}, stream);
+    with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+        launch_q5_a16_sliced_k_mma<Schedule>(q5_linear_operands(x, weight), q5_projection_output(gate, value),
+                                             epilogue, stream);
+    });
 }
 
 void launch_q5_invariant(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, const LoraAddend* lora) {
     const std::int32_t cols = x.ne[1];
-    if (cols <= 8) return launch_q5_sliced<q5_instances::SlicedR16T8W4S2>(x, weight, gate, value, stream);
-    if (cols <= 16) return launch_q5_sliced<q5_instances::SlicedR16T16W4S2>(x, weight, gate, value, stream);
-    if (cols <= 24) return launch_q5_sliced<q5_instances::SlicedR16T24W4S2>(x, weight, gate, value, stream);
-    launch_q5_sliced<q5_instances::SlicedR32T32W4S2>(x, weight, gate, value, stream);
+    if (cols <= 8) return launch_q5_sliced<q5_instances::SlicedR16T8W4S2>(x, weight, gate, value, stream, lora);
+    if (cols <= 16) return launch_q5_sliced<q5_instances::SlicedR16T16W4S2>(x, weight, gate, value, stream, lora);
+    if (cols <= 24) return launch_q5_sliced<q5_instances::SlicedR16T24W4S2>(x, weight, gate, value, stream, lora);
+    launch_q5_sliced<q5_instances::SlicedR32T32W4S2>(x, weight, gate, value, stream, lora);
+}
+
+// Each parent's term: the call's rows [0, 7168) (q, k) and [7168, 14336) (gate, v).
+struct ParentTerms {
+    LoraAddend first, second;
+    const LoraAddend* first_ptr  = nullptr;
+    const LoraAddend* second_ptr = nullptr;
+};
+
+ParentTerms parent_terms(const LoraAddend* lora) {
+    ParentTerms terms;
+    if (lora != nullptr && lora->present()) {
+        terms.first      = lora_row_range(*lora, 0, kParentRows);
+        terms.second     = lora_row_range(*lora, kParentRows, kParentRows);
+        terms.first_ptr  = terms.first.present() ? &terms.first : nullptr;
+        terms.second_ptr = terms.second.present() ? &terms.second : nullptr;
+    }
+    return terms;
 }
 
 } // namespace
 
 void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
-                                     Tensor& k, Tensor& v, cudaStream_t stream) {
-    launch_q4(x, query_key_weight, q, k, stream);
-    launch_q5(x, gate_value_weight, gate, v, stream);
+                                     Tensor& k, Tensor& v, cudaStream_t stream, const LoraAddend* lora) {
+    const ParentTerms terms = parent_terms(lora);
+    launch_q4(x, query_key_weight, q, k, stream, terms.first_ptr);
+    launch_q5(x, gate_value_weight, gate, v, stream, terms.second_ptr);
 }
 
 void q4_q5_attn_input_column_invariant_launch(const Tensor& x, const Weight& query_key_weight,
                                               const Weight& gate_value_weight, Tensor& q,
                                               Tensor& gate, Tensor& k, Tensor& v,
-                                              cudaStream_t stream) {
+                                              cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[1] < 1) {
         throw std::invalid_argument("attention Q4/Q5 column-invariant route requires T >= 1");
     }
-    launch_q4_invariant(x, query_key_weight, q, k, stream);
-    launch_q5_invariant(x, gate_value_weight, gate, v, stream);
+    const ParentTerms terms = parent_terms(lora);
+    launch_q4_invariant(x, query_key_weight, q, k, stream, terms.first_ptr);
+    launch_q5_invariant(x, gate_value_weight, gate, v, stream, terms.second_ptr);
 }
 
 } // namespace infernix::ops::detail

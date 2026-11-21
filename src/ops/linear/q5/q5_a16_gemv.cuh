@@ -4,6 +4,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 
@@ -58,6 +59,19 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const auto row0           = std::int64_t(row < rows ? row : 0) * row_groups + group_begin;
     constexpr bool kFullTiles = Schedule::kStaticK > 0 && (Schedule::kStaticK / 128) % W == 0 &&
                                 (Schedule::kStaticK / 64 / W) % G == 0;
+    [[maybe_unused]] LoraWarpStage<1, 1>* lora_stage = nullptr;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: U is read after the start's wait (a joining launch would read it unordered). The term's B row and U
+        // column stage in shared memory beside the main loop.
+        static_assert(!JoinPdl, "a LoRA term reads U, which a joining launch reads before its wait");
+        __shared__ LoraWarpStage<1, 1> lora_stages[R];
+        lora_stage = &lora_stages[local_row];
+        if (split == 0) {
+            const int term_rows[1] = {row < rows ? row : -1};
+            lora_stage_warp_b(epilogue.lora, term_rows, *lora_stage);
+            lora_stage_warp_u(epilogue.lora, term_rows, 0, 1, *lora_stage);
+        }
+    }
     const auto stage = [&](int slot, int tile) {
         const int active  = kFullTiles ? G : min(G, groups - tile * G);
         const auto group0 = row0 + tile * G;
@@ -122,6 +136,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             acc = shared.partial[local_row][0];
 #pragma unroll
             for (int part = 1; part < W; ++part) acc += shared.partial[local_row][part];
+        }
+    }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The row's value (lane 0) plus its term (the warp's MMA chain), before the epilogue.
+        if (split == 0) {
+            const int term_rows[1] = {row < rows ? row : -1};
+            float add[1][1];
+            bool has[1];
+            lora_warp_rows_staged<1, 1>(epilogue.lora, term_rows, 0, 1, add, has, *lora_stage);
+            acc = lora_add(acc, add[0][0], has[0]);
         }
     }
     if (split == 0 && lane == 0 && row < rows) {

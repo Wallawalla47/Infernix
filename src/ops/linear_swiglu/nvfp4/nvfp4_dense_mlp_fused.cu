@@ -36,11 +36,14 @@ static_assert(kPairsPerThread == 10);
 // as nvfp4_a4_quantize_kernel (term 0 of quantize_nvfp4_terms_k16 is quantize_nvfp4_k16), scales row-major or in the
 // TMA route's tiles. The bytes of rmsnorm() followed by that quantizer, without the normalized row in global memory.
 // A tiled plane's launch covers its padded tokens: a CTA past the call zeroes its token's scales.
-template <int Terms, Nvfp4ScaleLayout Layout>
-__launch_bounds__(kBlock) __global__ void rmsnorm_a4_quantize_kernel(
+// With StoreNormalized (a LoRA adapter's form, whose shrink reads the normalized row) the staged BF16 row is also
+// stored to `normalized` ([T][5120]): the bytes rmsnorm() writes.
+template <int Terms, Nvfp4ScaleLayout Layout, bool StoreNormalized>
+__device__ __forceinline__ void rmsnorm_a4_quantize_body(
     const __nv_bfloat162* __restrict__ residual, const __nv_bfloat162* __restrict__ norm_weight,
     std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ scales, std::int64_t code_plane,
-    std::int64_t scale_plane, std::int32_t tokens, float eps, float input_scale_divisor) {
+    std::int64_t scale_plane, std::int32_t tokens, float eps, float input_scale_divisor,
+    __nv_bfloat162* __restrict__ normalized) {
     pdl::enter();
     const int token             = static_cast<int>(blockIdx.x);
     const int thread            = static_cast<int>(threadIdx.x);
@@ -90,6 +93,7 @@ __launch_bounds__(kBlock) __global__ void rmsnorm_a4_quantize_kernel(
         const float2 wf = __bfloat1622float2(weights[i]);
         staged[pair]    = __floats2bfloat162_rn(rmsnorm_epilogue<RmsEpilogue::Offset>(xf.x, inv, wf.x, 0.0F),
                                                 rmsnorm_epilogue<RmsEpilogue::Offset>(xf.y, inv, wf.y, 0.0F));
+        if constexpr (StoreNormalized) { normalized[row_base + pair] = staged[pair]; }
     }
     __syncthreads();
 
@@ -110,6 +114,25 @@ __launch_bounds__(kBlock) __global__ void rmsnorm_a4_quantize_kernel(
     }
 }
 
+template <int Terms, Nvfp4ScaleLayout Layout>
+__launch_bounds__(kBlock) __global__ void rmsnorm_a4_quantize_kernel(
+    const __nv_bfloat162* __restrict__ residual, const __nv_bfloat162* __restrict__ norm_weight,
+    std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ scales, std::int64_t code_plane,
+    std::int64_t scale_plane, std::int32_t tokens, float eps, float input_scale_divisor) {
+    rmsnorm_a4_quantize_body<Terms, Layout, false>(residual, norm_weight, codes, scales, code_plane, scale_plane,
+                                                   tokens, eps, input_scale_divisor, nullptr);
+}
+
+template <int Terms, Nvfp4ScaleLayout Layout>
+__launch_bounds__(kBlock) __global__ void rmsnorm_a4_quantize_store_kernel(
+    const __nv_bfloat162* __restrict__ residual, const __nv_bfloat162* __restrict__ norm_weight,
+    std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ scales, std::int64_t code_plane,
+    std::int64_t scale_plane, std::int32_t tokens, float eps, float input_scale_divisor,
+    __nv_bfloat162* __restrict__ normalized) {
+    rmsnorm_a4_quantize_body<Terms, Layout, true>(residual, norm_weight, codes, scales, code_plane, scale_plane,
+                                                  tokens, eps, input_scale_divisor, normalized);
+}
+
 struct FusedPlanes {
     Nvfp4A4Workspace input;   // the normalized x, K = 5120
     Nvfp4A4Workspace product; // silu(gate) * up, K = 17408
@@ -124,7 +147,7 @@ FusedPlanes allocate_planes(Allocator& allocator, std::int32_t tokens, int terms
 
 template <int Terms, Nvfp4ScaleLayout Layout>
 void launch_rmsnorm_quantize(const Tensor& residual, const Tensor& norm_weight, float eps, float input_scale_divisor,
-                             Nvfp4A4Workspace planes, cudaStream_t stream) {
+                             Nvfp4A4Workspace planes, cudaStream_t stream, void* normalized = nullptr) {
     const std::int32_t tokens = residual.ne[1];
     const std::int32_t padded = Layout == Nvfp4ScaleLayout::RowMajor ? tokens : nvfp4_a4_padded_tokens(tokens, Layout);
     const std::size_t scale_extent = Terms > 1 ? planes.scale_plane : planes.scale_bytes;
@@ -133,12 +156,38 @@ void launch_rmsnorm_quantize(const Tensor& residual, const Tensor& norm_weight, 
         scale_extent < static_cast<std::size_t>(padded) * InputGeometry::kGroupsPerRow) {
         throw std::invalid_argument("fused rmsnorm A4 quantize: unsupported call or planes too small");
     }
+    if (normalized != nullptr) {
+        CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(padded)), dim3(kBlock), 0, stream},
+                                        rmsnorm_a4_quantize_store_kernel<Terms, Layout>,
+                                        static_cast<const __nv_bfloat162*>(residual.data),
+                                        static_cast<const __nv_bfloat162*>(norm_weight.data), planes.codes,
+                                        planes.scales, static_cast<std::int64_t>(planes.code_plane),
+                                        static_cast<std::int64_t>(planes.scale_plane), tokens, eps,
+                                        input_scale_divisor, static_cast<__nv_bfloat162*>(normalized)));
+        return;
+    }
     CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(padded)), dim3(kBlock), 0, stream},
                                     rmsnorm_a4_quantize_kernel<Terms, Layout>,
                                     static_cast<const __nv_bfloat162*>(residual.data),
                                     static_cast<const __nv_bfloat162*>(norm_weight.data), planes.codes, planes.scales,
                                     static_cast<std::int64_t>(planes.code_plane),
                                     static_cast<std::int64_t>(planes.scale_plane), tokens, eps, input_scale_divisor));
+}
+
+// The adapter form's extra buffers (beside the planes): the normalized x and its U, the stored product and its U.
+struct FusedLoraBuffers {
+    Tensor normalized, input_u, product, product_u;
+};
+
+template <class Allocator>
+FusedLoraBuffers allocate_lora_buffers(Allocator& allocator, std::int32_t tokens, std::int32_t input_rows,
+                                       std::int32_t product_rows) {
+    FusedLoraBuffers out;
+    out.normalized = allocator.alloc(DType::BF16, {InputGeometry::kInputRows, tokens});
+    if (input_rows > 0) { out.input_u = allocator.alloc(DType::BF16, {input_rows, tokens}); }
+    out.product = allocator.alloc(DType::BF16, {DownGeometry::kInputRows, tokens});
+    if (product_rows > 0) { out.product_u = allocator.alloc(DType::BF16, {product_rows, tokens}); }
+    return out;
 }
 
 } // namespace
@@ -156,14 +205,17 @@ void launch_nvfp4_rmsnorm_a4_quantize_tiled(const Tensor& residual, const Tensor
                                                            stream);
 }
 
-std::size_t nvfp4_dense_mlp_fused_rmsnorm_workspace_bytes(std::int32_t max_tokens) {
+std::size_t nvfp4_dense_mlp_fused_rmsnorm_workspace_bytes(std::int32_t max_tokens, std::int32_t lora_input_rows,
+                                                         std::int32_t lora_product_rows) {
     // The widest call of either profile within max_tokens.
     std::size_t bytes = 0;
+    const bool lora   = lora_input_rows > 0 || lora_product_rows > 0;
     for (const auto& [terms, tokens] : {std::pair{kTerms, std::min(max_tokens, kDenseMlpFusedMaxTokens)},
                                         std::pair{1, max_tokens}}) {
         if (tokens <= 0) { continue; }
         WorkspaceLayoutBuilder layout;
         (void)allocate_planes<WorkspaceLayoutBuilder>(layout, tokens, terms);
+        if (lora) { (void)allocate_lora_buffers(layout, tokens, lora_input_rows, lora_product_rows); }
         bytes = std::max(bytes, layout.peak_bytes(1));
     }
     return bytes;
@@ -171,23 +223,57 @@ std::size_t nvfp4_dense_mlp_fused_rmsnorm_workspace_bytes(std::int32_t max_token
 
 void nvfp4_dense_mlp_fused_rmsnorm_launch(Tensor& residual, const Tensor& norm_weight, float eps,
                                           const Weight& gate_up, const Weight& down, LinearPolicy policy,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
+                                          WorkspaceArena& workspace, cudaStream_t stream, const LoraSite* gate_up_lora,
+                                          const LoraSite* down_lora) {
     const std::int32_t tokens = residual.ne[1];
     auto scope                = workspace.scope();
+    const bool lora           = gate_up_lora != nullptr || down_lora != nullptr;
+    // --lora: the planes kernels add each projection's term over U = A of its BF16 input. The norm also stores h
+    // and the SwiGLU epilogue the product, the bytes rmsnorm() and linear_swiglu() store, for the shrinks; every
+    // other byte is the composition's as before.
+    const auto planes_terms = allows_a4_residual(policy) ? kTerms : 1;
+    const auto planes       = allocate_planes<WorkspaceArena>(workspace, tokens, planes_terms);
+    FusedLoraBuffers buffers;
+    LoraAddend gate_up_term, down_term;
+    if (lora) {
+        buffers = allocate_lora_buffers(workspace, tokens, gate_up_lora != nullptr ? gate_up_lora->a.rows : 0,
+                                        down_lora != nullptr ? down_lora->a.rows : 0);
+        if (gate_up_lora != nullptr) {
+            gate_up_term   = gate_up_lora->addend;
+            gate_up_term.u = buffers.input_u.data;
+        }
+        if (down_lora != nullptr) {
+            down_term   = down_lora->addend;
+            down_term.u = buffers.product_u.data;
+        }
+    }
+    const LoraAddend* gate_up_addend = gate_up_lora != nullptr ? &gate_up_term : nullptr;
+    const LoraAddend* down_addend    = down_lora != nullptr ? &down_term : nullptr;
+    // The product is stored for the down projection's shrink (also, unused, with a gate/up term alone).
+    void* product = lora ? buffers.product.data : nullptr;
+    const auto shrink_input = [&] {
+        if (gate_up_lora != nullptr) { lora_shrink(buffers.normalized, gate_up_lora->a, buffers.input_u, stream); }
+    };
+    const auto shrink_product = [&] {
+        if (down_lora != nullptr) { lora_shrink(buffers.product, down_lora->a, buffers.product_u, stream); }
+    };
     if (allows_a4_residual(policy)) {
-        const auto planes = allocate_planes<WorkspaceArena>(workspace, tokens, kTerms);
-        launch_nvfp4_rmsnorm_a4_residual_quantize(residual, norm_weight, eps, gate_up.input_scale_divisor,
-                                                  planes.input, stream);
+        launch_rmsnorm_quantize<kTerms, Nvfp4ScaleLayout::RowMajor>(residual, norm_weight, eps,
+                                                                    gate_up.input_scale_divisor, planes.input, stream,
+                                                                    lora ? buffers.normalized.data : nullptr);
+        shrink_input();
         nvfp4_linear_swiglu_a4_residual_planes_launch(gate_up, planes.input, planes.product, down.input_scale_divisor,
-                                                      tokens, stream);
-        nvfp4_linear_add_a4_residual_planes_launch(down, residual, planes.product, tokens, stream);
+                                                      tokens, stream, gate_up_addend, product);
+        shrink_product();
+        nvfp4_linear_add_a4_residual_planes_launch(down, residual, planes.product, tokens, stream, down_addend);
         return;
     }
     // The prompt profile (AllowA4, at least kDenseMlpFusedPromptMinTokens columns): the gate/up projection's TMA tile
     // (x's scales Tiled256), its product in the layout the down projection's A4 route reads at this width.
-    const auto planes = allocate_planes<WorkspaceArena>(workspace, tokens, 1);
-    launch_nvfp4_rmsnorm_a4_quantize_tiled(residual, norm_weight, eps, gate_up.input_scale_divisor, planes.input,
-                                           stream);
+    launch_rmsnorm_quantize<1, Nvfp4ScaleLayout::Tiled256>(residual, norm_weight, eps, gate_up.input_scale_divisor,
+                                                           planes.input, stream,
+                                                           lora ? buffers.normalized.data : nullptr);
+    shrink_input();
     const Nvfp4ScaleLayout down_layout = nvfp4_linear_add_a4_scale_layout(tokens);
     // ZK-09: a remainder past the down projection's whole TMA tiles whose tile would add a wave runs on its MMA tiles
     // (nvfp4_tma_tail), its product scales row-major after the whole tiles'; the gate/up projection keeps its one TMA
@@ -197,15 +283,19 @@ void nvfp4_dense_mlp_fused_rmsnorm_launch(Tensor& residual, const Tensor& norm_w
     const std::int32_t wide = tokens - tail;
     launch_nvfp4_linear_swiglu_a4_tma_planes(nvfp4_a4_operands(gate_up, planes.input, tokens, Nvfp4ScaleLayout::Tiled256),
                                              planes.product, down.input_scale_divisor, down_layout, stream,
-                                             tail > 0 ? wide : 0x7fffffff);
+                                             tail > 0 ? wide : 0x7fffffff, gate_up_addend,
+                                             static_cast<__nv_bfloat16*>(product));
+    shrink_product();
     if (tail > 0) {
-        nvfp4_linear_add_a4_planes_launch(down, residual, planes.product, wide, stream);
+        nvfp4_linear_add_a4_planes_launch(down, residual, planes.product, wide, stream, down_addend);
         Tensor residual_tail = residual.slice(1, wide, tail);
+        LoraAddend tail_term;
+        if (down_addend != nullptr) { tail_term = lora_columns_from(*down_addend, wide); }
         nvfp4_linear_add_a4_planes_launch(down, residual_tail, nvfp4_a4_tail_plane(planes.product, down.k, wide), tail,
-                                          stream);
+                                          stream, down_addend != nullptr ? &tail_term : nullptr);
         return;
     }
-    nvfp4_linear_add_a4_planes_launch(down, residual, planes.product, tokens, stream);
+    nvfp4_linear_add_a4_planes_launch(down, residual, planes.product, tokens, stream, down_addend);
 }
 
 } // namespace infernix::ops::detail

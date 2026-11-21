@@ -1,6 +1,7 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -33,17 +34,19 @@ using K17408Bulk =
 // with the parent's static input scale in every token's slot.
 template <int K, class Operands>
 void launch_problem(const Tensor& x, const Operands& operands, const Weight& weight, Tensor& residual,
-                    Fp8A8Workspace workspace, cudaStream_t stream) {
+                    Fp8A8Workspace workspace, cudaStream_t stream, const LoraAddend* lora) {
     auto* data = static_cast<__nv_bfloat16*>(residual.data);
     const LinearBf16Output output{data, weight.n};
     const Fp8ResidualAddEpilogue epilogue{{{data, weight.n}}};
     const auto launch   = [&]<class Schedule>() {
         using S = Fp8ScheduleInstance<Schedule, K>;
         if constexpr (S::kTmaSwizzle)
-            launch_fp8_a8_tma_mma<S>(operands, output, epilogue, stream, workspace.partials);
+            with_lora_epilogue(lora, epilogue, [&](auto e) {
+                launch_fp8_a8_tma_mma<S>(operands, output, e, stream, workspace.partials);
+            });
         else
-            launch_fp8_a8_mma<S>(operands, output, LinearResidualAddEpilogue{{data, weight.n}},
-                                   stream);
+            with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, weight.n}},
+                               [&](auto e) { launch_fp8_a8_mma<S>(operands, output, e, stream); });
     };
     if constexpr (K == 6144) {
         if (x.ne[1] <= 64) return launch.template operator()<K6144Tma32x64>();
@@ -80,17 +83,18 @@ std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t m
 }
 
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                              WorkspaceArena& workspace, cudaStream_t stream) {
+                              WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
     auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_add_partial_capacity_bytes(weight.k, x.ne[1]));
     launch_fp8_a8_quantize(x, weight, scratch, stream);
     if (weight.k == 6144) {
         with_fp8_a8_operands(weight, scratch, x.ne[1], [&](const auto& operands) {
-            launch_problem<6144>(x, operands, weight, residual, scratch, stream);
+            launch_problem<6144>(x, operands, weight, residual, scratch, stream, lora);
         });
     } else {
-        launch_problem<17408>(x, fp8_a8_operands(weight, scratch, x.ne[1]), weight, residual, scratch, stream);
+        launch_problem<17408>(x, fp8_a8_operands(weight, scratch, x.ne[1]), weight, residual, scratch, stream,
+                              lora);
     }
 }
 } // namespace infernix::ops::detail

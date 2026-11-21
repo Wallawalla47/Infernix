@@ -59,40 +59,50 @@ struct RowSplitGroupedRingCodec {
     }
 };
 
-template <class Tile, int Stages, int ProducerWarps, bool FullTiles, int Jobs = 4>
+// `lora`: LoraNone, or the call's term (RowSplitGroupedLora, rowsplit_grouped_mma.cuh).
+template <class Tile, int Stages, int ProducerWarps, bool FullTiles, int Jobs = 4, class Lora = LoraNone>
 __global__ __launch_bounds__(RowSplitRing<Tile, Stages, ProducerWarps>::kThreads, Tile::MIN_BLOCKS)
 void rowsplit_grouped_ring_kernel(const __nv_bfloat16* __restrict__ x, RowSplitGroupedMmaJob job0,
                                   RowSplitGroupedMmaJob job1, RowSplitGroupedMmaJob job2, RowSplitGroupedMmaJob job3,
-                                  std::int32_t k, std::int32_t t, std::int32_t padded_k) {
+                                  std::int32_t k, std::int32_t t, std::int32_t padded_k, Lora lora) {
     using Ring = RowSplitRing<Tile, Stages, ProducerWarps>;
     constexpr int BM = Tile::BM, BN = Tile::BN, MT = Tile::MT, NT = Tile::NT;
+    constexpr bool kLora = kRowSplitGroupedLora<Lora>;
     static_assert(Jobs == 2 || Jobs == 4, "grouped input GEMM supports two or four jobs");
     Ring::init();
 
     const int tiles0 = div_up(job0.n, BM);
     int tile         = static_cast<int>(blockIdx.x);
     RowSplitGroupedMmaJob job;
+    int lora_row_base = 0; // --lora: the job's first logical row
     if constexpr (Jobs == 2) {
         if (tile < tiles0) {
             job = job0;
+            if constexpr (kLora) { lora_row_base = lora.row_base[0]; }
         } else {
             tile -= tiles0;
             job = job1;
+            if constexpr (kLora) { lora_row_base = lora.row_base[1]; }
         }
     } else {
         const int tiles1 = div_up(job1.n, BM);
         const int tiles2 = div_up(job2.n, BM);
         if (tile < tiles0) {
             job = job0;
+            if constexpr (kLora) { lora_row_base = lora.row_base[0]; }
         } else if ((tile -= tiles0) < tiles1) {
             job = job1;
+            if constexpr (kLora) { lora_row_base = lora.row_base[1]; }
         } else if ((tile -= tiles1) < tiles2) {
             job = job2;
+            if constexpr (kLora) { lora_row_base = lora.row_base[2]; }
         } else {
             tile -= tiles2;
             job = job3;
+            if constexpr (kLora) { lora_row_base = lora.row_base[3]; }
         }
     }
+    (void)lora_row_base;
     const int NKT = padded_k / Tile::BK;
     const int m0  = tile * BM;
     const int t0  = static_cast<int>(blockIdx.y) * BN;
@@ -106,12 +116,31 @@ void rowsplit_grouped_ring_kernel(const __nv_bfloat16* __restrict__ x, RowSplitG
         return;
     }
 
+    if constexpr (kLora) {
+        // The term's B rows and U columns into L2 while the ring runs (consumer threads).
+        lora_prefetch_tile(
+            lora.addend, BM, [&](int i) { return lora_row_base + (m0 + i < job.n ? m0 + i : job.n - 1); }, t0,
+            FullTiles ? BN : min(BN, t - t0), static_cast<int>(threadIdx.x), Tile::THREADS);
+    }
     float acc[MT][NT][4] = {};
     Ring::consume(acc, NKT);
 
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
     const int wm = warp / Tile::WARPS_N, wn = warp % Tile::WARPS_N;
     const int gid = lane >> 2, lid = lane & 3;
+    if constexpr (kLora) {
+        // --lora: the term on each consumer warp's fragments (canonical chains), before the BF16 stores.
+        lora_add_rows_tile<MT, NT>(
+            lora.addend, acc,
+            [&](int mm, int i) {
+                const int r = m0 + wm * Tile::WM + mm * 16 + i;
+                return lora_row_base + (r < job.n ? r : job.n - 1);
+            },
+            [&](int mn, int j) {
+                const int c = t0 + wn * Tile::WN + mn * 8 + j;
+                return c < t ? c : -1;
+            });
+    }
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
         const int r0 = m0 + wm * Tile::WM + mi * 16 + gid;

@@ -1,10 +1,12 @@
 #include "models/qwen3_5/execution/attention.h"
 
 #include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/lora.h"
 #include "infernix/ops/rmsnorm.h"
 #include "infernix/ops/rmsnorm_rope.h"
 #include "infernix/ops/rope.h"
 
+#include <optional>
 #include <stdexcept>
 
 namespace infernix::models::qwen3_5::execution {
@@ -45,30 +47,58 @@ bool fused_text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
 
 } // namespace
 
+std::size_t lora_u_bytes(std::int32_t rows, std::int32_t columns) {
+    // One BF16 [rows, columns] arena allocation (256-byte aligned, as WorkspaceArena::alloc places it).
+    const std::size_t bytes = static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns) * 2;
+    return (bytes + 255) / 256 * 256;
+}
+
 std::size_t attention_projection_workspace_bytes(const AttentionParameters& parameters,
                                                  std::int32_t first, std::int32_t last) {
     if (first <= 0 || last < first) {
         throw std::invalid_argument("attention projection: invalid column interval");
     }
+    // --lora: the input's U (attention_projection's caller allocates it before the projection's own scratch).
+    const std::size_t lora = parameters.lora_input ? lora_u_bytes(parameters.lora_input->a.rows, last) : 0;
     if (const auto* single = std::get_if<LinearParameters>(&parameters.projection)) {
         const auto& weight = single->weight;
-        return ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
-                                                             single->policy, first, last);
+        return lora + ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
+                                                                    single->policy, first, last);
     }
-    return 0;
+    return lora;
 }
 
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream) {
+    // --lora: U = A h for q_proj, k_proj and v_proj, and their term on the projection (U released on return, as
+    // attention_projection_workspace_bytes counts it).
+    auto scope = workspace.scope();
+    std::optional<ops::LoraAddend> lora;
+    if (parameters.lora_input) {
+        Tensor u = workspace.alloc(DType::BF16, {parameters.lora_input->a.rows, hidden.ne[1]});
+        ops::lora_shrink(hidden, parameters.lora_input->a, u, stream);
+        lora    = parameters.lora_input->addend;
+        lora->u = u.data;
+    }
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value,
-                             pair->policy, stream);
+                             pair->policy, stream, lora ? &*lora : nullptr);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,
-                             workspace, stream);
+                             workspace, stream, lora ? &*lora : nullptr);
     }
+}
+
+std::optional<ops::LoraAddend> attention_output_lora(const AttentionParameters& parameters, const Tensor& input,
+                                                     WorkspaceArena& workspace, cudaStream_t stream) {
+    if (!parameters.lora_output) { return std::nullopt; }
+    Tensor u = workspace.alloc(DType::BF16, {parameters.lora_output->a.rows, input.ne[1]});
+    ops::lora_shrink(input, parameters.lora_output->a, u, stream);
+    ops::LoraAddend lora = parameters.lora_output->addend;
+    lora.u               = u.data;
+    return lora;
 }
 
 void text_rope(const Tensor& positions, const RopeConfig& config, const ops::PreparedRope& prepared,

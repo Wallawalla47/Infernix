@@ -73,6 +73,11 @@ infernix_add_test(infernix_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES infernix_model_loading)
 
+# --lora: a PEFT adapter's modules bound to a Qwen3.5 text configuration, and every refusal (host only).
+infernix_add_test(infernix_qwen3_5_lora_binding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_binding.cpp"
+  LIBRARIES infernix_model_loading infernix::json)
+
 infernix_add_test(infernix_qwen3_5_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
   NEEDS_SOURCE_DIR

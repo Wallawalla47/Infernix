@@ -54,6 +54,7 @@ Json memory_json(const MetricsJsonSnapshot& s) {
     Json device_parts              = Json::array();
     add_part(device_parts, "weights", m.device.weights);
     add_part(device_parts, "drafter", m.device.drafter);
+    add_part(device_parts, "adapter", m.device.adapter);
     add_part(device_parts, "experts", m.device.experts, std::nullopt,
              m.device.experts != 0 ? std::optional<std::uint64_t>(m.device.expert_frames) : std::nullopt);
     add_part(device_parts, "kv_cache", m.device.kv, m.device.kv_used);

@@ -7,6 +7,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -43,7 +44,8 @@ Q4W4A8Workspace allocate_q4_w4a8_workspace(Arena& arena, std::int32_t tokens,
 
 // Gate/up [34816,5120] (RowSplit Q4_G64_FP16), x [5120,T], out [17408,T]; any positive T. Uses
 // allocate_q4_w4a8_workspace(ws, T, 5120) inside its own scope of `ws`.
+// `lora`: a LoRA term (include/infernix/ops/lora.h) added to the scaled gate and up values before the SwiGLU.
 void q4_linear_swiglu_w4a8_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

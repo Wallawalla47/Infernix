@@ -134,8 +134,9 @@ plan's `error`.
 | `vram.bytes_per_page_group`, `page_group_tokens` | Qwen3.5 family: each further 64-token KV page group's bytes, the capacity curve's slope |
 | `vram.workspace_bytes`, `graph_allowance_bytes` | the Program workspace and the CUDA Graph allowance (Qwen3.8-Flash-Next: the expert cache's reserve for graph executables) |
 | `vram.expert_frames`, `expert_cache_bytes` | offloaded experts: the VRAM expert cache's frames and bytes |
+| `vram.draft_screen_bytes`, `adapter_bytes` | Qwen3.5 family, beside the weights' arena: the DFlash2 drafter's proposal-head screen and a LoRA adapter's factors (`--lora`; its per-call workspace is in `workspace_bytes`); `null` when the start has none |
 | `vram.headroom_bytes` | VRAM left free for the display and other programs (`--vram-headroom-mib` or the automatic headroom) |
-| `vram.planned_bytes`, `left_bytes` | everything planned on the device, and what free VRAM leaves beside it, the headroom and the expert cache's reserve |
+| `vram.planned_bytes`, `left_bytes` | everything planned on the device (the weights, the draft screen and the adapter, the Program's reservation, the expert cache), and what free VRAM leaves beside it, the headroom and the expert cache's reserve |
 | `ram.total_bytes`, `available_bytes`, `ram_free_bytes` | physical RAM, what is available now, and the reserve (`--ram-free-mib`) |
 | `ram.experts_bytes`, `tier`, `expert_ram_layout` | offloaded experts: the RAM the ledger gives the routed experts; `full` when none is read from the SSD (all in RAM, or with the exclusive layout in RAM or VRAM), `ssd` when part are; and `full` or `exclusive` |
 | `ram.pinned_bytes` | the weights the load pins in RAM (offloaded experts, the token embedding with them or with `--embedding-host`, an offloaded vision tower and, on the Qwen3.5 family without offloaded experts, the pinned mirror of the device weights its window evicts: the embedding, the heads, MTP) |
@@ -160,7 +161,8 @@ What is exact and what is estimated (`estimated` is always `true`):
   (under Windows with a DXGI budget, at most the budget less the process's usage, which can be GiBs
   below the driver's free figure; a KV sized past it would be demoted to system memory), less
   the weights' arena the plan did not upload (with `--vision-offload on`, in whole 16 MiB chunks: the
-  vision window borrows the evicted ones). A start reads it after the upload, which may differ by the
+  vision window borrows the evicted ones) and the draft screen and adapter it did not allocate (a start
+  allocates both before it sizes the KV). A start reads it after the upload, which may differ by the
   driver's allocation granularity; an automatic `kv_tokens` and `kv_bytes` follow from it.
 - The CUDA Graph allowance is the planned one. When a start's graphs need more, an automatic KV
   capacity retries once with 1 GiB more headroom (fewer KV pages); the plan cannot see that.
@@ -2005,6 +2007,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--any-model-name` | serve OpenAI-route requests whatever non-empty `model` they name, reporting the public model ID (see Chat Completions) | off: other names are 404 `model_not_found` |
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
+| `--lora PATH` | apply a LoRA adapter at runtime: a Hugging Face PEFT adapter's folder, or its `adapter_model.safetensors` with `adapter_config.json` beside it. Qwen3.5 dense models (the 27Bs); `--lossless` computes it as PEFT does. `--model-id` names the adapted model ([LoRA adapters](lora.md)) | none |
 | `--claude-code-prompt as-sent\|local` | Anthropic Messages from Claude Code: use its System prompt as sent, or replace its Claude-specific parts with a short local-agent preamble ([Anthropic Messages](#anthropic-messages)) | `as-sent` |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N\|auto` | logical context ceiling of each sequence. `auto` sizes it at startup to the largest context whose smallest reservation fits beside the weights (what `--plan` reports as `max_context`), within the model's positions, so one request may fill the KV cache; startup logs the value and `/v1/models` and `/metrics` report it. With it the KV capacity defaults to `auto` (also with `--no-prefix-reuse`), and an explicit `--kv-capacity N` is its ceiling. Qwen3.5-family models whose experts stay in VRAM (the 27Bs, the 35B-A3B); offloaded experts and Qwen3.8-Flash-Next refuse it, as the KV cache would take their expert cache's VRAM | `8192` |
@@ -2400,6 +2403,7 @@ occupied share (KV pages holding requests' tokens, prefix-cache space holding en
 |---|---|---|---|
 | `weights` | the model's weights, the drafter's excepted | weights kept in RAM (pinned objects, the token embedding, packed-weight escapes) | |
 | `drafter` | the speculative drafter's weights (MTP, DFlash, DFlash2), its columns, rings and pools, and DFlash2's proposal-head screen | | |
+| `adapter` | a LoRA adapter's factors (`--lora`; its per-call U is in `workspace`) | | |
 | `experts` | the VRAM expert cache's frames that hold experts (`count`: frames) | expert records in RAM (`count`: records) | records read from the artifact on use (`count`) |
 | `kv_cache` | the KV cache's backed pages and tables, less `prefix_cache`'s and `mtp_kv` | | |
 | `mtp_kv` | the MTP drafter's own KV page pool (Qwen3.5 with `--spec mtp`; counted in `kv_cache` before 2026-11-15) | | |
@@ -2467,7 +2471,7 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v31 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v32 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, payload-size fields, and
@@ -2592,6 +2596,9 @@ For `server_start.memory`, `workspace.capacity_bytes` is the only physical works
 When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token
 bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
 be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
+`draft_screen_bytes` and `adapter_bytes` are the Device memory beside the weights' arena: the DFlash2
+drafter's proposal-head screen and a LoRA adapter's factors (`--lora`; `0` without one), and
+`server_start.artifact.lora_adapter` names the adapter as the startup log does (`null` without one).
 `cuda_graph_allowance_bytes` is the CUDA Graph memory
 the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph preparation
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds

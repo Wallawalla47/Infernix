@@ -222,7 +222,7 @@ void print_generation_summary(const infernix::GenerationResult& result,
                  format_rate(static_cast<double>(generated), model_seconds));
 
     const std::uint64_t reserved = static_cast<std::uint64_t>(memory.weights.capacity_bytes) +
-                                   memory.runtime_reservation_bytes;
+                                   memory.draft_screen_bytes + memory.adapter_bytes + memory.runtime_reservation_bytes;
     print_metric("device", std::to_string(memory.device));
     print_metric("max context", std::to_string(memory.max_context));
     print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
@@ -230,6 +230,8 @@ void print_generation_summary(const infernix::GenerationResult& result,
     print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
+    if (memory.draft_screen_bytes != 0) { print_metric("draft screen", format_bytes(memory.draft_screen_bytes)); }
+    if (memory.adapter_bytes != 0) { print_metric("LoRA adapter", format_bytes(memory.adapter_bytes)); }
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
@@ -385,6 +387,7 @@ int main(int argc, char** argv) {
 
         infernix::EngineOptions engine_options;
         engine_options.artifact_path            = cli.artifact_path;
+        engine_options.lora_path                = cli.lora_path;
         engine_options.chat_template_path       = cli.chat_template_path;
         engine_options.ngram_volume_path        = cli.ngram_volume_path;
         engine_options.expert_stripe_path       = cli.expert_stripe_path;

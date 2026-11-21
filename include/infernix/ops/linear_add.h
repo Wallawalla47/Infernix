@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -88,6 +89,14 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 /// Q5 calls of 2-16 columns (every width under A16ColumnInvariant, still column-invariant) take
 /// the 8 K-warp K-split tiles; without a flag every profile runs its exact route.
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
-                WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
+                WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact,
+                const LoraAddend* lora = nullptr);
+
+/**
+ * Whether linear_add takes a LoRA term (include/infernix/ops/lora.h) for this weight at every policy and T: each
+ * projected value p becomes fl32(p + fl32(c * s)) before the residual add (the canonical addend). NVFP4, row-scaled
+ * FP8 and groupwise Q5 [5120,6144] and [5120,17408] weights.
+ */
+[[nodiscard]] bool linear_add_lora_supported(QType qtype, std::int32_t output_rows, std::int32_t input_rows);
 
 } // namespace infernix::ops

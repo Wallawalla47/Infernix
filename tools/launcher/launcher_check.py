@@ -430,6 +430,16 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         status, plan = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "65536"]})
         check("a plan that fits", status == 200 and plan.get("fits") is True and plan.get("max_context") and
               plan.get("vram") and plan["vram"]["parts"], str(plan)[:200])
+        # A LoRA adapter's factors are a part of the plan beside the weights, and count in what it plans.
+        adapter_dir = Path(tempfile.mkdtemp(prefix="infernix-launcher-lora-"))
+        status, plain = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "65536"]})
+        status_lora, adapted = call(port, "POST", f"{cfg}/plan",
+                                    {"args": fast + ["--max-context", "65536", "--lora", str(adapter_dir)]})
+        labels = [part.get("label") for part in (adapted.get("vram") or {}).get("parts", [])]
+        check("a LoRA adapter's VRAM is a part of the plan and of what it plans",
+              status == 200 and status_lora == 200 and "LoRA adapter" in labels
+              and (adapted.get("vram") or {}).get("planned", 0) - (plain.get("vram") or {}).get("planned", 0)
+              == 318767104, str(labels))
         status, plan = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "250000"]})
         suggestions = plan.get("suggestions", [])
         first = suggestions[0] if suggestions and isinstance(suggestions[0], dict) else {}

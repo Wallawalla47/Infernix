@@ -548,7 +548,28 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 26, "report schema v26");
+    failures += expect(report.at("schema_version") == 27, "report schema v27");
+    failures += expect(report.at("config").at("lora") == "" && report.at("load").at("lora_adapter") == "" &&
+                           report.at("memory").at("adapter_bytes") == 0 &&
+                           report.at("memory").at("draft_screen_bytes") == 0,
+                       "no adapter: an empty path and no bytes beside the weights");
+    auto lora_env                      = env;
+    lora_env.lora_path                 = "C:/adapters/pi";
+    lora_env.load.lora_adapter         = "C:/adapters/pi: 64 attention and 192 MLP projections";
+    lora_env.memory.adapter_bytes      = 318767104ULL;
+    lora_env.memory.draft_screen_bytes = 357600000ULL;
+    lora_env.memory.cuda_graph_measured_bytes = 31457280ULL;
+    const Json lora = Json::parse(qb::format_json(lora_env, "infernix_bench --lora C:/adapters/pi", results));
+    failures += expect(lora.at("config").at("lora") == "C:/adapters/pi" &&
+                           lora.at("load").at("lora_adapter") == lora_env.load.lora_adapter &&
+                           lora.at("memory").at("adapter_bytes") == 318767104ULL &&
+                           lora.at("memory").at("draft_screen_bytes") == 357600000ULL &&
+                           lora.at("memory").at("cuda_graph_measured_bytes") == 31457280ULL,
+                       "report records the adapter, the bytes beside the weights and the graphs' memory");
+    const std::string lora_table = qb::format_table(lora_env, results);
+    failures += expect(lora_table.find(", LoRA adapter ") != std::string::npos &&
+                           lora_table.find(" lora=C:/adapters/pi") != std::string::npos,
+                       "the table names the adapter in its memory and config lines");
     failures += expect(report.at("config").at("expert_state") == "calibrated" &&
                            report.at("config").at("ram_free_mib") == 4096,
                        "report records the expert seed and the RAM kept free");

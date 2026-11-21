@@ -131,6 +131,18 @@ in the Program stores and its index.
 The Model owns the config, bindings, Uses, weight backing and read-only resources. A ModelInstance's
 const Parameters borrow these resources, and planning and execution consume the same parameters.
 
+A runtime LoRA adapter (`--lora`, [user guide](../lora.md)) follows the same split. The artifact layer reads its
+Hugging Face files (`artifact/safetensors.h`, `artifact/peft_lora.h`: header validation, the configuration's
+refusals, rank and alpha patterns). The Qwen3.5 Model binds its modules to text layers and projections
+(`models/qwen3_5/load/lora.h`) and keeps the binding; the instance's Parameters own the BF16 factor buffer
+(`execution/lora_parameters.h`: the factors in each adapted parent's physical row order, q_proj split per head into
+query and gate rows) and give each adapted input a site (`ops::LoraSite`: A stacked over the input's adapters, and
+the parent's term). Execution runs `ops::lora_shrink` before a projection and passes the term to the projection Op;
+the Ops own the canonical term arithmetic (`include/infernix/ops/lora.h`) in an adapter instance of each kernel,
+and refuse a parent format without one by name. An adapter instance keeps the kernel's own arithmetic (a zero `B`
+returns the no-adapter kernel's bits) and the no-adapter instance is the kernel as it was, so `--lora` changes no
+route and costs nothing without it. Planning counts each site's `U` in the workspace the call uses.
+
 Each Program exclusively owns:
 
 - the active sequences, committed prefix identity, execution ledger and backend state;

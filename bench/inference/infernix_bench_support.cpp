@@ -566,6 +566,7 @@ std::string usage_text(std::string_view program) {
         << "                             round's length (0..7; Qwen3.5/3.6 1..5 by adaptive-mtp where\n"
         << "                             qualified, else the model's fastest fixed length)\n"
         << "  --draft-model <path>       Qwen3.8-Flash-Next DFlash2: the drafter's companion artifact\n"
+        << "  --lora <path>              Qwen3.5 dense: a LoRA adapter applied at runtime (PEFT directory)\n"
         << "  --spec-min-p <p>           MTP (Flash-Next: fixed --draft-tokens only), Flash-Next DFlash2\n"
         << "                             draft-confidence gate 0..1 (default 0: every draft)\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
@@ -793,6 +794,8 @@ BenchOptions parse_args(int argc, char** argv) {
             product::apply_draft_tokens(options.speculative, value("--draft-tokens"));
         } else if (arg == "--draft-model") {
             options.speculative.draft_model = std::filesystem::path(std::string(value("--draft-model")));
+        } else if (arg == "--lora") {
+            options.lora_path = value("--lora");
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {
@@ -1093,6 +1096,10 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.load.host_to_device_bytes) << ", staging peak "
         << format_bytes(env.load.peak_staging_bytes) << '\n'
         << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
+        << (env.memory.draft_screen_bytes != 0 ? ", draft screen " + format_bytes(env.memory.draft_screen_bytes)
+                                               : std::string())
+        << (env.memory.adapter_bytes != 0 ? ", LoRA adapter " + format_bytes(env.memory.adapter_bytes)
+                                          : std::string())
         << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
         << format_bytes(env.memory.workspace.capacity_bytes) << ", Vision handoff "
         << (env.memory.vision_workspace
@@ -1115,6 +1122,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " expert_a16_activations=" << (env.expert_a16_activations ? "on" : "off")
         << " a8_activations=" << (env.a8_activations ? "on" : "off")
         << " expert_state=" << env.expert_state
+        << " lora=" << (env.lora_path.empty() ? "none" : env.lora_path)
         << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
         << " ngram_residency=" << ngram_residency_name(env.ngram_residency)
         << " expert_stripe=" << (env.expert_stripe_path.empty() ? "none" : env.expert_stripe_path)
@@ -1222,7 +1230,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"host_to_device_bytes\": " << env.load.host_to_device_bytes << ",\n"
         << "    \"peak_staging_bytes\": " << env.load.peak_staging_bytes << ",\n"
         << "    \"device_object_count\": " << env.load.device_object_count << ",\n"
-        << "    \"host_object_count\": " << env.load.host_object_count << "\n"
+        << "    \"host_object_count\": " << env.load.host_object_count << ",\n"
+        << "    \"lora_adapter\": \"" << json_escape(env.load.lora_adapter) << "\"\n"
         << "  },\n"
         << "  \"memory\": {\n"
         << "    \"device\": " << env.memory.device << ",\n"
@@ -1236,6 +1245,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
+    out << "    \"draft_screen_bytes\": " << env.memory.draft_screen_bytes << ",\n"
+        << "    \"adapter_bytes\": " << env.memory.adapter_bytes << ",\n";
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
     append_vision_workspace_json(out, env.memory.vision_workspace, "    ", true);
@@ -1251,6 +1262,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"vram_headroom_bytes\": " << env.memory.vram_headroom_bytes << ",\n"
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
+        << "    \"cuda_graph_measured_bytes\": " << env.memory.cuda_graph_measured_bytes << ",\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
@@ -1277,6 +1289,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"expert_a16_activations\": " << (env.expert_a16_activations ? "true" : "false") << ",\n"
         << "    \"a8_activations\": " << (env.a8_activations ? "true" : "false") << ",\n"
         << "    \"expert_state\": \"" << json_escape(env.expert_state) << "\",\n"
+        << "    \"lora\": \"" << json_escape(env.lora_path) << "\",\n"
         << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"
         << "    \"ngram_residency\": \"" << ngram_residency_name(env.ngram_residency) << "\",\n"
         << "    \"expert_stripe\": \"" << json_escape(env.expert_stripe_path) << "\",\n"

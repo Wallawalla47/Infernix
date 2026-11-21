@@ -90,6 +90,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
     const int row_begin = row_block * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     float accumulators[Schedule::kRowsPerWarp][Schedule::kBlockTokens]
                       [Schedule::kAccumulatorChains] = {};
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, Schedule::kBlockTokens>;
+    [[maybe_unused]] LoraStage* lora_stage = nullptr;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's operands (B rows, U columns) stage in shared memory beside the main loop.
+        __shared__ LoraStage lora_stages[Schedule::kWarpsPerCta];
+        lora_stage = &lora_stages[warp];
+        int term_rows[Schedule::kRowsPerWarp];
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row)
+            term_rows[local_row] = row_policy.weight_row(row_begin, local_row, operands.rows);
+        lora_stage_warp_b(epilogue.lora, term_rows, *lora_stage);
+        lora_stage_warp_u(epilogue.lora, term_rows, token0, live_tokens, *lora_stage);
+    }
 
 #pragma unroll Schedule::kPhaseUnroll
     for (int phase = 0; phase < kPhases; ++phase) {
@@ -177,6 +190,62 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
 
     const auto destination =
         linear_output_tile<kStoredRowsPerCta>(output, row_block * kStoredRowsPerCta);
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The rows' values as the no-adapter kernel forms them and the term (warp-wide): paired rows take it on the
+        // gate and up values before the SwiGLU, single rows on the epilogue's result (lora_epilogue_apply).
+        static_assert(Schedule::kBlockTokens <= 8, "LoRA term: at most 8 columns a SIMT tile");
+        static_assert(!requires { Epilogue::kRowTokens; }, "LoRA term: no row-vector epilogue");
+        // The warp sums and row scales; each value total * scale is formed where it is consumed, in the block of its
+        // epilogue's add, as the no-adapter kernel forms it (the add may fuse the product into one FMA).
+        int parent[Schedule::kRowsPerWarp];
+        float scales[Schedule::kRowsPerWarp];
+        float totals[Schedule::kRowsPerWarp][Schedule::kBlockTokens];
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            parent[local_row] = row_policy.weight_row(row_begin, local_row, operands.rows);
+            scales[local_row] = fp8_widen(__ldg(row_scales + parent[local_row]));
+#pragma unroll
+            for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
+                float total = 0.0F;
+#pragma unroll
+                for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+                    total += accumulators[local_row][local_token][chain];
+                }
+                totals[local_row][local_token] = warp_reduce_sum(total);
+            }
+        }
+        float add[Schedule::kRowsPerWarp][Schedule::kBlockTokens];
+        bool has[Schedule::kRowsPerWarp];
+        lora_warp_rows_staged<Schedule::kRowsPerWarp, Schedule::kBlockTokens>(epilogue.lora, parent, token0,
+                                                                             live_tokens, add, has, *lora_stage);
+        if (lane == 0) {
+#pragma unroll
+            for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
+                const int token = token0 + local_token;
+                if (token >= live_tokens) { continue; }
+                if constexpr (PairRows) {
+#pragma unroll
+                    for (int local_row = 0; local_row < kStoredRowsPerWarp; ++local_row) {
+                        const int second = kStoredRowsPerWarp + local_row;
+                        const float first  = totals[local_row][local_token] * scales[local_row];
+                        const float second_value = totals[second][local_token] * scales[second];
+                        epilogue.apply_pair(destination, row_begin + local_row, token,
+                                            lora_add(first, add[local_row][local_token], has[local_row]),
+                                            lora_add(second_value, add[second][local_token], has[second]));
+                    }
+                } else {
+#pragma unroll
+                    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+                        destination.store(parent[local_row], token,
+                                          lora_epilogue_apply(epilogue, parent[local_row], token,
+                                                              totals[local_row][local_token] * scales[local_row],
+                                                              add[local_row][local_token], has[local_row]));
+                    }
+                }
+            }
+        }
+        return;
+    }
     if constexpr (requires { Epilogue::kRowTokens; }) {
         static_assert(!PairRows, "row-vector finalization does not pair output rows");
         static_assert(Schedule::kBlockTokens == Epilogue::kRowTokens,

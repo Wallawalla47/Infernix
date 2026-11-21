@@ -56,12 +56,12 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
         rowsplit_grouped_mma_kernel<Schedule, true, RowSplitGroupedMmaCodec::Mixed, 4>
             <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), qk,
                                                      value, output_gate, empty, x.ne[0], cols,
-                                                     x.ne[0]);
+                                                     x.ne[0], LoraNone{});
     } else {
         rowsplit_grouped_mma_kernel<Schedule, false, RowSplitGroupedMmaCodec::Mixed, 4>
             <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), qk,
                                                      value, output_gate, empty, x.ne[0], cols,
-                                                     x.ne[0]);
+                                                     x.ne[0], LoraNone{});
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -89,7 +89,7 @@ void launch_ring(const Tensor& x, const Weight& qk_weight, const Weight& value_z
             constexpr auto kernel =
                 rowsplit_grouped_ring_kernel<Tile, kRowSplitRingStages, kRowSplitRingProducerWarps, Full, 4>;
             kernel<<<grid, Ring::kThreads, reserve_dynamic_shared<kernel, Ring::kSharedBytes>(), stream>>>(
-                static_cast<const __nv_bfloat16*>(x_slice.data), qk, value, gate, empty, x.ne[0], count, x.ne[0]);
+                static_cast<const __nv_bfloat16*>(x_slice.data), qk, value, gate, empty, x.ne[0], count, x.ne[0], LoraNone{});
             CUDA_CHECK(cudaGetLastError());
         };
         if (full) {

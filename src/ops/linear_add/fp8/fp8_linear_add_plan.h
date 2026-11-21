@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -22,13 +23,15 @@ namespace infernix::ops::detail {
                                                                   std::int32_t max_tokens);
 
 void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                  cudaStream_t stream);
-void fp8_linear_add_matrix_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+                                  cudaStream_t stream, const LoraAddend* lora = nullptr);
+void fp8_linear_add_matrix_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t,
+                                  const LoraAddend* lora = nullptr);
 // A16ColumnInvariant: one sliced-K schedule (8 K-warps) for every T, so a column's arithmetic does
 // not depend on the call's other columns.
-void fp8_linear_add_invariant_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void fp8_linear_add_invariant_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t,
+                                     const LoraAddend* lora = nullptr);
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                              WorkspaceArena& workspace, cudaStream_t stream);
+                              WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 // Qwen3.5-122B-A10B's static-scale fp8_e4m3fn_row_f32 [3072,8192] (attention and GDN output).
 [[nodiscard]] std::size_t fp8_linear_add_n3072_partial_capacity_bytes(std::int32_t max_tokens);
@@ -40,6 +43,7 @@ void fp8_linear_add_n3072_a8_launch(const Tensor& x, const Weight& weight, Tenso
                                     WorkspaceArena& workspace, cudaStream_t stream);
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                             LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+                             LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                             const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

@@ -45,10 +45,11 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
     return tokens >= first_a8 ? Fp8LinearAddRoute::A8 : Fp8LinearAddRoute::A16;
 }
 
-void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream,
+                const LoraAddend* lora) {
     if (n3072(weight.n, weight.k)) return fp8_linear_add_n3072_a16_launch(x, weight, residual, stream);
-    if (x.ne[1] == 1) return fp8_linear_add_decode_launch(x, weight, residual, stream);
-    fp8_linear_add_matrix_launch(x, weight, residual, stream);
+    if (x.ne[1] == 1) return fp8_linear_add_decode_launch(x, weight, residual, stream, lora);
+    fp8_linear_add_matrix_launch(x, weight, residual, stream, lora);
 }
 
 } // namespace
@@ -76,25 +77,29 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 }
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                             LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+                             LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                             const LoraAddend* lora) {
     const Fp8LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     const bool static_scale       = n3072(weight.n, weight.k);
+    if (static_scale && lora != nullptr) {
+        throw std::invalid_argument("fp8 linear_add: the [3072,8192] parent takes no LoRA term");
+    }
     if (route == Fp8LinearAddRoute::ColumnInvariantA16) {
         if (static_scale) {
             fp8_linear_add_n3072_invariant_launch(x, weight, residual, stream);
         } else {
-            fp8_linear_add_invariant_launch(x, weight, residual, stream);
+            fp8_linear_add_invariant_launch(x, weight, residual, stream, lora);
         }
         return;
     }
     if (route == Fp8LinearAddRoute::A16) {
-        launch_a16(x, weight, residual, stream);
+        launch_a16(x, weight, residual, stream, lora);
         return;
     }
     if (static_scale) {
         fp8_linear_add_n3072_a8_launch(x, weight, residual, workspace, stream);
     } else {
-        fp8_linear_add_a8_launch(x, weight, residual, workspace, stream);
+        fp8_linear_add_a8_launch(x, weight, residual, workspace, stream, lora);
     }
 }
 

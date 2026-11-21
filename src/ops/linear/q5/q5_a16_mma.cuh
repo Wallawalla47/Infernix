@@ -5,6 +5,7 @@
 // each 64-group scale on the FP32 partial measured slower: 27B pp4096 0.985x, removed 2026-10-28.)
 #include "ops/common/mma.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 
@@ -249,6 +250,12 @@ void q5_a16_mma_kernel(
         if (k_tiles > 0) { stage_activation(0, 0); }
         cp_commit();
     }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        lora_prefetch_tile(
+            epilogue.lora, BM,
+            [&](int i) { return row0 + i < rows ? row0 + i : rows - 1; }, token_begin + col0,
+            min(BN, cols - col0), tid, Schedule::kThreads);
+    }
 
     for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
         const int stage = k_tile % S;
@@ -336,6 +343,19 @@ void q5_a16_mma_kernel(
         }
     }
 
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: the term on every warp's fragments (canonical chains), then the epilogue as below.
+        lora_add_rows_tile<MT, NT>(
+            epilogue.lora, accum,
+            [&](int mm, int i) {
+                const int r = row0 + warp_row * WM + mm * 16 + i;
+                return r < rows ? r : rows - 1;
+            },
+            [&](int mn, int j) {
+                const int t = col0 + warp_col * WN + mn * 8 + j;
+                return t < cols ? token_begin + t : -1;
+            });
+    }
     if constexpr (requires {
                       epilogue.template finish_tile<Schedule, Full>(
                           output, Bs[0], accum, row0, token_begin + col0, rows, token_begin + cols);

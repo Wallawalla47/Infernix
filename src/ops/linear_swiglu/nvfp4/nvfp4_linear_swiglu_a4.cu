@@ -11,6 +11,7 @@
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -35,22 +36,23 @@ constexpr int kIntermediate = Geometry::kOutputRows / 2;
 
 template <class Schedule>
 void launch_gemm(const Weight& weight, Tensor& out, Nvfp4A4Workspace workspace, int tokens,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, const LoraAddend* lora) {
     using S = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
-    launch_nvfp4_a4_mma<S>(nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
-                           LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
-                           SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{},
-                           pdl::Dependency::Programmatic);
+    with_lora_epilogue(lora, SwiGluTokenMajorMmaEpilogue{}, [&](auto epilogue) {
+        launch_nvfp4_a4_mma<S>(nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
+                               LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate}, epilogue,
+                               stream, SwiGluTokenMajorMmaRows<S>{}, pdl::Dependency::Programmatic);
+    });
 }
 
 template <class Schedule>
 void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
-            cudaStream_t stream) {
+            cudaStream_t stream, const LoraAddend* lora) {
     auto scope = workspace.scope();
     const Nvfp4A4Workspace scratch =
         allocate_nvfp4_a4_workspace(workspace, x.ne[1], Geometry::kInputRows);
     launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
-    launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream);
+    launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream, lora);
 }
 
 // The A4 residual tiles: the same 64-row weight tiles at two CTAs per SM, each column's activations
@@ -68,7 +70,7 @@ using ResidualM96N128 = Nvfp4A4MmaSchedule<96, 128, 256, 3, 4, 2, 1, Cache::cg, 
 
 template <int Terms>
 void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, const LoraAddend* lora) {
     auto scope = workspace.scope();
     const Nvfp4A4Workspace scratch =
         allocate_nvfp4_a4_workspace(workspace, x.ne[1], Geometry::kInputRows, Terms);
@@ -79,7 +81,7 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
         launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled128, stream);
         launch_nvfp4_linear_swiglu_a4_residual_tma(
             nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128),
-            static_cast<__nv_bfloat16*>(out.data), stream);
+            static_cast<__nv_bfloat16*>(out.data), stream, lora);
         return;
     }
     launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
@@ -88,32 +90,50 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
     // (RTX 5090).
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 16) {
-        launch_gemm<ResidualM16N64<Terms>>(weight, out, scratch, tokens, stream);
+        launch_gemm<ResidualM16N64<Terms>>(weight, out, scratch, tokens, stream, lora);
     } else if (tokens <= 32) {
-        launch_gemm<ResidualM32N64<Terms>>(weight, out, scratch, tokens, stream);
+        launch_gemm<ResidualM32N64<Terms>>(weight, out, scratch, tokens, stream, lora);
     } else if (tokens <= 64 || tokens > 128) {
-        launch_gemm<ResidualM64N128<Terms>>(weight, out, scratch, tokens, stream);
+        launch_gemm<ResidualM64N128<Terms>>(weight, out, scratch, tokens, stream, lora);
     } else {
-        launch_gemm<ResidualM96N128<Terms>>(weight, out, scratch, tokens, stream);
+        launch_gemm<ResidualM96N128<Terms>>(weight, out, scratch, tokens, stream, lora);
     }
 }
 
 // The fused dense MLP's gate/up GEMM: the residual tiles above (the same per width, so the same bits) with the
-// epilogue that encodes the product as the down projection's planes instead of storing it.
+// epilogue that encodes the product as the down projection's planes instead of storing it. With an adapter the
+// product is stored as well (`product_out`): the down projection's shrink reads it.
 template <class Schedule>
 void launch_planes_gemm(const Weight& weight, Nvfp4A4Workspace x_planes, Nvfp4A4Workspace product_planes,
-                        float down_input_scale_divisor, std::int32_t tokens, cudaStream_t stream) {
+                        float down_input_scale_divisor, std::int32_t tokens, cudaStream_t stream,
+                        const LoraAddend* lora, __nv_bfloat16* product_out) {
     using S = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
-    SwiGluA4PlanesEpilogue<kNvfp4A4ResidualTerms> epilogue{};
-    epilogue.codes               = product_planes.codes;
-    epilogue.scales              = product_planes.scales;
-    epilogue.code_plane          = static_cast<std::int64_t>(product_planes.code_plane);
-    epilogue.scale_plane         = static_cast<std::int64_t>(product_planes.scale_plane);
-    epilogue.input_scale_divisor = down_input_scale_divisor;
-    epilogue.down_input_rows     = kIntermediate;
-    launch_nvfp4_a4_mma<S>(nvfp4_a4_operands(weight, x_planes, tokens, Nvfp4ScaleLayout::RowMajor),
-                           LinearBf16Output{nullptr, kIntermediate}, epilogue, stream, SwiGluTokenMajorMmaRows<S>{},
-                           pdl::Dependency::Programmatic);
+    const auto fill = [&](auto& epilogue) {
+        epilogue.codes               = product_planes.codes;
+        epilogue.scales              = product_planes.scales;
+        epilogue.code_plane          = static_cast<std::int64_t>(product_planes.code_plane);
+        epilogue.scale_plane         = static_cast<std::int64_t>(product_planes.scale_plane);
+        epilogue.input_scale_divisor = down_input_scale_divisor;
+        epilogue.down_input_rows     = kIntermediate;
+    };
+    const auto run = [&](const auto& epilogue) {
+        launch_nvfp4_a4_mma<S>(nvfp4_a4_operands(weight, x_planes, tokens, Nvfp4ScaleLayout::RowMajor),
+                               LinearBf16Output{nullptr, kIntermediate}, epilogue, stream, SwiGluTokenMajorMmaRows<S>{},
+                               pdl::Dependency::Programmatic);
+    };
+    if (product_out == nullptr) {
+        if (lora != nullptr) {
+            throw std::invalid_argument("nvfp4 linear_swiglu A4 planes: an adapter needs the stored product");
+        }
+        SwiGluA4PlanesEpilogue<kNvfp4A4ResidualTerms> epilogue{};
+        fill(epilogue);
+        run(epilogue);
+        return;
+    }
+    SwiGluA4PlanesProductEpilogue<kNvfp4A4ResidualTerms> epilogue{};
+    fill(epilogue);
+    epilogue.product = product_out;
+    with_lora_epilogue(lora, epilogue, [&](auto e) { run(e); });
 }
 
 } // namespace
@@ -121,43 +141,45 @@ void launch_planes_gemm(const Weight& weight, Nvfp4A4Workspace x_planes, Nvfp4A4
 void nvfp4_linear_swiglu_a4_residual_planes_launch(const Weight& weight, Nvfp4A4Workspace x_planes,
                                                    Nvfp4A4Workspace product_planes,
                                                    float down_input_scale_divisor, std::int32_t tokens,
-                                                   cudaStream_t stream) {
+                                                   cudaStream_t stream, const LoraAddend* lora,
+                                                   void* product) {
+    auto* product_out = static_cast<__nv_bfloat16*>(product);
     if (x_planes.terms != kNvfp4A4ResidualTerms || product_planes.terms != kNvfp4A4ResidualTerms) {
         throw std::invalid_argument("nvfp4 linear_swiglu A4 residual planes: unexpected activation planes");
     }
     constexpr int Terms = kNvfp4A4ResidualTerms;
     if (tokens <= 16) {
         launch_planes_gemm<ResidualM16N64<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
-                                                  stream);
+                                                  stream, lora, product_out);
     } else if (tokens <= 32) {
         launch_planes_gemm<ResidualM32N64<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
-                                                  stream);
+                                                  stream, lora, product_out);
     } else if (tokens <= 64) {
         launch_planes_gemm<ResidualM64N128<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
-                                                   stream);
+                                                   stream, lora, product_out);
     } else if (tokens <= 96) {
         launch_planes_gemm<ResidualM96N128<Terms>>(weight, x_planes, product_planes, down_input_scale_divisor, tokens,
-                                                   stream);
+                                                   stream, lora, product_out);
     } else {
         throw std::invalid_argument("nvfp4 linear_swiglu A4 residual planes: at most 96 columns");
     }
 }
 
 void nvfp4_linear_swiglu_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                            WorkspaceArena& workspace, cudaStream_t stream) {
-    launch_residual<kNvfp4A4ResidualTerms>(x, weight, out, workspace, stream);
+                                            WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
+    launch_residual<kNvfp4A4ResidualTerms>(x, weight, out, workspace, stream, lora);
 }
 
 void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                   WorkspaceArena& workspace, cudaStream_t stream) {
+                                   WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[1] <= 32) {
-        launch<M32N64S3>(x, weight, out, workspace, stream);
+        launch<M32N64S3>(x, weight, out, workspace, stream, lora);
     } else if (x.ne[1] <= M64N64::kBlockTokens) {
-        launch<M64N64>(x, weight, out, workspace, stream);
+        launch<M64N64>(x, weight, out, workspace, stream, lora);
     } else if (x.ne[1] <= M96N128::kBlockTokens) {
-        launch<M96N128>(x, weight, out, workspace, stream);
+        launch<M96N128>(x, weight, out, workspace, stream, lora);
     } else {
-        launch<M128N128>(x, weight, out, workspace, stream);
+        launch<M128N128>(x, weight, out, workspace, stream, lora);
     }
 }
 

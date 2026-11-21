@@ -15,6 +15,7 @@ struct Options {
     bool help_requested = false;
 
     std::filesystem::path artifact_path;
+    std::filesystem::path lora_path; // --lora: EngineOptions::lora_path
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;

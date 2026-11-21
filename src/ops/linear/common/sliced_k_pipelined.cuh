@@ -30,6 +30,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/sliced_k_route.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -355,6 +356,12 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             cp_commit();
         }
     }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B rows and U columns into L2 while the K loop runs (full weights: every row is real).
+        lora_prefetch_tile(
+            epilogue.lora, R, [&](int i) { return row_policy.weight_row(row_begin, i); }, token_begin + token0,
+            min(tokens - token0, C), tid, Schedule::kThreads);
+    }
     int slot = 0;
 #pragma unroll 1
     for (int tile = 0; tile < tiles; ++tile) {
@@ -447,6 +454,72 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             }
         }
         __syncthreads();
+    }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: warp 0's reduced fragments plus the term (canonical chains, B by weight row), then the stores below.
+        if (warp == 0) {
+            float sums[MT][NT][4];
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    float4 sum;
+                    if constexpr (kPairwise) {
+                        sum = make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3]);
+                    } else {
+                        sum = load_vec<float4>(partial_at(0, mi, ni));
+                    }
+#pragma unroll
+                    for (int part = kPairwise ? 2 : 1; part < W; part += kPairwise ? 2 : 1) {
+                        const float4 value = load_vec<float4>(partial_at(part, mi, ni));
+                        sum.x += value.x;
+                        sum.y += value.y;
+                        sum.z += value.z;
+                        sum.w += value.w;
+                    }
+                    sums[mi][ni][0] = sum.x;
+                    sums[mi][ni][1] = sum.y;
+                    sums[mi][ni][2] = sum.z;
+                    sums[mi][ni][3] = sum.w;
+                }
+            }
+            const int slice_end = min(tokens, token0 + C);
+            lora_add_rows_tile<MT, NT>(
+                epilogue.lora, sums, [&](int mm, int i) { return row_policy.weight_row(row_begin, mm * 16 + i); },
+                [&](int mn, int j) {
+                    const int t = token0 + mn * 8 + j;
+                    return t < slice_end ? token_begin + t : -1;
+                });
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const float4 sum    = make_float4(sums[mi][ni][0], sums[mi][ni][1], sums[mi][ni][2], sums[mi][ni][3]);
+                    const int top_row   = sliced_k_output_row(row_policy, row_begin, mi * 16 + gid);
+                    const int t0        = token0 + ni * 8 + 2 * lid;
+                    const int token_end = token_begin + slice_end;
+                    if constexpr (requires {
+                                      epilogue.store_fragment(output, top_row, token_begin + t0, sum, operands.rows,
+                                                              token_end);
+                                  }) {
+                        epilogue.store_fragment(output, top_row, token_begin + t0, sum, operands.rows, token_end);
+                    } else {
+                        const int bottom_row = sliced_k_output_row(row_policy, row_begin, mi * 16 + gid + 8);
+                        const auto store     = [&](int row, int token, float value) {
+                            if (token - token0 < C && token < tokens) {
+                                const int global_token = token_begin + token;
+                                output.store(row, global_token, epilogue.apply(row, global_token, value));
+                            }
+                        };
+                        store(top_row, t0, sum.x);
+                        store(top_row, t0 + 1, sum.y);
+                        store(bottom_row, t0, sum.z);
+                        store(bottom_row, t0 + 1, sum.w);
+                    }
+                }
+            }
+        }
+        return;
     }
     if (warp == 0) {
 #pragma unroll

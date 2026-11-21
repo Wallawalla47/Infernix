@@ -54,6 +54,7 @@ struct Options {
     std::optional<std::filesystem::path> save_tokens;
     std::optional<std::filesystem::path> kl_reference;
     std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
+    std::filesystem::path lora;          // --lora: EngineOptions::lora_path
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -88,6 +89,8 @@ std::string usage_text() {
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
+           "       [--lora PATH] (Qwen3.5 dense: a LoRA adapter applied at runtime, a Hugging Face PEFT\n"
+           "        adapter directory or its adapter_model.safetensors with adapter_config.json beside it)\n"
            "       [--lossless] (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next: the quality reference's\n"
            "        route, every operation of the model correctly rounded; no fast path, one\n"
            "        pass per window: give --prefill-chunk the context; logits as --logits-dtype)\n"
@@ -182,6 +185,8 @@ Options parse_options(int argc, char** argv) {
             out.a8_activations = true;
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
+        } else if (option == "--lora") {
+            out.lora = std::filesystem::path(value("--lora"));
         } else if (option == "--reproducible") {
             out.fast_paths = false;
         } else if (option == "--fast-path") {
@@ -332,6 +337,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     const Clock::time_point total_started = Clock::now();
     infernix::EngineOptions engine_options;
     engine_options.artifact_path    = options.artifact;
+    engine_options.lora_path        = options.lora;
     engine_options.purpose          = infernix::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
@@ -638,6 +644,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"expert_a4_activations", options.expert_a4_activations},
           {"expert_a16_activations", options.expert_a16_activations},
           {"a8_activations", options.a8_activations},
+          {"lora_adapter", load.lora_adapter.empty() ? nlohmann::json(nullptr) : nlohmann::json(load.lora_adapter)},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},

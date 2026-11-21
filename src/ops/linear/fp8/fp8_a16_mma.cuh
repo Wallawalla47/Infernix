@@ -15,6 +15,7 @@
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/fp8/fp8_operands.h"
 #include "ops/linear/fp8/fp8_shared.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -198,6 +199,44 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
     }
 
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        const auto row_of = [&](int mi, int i) { return row_policy.weight_row(row_begin, wm * WM + mi * 16 + i, M); };
+        const auto token_of = [&](int ni, int j) {
+            const int token = token_begin + wn * WN + ni * 8 + j;
+            return token < tokens ? token : -1;
+        };
+        float scales[MT][2];
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            scales[mi][0] = fp8_widen(__ldg(row_scales + row_of(mi, gid)));
+            scales[mi][1] = fp8_widen(__ldg(row_scales + row_of(mi, gid + 8)));
+        }
+        const auto destination = linear_output_tile<BM / (RowPolicy::kPaired ? 2 : 1)>(output, row_begin);
+        if constexpr (requires {
+                          epilogue.template finish_tile<Schedule, FullTokens>(
+                              destination, shared_raw, accumulators, row_begin, token_begin, M, tokens);
+                      }) {
+            // Gate and up (the SwiGLU tile epilogue): the scaled values (one rounded multiply by the row scale,
+            // the SwiGLU's own product) and the term, then the fused operation.
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        accumulators[mi][ni][e] = __fmul_rn(accumulators[mi][ni][e], scales[mi][e >> 1]);
+            lora_add_rows_tile<MT, NT>(epilogue.lora, accumulators, row_of, token_of);
+            epilogue.template finish_tile<Schedule, FullTokens>(destination, shared_raw, accumulators, row_begin,
+                                                                token_begin, M, tokens);
+        } else {
+            static_assert(!RowPolicy::kPaired, "paired rows require a collective epilogue");
+            // The epilogue on the kernel's own v * scale (its residual add may fuse the product), then the term.
+            lora_finish_rows_tile<MT, NT>(epilogue, accumulators, row_of, token_of,
+                                          [&](int mi, int e, float v) { return v * scales[mi][e >> 1]; });
+            lora_store_rows_tile<MT, NT>(destination, accumulators, row_of, token_of);
+        }
+        return;
+    }
     const auto destination =
         linear_output_tile<BM / (RowPolicy::kPaired ? 2 : 1)>(output, row_begin);
     if constexpr (requires {

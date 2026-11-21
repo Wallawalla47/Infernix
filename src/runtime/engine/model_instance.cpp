@@ -60,6 +60,14 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (!options.lora_path.empty()) {
+        if (architecture == models::Architecture::Qwen4Exp) {
+            throw std::invalid_argument("--lora adapts dense Qwen3.5 models; Qwen3.8-Flash-Next is a mixture of experts");
+        }
+        if (offloaded_experts) {
+            throw std::invalid_argument("--lora adapts dense Qwen3.5 models; this artifact's experts are offloaded");
+        }
+    }
     // An automatic context takes all the VRAM the KV pool may have: offloaded experts size their cache from what
     // the fixed allocations leave, so it would starve the expert cache.
     if (options.max_context_auto) {
@@ -240,6 +248,22 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
     // The 8-bit activation routes change the KV and state their calls write (decode, short and prefill calls).
     if (options.a8_activations) { out += ";a8"; }
+    // A LoRA adapter changes every adapted projection: its weights file and configuration name it as the artifact's
+    // path, size and time do.
+    if (!options.lora_path.empty()) {
+        const std::filesystem::path weights = std::filesystem::is_directory(options.lora_path, error)
+                                                  ? options.lora_path / "adapter_model.safetensors"
+                                                  : options.lora_path;
+        const std::filesystem::path config = weights.parent_path() / "adapter_config.json";
+        const auto stamp = [&](const std::filesystem::path& file) {
+            std::error_code e;
+            const auto bytes = std::filesystem::file_size(file, e);
+            const auto when  = std::filesystem::last_write_time(file, e);
+            return std::filesystem::absolute(file).string() + ":" + std::to_string(e ? 0U : bytes) + ":" +
+                   std::to_string(e ? 0 : when.time_since_epoch().count());
+        };
+        out += ";lora=" + stamp(weights) + "|" + stamp(config);
+    }
     // Tail skip leaves experts out of decode and verification rounds, so the KV and state those rounds wrote
     // (endpoints, continued turns) differ from what a run without it computes, and the reverse.
     if (options.expert_tail_skip != 0) { out += ";tail_skip=" + std::to_string(options.expert_tail_skip); }
@@ -391,7 +415,7 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
     vram.workspace_bytes       = sequence.workspace_capacity_bytes();
     vram.graph_allowance_bytes = sequence.graph_allowance_bytes();
     const std::uint64_t reservation = resolution.runtime_reservation_bytes;
-    vram.planned_bytes              = vram.weights_bytes + reservation;
+    vram.planned_bytes              = vram.weights_bytes + planned_beside_weights_bytes(vram) + reservation;
     std::uint64_t used              = reservation + vram.headroom_bytes;
     if (options.context_cache.enabled) {
         plan.ram.host_context_bytes = sequence.host_capacity_bytes();
@@ -1197,13 +1221,33 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     // slowing every proposal round.
     if (spill) { spill->begin(); }
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    // The adapter's VRAM as allocated (or, for Engine::plan, as it would be): the lossless route's layout is larger.
+    if (const auto* lora = instance->model->lora()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "LoRA adapter %s: %s; %llu MiB of VRAM",
+                           lora->adapter->weights_path().parent_path().string().c_str(), lora->describe().c_str(),
+                           static_cast<unsigned long long>((instance->parameters.lora_bytes() + (1U << 20) - 1) >> 20));
+    }
     if (spill) {
-        const std::uint64_t screen_bytes = instance->parameters.draft_screen.bytes;
-        if (const std::uint64_t spilled = screen_bytes != 0 ? spill->end(screen_bytes, 0) : 0; spilled != 0) {
-            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of the DFlash2 draft screen (" +
-                                     std::to_string(screen_bytes >> 20) +
+        const std::uint64_t screen = instance->parameters.draft_screen.bytes;
+        const std::uint64_t lora   = instance->parameters.lora_factors.bytes;
+        const std::uint64_t beside = screen + lora;
+        if (const std::uint64_t spilled = beside != 0 ? spill->end(beside, 0) : 0; spilled != 0) {
+            const char* what = screen != 0 && lora != 0 ? "the DFlash2 draft screen and the LoRA adapter's factors"
+                               : screen != 0           ? "the DFlash2 draft screen"
+                                                       : "the LoRA adapter's factors";
+            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of " + what + " (" +
+                                     std::to_string(beside >> 20) +
                                      " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
-                                     "VRAM and start again (" + spill->readings(screen_bytes) + ")");
+                                     "VRAM and start again (" + spill->readings(beside) + ")");
+        }
+    }
+    // Engine::plan: the device memory beside the weights' arena the Parameters plan (planned_bytes counts it).
+    if (planned != nullptr) {
+        if (const std::uint64_t screen = instance->parameters.draft_screen_bytes(); screen != 0) {
+            planned->vram.draft_screen_bytes = screen;
+        }
+        if (const std::uint64_t adapter = instance->parameters.lora_bytes(); adapter != 0) {
+            planned->vram.adapter_bytes = adapter;
         }
     }
     frontend.complete();
@@ -1285,7 +1329,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             vram_now, !expert_ram && kv_policy.mode == KvCapacityMode::Automatic, sizing_headroom, retry_headroom);
         std::size_t free_bytes =
             plan_only ? planned_free_after_weights(sizing_now, planned_weights,
-                                                   planned_beside_weights + instance->parameters.planned_device_bytes)
+                                                   planned_beside_weights + instance->parameters.draft_screen_bytes() +
+                                                       instance->parameters.lora_bytes())
                       : sizing_now;
         // Other processes' VRAM by NVML, which counts every process (the OS budget does not): its device-wide use
         // less this process's; 0 without NVML. On the RTX 5090 it read ~200 MiB on a quiet card (the desktop
@@ -1583,6 +1628,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;
+    if (const auto* lora = instance->model->lora()) {
+        summary.lora_adapter = lora->adapter->weights_path().parent_path().string() + ": " + lora->describe();
+    }
     summary.prefill_signature = signature;
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {

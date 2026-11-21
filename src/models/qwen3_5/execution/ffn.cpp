@@ -4,6 +4,7 @@
 #include "infernix/ops/linear.h"
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
+#include "infernix/ops/lora.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/projection_fp32.h"
 #include "infernix/ops/residual_add.h"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 
@@ -136,11 +138,14 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         }
     } else {
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
+        // --lora: the gate/up input's U, then the down input's (ffn below allocates them in this order).
+        if (p.lora_gate_up) { (void)layout.alloc(DType::BF16, {p.lora_gate_up->a.rows, last}); }
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
                 gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last, gate_up_routes));
         }
+        if (p.lora_down) { (void)layout.alloc(DType::BF16, {p.lora_down->a.rows, last}); }
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
@@ -158,7 +163,9 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     const bool fused_prompt = ops::dense_mlp_fused_rmsnorm_nvfp4_eligible(gu, p.gate_up.policy, down, down_policy, last);
     if (!mtp && (fused_rounds || fused_prompt)) {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(fused_prompt ? last : rounds_last));
+        (void)layout.alloc_bytes(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(
+            fused_prompt ? last : rounds_last, p.lora_gate_up ? p.lora_gate_up->a.rows : 0,
+            p.lora_down ? p.lora_down->a.rows : 0));
     }
     return layout.peak_bytes(1);
 }
@@ -172,8 +179,10 @@ bool fused_dense_mlp(Tensor& residual, const Tensor& norm_weight, float eps, con
                                                      down_policy, residual.ne[1])) {
         return false;
     }
+    // --lora: the fused form takes each projection's term (the same bits as the separate Ops with theirs).
     ops::dense_mlp_fused_rmsnorm_nvfp4(residual, norm_weight, eps, p->gate_up.weight, p->down.weight, down_policy,
-                                       workspace, stream);
+                                       workspace, stream, p->lora_gate_up ? &*p->lora_gate_up : nullptr,
+                                       p->lora_down ? &*p->lora_down : nullptr);
     return true;
 }
 
@@ -224,14 +233,28 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         return;
     }
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
+    // --lora: each projection's term over U = A x of its own input (ffn_workspace_bytes mirrors the allocations).
+    std::optional<ops::LoraAddend> gate_up_lora, down_lora;
+    if (p.lora_gate_up) {
+        Tensor u = workspace.alloc(DType::BF16, {p.lora_gate_up->a.rows, columns});
+        ops::lora_shrink(hidden, p.lora_gate_up->a, u, stream);
+        gate_up_lora    = p.lora_gate_up->addend;
+        gate_up_lora->u = u.data;
+    }
     {
         auto call = workspace.scope();
         ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream,
-                           gate_up_routes);
+                           gate_up_routes, gate_up_lora ? &*gate_up_lora : nullptr);
+    }
+    if (p.lora_down) {
+        Tensor u = workspace.alloc(DType::BF16, {p.lora_down->a.rows, columns});
+        ops::lora_shrink(activation, p.lora_down->a, u, stream);
+        down_lora    = p.lora_down->addend;
+        down_lora->u = u.data;
     }
     ops::linear_add(activation, down, residual,
                     residual_projection_policy(p.down, wide_verification), workspace, stream,
-                    down_routes);
+                    down_routes, down_lora ? &*down_lora : nullptr);
 }
 
 } // namespace infernix::models::qwen3_5::execution

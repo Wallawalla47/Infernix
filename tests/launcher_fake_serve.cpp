@@ -129,6 +129,7 @@ struct State {
     bool stalled = false;
     bool experts = false;
     bool memory  = true; // --fake-no-memory: an older server without the memory breakdown
+    bool lora    = false; // --lora: a rank-32 adapter's factors on the device
     std::uint64_t next_id        = 1;
     std::uint64_t completed      = 0;
     std::uint64_t prefill_tokens = 0;
@@ -237,6 +238,8 @@ Json memory_json() {
                     filled("kv_cache", 2 * kGiB, held * 32768), part("state", 680 * kMiB),
                     filled("prefix_cache", 256 * kMiB, g_state.completed * 24 * kMiB), part("workspace", 1500000000ull),
                     part("cuda_graphs", 530000000ull), part("staging", 64 * kMiB)};
+        // A dense model's adapter, after the drafter (the server omits a part that holds nothing).
+        if (g_state.lora) { device.insert(device.begin() + 2, part("adapter", 304 * kMiB)); }
         ram_others = 18 * kGiB;
         host       = {part("weights", 910 * kMiB), filled("prefix_cache", 4 * kGiB, computed * 24576), part("staging", 288 * kMiB)};
     }
@@ -645,6 +648,7 @@ void print_help() {
         "  --host-context-mib N|auto  pinned Host pool\n"
         "  --expert-state FILE|off    expert cache state\n"
         "  --vision                   load the vision tower\n"
+        "  --lora PATH                a LoRA adapter (its factors: 304 MiB of VRAM)\n"
         "FAKE\n"
         "  --fake-load-ms N           loading time\n"
         "  --fake-fail-load TEXT      fail the load\n"
@@ -665,7 +669,8 @@ int write_plan(const std::string& file, std::uint64_t context) {
     const std::uint64_t max_context = (free_bytes - weights - headroom - 2030000000ull) / 33792ull / 4096 * 4096;
     if (context == 0) { context = max_context; }
     const std::uint64_t minimum    = 2030000000ull + context * 33792ull;
-    const std::uint64_t planned    = weights + minimum + headroom;
+    const std::uint64_t adapter    = g_state.lora ? 318767104ull : 0ull;
+    const std::uint64_t planned    = weights + adapter + minimum + headroom;
     const bool fits                = planned <= free_bytes;
     const Json plan = {
         {"schema", 1},
@@ -689,6 +694,8 @@ int write_plan(const std::string& file, std::uint64_t context) {
           {"graph_allowance_bytes", 530000000ull},
           {"expert_cache_bytes", nullptr},
           {"expert_frames", nullptr},
+          {"draft_screen_bytes", nullptr},
+          {"adapter_bytes", g_state.lora ? Json(adapter) : Json(nullptr)},
           {"headroom_bytes", headroom},
           {"planned_bytes", planned},
           {"left_bytes", fits ? free_bytes - planned : 0}}},
@@ -759,6 +766,9 @@ int main(int argc, char** argv) {
             g_state.experts = true;
         } else if (arg == "--fake-no-memory") {
             g_state.memory = false;
+        } else if (arg == "--lora") {
+            (void)value();
+            g_state.lora = true;
         } else if (arg == "--log-level") {
             const std::string level = value();
             g_info_logged = level == "trace" || level == "debug" || level == "info";

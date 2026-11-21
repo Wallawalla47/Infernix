@@ -123,6 +123,8 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
                        {"available", bytes(gpu, "free_bytes")},
                        {"planned", bytes(vram, "planned_bytes")},
                        {"parts", parts(vram, {{"weights_bytes", "Weights"},
+                                              {"draft_screen_bytes", "Draft screen"},
+                                              {"adapter_bytes", "LoRA adapter"},
                                               {"kv_bytes", "KV cache"},
                                               {"workspace_bytes", "Workspace"},
                                               {"graph_allowance_bytes", "CUDA graphs"},
@@ -226,7 +228,7 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
     } else if (serve.error) {
         warnings.push_back(*serve.error);
     }
-    for (const char* flag : {"--draft-model", "--ngram-volume", "--chat-template", "--expert-stripe",
+    for (const char* flag : {"--draft-model", "--ngram-volume", "--chat-template", "--expert-stripe", "--lora",
                              "--context-cost-presets"}) {
         if (const std::optional<std::string> value = flag_value(args, flag)) {
             std::error_code error;
@@ -267,6 +269,9 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
         warnings.push_back(model.family_label +
                            " needs an n-gram volume (--ngram-volume): none was found in the model folders; download one "
                            "in Discover");
+    }
+    if (has_flag(args, "--lora") && (model.needs_ngram_volume || model.num_experts.has_value())) {
+        warnings.push_back("--lora adapts dense Qwen3.5 models (the 27B) only; this model's MLPs are experts");
     }
     if (has_flag(args, "--draft-model") && !model.accepts_draft_model) {
         warnings.push_back("--draft-model applies to Qwen3.8-Flash-Next only; this artifact bundles its drafters");

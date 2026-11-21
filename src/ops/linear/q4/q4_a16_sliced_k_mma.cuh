@@ -3,6 +3,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 
@@ -41,7 +42,9 @@ __device__ __forceinline__ int q4_sliced_k_swizzle(int row, int col) {
 
 template <class Schedule, bool Full, bool FullTokens, class Output, class Epilogue, class RowPolicy>
 __global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sliced_k_mma_kernel(
+__launch_bounds__(Schedule::kThreads,
+                  lora_launch_min_blocks<Epilogue>(Schedule::kThreads, Schedule::kMinBlocksPerSm)) void
+q4_a16_sliced_k_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, int rows, int k,
     int tokens, int padded_k, int token_begin, RowPolicy row_policy) {
@@ -139,6 +142,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sli
         else
             cp_commit();
     }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B rows and U columns into L2 while the K loop runs.
+        lora_prefetch_tile(
+            epilogue.lora, R,
+            [&](int i) {
+                const int r = row_policy.weight_row(row_begin, i);
+                return r < rows ? r : rows - 1;
+            },
+            token_begin + token0, min(tokens - token0, Schedule::kTokenCapacity), tid, Schedule::kThreads);
+    }
     constexpr int kUnroll = Schedule::kStaticK ? (Schedule::kStaticK / 64 + W - 1) / W : 1;
 #pragma unroll kUnroll
     for (int tile = 0; tile < tiles; ++tile) {
@@ -232,6 +245,69 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sli
             }
         }
         __syncthreads();
+    }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: the reduced fragments plus their terms (canonical chains), one fragment a warp in turn, so the
+        // term's registers are one fragment's and the warps share the work. A fragment's sum adds the K warps'
+        // partials in the order the no-adapter path below adds them.
+        if constexpr (kPairwise) {
+            // Warp 0 holds its pair's sum in registers; the fragments' owners read it here.
+            if (warp == 0) {
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                    for (int ni = 0; ni < NT; ++ni) {
+                        store_vec(shared.partial[0][mi][ni][lane],
+                                  make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3]));
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        const int slice_end = min(tokens, token0 + Schedule::kTokenCapacity);
+        for (int fragment = warp; fragment < MT * NT; fragment += W) {
+            const int mi = fragment / NT, ni = fragment % NT;
+            float4 sum   = load_vec<float4>(shared.partial[0][mi][ni][lane]);
+#pragma unroll
+            for (int part = kPairwise ? 2 : 1; part < W; part += kPairwise ? 2 : 1) {
+                const float4 value = load_vec<float4>(shared.partial[part][mi][ni][lane]);
+                sum.x += value.x;
+                sum.y += value.y;
+                sum.z += value.z;
+                sum.w += value.w;
+            }
+            float sums[1][1][4] = {{{sum.x, sum.y, sum.z, sum.w}}};
+            lora_add_rows_tile<1, 1>(
+                epilogue.lora, sums,
+                [&](int, int i) {
+                    const int r = row_policy.weight_row(row_begin, mi * 16 + i);
+                    return r < rows ? r : rows - 1;
+                },
+                [&](int, int j) {
+                    const int t = token0 + ni * 8 + j;
+                    return t < slice_end ? token_begin + t : -1;
+                });
+            sum                 = make_float4(sums[0][0][0], sums[0][0][1], sums[0][0][2], sums[0][0][3]);
+            const int r0        = row_begin + mi * 16 + gid;
+            const int t0        = token0 + ni * 8 + 2 * lid;
+            const int token_end = token_begin + slice_end;
+            if constexpr (requires { epilogue.store_fragment(output, r0, token_begin + t0, sum, rows, token_end); }) {
+                epilogue.store_fragment(output, r0, token_begin + t0, sum, rows, token_end);
+            } else {
+                const auto store = [&](int row, int token, float value) {
+                    if (token - token0 < Schedule::kTokenCapacity && (Full || row < rows) &&
+                        (FullTokens || token < tokens)) {
+                        const int global_token = token_begin + token;
+                        output.store(row, global_token, epilogue.apply(row, global_token, value));
+                    }
+                };
+                store(r0, t0, sum.x);
+                store(r0, t0 + 1, sum.y);
+                store(r0 + 8, t0, sum.z);
+                store(r0 + 8, t0 + 1, sum.w);
+            }
+        }
+        return;
     }
     if (warp == 0) {
 #pragma unroll

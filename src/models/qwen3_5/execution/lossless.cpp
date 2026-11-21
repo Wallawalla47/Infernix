@@ -2,6 +2,7 @@
 
 #include "infernix/ops/linear.h"
 #include "infernix/ops/lossless_linear.h"
+#include "infernix/ops/lossless_lora.h"
 #include "infernix/ops/lossless_ops.h"
 #include "infernix/ops/lossless_quantize.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
@@ -122,6 +123,46 @@ void grouped(A& a, const Tensor& x, const Weight& w, const Tensor& tiles, std::i
     }
 }
 
+// --lora (lossless-route.md §2, LoRA adapter): the site's u = fp32(A x), then each adapted segment's rows of its
+// output take PEFT's term. targets[s] is segment s's output tensor and its first row there.
+struct LoraTarget {
+    Tensor* out;
+    std::int32_t row;
+};
+
+template <class A>
+void lora_terms(A& a, const LosslessLoraSite& site, const Tensor& x, std::initializer_list<LoraTarget> targets,
+                cudaStream_t s) {
+    if (site.segments != static_cast<std::int32_t>(targets.size())) {
+        throw std::logic_error("--lora --lossless: a site's segments do not match its outputs");
+    }
+    const std::int32_t T = x.ne[1];
+    auto scope           = a.scope();
+    Tensor u             = alloc(a, DType::FP32, {site.a_rows, T});
+    if constexpr (kRuns<A>) {
+        ops::lossless_lora_shrink(x, site.a3, site.a_rows, u, a, s);
+    } else {
+        auto inner = a.scope();
+        (void)a.alloc_bytes(ops::lossless_lora_shrink_workspace_bytes(site.a_rows, x.ne[0], T));
+    }
+    std::int32_t begin = 0;
+    int index          = 0;
+    for (const LoraTarget& target : targets) {
+        const ops::LoraSegment& segment = site.segment[static_cast<std::size_t>(index++)];
+        const std::int32_t rows         = segment.row_end - begin;
+        if (segment.u_offset >= 0) {
+            if constexpr (kRuns<A>) {
+                ops::lossless_lora_add(*target.out, target.row, site.b + static_cast<std::int64_t>(begin) * site.rank,
+                                       rows, site.rank, u, segment.u_offset, segment.scale, a, s);
+            } else {
+                auto inner = a.scope();
+                (void)a.alloc_bytes(ops::lossless_lora_add_workspace_bytes(rows, site.rank, T));
+            }
+        }
+        begin = segment.row_end;
+    }
+}
+
 template <class A>
 void attention_layer(A& a, const BlockParameters& block, const TextConfig& config, const Tensor& rope_table,
                      Tensor& x, cudaStream_t s, const LosslessCache* cache, const LosslessDesign& design) {
@@ -151,6 +192,8 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
         shared(a, hq.x, {{&w, 0, Q, &q, 0}, {&w, Q, K, &k, 0}, {&w, Q + K, Q, &gate, 0}, {&w, 2 * Q + K, K, &v, 0}}, s,
                hq.scale);
     }
+    // --lora: q_proj (query and gate rows), k_proj and v_proj read h (unquantized, as PEFT's lora_A reads x).
+    if (p.lossless_lora_input) { lora_terms(a, *p.lossless_lora_input, h, {{&q, 0}, {&k, 0}, {&gate, 0}, {&v, 0}}, s); }
     Tensor q3 = q.view({D, heads, T}), k3 = k.view({D, kv_heads, T}), v3 = v.view({D, kv_heads, T});
     Tensor o = alloc(a, DType::BF16, {D, heads, T});
     // The design reference with a coded KV format: K and V through its production encoder, attention over the
@@ -189,6 +232,7 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
     Tensor flat = o.view({Q, T});
     const Quantized oq = quantize(a, design_step(design, p.output), flat, p.output.weight, s);
     linear(a, oq.x, p.output.weight, 0, H, y, 0, s, oq.scale);
+    if (p.lossless_lora_output) { lora_terms(a, *p.lossless_lora_output, flat, {{&y, 0}}, s); }
     if constexpr (kRuns<A>) { ops::lossless_add(x, y, x, s); }
 }
 
@@ -293,10 +337,13 @@ void dense_mlp(A& a, const DenseParameters& p, const Tensor& h, Tensor& x, cudaS
         Tensor g = alloc(a, DType::BF16, {I, n}), u = alloc(a, DType::BF16, {I, n});
         const Quantized hq = quantize(a, design_step(design, p.gate_up), hc, p.gate_up.weight, s);
         shared(a, hq.x, {{&p.gate_up.weight, 0, I, &g, 0}, {&p.gate_up.weight, I, I, &u, 0}}, s, hq.scale);
+        // --lora: gate_proj and up_proj read hc, down_proj the SwiGLU product (each unquantized).
+        if (p.lossless_lora_gate_up) { lora_terms(a, *p.lossless_lora_gate_up, hc, {{&g, 0}, {&u, 0}}, s); }
         if constexpr (kRuns<A>) { ops::lossless_silu_mul(g, u, g, s); }
         Tensor d = alloc(a, DType::BF16, {H, n});
         const Quantized gq = quantize(a, design_step(design, p.down), g, p.down.weight, s);
         linear(a, gq.x, p.down.weight, 0, H, d, 0, s, gq.scale);
+        if (p.lossless_lora_down) { lora_terms(a, *p.lossless_lora_down, g, {{&d, 0}}, s); }
         if constexpr (kRuns<A>) {
             Tensor xc = x.slice(1, c0, n);
             ops::lossless_add(xc, d, xc, s);

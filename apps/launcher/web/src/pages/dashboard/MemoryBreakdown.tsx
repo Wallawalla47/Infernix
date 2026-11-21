@@ -30,7 +30,7 @@ interface KeySpec {
 
 // The bars' order: the contract's keys, but with the KV cache beside the prefix cache. The two trade
 // pages with every request (the prefix cache gives up what a growing KV cache takes), so beside each
-// other only their shared boundary moves and the other parts keep their places. Eleven keys share
+// other only their shared boundary moves and the other parts keep their places. Twelve keys share
 // eight hues: the slots were chosen so that neighbours in realistic bars (with or without a drafter,
 // experts, device prefix slots, CUDA graphs) stay apart for normal and colour-blind vision in both
 // themes (model state and the KV cache swapped hues when they swapped places, so the bar's run of
@@ -47,6 +47,13 @@ const KEYS: Record<MemoryPartKey, KeySpec> = {
     },
   },
   drafter: { label: "Drafter", slot: 3, what: { device: "The speculative drafter's weights and buffers (MTP, DFlash or DFlash2)." } },
+  // A dense model's adapter takes the experts' place and hue: --lora refuses mixture-of-experts models, so the two
+  // never share a bar.
+  adapter: {
+    label: "LoRA adapter",
+    slot: 5,
+    what: { device: "The LoRA adapter's factors (--lora), applied to the model's projections at runtime." },
+  },
   experts: {
     label: "Experts",
     slot: 5,

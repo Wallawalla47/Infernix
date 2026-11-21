@@ -9,6 +9,7 @@
 // reduction, and calls wider than 16 columns run 16-column token tiles.
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/linear/q5/q5_sliced_k_launch.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <stdexcept>
 
@@ -20,24 +21,26 @@ using KSplitSchedule = Q5A16SlicedKMmaSchedule<16, Capacity, 8, 2, Cache::cg, Ca
                                                Capacity, Q5SlicedKReduction::Pairwise>;
 
 template <int Capacity>
-void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream,
+                   const LoraAddend* lora) {
     auto* data        = static_cast<__nv_bfloat16*>(residual.data);
     const auto stride = std::int64_t(residual.nb[1] / sizeof(__nv_bfloat16));
-    launch_q5_a16_sliced_k_pipelined<KSplitSchedule<Capacity>>(
-        q5_linear_operands(x, w), LinearBf16StridedOutput{data, stride, 0},
-        LinearResidualAddEpilogue{{data, stride, 0}}, stream);
+    with_lora_epilogue(lora, LinearResidualAddEpilogue{{data, stride, 0}}, [&](auto epilogue) {
+        launch_q5_a16_sliced_k_pipelined<KSplitSchedule<Capacity>>(
+            q5_linear_operands(x, w), LinearBf16StridedOutput{data, stride, 0}, epilogue, stream);
+    });
 }
 
 } // namespace
 
 void q5_linear_add_ksplit_launch(const Tensor& x, const Weight& w, Tensor& residual,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, const LoraAddend* lora) {
     const std::int32_t cols = x.ne[1];
     if (cols < 1) { throw std::invalid_argument("q5 linear_add K-split requires T >= 1"); }
     if (cols <= 8) {
-        launch_ksplit<8>(x, w, residual, stream);
+        launch_ksplit<8>(x, w, residual, stream, lora);
     } else {
-        launch_ksplit<16>(x, w, residual, stream);
+        launch_ksplit<16>(x, w, residual, stream, lora);
     }
 }
 

@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <cstdint>
 
@@ -22,38 +23,33 @@ using GateUpRingCfg = RowSplitRingTile128;
 inline constexpr int kGateUpRingStages        = kRowSplitRingStages;
 inline constexpr int kGateUpRingProducerWarps = kRowSplitRingProducerWarps;
 
+// `lora` below: the call's term over its columns (a slice takes it from the slice's first column), or null.
 template <class Cfg, bool Full>
-void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream, const LoraAddend* lora,
+                   std::int32_t first_column) {
     constexpr int PM = Cfg::BM / 2;
     const int t      = x.ne[1];
     const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], PM)),
                     static_cast<unsigned>(div_up(t, Cfg::BN)));
-    if constexpr (Full) {
-        q4_linear_swiglu_mma_split_half_pair_kernel<Cfg, true><<<grid, Cfg::THREADS, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
-            out.ne[0], x.ne[0], t, weight.padded_shape[1]);
-    } else {
-        q4_linear_swiglu_mma_split_half_pair_kernel<Cfg, false><<<grid, Cfg::THREADS, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
-            out.ne[0], x.ne[0], t, weight.padded_shape[1]);
-    }
+    with_lora_term(lora, first_column, [&](auto term) {
+        q4_linear_swiglu_mma_split_half_pair_kernel<Cfg, Full, decltype(term)><<<grid, Cfg::THREADS, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data), out.ne[0],
+            x.ne[0], t, weight.padded_shape[1], term);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Cfg>
-void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream, const LoraAddend* lora) {
     const bool full = (x.ne[1] % Cfg::BN) == 0;
     for_each_token_slice(x.ne[1], Cfg::BN, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor out_slice     = out.slice(1, offset, count);
         if (full) {
-            launch_folded<Cfg, true>(x_slice, weight, out_slice, stream);
+            launch_folded<Cfg, true>(x_slice, weight, out_slice, stream, lora, offset);
         } else {
-            launch_folded<Cfg, false>(x_slice, weight, out_slice, stream);
+            launch_folded<Cfg, false>(x_slice, weight, out_slice, stream, lora, offset);
         }
     });
 }
@@ -61,7 +57,7 @@ void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 // The ring kernel on Cfg's tile with `Stages` stages and `ProducerWarps` producer warps. A full launch reads no
 // bounds: whole column tiles, whole row tiles and no K padding.
 template <class Cfg, int Stages, int ProducerWarps>
-void launch_ring(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_ring(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream, const LoraAddend* lora) {
     using Layout    = RowSplitRing<Cfg, Stages, ProducerWarps>;
     const bool full = (x.ne[1] % Cfg::BN) == 0 && (out.ne[0] % (Cfg::BM / 2)) == 0 &&
                       x.ne[0] == weight.padded_shape[1];
@@ -70,24 +66,27 @@ void launch_ring(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
         Tensor out_slice     = out.slice(1, offset, count);
         const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], Cfg::BM / 2)),
                         static_cast<unsigned>(div_up(count, Cfg::BN)));
-        const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = q4_linear_swiglu_ring_kernel<Cfg, Stages, ProducerWarps, Full>;
-            kernel<<<grid, Layout::kThreads, reserve_dynamic_shared<kernel, Layout::kSharedBytes>(), stream>>>(
-                static_cast<const __nv_bfloat16*>(x_slice.data), static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out_slice.data),
-                out.ne[0], x.ne[0], count, weight.padded_shape[1]);
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (full) {
-            launch.template operator()<true>();
-        } else {
-            launch.template operator()<false>();
-        }
+        with_lora_term(lora, offset, [&](auto term) {
+            const auto launch = [&]<bool Full>() {
+                constexpr auto kernel = q4_linear_swiglu_ring_kernel<Cfg, Stages, ProducerWarps, Full, decltype(term)>;
+                kernel<<<grid, Layout::kThreads, reserve_dynamic_shared<kernel, Layout::kSharedBytes>(), stream>>>(
+                    static_cast<const __nv_bfloat16*>(x_slice.data), static_cast<const std::uint8_t*>(weight.qdata),
+                    static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out_slice.data),
+                    out.ne[0], x.ne[0], count, weight.padded_shape[1], term);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (full) {
+                launch.template operator()<true>();
+            } else {
+                launch.template operator()<false>();
+            }
+        });
     });
 }
 
 // Whole and partly filled ring tiles only.
-void launch_ring_tiles(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_ring_tiles(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream,
+                       const LoraAddend* lora) {
     // RTX 5090, q4_linear_swiglu_bench ([34816, 5120], CUDA graph, cold L2, A B B A, the same output hashes at
     // every width), against the 64-row plain tiles this route ran before (2026-11-10): 136 columns -10.7 %, 160
     // -8.4 %, 225 -5.5 %, 256 -5.5 %, 400 -8.1 %, 512 -8.5 %, 768 -12.7 %, 896 -10.1 %, 1,000 -14.3 %, 1,024 -13.2 %,
@@ -95,13 +94,13 @@ void launch_ring_tiles(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     // 1,024-2,048 against 194). A 64-row ring tile (two CTAs an SM) measured -8.0 % at 256 columns and less than
     // this one everywhere else; the plain kernel on a 128-row tile, a one-barrier pipelined form of it and a ring
     // whose consumers looked their weights up in a table a row all measured slower than this.
-    launch_ring<GateUpRingCfg, kGateUpRingStages, kGateUpRingProducerWarps>(x, weight, out, stream);
+    launch_ring<GateUpRingCfg, kGateUpRingStages, kGateUpRingProducerWarps>(x, weight, out, stream, lora);
 }
 
 } // namespace
 
 void q4_linear_swiglu_mma_ring_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                               cudaStream_t stream) {
+                                               cudaStream_t stream, const LoraAddend* lora) {
     // The ring tile is 128 columns wide and a ring CTA decodes its rows' weights however few of its columns are
     // live, so a column tile holding a short remainder costs a whole tile: one or two more waves of the launch
     // (272 row tiles a column tile on 170 SMs). A remainder of at most kExactTailCols columns is cheaper on the
@@ -122,23 +121,27 @@ void q4_linear_swiglu_mma_ring_r64_c128_launch(const Tensor& x, const Weight& we
     const std::int64_t rows   = div_up(out.ne[0], GateUpRingCfg::BM / 2);
     const bool two_waves      = blocks > 0 && rowsplit_ring_waves(rows * (blocks + 1)) - rowsplit_ring_waves(rows * blocks) >= 2;
     if (blocks == 0 || tail == 0 || tail > (two_waves ? kNarrowTailCols : kExactTailCols)) {
-        launch_ring_tiles(x, weight, out, stream);
+        launch_ring_tiles(x, weight, out, stream, lora);
         return;
     }
 
     const std::int32_t wide_cols = blocks * kBlockCols;
     const Tensor x_wide = x.slice(1, 0, wide_cols);
     Tensor out_wide     = out.slice(1, 0, wide_cols);
-    launch_ring_tiles(x_wide, weight, out_wide, stream);
+    launch_ring_tiles(x_wide, weight, out_wide, stream, lora);
     const Tensor x_tail = x.slice(1, wide_cols, tail);
     Tensor out_tail     = out.slice(1, wide_cols, tail);
+    // The tail's term reads U from its first column.
+    LoraAddend tail_lora;
+    if (lora != nullptr) { tail_lora = lora_columns_from(*lora, wide_cols); }
+    const LoraAddend* tail_term = lora != nullptr ? &tail_lora : nullptr;
     if (tail == 1) {
         // The exact small-T tiled route starts at two columns.
-        q4_linear_swiglu_gemv_pair_launch(x_tail, weight, out_tail, stream);
+        q4_linear_swiglu_gemv_pair_launch(x_tail, weight, out_tail, stream, tail_term);
     } else if (tail <= kExactTailCols) {
-        q4_linear_swiglu_small_t_tiled_launch(x_tail, weight, out_tail, stream);
+        q4_linear_swiglu_small_t_tiled_launch(x_tail, weight, out_tail, stream, tail_term);
     } else {
-        launch_route<GateUpC40Cfg>(x_tail, weight, out_tail, stream);
+        launch_route<GateUpC40Cfg>(x_tail, weight, out_tail, stream, tail_term);
     }
 }
 

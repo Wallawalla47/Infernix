@@ -679,6 +679,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       product::format_pretty_bytes(media.live_capacity_bytes));
     }
 
+    if (memory.draft_screen_bytes != 0 || memory.adapter_bytes != 0) {
+        logger_->debug("memory ledger | beside the weights: draft screen {} | LoRA adapter {}",
+                       product::format_pretty_bytes(memory.draft_screen_bytes),
+                       product::format_pretty_bytes(memory.adapter_bytes));
+    }
     logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
                    "CUDA graphs {} allowed, {} used",
                    product::format_pretty_bytes(memory.available_after_weights_bytes),

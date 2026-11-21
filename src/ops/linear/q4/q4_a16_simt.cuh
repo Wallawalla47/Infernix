@@ -4,6 +4,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 
@@ -149,6 +150,18 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int stages          = FullK ? groups / G : (groups + G - 1) / G;
     const int token0          = static_cast<int>(blockIdx.y) * T;
     const int active_tokens   = Full ? T : min(T, tokens - token0);
+    [[maybe_unused]] LoraWarpStage<1, T>* lora_stage = nullptr;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The row's term operands (B row, U columns) stage in shared memory beside the main loop.
+        __shared__ LoraWarpStage<1, T> lora_stages[R];
+        lora_stage = &lora_stages[local_row];
+        if (split == 0) {
+            const int term_rows[1] = {row < rows ? row : -1};
+            lora_stage_warp_b(epilogue.lora, term_rows, *lora_stage);
+            lora_stage_warp_u(epilogue.lora, term_rows, token_begin + token0, token_begin + token0 + active_tokens,
+                              *lora_stage);
+        }
+    }
     const std::int64_t group0 = static_cast<std::int64_t>(safe_row) * (padded_k / 64) + group_begin;
     const auto* code_row      = codes + group0 * 32;
     const auto* scale_row     = scales + group0 * 2;
@@ -194,6 +207,32 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         if constexpr (W > 1) {
             if (lane == 0) shared.partial[local_row][split][token] = sums[token];
         }
+    }
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: the row's reduced values (lane 0 of its first warp) plus its terms (that warp's MMA chains, every
+        // lane), then the epilogue as below.
+        static_assert(!JoinPdl, "a LoRA term reads U, which a joining launch reads before its wait");
+        if constexpr (W > 1) { __syncthreads(); }
+        if (split == 0) {
+            if constexpr (W > 1) {
+#pragma unroll
+                for (int token = 0; token < T; ++token) {
+                    sums[token] = shared.partial[local_row][0][token];
+#pragma unroll
+                    for (int part = 1; part < W; ++part) sums[token] += shared.partial[local_row][part][token];
+                }
+            }
+            float add[T];
+            bool has;
+            lora_warp_row_all_staged<T>(epilogue.lora, row < rows ? row : -1, token_begin + token0,
+                                        token_begin + token0 + active_tokens, add, has, *lora_stage);
+#pragma unroll
+            for (int token = 0; token < T; ++token) { sums[token] = lora_add(sums[token], add[token], has); }
+            if (lane == 0 && row < rows) {
+                linear_finish_row(output, epilogue, row, token_begin + token0, sums, active_tokens);
+            }
+        }
+        return;
     }
     if constexpr (W > 1) {
         __syncthreads();

@@ -124,7 +124,8 @@ same route as generation; `--ngram-volume FILE` names their n-gram volume when i
 (NVFP4, NVFP4 Dense8 and NVFP4-QAD) with 16-bit expert activations and NVIDIA's NVFP4 Qwen3.8-27B artifacts with
 16-bit activations at every text projection, and `--a8-activations` scores infernix-serve's
 8-bit route, which the reproducible and lossless routes refuse; `report.json` records them as
-`expert_a16_activations` and `a8_activations`. The
+`expert_a16_activations` and `a8_activations`. `--lora PATH` scores the model with a LoRA adapter applied
+([LoRA adapters](lora.md)); `report.json` names it in `execution.lora_adapter` (`null` without one). The
 [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
 uses its own corpus and tool (`infernix-certify`).
 

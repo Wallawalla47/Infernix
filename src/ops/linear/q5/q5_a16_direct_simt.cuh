@@ -4,6 +4,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 
@@ -12,7 +13,9 @@ namespace infernix::ops::detail {
 template <class Schedule, bool FullK, bool FullTokens, class Output, class Epilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
 __global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_direct_simt_kernel(
+__launch_bounds__(Schedule::kThreads,
+                  lora_launch_min_blocks<Epilogue>(Schedule::kThreads, Schedule::kMinBlocksPerSm)) void
+q5_a16_direct_simt_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin) {
@@ -42,6 +45,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_dir
     const int logical_k     = Schedule::kStaticK ? Schedule::kStaticK : k;
     const int iterations    = (logical_k + BK - 1) / BK;
     const auto group0       = std::int64_t(R == 1 || row < rows ? row : 0) * (padded_k / 64);
+    [[maybe_unused]] LoraWarpStage<1, T>* lora_stage = nullptr;
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The row's term operands (B row, U columns) stage in shared memory beside the main loop.
+        __shared__ LoraWarpStage<1, T> lora_stages[R];
+        lora_stage = &lora_stages[local_row];
+        if (part == 0) {
+            const int term_rows[1] = {row < rows ? row : -1};
+            lora_stage_warp_b(epilogue.lora, term_rows, *lora_stage);
+            lora_stage_warp_u(epilogue.lora, term_rows, global_token0, global_token0 + active_tokens, *lora_stage);
+        }
+    }
     float acc[T]            = {};
     constexpr int kUnroll   = Schedule::kStaticK ? (Schedule::kStaticK + BK - 1) / BK : 1;
 #pragma unroll kUnroll
@@ -91,6 +105,36 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_dir
     constexpr bool kRowConsumer = requires {
         epilogue.apply_row(output, row, global_token0, partial[local_row][0], active_tokens);
     };
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: the row's reduced values plus its term (the first warp's MMA chain, lane t column t), then the
+        // epilogue as below.
+        static_assert(!JoinPdl, "a LoRA term reads U, which a joining launch reads before its wait");
+        static_assert(T <= 32);
+        if (part == 0) {
+            float sum = 0.0f;
+            if (lane < active_tokens) {
+                sum = partial[local_row][0][lane];
+#pragma unroll
+                for (int split = 1; split < W; ++split) sum += partial[local_row][split][lane];
+            }
+            bool has;
+            const float term = lora_warp_row_tokens_staged<T>(epilogue.lora, row < rows ? row : -1, global_token0,
+                                                              global_token0 + active_tokens, has, *lora_stage);
+            sum              = lora_add(sum, term, has);
+            if (lane < active_tokens) {
+                if constexpr (kRowConsumer)
+                    partial[local_row][0][lane] = sum;
+                else if (row < rows)
+                    output.store(row, global_token0 + lane, epilogue.apply(row, global_token0 + lane, sum));
+            }
+        }
+        if constexpr (kRowConsumer) {
+            __syncthreads();
+            if (part == 0 && lane == 0 && row < rows)
+                linear_finish_row(output, epilogue, row, global_token0, partial[local_row][0], active_tokens);
+        }
+        return;
+    }
     if (part == 0 && lane < active_tokens) {
         float sum = partial[local_row][0][lane];
 #pragma unroll

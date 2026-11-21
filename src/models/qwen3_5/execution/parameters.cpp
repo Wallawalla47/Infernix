@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/lora_parameters.h"
 
 #include "core/device.h"
 #include "core/weight_view.h"
@@ -397,7 +398,7 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
                 CUDA_CHECK(cudaStreamSynchronize(nullptr));
             } else {
                 // A plan-only model (Engine::plan) fits nothing; its plan counts the screen's bytes.
-                planned_device_bytes += ops::screened_head_wide_screen_bytes(head.n);
+                planned_draft_screen_bytes = ops::screened_head_wide_screen_bytes(head.n);
             }
         }
     }
@@ -406,6 +407,8 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
             ProposalParameters{prepare.linear(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
+    // --lora: the adapter's factors beside the text layers' projections, before the copies below take them.
+    planned_lora_bytes = prepare_lora(model, text, lora_factors);
     // The exact route decodes and verifies request-invariant on every artifact; a projection with
     // no dedicated column-invariant route runs its exact route once per column.
     invariant_text = column_invariant_text(text);

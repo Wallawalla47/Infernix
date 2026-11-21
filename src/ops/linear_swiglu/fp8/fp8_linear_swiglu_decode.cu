@@ -6,6 +6,7 @@
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/fp8/fp8_a16_gemv.cuh"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_output.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -18,7 +19,6 @@ namespace {
 using Geometry = Fp8N34816K5120;
 using Schedule = Fp8A16SimtSchedule<4, 2, 16, 4, 1, Fp8SimtActivationAccess::TokenPacked,
                                     Fp8CodeCache::Default, 1, Fp8SimtBlockOrder::RowsContiguous, 1>;
-
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
 static_assert(Schedule::kRowsPerWarp == 2);
 static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
@@ -27,14 +27,16 @@ using Rows = Fp8SwiGluRows<Schedule::kRowsPerWarp / 2, kIntermediate>;
 } // namespace
 
 void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, const LoraAddend* lora) {
     if (x.ne[0] != Geometry::kInputRows || x.ne[1] != 1 || out.ne[0] != kIntermediate ||
         out.ne[1] != 1 || weight.n != Geometry::kOutputRows || weight.k != Geometry::kInputRows) {
         throw std::invalid_argument("fp8 linear_swiglu decode: invalid exact problem");
     }
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
-    launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, 4>>(
-        fp8_a16_operands(x, weight), output, Fp8SwiGluEpilogue{}, stream, Rows{});
+    with_lora_epilogue(lora, Fp8SwiGluEpilogue{}, [&](auto epilogue) {
+        launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, 4>>(fp8_a16_operands(x, weight),
+                                                                                   output, epilogue, stream, Rows{});
+    });
 }
 
 } // namespace infernix::ops::detail

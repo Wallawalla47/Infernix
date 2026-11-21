@@ -25,14 +25,14 @@ static_assert(kPairsPerThread == 10);
 // accumulation order, reduction, and BF16 store rounding. The shared row is the exact BF16 image
 // which the standalone quantizer would read from the intermediate global allocation. The scales go
 // to the tiled plane the TMA route reads; a token past the real count is a tile's padding and gets
-// zero scales, as the standalone quantizer writes them.
-template <Nvfp4ScaleLayout Layout>
-__launch_bounds__(kBlock) __global__
-    void rmsnorm_nvfp4_quantize_kernel(const __nv_bfloat162* __restrict__ residual,
-                                       const __nv_bfloat162* __restrict__ norm_weight,
-                                       std::uint8_t* __restrict__ codes,
-                                       std::uint8_t* __restrict__ scales, std::int32_t tokens,
-                                       float eps, float input_scale_divisor) {
+// zero scales, as the standalone quantizer writes them. With StoreNormalized (a LoRA adapter's form,
+// whose shrink reads h) the staged row is also stored to `normalized` ([T][5120]): the bytes
+// rmsnorm() writes.
+template <Nvfp4ScaleLayout Layout, bool StoreNormalized>
+__device__ __forceinline__ void rmsnorm_nvfp4_quantize_body(
+    const __nv_bfloat162* __restrict__ residual, const __nv_bfloat162* __restrict__ norm_weight,
+    std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ scales, std::int32_t tokens,
+    float eps, float input_scale_divisor, __nv_bfloat162* __restrict__ normalized) {
     static_assert(Layout != Nvfp4ScaleLayout::RowMajor);
     const int token             = static_cast<int>(blockIdx.x);
     const int thread            = static_cast<int>(threadIdx.x);
@@ -75,6 +75,7 @@ __launch_bounds__(kBlock) __global__
         staged[pair] =
             __floats2bfloat162_rn(rmsnorm_epilogue<RmsEpilogue::Offset>(xf.x, inv, wf.x, 0.0F),
                                   rmsnorm_epilogue<RmsEpilogue::Offset>(xf.y, inv, wf.y, 0.0F));
+        if constexpr (StoreNormalized) { normalized[row_base + pair] = staged[pair]; }
     }
     __syncthreads();
 
@@ -89,18 +90,52 @@ __launch_bounds__(kBlock) __global__
     }
 }
 
+// The original kernel (no normalized store) keeps its own instantiation.
+template <Nvfp4ScaleLayout Layout>
+__launch_bounds__(kBlock) __global__
+    void rmsnorm_nvfp4_quantize_kernel(const __nv_bfloat162* __restrict__ residual,
+                                       const __nv_bfloat162* __restrict__ norm_weight,
+                                       std::uint8_t* __restrict__ codes,
+                                       std::uint8_t* __restrict__ scales, std::int32_t tokens,
+                                       float eps, float input_scale_divisor) {
+    rmsnorm_nvfp4_quantize_body<Layout, false>(residual, norm_weight, codes, scales, tokens, eps,
+                                               input_scale_divisor, nullptr);
+}
+
+template <Nvfp4ScaleLayout Layout>
+__launch_bounds__(kBlock) __global__
+    void rmsnorm_nvfp4_quantize_store_kernel(const __nv_bfloat162* __restrict__ residual,
+                                             const __nv_bfloat162* __restrict__ norm_weight,
+                                             std::uint8_t* __restrict__ codes,
+                                             std::uint8_t* __restrict__ scales,
+                                             std::int32_t tokens, float eps,
+                                             float input_scale_divisor,
+                                             __nv_bfloat162* __restrict__ normalized) {
+    rmsnorm_nvfp4_quantize_body<Layout, true>(residual, norm_weight, codes, scales, tokens, eps,
+                                              input_scale_divisor, normalized);
+}
+
 template <Nvfp4ScaleLayout Layout>
 void launch_quantize(const Tensor& residual, const Tensor& norm_weight, float eps,
-                     float input_scale_divisor, Nvfp4A4Workspace workspace, cudaStream_t stream) {
+                     float input_scale_divisor, Nvfp4A4Workspace workspace, cudaStream_t stream,
+                     void* normalized) {
     const std::int32_t tokens = residual.ne[1];
     const int padded          = nvfp4_a4_padded_tokens(tokens, Layout);
     if (static_cast<std::size_t>(padded) * Geometry::kGroupsPerRow > workspace.scale_bytes) {
         throw std::logic_error("fused rmsnorm NVFP4 quantize: scale plane is too small");
     }
-    rmsnorm_nvfp4_quantize_kernel<Layout><<<padded, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat162*>(residual.data),
-        static_cast<const __nv_bfloat162*>(norm_weight.data), workspace.codes, workspace.scales,
-        tokens, eps, input_scale_divisor);
+    if (normalized != nullptr) {
+        rmsnorm_nvfp4_quantize_store_kernel<Layout><<<padded, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(residual.data),
+            static_cast<const __nv_bfloat162*>(norm_weight.data), workspace.codes,
+            workspace.scales, tokens, eps, input_scale_divisor,
+            static_cast<__nv_bfloat162*>(normalized));
+    } else {
+        rmsnorm_nvfp4_quantize_kernel<Layout><<<padded, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(residual.data),
+            static_cast<const __nv_bfloat162*>(norm_weight.data), workspace.codes,
+            workspace.scales, tokens, eps, input_scale_divisor);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -110,15 +145,18 @@ void launch_nvfp4_attn_input_fused_rmsnorm_quantize(const Tensor& residual,
                                                     const Tensor& norm_weight, float eps,
                                                     float input_scale_divisor,
                                                     Nvfp4A4Workspace workspace,
-                                                    Nvfp4ScaleLayout layout, cudaStream_t stream) {
+                                                    Nvfp4ScaleLayout layout, cudaStream_t stream,
+                                                    void* normalized) {
     switch (layout) {
     case Nvfp4ScaleLayout::Tiled128:
         launch_quantize<Nvfp4ScaleLayout::Tiled128>(residual, norm_weight, eps,
-                                                    input_scale_divisor, workspace, stream);
+                                                    input_scale_divisor, workspace, stream,
+                                                    normalized);
         return;
     case Nvfp4ScaleLayout::Tiled256:
         launch_quantize<Nvfp4ScaleLayout::Tiled256>(residual, norm_weight, eps,
-                                                    input_scale_divisor, workspace, stream);
+                                                    input_scale_divisor, workspace, stream,
+                                                    normalized);
         return;
     case Nvfp4ScaleLayout::RowMajor:
         break;
@@ -129,19 +167,32 @@ void launch_nvfp4_attn_input_fused_rmsnorm_quantize(const Tensor& residual,
 void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor& residual, const Tensor& norm_weight,
                                            float eps, const Weight& weight, Tensor& q, Tensor& gate,
                                            Tensor& k, Tensor& v, WorkspaceArena& workspace,
-                                           cudaStream_t stream) {
-    const std::int32_t tokens      = residual.ne[1];
-    const Nvfp4ScaleLayout layout  = nvfp4_attn_input_scale_layout(tokens);
-    auto scope                     = workspace.scope();
+                                           cudaStream_t stream, const LoraSite* lora,
+                                           const Tensor* normalized) {
+    const std::int32_t tokens     = residual.ne[1];
+    const Nvfp4ScaleLayout layout = nvfp4_attn_input_scale_layout(tokens);
+    auto scope                    = workspace.scope();
+    // --lora: U first (the order attention_projection allocates it in), the norm also stores h, and the
+    // shrink of h runs between the norm and the projection.
+    LoraAddend term;
+    Tensor u;
+    if (lora != nullptr) {
+        u      = workspace.alloc(DType::BF16, {lora->a.rows, tokens});
+        term   = lora->addend;
+        term.u = u.data;
+    }
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(workspace, tokens, weight.k);
     launch_nvfp4_attn_input_fused_rmsnorm_quantize(residual, norm_weight, eps,
                                                    weight.input_scale_divisor, scratch, layout,
-                                                   stream);
+                                                   stream,
+                                                   lora != nullptr ? normalized->data : nullptr);
+    if (lora != nullptr) { lora_shrink(*normalized, lora->a, u, stream); }
     launch_nvfp4_a4_tma_attention(nvfp4_a4_operands(weight, scratch, tokens, layout),
                                   static_cast<__nv_bfloat16*>(q.data),
                                   static_cast<__nv_bfloat16*>(gate.data),
                                   static_cast<__nv_bfloat16*>(k.data),
-                                  static_cast<__nv_bfloat16*>(v.data), stream);
+                                  static_cast<__nv_bfloat16*>(v.data), stream,
+                                  lora != nullptr ? &term : nullptr);
 }
 
 } // namespace infernix::ops::detail
