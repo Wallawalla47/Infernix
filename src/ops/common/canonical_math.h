@@ -303,6 +303,167 @@ INFERNIX_CANON_HD std::uint16_t swiglu_bf16(std::uint16_t gate_bf16, std::uint16
     return f32_to_bf16_rn(mul_rn(silu_c(bf16_to_f32(gate_bf16)), bf16_to_f32(up_bf16)));
 }
 
+// expm1(x), accurate near zero (no cancellation): the reduction of exp_c, then
+// expm1(x) = 2^n expm1(r) + (2^n - 1) with expm1(r) by a degree-9 Taylor polynomial (|r| <= ln2 / 2: the truncation is
+// below 2^-30 relative). n = 0 (|x| < ln2 / 2) returns the polynomial itself. Overflow +inf, x < -88.7 gives -1, NaN the
+// canonical NaN.
+INFERNIX_CANON_HD float expm1_c(float x) {
+    if (x != x) { return f32_from_bits(kCanonicalNan); }
+    if (x > 88.72283935546875F) { return f32_from_bits(0x7F800000U); }
+    if (x < -88.0F) { return -1.0F; }
+    const float n  = rint_rn(mul_rn(x, 1.44269502162933349609375F));
+    const float r0 = fma_rn(-n, 0.693145751953125F, x);
+    const float r  = fma_rn(-n, 1.428606765330187045e-06F, r0);
+    float p        = 1.0F / 362880.0F;
+    p              = fma_rn(p, r, 1.0F / 40320.0F);
+    p              = fma_rn(p, r, 1.0F / 5040.0F);
+    p              = fma_rn(p, r, 1.0F / 720.0F);
+    p              = fma_rn(p, r, 1.0F / 120.0F);
+    p              = fma_rn(p, r, 1.0F / 24.0F);
+    p              = fma_rn(p, r, 1.0F / 6.0F);
+    p              = fma_rn(p, r, 0.5F);
+    const float q  = fma_rn(mul_rn(p, r), r, r); // expm1(r) = r + r^2 p(r)
+    const int k    = static_cast<int>(n);
+    if (k == 0) { return q; }
+    const int k1   = k / 2;
+    const float s1 = f32_from_bits(static_cast<std::uint32_t>(k1 + 127) << 23);
+    const float s2 = f32_from_bits(static_cast<std::uint32_t>(k - k1 + 127) << 23);
+    if (k > 64) {
+        // exp(x) - 1 where the -1 is far below the result's ulp: (1 + q) scaled by 2^k in two exact steps (2^128 itself
+        // would overflow at k = 128, x near 88.7).
+        return mul_rn(mul_rn(add_rn(1.0F, q), s1), s2);
+    }
+    // 2^k expm1(r) + (2^k - 1): the power of two and, for k <= 24, 2^k - 1 are exact; for k <= -1 the result is
+    // dominated by -1 + 2^k (exact) plus a small term.
+    const float scale = mul_rn(s1, s2);
+    return add_rn(mul_rn(q, scale), add_rn(scale, -1.0F));
+}
+
+// tanh(|x|), signed: below 0.6 the odd Taylor series a + a^3 P(a^2) (ten terms, truncation below 2^-30 relative; by
+// Horner with fma), else e / (e + 2) with e = expm1(2|x|) (no (1 - e) / (1 + e) cancellation); |x| >= 9 gives 1 (tanh(9)
+// rounds to 1 in binary32). -0 stays -0; NaN gives the canonical NaN. Over every BF16 input: 1.24 ulp at most.
+INFERNIX_CANON_HD float tanh_c(float x) {
+    if (x != x) { return f32_from_bits(kCanonicalNan); }
+    const std::uint32_t sign = f32_bits(x) & 0x80000000U;
+    const float a            = f32_from_bits(f32_bits(x) & 0x7FFFFFFFU);
+    float t;
+    if (a >= 9.0F) {
+        t = 1.0F;
+    } else if (a < 0.6F) {
+        // c_n of tanh's series a - c1 a^3 + c2 a^5 - ..., each rounded once to binary32 (1/3, 2/15, 17/315, 62/2835,
+        // 1382/155925, 21844/6081075, 929569/638512875, 6404582/10854718875, 443861162/1856156927625,
+        // 18888466084/194896477400625).
+        const float s = mul_rn(a, a);
+        float p       = -0x1.967e18p-14F;          // -c10
+        p             = fma_rn(p, s, 0x1.f57d78p-13F);  // c9
+        p             = fma_rn(p, s, -0x1.355824p-11F); // -c8
+        p             = fma_rn(p, s, 0x1.7da364p-10F);  // c7
+        p             = fma_rn(p, s, -0x1.d6d3d0p-9F);  // -c6
+        p             = fma_rn(p, s, 0x1.226e36p-7F);   // c5
+        p             = fma_rn(p, s, -0x1.664f48p-6F);  // -c4
+        p             = fma_rn(p, s, 0x1.ba1ba2p-5F);   // c3
+        p             = fma_rn(p, s, -0x1.111112p-3F);  // -c2
+        p             = fma_rn(p, s, 0x1.555556p-2F);   // c1
+        t             = fma_rn(mul_rn(a, s), -p, a);    // a - a^3 (c1 - c2 a^2 + ...)
+    } else {
+        const float e = expm1_c(mul_rn(2.0F, a));
+        t             = div_rn(e, add_rn(e, 2.0F));
+    }
+    return f32_from_bits(f32_bits(t) | sign);
+}
+
+// The logistic sigmoid in the form that never overflows exp: x >= 0: 1 / (1 + exp_c(-x)); x < 0: e / (1 + e),
+// e = exp_c(x). NaN gives the canonical NaN.
+INFERNIX_CANON_HD float sigmoid_c(float x) {
+    if (x != x) { return f32_from_bits(kCanonicalNan); }
+    if (x >= 0.0F) { return div_rn(1.0F, add_rn(1.0F, exp_c(-x))); }
+    const float e = exp_c(x);
+    return div_rn(e, add_rn(1.0F, e));
+}
+
+// cap * tanh(x / cap) with the division correctly rounded (a power-of-two cap makes it exact). A NaN result is the
+// canonical NaN (CUDA arithmetic on a NaN gives its own).
+INFERNIX_CANON_HD float softcap_c(float x, float cap) {
+    const float r = mul_rn(cap, tanh_c(div_rn(x, cap)));
+    return r != r ? f32_from_bits(kCanonicalNan) : r;
+}
+
+// ---------------------------------------------------------------------------- four-over-six NVFP4 activations
+
+// Inkling 2's NVFP4 activation rule (vLLM's and TokenSpeed's four-over-six, design docs/maintainer/inkling2_mini-design.md
+// §2.5), per row of K values with a per-row outer scale amax / 1536:
+//   enc = min(1536 / amax, FP32_MAX), dec = 1 / enc, outer = amax * fl32(1 / 1536)
+//   per 16-element block with largest magnitude bmax, two candidate scales
+//     s6 = e4m3(min(bmax * (enc * fl32(1 / 6)), 448)), s4 = e4m3(min(bmax * (enc * 0.25), 448)),
+//     codes e2m1(x * min(1 / (s * dec), FP32_MAX)), error = pairwise sum over the 16 columns of |(c * s) * outer - x|;
+//   the block takes s4 exactly when its error is smaller than s6's.
+// The row's value is then (c * s) * outer per element; the row carries amax, each block its scale word.
+struct FourOverSixRow {
+    float enc   = 0;
+    float dec   = 0;
+    float outer = 0;
+};
+
+INFERNIX_CANON_HD FourOverSixRow four_over_six_row(float amax) {
+    constexpr float kFp32Max = 3.4028234663852886e38F;
+    FourOverSixRow out;
+    const float enc = div_rn(1536.0F, amax);
+    out.enc         = enc < kFp32Max ? enc : kFp32Max; // amax == 0 gives +inf, clamped
+    out.dec         = div_rn(1.0F, out.enc);
+    out.outer       = mul_rn(amax, 1.0F / 1536.0F);
+    return out;
+}
+
+struct FourOverSixBlock {
+    std::uint8_t code[16]; // E2M1 code words, sign in bit 3
+    std::uint8_t scale_word;
+};
+
+namespace detail {
+INFERNIX_CANON_HD float four_over_six_candidate(const float (&x)[16], std::uint8_t word, const FourOverSixRow& row,
+                                                std::uint8_t (&codes)[16]) {
+    constexpr float kFp32Max = 3.4028234663852886e38F;
+    const float s   = e4m3_value(word);
+    const float inv = div_rn(1.0F, mul_rn(s, row.dec));
+    const float k   = inv < kFp32Max ? inv : kFp32Max;
+    float err[16];
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 16; ++j) {
+        codes[j]      = e2m1_rn_satfinite(mul_rn(x[j], k));
+        const float c = mul_rn(0.5F, static_cast<float>(e2m1_x2(codes[j]))); // the signed E2M1 value, exact
+        const float d = add_rn(mul_rn(mul_rn(c, s), row.outer), -x[j]);
+        err[j]        = d < 0.0F ? -d : d;
+    }
+    INFERNIX_CANON_UNROLL
+    for (int width = 8; width >= 1; width /= 2) {
+        INFERNIX_CANON_UNROLL
+        for (int j = 0; j < width; ++j) { err[j] = add_rn(err[2 * j], err[2 * j + 1]); }
+    }
+    return err[0];
+}
+} // namespace detail
+
+// One block of 16 BF16-valued activations x (as binary32) under `row`.
+INFERNIX_CANON_HD FourOverSixBlock four_over_six_block(const float (&x)[16], const FourOverSixRow& row) {
+    float bmax = 0.0F;
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 16; ++j) {
+        const float a = f32_from_bits(f32_bits(x[j]) & 0x7FFFFFFFU);
+        bmax          = a > bmax ? a : bmax;
+    }
+    // min(., 448) before the encode, as the reference does (the satfinite encode alone would give the same word).
+    const float v6        = mul_rn(bmax, mul_rn(row.enc, 1.0F / 6.0F));
+    const float v4        = mul_rn(bmax, mul_rn(row.enc, 0.25F));
+    const std::uint8_t s6 = e4m3_rn_satfinite(v6 < 448.0F ? v6 : 448.0F);
+    const std::uint8_t s4 = e4m3_rn_satfinite(v4 < 448.0F ? v4 : 448.0F);
+    FourOverSixBlock six{}, four{};
+    const float err6 = detail::four_over_six_candidate(x, s6, row, six.code);
+    const float err4 = detail::four_over_six_candidate(x, s4, row, four.code);
+    six.scale_word   = s6;
+    four.scale_word  = s4;
+    return err4 < err6 ? four : six;
+}
+
 // ---------------------------------------------------------------------------- A4 codes
 
 // The A4 rule of quantize_a4_block split into its two steps and returning the 4-bit E2M1 code

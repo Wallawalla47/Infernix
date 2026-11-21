@@ -595,6 +595,12 @@ infernix_add_family_op_test(infernix_lora_gdn_test FAMILY lora
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_gdn.cpp"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_lora_gdn_test PROPERTIES TIMEOUT 3600 RESOURCE_LOCK gpu_memory)
+# Inkling 2's canonical functions (expm1, tanh, sigmoid, softcaps, four-over-six NVFP4 activations): GPU bits equal the
+# CPU header's, exhaustively over BF16; within 2 ulp of FP64; four-over-six against the torch reference's fixture.
+infernix_add_family_op_test(infernix_inkling2_canon_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_canon.cu"
+  LIBRARIES infernix::json
+  ARGS "${PROJECT_SOURCE_DIR}/tests/fixtures/inkling2/four_over_six.json")
 
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()
