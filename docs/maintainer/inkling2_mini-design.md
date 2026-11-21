@@ -332,7 +332,7 @@ statement, records it in the model reference, and the oracles follow it:
 | TokenSpeed PR, gfx950 | NVFP4 GEMM tiles reading the exact BF16 values of the codes, epilogue `bf16(acc·(xa·wa)/(1536·WD))`; MXFP8 ring 2 × 42 KB | split-KV decode at 8 splits (window) and a fixed 32 at the served context (full), 128-key blocks | **decode monokernel**: one persistent launch per layer, stages with tagged mailboxes, bit for bit its regular path; a later pass's core visit runs as two launches; conv rings of 3 + verify block | 465.6 tok/s per user at C = 1 (4× MI350X, DSpark, 3.59 tokens per verify step); attention-residual partials swept once per block set; conv checkpoints paged on the KV planes |
 | Transformers PR | experts dequantized to BF16, BF16 activations | eager only (bias + sink) | none | layer-mathematics reference |
 | llama.cpp (GGUF) | re-quantized Q8_0 / IQ4_NL | ggml | — | not the trained arithmetic |
-| NInfer-all (`iamwavecut/ninfer-all` @ 395ce8b8, Apache-2.0; its `docs/inkling2.md`) | Unsloth's UD-IQ4_XS GGUF: NVFP4 experts (20 layers) and Q5_K/Q4_K/IQ4_XS/Q5_0 (4), multiplied as GGUF vector kernels against q8_1 activations (W4A8, not the trained W4A4) up to 8 tokens; expert products summed in 2^-32 fixed point, so the CPU/GPU split cannot change them | F16 KV; FMA kernels (no tensor cores), keys split over ranges at decode, 8 rows a block at prefill; a sliding visit's prefill attends over a staging ring (the window before the chunk copied in, the last window copied back) | FP32 residual rows; ~15-20 launches a visit; at ≤ 16 rows each depth mix spread over one-warp blocks of 128 channels whose readers add the warp sums in the one-block order (same bits); a CUDA graph per batch size | reported on an RTX 5090: 182.1 tok/s decode (near-empty context), 163.6 after 10K, prefill 8,367 tok/s at 2K and 6,664 at 10K; DSpark 1.19× (essay, 1.71 tokens a round); also prefix reuse, vision, structured output, host and disk experts. Q8_0 attention and a Q6_K head move ~3.5 GB a token against this design's ~5.35 GB (estimate) |
+| NInfer-all (`iamwavecut/ninfer-all` @ 395ce8b8, Apache-2.0; its `docs/inkling2.md`) | Unsloth's UD-IQ4_XS GGUF: NVFP4 experts (20 layers) and Q5_K/Q4_K/IQ4_XS/Q5_0 (4), multiplied as GGUF vector kernels against q8_1 activations (W4A8, not the trained W4A4) up to 8 tokens; expert products summed in 2^-32 fixed point, so the CPU/GPU split cannot change them | F16 KV; FMA kernels (no tensor cores), keys split over ranges at decode, 8 rows a block at prefill; a sliding visit's prefill attends over a staging ring (the window before the chunk copied in, the last window copied back) | FP32 residual rows; ~15-20 launches a visit; at ≤ 16 rows each depth mix spread over one-warp blocks of 128 channels whose readers add the warp sums in the one-block order (same bits); a CUDA graph per batch size | reported on an RTX 5090: 182.1 tok/s decode (near-empty context), 163.6 after 10K, prefill 8,367 tok/s at 2K and 6,664 at 10K; DSpark 1.19× (essay, 1.71 tokens a round); measured on this machine: [§3.4](#34-ideas-from-ninfer-all-reviewed-2026-11-21); also prefix reuse, vision, structured output, host and disk experts. Q8_0 attention and a Q6_K head move ~3.5 GB a token against this design's ~5.1 GB with the head packed (estimate) |
 
 None of the published paths runs near this GPU's byte floor (SGLang's B300 chart: 29.7 ms per token plain at C = 1,
 ~40× its floor). The gap everywhere is fixed per-step cost; TokenSpeed's monokernel is the one design aimed at it.
@@ -392,11 +392,21 @@ from the first implementation.
 
 ### 3.4 Ideas from NInfer-all (reviewed 2026-11-21)
 
-Its lead over this design's first builds is the artifact (fewer bytes a token, not the trained arithmetic) and the
-routes this design has not built yet (prefill, DSpark, prefix reuse, vision, structured output); per byte its decode
-moves less than this design's (~0.64 TB/s against ~0.85 TB/s effective, estimates from its reported rate on another
-RTX 5090 and this design's 158.5 tok/s at 4K, measured with the clocks held high after an nsys run: P0/P1, SM 2400 MHz, even when idle; the forward test's
-captured round, not an end-to-end rate).
+Measured on this machine (2026-11-21, RTX 5090, normal clocks; both engines' benchmarks through their public Engine on
+one Inkling-tokenized corpus of English prose, C = 1, 3 repetitions after a warmup; NInfer-all built at 395ce8b8 from
+Unsloth's UD-IQ4_XS GGUF; this design's first builds with the head packed):
+
+| Workload | This design | NInfer-all | |
+|---|---:|---:|---|
+| prefill 2,048 | 752.8 tok/s | 8,542.8 | 11.3× behind (prefill still runs the decode kernels, 16 columns a call) |
+| prefill 10,000 | 736.5 | 6,785.6 | 9.2× behind |
+| decode 128 | 167.65 | 187.27 | 10.5 % behind; M5's 185 tok/s target missed |
+| decode after 10,000 | 154.63 | 168.47 | 8.2 % behind |
+| greedy 384-token essay (CLIs) | 167.0 | 185.5 plain, 216.2 with DSpark (window 3; 1.90 tokens a round) | |
+
+Its artifact reads ~3.5 GB a token against this design's ~5.1 GB (estimates from the formats), and neither decode is
+near its byte floor (~2.9 ms a token here against 5.96 ms): fixed per-step cost dominates both. Its other leads are the
+routes this design has not built yet (prefill, DSpark, prefix reuse, vision, structured output).
 
 | Idea | Source | Use here |
 |---|---|---|
