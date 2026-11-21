@@ -728,9 +728,10 @@ A BF16 P12 volume holds the same BF16 values as the BF16 volume, bit for bit, in
 of 320 (16 per 4 KiB block instead of 12). Each value keeps its sign and 7 mantissa bits in a byte
 and its exponent as a 4-bit offset from the row's base; a value whose exponent lies outside the row's
 15-exponent window is stored whole in one of up to four escapes in the row's 16-byte tail. Every row
-of Qwen's table fits. The PLE decodes the rows to their exact BF16 values, so an artifact gives the
-same output with the BF16 P12 volume as with the BF16 volume, on every route. Pack it from a BF16
-volume and check every row:
+of Qwen's table fits: 98.4 % need no escape and the rest at most three. The PLE decodes the rows to
+their exact BF16 values, so an artifact gives the same output with the BF16 P12 volume as with the
+BF16 volume, on every route (NVIDIA NVFP4 Dense8 gave the same tokens with either volume on the
+reproducible, default and lossless routes). Pack it from a BF16 volume and check every row:
 
 ```text
 python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --census
@@ -741,10 +742,17 @@ infernix-serve <artifact part 1> --ngram-volume <fast drive>/Qwen3.8-Flash-Next-
 
 `--census` counts the escapes each row needs (the packer refuses a row that needs more than four).
 The packed volume's id follows from its source's, so packing one BF16 volume always gives the same
-file. The volume is 81.9 GB against the BF16 volume's 109.2 GB (FP8: 52.4 GB). A missed row costs
-one 4 KiB read whatever the format, so a token reads about as many blocks as with the BF16 or FP8
-volume. What changes is the space: on disk, and in RAM when the whole table is held there
-(`--ngram-residency`). No artifact binds a BF16 P12 table as its own (`--ngram-reuse` refuses one);
+file. From and to Samsung 990 PRO drives, with other jobs running, packing took 29 minutes and
+`--verify --rows all` 39. The
+volume is 81.9 GB against the BF16 volume's 109.2 GB (FP8: 52.4 GB). A missed row costs one 4 KiB
+read whatever the format, so a token reads as many blocks as with the BF16 or FP8 volume (a
+7,578-token prompt: 73,289 reads from the BF16 volume, 73,263 from the BF16 P12 one). What changes
+is the space: on disk, and in RAM when the whole table is held there (`--ngram-residency`). Decoding
+the rows costs the PLE one more kernel launch per call, which did not measurably change speed: NVIDIA
+NVFP4 Dense8 with 8,192-token prompts and 256 generated tokens (INT8 KV, rows in the host cache, four
+interleaved runs on an RTX 5090, 2026-11-21) decoded 127.0 tok/s with the BF16 P12 volume and 126.7
+with the BF16 one and read prompts at 4,856 and 4,807 tok/s; the BF16 volume against itself varied
+as much (decode down to 0.973 of itself in one pair). No artifact binds a BF16 P12 table as its own (`--ngram-reuse` refuses one);
 pass it at run time.
 
 ## Chat template

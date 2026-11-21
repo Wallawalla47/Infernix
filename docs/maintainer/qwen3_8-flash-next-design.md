@@ -2281,13 +2281,21 @@ carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
   (0-4) and K 3-byte escapes (column, BF16 bits) in a 16-byte tail; q = 15 marks an escaped value.
   The packer picks the b whose window [b, b+14] holds the most of the row's exponents (the lowest on a
   tie, so zeros and subnormals sit in the window at b = 0); every row of Qwen's table needs at most 3
-  escapes. `ple_embed_bf16_p12` writes each value's exact BF16 bits, so the embedding equals the BF16
-  volume's and every route gives the BF16 volume's output; it costs one decode launch per PLE call that
-  the BF16 rows, read in place, do not. Each W must be even and at most 255 (the escape column is a
+  escapes (packing the published BF16 volume, 2026-11-20: 314,900,146 rows none, 5,061,053 one, 40,153
+  two, 184 three; `--verify --rows all` found 0 of 320,001,536 rows differing). `ple_embed_bf16_p12`
+  writes each value's exact BF16 bits, so the embedding equals the BF16 volume's and every route gives
+  the BF16 volume's output (NVIDIA NVFP4 Dense8: the same tokens with either volume on the reproducible,
+  default and lossless routes); it costs one decode launch per PLE call that the BF16 rows, read in
+  place, do not, which an ABBA run did not resolve (Dense8, pp8192 + tg256, INT8 KV, rows cached, 4
+  pairs, 2026-11-21: P12/BF16 median decode 0.999 (worst 0.996), prefill 0.998 (worst 0.994); the
+  BF16-again noise arm 0.999 (worst 0.973) and 1.001). Each W must be even and at most 255 (the escape column is a
   byte); Flash-Next's 160 gives 256-byte rows. No artifact binds the format (`config.cpp` refuses it,
   `--ngram-reuse` refuses such a volume), so the volume serves only as a run-time replacement. A missed
   row is one 4 KiB read in every format (§12.3), so against the BF16 volume it saves disk space and
-  resident RAM, not reads.
+  resident RAM, not reads: the same 7,578-token Dense8 request read 73,289 blocks from the BF16 volume
+  and 73,263 from the P12 volume (127,168 rows requested, 1.5 % host-cache hits: since 12 or 16 rows a
+  block read the same count, the reads fall short of the misses because a prompt repeats rows, not
+  because rows share blocks).
 - **NVFP4 (2026-10-19).** `ple_embed_nvfp4` decodes each value as `bf16_rn(e2m1 · e4m3 · m)`, the
   exact product (at most 30 significant bits) rounded once (an FMA residual decides the FP32 product's
   BF16 ties); element 2i is byte i's low nibble, ModelOpt's packing. The multiplier `m` (ModelOpt's
