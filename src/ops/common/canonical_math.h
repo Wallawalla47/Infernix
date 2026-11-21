@@ -455,29 +455,41 @@ struct FourOverSixBlock {
     std::uint8_t scale_word;
 };
 
-namespace detail {
-INFERNIX_CANON_HD float four_over_six_candidate(const float (&x)[16], std::uint8_t word, const FourOverSixRow& row,
-                                                std::uint8_t (&codes)[16]) {
+// One half (8 consecutive elements) of a block under a candidate scale word: each element's code, and the half's
+// balanced pairwise error tree. The block's error is add_rn(first half's tree, second half's tree): the top level of
+// its 16-column tree, so two threads holding a half each give the block's bits.
+INFERNIX_CANON_HD float four_over_six_half(const float (&x)[8], std::uint8_t word, const FourOverSixRow& row,
+                                           std::uint8_t (&codes)[8]) {
     constexpr float kFp32Max = 3.4028234663852886e38F;
     const float s   = e4m3_value(word);
     const float inv = div_rn(1.0F, mul_rn(s, row.dec));
     const float k   = inv < kFp32Max ? inv : kFp32Max;
-    float err[16];
+    float err[8];
     INFERNIX_CANON_UNROLL
-    for (int j = 0; j < 16; ++j) {
+    for (int j = 0; j < 8; ++j) {
         codes[j]      = e2m1_rn_satfinite(mul_rn(x[j], k));
         const float c = mul_rn(0.5F, static_cast<float>(e2m1_x2(codes[j]))); // the signed E2M1 value, exact
         const float d = add_rn(mul_rn(mul_rn(c, s), row.outer), -x[j]);
         err[j]        = d < 0.0F ? -d : d;
     }
     INFERNIX_CANON_UNROLL
-    for (int width = 8; width >= 1; width /= 2) {
+    for (int width = 4; width >= 1; width /= 2) {
         INFERNIX_CANON_UNROLL
         for (int j = 0; j < width; ++j) { err[j] = add_rn(err[2 * j], err[2 * j + 1]); }
     }
     return err[0];
 }
-} // namespace detail
+
+// A block's two candidate scale words from its largest magnitude bmax: min(., 448) before the encode, as the
+// reference does (the satfinite encode alone would give the same word).
+struct FourOverSixWords {
+    std::uint8_t six, four;
+};
+INFERNIX_CANON_HD FourOverSixWords four_over_six_words(float bmax, const FourOverSixRow& row) {
+    const float v6 = mul_rn(bmax, mul_rn(row.enc, 1.0F / 6.0F));
+    const float v4 = mul_rn(bmax, mul_rn(row.enc, 0.25F));
+    return {e4m3_rn_satfinite(v6 < 448.0F ? v6 : 448.0F), e4m3_rn_satfinite(v4 < 448.0F ? v4 : 448.0F)};
+}
 
 // ---------------------------------------------------------------------------- MXFP8 activations
 
@@ -540,17 +552,22 @@ INFERNIX_CANON_HD FourOverSixBlock four_over_six_block(const float (&x)[16], con
         const float a = f32_from_bits(f32_bits(x[j]) & 0x7FFFFFFFU);
         bmax          = a > bmax ? a : bmax;
     }
-    // min(., 448) before the encode, as the reference does (the satfinite encode alone would give the same word).
-    const float v6        = mul_rn(bmax, mul_rn(row.enc, 1.0F / 6.0F));
-    const float v4        = mul_rn(bmax, mul_rn(row.enc, 0.25F));
-    const std::uint8_t s6 = e4m3_rn_satfinite(v6 < 448.0F ? v6 : 448.0F);
-    const std::uint8_t s4 = e4m3_rn_satfinite(v4 < 448.0F ? v4 : 448.0F);
-    FourOverSixBlock six{}, four{};
-    const float err6 = detail::four_over_six_candidate(x, s6, row, six.code);
-    const float err4 = detail::four_over_six_candidate(x, s4, row, four.code);
-    six.scale_word   = s6;
-    four.scale_word  = s4;
-    return err4 < err6 ? four : six;
+    const FourOverSixWords w = four_over_six_words(bmax, row);
+    float lo[8], hi[8];
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 8; ++j) { lo[j] = x[j], hi[j] = x[8 + j]; }
+    std::uint8_t c6[2][8], c4[2][8];
+    const float err6 = add_rn(four_over_six_half(lo, w.six, row, c6[0]), four_over_six_half(hi, w.six, row, c6[1]));
+    const float err4 = add_rn(four_over_six_half(lo, w.four, row, c4[0]), four_over_six_half(hi, w.four, row, c4[1]));
+    const bool four  = err4 < err6;
+    FourOverSixBlock out{};
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 8; ++j) {
+        out.code[j]     = four ? c4[0][j] : c6[0][j];
+        out.code[8 + j] = four ? c4[1][j] : c6[1][j];
+    }
+    out.scale_word = four ? w.four : w.six;
+    return out;
 }
 
 // ---------------------------------------------------------------------------- A4 codes

@@ -447,31 +447,56 @@ __global__ void __launch_bounds__(kGuThreads) gate_up_a4_kernel(Args a) {
     __syncthreads();
     if (sm.last == 0) { return; }
     __threadfence();
+    // A block's halves on a thread pair (canon::four_over_six_half: each thread both candidates over its 8, the pair's
+    // half-trees added: four_over_six_block's bits). Whole rounds of the CTA, so every lane takes part in the pair
+    // shuffles; lanes past the work store nothing.
     constexpr int kBlocks = G::kInter / 16;
-    for (int i = tid; i < v.count * kBlocks; i += kGuThreads) {
-        const int c = i / kBlocks, b = i % kBlocks;
-        const int entry = a.ws.entries[v.first + c];
-        const float amax = canon::f32_from_bits(__ldcg(a.ws.h_amax + entry));
+    const int items  = v.count * kBlocks * 2;
+    const int rounds = (items + kGuThreads - 1) / kGuThreads;
+    for (int r = 0; r < rounds; ++r) {
+        const int i    = r * kGuThreads + tid;
+        const bool on  = i < items;
+        const int half = i & 1, blk = i >> 1;
+        const int c = on ? blk / kBlocks : 0, b = on ? blk % kBlocks : 0;
+        const int entry  = on ? a.ws.entries[v.first + c] : 0;
+        const float amax = on ? canon::f32_from_bits(__ldcg(a.ws.h_amax + entry)) : 1.0F;
         const canon::FourOverSixRow row = canon::four_over_six_row(amax);
-        const auto* src = reinterpret_cast<const uint4*>(a.ws.h + static_cast<std::size_t>(entry) * G::kInter + 16 * b);
-        const uint4 lo = __ldcg(src), hi = __ldcg(src + 1);
-        const std::uint32_t w[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-        float xv[16];
+        float xv[8] = {};
+        float mag   = 0.0F;
+        if (on) {
+            const uint4 q = __ldcg(reinterpret_cast<const uint4*>(a.ws.h + static_cast<std::size_t>(entry) * G::kInter + 16 * b) + half);
+            const std::uint32_t w[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            xv[2 * j]     = canon::f32_from_bits(w[j] << 16);
-            xv[2 * j + 1] = canon::f32_from_bits(w[j] & 0xFFFF0000U);
+            for (int j = 0; j < 4; ++j) {
+                xv[2 * j]     = canon::f32_from_bits(w[j] << 16);
+                xv[2 * j + 1] = canon::f32_from_bits(w[j] & 0xFFFF0000U);
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float m = canon::f32_from_bits(canon::f32_bits(xv[j]) & 0x7FFFFFFFU);
+                mag           = m > mag ? m : mag;
+            }
         }
-        const canon::FourOverSixBlock block = canon::four_over_six_block(xv, row);
-        std::uint32_t packed[2] = {0, 0};
+        const float other = __shfl_xor_sync(0xFFFFFFFFU, mag, 1);
+        const canon::FourOverSixWords words = canon::four_over_six_words(other > mag ? other : mag, row);
+        std::uint8_t c6[8], c4[8];
+        const float e6 = canon::four_over_six_half(xv, words.six, row, c6);
+        const float e4 = canon::four_over_six_half(xv, words.four, row, c4);
+        const float p6 = __shfl_xor_sync(0xFFFFFFFFU, e6, 1), p4 = __shfl_xor_sync(0xFFFFFFFFU, e4, 1);
+        const float err6 = half == 0 ? canon::add_rn(e6, p6) : canon::add_rn(p6, e6);
+        const float err4 = half == 0 ? canon::add_rn(e4, p4) : canon::add_rn(p4, e4);
+        const bool four  = err4 < err6;
+        if (!on) { continue; }
+        std::uint32_t packed = 0;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const std::uint32_t byte = block.code[2 * j] | (static_cast<std::uint32_t>(block.code[2 * j + 1]) << 4);
-            packed[j / 4] |= byte << (8 * (j % 4));
+        for (int j = 0; j < 4; ++j) {
+            const std::uint32_t lo = four ? c4[2 * j] : c6[2 * j];
+            const std::uint32_t hi = four ? c4[2 * j + 1] : c6[2 * j + 1];
+            packed |= (lo | (hi << 4)) << (8 * j);
         }
         std::uint8_t* out = a.ws.h_rows + static_cast<std::size_t>(entry) * S::kHRowBytes;
-        *reinterpret_cast<uint2*>(out + 8 * b) = make_uint2(packed[0], packed[1]);
-        out[S::kHScales + b]                   = block.scale_word;
+        *reinterpret_cast<std::uint32_t*>(out + 8 * b + 4 * half) = packed;
+        if (half == 0) { out[S::kHScales + b] = four ? words.four : words.six; }
     }
     __syncthreads();
     if (tid == 0) {

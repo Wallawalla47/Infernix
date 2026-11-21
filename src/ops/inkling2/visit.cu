@@ -299,25 +299,28 @@ __device__ __forceinline__ void quantize_row(const float (&v)[8], const ExpertRo
         const float amax = cta_max(a, scratch);
         if (g == 0) { rows.amax[t] = amax; }
         const canon::FourOverSixRow row = canon::four_over_six_row(amax);
-        float block[16];
+        // A block is a thread pair's 16 elements: each thread evaluates both candidates over its own 8 and the pair
+        // adds the two half-trees, the top level of the block's error tree (canon::four_over_six_block's bits).
         const bool even = (g & 1) == 0;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) { // selects, not an index chosen at run time (which would be local memory)
-            const float partner = __shfl_xor_sync(kAll, v[j], 1);
-            block[j]            = even ? v[j] : partner;
-            block[j + 8]        = even ? partner : v[j];
-        }
-        const canon::FourOverSixBlock q = canon::four_over_six_block(block, row);
-        std::uint32_t packed            = 0;
+        const float o   = __shfl_xor_sync(kAll, a, 1);
+        const canon::FourOverSixWords w = canon::four_over_six_words(o > a ? o : a, row);
+        std::uint8_t c6[8], c4[8];
+        const float e6 = canon::four_over_six_half(v, w.six, row, c6);
+        const float e4 = canon::four_over_six_half(v, w.four, row, c4);
+        const float p6 = __shfl_xor_sync(kAll, e6, 1), p4 = __shfl_xor_sync(kAll, e4, 1);
+        const float err6 = even ? canon::add_rn(e6, p6) : canon::add_rn(p6, e6);
+        const float err4 = even ? canon::add_rn(e4, p4) : canon::add_rn(p4, e4);
+        const bool four  = err4 < err6;
+        std::uint32_t packed = 0;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const std::uint32_t lo = even ? q.code[2 * i] : q.code[8 + 2 * i];
-            const std::uint32_t hi = even ? q.code[2 * i + 1] : q.code[8 + 2 * i + 1];
+            const std::uint32_t lo = four ? c4[2 * i] : c6[2 * i];
+            const std::uint32_t hi = four ? c4[2 * i + 1] : c6[2 * i + 1];
             packed |= (lo | (hi << 4)) << (8 * i);
         }
         std::uint8_t* base = rows.rows + static_cast<std::size_t>(t) * kNvfp4RowBytes;
         *reinterpret_cast<std::uint32_t*>(base + 4 * g) = packed;
-        if (even) { base[kHidden / 2 + g / 2] = q.scale_word; }
+        if (even) { base[kHidden / 2 + g / 2] = four ? w.four : w.six; }
     } else {
 #pragma unroll
         for (int offset = 1; offset <= 2; offset <<= 1) {
