@@ -6,8 +6,8 @@
 //    its twin's added tokens.
 // 2. Echo: a generated turn (tests/fixtures/inkling2/output_session_golden.json) parsed by the output session and
 //    sent back as the assistant message of the history renders the prompt's ids followed by the generated ids where
-//    the model wrote the template's canonical form; the first differing position is reported otherwise (it decides
-//    where a next turn's prefix reuse ends).
+//    the model wrote the template's canonical form, and tokenize_chat marks exactly the reply's ids as generated; the
+//    first differing position is reported otherwise (it decides where a next turn's prefix reuse ends).
 // 3. Refusals: images, continuation modes, constrained output, required tool choices; context length.
 //
 //   INFERNIX_TEST_INKLING_TOKENIZER_DIR  tokenizer.json, tokenizer_config.json and generation_config.json
@@ -219,6 +219,13 @@ int main() {
             while (at < again.size() && at < expected.size() && again[at] == expected[at]) { ++at; }
             if (again == expected) {
                 ++echoed;
+                // The history's generated mask covers exactly the reply's ids.
+                const infernix::ChatTokens chat = frontend.tokenize_chat(history);
+                bool mask = chat.ids == again && chat.generated.size() == again.size();
+                for (std::size_t i = 0; mask && i < again.size(); ++i) {
+                    mask = chat.generated[i] == (i >= prepared.token_ids().size() ? 1 : 0);
+                }
+                check(mask, name + ": tokenize_chat marks exactly the reply's ids as generated");
             } else {
                 std::cout << "  echo of \"" << name << "\": the history departs at generated position "
                           << (at - prepared.token_ids().size()) << " of " << generated.size() << '\n';

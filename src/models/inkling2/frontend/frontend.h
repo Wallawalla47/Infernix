@@ -63,6 +63,9 @@ public:
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
     [[nodiscard]] std::string detokenize_bytes(std::span<const TokenId> token_ids) const;
+    // The chat's ids and which of them the model writes: every assistant message, from its first <|message_model|>
+    // through its <|content_model_end_sampling|> (the template's generation blocks; no other role writes either).
+    [[nodiscard]] ChatTokens tokenize_chat(PromptInput input) const;
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
                                                     const OutputOptions& output                       = {},
                                                     const ThinkingControlOptions& thinking            = {},

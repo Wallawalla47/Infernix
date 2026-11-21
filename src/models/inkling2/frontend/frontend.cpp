@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -292,6 +293,21 @@ std::string Frontend::detokenize(std::span<const TokenId> token_ids) const { ret
 
 std::string Frontend::detokenize_bytes(std::span<const TokenId> token_ids) const {
     return impl_->tokenizer->decode_bytes(token_ids);
+}
+
+ChatTokens Frontend::tokenize_chat(PromptInput input) const {
+    Rendered rendered = impl_->render(input, std::numeric_limits<std::size_t>::max());
+    ChatTokens out;
+    out.generated.resize(rendered.ids.size(), 0);
+    bool inside = false;
+    for (std::size_t i = 0; i < rendered.ids.size(); ++i) {
+        const TokenId id = rendered.ids[i];
+        if (id == impl_->markers.message_model) { inside = true; }
+        out.generated[i] = inside ? 1 : 0;
+        if (id == impl_->markers.end_of_turn) { inside = false; }
+    }
+    out.ids = std::move(rendered.ids);
+    return out;
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
