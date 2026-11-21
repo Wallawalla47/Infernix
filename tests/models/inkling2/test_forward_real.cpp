@@ -857,6 +857,12 @@ int main() {
                         model->q8().storage.bytes / 1048576.0, 1000.0 * model->q8().seconds);
             q8_census(*model);
         }
+        {
+            std::size_t free = 0, total = 0;
+            cuda(cudaMemGetInfo(&free, &total), "memory");
+            std::printf("loaded: %.1f MiB of device weights; %.1f MiB of VRAM free\n",
+                        model->device_weight_bytes() / 1048576.0, free / 1048576.0);
+        }
         const m::Parameters parameters(*model);
         m::Forward forward(parameters, 1);
         State state(forward.layout());

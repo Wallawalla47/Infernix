@@ -72,6 +72,9 @@ int run_tests() {
     failures += check(parse({"infernix", "model.ninfer", "--prompt", "hello", "--embedding-host"}).embedding_host &&
                           !parse({"infernix", "model.ninfer", "--prompt", "hello"}).embedding_host,
                       "--embedding-host did not parse (default off)");
+    failures += check(parse({"infernix", "model.ninfer", "--prompt", "hello", "--q8-weights"}).q8_weights &&
+                          !parse({"infernix", "model.ninfer", "--prompt", "hello"}).q8_weights,
+                      "--q8-weights did not parse (default off)");
     const auto gated = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
                               "--draft-tokens", "3", "--spec-min-p", "0.7"});
     failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.7F,

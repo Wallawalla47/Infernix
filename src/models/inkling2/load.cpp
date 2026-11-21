@@ -213,8 +213,9 @@ std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const
 // faster as 8-bit weights in the decode round (2026-11-21, 4K context, captured round, against the shipped route):
 // each attention's fused input projections (the K2 parent and the sink/taps parent beside it, one launch) -7.6 % at
 // one column, -5.6 % at two, -1.3 % at eight; the head (in place of its bf16_p12 packing) -1.6 %, -1.4 %, -0.2 %.
-// W_o (-2.5 %, -1.4 %, +2.7 %; +6.7 % of its prefill time) and the message gates' downs (-0.1 %, +0.1 %, +0.1 %) stay
-// BF16.
+// W_o (-2.5 %, -1.4 %, +2.7 %: slower at eight, its arm also moving it from ops::linear's kernel to the fused
+// projections'; not re-timed since the wide Q8 kernel's spill fix) and the message gates' downs (-0.1 %, +0.1 %,
+// +0.1 %) stay BF16.
 std::vector<artifact::ObjectHandle> q8_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
                                                const artifact::Reader& reader) {
     std::vector<bool> selected(pending.size(), false);

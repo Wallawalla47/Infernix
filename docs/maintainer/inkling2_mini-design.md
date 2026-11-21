@@ -838,15 +838,16 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   the call's width and other columns), the head runs on them too (`ops::linear` has no Q8 route at its shape). Chosen
   per group in the captured round (2026-11-21, 4K context, against the shipped route, each group alone): K2 -7.6 % at
   one column, -5.6 % at two, -1.3 % at eight; the head (against its packed form) -1.6 %, -1.4 %, -0.2 %; W_o -2.5 %,
-  -1.4 %, +2.7 % (and +6.7 % of its prefill time) and the gates' downs -0.1 %, +0.1 %, +0.1 % stay BF16 (W_o's Q8 arm
-  also changed its kernel from `ops::linear`'s to the fused projections', so its result is not storage alone). A
-  2,048-column prefill call with every group in Q8 took +0.5 % (the wide Q8 kernel then spilled at W_o's and the gates'
-  K: the compiler hoisted every chunk's decode out of the pass loop; an empty `asm volatile` on the held codes keeps it
-  in the loop, 0 spills). Its oracle is the Op test's FP64 sum of the stored codes and scales; model-level closeness to
-  BF16 is reported, not judged (the quality gate is Quality Gates'). Shipped set measured (2026-11-21, infernix_bench,
-  Inkling corpus, two interleaved invocations against the default route): tg128 167.1 → 185.2 tok/s at C = 1, 399.8 →
-  419.4 at C = 4; pp2048 1,504.5 → 1,512.3, pp10000 1,457.0 → 1,463.3; load +0.03 s (the conversion 12-16 ms); weights
-  1,787 MiB of BF16 → 950 MiB (619 MiB less than the default's packed head + BF16 K2). On the perplexity corpus's quick
+  -1.4 %, +2.7 % and the gates' downs -0.1 %, +0.1 %, +0.1 % stay BF16. W_o is an open candidate: its Q8 arm also
+  changed its kernel from `ops::linear`'s to the fused projections', so its width-8 loss is not storage alone, and it
+  was not re-timed after the wide kernel's spill fix. (A 2,048-column prefill call with every group in Q8 took +0.5 %,
+  W_o's time +6.7 %, while the wide Q8 kernel spilled at W_o's and the gates' K: the compiler hoisted every chunk's
+  decode out of the pass loop; an empty `asm volatile` on the held codes keeps it in the loop, 0 spills.) Its oracle is the Op test's FP64 sum of the stored codes and scales; model-level closeness to
+  BF16 is reported, not judged (the quality gate is Quality Gates'). Shipped set measured (2026-11-21) against the
+  default route: in the captured round (4K context) -9.3 % at one column, -7.1 % at two, -1.4 % at eight; through
+  infernix_bench (Inkling corpus; two interleaved invocations at C = 1, one at C = 4 and 8) tg128 167.1 → 185.2 tok/s at
+  C = 1, 399.8 → 419.4 at C = 4, 531.4 → 549.5 at C = 8; pp2048 1,504.5 → 1,512.3, pp10000 1,457.0 → 1,463.3; load
+  +0.03 s (the conversion 12-16 ms); device weights 17,792.6 → 17,173.6 MiB, 620 MiB more VRAM free after load. On the perplexity corpus's quick
   set (291,842 tokens, context 4,096 / stride 2,048): perplexity 4.0348 → 4.0328, KL(BF16 ‖ Q8) mean 0.0107 (p99
   0.108), top-1 agreement 96.0 % (code 98.2 %, the prose and Chinese streams 95.1-95.6 %). Its FP16 group scales on the
   real matrices: none rounds to zero, 47 of 29.3 M are subnormal.
