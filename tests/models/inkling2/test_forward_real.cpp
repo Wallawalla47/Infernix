@@ -19,6 +19,9 @@
 //    embedding elements moves the reference's own logits by up to 8.8 and its mean NLL by up to 0.40, so neither is a
 //    criterion (a first criterion on prompt-position argmax and one on the NLL both failed for that reason, 2026-11-21).
 // 3. Decode = verify: the 32 positions as single-column calls give the free-running calls' logits bit for bit.
+// 4. Graphs: a 16-column call and a 1-column step captured whole (PDL dependents) and replayed three times from the
+//    same state give the eager logits bit for bit.
+// 5. Lanes: three lanes (different tokens, mixed widths, a padding column) in one call give each lane's solo logits.
 //
 // Diagnostics (environment): INFERNIX_INKLING2_DRIFT prints the free-running drift per visit and the NLL detail;
 // INFERNIX_INKLING2_HYBRID = blocks | input | perturb runs a hybrid (the reference's blocks and message sources, or its
@@ -165,30 +168,34 @@ std::vector<double> f32_values(const float* p, std::size_t n) {
 
 // ---------------------------------------------------------------------------- state
 
+// Lanes' images and the full visits' pools: one 64-position page a lane (lane l's page l), so positions below 64.
 struct State {
     m::StateView view;
     std::uint16_t* images = nullptr;
     std::vector<std::uint16_t*> pools;
     int* table = nullptr;
     std::size_t image_bytes = 0, pool_bytes = 0;
-    explicit State(const m::StateLayout& layout) {
-        image_bytes = static_cast<std::size_t>(layout.lane_words) * 2;
+    std::vector<std::vector<std::uint8_t>> saved;
+    explicit State(const m::StateLayout& layout, int lanes = 1) {
+        image_bytes = static_cast<std::size_t>(layout.lane_words) * 2 * lanes;
         cuda(cudaMalloc(&images, image_bytes), "state");
-        pool_bytes = std::size_t{ik::kKvHeads} * 1 * ik::kKeyUnit * ik::kHeadDim * 2;
+        pool_bytes = std::size_t{ik::kKvHeads} * lanes * ik::kKeyUnit * ik::kHeadDim * 2;
         for (int s = 0; s < 2 * layout.full_visits; ++s) {
             std::uint16_t* p = nullptr;
             cuda(cudaMalloc(&p, pool_bytes), "pool");
             pools.push_back(p);
         }
-        cuda(cudaMalloc(&table, 4), "table");
-        cuda(cudaMemset(table, 0, 4), "table");
+        std::vector<int> rows(lanes);
+        for (int l = 0; l < lanes; ++l) { rows[l] = l; }
+        cuda(cudaMalloc(&table, rows.size() * 4), "table");
+        cuda(cudaMemcpy(table, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice), "table");
         view.images     = images;
         view.lane_words = layout.lane_words;
         for (int s = 0; s < layout.full_visits; ++s) {
             view.pool_k.push_back(pools[2 * s]);
             view.pool_v.push_back(pools[2 * s + 1]);
         }
-        view.pool_pages   = 1;
+        view.pool_pages   = lanes;
         view.table        = table;
         view.table_stride = 1;
         reset();
@@ -196,6 +203,22 @@ struct State {
     void reset() {
         cuda(cudaMemset(images, 0, image_bytes), "reset");
         for (auto* p : pools) { cuda(cudaMemset(p, 0, pool_bytes), "reset"); }
+    }
+    // A host copy of every byte of the state, and its return (both synchronous).
+    void save() {
+        saved.clear();
+        saved.push_back(std::vector<std::uint8_t>(image_bytes));
+        cuda(cudaMemcpy(saved.back().data(), images, image_bytes, cudaMemcpyDeviceToHost), "save");
+        for (auto* p : pools) {
+            saved.push_back(std::vector<std::uint8_t>(pool_bytes));
+            cuda(cudaMemcpy(saved.back().data(), p, pool_bytes, cudaMemcpyDeviceToHost), "save");
+        }
+    }
+    void restore() {
+        cuda(cudaMemcpy(images, saved[0].data(), image_bytes, cudaMemcpyHostToDevice), "restore");
+        for (std::size_t i = 0; i < pools.size(); ++i) {
+            cuda(cudaMemcpy(pools[i], saved[i + 1].data(), pool_bytes, cudaMemcpyHostToDevice), "restore");
+        }
     }
     ~State() {
         cudaFree(images);
@@ -517,6 +540,123 @@ std::vector<float> free_running(const m::Parameters& p, m::Forward& fw, State& s
     return out;
 }
 
+// One call through the forward on `stream`, its logits downloaded.
+std::vector<float> run_call(const m::Parameters& p, m::Forward& fw, State& state, const m::CallPlan& plan,
+                            cudaStream_t stream) {
+    const auto& c = p.model.config().text;
+    fw.prepare(plan);
+    fw.embed(stream);
+    for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+    fw.finish(state.view, stream);
+    cuda(cudaStreamSynchronize(stream), "call");
+    return download(fw.buffers().logits, static_cast<std::size_t>(plan.columns()) * c.vocab_size);
+}
+
+// 4. The whole call captured as one CUDA graph on a non-blocking stream (the visit, attention and expert kernels
+//    become programmatic dependents) and replayed three times from the same state: the eager call's logits bit for
+//    bit, for a 16-column call from an empty state and a 1-column decode step after it.
+bool graph_replay(const m::Parameters& p, m::Forward& fw, State& state, const Reference& ref) {
+    const auto& c = p.model.config().text;
+    cudaStream_t stream = nullptr;
+    cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    bool ok = true;
+    state.reset();
+    for (const auto& [c0, width] : {std::pair{0, kT}, std::pair{kT, 1}}) {
+        const m::CallPlan plan = call_plan(ref, c0, width);
+        state.save();
+        const auto eager = run_call(p, fw, state, plan, nullptr);
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        fw.prepare(plan);
+        cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+        fw.embed(stream);
+        for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+        fw.finish(state.view, stream);
+        cuda(cudaStreamEndCapture(stream, &graph), "capture");
+        cuda(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (int replay = 0; replay < 3; ++replay) {
+            state.restore();
+            cuda(cudaGraphLaunch(exec, stream), "replay");
+            cuda(cudaStreamSynchronize(stream), "replay");
+            const auto got = download(fw.buffers().logits, static_cast<std::size_t>(width) * c.vocab_size);
+            const bool same = std::memcmp(got.data(), eager.data(), got.size() * 4) == 0;
+            ok = ok && same;
+            std::printf("graph replay %d of a %d-column call at position %d: %s\n", replay + 1, width, c0,
+                        same ? "the eager logits bit for bit" : "DIFFERENT");
+        }
+        cuda(cudaGraphExecDestroy(exec), "destroy");
+        cuda(cudaGraphDestroy(graph), "destroy");
+        state.restore();
+        (void)run_call(p, fw, state, plan, nullptr); // the state after this call, for the next one
+    }
+    cuda(cudaStreamDestroy(stream), "stream");
+    return ok;
+}
+
+// 5. Three lanes in one call with different token sequences and a padding column, in two calls of mixed widths:
+//    each lane's logits equal its own run alone (as the only lane of a one-lane forward) bit for bit.
+bool lanes_alone(const m::Parameters& p, m::Forward& solo, State& solo_state, const Reference& ref) {
+    const auto& c = p.model.config().text;
+    const std::int32_t* ids = ref.get<std::int32_t>("ids");
+    std::vector<std::vector<std::int32_t>> tokens(3);
+    for (int i = 0; i < kPositions; ++i) {
+        tokens[0].push_back(ids[i]);
+        tokens[1].push_back(ids[kPositions - 1 - i]);
+        tokens[2].push_back(ids[(i + 7) % kPositions]);
+    }
+    // Per call, each lane's first position and width (lane 0 0-7 then 8-15, lane 1 0-4 then 5-20, lane 2 0-11 then 12).
+    const int widths[2][3] = {{8, 5, 12}, {8, 16, 1}};
+    m::Forward multi(p, 3);
+    State multi_state(multi.layout(), 3);
+    std::vector<std::vector<float>> together(3), alone(3);
+    int at[3] = {0, 0, 0};
+    for (int call = 0; call < 2; ++call) {
+        m::CallPlan plan;
+        plan.first = {0, 0, 0};
+        int lane_at[3] = {at[0], at[1], at[2]};
+        for (int l = 0; l < 3; ++l) {
+            if (l == 1) { plan.tokens.push_back(0), plan.lane.push_back(-1), plan.position.push_back(0); } // padding
+            for (int i = 0; i < widths[call][l]; ++i) {
+                plan.tokens.push_back(tokens[l][lane_at[l] + i]);
+                plan.lane.push_back(l);
+                plan.position.push_back(lane_at[l] + i);
+            }
+        }
+        const auto logits = run_call(p, multi, multi_state, plan, nullptr);
+        for (int t = 0; t < plan.columns(); ++t) {
+            if (plan.lane[t] < 0) { continue; }
+            const float* row = logits.data() + static_cast<std::size_t>(t) * c.vocab_size;
+            together[plan.lane[t]].insert(together[plan.lane[t]].end(), row, row + c.vocab_size);
+        }
+        for (int l = 0; l < 3; ++l) { at[l] += widths[call][l]; }
+    }
+    for (int l = 0; l < 3; ++l) {
+        solo_state.reset();
+        int position = 0;
+        for (int call = 0; call < 2; ++call) {
+            m::CallPlan plan;
+            plan.first = {0};
+            for (int i = 0; i < widths[call][l]; ++i) {
+                plan.tokens.push_back(tokens[l][position + i]);
+                plan.lane.push_back(0);
+                plan.position.push_back(position + i);
+            }
+            const auto logits = run_call(p, solo, solo_state, plan, nullptr);
+            alone[l].insert(alone[l].end(), logits.begin(), logits.end());
+            position += widths[call][l];
+        }
+    }
+    bool ok = true;
+    for (int l = 0; l < 3; ++l) {
+        const bool same = together[l].size() == alone[l].size() &&
+                          std::memcmp(together[l].data(), alone[l].data(), alone[l].size() * 4) == 0;
+        ok = ok && same;
+        std::printf("lane %d (%zu positions) in a 3-lane call: %s\n", l, alone[l].size() / c.vocab_size,
+                    same ? "its solo logits bit for bit" : "DIFFERENT");
+    }
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -658,6 +798,8 @@ int main() {
             }
             std::printf("\n");
         }
+        ok = graph_replay(parameters, forward, state, ref) && ok;
+        ok = lanes_alone(parameters, forward, state, ref) && ok;
         std::printf(ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& error) {

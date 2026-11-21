@@ -1,8 +1,9 @@
 // Inkling 2's decode and verify attention (include/infernix/ops/inkling2_attention.h), sliding and full visits.
 //
-// One call of 22 columns: lane 0 at positions 1100-1103 (its window starts inside unit 1), lane 1 at 60-75 (crossing
-// a unit boundary, history from position 0), a padding column, and lane 2 at 5000 (sliding: a 17-unit window; full: 79
-// units in 27 splits of 3, so the in-split merge runs). Every earlier position of each lane holds random represented
+// One call of 24 columns: lane 0 at positions 1100-1103 (its window starts inside unit 1), lane 1 at 60-75 (crossing
+// a unit boundary, history from position 0), a padding column, lane 2 at 5000 (sliding: a 17-unit window; full: 79
+// units in 27 splits of 3, so the in-split merge runs) and lane 3 at 9000-9001 with its first position 8013 inside
+// its lowest unit (keys and conv history below it masked; full visits' tau above 1). Every earlier position of each lane holds random represented
 // keys (BF16 K, FP16 V of BF16 values) and the conv rings random inputs. Projections are random BF16 of the
 // checkpoint's scales (some query heads scaled so their clip engages; relative tables and sinks of realistic spread).
 //
@@ -42,7 +43,7 @@ namespace {
 
 constexpr int D = 128, NH = ik::kHeads, NKV = ik::kKvHeads, G = ik::kGroupHeads, RD = ik::kRelDim;
 constexpr int KVW = NKV * D, QW = NH * D, RW = NH * RD, R = ik::kRingPositions, U = ik::kKeyUnit;
-constexpr int kLanes = 3, kPoolPages = 128, kTableStride = 96;
+constexpr int kLanes = 4, kPoolPages = 256, kTableStride = 160;
 int g_failures = 0;
 
 void check(bool ok, const char* what) {
@@ -114,7 +115,7 @@ struct Tally {
 // ---------------------------------------------------------------------------- the call
 
 struct Call {
-    std::vector<int> lane, pos, first = {0, 0, 0};
+    std::vector<int> lane, pos, first = {0, 0, 0, 8013};
     [[nodiscard]] int size() const { return static_cast<int>(lane.size()); }
 };
 Call the_call() {
@@ -123,6 +124,7 @@ Call the_call() {
     for (int p = 60; p < 76; ++p) { c.lane.push_back(1), c.pos.push_back(p); }
     c.lane.push_back(-1), c.pos.push_back(0);
     c.lane.push_back(2), c.pos.push_back(5000);
+    for (int p = 9000; p < 9002; ++p) { c.lane.push_back(3), c.pos.push_back(p); }
     return c;
 }
 
@@ -190,7 +192,7 @@ Problem make_problem(bool full, const Call& call, std::uint32_t seed) {
         for (int i = 0; i < kPoolPages; ++i) { pages[i] = i; }
         std::shuffle(pages.begin(), pages.end(), gen);
         p.block_table.assign(std::size_t(kLanes) * kTableStride, -1);
-        const int need[kLanes] = {1104 / U + 1, 76 / U + 1, 5000 / U + 1};
+        const int need[kLanes] = {1104 / U + 1, 76 / U + 1, 5000 / U + 1, 9002 / U + 1};
         int next = 0;
         for (int l = 0; l < kLanes; ++l) {
             for (int b = 0; b < need[l]; ++b) { p.block_table[std::size_t(l) * kTableStride + b] = pages[next++]; }
@@ -411,7 +413,7 @@ void attention_check(const Problem& p, const Call& call, const Outputs& got, con
             const int kv = h / G;
             const std::uint16_t* q = got.q.data() + (std::size_t(t) * NH + h) * D;
             const std::uint16_t* r = got.r.data() + (std::size_t(t) * NH + h) * RD;
-            const int lo = p.full ? 0 : std::max(0, pos - (ik::kWindow - 1));
+            const int lo = std::max(call.first[lane], p.full ? 0 : std::max(0, pos - (ik::kWindow - 1)));
             std::vector<double> score;
             std::vector<const std::uint16_t*> vrows;
             double vmax = 0;
