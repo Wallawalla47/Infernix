@@ -80,6 +80,11 @@ void test_args() {
     check(!has_flag(args, "--kv-dtype") && std::find(args.begin(), args.end(), "int8") == args.end(),
           "remove_flag removes a flag with its value");
     check(flag_value({"--draft-tokens=auto"}, "--draft-tokens") == "auto", "flag_value reads --flag=value");
+    check(flag_value({"--max-context", "auto", "--kv-dtype", "int8", "--max-context", "250000"}, "--max-context") ==
+                  "250000" &&
+              !context_auto({"--max-context", "auto", "--max-context", "250000"}) &&
+              context_length({"--max-context=4096", "--max-context", "250000"}) == 250000,
+          "a repeated flag's value is its last, as infernix-serve parses it");
     check(context_length({"--max-context", "240000"}) == 240000, "context_length reads --max-context");
     check(context_length({}) == 8192, "context_length falls back to infernix-serve's default");
     check(context_length({"--max-context", "auto"}) == 0 && context_auto({"--max-context", "auto"}) &&

@@ -39,7 +39,11 @@ bool has_flag(const Args& args, std::string_view flag) {
 }
 
 std::optional<std::string> flag_value(const Args& args, std::string_view flag) {
-    const std::size_t index = find_flag(args, flag);
+    // The last occurrence: infernix-serve (and the CLI) take a repeated option's last value.
+    std::size_t index = std::string::npos;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (matches(args[i], flag)) { index = i; }
+    }
     if (index == std::string::npos) { return std::nullopt; }
     const std::string& token = args[index];
     if (token.size() > flag.size()) { return token.substr(flag.size() + 1); }

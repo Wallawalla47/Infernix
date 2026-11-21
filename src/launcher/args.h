@@ -21,7 +21,8 @@ using TakesValue = std::function<std::optional<bool>(std::string_view flag)>;
 // Index of the first occurrence of `flag` (as `--flag` or `--flag=value`), or npos.
 [[nodiscard]] std::size_t find_flag(const Args& args, std::string_view flag);
 [[nodiscard]] bool has_flag(const Args& args, std::string_view flag);
-// The value after `flag` (or after `=`); nullopt when absent or valueless.
+// The value after the last occurrence of `flag` (or after its `=`), the one infernix-serve uses; nullopt when absent
+// or valueless.
 [[nodiscard]] std::optional<std::string> flag_value(const Args& args, std::string_view flag);
 // Replaces every occurrence of `flag` with one `flag value` (appended when absent).
 void set_flag(Args& args, std::string_view flag, std::string_view value);
