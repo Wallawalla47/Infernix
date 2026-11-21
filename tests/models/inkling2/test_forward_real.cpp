@@ -5,7 +5,8 @@
 //   INFERNIX_INKLING2_ARTIFACT   an artifact converted with the inkling2_mini recipe
 //   INFERNIX_INKLING2_REFERENCE  the dump's path prefix: <prefix>.bin and <prefix>.json (tools/npz_to_bin.py)
 //
-// 1. Teacher-forced: two calls of 16 columns; before each visit the reference's input, blocks and message sources are
+// 1. Teacher-forced, on the decode route and again on the prompt route (CallPlan::prompt), the same criteria: two
+//    calls of 16 columns; before each visit the reference's input, blocks and message sources are
 //    injected, so each stage of each visit compares with the reference from the same inputs. Judged: every stage
 //    upstream of the experts (x_q/x_k/x_v, q, r, the stored k and v, sink, gate, a, W_o, cand, x_mlp, gamma, the
 //    final hidden) within 2^-5 of its row's largest magnitude; a routing difference at a near-tie is counted. The visit
@@ -22,14 +23,18 @@
 // 4. Graphs: a 16-column call and a 1-column step captured whole (PDL dependents) and replayed three times from the
 //    same state give the eager logits bit for bit.
 // 5. Lanes: three lanes (different tokens, mixed widths, a padding column) in one call give each lane's solo logits.
-// 6. The bit guard (INFERNIX_INKLING2_LOGITS_GUARD = a file of free-running logits): the decode route's logits byte
-//    for byte, for changes claimed to keep them.
+// 6. The bit guards, for changes claimed to keep the bits: INFERNIX_INKLING2_LOGITS_GUARD (the decode route's
+//    free-running logits, written by INFERNIX_INKLING2_LOGITS_OUT) and INFERNIX_INKLING2_PROMPT_LOGITS_GUARD (the
+//    prompt route's 32-column call, written by INFERNIX_INKLING2_PROMPT_LOGITS_OUT; the Engine test's scoring check
+//    reads it), each byte for byte.
 // 7. The prompt route (CallPlan::prompt: tensor-core projections, router and experts): the 32 positions as one prompt
 //    call give the bits of prompt calls of 8, and the greedy continuation equals the reference's. Reported: its
 //    argmax elsewhere and its largest logit difference from the reference and from the decode route.
 //
 // Timing (environment): INFERNIX_INKLING2_PROFILE = width (the captured decode round, INFERNIX_INKLING2_CONTEXT
-// positions before it); INFERNIX_INKLING2_PREFILL_PROFILE = width (one prompt call, each Op's time;
+// positions before it; INFERNIX_INKLING2_SKELETON = serial or trigger also times the same graph with every kernel
+// empty, = kernel-name parts "a|b" with those kernels empty, = names lists the round's kernels and their node counts);
+// INFERNIX_INKLING2_PREFILL_PROFILE = width (one prompt call, each Op's time;
 // INFERNIX_INKLING2_PREFILL_DECODE runs it on the decode route instead, for comparison).
 //
 // Diagnostics (environment): INFERNIX_INKLING2_DRIFT prints the free-running drift per visit and the NLL detail;
@@ -62,6 +67,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// graph_skeleton.cu: every kernel node of a graph made an empty kernel of the same launch shape; the count replaced.
+int skeletonize_graph(cudaGraph_t graph, bool trigger, const std::string& filter);
+void print_graph_kernels(cudaGraph_t graph);
 
 namespace {
 
@@ -317,8 +326,9 @@ double tail_worst(const std::vector<double>& got, const Reference& ref, const st
     return worst;
 }
 
-void teacher_forced(const m::Parameters& p, m::Forward& fw, State& state, const Reference& ref) {
+void teacher_forced(const m::Parameters& p, m::Forward& fw, State& state, const Reference& ref, bool prompt) {
     const auto& c  = p.model.config().text;
+    state.reset();
     const auto& b  = fw.buffers();
     const char* dump_dir = std::getenv("INFERNIX_INKLING2_DUMP");
     TailDump dump(dump_dir != nullptr ? c.visits() : 0);
@@ -329,7 +339,9 @@ void teacher_forced(const m::Parameters& p, m::Forward& fw, State& state, const 
     long logit_columns = 0;
     double logit_worst = 0;
     for (int c0 = 0; c0 < kPositions; c0 += kT) {
-        fw.prepare(call_plan(ref, c0, kT));
+        m::CallPlan plan = call_plan(ref, c0, kT);
+        plan.prompt      = prompt;
+        fw.prepare(plan);
         fw.embed(nullptr);
         std::vector<bool> skip(kT, false), none(kT, false);
         compare("embed", bf16_values(b.e, static_cast<std::size_t>(kT) * H), ref, "e", c0, kT, H, none);
@@ -673,6 +685,34 @@ void profile_rounds(const m::Parameters& p, m::Forward& fw, State& state, const 
     cuda(cudaEventElapsedTime(&ms, start, stop), "event");
     std::printf("timing: %d-column step at context %d: %.4f ms a round (%.1f tokens/s)\n", width, context, ms / kRuns,
                 1000.0 * width * kRuns / ms);
+    const char* skeleton_mode = std::getenv("INFERNIX_INKLING2_SKELETON");
+    if (skeleton_mode != nullptr && std::string(skeleton_mode) == "names") {
+        print_graph_kernels(graph);
+    } else if (skeleton_mode != nullptr) {
+        // Attribution: the same graph with every kernel an empty one of its grid, block and shared memory (the edges,
+        // programmatic ones included, unchanged): the chain of launches and dependency waits alone.
+        cudaGraph_t skeleton = nullptr;
+        cudaGraphExec_t skeleton_exec = nullptr;
+        cuda(cudaGraphClone(&skeleton, graph), "clone");
+        // INFERNIX_INKLING2_SKELETON = serial, trigger, or kernel-name parts ("a|b"): only those kernels emptied.
+        const std::string mode = std::getenv("INFERNIX_INKLING2_SKELETON");
+        const bool trigger     = mode == "trigger";
+        const std::string filter = mode == "serial" || mode == "trigger" ? std::string() : mode;
+        const int kernels  = skeletonize_graph(skeleton, trigger, filter);
+        cuda(cudaGraphInstantiate(&skeleton_exec, skeleton, 0), "instantiate");
+        for (int i = 0; i < 20; ++i) { cuda(cudaGraphLaunch(skeleton_exec, stream), "warm"); }
+        cuda(cudaEventRecord(start, stream), "event");
+        for (int i = 0; i < kRuns; ++i) { cuda(cudaGraphLaunch(skeleton_exec, stream), "time"); }
+        cuda(cudaEventRecord(stop, stream), "event");
+        cuda(cudaEventSynchronize(stop), "event");
+        float skeleton_ms = 0;
+        cuda(cudaEventElapsedTime(&skeleton_ms, start, stop), "event");
+        std::printf("skeleton (%s): %d kernels, %.4f ms a round (%.1f %% of the round)\n",
+                    filter.empty() ? (trigger ? "triggering at entry" : "serialized") : filter.c_str(), kernels,
+                    skeleton_ms / kRuns, 100.0 * skeleton_ms / ms);
+        cuda(cudaGraphExecDestroy(skeleton_exec), "destroy");
+        cuda(cudaGraphDestroy(skeleton), "destroy");
+    }
     cuda(cudaProfilerStart(), "profiler");
     for (int i = 0; i < 50; ++i) { cuda(cudaGraphLaunch(exec, stream), "replay"); }
     cuda(cudaStreamSynchronize(stream), "replay");
@@ -875,6 +915,11 @@ int main() {
             cuda(cudaMemGetInfo(&free, &total), "memory");
             std::printf("loaded: %.1f MiB of device weights; %.1f MiB of VRAM free\n",
                         model->device_weight_bytes() / 1048576.0, free / 1048576.0);
+            // The forward's call buffers by capacity (the Program's is the prefill chunk, capped at the context).
+            for (const std::int32_t capacity : {128, 512, 2048, 4096, 8191}) {
+                std::printf("forward buffers at a capacity of %d columns, 1 lane: %.1f MiB\n", capacity,
+                            m::Forward::device_bytes(model->config().text, 1, capacity) / 1048576.0);
+            }
         }
         const m::Parameters parameters(*model);
         m::Forward forward(parameters, 1);
@@ -893,19 +938,25 @@ int main() {
             return 0;
         }
 
-        teacher_forced(parameters, forward, state, ref);
         bool ok = true;
-        std::printf("%-24s %8s %8s %s\n", "stage", "columns", "excluded", "worst |diff| / row max");
-        for (const auto& [name, s] : g_stages) {
-            // The tails cross the experts' 4-bit activation boundary with inputs an ulp apart: reported here, judged
-            // boundary-conditioned (the reference's MoE on the kernel's own x_mlp: .local tools/tail_check.py).
-            const bool judged = name.rfind("tail", 0) != 0;
-            const bool pass   = !judged || s.worst <= 0x1p-5;
-            ok                = ok && pass;
-            std::printf("%-24s %8ld %8ld %.3e%s\n", name.c_str(), s.columns, s.excluded, s.worst,
-                        !judged ? "  (reported)" : (pass ? "" : "  FAIL"));
+        // 1. Teacher-forced, on the decode route and then on the prompt route (the same criteria).
+        for (const bool prompt : {false, true}) {
+            g_stages.clear();
+            g_routing_differs = 0;
+            teacher_forced(parameters, forward, state, ref, prompt);
+            std::printf("teacher-forced, %s route:\n%-24s %8s %8s %s\n", prompt ? "prompt" : "decode", "stage", "columns",
+                        "excluded", "worst |diff| / row max");
+            for (const auto& [name, s] : g_stages) {
+                // The tails cross the experts' 4-bit activation boundary with inputs an ulp apart: reported here,
+                // judged boundary-conditioned (the reference's MoE on the kernel's own x_mlp: .local tools/tail_check.py).
+                const bool judged = name.rfind("tail", 0) != 0;
+                const bool pass   = !judged || s.worst <= 0x1p-5;
+                ok                = ok && pass;
+                std::printf("%-24s %8ld %8ld %.3e%s\n", name.c_str(), s.columns, s.excluded, s.worst,
+                            !judged ? "  (reported)" : (pass ? "" : "  FAIL"));
+            }
+            std::printf("routing differs from the reference in %ld (visit, column) pairs\n", g_routing_differs);
         }
-        std::printf("routing differs from the reference in %ld (visit, column) pairs\n", g_routing_differs);
 
         std::vector<float> hybrid_logits;
         const char* hybrid = std::getenv("INFERNIX_INKLING2_HYBRID");
@@ -1048,6 +1099,21 @@ int main() {
             const bool same  = std::memcmp(one.data(), eight.data(), one.size() * 4) == 0;
             std::printf("prompt route: one 32-column call = calls of 8: %s\n", same ? "bit for bit" : "DIFFERENT");
             ok = ok && same;
+            // The prompt route's guard (the Engine test's scoring check reads the same file):
+            // INFERNIX_INKLING2_PROMPT_LOGITS_OUT writes its logits, INFERNIX_INKLING2_PROMPT_LOGITS_GUARD requires them.
+            if (const char* out = std::getenv("INFERNIX_INKLING2_PROMPT_LOGITS_OUT"); out != nullptr) {
+                std::ofstream f(out, std::ios::binary);
+                f.write(reinterpret_cast<const char*>(one.data()), static_cast<std::streamsize>(one.size() * 4));
+                std::printf("wrote the prompt route's logits to %s\n", out);
+            }
+            if (const char* guard = std::getenv("INFERNIX_INKLING2_PROMPT_LOGITS_GUARD"); guard != nullptr) {
+                std::ifstream f(guard, std::ios::binary);
+                std::vector<float> want(one.size());
+                f.read(reinterpret_cast<char*>(want.data()), static_cast<std::streamsize>(want.size() * 4));
+                const bool equal = static_cast<bool>(f) && std::memcmp(want.data(), one.data(), one.size() * 4) == 0;
+                std::printf("prompt route guard (%s): %s\n", guard, equal ? "the logits byte for byte" : "DIFFERENT");
+                ok = ok && equal;
+            }
             double vs_ref = 0, vs_decode = 0;
             int prompt_differ = 0;
             for (int t = 0; t < kPositions; ++t) {

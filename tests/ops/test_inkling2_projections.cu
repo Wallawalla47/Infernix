@@ -115,7 +115,10 @@ double f16_value(std::uint16_t h) {
 // products by fma, then 5 butterfly adds: |err| <= (K / 32 + 5) u sum |w x|, u = 2^-24) plus BF16 rounding of the
 // output (<= 2^-8 |y|, one ulp's half on either side of a rounding). Every column of the call must also equal the
 // same column projected alone (T = 1, the narrow kernel) bit for bit: width invariance, and wide = narrow.
-void run_q8(const Case& c, int columns, std::uint32_t seed) {
+using ProjectionsFn = void (*)(const ik::ProjectionArgs&, cudaStream_t);
+// fn: the fold (projections, bound (K / 32 + 5) 2^-24 sum|wx|) or the prompt route's MMA (projections_mma, (K / 16 + 5)
+// 2^-23 sum|wx|: per 32-group an MMA sum then an fma with its scale).
+void run_q8(const Case& c, int columns, std::uint32_t seed, ProjectionsFn fn = ik::projections, bool mma = false) {
     std::mt19937 gen(seed);
     const int word = c.fp32 ? 4 : 2;
     std::uint16_t* x[3];
@@ -178,7 +181,7 @@ void run_q8(const Case& c, int columns, std::uint32_t seed) {
         seg.q8_stride = stride;
         args.segments[args.count++] = seg;
     }
-    ik::projections(args, nullptr);
+    fn(args, nullptr);
     // Each column alone: the same segments, the inputs and outputs offset to that column.
     std::vector<void*> alone;
     for (int s = 0; s < args.count; ++s) {
@@ -191,12 +194,12 @@ void run_q8(const Case& c, int columns, std::uint32_t seed) {
         for (int s = 0; s < args.count; ++s) {
             one.segments[s].out = static_cast<std::uint8_t*>(alone[s]) + static_cast<std::size_t>(t) * args.segments[s].rows * word;
         }
-        ik::projections(one, nullptr);
+        fn(one, nullptr);
     }
     cuda_check(cudaDeviceSynchronize(), "projections");
     long outside = 0, differ = 0, total = 0;
     double worst = 0;
-    const double depth = c.k / 32 + 5;
+    const double depth = mma ? 2.0 * (c.k / 16 + 5) : c.k / 32 + 5; // in units of 2^-24
     for (int s = 0; s < args.count; ++s) {
         const std::size_t n = static_cast<std::size_t>(columns) * args.segments[s].rows;
         std::vector<std::uint8_t> got(n * word), solo(n * word);
@@ -222,9 +225,9 @@ void run_q8(const Case& c, int columns, std::uint32_t seed) {
         }
         total += static_cast<long>(n);
     }
-    std::printf("%-44s Q8   T = %2d: %ld of %ld outside the bound (worst |err| / sum|wx| %.2e), %ld differ from the "
+    std::printf("%-44s %s T = %2d: %ld of %ld outside the bound (worst |err| / sum|wx| %.2e), %ld differ from the "
                 "column alone\n",
-                c.name, columns, outside, total, worst, differ);
+                c.name, mma ? "Q8MMA" : "Q8  ", columns, outside, total, worst, differ);
     if (outside != 0 || differ != 0) { ++g_failures; }
     for (auto* p : x) { cudaFree(p); }
     for (auto* p : blocks) { cudaFree(p); }
@@ -238,7 +241,7 @@ void run_q8(const Case& c, int columns, std::uint32_t seed) {
 // step, at a unit that also covers truncating internal adds) plus BF16 rounding of the output (2^-8 |y|). Every
 // column must equal the same column projected alone (a 1-column call: the narrow tile shape) bit for bit, so the bits
 // depend neither on the call's width nor on its tile shape. Wide calls check a sample of their columns.
-void run_mma(const Case& c, int columns, std::uint32_t seed) {
+void run_mma(const Case& c, int columns, std::uint32_t seed, ProjectionsFn fn = ik::projections_mma, const char* label = "MMA ") {
     std::mt19937 gen(seed);
     const int word = c.fp32 ? 4 : 2;
     std::uint16_t* x[3];
@@ -271,7 +274,7 @@ void run_mma(const Case& c, int columns, std::uint32_t seed) {
         seg.out    = dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * rows * word);
         args.segments[args.count++] = seg;
     }
-    ik::projections_mma(args, nullptr);
+    fn(args, nullptr);
     // The checked columns: all up to 40, else the first 3, the last 2 and 5 between.
     std::vector<int> checked;
     if (columns <= 40) {
@@ -291,7 +294,7 @@ void run_mma(const Case& c, int columns, std::uint32_t seed) {
             one.segments[s].out =
                 static_cast<std::uint8_t*>(alone[s]) + static_cast<std::size_t>(t) * args.segments[s].rows * word;
         }
-        ik::projections_mma(one, nullptr);
+        fn(one, nullptr);
     }
     cuda_check(cudaDeviceSynchronize(), "projections_mma");
     long outside = 0, differ = 0, total = 0;
@@ -332,9 +335,9 @@ void run_mma(const Case& c, int columns, std::uint32_t seed) {
             }
         }
     }
-    std::printf("%-44s MMA  T = %4d: %ld of %ld outside the bound (worst %.3f of it), %ld differ from the column "
+    std::printf("%-44s %s T = %4d: %ld of %ld outside the bound (worst %.3f of it), %ld differ from the column "
                 "alone\n",
-                c.name, columns, outside, total, worst, differ);
+                c.name, label, columns, outside, total, worst, differ);
     if (outside != 0 || differ != 0) { ++g_failures; }
     for (auto* p : x) { cudaFree(p); }
     for (auto* p : weights) { cudaFree(p); }
@@ -436,6 +439,8 @@ INFERNIX_OP_TEST(inkling2_projections) {
     const std::vector<Case> q8_cases = {cases[0], cases[1], cases[3], {"head rows [4096, 2304], FP32 out", 2304, true, {{4096, 0}}}};
     for (const auto& c : q8_cases) {
         for (const int columns : {1, 3, 8, 16, 17, 40, 100}) { run_q8(c, columns, seed++); }
+        // The prompt route's Q8 tensor-core arithmetic.
+        for (const int columns : {1, 3, 16, 17, 100, 300}) { run_q8(c, columns, seed++, ik::projections_mma, true); }
     }
     // The tensor-core projections at the same shapes, the router's [128, 2304] FP32 and the head's arithmetic, at
     // narrow and wide widths (tile shapes: <= 16 columns, few rows, wide).

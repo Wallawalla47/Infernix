@@ -73,9 +73,10 @@ std::uint64_t elapsed_ns(Clock::time_point start) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
-// The forward's call capacity: the prefill chunk, and at least the decode and verify calls' width.
+// The forward's call capacity: the prefill chunk (no wider than the context: a call never holds more prompt
+// positions), and at least the decode and verify calls' width.
 std::int32_t forward_capacity(const ProgramOptions& o) {
-    return std::max(kMaxForwardColumns, static_cast<std::int32_t>(o.prefill_chunk));
+    return std::max(kMaxForwardColumns, static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context)));
 }
 
 std::uint32_t pages_per_lane(std::uint32_t max_context) {

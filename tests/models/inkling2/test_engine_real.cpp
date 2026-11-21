@@ -12,7 +12,7 @@
 //    greedy continuation, and chunks of 128, 100, 1,000 and 4,096 the scoring logits (19 positions across the
 //    window's wrap and the chunk edges), of chunks of 16 byte for byte.
 // 5. Scoring: a CausalScoring Engine's logits of the 32 golden ids (positions 0-30) equal the forward test's
-//    free-running logits (INFERNIX_INKLING2_LOGITS_GUARD) byte for byte.
+//    prompt-route logits (INFERNIX_INKLING2_PROMPT_LOGITS_GUARD: scoring runs the prompt route) byte for byte.
 // 6. --q8-weights (approximate 8-bit weights): refused with --reproducible; under it, an eager Engine at chunks of 16
 //    serving one request at a time is the reference, and graphs (alone and C = 4 in reverse order), chunks of 7, and
 //    the long prompt in one 4,096-column call give its tokens.
@@ -21,7 +21,7 @@
 //
 //   INFERNIX_INKLING2_ARTIFACT      an artifact converted with the inkling2_mini recipe
 //   INFERNIX_INKLING2_REFERENCE     the reference dump's path prefix (<prefix>.bin and <prefix>.json: the golden ids)
-//   INFERNIX_INKLING2_LOGITS_GUARD  the forward test's free-running logits ([32][V] FP32), for 5
+//   INFERNIX_INKLING2_PROMPT_LOGITS_GUARD  the forward test's prompt-route logits ([32][V] FP32), for 5
 
 #include "infernix/engine.h"
 
@@ -176,7 +176,7 @@ void require_alone(const std::string& label, infernix::Engine& engine, const std
 int main() {
     const char* artifact  = std::getenv("INFERNIX_INKLING2_ARTIFACT");
     const char* reference = std::getenv("INFERNIX_INKLING2_REFERENCE");
-    const char* guard     = std::getenv("INFERNIX_INKLING2_LOGITS_GUARD");
+    const char* guard     = std::getenv("INFERNIX_INKLING2_PROMPT_LOGITS_GUARD");
     if (artifact == nullptr || reference == nullptr) {
         std::cout << "skip: set INFERNIX_INKLING2_ARTIFACT and INFERNIX_INKLING2_REFERENCE\n";
         return 77;
@@ -383,9 +383,9 @@ int main() {
             std::size_t differ = 0;
             for (std::size_t i = 0; i < want.size(); ++i) { differ += std::memcmp(&want[i], &result.logits[i], 4) != 0 ? 1 : 0; }
             require(differ == 0, "scoring: " + std::to_string(differ) + " logits differ from the forward test's");
-            std::cout << "scoring: 31 logits rows equal the forward test's byte for byte\n";
+            std::cout << "scoring: 31 logits rows equal the forward test's prompt route byte for byte\n";
         } else {
-            std::cout << "scoring skipped: INFERNIX_INKLING2_LOGITS_GUARD is not set\n";
+            std::cout << "scoring skipped: INFERNIX_INKLING2_PROMPT_LOGITS_GUARD is not set\n";
         }
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -49,7 +49,7 @@ inline constexpr std::size_t kMaximumConcurrency = 8;
 // The widest prefill chunk: the forward's call capacity, bounded by the routed experts' dispatch.
 inline constexpr std::int32_t kMaxPrefillChunk = 8191;
 // The default chunk: the fastest measured (every chunk gives the same bits).
-inline constexpr std::uint32_t kDefaultPrefillChunk = 512;
+inline constexpr std::uint32_t kDefaultPrefillChunk = 4096;
 
 // Read-only diagnostics of the Program's physical stores.
 struct PhysicalUsageSnapshot {

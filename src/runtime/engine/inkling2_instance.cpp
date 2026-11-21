@@ -63,8 +63,9 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
     refuse(options.max_context_auto, "--max-context auto is not resolved yet: give a context limit");
     refuse(options.max_concurrency == 0 || options.max_concurrency > models::inkling2::kMaximumConcurrency,
            "max_concurrency must be 1-8");
-    // 512: the fastest chunk measured (2026-11-21, infernix_bench pp2048: 1,303.7 at 128, 1,505.5 at 512, 1,398.1 at
-    // 2,048 tok/s); every chunk gives the same bits.
+    // 4,096: the fastest chunk measured on the prompt route (2026-11-21, infernix_bench C = 1, pp2048 / pp10000 tok/s:
+    // 9,514 / 8,514 at 512, 13,827 / 12,851 at 1,024, 16,400 / 14,926 at 2,048, 16,387 / 16,312 at 4,096); every
+    // chunk gives the same bits.
     if (options.prefill_chunk == 0) { options.prefill_chunk = models::inkling2::kDefaultPrefillChunk; }
     refuse(options.prefill_chunk > static_cast<std::uint32_t>(models::inkling2::kMaxPrefillChunk),
            "prefill chunks are at most 8191 columns");

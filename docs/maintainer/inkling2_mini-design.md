@@ -961,7 +961,7 @@ K/V through the codec before reading it, so in-chunk and cached keys are the sam
 ([§9.3](#93-prefill)). The model has no recurrent layer whose kernel chunking regroups sums (its convs read a 3-position
 history), so, as TokenSpeed notes for KV-only models, a prefix resumes at any token bit for bit. Then publication and
 resumes are exact at any prefill-computed frontier, chunks can be any width (the default is the fastest measured,
-512 columns today), and the prompt's last two calls merge (L23). Where an Op cannot be made invariant, the Qwen rule
+4,096 columns today, no wider than the context), and the prompt's last two calls merge (L23). Where an Op cannot be made invariant, the Qwen rule
 applies instead: a canonical chunk grid and grid-only publication on the reproducible route.
 
 Built (2026-11-21): the first prefill route keeps the decode route's arithmetic at every width instead of a second
@@ -985,17 +985,35 @@ each projection to SIMT FMAs reading x once per two rows (~6 TFLOPs at K2), and 
 tensor cores at every width, while decode, verification and forced tokens keep the decode route: the owner's agreed
 reproducible-route contract lets a prompt token differ from the same position computed by decode, and requires only
 that each route give a column the same bits in any call (so any chunking of a prompt is exact, and verify columns
-equal decode columns). The fused projections (K2, W_o, the gates' downs and forget/gain) and the router's FP32 logits
-run `projections_mma` (ops::linear's MMA arithmetic: each output's k16 steps in ascending K chained through the FP32
-accumulator, no split of K; FP64 oracle: worst 0.06 of a (K/16 + 5) 2^-23 Σ|wx| bound at FP32 output); each column's
-selection by a warp; the NVFP4 experts offloaded_sparse_moe's grouped `mxf4nvf4` pipeline at Inkling's geometry with
-this Op's epilogues (bf16(acc · rs), the softcapped SwiGLU · γ, four-over-six h by warp, bf16(acc · rs_h); FP64 oracle
-over the kernel's own h within half a BF16 ulp plus the FP32 sum's bound: worst 0.992 of it; on the op test's random
-banks it matched the exact narrow route on every checked output). The MXFP8 layers and attention still run the decode
-route's kernels on prompt calls. A 2,048-column call (forward test, one eager call): 1,552 ms → 221 ms (9,264
-tok/s): experts 83.5 ms, attention 76.9, K2 23.4, W_o 9.0, gates 8.7, router 8.0. A narrow instance of the projections'
-MMA arithmetic in the decode round lost to the fold at widths 1 and 2 (+20.8 %, +18.0 %) and won at 8 (−6.4 %), so the
-decode route keeps the fold.
+equal decode columns). It is the reproducible route's prefill too, with two rules for the work that follows: on
+`--reproducible` no request resumes from state the decode route produced (a later turn's prompt containing an earlier
+answer is prefilled, or resumed only from prompt-route state), and Replay re-runs generated tokens on the decode
+route.
+
+- **Projections and router.** The fused projections (K2, W_o, the gates' downs and forget/gain) and the router's FP32
+  logits run `projections_mma` (ops::linear's MMA arithmetic: each output's k16 steps in ascending K chained through
+  the FP32 accumulator, no split of K; FP64 oracle: worst 0.06 of a (K/16 + 5) 2^-23 Σ|wx| bound at FP32 output). Under
+  `--q8-weights` the Q8 matrices run its Q8 form: per 32-group in ascending order, two chained MMAs from zero over the
+  group's codes (as BF16, exact) and the BF16 inputs, then acc = fma(sum, the row's FP16 group scale, acc) (FP64 oracle
+  over the represented weights within 2 (K/16 + 5) 2^-24 Σ|wx|). Each column's selection by a warp.
+- **Experts.** The NVFP4 layers run offloaded_sparse_moe's grouped `mxf4nvf4` pipeline at Inkling's geometry with this
+  Op's epilogues (bf16(acc · rs), the softcapped SwiGLU · γ, four-over-six h by warp, bf16(acc · rs_h); FP64 oracle
+  over the kernel's own h within half a BF16 ulp plus the FP32 sum's bound: worst 0.992 of it; on the op test's random
+  banks it matched the exact narrow route on every checked output). The MXFP8 layers run a grouped block-scaled FP8
+  GEMM (m16n8k32 `mxf8f6f4`, the record's units as A fragments; h's MXFP8 groups by warp into the row the layer's
+  input plane frees; outputs within half a BF16 ulp plus the FP32 sum's bound of FP64 over the kernel's h: worst
+  0.990; 2 of 129,024 checked outputs differ from the decode route).
+- **Attention.** `attention_prompt`: the decode route's prologue, then a CTA of 12 warps per (64 columns, KV head) over
+  each row's fixed absolute 64-key units in ascending order: S = q kᵀ by BF16 MMA, the decode route's bias (the fma fold
+  over r P, from a per-unit shared copy of the table's columns), online softmax in base 2, p rounded to FP16 for P V by
+  FP16 MMA, FP32 accumulation (FP64 oracle within its stated bound: worst 0.612). It still spills (26 STL / 24 LDL at
+  168 registers).
+- **Measured.** A 2,048-column call (forward test, one eager call): 1,552 ms → 122 ms (16,778 tok/s). Engine
+  (infernix_bench, C = 1, RTX 5090, pp2048 / pp10000 tok/s): 9,514 / 8,514 at 512-column chunks, 13,827 / 12,851 at
+  1,024, 16,400 / 14,926 at 2,048, 16,387 / 16,312 at 4,096 (the default chunk; a lane's forward buffers take
+  1,462 MiB at 4,096 against 318 MiB at 512); pp32 / pp128 / pp512: 1,165 / 3,823 / 10,238; `--q8-weights` pp2048
+  16,014.5. One prompt call on each route (forward test): 32 columns 26.0 against 32.9 ms on the decode route, 128
+  30.0 against 97.9, 512 46.3 against 351.8.
 
 ### 14.2 Pass schedule
 

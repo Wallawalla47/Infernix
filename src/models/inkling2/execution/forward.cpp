@@ -7,7 +7,6 @@
 #include "infernix/ops/linear.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -81,10 +80,10 @@ void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, 
     args.segments[args.count++] = s;
 }
 
-// A prompt call's fused projections run on tensor cores (projections_mma, BF16 storage); a decode-route call, and a Q8
-// matrix (--q8-weights: no Q8 tensor-core route yet), the fold (projections).
+// The fused projections: a prompt call's on projections_mma (BF16 or Q8 storage); a decode-route call's (decode,
+// verification, forced tokens) on the fold (projections).
 bool use_mma(bool prompt, const ik::ProjectionArgs& a) {
-    return prompt && a.segments[0].weight != nullptr && a.k % 64 == 0;
+    return prompt && (a.segments[0].weight != nullptr || a.segments[0].q8_scales != nullptr) && a.k % 64 == 0;
 }
 void project_fused(bool prompt, const ik::ProjectionArgs& a, cudaStream_t stream) {
     if (use_mma(prompt, a)) {
@@ -462,7 +461,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     const std::uint16_t* xk = three ? b_.x[1] : b_.x[0];
     const std::uint16_t* xv = three ? b_.x[2] : b_.x[0];
 
-    // K2: every projection of the visit's inputs in one launch (the BF16 skinny route's arithmetic).
+    // K2: every projection of the visit's inputs in one launch (project_fused: the call's route's arithmetic).
     const AttentionOperands& a = op.attention;
     ik::ProjectionArgs k2{};
     k2.columns = T;

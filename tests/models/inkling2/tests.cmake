@@ -43,7 +43,7 @@ set_tests_properties(infernix_inkling2_engine_real_test PROPERTIES SKIP_RETURN_C
 # The forward on a real artifact against the CPU reference's per-visit dump (teacher-forced stages, free-running
 # argmax, decode = verify): skips without INFERNIX_INKLING2_ARTIFACT and INFERNIX_INKLING2_REFERENCE.
 infernix_add_test(infernix_inkling2_forward_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_forward_real.cpp"
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_forward_real.cpp" "${CMAKE_CURRENT_LIST_DIR}/graph_skeleton.cu"
   LIBRARIES infernix_model_runtime infernix::json)
 set_tests_properties(infernix_inkling2_forward_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
   LABELS "gpu;real" TIMEOUT 1800)

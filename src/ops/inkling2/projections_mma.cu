@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace infernix::ops::inkling2 {
@@ -36,7 +37,15 @@ struct MmaSegment {
     const __nv_bfloat16* x;
     void* out;
     std::int32_t rows;
+    // Q8 storage (Q8_G32_FP16 RowSplit): int8 codes [rows][stride] and FP16 scales [rows][stride / 32].
+    const std::uint8_t* codes   = nullptr;
+    const std::uint16_t* scales = nullptr;
+    std::int32_t stride         = 0;
 };
+
+// A Q8 stage's weights: codes [BM][kQ8Row] (64 a row used; the padding spreads the fragment rows over the banks) and
+// scales [BM][2] (the stage's two 32-groups), inside the BF16 stage's region.
+constexpr int kQ8Row = 80;
 
 struct MmaParams {
     MmaSegment seg[kMaxProjectionSegments];
@@ -61,13 +70,84 @@ constexpr int shared_bytes() {
     return std::max(Sched::kSharedBytes, staging_bytes<Sched>());
 }
 
-template <class Sched, class Out>
+// A Q8 stage (BK = 64: two 32-groups): per group a chain of two m16n8k16 MMAs from zero over the codes (as BF16, exact)
+// and the columns' BF16 inputs, then acc = fma(group sum, the row's group scale, acc). The B fragments as
+// bf16_mma_compute_stage reads them.
+template <class Sched>
+__device__ __forceinline__ void q8_compute_stage(const std::uint8_t* codes, const std::uint16_t* scales,
+                                                 const __nv_bfloat16* Bs,
+                                                 float (&accum)[Sched::kMmaRows][Sched::kMmaTokens][4], int warp,
+                                                 int lane) {
+    constexpr int BK = Sched::kBlockK, WM = Sched::kWarpRows, WN = Sched::kWarpTokens;
+    constexpr int MT = Sched::kMmaRows, NT = Sched::kMmaTokens;
+    static_assert(BK == 64, "a Q8 stage is two 32-groups");
+    const int wm = warp / Sched::kWarpsTokens, wn = warp % Sched::kWarpsTokens;
+    const int g = lane >> 2, t = lane & 3;
+    const int b_inner_row = lane & 7, b_k_offset = ((lane >> 3) & 1) << 3;
+    const auto pair = [&](int row, int k) {
+        const unsigned v = *reinterpret_cast<const std::uint16_t*>(codes + row * kQ8Row + k);
+        const __nv_bfloat162 b = __floats2bfloat162_rn(static_cast<float>(static_cast<signed char>(v & 0xFFU)),
+                                                       static_cast<float>(static_cast<signed char>(v >> 8)));
+        return *reinterpret_cast<const unsigned*>(&b);
+    };
+#pragma unroll
+    for (int grp = 0; grp < 2; ++grp) {
+        float tmp[MT][NT][4] = {};
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            const int k = 32 * grp + 16 * ks;
+            unsigned a[MT][4];
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                const int r = wm * WM + mi * 16 + g;
+                a[mi][0] = pair(r, k + 2 * t);
+                a[mi][1] = pair(r + 8, k + 2 * t);
+                a[mi][2] = pair(r, k + 8 + 2 * t);
+                a[mi][3] = pair(r + 8, k + 8 + 2 * t);
+            }
+            unsigned b[NT][2];
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                const int row = wn * WN + ni * 8 + b_inner_row;
+                const int col = k + b_k_offset;
+                ldmatrix_x2(b[ni][0], b[ni][1], smem_addr(&Bs[row * BK + d::bf16_mma_shared_col<Sched>(row, col)]));
+            }
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    mma_bf16(tmp[mi][ni][0], tmp[mi][ni][1], tmp[mi][ni][2], tmp[mi][ni][3], a[mi][0], a[mi][1],
+                             a[mi][2], a[mi][3], b[ni][0], b[ni][1]);
+                }
+            }
+        }
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            const int r = wm * WM + mi * 16 + g;
+            const float s0 = __half2float(__ushort_as_half(scales[r * 2 + grp]));
+            const float s1 = __half2float(__ushort_as_half(scales[(r + 8) * 2 + grp]));
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                accum[mi][ni][0] = fmaf(tmp[mi][ni][0], s0, accum[mi][ni][0]);
+                accum[mi][ni][1] = fmaf(tmp[mi][ni][1], s0, accum[mi][ni][1]);
+                accum[mi][ni][2] = fmaf(tmp[mi][ni][2], s1, accum[mi][ni][2]);
+                accum[mi][ni][3] = fmaf(tmp[mi][ni][3], s1, accum[mi][ni][3]);
+            }
+        }
+    }
+}
+
+template <class Sched, class Out, bool Q8 = false>
 __global__ void __launch_bounds__(Sched::kThreads, Sched::kMinBlocksPerSm) projections_mma_kernel(const MmaParams p) {
     constexpr int BM = Sched::kBlockRows, BN = Sched::kBlockTokens, BK = Sched::kBlockK, S = Sched::kStages;
     constexpr int THREADS = Sched::kThreads;
     extern __shared__ __align__(16) unsigned char shared_raw[];
     auto* As = reinterpret_cast<__nv_bfloat16*>(shared_raw);
     auto* Bs = As + S * BM * BK;
+    // Q8: stage s's codes at shared_raw + s * BM * kQ8Row, its scales after every stage's codes.
+    static_assert(!Q8 || S * BM * (kQ8Row + 4) <= S * BM * BK * 2, "a Q8 stage fits the BF16 stage's region");
+    auto* q8_codes  = reinterpret_cast<std::uint8_t*>(shared_raw);
+    auto* q8_scales = reinterpret_cast<std::uint16_t*>(shared_raw + S * BM * kQ8Row);
 
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
     const int tile = static_cast<int>(blockIdx.x);
@@ -82,6 +162,24 @@ __global__ void __launch_bounds__(Sched::kThreads, Sched::kMinBlocksPerSm) proje
     // Weights first (immutable: before the PDL wait), then the inputs of the same stages.
     const auto stage_weights = [&](int stage, int k_tile) {
         const int k0 = k_tile * BK;
+        if constexpr (Q8) {
+            std::uint8_t* codes    = q8_codes + stage * BM * kQ8Row;
+            std::uint16_t* scales  = q8_scales + stage * BM * 2;
+#pragma unroll 1
+            for (int item = tid; item < BM * (BK / 16 + 1); item += THREADS) {
+                const int row = item / (BK / 16 + 1), part = item - row * (BK / 16 + 1);
+                const bool valid = m0 + row < M;
+                const std::size_t r = valid ? static_cast<std::size_t>(m0 + row) : 0;
+                if (part < BK / 16) {
+                    ops::cp_async_zfill<16, Cache::cg>(codes + row * kQ8Row + 16 * part,
+                                                      seg.codes + r * seg.stride + k0 + 16 * part, valid ? 16 : 0);
+                } else {
+                    ops::cp_async_zfill<4>(scales + row * 2, seg.scales + r * (seg.stride / 32) + k0 / 32,
+                                           valid ? 4 : 0);
+                }
+            }
+            return;
+        }
         auto* a      = As + stage * BM * BK;
 #pragma unroll 1
         for (int item = tid; item < BM * (BK / 8); item += THREADS) {
@@ -130,7 +228,12 @@ __global__ void __launch_bounds__(Sched::kThreads, Sched::kMinBlocksPerSm) proje
             ops::cp_wait<S - 1>();
         }
         __syncthreads();
-        d::bf16_mma_compute_stage<Sched>(As + stage * BM * BK, Bs + stage * BN * BK, accum, warp, lane);
+        if constexpr (Q8) {
+            q8_compute_stage<Sched>(q8_codes + stage * BM * kQ8Row, q8_scales + stage * BM * 2, Bs + stage * BN * BK,
+                                    accum, warp, lane);
+        } else {
+            d::bf16_mma_compute_stage<Sched>(As + stage * BM * BK, Bs + stage * BN * BK, accum, warp, lane);
+        }
         __syncthreads();
         const int next = k_tile + S;
         if (next < kTiles) {
@@ -184,9 +287,9 @@ __global__ void __launch_bounds__(Sched::kThreads, Sched::kMinBlocksPerSm) proje
     }
 }
 
-template <class Sched, class Out>
+template <class Sched, class Out, bool Q8 = false>
 void launch(const MmaParams& p, std::int32_t tiles, cudaStream_t stream) {
-    constexpr auto kernel = projections_mma_kernel<Sched, Out>;
+    constexpr auto kernel = projections_mma_kernel<Sched, Out, Q8>;
     constexpr int bytes   = shared_bytes<Sched>();
     const int dynamic     = d::prepare_dynamic_shared<bytes, kernel, true>();
     const dim3 grid(static_cast<unsigned>(tiles),
@@ -198,7 +301,7 @@ void launch(const MmaParams& p, std::int32_t tiles, cudaStream_t stream) {
 // Tile shapes (the arithmetic is the same in each): wide calls 128 x 128 (8 warps of 64 x 32, three 32 KB stages);
 // few-row matrices (<= 256 rows: the gates' downs, the router) 64 x 64 so the launch still fills the GPU; narrow
 // calls (<= 16 columns) 64 rows x 16 columns.
-template <class Out>
+template <class Out, bool Q8 = false>
 void launch_shape(const MmaParams& p, bool small, cudaStream_t stream, std::int32_t& tiles_out,
                   const ProjectionArgs& a) {
     const auto tiles_for = [&](int bm, MmaParams& q) {
@@ -214,19 +317,20 @@ void launch_shape(const MmaParams& p, bool small, cudaStream_t stream, std::int3
     if (a.columns <= 8) { // decode widths: one warp of 16 rows a CTA, eight stages in flight
         using Sched = Schedule<16, 8, 16, 8, 8, 4>;
         tiles_out   = tiles_for(Sched::kBlockRows, q);
-        launch<Sched, Out>(q, tiles_out, stream);
+        launch<Sched, Out, Q8>(q, tiles_out, stream);
     } else if (a.columns <= 16) {
         using Sched = Schedule<16, 16, 16, 16, 8, 4>;
         tiles_out   = tiles_for(Sched::kBlockRows, q);
-        launch<Sched, Out>(q, tiles_out, stream);
+        launch<Sched, Out, Q8>(q, tiles_out, stream);
     } else if (small) {
         using Sched = Schedule<64, 64, 32, 32, 3, 2>;
         tiles_out   = tiles_for(Sched::kBlockRows, q);
-        launch<Sched, Out>(q, tiles_out, stream);
+        launch<Sched, Out, Q8>(q, tiles_out, stream);
     } else {
-        using Sched = Schedule<128, 128, 64, 32, 3, 1>;
+        // Q8: 16 warps of 32 x 32 (each 32-group's sums beside the accumulators).
+        using Sched = std::conditional_t<Q8, Schedule<128, 128, 32, 32, 3, 1>, Schedule<128, 128, 64, 32, 3, 1>>;
         tiles_out   = tiles_for(Sched::kBlockRows, q);
-        launch<Sched, Out>(q, tiles_out, stream);
+        launch<Sched, Out, Q8>(q, tiles_out, stream);
     }
 }
 
@@ -241,22 +345,39 @@ void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
     p.k       = a.k;
     p.columns = a.columns;
     std::int32_t widest = 0;
+    // One storage for the call: BF16, or Q8 (codes and scales, stride a multiple of 128).
+    const bool q8 = a.segments[0].q8_scales != nullptr;
     for (int s = 0; s < a.count; ++s) {
         const ProjectionSegment& g = a.segments[s];
         const auto* x              = (g.input >= 0 && g.input <= 2) ? a.x[g.input] : nullptr;
         const std::size_t word     = a.fp32_out ? 4 : 2;
-        if (g.weight == nullptr || g.codes != nullptr || g.rows <= 0 || x == nullptr || g.out == nullptr ||
-            reinterpret_cast<std::uintptr_t>(g.weight) % 16 != 0 || reinterpret_cast<std::uintptr_t>(x) % 16 != 0 ||
+        const bool storage = q8 ? (g.weight == nullptr && g.codes != nullptr && g.q8_scales != nullptr &&
+                                   g.nibbles == nullptr && g.q8_stride >= a.k && g.q8_stride % 128 == 0 &&
+                                   reinterpret_cast<std::uintptr_t>(g.codes) % 16 == 0 &&
+                                   reinterpret_cast<std::uintptr_t>(g.q8_scales) % 4 == 0)
+                                : (g.weight != nullptr && g.codes == nullptr &&
+                                   reinterpret_cast<std::uintptr_t>(g.weight) % 16 == 0);
+        if (!storage || g.rows <= 0 || x == nullptr || g.out == nullptr || reinterpret_cast<std::uintptr_t>(x) % 16 != 0 ||
             reinterpret_cast<std::uintptr_t>(g.out) % 16 != 0 || (g.rows * word) % 16 != 0) {
-            throw std::invalid_argument("inkling2 projections_mma: BF16 segments only, with 16-byte aligned weights, "
-                                        "inputs, outputs and output rows");
+            throw std::invalid_argument("inkling2 projections_mma: BF16 or Q8 segments (one storage a call), with 16-byte "
+                                        "aligned weights, inputs, outputs and output rows");
         }
         p.seg[s] = {reinterpret_cast<const __nv_bfloat16*>(g.weight), reinterpret_cast<const __nv_bfloat16*>(x), g.out,
                     g.rows};
+        if (q8) {
+            p.seg[s].codes  = static_cast<const std::uint8_t*>(g.codes);
+            p.seg[s].scales = g.q8_scales;
+            p.seg[s].stride = g.q8_stride;
+        }
         widest = std::max(widest, g.rows);
     }
     std::int32_t tiles = 0;
     const bool small   = widest <= 256;
+    if (q8) {
+        a.fp32_out ? launch_shape<float, true>(p, small, stream, tiles, a)
+                   : launch_shape<__nv_bfloat16, true>(p, small, stream, tiles, a);
+        return;
+    }
     a.fp32_out ? launch_shape<float>(p, small, stream, tiles, a) : launch_shape<__nv_bfloat16>(p, small, stream, tiles, a);
 }
 
