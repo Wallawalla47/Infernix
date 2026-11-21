@@ -256,12 +256,51 @@ __device__ __forceinline__ void combine8(const std::uint16_t* experts, int t, in
     round8(v);
 }
 
+// Raw rows, issued before anything waits on them (a warp issues in order: an unpack right after its load would hold
+// back every later load).
+__device__ __forceinline__ uint4 raw8(const std::uint16_t* p) { return *reinterpret_cast<const uint4*>(p); }
+struct Raw8F {
+    float4 a, b;
+};
+__device__ __forceinline__ Raw8F raw8(const float* p) {
+    return {reinterpret_cast<const float4*>(p)[0], reinterpret_cast<const float4*>(p)[1]};
+}
+__device__ __forceinline__ void unpack8(const Raw8F& r, float (&v)[8]) {
+    v[0] = r.a.x, v[1] = r.a.y, v[2] = r.a.z, v[3] = r.a.w, v[4] = r.b.x, v[5] = r.b.y, v[6] = r.b.z, v[7] = r.b.w;
+}
+
+// The current column's 8 expert rows and cand, loaded with the visit's other rows.
+struct TailRows {
+    uint4 e[kTopK];
+    Raw8F cand;
+};
+__device__ __forceinline__ TailRows tail_rows(const MlpTail& tail, int t, int c) {
+    TailRows r;
+#pragma unroll
+    for (int j = 0; j < kTopK; ++j) { r.e[j] = raw8(tail.experts + static_cast<std::size_t>(t * kTopK + j) * kHidden + c); }
+    r.cand = raw8(tail.cand + static_cast<std::size_t>(t) * kHidden + c);
+    return r;
+}
+
+// The 8 slots folded in slot order from +0.0, rounded once (combine8's arithmetic on rows already loaded).
+__device__ __forceinline__ void combine_rows(const uint4 (&e)[kTopK], float (&v)[8]) {
+    zero8(v);
+#pragma unroll
+    for (int j = 0; j < kTopK; ++j) {
+        float f[8];
+        unpack8(e[j], f);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { v[i] = canon::add_rn(v[i], f[i]); }
+    }
+    round8(v);
+}
+
 // The MLP tail of the previous visit for column col: out = bf16(cand + bf16(conv(combined))), the combined output
 // written to the ring.
 __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& map, const Column& col, int c,
-                                         const float (&w)[4][8], float (&out)[8]) {
+                                         const float (&w)[4][8], const TailRows& rows, float (&out)[8]) {
     float x[4][8];
-    combine8(tail.experts, col.t, c, x[0]);
+    combine_rows(rows.e, x[0]);
 #pragma unroll
     for (int k = 1; k < 4; ++k) {
         switch (history_source(map, col, k)) {
@@ -273,7 +312,7 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
     float m[8];
     conv8(w, x, m);
     float cand[8];
-    load8(tail.cand + static_cast<std::size_t>(col.t) * kHidden + c, cand);
+    unpack8(rows.cand, cand);
 #pragma unroll
     for (int j = 0; j < 8; ++j) { out[j] = canon::add_rn(cand[j], m[j]); }
     round8(out);
@@ -393,14 +432,41 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
     }
     pdl::enter();
 
-    const Column col = column_of(a.map, t);
+    // Every row the column reads, issued before the first use: the tail's rows, the input, the blocks and the
+    // message sources. A source that is the tail's own output (a pass restart's second message source) comes from
+    // the values computed here, never from memory.
     const std::size_t row = static_cast<std::size_t>(t) * kHidden + c;
-    float h[8];
-    if (tail) {
-        mlp_tail(a.tail, a.map, col, c, conv, h);
-        store8(a.tail_out + row, h);
+    TailRows trows{};
+    if (tail) { trows = tail_rows(a.tail, t, c); }
+    uint4 rin{};
+    if (a.input != nullptr) { rin = raw8(a.input + row); }
+    uint4 rblk[kPartial] = {};
+    bool blk_tail[kPartial] = {};
+    if constexpr (!Layer0) {
+#pragma unroll
+        for (int s = 0; s < kPartial; ++s) {
+            blk_tail[s] = tail && a.blocks.rows[s] == a.tail_out;
+            if (s < a.blocks.count && !blk_tail[s]) { rblk[s] = raw8(a.blocks.rows[s] + row); }
+        }
     }
-    if (a.input != nullptr) { load8(a.input + row, h); }
+    uint4 rmsg[2]    = {};
+    bool msg_tail[2] = {};
+    if constexpr (Messages) {
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            msg_tail[s] = tail && a.message_sources[s] == a.tail_out;
+            if (!msg_tail[s]) { rmsg[s] = raw8(a.message_sources[s] + row); }
+        }
+    }
+    const Column col = column_of(a.map, t);
+    float h[8], tail_h[8] = {};
+    if (tail) {
+        mlp_tail(a.tail, a.map, col, c, conv, trows, tail_h);
+        store8(a.tail_out + row, tail_h);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { h[j] = tail_h[j]; }
+    }
+    if (a.input != nullptr) { unpack8(rin, h); }
 
     float out[M::kQ][8];
     if constexpr (Layer0) {
@@ -411,7 +477,12 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
 #pragma unroll
         for (int s = 0; s < kPartial; ++s) {
             if (s < a.blocks.count) {
-                load8(a.blocks.rows[s] + row, src[s]);
+                if (blk_tail[s]) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { src[s][j] = tail_h[j]; }
+                } else {
+                    unpack8(rblk[s], src[s]);
+                }
             } else {
                 zero8(src[s]);
             }
@@ -420,7 +491,14 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
         for (int j = 0; j < 8; ++j) { src[kPartial][j] = h[j]; }
         if constexpr (Messages) {
 #pragma unroll
-            for (int s = 0; s < 2; ++s) { load8(a.message_sources[s] + row, src[kMaxSources + s]); }
+            for (int s = 0; s < 2; ++s) {
+                if (msg_tail[s]) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { src[kMaxSources + s][j] = tail_h[j]; }
+                } else {
+                    unpack8(rmsg[s], src[kMaxSources + s]);
+                }
+            }
         }
         mix_columns<QA, QB>(src, a.blocks.count, q, out, s1, s2);
     }
@@ -488,11 +566,26 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
     if constexpr (!Messages) { weight8(a.norm + c, nw); }
     pdl::enter();
 
-    const Column col = column_of(a.map, t);
+    // Every row the column reads, issued before the first use (none aliases what this kernel writes: the ring is
+    // state, cand FP32).
     const std::size_t row = static_cast<std::size_t>(t) * kHidden + c;
+    const uint4 ro = raw8(a.o + row);
+    uint4 rh{};
+    if (!a.boundary) { rh = raw8(a.h + row); }
+    uint4 rblk[kPartial] = {};
+#pragma unroll
+    for (int s = 0; s < kPartial; ++s) {
+        if (s < a.blocks.count) { rblk[s] = raw8(a.blocks.rows[s] + row); }
+    }
+    uint4 rmsg[2] = {};
+    if constexpr (Messages) {
+#pragma unroll
+        for (int s = 0; s < 2; ++s) { rmsg[s] = raw8(a.message_sources[s] + row); }
+    }
+    const Column col = column_of(a.map, t);
     // The post-attention conv of W_o's output (the call holds every column's o, so in-call history is a load).
     float x[4][8];
-    load8(a.o + row, x[0]);
+    unpack8(ro, x[0]);
 #pragma unroll
     for (int k = 1; k < 4; ++k) {
         switch (history_source(a.map, col, k)) {
@@ -511,7 +604,7 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
         for (int j = 0; j < 8; ++j) { cand[j] = attn[j]; }
     } else {
         float h[8];
-        load8(a.h + row, h);
+        unpack8(rh, h);
 #pragma unroll
         for (int j = 0; j < 8; ++j) { cand[j] = canon::add_rn(h[j], attn[j]); }
     }
@@ -521,7 +614,7 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
 #pragma unroll
     for (int s = 0; s < kPartial; ++s) {
         if (s < a.blocks.count) {
-            load8(a.blocks.rows[s] + row, src[s]);
+            unpack8(rblk[s], src[s]);
         } else {
             zero8(src[s]);
         }
@@ -530,7 +623,7 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
     for (int j = 0; j < 8; ++j) { src[kPartial][j] = cand[j]; }
     if constexpr (Messages) {
 #pragma unroll
-        for (int s = 0; s < 2; ++s) { load8(a.message_sources[s] + row, src[kMaxSources + s]); }
+        for (int s = 0; s < 2; ++s) { unpack8(rmsg[s], src[kMaxSources + s]); }
     }
     float out[M::kQ][8];
     mix_columns<1, QB>(src, a.blocks.count, q, out, s1, s2);
