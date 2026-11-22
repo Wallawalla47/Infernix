@@ -811,10 +811,25 @@ exact, no serial arg-max), γ, and per-expert job lists. Padded rows of a graph 
 
 ### 10.3 Narrow routes (decode, verify)
 
-- **NVFP4 W4A4.** The tensor-core `narrow_a4_mma` core at every width (L9: the row pairs were retired), bit-equal to
-  the exact int64 sum, adapted to a per-column outer scale and a per-expert weight factor in the epilogue in the pinned
-  order ([§2.5](#25-rounding-points-pinned-at-m0)). kMaxColumns ≥ B_max × T_max = 128, so every decode and verify call
-  stays narrow and its bits never depend on other requests. A job of 9-16 columns runs two passes over
+- **NVFP4 W4A4.** Since 2026-11-22 the native block-scaled core (`ops/common/a4_native.cuh`): one `mxf4nvf4`
+  m16n8k64 MMA a 64-element K step of a 16-row group (the weights as A, E4M3 block scales applied by the MMA, K slot
+  blocks 0, 2, 1, 3; x and h staged once in the core's slot order), an FP32 chain a gate/up K half added half 0 +
+  half 1, one chain over down's K, then the per-column outer scale and per-expert weight factor in the pinned order
+  ([§2.5](#25-rounding-points-pinned-at-m0)). The same chain runs in `single_kernel`, `gate_up_a4` and `down_a4`, the
+  only NVFP4 kernels a decode or verify call reaches, so decode = verify and a lane's bits never depend on running
+  alone or beside others. It replaced the exact int64 core (`narrow_a4_mma`'s s8 `mma.m16n8k16` on doubled codes,
+  L9), which stays as `Nvfp4Core::Exact` (op test and bench; no CLI): an FP32 chain is no longer the exact sum rounded
+  once, so the default and `--reproducible` routes' bits may change (deterministic and request-invariant as before);
+  on the op test's 589,824 outputs and the forward test's 32-position free-running logits they did not change at all.
+  Op test: operand mapping exact on 524,288 one-hot cases, every finite scale-word pair decoding as
+  `canon::e4m3_value` (only 0x7F / 0xFF, E4M3FN's NaN, decode differently: the activation quantizers never write
+  them, and none of the checkpoint's 1.40 × 10^9 expert scale words is one or has its sign bit set), the FP64
+  criteria of the MXFP8 chains (h within 2^-6
+  of max|h|, outputs within half a BF16 ulp + 2^-16 max|y|: worst 0.993). Measured (RTX 5090, forward test round at
+  context 128, three runs each): 5.283 → 5.078 ms at one column (−3.9 %), 7.448 → 7.236 at three, 10.299 → 9.758 at
+  eight; op bench T = 1 cold 34.65 → 30.35 µs (the emptied-unit ceiling 29.05), warm 35.5 → 21.2 µs.
+  kMaxColumns ≥ B_max × T_max = 128, so every decode and verify call stays narrow and its bits never depend on other
+  requests. A job of 9-16 columns runs two passes over
   register-resident weights rather than one wide tile (L16's cliff); a job above 16 columns (possible only at C > 1)
   runs successive 16-column passes with the same per-column arithmetic, exact and linear in its columns. A faster wide
   form for such jobs would be a fast path.
@@ -830,7 +845,9 @@ exact, no serial arg-max), γ, and per-expert job lists. Padded rows of a graph 
   three launches): the router's rows on CTAs 0-15 in route_kernel's order, every CTA selecting the column itself, a
   job's 144 gate/up and down row groups on 18 CTAs of 8 warps, each warp streaming its gate/up row group over all of K
   and then its down row group through one 9-stage cp.async ring, so the down weights stream while the CTA waits for
-  its job's h; each CTA forms the job's quantized h row itself. Bits equal the three launches' (op test: routing and
+  its job's h. NVFP4: each CTA loads the job's BF16 h row once (its amax from the same loads) and forms the
+  four-over-six row itself; MXFP8: each CTA quantizes its 64 intermediates (two whole groups) and publishes them, and
+  the down CTAs load the row (2026-11-22, the same bits, −0.031 ms a round at context 128). Bits equal the three launches' (op test: routing and
   outputs byte for byte, graphs interleaving both paths; the forward test's decode guard). Measured (RTX 5090): the op
   bench at T = 1 (8 cold layers a graph) NVFP4 44.4 → 35.2 µs, MXFP8 58.5 → 49.6 µs (808 → 1,019 and 1,123 → 1,327
   GB/s); the decode round −3.0 % at 4K context (6.107 → 5.921 ms), −3.4 % at 128 (5.818 → 5.622 ms), about −0.19 ms a

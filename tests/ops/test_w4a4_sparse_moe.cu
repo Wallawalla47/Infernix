@@ -21,8 +21,16 @@
 //   - call state: a call over the same workspace after one whose h amax are 64 times larger gives the same bits;
 //   - the single-column launch (moe_single): its routing and outputs equal moe_route + moe_experts byte for byte, for 4
 //     columns, eagerly and in graphs interleaving the two paths.
+//
+// The native NVFP4 core (a4_native_step: the m16n8k64 e2m1 MMA, FP32 chains; the decode and verify kernels' default
+// since 2026-11-22, Nvfp4Core::Exact selecting the exact core): criteria fixed 2026-11-22 before its first run. Its
+// operand mapping exactly (one-hot cases over every row, K index of either operand and column; every scale word pair
+// 0x00-0x7E decoding as canon::e4m3_value, the others reported); then the FP64 criteria above, which already hold
+// MXFP8's FP32 chains, unchanged for NVFP4, with column invariance and the single launch = the separate kernels byte
+// for byte; "equal to the exact arithmetic" is reported only (a changed bit is the core's FP32 chain).
 
 #include "infernix/ops/w4a4_sparse_moe.h"
+#include "ops/common/a4_native.cuh"
 #include "ops/common/canonical_math.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
@@ -394,7 +402,7 @@ LimbRow encode_a16(const std::vector<float>& v) {
 }
 
 Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* workspace,
-           int capacity = moe::kMaxColumns, bool a16 = false) {
+           int capacity = moe::kMaxColumns, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core::Native) {
     std::vector<std::uint8_t> rows;
     std::vector<float> amax;
     std::vector<std::int32_t> emax;
@@ -423,6 +431,7 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     std::int32_t* d_emax  = upload(emax);
     std::uint16_t* d_x16  = upload(x16);
     moe::Activations act{d_rows, d_amax, call.columns};
+    act.core = core;
     if (a16) {
         act.activation = moe::ExpertActivation::A16;
         act.rows       = b.a8 ? nullptr : d_rows;
@@ -580,20 +589,24 @@ void a16_case() {
     }
 }
 
-void bank_case(bool a8) {
-    const char* name = a8 ? "MXFP8" : "NVFP4";
+// `core`: NVFP4's decode / verify core (both run: the native default under the FP64 criteria, the exact one also equal
+// to the pinned arithmetic bit for bit).
+void bank_case(bool a8, moe::Nvfp4Core core = moe::Nvfp4Core::Native) {
+    const bool exact_core = !a8 && core == moe::Nvfp4Core::Exact;
+    const char* name = a8 ? "MXFP8" : exact_core ? "NVFP4 (exact core)" : "NVFP4 (native core)";
     const HostBank b = make_bank(a8, a8 ? 81U : 41U);
     DeviceBank db{upload(b.records), upload(b.amax), upload(std::vector<float>{b.den[0], b.den[1]})};
     void* workspace = nullptr;
     cuda_check(cudaMalloc(&workspace, moe::workspace_bytes(E, I)), "cudaMalloc");
     cuda_check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I)), "cudaMemset");
     const int row_bytes = moe::row_bytes(a8 ? moe::ExpertFormat::Mxfp8 : moe::ExpertFormat::Nvfp4FourOverSix, I);
+    const auto go = [&](const Call& c, void* w, int capacity) { return run(b, db, c, w, capacity, false, core); };
 
     // A call whose h amax are 64 times larger first: the next call must not see its state.
-    (void)run(b, db, make_call(32, 7, 64.0F), workspace);
+    (void)go(make_call(32, 7, 64.0F), workspace, moe::kMaxColumns);
     const Call call    = make_call(32, 11, 1.0F);
-    const Result got   = run(b, db, call, workspace);
-    const Result again = run(b, db, call, workspace);
+    const Result got   = go(call, workspace, moe::kMaxColumns);
+    const Result again = go(call, workspace, moe::kMaxColumns);
     check(got.out == again.out, "a repeated call gives the same bits");
 
     int exact_differ = 0;
@@ -647,8 +660,10 @@ void bank_case(bool a8) {
     check(worst_h <= std::ldexp(1.0, -6), "h is further from FP64 than its criterion");
     check(worst_y <= 1.0, "an output is further than half a BF16 ulp from FP64 over the kernel's h");
     if (!a8) {
-        std::printf("%s: %d outputs differ from the exact pinned arithmetic\n", name, exact_differ);
-        check(exact_differ == 0, "NVFP4 outputs differ from the exact pinned arithmetic");
+        // The exact core must equal the pinned arithmetic; the native core's count is reported (its FP32 chain).
+        std::printf("%s: %d outputs differ from the exact pinned arithmetic%s\n", name, exact_differ,
+                    exact_core ? "" : " (reported)");
+        if (exact_core) { check(exact_differ == 0, "NVFP4 outputs differ from the exact pinned arithmetic"); }
     }
 
     // Column invariance: each of the first 8 columns alone.
@@ -659,7 +674,7 @@ void bank_case(bool a8) {
         one.x       = {call.x[t]};
         one.experts.assign(call.experts.begin() + t * K, call.experts.begin() + (t + 1) * K);
         one.gamma.assign(call.gamma.begin() + t * K, call.gamma.begin() + (t + 1) * K);
-        const Result alone = run(b, db, one, workspace);
+        const Result alone = go(one, workspace, moe::kMaxColumns);
         for (int i = 0; i < K * H; ++i) { invariance_differ += alone.out[i] != got.out[std::size_t(t) * K * H + i] ? 1 : 0; }
     }
     std::printf("%s: column invariance: %d outputs differ between T = 1 and T = 32\n", name, invariance_differ);
@@ -673,7 +688,7 @@ void bank_case(bool a8) {
         cuda_check(cudaMalloc(&wide_ws, moe::workspace_bytes(E, I, kWide)), "cudaMalloc");
         cuda_check(cudaMemset(wide_ws, 0, moe::workspace_bytes(E, I, kWide)), "cudaMemset");
         const Call wide   = make_call(kWide, 13, 1.0F);
-        const Result all  = run(b, db, wide, wide_ws, kWide);
+        const Result all  = go(wide, wide_ws, kWide);
         int wide_differ   = 0;
         for (const int t : {0, 7, 8, 63, 150, 255, 256, 299}) {
             Call one;
@@ -681,7 +696,7 @@ void bank_case(bool a8) {
             one.x       = {wide.x[t]};
             one.experts.assign(wide.experts.begin() + t * K, wide.experts.begin() + (t + 1) * K);
             one.gamma.assign(wide.gamma.begin() + t * K, wide.gamma.begin() + (t + 1) * K);
-            const Result alone = run(b, db, one, workspace);
+            const Result alone = go(one, workspace, moe::kMaxColumns);
             for (int i = 0; i < K * H; ++i) { wide_differ += alone.out[i] != all.out[std::size_t(t) * K * H + i] ? 1 : 0; }
         }
         std::printf("%s: a 300-column call: %d outputs of 8 sampled columns differ from the columns alone\n", name,
@@ -1066,8 +1081,11 @@ void router_case() {
 // moe_single against moe_route + moe_experts over the same workspace: routing and outputs byte for byte, for several
 // columns; eagerly and in a CUDA graph that interleaves the two paths (single, separate, single: each leaves the
 // workspace's state as the other needs it), replayed three times.
-void single_case(bool a8, bool a16 = false) {
-    const char* name   = a8 ? "MXFP8" : a16 ? "NVFP4 A16" : "NVFP4";
+void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core::Native) {
+    const char* name   = a8                              ? "MXFP8"
+                         : a16                           ? "NVFP4 A16"
+                         : core == moe::Nvfp4Core::Exact ? "NVFP4 (exact core)"
+                                                         : "NVFP4 (native core)";
     const auto format  = a8 ? moe::ExpertFormat::Mxfp8 : moe::ExpertFormat::Nvfp4FourOverSix;
     const auto activation = a16 ? moe::ExpertActivation::A16 : moe::ExpertActivation::Checkpoint;
     if (!moe::moe_single_supported(format, activation)) {
@@ -1124,6 +1142,7 @@ void single_case(bool a8, bool a16 = false) {
         float* d_amax        = upload(std::vector<float>{q.amax});
         std::int32_t* d_emax = upload(std::vector<std::int32_t>{l.emax});
         moe::Activations rows{d_rows, d_amax, 1};
+        rows.core = core;
         if (a16) {
             rows.activation = moe::ExpertActivation::A16;
             rows.emax       = d_emax;
@@ -1195,14 +1214,157 @@ void single_case(bool a8, bool a16 = false) {
     }
 }
 
+// ---------------------------------------------------------------------------- the native core's operand mapping
+
+// A one-hot case of a4_native_step (one warp): the four units hold one nonzero weight code `wcode` at (row r, K index
+// kw) and the eight columns one nonzero code `xcode` in column col at K index kx. Scale words: the mapping cases give
+// row rr of unit u the word 0x20 + rr + 16 u and column c's block b 0x28 + c + 8 b (all distinct, all finite); the
+// sweep gives the hit's row and column the words sw and sx, every other 0x38.
+struct OneHot {
+    int r = 0, kw = 0, kx = 0, col = 0;
+    unsigned wcode = 0, xcode = 0;
+    bool sweep = false;
+    unsigned sw = 0, sx = 0;
+};
+
+__host__ __device__ unsigned onehot_wscale(const OneHot& o, int row, int u) {
+    return o.sweep ? (row == o.r && u == o.kw / 16 ? o.sw : 0x38U) : 0x20U + static_cast<unsigned>(row) + 16U * static_cast<unsigned>(u);
+}
+__host__ __device__ unsigned onehot_xscale(const OneHot& o, int column, int b) {
+    return o.sweep ? (column == o.col && b == o.kx / 16 ? o.sx : 0x38U)
+                   : 0x28U + static_cast<unsigned>(column) + 8U * static_cast<unsigned>(b);
+}
+
+__device__ void onehot_run(const OneHot& o, std::uint8_t* units, std::uint8_t (*cols)[36], float (&c)[4]) {
+    const int lane = static_cast<int>(threadIdx.x) % 32, g = lane / 4, t = lane % 4;
+    for (int i = lane; i < 4 * 144; i += 32) {
+        const int u = i / 144, off = i % 144;
+        units[i] = off < 128 ? std::uint8_t{0} : static_cast<std::uint8_t>(onehot_wscale(o, off - 128, u));
+    }
+    for (int i = lane; i < 8 * 36; i += 32) {
+        const int column = i / 36, off = i % 36;
+        cols[column][off] = off < 32 ? std::uint8_t{0} : static_cast<std::uint8_t>(onehot_xscale(o, column, off - 32));
+    }
+    __syncwarp();
+    if (lane == 0) {
+        // The record: element e of row r in byte 32 (e / 4) + 4 (r % 8) + e % 4 of its block's unit, rows 0-7 in the
+        // low nibbles (docs/maintainer/storage-layouts.md §6); a column: element e of block b in byte 8 b + e / 2.
+        const int u = o.kw / 16, e = o.kw % 16;
+        std::uint8_t& w = units[u * 144 + 32 * (e / 4) + 4 * (o.r % 8) + e % 4];
+        w = static_cast<std::uint8_t>(o.r < 8 ? (w & 0xF0U) | o.wcode : (w & 0x0FU) | (o.wcode << 4));
+        const int b = o.kx / 16, ex = o.kx % 16;
+        std::uint8_t& x = cols[o.col][8 * b + ex / 2];
+        x = static_cast<std::uint8_t>((ex & 1) != 0 ? (x & 0x0FU) | (o.xcode << 4) : (x & 0xF0U) | o.xcode);
+    }
+    __syncwarp();
+    for (int i = lane; i < 64; i += 32) { // the columns' code words in the core's slot order
+        auto* word = reinterpret_cast<std::uint32_t*>(cols[i / 8]) + i % 8;
+        *word      = infernix::ops::a4_native_order(*word);
+    }
+    __syncwarp();
+    for (float& v : c) { v = 0.0F; }
+    infernix::ops::a4_native_step(units, cols[g], *reinterpret_cast<const std::uint32_t*>(cols[g] + 32), g, t, c);
+}
+
+__device__ float onehot_want(const OneHot& o, int row, int column, float codes) {
+    const bool hit = row == o.r && column == o.col && o.kw == o.kx;
+    return hit ? canon::mul_rn(canon::mul_rn(codes, canon::e4m3_value(onehot_wscale(o, o.r, o.kw / 16))),
+                               canon::e4m3_value(onehot_xscale(o, o.col, o.kx / 16)))
+               : 0.0F;
+}
+
+// Mapping: case id = r + 16 (kw + 64 (kx + 64 col)), weight 1.5 (code 3), x 3.0 (code 5).
+__global__ void onehot_map_kernel(int* fails, int* first) {
+    __shared__ __align__(16) std::uint8_t units[8][4 * 144];
+    __shared__ __align__(16) std::uint8_t cols[8][8][36];
+    const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32, g = lane / 4, t = lane % 4;
+    const int id = static_cast<int>(blockIdx.x) * 8 + warp;
+    OneHot o;
+    o.r = id & 15, o.kw = (id >> 4) & 63, o.kx = (id >> 10) & 63, o.col = (id >> 16) & 7;
+    o.wcode = 0x3U, o.xcode = 0x5U;
+    float c[4];
+    onehot_run(o, units[warp], cols[warp], c);
+    bool bad = false;
+    for (int i = 0; i < 4; ++i) { bad = bad || c[i] != onehot_want(o, g + (i < 2 ? 0 : 8), 2 * t + (i & 1), 4.5F); }
+    if (bad && atomicAdd(fails, 1) == 0) { *first = id; }
+}
+
+// Scale words: case id = sw + 256 sx at (row 5, K 37, column 3), both codes 1.0 (code 2).
+__global__ void onehot_scale_kernel(std::uint8_t* bad) {
+    __shared__ __align__(16) std::uint8_t units[8][4 * 144];
+    __shared__ __align__(16) std::uint8_t cols[8][8][36];
+    const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32, g = lane / 4, t = lane % 4;
+    const int id = static_cast<int>(blockIdx.x) * 8 + warp;
+    OneHot o;
+    o.r = 5, o.kw = 37, o.kx = 37, o.col = 3, o.wcode = 0x2U, o.xcode = 0x2U, o.sweep = true;
+    o.sw = static_cast<unsigned>(id & 255), o.sx = static_cast<unsigned>(id >> 8);
+    float c[4];
+    onehot_run(o, units[warp], cols[warp], c);
+    bool wrong = false;
+    for (int i = 0; i < 4; ++i) { wrong = wrong || c[i] != onehot_want(o, g + (i < 2 ? 0 : 8), 2 * t + (i & 1), 1.0F); }
+    if (wrong) { bad[id] = 1; }
+}
+
+void native_core_case() {
+    int* d_counts = nullptr;
+    std::uint8_t* d_bad = nullptr;
+    cuda_check(cudaMalloc(&d_counts, 2 * sizeof(int)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_bad, 65536), "cudaMalloc");
+    cuda_check(cudaMemset(d_counts, 0, 2 * sizeof(int)), "cudaMemset");
+    cuda_check(cudaMemset(d_bad, 0, 65536), "cudaMemset");
+    constexpr int kMapCases = 16 * 64 * 64 * 8;
+    onehot_map_kernel<<<kMapCases / 8, 256>>>(d_counts, d_counts + 1);
+    onehot_scale_kernel<<<65536 / 8, 256>>>(d_bad);
+    cuda_check(cudaGetLastError(), "one-hot launches");
+    cuda_check(cudaDeviceSynchronize(), "one-hot kernels");
+    int counts[2] = {};
+    std::vector<std::uint8_t> bad(65536);
+    cuda_check(cudaMemcpy(counts, d_counts, sizeof(counts), cudaMemcpyDeviceToHost), "download");
+    cuda_check(cudaMemcpy(bad.data(), d_bad, bad.size(), cudaMemcpyDeviceToHost), "download");
+    std::printf("native core operand mapping: %d one-hot cases (16 rows x 64 weight K x 64 x K x 8 columns), %d differ%s\n",
+                kMapCases, counts[0], counts[0] == 0 ? "" : " (first: see id)");
+    if (counts[0] != 0) {
+        const int id = counts[1];
+        std::printf("  first failing case: row %d, weight K %d, x K %d, column %d\n", id & 15, (id >> 4) & 63,
+                    (id >> 10) & 63, (id >> 16) & 7);
+    }
+    check(counts[0] == 0, "the native core's operand mapping");
+    int finite_bad = 0, other_bad = 0, other_total = 0;
+    std::vector<int> bad_words;
+    for (int id = 0; id < 65536; ++id) {
+        const int sw = id & 255, sx = id >> 8;
+        const bool finite = sw <= 0x7E && sx <= 0x7E;
+        if (finite) {
+            finite_bad += bad[static_cast<std::size_t>(id)];
+        } else {
+            ++other_total;
+            other_bad += bad[static_cast<std::size_t>(id)];
+        }
+    }
+    for (int w = 0; w < 256; ++w) { // a word that decodes differently against 0x38 on the other side
+        if (bad[static_cast<std::size_t>(w + 256 * 0x38)] != 0) { bad_words.push_back(w); }
+    }
+    std::printf("native core scale words: %d of %d pairs of 0x00-0x7E differ from canon::e4m3_value (criterion 0); "
+                "%d of %d pairs with 0x7F or the sign bit differ (reported; %zu weight words against 0x38 differ:",
+                finite_bad, 127 * 127, other_bad, other_total, bad_words.size());
+    for (std::size_t i = 0; i < bad_words.size() && i < 12; ++i) { std::printf(" 0x%02X", bad_words[i]); }
+    std::printf("%s)\n", bad_words.size() > 12 ? " ..." : "");
+    check(finite_bad == 0, "a finite scale word decodes differently in the native core");
+    cuda_check(cudaFree(d_counts), "cudaFree");
+    cuda_check(cudaFree(d_bad), "cudaFree");
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(w4a4_sparse_moe) {
+    native_core_case();
     router_case();
     single_case(false);
+    single_case(false, false, moe::Nvfp4Core::Exact);
     single_case(true);
     single_case(false, true);
     bank_case(false);
+    bank_case(false, moe::Nvfp4Core::Exact);
     bank_case(true);
     a16_case();
     mx_a16_case();

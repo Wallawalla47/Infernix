@@ -4,14 +4,17 @@
 // - Dispatch (one CTA): the call's entries grouped by expert (ascending entry within an expert), jobs in ascending
 //   expert id, and the per-call state cleared: each job's completion count and each entry's h amax.
 // - Gate/up (a CTA of 8 warps per 4 row groups of a job's gate/up matrix: 2 K halves a row group, each streaming its
-//   half through a private cp.async ring): the job's columns in passes of 8 (one MMA's n). NVFP4: the exact int64 core
-//   (ops/common/a4_mma.cuh) and the row scale (amax_x * amax_w) * rcp_rn(1536 * den); MXFP8: block-scaled FP8 MMAs
-//   accumulating in FP32 in block order, the halves added half 0 + half 1. Interleaved rows put gate_i and up_i on
+//   half through a private cp.async ring): the job's columns in passes of 8 (one MMA's n). NVFP4: the native core
+//   (ops/common/a4_native.cuh: block-scaled e2m1 MMAs, an FP32 chain a K half, the halves added half 0 + half 1; x
+//   staged in its slot order) or Nvfp4Core::Exact's int64 core (ops/common/a4_mma.cuh), and the row scale
+//   (amax_x * amax_w) * rcp_rn(1536 * den); MXFP8: block-scaled FP8 MMAs accumulating in FP32 in block order, the
+//   halves added half 0 + half 1. Interleaved rows put gate_i and up_i on
 //   lanes 4 apart; h = the softcapped SwiGLU times gamma, BF16. NVFP4: h to global with its row amax (atomicMax of the
 //   magnitude's bits, order-free), and the job's last CTA (the one completing its count) quantizes the job's h rows by
 //   four-over-six once; MXFP8: a CTA's 32 intermediates are one MXFP8 group, quantized in place.
 // - Down (a CTA per kDownWarps output row groups of a job): its weight units copied before it waits for its job's h
-//   (the job's count, a release from each gate/up CTA), then the same core over K = I.
+//   (the job's count, a release from each gate/up CTA), then the same core over K = I (native: one FP32 chain in
+//   block order, h staged in its slot order).
 // Each entry's arithmetic depends only on its own column, in a fixed order, so a column's outputs never depend on the
 // call's other columns.
 
@@ -20,6 +23,7 @@
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/a4_mma.cuh"
+#include "ops/common/a4_native.cuh"
 #include "ops/common/canonical_math.h"
 #include "ops/common/mma.cuh"
 #include "ops/ggml/ggml_tile.cuh"
@@ -122,6 +126,9 @@ __device__ __forceinline__ bool wait_count(const std::uint32_t* word, std::uint3
 
 __device__ __forceinline__ void release_add(std::uint32_t* word) {
     asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(word) : "memory");
+}
+__device__ __forceinline__ void release_add(std::uint32_t* word, std::uint32_t n) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(word), "r"(n) : "memory");
 }
 
 __device__ __forceinline__ std::uint32_t acq_rel_add(std::uint32_t* word) {
@@ -297,7 +304,9 @@ struct GateUpA4Smem {
     int last;
 };
 
-template <class G>
+// Native: a K half's FP32 chain of native steps, the halves added half 0 + half 1 (single_kernel's chain); not Native
+// (Nvfp4Core::Exact): the exact int64 sums.
+template <class G, bool Native>
 __global__ void __launch_bounds__(kGuThreads) gate_up_a4_kernel(Args a) {
     using S = Shape<G, false>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -329,13 +338,16 @@ __global__ void __launch_bounds__(kGuThreads) gate_up_a4_kernel(Args a) {
             issue(k);
             tile::cp_async_commit();
         }
-        // The pass's x rows and row scales while the rings fill.
+        // The pass's x rows and row scales while the rings fill (Native: the codes in the core's slot order).
         constexpr int kWords = S::kXRowBytes / 8;
         for (int i = tid; i < n * kWords; i += kGuThreads) {
             const int c      = i / kWords;
             const int column = a.ws.entries[v.first + base + c] / kTopK;
-            reinterpret_cast<uint2*>(sm.x[c])[i % kWords] =
-                reinterpret_cast<const uint2*>(a.x.rows + static_cast<std::size_t>(column) * S::kXRowBytes)[i % kWords];
+            uint2 word = reinterpret_cast<const uint2*>(a.x.rows + static_cast<std::size_t>(column) * S::kXRowBytes)[i % kWords];
+            if constexpr (Native) {
+                if (i % kWords < S::kXScales / 8) { word = make_uint2(a4_native_order(word.x), a4_native_order(word.y)); }
+            }
+            reinterpret_cast<uint2*>(sm.x[c])[i % kWords] = word;
         }
         if (tid < n) {
             const int column = a.ws.entries[v.first + base + tid] / kTopK;
@@ -346,7 +358,9 @@ __global__ void __launch_bounds__(kGuThreads) gate_up_a4_kernel(Args a) {
         const std::uint8_t* xg  = sm.x[min(g, n - 1)] + 8 * b0 + 2 * t;
         const std::uint8_t* xs0 = sm.x[min(2 * t, n - 1)] + S::kXScales + b0;
         const std::uint8_t* xs1 = sm.x[min(2 * t + 1, n - 1)] + S::kXScales + b0;
+        const std::uint8_t* xc  = sm.x[min(g, n - 1)]; // Native: column g's codes and scales
         long long s[4]          = {0, 0, 0, 0};
+        float c[4]              = {0.0F, 0.0F, 0.0F, 0.0F};
         for (int st = 0; st < S::kStages; ++st) {
             tile::cp_async_wait<kDepth - 2>();
             __syncwarp();
@@ -356,27 +370,47 @@ __global__ void __launch_bounds__(kGuThreads) gate_up_a4_kernel(Args a) {
 #pragma unroll
             for (int u = 0; u < S::kStageUnits; ++u) {
                 const int b = st * S::kStageUnits + u;
-                a4_mma_unit(stage + u * S::kUnit, a4_x_quad(*reinterpret_cast<const unsigned short*>(xg + 8 * b)), sm.scaled,
-                            sm.scaled[xs0[b]], sm.scaled[xs1[b]], g, t, s);
+                if constexpr (Native) {
+                    if (u % 4 == 0) {
+                        a4_native_step(stage + u * S::kUnit, xc + 8 * (b0 + b),
+                                       *reinterpret_cast<const std::uint32_t*>(xc + S::kXScales + b0 + b), g, t, c);
+                    }
+                } else {
+                    a4_mma_unit(stage + u * S::kUnit, a4_x_quad(*reinterpret_cast<const unsigned short*>(xg + 8 * b)),
+                                sm.scaled, sm.scaled[xs0[b]], sm.scaled[xs1[b]], g, t, s);
+                }
             }
             __syncwarp();
         }
         tile::cp_async_wait<0>();
         __syncthreads();
-        // The second half's sums join the first's (exact int64 adds) through the rings' memory.
-        auto* half = reinterpret_cast<long long (*)[32][4]>(&sm.ring[0][0][0]);
+        // The second half's sums join the first's (exact int64 adds; Native: half 0 + half 1 in FP32) through the
+        // rings' memory.
+        auto* half  = reinterpret_cast<long long (*)[32][4]>(&sm.ring[0][0][0]);
+        auto* halfc = reinterpret_cast<float (*)[32][4]>(&sm.ring[0][0][0]);
         if (k_half == 1) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i) { half[rg][lane][i] = s[i]; }
+            for (int i = 0; i < 4; ++i) {
+                if constexpr (Native) {
+                    halfc[rg][lane][i] = c[i];
+                } else {
+                    half[rg][lane][i] = s[i];
+                }
+            }
         }
         __syncthreads();
         if (k_half == 0) {
             std::uint16_t y[4], up[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                s[i] += half[rg][lane][i];
                 const float rs = sm.rs[min(2 * t + (i & 1), n - 1)];
-                y[i] = canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(canon::i64_to_f32_rn(s[i]), 1.0F / 1048576.0F), rs));
+                if constexpr (Native) {
+                    y[i] = canon::f32_to_bf16_rn(canon::mul_rn(canon::add_rn(c[i], halfc[rg][lane][i]), rs));
+                } else {
+                    s[i] += half[rg][lane][i];
+                    y[i] = canon::f32_to_bf16_rn(
+                        canon::mul_rn(canon::mul_rn(canon::i64_to_f32_rn(s[i]), 1.0F / 1048576.0F), rs));
+                }
             }
             // Rows g and g + 8 are gate rows for even g (row 2i is intermediate i's gate, 2i + 1 its up): the up
             // row's outputs come from lane + 4.
@@ -489,7 +523,9 @@ struct DownA4Smem {
     float rs[kPass];
 };
 
-template <class G>
+// Native: one FP32 chain of native steps in block order (single_kernel's down chain); not Native (Nvfp4Core::Exact):
+// the exact int64 sum.
+template <class G, bool Native>
 __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a4_kernel(Args a) {
     using S = Shape<G, false>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -520,9 +556,13 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a4_kernel(
         constexpr int kWords = S::kHRowBytes / 4;
         for (int i = tid; i < n * kWords; i += S::kDownThreads) {
             const int c = i / kWords, entry = a.ws.entries[v.first + base + c];
-            reinterpret_cast<std::uint32_t*>(sm.h[c])[i % kWords] =
+            std::uint32_t word =
                 __ldcg(reinterpret_cast<const std::uint32_t*>(a.ws.h_rows + static_cast<std::size_t>(entry) * S::kHRowBytes) +
                        i % kWords);
+            if constexpr (Native) {
+                if (i % kWords < S::kHScales / 4) { word = a4_native_order(word); } // the codes in the core's slot order
+            }
+            reinterpret_cast<std::uint32_t*>(sm.h[c])[i % kWords] = word;
         }
         if (tid < n) {
             const int entry = a.ws.entries[v.first + base + tid];
@@ -535,10 +575,20 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a4_kernel(
         const std::uint8_t* hs1 = sm.h[min(2 * t + 1, n - 1)] + S::kHScales;
         const std::uint8_t* units = sm.units[warp];
         long long s[4] = {0, 0, 0, 0};
+        float cn[4]    = {0.0F, 0.0F, 0.0F, 0.0F};
+        if constexpr (Native) {
+            const std::uint8_t* hc = sm.h[min(g, n - 1)];
+#pragma unroll 6
+            for (int b = 0; b < S::kDownBlocks; b += 4) {
+                a4_native_step(units + b * S::kUnit, hc + 8 * b, *reinterpret_cast<const std::uint32_t*>(hc + S::kHScales + b),
+                               g, t, cn);
+            }
+        } else {
 #pragma unroll 8
-        for (int b = 0; b < S::kDownBlocks; ++b) {
-            a4_mma_unit(units + b * S::kUnit, a4_x_quad(*reinterpret_cast<const unsigned short*>(hg + 8 * b)), sm.scaled,
-                        sm.scaled[hs0[b]], sm.scaled[hs1[b]], g, t, s);
+            for (int b = 0; b < S::kDownBlocks; ++b) {
+                a4_mma_unit(units + b * S::kUnit, a4_x_quad(*reinterpret_cast<const unsigned short*>(hg + 8 * b)), sm.scaled,
+                            sm.scaled[hs0[b]], sm.scaled[hs1[b]], g, t, s);
+            }
         }
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -546,8 +596,9 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a4_kernel(
             if (c < n) {
                 const int entry = a.ws.entries[v.first + base + c];
                 const int row   = group * 16 + g + (i < 2 ? 0 : 8);
-                a.outputs[static_cast<std::size_t>(entry) * G::kHidden + row] = canon::f32_to_bf16_rn(
-                    canon::mul_rn(canon::mul_rn(canon::i64_to_f32_rn(s[i]), 1.0F / 1048576.0F), sm.rs[c]));
+                const float value = Native ? canon::mul_rn(cn[i], sm.rs[c])
+                                           : canon::mul_rn(canon::mul_rn(canon::i64_to_f32_rn(s[i]), 1.0F / 1048576.0F), sm.rs[c]);
+                a.outputs[static_cast<std::size_t>(entry) * G::kHidden + row] = canon::f32_to_bf16_rn(value);
             }
         }
         __syncthreads();
@@ -1121,11 +1172,13 @@ __global__ void __launch_bounds__(Shape<G, true>::kDownThreads) down_mx_a16_kern
 // its order); every CTA waits for them and selects the column's experts itself (select_column's rule, a thread an
 // expert); CTA c then takes job
 // c / 18 (jobs in ascending expert id) and its warps the row groups (c % 18) * 8 + warp, each streaming its gate/up row
-// group over all of K (NVFP4: the exact int64 sum of both halves; MXFP8: the two halves' FP32 chains added half 0 +
-// half 1, as gate_up_a8_kernel) and then its down row group through one cp.async ring, so the down weights stream
-// while the CTA waits for its job's h. h goes to global as BF16; once the job's 144 row groups are counted, each of
-// its 18 CTAs forms the job's quantized h row itself (the same four-over-six blocks or MXFP8 groups) and runs its down
-// row groups. Every value is the separate kernels' bit for bit. The last CTA to finish resets the counters.
+// group over all of K (NVFP4: the core of gate_up_a4_kernel, native or exact; MXFP8: the two halves' FP32 chains
+// added half 0 + half 1, as gate_up_a8_kernel) and then its down row group through one cp.async ring, so the down
+// weights stream while the CTA waits for its job's h. NVFP4: h goes to global as BF16; once the job's 144 row groups
+// are counted, each of its 18 CTAs loads the job's h row once (its amax from the same loads) and forms its
+// four-over-six blocks itself. MXFP8: each CTA quantizes its 64 intermediates (two whole groups) and publishes them to
+// the job's h row, which every down CTA loads. Every value is the separate kernels' bit for bit (with the same core).
+// The last CTA to finish resets the counters.
 constexpr int kSingleWarps      = 8;
 constexpr int kSingleThreads    = 32 * kSingleWarps;
 constexpr int kSingleDepth      = 9;                                // stages of a warp's ring
@@ -1168,8 +1221,12 @@ struct SingleSmem {
     int stalled;
 };
 
-template <class G, bool A8, bool A16 = false>
+// Native (NVFP4 A4): the native block-scaled core (a4_native_step) in gate_up_a4_kernel's and down_a4_kernel's chains:
+// gate/up two FP32 chains over the K halves added half 0 + half 1, down one chain in block order; x and h staged in
+// the core's slot order. Not Native (Nvfp4Core::Exact): the exact int64 core.
+template <class G, bool A8, bool A16 = false, bool Native = false>
 __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleArgs a) {
+    static_assert(!Native || (!A8 && !A16), "the native core is NVFP4 A4's");
     using S = Shape<G, A8>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<SingleSmem<G, A8, A16>*>(smem_raw);
@@ -1216,7 +1273,11 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     // The column's activation row (the gate/up's B operand) while the router finishes.
     constexpr int kXBytes = A16 ? kA16XRowBytes : S::kXRowBytes;
     for (int i = tid; i < kXBytes / 8; i += kSingleThreads) {
-        reinterpret_cast<uint2*>(sm.x)[i] = reinterpret_cast<const uint2*>(a.e.x.rows)[i];
+        uint2 v = reinterpret_cast<const uint2*>(a.e.x.rows)[i];
+        if constexpr (Native) {
+            if (i < S::kXScales / 8) { v = make_uint2(a4_native_order(v.x), a4_native_order(v.y)); }
+        }
+        reinterpret_cast<uint2*>(sm.x)[i] = v;
     }
     if constexpr (A16) {
         if (tid == 0) { sm.x_emax = a.e.x.emax[0]; }
@@ -1307,7 +1368,13 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
 #pragma unroll
         for (int u = 0; u < S::kStageUnits; ++u) {
             const int b = first + u;
-            if constexpr (A8) {
+            if constexpr (Native) {
+                static_assert(S::kStageUnits % 4 == 0, "whole 64-element steps a stage");
+                if (u % 4 == 0) {
+                    a4_native_step(stage + u * S::kUnit, b_row + 8 * b,
+                                   *reinterpret_cast<const std::uint32_t*>(b_row + scales + b), g, t, acc);
+                }
+            } else if constexpr (A8) {
                 a8_mma_unit(stage + u * S::kUnit, b_row + 32 * b, b_row[scales + b], lane, g, t, acc);
             } else if constexpr (A16) {
                 (void)scales;
@@ -1330,6 +1397,11 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     if constexpr (A8) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) { y[i] = canon::f32_to_bf16_rn(canon::add_rn(c0[i], c1[i])); }
+    } else if constexpr (Native) {
+        const float rs = detail::nvfp4_row_scale(a.e.x.amax[0], a.e.bank.amax[2 * expert],
+                                                 detail::nvfp4_rcp(a.e.bank.denominators[0]));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { y[i] = canon::f32_to_bf16_rn(canon::mul_rn(canon::add_rn(c0[i], c1[i]), rs)); }
     } else if constexpr (A16) {
         const float m = a16_multiplier(a.e.bank.amax[2 * expert], a.e.bank.denominators[0]);
 #pragma unroll
@@ -1346,13 +1418,44 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
     // Column 0's intermediates (t = 0): gate rows g (even) and g + 8, their up rows from lane + 4.
     std::uint16_t* h_row = a.e.ws.h + static_cast<std::size_t>(slot) * G::kInter;
-    if (t == 0 && (g & 1) == 0) {
-        h_row[group * 8 + g / 2]     = swiglu(y[0], up[0], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
-        h_row[group * 8 + g / 2 + 4] = swiglu(y[2], up[2], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
-        __threadfence();
+    if constexpr (A8) {
+        // MXFP8: the CTA's 8 row groups are 64 consecutive intermediates, two whole groups: quantized here
+        // (gate_up_a8_kernel's rule, the same values) and published to the job's h row (codes at 32 a group, the UE8M0
+        // words after the 1,152 codes), so each down CTA loads them instead of forming all 36 groups itself.
+        __shared__ std::uint16_t cta_h[2 * 32];
+        if (t == 0 && (g & 1) == 0) {
+            cta_h[warp * 8 + g / 2]     = swiglu(y[0], up[0], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+            cta_h[warp * 8 + g / 2 + 4] = swiglu(y[2], up[2], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+        }
+        __syncthreads();
+        if (tid < 2) {
+            float values[32];
+#pragma unroll
+            for (int j = 0; j < 32; ++j) { values[j] = bf16f(cta_h[32 * tid + j]); }
+            const canon::Mxfp8Group q = canon::mxfp8_group(values);
+            const int gi              = 2 * (cta % kSingleCtasPerJob) + tid;
+            std::uint8_t* out         = a.e.ws.h_rows + static_cast<std::size_t>(slot) * S::kHRowBytes;
+            auto* words               = reinterpret_cast<std::uint32_t*>(out + 32 * gi);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                words[j] = q.code[4 * j] | (static_cast<std::uint32_t>(q.code[4 * j + 1]) << 8) |
+                           (static_cast<std::uint32_t>(q.code[4 * j + 2]) << 16) |
+                           (static_cast<std::uint32_t>(q.code[4 * j + 3]) << 24);
+            }
+            out[S::kHScales + gi] = q.exponent;
+            __threadfence();
+        }
+        __syncthreads();
+        if (tid == 0) { release_add(counters + 2 + job, kSingleWarps); } // the CTA's 8 row groups
+    } else {
+        if (t == 0 && (g & 1) == 0) {
+            h_row[group * 8 + g / 2]     = swiglu(y[0], up[0], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+            h_row[group * 8 + g / 2 + 4] = swiglu(y[2], up[2], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+            __threadfence();
+        }
+        __syncwarp();
+        if (lane == 0) { release_add(counters + 2 + job); }
     }
-    __syncwarp();
-    if (lane == 0) { release_add(counters + 2 + job); }
     pdl::trigger_dependents();
     // The job's h, once its 144 row groups are counted (the down weights keep streaming meanwhile).
     __syncthreads();
@@ -1363,27 +1466,29 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         return;
     }
     if constexpr (A8) {
-        // MXFP8: each 32 intermediates one group (gate_up_a8_kernel's).
-        if (tid < G::kInter / 32) {
-            float values[32];
-#pragma unroll
-            for (int j = 0; j < 32; ++j) { values[j] = bf16f(__ldcg(h_row + 32 * tid + j)); }
-            const canon::Mxfp8Group q = canon::mxfp8_group(values);
-            auto* words               = reinterpret_cast<std::uint32_t*>(sm.h + 32 * tid);
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                words[j] = q.code[4 * j] | (static_cast<std::uint32_t>(q.code[4 * j + 1]) << 8) |
-                           (static_cast<std::uint32_t>(q.code[4 * j + 2]) << 16) |
-                           (static_cast<std::uint32_t>(q.code[4 * j + 3]) << 24);
-            }
-            sm.h[S::kHScales + tid] = q.exponent;
-        }
+        // MXFP8: the job's h row as its 18 CTAs published it (codes and UE8M0 words, in sm.h's layout).
+        (void)h_row;
+        static_assert(S::kHRowBytes % 4 == 0 && S::kHRowBytes <= S::kHStride, "the h row in words");
+        const auto* src = reinterpret_cast<const std::uint32_t*>(a.e.ws.h_rows + static_cast<std::size_t>(slot) * S::kHRowBytes);
+        for (int i = tid; i < S::kHRowBytes / 4; i += kSingleThreads) { reinterpret_cast<std::uint32_t*>(sm.h)[i] = __ldcg(src + i); }
     } else {
         // NVFP4: the row's amax (the largest magnitude's bits), then four-over-six by block halves on thread pairs
-        // (gate_up_a4_kernel's last-CTA quantization).
+        // (gate_up_a4_kernel's last-CTA quantization). A block half's 8 values are loaded once, by the thread that
+        // quantizes them, and the amax is the maximum of the threads' 8-value maxima (the same values, the same max).
+        constexpr int kBlocks = G::kInter / 16;
+        static_assert(2 * kBlocks <= kSingleThreads, "one round of block halves");
+        const int i    = tid;
+        const bool on  = i < 2 * kBlocks;
+        const int half = i & 1, b = on ? i >> 1 : 0;
+        const uint4 hq = on ? __ldcg(reinterpret_cast<const uint4*>(h_row + 16 * b) + half) : make_uint4(0, 0, 0, 0);
         std::uint32_t m = 0;
-        for (int k = tid; k < G::kInter; k += kSingleThreads) {
-            m = max(m, canon::f32_bits(bf16f(__ldcg(h_row + k))) & 0x7FFFFFFFU);
+        {
+            const std::uint32_t hw[4] = {hq.x, hq.y, hq.z, hq.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                m = max(m, canon::f32_bits(bf16f(static_cast<std::uint16_t>(hw[j] & 0xFFFFU))) & 0x7FFFFFFFU);
+                m = max(m, canon::f32_bits(bf16f(static_cast<std::uint16_t>(hw[j] >> 16))) & 0x7FFFFFFFU);
+            }
         }
 #pragma unroll
         for (int o = 16; o >= 1; o /= 2) { m = max(m, __shfl_xor_sync(0xFFFFFFFFU, m, o)); }
@@ -1392,20 +1497,15 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         if (tid == 0) {
             std::uint32_t all = 0;
 #pragma unroll
-            for (int i = 0; i < kSingleWarps; ++i) { all = max(all, sm.red[i]); }
+            for (int wi = 0; wi < kSingleWarps; ++wi) { all = max(all, sm.red[wi]); }
             sm.h_amax = canon::f32_from_bits(all);
             if constexpr (A16) { sm.h_emax = a16::a16_emax(all >> 16); } // the BF16 bits of max |h|
         }
         __syncthreads();
-        constexpr int kBlocks = G::kInter / 16;
-        static_assert(2 * kBlocks <= kSingleThreads, "one round of block halves");
-        const int i    = tid;
-        const bool on  = i < 2 * kBlocks;
-        const int half = i & 1, b = on ? i >> 1 : 0;
         if constexpr (A16) {
             // A16: the row's limbs, a block's halves on a thread pair.
             if (on) {
-                const uint4 q = __ldcg(reinterpret_cast<const uint4*>(h_row + 16 * b) + half);
+                const uint4 q = hq;
                 const std::uint32_t hw[4] = {q.x, q.y, q.z, q.w};
                 std::uint16_t bits[8];
 #pragma unroll
@@ -1420,7 +1520,7 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
             float xv[8] = {};
             float mag   = 0.0F;
             if (on) {
-                const uint4 q = __ldcg(reinterpret_cast<const uint4*>(h_row + 16 * b) + half);
+                const uint4 q = hq;
                 const std::uint32_t hw[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -1450,13 +1550,14 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
                     const std::uint32_t hi = four ? c4[2 * j + 1] : c6[2 * j + 1];
                     packed |= (lo | (hi << 4)) << (8 * j);
                 }
+                if constexpr (Native) { packed = a4_native_order(packed); }
                 *reinterpret_cast<std::uint32_t*>(sm.h + 8 * b + 4 * half) = packed;
                 if (half == 0) { sm.h[S::kHScales + b] = four ? words.four : words.six; }
             }
         }
     }
     __syncthreads();
-    // Down: one chain over K = I (MXFP8 one FP32 chain in block order; NVFP4 the exact sum).
+    // Down: one chain over K = I (MXFP8 and native NVFP4 one FP32 chain in block order; exact NVFP4 the int64 sum).
     float cd[4]     = {0.0F, 0.0F, 0.0F, 0.0F};
     long long sd[4] = {0, 0, 0, 0};
     for (int st = kGu; st < kTotal; ++st) { step(st, cd, sd); }
@@ -1466,6 +1567,11 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         if constexpr (A8) {
             lo = canon::f32_to_bf16_rn(cd[0]);
             hi = canon::f32_to_bf16_rn(cd[2]);
+        } else if constexpr (Native) {
+            const float rs = detail::nvfp4_row_scale(sm.h_amax, a.e.bank.amax[2 * expert + 1],
+                                                     detail::nvfp4_rcp(a.e.bank.denominators[1]));
+            lo = canon::f32_to_bf16_rn(canon::mul_rn(cd[0], rs));
+            hi = canon::f32_to_bf16_rn(canon::mul_rn(cd[2], rs));
         } else if constexpr (A16) {
             const float m = a16_multiplier(a.e.bank.amax[2 * expert + 1], a.e.bank.denominators[1]);
             lo            = canon::a16_row_output(sd[0], sm.h_emax, m);
@@ -1615,21 +1721,22 @@ void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t exp
 }
 
 namespace {
-template <bool A8, bool A16>
+// Sets the instance's shared-memory attributes (every launch of it follows a check here) and whether its grid fits.
+template <bool A8, bool A16, bool Native = false>
 bool single_fits() {
     using G = Inkling;
-    allow_shared(single_kernel<G, A8, A16>, sizeof(SingleSmem<G, A8, A16>));
+    allow_shared(single_kernel<G, A8, A16, Native>, sizeof(SingleSmem<G, A8, A16>));
     int device = 0, sms = 0, blocks = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, single_kernel<G, A8, A16>, kSingleThreads,
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, single_kernel<G, A8, A16, Native>, kSingleThreads,
                                                              sizeof(SingleSmem<G, A8, A16>)));
     return blocks >= 1 && static_cast<long long>(blocks) * sms >= kSingleCtas;
 }
 } // namespace
 
 bool moe_single_supported(ExpertFormat format, ExpertActivation activation) {
-    static const bool a4  = single_fits<false, false>();
+    static const bool a4  = single_fits<false, false>() && single_fits<false, false, true>();
     static const bool a8  = single_fits<true, false>();
     static const bool a16 = single_fits<false, true>();
     if (format == ExpertFormat::Mxfp8) { return activation == ExpertActivation::Checkpoint && a8; }
@@ -1664,7 +1771,9 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
     } else if (bank.format == ExpertFormat::Nvfp4FourOverSix) {
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
                                     {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, false>), stream},
-                                    single_kernel<G, false>, args));
+                                    rows.core == Nvfp4Core::Exact ? single_kernel<G, false, false, false>
+                                                                  : single_kernel<G, false, false, true>,
+                                    args));
     } else {
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
                                     {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, true>), stream},
@@ -1728,18 +1837,21 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
     if (bank.format == ExpertFormat::Nvfp4FourOverSix) {
         using S = Shape<G, false>;
         static const bool configured = [] {
-            allow_shared(gate_up_a4_kernel<G>, sizeof(GateUpA4Smem<G>));
-            allow_shared(down_a4_kernel<G>, sizeof(DownA4Smem<G>));
+            allow_shared(gate_up_a4_kernel<G, false>, sizeof(GateUpA4Smem<G>));
+            allow_shared(down_a4_kernel<G, false>, sizeof(DownA4Smem<G>));
+            allow_shared(gate_up_a4_kernel<G, true>, sizeof(GateUpA4Smem<G>));
+            allow_shared(down_a4_kernel<G, true>, sizeof(DownA4Smem<G>));
             return true;
         }();
         (void)configured;
+        const bool exact = x.core == Nvfp4Core::Exact;
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
                                     {dim3(S::kGateUpCtas, jobs), dim3(kGuThreads), sizeof(GateUpA4Smem<G>), stream},
-                                    gate_up_a4_kernel<G>, args));
+                                    exact ? gate_up_a4_kernel<G, false> : gate_up_a4_kernel<G, true>, args));
         check_launch("NVFP4 gate/up");
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
                                     {dim3(S::kDownCtas, jobs), dim3(S::kDownThreads), sizeof(DownA4Smem<G>), stream},
-                                    down_a4_kernel<G>, args));
+                                    exact ? down_a4_kernel<G, false> : down_a4_kernel<G, true>, args));
         check_launch("NVFP4 down");
         return;
     }

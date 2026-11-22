@@ -4,10 +4,15 @@
 // every expert device-resident, in the trained arithmetic of its layer:
 //
 //   NVFP4 (four-over-six W4A4, nvfp4_expert_rg16_v1): x and h are four-over-six NVFP4 rows (canon::four_over_six_*,
-//     a per-row amax and an E4M3 scale per 16 elements); a gate/up or down output is
-//       bf16((fl32(S) * 2^-20) * rs),  rs = (amax_row * amax_w[e]) * rcp_rn(1536 * denominator),
-//     with S the exact int64 sum of the decoded products (ops/common/a4_mma.cuh), so the dot product is exact and
-//     rounded once to binary32;
+//     a per-row amax and an E4M3 scale per 16 elements), rs = (amax_row * amax_w[e]) * rcp_rn(1536 * denominator).
+//     The decode and verify kernels (moe_single, moe_experts) take one of two cores (Activations::core), the same in
+//     every kernel a decode or verify call reaches:
+//       Native (the default): a gate/up or down output is bf16(acc * rs), acc an FP32 chain of 64-element steps on the
+//         block-scaled e2m1 tensor core (mma mxf4nvf4 m16n8k64 with E4M3 block scales, ops/common/a4_native.cuh; K
+//         slot blocks 0, 2, 1, 3 of each step): gate/up one chain a K half, acc = half 0 + half 1; down one chain in
+//         block order;
+//       Exact: bf16((fl32(S) * 2^-20) * rs) with S the exact int64 sum of the decoded products (ops/common/a4_mma.cuh),
+//         the dot product rounded once to binary32;
 //   MXFP8 (W8A8, mxfp8_expert_rg16_v1): x and h are MXFP8 rows (E4M3 codes, a UE8M0 power of two per 32 elements);
 //     a gate/up or down output is bf16(acc), acc the block-scaled FP32 tensor-core sum in one fixed K order.
 //
@@ -66,6 +71,10 @@ struct Bank {
 //   MXFP8 layers: W8A16, x and h BF16 (no rows).
 enum class ExpertActivation : std::uint8_t { Checkpoint, A16 };
 
+// The NVFP4 checkpoint arithmetic's core in the decode and verify kernels (the header's NVFP4 contract; no effect on
+// A16, MXFP8 or the prompt route).
+enum class Nvfp4Core : std::uint8_t { Native, Exact };
+
 // An A16 limb row (a16_limbs.cuh's planes: per 64-element tile 64 H1, 64 L1, 64 H0 | L0 << 4 bytes).
 inline constexpr std::int32_t kA16XRowBytes = 2304 / 64 * 192; // 6,912
 inline constexpr std::int32_t kA16HRowBytes = 1152 / 64 * 192; // 3,456
@@ -79,6 +88,7 @@ struct Activations {
     ExpertActivation activation = ExpertActivation::Checkpoint;
     const std::int32_t* emax    = nullptr;
     const std::uint16_t* x16    = nullptr;
+    Nvfp4Core core              = Nvfp4Core::Native;
 };
 
 // The routing of the call's columns: experts [T][top_k] in slot order and their weights gamma [T][top_k].
@@ -182,8 +192,8 @@ void moe_select(const float* logits, std::int32_t columns, const float* bias, st
 
 // moe_experts_prompt: NVFP4 layers on block-scaled tensor cores (mma mxf4nvf4, a grouped GEMM over the dispatched
 // entries): a gate/up or down output is bf16(acc * rs) with acc the FP32 tensor-core sum of the decoded block
-// products in one fixed K order (the narrow route's exact int64 sum rounded once, up to the accumulation's rounding)
-// and rs the narrow route's row scale; h and its four-over-six rows as the narrow route forms them. MXFP8 layers: a
+// products in its own fixed K order (the exact sum up to the accumulation's rounding) and rs the narrow route's row
+// scale; h and its four-over-six rows as the narrow route forms them. MXFP8 layers: a
 // grouped GEMM on block-scaled FP8 tensor cores (mma mxf8f6f4, UE8M0 per 32), each output the FP32 sum over K's
 // 32-blocks in ascending order, g, u = bf16(acc), h's MXFP8 groups as the narrow route's, y = bf16(acc). Outputs as
 // moe_experts'.
