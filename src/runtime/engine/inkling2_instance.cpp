@@ -32,6 +32,7 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
                       options.purpose == EnginePurpose::Generation,
             .draft_tokens      = options.speculative.draft_tokens == 0 ? 7U : options.speculative.draft_tokens,
             .draft_tokens_auto = options.speculative.draft_tokens_auto,
+            .expert_a16        = options.expert_a16_activations,
             .diagnostics       = options.diagnostic_observer};
 }
 
@@ -49,8 +50,13 @@ bool artifact_is_inkling2(const artifact::Reader& reader) { return models::inkli
 
 EngineOptions normalize_inkling2_options(EngineOptions options) {
     refuse(options.lossless || options.reference, "the lossless and reference routes are a later milestone");
-    refuse(options.expert_a4_activations || options.expert_a16_activations || options.a8_activations,
-           "the expert and 8-bit activation switches belong to other architectures");
+    refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
+    refuse(options.a8_activations, "--a8-activations is not built for Inkling 2 yet");
+    if (options.expert_a16_activations) {
+        report(options, "Inkling 2: --a16-activations: the routed experts take 16-bit activations instead of the "
+                        "checkpoint's four-over-six NVFP4 and MXFP8 ones (changes the output; the default follows the "
+                        "trained arithmetic and is recommended)");
+    }
     if (options.q8_weights && !options.fast_paths) {
         throw std::invalid_argument("--q8-weights is approximate; the reproducible route (--reproducible) refuses it");
     }

@@ -284,6 +284,8 @@ struct ProgramOptions {
     bool dspark                 = false;
     std::uint32_t draft_tokens  = 7;
     bool draft_tokens_auto      = true;
+    // --a16-activations: the routed experts on 16-bit activations (w4a4_sparse_moe.h's ExpertActivation::A16).
+    bool expert_a16             = false;
     DiagnosticObserver diagnostics;
 };
 

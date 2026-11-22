@@ -106,8 +106,9 @@ std::int32_t max_groups(std::int32_t lanes, std::int32_t capacity) {
 // The forward's device buffers in order, each through add(pointer, bytes) (the constructor places them; device_bytes
 // counts them).
 template <class Add>
-void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, bool features, ForwardBuffers& b,
-                  std::uint8_t*& moe_base, std::uint8_t*& attention_base, Add&& add) {
+void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, bool features,
+                  moe::ExpertActivation activation, ForwardBuffers& b, std::uint8_t*& moe_base,
+                  std::uint8_t*& attention_base, Add&& add) {
     const std::size_t T = static_cast<std::size_t>(capacity);
     const std::size_t V = c.vocab_size, rank = c.loop.message_rank, lanes = static_cast<std::size_t>(max_lanes);
     const std::size_t row16         = T * kH * 2;
@@ -127,25 +128,27 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
     add(b.q, T * kQ * 2), add(b.r, T * kR * 2), add(b.gate, T * kQ * 2), add(b.k, T * kKv * 2);
     add(b.v, T * kKv * 2), add(b.sink, T * ik::kHeads * 2), add(b.key_taps, T * kTaps * 2);
     add(b.value_taps, T * kTaps * 2), add(b.attention, T * kQ * 2), add(b.o, row16), add(b.xm, row16);
-    add(b.rows, T * std::max(moe::row_bytes(moe::ExpertFormat::Nvfp4FourOverSix, kH),
-                             moe::row_bytes(moe::ExpertFormat::Mxfp8, kH)));
-    add(b.amax, T * 4), add(b.experts, T * moe::kTopK * kH * 2);
+    const bool a16 = activation == moe::ExpertActivation::A16;
+    add(b.rows, T * std::max({moe::row_bytes(moe::ExpertFormat::Nvfp4FourOverSix, kH),
+                              moe::row_bytes(moe::ExpertFormat::Mxfp8, kH), a16 ? moe::kA16XRowBytes : 0}));
+    add(b.amax, T * 4), add(b.emax, T * 4), add(b.experts, T * moe::kTopK * kH * 2);
     add(b.mixed, 3 * T * kH * 4), add(b.message, 3 * T * kH * 4), add(b.fg, 3 * T * 2 * kH * 4);
     add(b.gate_input, 3 * T * 2 * kH * 2), add(b.z, 3 * T * rank * 2);
     add(b.final_hidden, row16), add(b.logits, std::size_t{kMaxForwardColumns} * V * 4);
     if (features) { add(b.features, 4 * row16); }
     add(moe_base, moe::workspace_bytes(static_cast<std::int32_t>(c.experts), static_cast<std::int32_t>(c.intermediate),
-                                       capacity));
+                                       capacity, activation));
     add(attention_base, ik::attention_workspace_bytes(capacity));
 }
 
 } // namespace
 
-std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity, bool features) {
+std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity, bool features,
+                                  moe::ExpertActivation activation) {
     ForwardBuffers b;
     std::uint8_t *moe_base = nullptr, *attention_base = nullptr;
     std::size_t at = 0;
-    walk_buffers(config, max_lanes, capacity, features, b, moe_base, attention_base,
+    walk_buffers(config, max_lanes, capacity, features, activation, b, moe_base, attention_base,
                  [&](auto*&, std::size_t bytes) { at = align(at + bytes); });
     return at;
 }
@@ -172,9 +175,10 @@ StateLayout state_layout(const TextConfig& c) {
     return out;
 }
 
-Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity)
+Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity,
+                 moe::ExpertActivation activation)
     : p_(parameters), c_(parameters.model.config().text), layout_(state_layout(c_)), max_lanes_(max_lanes),
-      capacity_(capacity), max_groups_(max_groups(max_lanes, capacity)),
+      capacity_(capacity), activation_(activation), max_groups_(max_groups(max_lanes, capacity)),
       staging_pages_(ik::staging_ring_pages(capacity)) {
     if (max_lanes <= 0 || max_lanes > ik::kMaxAttentionLanes) {
         throw std::invalid_argument("inkling2 forward: 1-8 lanes");
@@ -187,7 +191,7 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     std::vector<std::pair<void**, std::size_t>> slots;
     std::uint8_t* moe_base       = nullptr;
     std::uint8_t* attention_base = nullptr;
-    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), b_, moe_base, attention_base,
+    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, b_, moe_base, attention_base,
                  [&](auto*& pointer, std::size_t bytes) {
         slots.emplace_back(reinterpret_cast<void**>(&pointer), at);
         at = align(at + bytes);
@@ -197,7 +201,7 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     auto* base = static_cast<std::uint8_t*>(memory_.p);
     for (auto& [pointer, offset] : slots) { *pointer = base + offset; }
     b_.moe          = moe::carve_workspace(moe_base, static_cast<std::int32_t>(c_.experts),
-                                           static_cast<std::int32_t>(c_.intermediate), capacity);
+                                           static_cast<std::int32_t>(c_.intermediate), capacity, activation);
     b_.attention_ws = ik::carve_attention_workspace(attention_base, capacity);
     // conv_history's descriptors: every visit's four rings.
     std::vector<std::int64_t> rings;
@@ -561,7 +565,19 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     add_segment(wo, a.output, 0, b_.o);
     project_fused(prompt_, wo, stream);
     mark("w_o");
-    const ik::ExpertRows rows{op.format, b_.rows, b_.amax};
+    // The experts' x: the checkpoint's rows, or under A16 an NVFP4 layer's limb rows and an MXFP8 layer's BF16 x alone.
+    const bool a16 = activation_ == moe::ExpertActivation::A16;
+    const bool nvfp4 = op.format == moe::ExpertFormat::Nvfp4FourOverSix;
+    const ik::ExpertRows rows = !a16 ? ik::ExpertRows{op.format, b_.rows, b_.amax}
+                                : nvfp4 ? ik::ExpertRows{op.format, b_.rows, nullptr, b_.emax}
+                                        : ik::ExpertRows{op.format, nullptr, nullptr, nullptr};
+    moe::Activations experts_x{b_.rows, b_.amax, T};
+    if (a16) {
+        experts_x.activation = moe::ExpertActivation::A16;
+        experts_x.rows       = nvfp4 ? b_.rows : nullptr;
+        experts_x.emax       = nvfp4 ? b_.emax : nullptr;
+        experts_x.x16        = b_.xm;
+    }
     ik::MlpEntryArgs m;
     m.columns  = T;
     m.map      = map;
@@ -628,15 +644,16 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         ik::projections_mma(router, stream);
         moe::moe_select(b_.moe.logits, T, op.router_bias, op.bank.experts, c_.route_scale, b_.moe, stream);
         mark("router");
-        moe::moe_experts_prompt({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
-    } else if (T == 1 && moe::moe_single_supported(op.bank.format)) {
+        // A16: the narrow kernels at the prompt's width too (their exact or column-invariant sums; no A16 grouped GEMM).
+        a16 ? moe::moe_experts(experts_x, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream)
+            : moe::moe_experts_prompt(experts_x, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
+    } else if (T == 1 && moe::moe_single_supported(op.bank.format, experts_x.activation)) {
         // One column: the router and the experts in one launch (the same bits).
-        moe::moe_single(b_.xm, {b_.rows, b_.amax, T}, op.router, op.router_bias, c_.route_scale, op.bank, b_.moe,
-                        b_.experts, stream);
+        moe::moe_single(b_.xm, experts_x, op.router, op.router_bias, c_.route_scale, op.bank, b_.moe, b_.experts, stream);
     } else {
         moe::moe_route(b_.xm, T, op.router, op.router_bias, op.bank.experts, kH, c_.route_scale, b_.moe, stream);
         mark("router");
-        moe::moe_experts({b_.rows, b_.amax, T}, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
+        moe::moe_experts(experts_x, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
     }
     mark("experts");
 }

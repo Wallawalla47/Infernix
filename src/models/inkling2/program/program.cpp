@@ -85,6 +85,10 @@ std::int32_t forward_capacity(const ProgramOptions& o) {
     return std::max(kMaxForwardColumns, static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context)));
 }
 
+ops::w4a4_moe::ExpertActivation expert_activation(const ProgramOptions& o) {
+    return o.expert_a16 ? ops::w4a4_moe::ExpertActivation::A16 : ops::w4a4_moe::ExpertActivation::Checkpoint;
+}
+
 std::uint32_t pages_per_lane(std::uint32_t max_context) {
     return (max_context + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit + 1;
 }
@@ -103,7 +107,7 @@ public:
     ProgramImpl(const Parameters& parameters, DeviceContext& device, ProgramOptions options)
         : p_(parameters), c_(parameters.model.config().text), device_(device), o_(std::move(options)),
           plan_(Program::plan_device(o_, parameters.model.config())),
-          forward_(parameters, static_cast<std::int32_t>(o_.max_concurrency), forward_capacity(o_)),
+          forward_(parameters, static_cast<std::int32_t>(o_.max_concurrency), forward_capacity(o_), expert_activation(o_)),
           vocab_(static_cast<std::int32_t>(c_.vocab_size)), lanes_(o_.max_concurrency),
           sampling_(ops::sampling_workspace_capacity_bytes(vocab_, 1, static_cast<std::int32_t>(kMaximumConcurrency)) +
                     4096),
@@ -1149,7 +1153,7 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2;
     const bool dspark = options.dspark && !options.causal_scoring;
     out.workspace = Forward::device_bytes(config.text, static_cast<std::int32_t>(lanes), detail::forward_capacity(options),
-                                          dspark) +
+                                          dspark, detail::expert_activation(options)) +
                     ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(config.text.vocab_size), 1,
                                                            static_cast<std::int32_t>(kMaximumConcurrency));
     if (dspark) {

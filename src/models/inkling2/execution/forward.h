@@ -82,8 +82,9 @@ struct ForwardBuffers {
     std::uint16_t *q = nullptr, *r = nullptr, *gate = nullptr, *k = nullptr, *v = nullptr, *sink = nullptr;
     std::uint16_t *key_taps = nullptr, *value_taps = nullptr;
     std::uint16_t *attention = nullptr, *o = nullptr, *xm = nullptr;
-    std::uint8_t* rows = nullptr;
+    std::uint8_t* rows = nullptr;     // the experts' x rows (checkpoint rows, or A16 limb rows)
     float* amax = nullptr;
+    std::int32_t* emax = nullptr;     // A16: the limb rows' exponents
     std::uint16_t* experts = nullptr; // [columns * kTopK][H]
     float *mixed = nullptr, *message = nullptr, *fg = nullptr; // [3][columns][H], [3][columns][H], [3][columns][2H]
     std::uint16_t *gate_input = nullptr, *z = nullptr;          // [3][columns][2H], [3][columns][rank]
@@ -116,7 +117,9 @@ class Forward {
 public:
     // A forward of `max_lanes` lanes and calls of up to `capacity` columns (prefill's chunk; at least
     // kMaxForwardColumns, the decode and verify calls' width, whose logits rows the head takes).
-    Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity = kMaxForwardColumns);
+    // `activation`: the routed experts' (--a16-activations: ExpertActivation::A16).
+    Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity = kMaxForwardColumns,
+            ops::w4a4_moe::ExpertActivation activation = ops::w4a4_moe::ExpertActivation::Checkpoint);
 
     // Uploads the call's tokens and column map (synchronous copies) and fixes the call's width.
     void prepare(const CallPlan& call);
@@ -129,7 +132,9 @@ public:
     [[nodiscard]] std::int32_t capacity() const noexcept { return capacity_; }
     // The device memory a forward of these lanes and capacity allocates.
     [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity,
-                                                  bool features = false);
+                                                  bool features = false,
+                                                  ops::w4a4_moe::ExpertActivation activation =
+                                                      ops::w4a4_moe::ExpertActivation::Checkpoint);
     void embed(cudaStream_t stream);
     void visit(std::uint32_t visit, const StateView& state, const VisitInputs& in, cudaStream_t stream);
     void visit(std::uint32_t v, const StateView& state, cudaStream_t stream) { visit(v, state, inputs(v), stream); }
@@ -184,6 +189,7 @@ private:
     std::int64_t history_words_ = 0; // a lane's histories
     std::int32_t max_lanes_ = 0;
     std::int32_t capacity_  = 0;
+    ops::w4a4_moe::ExpertActivation activation_ = ops::w4a4_moe::ExpertActivation::Checkpoint;
     std::int32_t max_groups_ = 0;
     std::int32_t staging_pages_ = 0;
     std::int32_t columns_   = 0;
