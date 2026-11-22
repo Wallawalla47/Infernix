@@ -69,14 +69,22 @@ void walk(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity, 
     add(b.tokens, kB * 4), add(b.probabilities, kB * 4), add(b.inv_freq, ik::kDSparkHeadDim / 2 * 4);
 }
 
-// A BF16 matrix as one segment of a fused projection (the drafter's weights are BF16 as shipped).
+// A BF16 or 8-bit (Q8_G32_FP16 RowSplit, converted at load: plan_load's drafter_q8_objects) matrix as one segment of
+// a fused projection.
 void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, void* out) {
-    if (w.qdata == nullptr || w.qtype != QType::BF16 || w.layout != QuantLayout::Contiguous ||
-        args.count >= ik::kMaxProjectionSegments) {
-        throw std::invalid_argument("inkling2 dspark: a drafter projection is not a resident BF16 matrix");
+    const bool bf16 = w.qtype == QType::BF16 && w.layout == QuantLayout::Contiguous;
+    const bool q8   = w.qtype == QType::Q8_G32_FP16 && w.layout == QuantLayout::RowSplit;
+    if (w.qdata == nullptr || !(bf16 || q8) || args.count >= ik::kMaxProjectionSegments) {
+        throw std::invalid_argument("inkling2 dspark: a drafter projection is not a resident BF16 or Q8 matrix");
     }
     ik::ProjectionSegment s;
-    s.weight = static_cast<const std::uint16_t*>(w.qdata);
+    if (bf16) {
+        s.weight = static_cast<const std::uint16_t*>(w.qdata);
+    } else {
+        s.codes     = w.qdata;
+        s.q8_scales = static_cast<const std::uint16_t*>(w.scales);
+        s.q8_stride = static_cast<std::int32_t>(w.padded_shape[1]);
+    }
     s.rows   = w.n;
     s.input  = input;
     s.out    = out;
@@ -325,7 +333,15 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
     mk.f_ring_rows   = kFRing;
     mk.f_lane_stride = static_cast<std::int64_t>(kFRing) * kH;
     mk.embedding     = d_.markov_embedding;
-    mk.fold          = bf16_words(d_.fold);
+    if (d_.fold.qtype == QType::Q8_G32_FP16) { // converted at load (drafts only: plan_load's drafter_q8_objects)
+        if (d_.fold.qdata == nullptr || d_.fold.scales == nullptr || d_.fold.padded_shape[1] != ik::kMarkovRank) {
+            throw std::invalid_argument("inkling2 dspark: the 8-bit Fold needs its codes and scales at rank 256");
+        }
+        mk.fold_codes  = static_cast<const std::int8_t*>(d_.fold.qdata);
+        mk.fold_scales = static_cast<const std::uint16_t*>(d_.fold.scales);
+    } else {
+        mk.fold = bf16_words(d_.fold);
+    }
     mk.fold_bias     = d_.fold_bias;
     mk.base          = base_;
     mk.vocab         = static_cast<std::int32_t>(vocab_);

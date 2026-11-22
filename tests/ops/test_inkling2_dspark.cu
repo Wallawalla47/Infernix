@@ -15,6 +15,7 @@
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -363,7 +364,9 @@ void swiglu_case() {
 
 // ---------------------------------------------------------------------------- Markov head
 
-void markov_case() {
+// q8: the Fold as Q8_G32_FP16 (q8_g32.h's rule over the BF16 values: scale fl16(m / 127), codes rne(v / scale)); the
+// oracle then reads its represented values code * scale.
+void markov_case(bool q8) {
     std::mt19937 rng(17);
     constexpr int V = 6000, R3 = 768, K = 5120, kRank = 256, kRing = 16, kSteps = 7;
     const int first = 205, anchor = 4321;
@@ -374,6 +377,26 @@ void markov_case() {
     const auto w1    = random_bf16(static_cast<std::size_t>(V) * kRank, rng, 1.0);
     const auto fold  = random_bf16(static_cast<std::size_t>(V) * kRank, rng, 0.15);
     const auto fbias = random_bf16(V, rng, 0.1);
+    std::vector<double> fold_value(fold.size());
+    std::vector<std::int8_t> codes(q8 ? fold.size() : 0);
+    std::vector<std::uint16_t> scales(q8 ? fold.size() / 32 : 0);
+    for (std::size_t g = 0; g < fold.size() / 32; ++g) {
+        if (!q8) {
+            for (int j = 0; j < 32; ++j) { fold_value[32 * g + j] = bf(fold[32 * g + j]); }
+            continue;
+        }
+        float m = 0.0F;
+        for (int j = 0; j < 32; ++j) { m = std::max(m, std::fabs(static_cast<float>(bf(fold[32 * g + j])))); }
+        const __half sh = __float2half_rn(m / 127.0F);
+        const float s   = __half2float(sh);
+        scales[g]       = __half_as_ushort(sh);
+        for (int j = 0; j < 32; ++j) {
+            const float v = static_cast<float>(bf(fold[32 * g + j]));
+            const int c   = s == 0.0F ? 0 : std::clamp(static_cast<int>(std::nearbyint(v / s)), -127, 127);
+            codes[32 * g + j]      = static_cast<std::int8_t>(c);
+            fold_value[32 * g + j] = static_cast<double>(static_cast<float>(c) * s);
+        }
+    }
     std::vector<float> base(static_cast<std::size_t>(kSteps) * V);
     {
         std::normal_distribution<float> normal(0.0F, 3.0F);
@@ -387,7 +410,12 @@ void markov_case() {
     a.f_ring_rows   = kRing;
     a.f_lane_stride = static_cast<std::int64_t>(kRing) * H;
     a.embedding     = upload(w1);
-    a.fold          = upload(fold);
+    if (q8) {
+        a.fold_codes  = upload(codes);
+        a.fold_scales = upload(scales);
+    } else {
+        a.fold = upload(fold);
+    }
     a.fold_bias     = upload(fbias);
     a.base          = upload(base);
     a.vocab         = V;
@@ -432,7 +460,7 @@ void markov_case() {
         int best = 0;
         for (int vv = 0; vv < V; ++vv) {
             double acc = bf(fbias[vv]);
-            for (int c = 0; c < kRank; ++c) { acc += bf(fold[static_cast<std::size_t>(vv) * kRank + c]) * lat[c]; }
+            for (int c = 0; c < kRank; ++c) { acc += fold_value[static_cast<std::size_t>(vv) * kRank + c] * lat[c]; }
             const double z = rbd(rbd(base[static_cast<std::size_t>(step - 1) * V + vv]) + rbd(acc));
             L[vv]          = rbd(30.0 * std::tanh(z / 30.0));
             if (L[vv] > L[best]) { best = vv; }
@@ -453,10 +481,10 @@ void markov_case() {
         worst_prob = std::max(worst_prob, std::fabs(probs[static_cast<std::size_t>(step - 1)] - 1.0 / sum) / (1.0 / sum));
         prev       = best;
     }
-    std::printf("dspark_markov (V = 6000, 7 steps): %d drafts compared%s, %s; worst probability %.2e relative; repeat "
-                "%s\n",
-                compared, near_tie ? " (then a near tie)" : "", agree ? "all equal the oracle's argmax" : "a draft DIFFERS",
-                worst_prob, repeat ? "identical" : "DIFFERS");
+    std::printf("dspark_markov (V = 6000, 7 steps, %s Fold): %d drafts compared%s, %s; worst probability %.2e relative; "
+                "repeat %s\n",
+                q8 ? "8-bit" : "BF16", compared, near_tie ? " (then a near tie)" : "",
+                agree ? "all equal the oracle's argmax" : "a draft DIFFERS", worst_prob, repeat ? "identical" : "DIFFERS");
     check(agree, "dspark_markov drafts another token than the oracle's argmax");
     check(compared >= 1, "dspark_markov: no draft compared (a near tie at the first step)");
     check(worst_prob <= std::ldexp(1.0, -6), "dspark_markov's probability is outside its bound");
@@ -474,7 +502,8 @@ INFERNIX_OP_TEST(inkling2_dspark) {
     attention_case(false, 3);
     add_norm_case();
     swiglu_case();
-    markov_case();
+    markov_case(false);
+    markov_case(true);
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

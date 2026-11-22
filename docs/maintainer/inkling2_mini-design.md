@@ -1026,7 +1026,19 @@ gives 7 kernels; the IF nodes stop early.
 | 8-bit dense layers, FP8 Fold (51 MB: stays in L2 across the 7 steps, L18), Q4 proposal head | ~0.55 GB | 0.5-0.6 ms | acceptance only |
 
 Fold is derived by the converter in FP64 from the head and `hidden_out` and stored rounded as the reference's
-`refresh_fold`. Infernix already re-quantizes drafters (DFlash2 companions in 8 bits). The choice is D2.
+`refresh_fold`. Infernix already re-quantizes drafters (DFlash2 companions in 8 bits).
+
+Built (2026-11-22): whenever DSpark is bound, the drafter's dense layers (each layer's q/k/v, the context's k/v, o,
+gate/up/down) and the Fold become `q8_g32_fp16` at load (int8, an FP16 scale per 32; 597 → 317 MiB), the Fold's
+Markov steps decoding it in place (54 MB, L2-resident across a round's steps). Not an option: only the drafts depend on
+them, and a draft is kept only when it equals the target's own token, so no route's output changes (the Engine test's
+DSpark = plain holds on every request). Measured (RTX 5090, Basalt's sampled fixtures, 1,200 tokens, 2 repetitions
+an arm, slot DS3): a round's draft 1.94-1.98 → 1.84-1.87 ms on conv, 1.73 → 1.62-1.66 on prose, 2.17-2.27 →
+2.07-2.13 on struct (about −5 %: the 0.69 GB target head dominates); decode 264.7 → 265.8 tok/s on conv, 191.3 →
+194.3 on prose (plain 191.5), 399.4 → 402.9 on struct; pp2048 under DSpark unchanged (16,337-16,344 → 16,339-16,340).
+The proposal head (the larger lever) is not built. A plain-round policy that drafted only while the measured
+tokens-per-ms gain exceeded plain decoding's was tried and rejected: it chose plain rounds on 339 and 598 of the prose
+repetitions' rounds and lost on conv (265.8 → 260.9 tok/s).
 
 ---
 

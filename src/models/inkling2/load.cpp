@@ -358,6 +358,25 @@ std::vector<artifact::ObjectHandle> q8_objects(const TextWeights& w, const std::
     return objects_of(selected, pending, reader, 32);
 }
 
+// The drafter's matrices converted to 8-bit weights whenever DSpark is bound (not an opt-in: only the drafts depend on
+// them, and a draft is kept only when it equals the target's own token, so no route's output does; STRATEGIES-REVIEW
+// D1, design §13.6): each layer's dense projections (q/k/v, the context's k/v, o, gate/up/down: the round's 0.52 GB
+// halved), and the Markov head's Fold [V, 256], 102 -> 54 MB, so it stays in L2 across a round's seven steps.
+std::vector<artifact::ObjectHandle> drafter_q8_objects(const DSparkWeights& d, const std::vector<PendingWeight>& pending,
+                                                       const artifact::Reader& reader) {
+    std::vector<bool> selected(pending.size(), false);
+    const auto select = [&](WeightId id) {
+        if (id.valid()) { selected.at(id.index) = true; }
+    };
+    for (const DSparkLayerWeights& l : d.layers) {
+        for (const WeightId id : {l.query, l.key, l.value, l.context_key, l.context_value, l.output, l.gate, l.up, l.down}) {
+            select(id);
+        }
+    }
+    select(d.fold);
+    return objects_of(selected, pending, reader, 32);
+}
+
 FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config) {
     const auto resource = [&](std::string_view role) {
         const auto bytes = binder.host_object(binder.resource("text", role));
@@ -444,8 +463,16 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             out->packed_bytes += models::packed_estimate(reader.geometry(object));
         }
     }
-    if (options.q8_weights) {
-        out->q8_objects = q8_objects(out->weights, out->pending, reader);
+    if (options.q8_weights) { out->q8_objects = q8_objects(out->weights, out->pending, reader); }
+    if (out->weights.dspark) {
+        for (const auto object : drafter_q8_objects(*out->weights.dspark, out->pending, reader)) {
+            if (std::find_if(out->q8_objects.begin(), out->q8_objects.end(),
+                             [&](const artifact::ObjectHandle h) { return h.index == object.index; }) == out->q8_objects.end()) {
+                out->q8_objects.push_back(object);
+            }
+        }
+    }
+    if (!out->q8_objects.empty()) {
         for (const auto object : out->q8_objects) {
             binder.mark_device_transient(object);
             out->q8_bytes += models::q8_bytes(reader.geometry(object));

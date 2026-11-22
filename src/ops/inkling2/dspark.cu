@@ -16,6 +16,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/canonical_math.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -505,7 +506,8 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_gate_kernel(const DS
 }
 
 // Step `step`: the vocabulary's logits, a warp per row; each CTA's argmax (lowest id on ties) and its running softmax
-// sum, merged in CTA order by the last CTA.
+// sum, merged in CTA order by the last CTA. Q8: the 8-bit Fold (a lane's 8 codes and its group's scale).
+template <bool Q8>
 __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const DSparkMarkovArgs a, int step) {
     __shared__ float lat[kMarkovRank];
     __shared__ float wbest[kMarkovWarps], wmax[kMarkovWarps], wsum[kMarkovWarps];
@@ -526,7 +528,20 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const 
     int best_index = 0x7FFFFFFF;
     for (int v = v0 + warp; v < v1; v += kMarkovWarps) {
         float fv[8];
-        load8(a.fold + static_cast<std::size_t>(v) * kMarkovRank + 8 * lane, fv);
+        if constexpr (Q8) {
+            // code * scale, exact in FP32 (8 by 11 significant bits): each byte c as 2^23 + (c + 128) by a byte
+            // permute into 0x4B000000, less 2^23 + 128.
+            const uint2 code = __ldg(reinterpret_cast<const uint2*>(a.fold_codes + static_cast<std::size_t>(v) * kMarkovRank) + lane);
+            const float s    = __half2float(__ushort_as_half(__ldg(a.fold_scales + static_cast<std::size_t>(v) * (kMarkovRank / 32) + lane / 4)));
+            const unsigned lo = code.x ^ 0x80808080U, hi = code.y ^ 0x80808080U;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                fv[j]     = (__uint_as_float(__byte_perm(lo, 0x4B000000U, 0x7650U + j)) - 8388736.0F) * s;
+                fv[4 + j] = (__uint_as_float(__byte_perm(hi, 0x4B000000U, 0x7650U + j)) - 8388736.0F) * s;
+            }
+        } else {
+            load8(a.fold + static_cast<std::size_t>(v) * kMarkovRank + 8 * lane, fv);
+        }
         float acc = 0.0F;
 #pragma unroll
         for (int j = 0; j < 8; ++j) { acc = __fmaf_rn(fv[j], l8[j], acc); }
@@ -677,8 +692,9 @@ void dspark_swiglu(const std::uint16_t* gate, const std::uint16_t* up, std::int3
 std::size_t dspark_markov_scratch_bytes(std::int32_t) { return sizeof(MarkovScratch); }
 
 void dspark_markov(const DSparkMarkovArgs& a, std::int32_t steps, cudaStream_t stream) {
+    const bool q8 = a.fold_codes != nullptr && a.fold_scales != nullptr;
     if (a.projection == nullptr || a.bias == nullptr || a.block == nullptr || a.f_ring == nullptr || a.f_ring_rows <= 0 ||
-        a.embedding == nullptr || a.fold == nullptr || a.fold_bias == nullptr || a.base == nullptr || a.vocab <= 0 ||
+        a.embedding == nullptr || (a.fold == nullptr && !q8) || a.fold_bias == nullptr || a.base == nullptr || a.vocab <= 0 ||
         a.round == nullptr || a.tokens == nullptr || a.probabilities == nullptr || a.scratch == nullptr || steps < 1 ||
         steps > kMarkovSteps) {
         throw std::invalid_argument("inkling2 dspark_markov: every operand and 1-7 steps");
@@ -690,8 +706,10 @@ void dspark_markov(const DSparkMarkovArgs& a, std::int32_t steps, cudaStream_t s
     for (int step = 1; step <= steps; ++step) {
         check(pdl::launch_consumer(config(dim3(kGateCtas), dim3(32 * kMarkovWarps), 0, stream), markov_gate_kernel, a, step),
               "markov gates");
-        check(pdl::launch_consumer(config(dim3(kLogitCtas), dim3(32 * kMarkovWarps), 0, stream), markov_logits_kernel, a,
-                                   step),
+        check(q8 ? pdl::launch_consumer(config(dim3(kLogitCtas), dim3(32 * kMarkovWarps), 0, stream),
+                                        markov_logits_kernel<true>, a, step)
+                 : pdl::launch_consumer(config(dim3(kLogitCtas), dim3(32 * kMarkovWarps), 0, stream),
+                                        markov_logits_kernel<false>, a, step),
               "markov logits");
     }
 }

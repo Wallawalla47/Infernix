@@ -131,6 +131,10 @@ void dspark_swiglu(const std::uint16_t* gate, const std::uint16_t* up, std::int3
 //   prob_i = 1 / sum_v exp_c(L_v - L_max)  (the draft-length policy's confidence)
 // invariant[i] = sum over W's hidden and feature columns of [x_out[i]; f_rnn] + bias (FP32, unrounded), x_out[i] the
 // block's final row i, f_rnn the Markov context of position F - 1.
+// Fold is BF16 (`fold`) or 8-bit (`fold_codes` + `fold_scales`: q8_g32.h's Q8_G32_FP16 RowSplit, rank 256 a row, an
+// FP16 scale per 32: Fold[v, r] = code * scale, exact in FP32): 51 MB that stay in L2 across a round's steps, where
+// the BF16 Fold's 102 MB are read from DRAM at every step. Only the drafts depend on it (a draft is kept only when it
+// equals the target's own token), so no route's output does.
 struct DSparkMarkovArgs {
     const std::uint16_t* projection = nullptr; // BF16 [768][2 rank + 2 H]
     const std::uint16_t* bias       = nullptr; // BF16 [768]
@@ -139,7 +143,9 @@ struct DSparkMarkovArgs {
     std::int32_t f_ring_rows        = 0;
     std::int64_t f_lane_stride      = 0;       // words between lanes' rings
     const std::uint16_t* embedding  = nullptr; // BF16 [V][rank] (markov w1)
-    const std::uint16_t* fold       = nullptr; // BF16 [V][rank]
+    const std::uint16_t* fold       = nullptr; // BF16 [V][rank], or null with the 8-bit Fold below
+    const std::int8_t* fold_codes   = nullptr; // Q8 [V][rank] codes
+    const std::uint16_t* fold_scales = nullptr; // Q8 FP16 [V][rank / 32] scales
     const std::uint16_t* fold_bias  = nullptr; // BF16 [V]
     const float* base               = nullptr; // FP32 [steps][V]: the target head over the block's rows 1 .. steps
     std::int32_t vocab              = 0;
