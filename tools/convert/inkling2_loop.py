@@ -7,12 +7,14 @@ sinks, L2-clipped queries and keys and short convolutions, Block Attention Resid
 experts are NVFP4 with four-over-six activations (layers 0-19) or MXFP8 (layers 20-23). The DSpark drafter comes from
 ``mtp.safetensors``. Every stored tensor keeps its words; the only transforms are value-preserving: rows past the real
 vocabulary are dropped, the static convolutions become lag-major ``[k, C]`` (row 0 the current token), the cross-pass
-message queries are regrouped per loop layer in (query, key, value, mlp) order, and the drafter's ``Fold`` and
-``fold_bias`` are derived as the references derive them at load. Recipes live in official_recipes.
+message queries are regrouped per loop layer in (query, key, value, mlp) order, the drafter's ``Fold`` and
+``fold_bias`` are derived as the references derive them at load, and the vision tower's class row is the one BF16
+addition ``class_embedding + cls_position_embedding`` both references make. Recipes live in official_recipes.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
@@ -33,7 +35,12 @@ from .sources.safetensors import SafetensorsSource, tensor_source
 ARCHITECTURE = "Inkling2LoopForConditionalGeneration"
 TEXT_ARCHITECTURE = "Inkling2LoopForCausalLM"
 DSPARK_ARCHITECTURE = "Inkling2DSpark"
+VISION_ARCHITECTURE = "Inkling2Vision"
 PREFIX = "model.llm."
+VISUAL = "model.visual."
+IMAGE_TOKEN = "<|unused_200054|>"         # one per 40-pixel cell (Inkling2Processor.image_token)
+IMAGE_START_TOKEN = "<|content_image|>"  # the chat template's image part marker
+PROCESSOR = "processor_config.json"
 MESSAGE_KINDS = (("query", "attn"), ("key", "k"), ("value", "v"), ("mlp", "mlp"))
 NVFP4_EXPERTS = "nvfp4_four_over_six"  # W4A4: per-token four-over-six NVFP4 activations
 MXFP8_EXPERTS = "mxfp8"                # W8A8: MXFP8 activations
@@ -164,6 +171,70 @@ def dspark_config(source: Mapping, text: Mapping) -> dict:
         # Inputs of these visits (0-based over the 48 visits of a forward), then the final state.
         "target_layer_ids": list(targets),
     }
+
+
+def vision_config(source: Mapping, text: Mapping) -> dict:
+    """The vision tower's mathematics (design §15): the ``inkling2_vision`` ViT, its 2 x 2 merge and the projector into
+    the text width. Its fixed semantics (CLS token, axial rotary on interleaved pairs, exact GELU, layer scale) are the
+    model's; the config gives the sizes."""
+
+    raw = source.get("vision_config")
+    _require(isinstance(raw, Mapping), "vision_config is missing")
+    for key, expected in (("model_type", "inkling2_vision"), ("projector_bias", False),
+                          ("text_hidden_size", text["hidden_size"])):
+        _require(raw.get(key) == expected, f"vision_config.{key} must be {expected!r}")
+    _require(raw.get("hidden_act", "gelu") == "gelu", "vision_config.hidden_act must be gelu (exact)")
+    _require(raw.get("num_channels", 3) == 3, "vision_config.num_channels must be 3")
+    theta = 10000.0  # Transformers' default_theta; SGLang's rotary hardcodes it
+    rope = raw.get("rope_parameters")
+    if rope is not None:
+        _require(isinstance(rope, Mapping) and rope.get("rope_type", "axial") == "axial", "vision rope must be axial")
+        if "rope_theta" in rope:
+            theta = _number(rope, "rope_theta")
+    hidden, heads = _positive_int(raw, "hidden_size"), _positive_int(raw, "num_attention_heads")
+    intermediate = hidden * _number(raw, "mlp_ratio")
+    _require(intermediate == int(intermediate) and intermediate > 0, "vision MLP width must be a positive integer")
+    _require(hidden % heads == 0 and (hidden // heads) % 4 == 0, "vision heads must split the width into 4k features")
+    return {
+        "architectures": [VISION_ARCHITECTURE],
+        "model_type": "inkling2_vision",
+        "hidden_size": hidden,
+        "num_hidden_layers": _positive_int(raw, "num_hidden_layers"),
+        "num_attention_heads": heads,
+        "intermediate_size": int(intermediate),
+        "patch_size": _positive_int(raw, "native_patch_size"),
+        "spatial_merge_size": _positive_int(raw, "adapter_merge_size"),
+        "position_grid": _positive_int(raw, "posemb_grid_size"),
+        "projection_hidden_size": _positive_int(raw, "projection_hidden_dim"),
+        "output_size": text["hidden_size"],
+        "layer_norm_eps": _number(raw, "layer_norm_eps"),
+        "rope_theta": theta,
+        "image_token": IMAGE_TOKEN,
+        "image_start_token": IMAGE_START_TOKEN,
+        # Inkling2ImageProcessor's pixel mapping, validated against processor_config.json: v * rescale, then
+        # (x - mean) / std; one image token per (patch * merge)-pixel cell.
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+        "rescale_factor": 1.0 / 255.0,
+    }
+
+
+def processor_resource(root: Path, vision: Mapping) -> bytes:
+    """``processor_config.json`` byte for byte, after checking it describes the processor the frontend implements."""
+
+    path = root / PROCESSOR
+    data = path.read_bytes()
+    value = json.loads(data.decode("utf-8"))
+    image = value.get("image_processor") if isinstance(value, dict) else None
+    _require(isinstance(image, dict), f"{path}: image_processor is missing")
+    side = vision["patch_size"] * vision["spatial_merge_size"]
+    for key, expected in (("image_processor_type", "Inkling2ImageProcessor"), ("do_convert_rgb", True),
+                          ("do_rescale", True), ("do_normalize", True), ("image_mean", vision["image_mean"]),
+                          ("image_std", vision["image_std"]), ("rescale_factor", vision["rescale_factor"]),
+                          ("size", {"height": side, "width": side})):
+        _require(image.get(key) == expected, f"{path}: image_processor.{key} must be {expected!r}")
+    _require(value.get("image_token", IMAGE_TOKEN) == IMAGE_TOKEN, f"{path}: image_token must be {IMAGE_TOKEN}")
+    return data
 
 
 # ---------------------------------------------------------------------------- expert banks
@@ -354,6 +425,24 @@ def stacked_fp32(store: SafetensorsSource, names: tuple[str, ...], count: int, l
     return LogicalSource((len(names),) if flat else (count, len(names)), label, read)
 
 
+def class_row(store: SafetensorsSource, hidden: int) -> LogicalSource:
+    """The class token's row ``[H]``: ``class_embedding + cls_position_embedding``, one BF16 addition as both references
+    form it before the tower (``(class + cls_pos).to(bf16)`` of two BF16 vectors)."""
+
+    names = (VISUAL + "backbone.embeddings.class_embedding", VISUAL + "backbone.embeddings.cls_position_embedding")
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        parts = []
+        for name in names:
+            info = store.describe(name)
+            if info.dtype != "BF16" or tuple(info.shape) != (hidden,):
+                raise ValueError(f"{name}: expected BF16 [{hidden}], got {info.dtype} {info.shape}")
+            parts.append(store.read_flat(name).reshape(hidden))
+        return (parts[0] + parts[1])[begin:end]
+
+    return LogicalSource((hidden,), f"{store.path}:class_embedding + cls_position_embedding", read)
+
+
 def fold_source(head: SafetensorsSource, head_name: str, rows: int, drafter: SafetensorsSource,
                 *, bias: bool) -> LogicalSource:
     """DSpark's Fold ``[rows, rank]`` (``bias``: fold_bias ``[rows]``) as TokenSpeed's and SGLang's
@@ -503,6 +592,46 @@ class _Builder:
             self.model.add(Parameter(m + "experts", (e, h, ir), bank, None, (m + "input",), "fp8_e4m3fn_g32_e8m0",
                                      residency="text"))
 
+    def vision(self, store: SafetensorsSource, config: dict) -> None:
+        """The tower as the checkpoint stores it (BF16; the patch embedding's columns in (ky, kx, channel) order, the
+        position table [grid * grid, H] row-major by (row, column)), q/k/v and their biases each one parent (one
+        GEMM, one bias pass), and the class row derived."""
+
+        h, inter = config["hidden_size"], config["intermediate_size"]
+        patch, merge, grid = config["patch_size"], config["spatial_merge_size"], config["position_grid"]
+        e = VISUAL + "backbone.embeddings."
+        self.add("vision/patch_embedding", store, e + "patch_embedding.weight", (h, 3 * patch * patch),
+                 inputs=("vision/patch_input",))
+        self.add("vision/position_embedding", store, e + "position_embedding", (grid * grid, h))
+        self.add("vision/class_row", store, None, (h,), source=class_row(store, h))
+        self.add("vision/pre_norm", store, VISUAL + "backbone.ln_pre.weight", (h,))
+        self.add("vision/pre_norm_bias", store, VISUAL + "backbone.ln_pre.bias", (h,))
+        for index in range(config["num_hidden_layers"]):
+            p, sp = f"vision/layers/{index}/", f"{VISUAL}backbone.layers.{index}."
+            a = p + "attention/"
+            self.add(p + "attention_norm", store, sp + "ln_1.weight", (h,))
+            self.add(p + "attention_norm_bias", store, sp + "ln_1.bias", (h,))
+            for role, leaf in (("query", "q_proj"), ("key", "k_proj"), ("value", "v_proj")):
+                self.add(a + role, store, f"{sp}self_attn.{leaf}.weight", (h, h), inputs=(a + "input",))
+                self.add(a + role + "_bias", store, f"{sp}self_attn.{leaf}.bias", (h,))
+            self.group(a + "query", a + "key", a + "value")
+            self.group(a + "query_bias", a + "key_bias", a + "value_bias")
+            self.add(a + "output", store, sp + "self_attn.out_proj.weight", (h, h), inputs=(a + "attended",))
+            self.add(a + "output_bias", store, sp + "self_attn.out_proj.bias", (h,))
+            self.add(p + "attention_scale", store, sp + "ls_1.gamma", (h,))
+            self.add(p + "mlp_norm", store, sp + "ln_2.weight", (h,))
+            self.add(p + "mlp_norm_bias", store, sp + "ln_2.bias", (h,))
+            self.add(p + "mlp/up", store, sp + "mlp.c_fc.weight", (inter, h), inputs=(p + "mlp/input",))
+            self.add(p + "mlp/up_bias", store, sp + "mlp.c_fc.bias", (inter,))
+            self.add(p + "mlp/down", store, sp + "mlp.c_proj.weight", (h, inter), inputs=(p + "mlp/hidden",))
+            self.add(p + "mlp/down_bias", store, sp + "mlp.c_proj.bias", (h,))
+            self.add(p + "mlp_scale", store, sp + "ls_2.gamma", (h,))
+        width = config["projection_hidden_size"]
+        self.add("vision/projector/in", store, VISUAL + "proj_in.weight", (width, merge * merge * h),
+                 inputs=("vision/projector/merged",))
+        self.add("vision/projector/out", store, VISUAL + "proj_out.weight", (config["output_size"], width),
+                 inputs=("vision/projector/hidden",))
+
     def dspark(self, store: SafetensorsSource, base: SafetensorsSource, config: dict, text: dict) -> None:
         h, vocab = config["hidden_size"], text["vocab_size"]
         heads, kv, d = config["num_attention_heads"], config["num_key_value_heads"], config["head_dim"]
@@ -571,11 +700,12 @@ def build_model(
     drafter: SafetensorsSource | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
 ) -> Model:
-    """The logical model: ``text`` and optionally ``dspark`` (``drafter``: ``mtp.safetensors``)."""
+    """The logical model: ``text`` and optionally ``dspark`` (``drafter``: ``mtp.safetensors``) and ``vision`` (the
+    tower and projector, with ``processor_config.json``)."""
 
     selected = set(components)
-    if "text" not in selected or selected - {"text", "dspark"}:
-        raise ValueError("Inkling2Loop: select text and optionally dspark")
+    if "text" not in selected or selected - {"text", "dspark", "vision"}:
+        raise ValueError("Inkling2Loop: select text and optionally dspark and vision")
     layers = base.config.get("text_config", {}).get("num_hidden_layers")
     if type(layers) is not int or layers <= 0:
         raise ValueError("Inkling2Loop config: text_config.num_hidden_layers is missing")
@@ -585,11 +715,17 @@ def build_model(
         if drafter is None:
             raise ValueError("the dspark component reads the drafter (mtp.safetensors)")
         records["dspark"] = {"config": dspark_config(base.config, config), "target": "text"}
+    if "vision" in selected:
+        records["vision"] = {"config": vision_config(base.config, config), "target": "text"}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"], overrides=resource_overrides, qwen_normalizers=False
     )
     if count != config["vocab_size"]:
         raise ValueError(f"the tokenizer's {count} public tokens differ from the model's {config['vocab_size']} rows")
+    if "vision" in selected:
+        object_id = f"resource/vision/{PROCESSOR}"
+        refs["vision"] = {PROCESSOR: object_id}
+        resources[object_id] = processor_resource(Path(base.root), records["vision"]["config"])
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
     model = Model(records, resources=resources, token_count=count, special_token_ids=special)
@@ -613,4 +749,6 @@ def build_model(
         raise ValueError("the [3, H] attention-residual queries do not sit at the full layers' indices minus one")
     if "dspark" in selected:
         builder.dspark(drafter, base, records["dspark"]["config"], config)
+    if "vision" in selected:
+        builder.vision(base, records["vision"]["config"])
     return model

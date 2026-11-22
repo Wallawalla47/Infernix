@@ -13,9 +13,12 @@ Every bound parameter must equal its checkpoint source:
   ``nvfp4_expert_rg16_v1``; the multiplier plane = ``fl32(amax / denominator)`` (one FP32 division); ``expert_amax``
   and ``expert_denominators`` the checkpoint's words, every amax and denominator finite and positive;
 - MXFP8 banks: codes and UE8M0 scales decoded from ``mxfp8_expert_rg16_v1``;
-- the DSpark Fold and fold_bias recomputed as ``refresh_fold`` (FP64 head rows times ``hidden_out``, copied into BF16).
+- the DSpark Fold and fold_bias recomputed as ``refresh_fold`` (FP64 head rows times ``hidden_out``, copied into BF16);
+- the vision tower's tensors bit for bit, its class row as the BF16 sum ``class_embedding + cls_position_embedding``,
+  and ``processor_config.json`` byte for byte.
 
-Every checkpoint tensor must be consumed, except the vision tower (not converted yet) and ``hidden_out`` (folded).
+Every checkpoint tensor must be consumed, except ``hidden_out`` (folded) and, in an artifact without the vision
+component, the vision tower.
 """
 
 from __future__ import annotations
@@ -148,6 +151,29 @@ def _expected(name: str, ck: _Checkpoint, mtp: _Checkpoint, config: dict) -> tor
             return torch.cat((ck.get(x + "w13_weight_outer_scale_denominator"),
                               ck.get(x + "w2_weight_outer_scale_denominator")))
         return None
+    v = "model.visual."
+    vision = {
+        "vision/patch_embedding": v + "backbone.embeddings.patch_embedding.weight",
+        "vision/position_embedding": v + "backbone.embeddings.position_embedding",
+        "vision/pre_norm": v + "backbone.ln_pre.weight", "vision/pre_norm_bias": v + "backbone.ln_pre.bias",
+        "vision/projector/in": v + "proj_in.weight", "vision/projector/out": v + "proj_out.weight",
+    }
+    if name in vision:
+        return ck.get(vision[name])
+    match = re.fullmatch(r"vision/layers/(\d+)/(.+)", name)
+    if match:
+        sp = f"{v}backbone.layers.{match.group(1)}."
+        leaf = {
+            "attention_norm": "ln_1.weight", "attention_norm_bias": "ln_1.bias",
+            "attention/query": "self_attn.q_proj.weight", "attention/query_bias": "self_attn.q_proj.bias",
+            "attention/key": "self_attn.k_proj.weight", "attention/key_bias": "self_attn.k_proj.bias",
+            "attention/value": "self_attn.v_proj.weight", "attention/value_bias": "self_attn.v_proj.bias",
+            "attention/output": "self_attn.out_proj.weight", "attention/output_bias": "self_attn.out_proj.bias",
+            "attention_scale": "ls_1.gamma", "mlp_norm": "ln_2.weight", "mlp_norm_bias": "ln_2.bias",
+            "mlp/up": "mlp.c_fc.weight", "mlp/up_bias": "mlp.c_fc.bias", "mlp/down": "mlp.c_proj.weight",
+            "mlp/down_bias": "mlp.c_proj.bias", "mlp_scale": "ls_2.gamma",
+        }.get(match.group(2))
+        return None if leaf is None else ck.get(sp + leaf)
     match = re.fullmatch(r"dspark/layers/(\d+)/(.+)", name)
     if match:
         sp, role = f"layers.{match.group(1)}.", match.group(2)
@@ -241,6 +267,10 @@ def verify(model: Path, artifact_path: Path) -> dict:
             if name in ("dspark/markov/fold", "dspark/markov/fold_bias"):
                 expected = _fold(ck, mtp, vocab, bias=name.endswith("bias"))
                 counts["derived"] += 1
+            elif name == "vision/class_row":
+                e = "model.visual.backbone.embeddings."
+                expected = ck.get(e + "class_embedding") + ck.get(e + "cls_position_embedding")
+                counts["derived"] += 1
             else:
                 expected = _expected(name, ck, mtp, config)
                 if expected is None:
@@ -248,13 +278,20 @@ def verify(model: Path, artifact_path: Path) -> dict:
                 counts["direct"] += 1
             if _bound(artifact, name) != _bytes(expected):
                 raise AssertionError(f"{name}: the artifact's words differ from the checkpoint's")
+        with_vision = "vision" in artifact.directory.components
+        if with_vision:
+            refs = artifact.directory.components["vision"]["resources"]
+            if artifact.read_object(refs["processor_config.json"]) != (model / "processor_config.json").read_bytes():
+                raise AssertionError("processor_config.json differs from the checkpoint's")
     mtp.used.add("markov_head.hidden_out.weight")
     mtp.used.add("markov_head.hidden_out.bias")
-    unused = sorted(n for n in ck.header if n not in ck.used and not n.startswith("model.visual."))
+    unused = sorted(n for n in ck.header
+                    if n not in ck.used and (with_vision or not n.startswith("model.visual.")))
     unused += sorted("mtp:" + n for n in mtp.header if n not in mtp.used)
     if unused:
         raise AssertionError(f"checkpoint tensors not in the artifact: {unused[:8]} ({len(unused)})")
-    return {**counts, "unconverted": "model.visual.* (vision, M7)", "seconds": round(time.time() - began, 1)}
+    unconverted = {} if with_vision else {"unconverted": "model.visual.* (no vision component)"}
+    return {**counts, **unconverted, "seconds": round(time.time() - began, 1)}
 
 
 def main(argv=None) -> None:

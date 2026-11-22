@@ -289,3 +289,100 @@ def test_the_independent_verifier_accepts_the_artifact(tmp_path):
 def test_a_nonpositive_amax_is_refused(tmp_path):
     with pytest.raises(ValueError, match="finite and positive"):
         _convert(tmp_path, zero_amax=True)
+
+
+VH, VHEADS, VLAYERS, VPATCH, VMERGE, VGRID, VPROJ = 16, 2, 2, 2, 2, 4, 24
+
+
+def _vision_checkpoint(source):
+    """Add a small tower (model.visual.*) and processor_config.json to a synthetic checkpoint."""
+    g = torch.Generator().manual_seed(11)
+    config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    config["vision_config"] = {
+        "model_type": "inkling2_vision", "text_hidden_size": H, "temporal_patch_size": 2,
+        "native_patch_size": VPATCH, "adapter_merge_size": VMERGE, "projection_hidden_dim": VPROJ,
+        "projector_bias": False, "hidden_size": VH, "num_hidden_layers": VLAYERS, "num_attention_heads": VHEADS,
+        "mlp_ratio": 2.0, "posemb_grid_size": VGRID, "layer_norm_eps": 1e-5,
+    }
+    (source / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    side = VPATCH * VMERGE
+    (source / "processor_config.json").write_text(json.dumps({
+        "image_processor": {"do_convert_rgb": True, "do_normalize": True, "do_rescale": True,
+                            "image_mean": [0.5, 0.5, 0.5], "image_processor_type": "Inkling2ImageProcessor",
+                            "image_std": [0.5, 0.5, 0.5], "rescale_factor": 0.00392156862745098,
+                            "size": {"height": side, "width": side}},
+        "image_token": "<|unused_200054|>", "processor_class": "Inkling2Processor"}), encoding="utf-8")
+    from safetensors.torch import load_file
+    t = load_file(str(source / "model.safetensors"))
+    v, e = "model.visual.", "model.visual.backbone.embeddings."
+    t[e + "patch_embedding.weight"] = _bf16(VH, 3 * VPATCH * VPATCH, generator=g)
+    t[e + "position_embedding"] = _bf16(VGRID * VGRID, VH, generator=g)
+    t[e + "class_embedding"] = _bf16(VH, generator=g)
+    t[e + "cls_position_embedding"] = _bf16(VH, generator=g)
+    for leaf in ("weight", "bias"):
+        t[f"{v}backbone.ln_pre.{leaf}"] = _bf16(VH, generator=g)
+    for i in range(VLAYERS):
+        sp = f"{v}backbone.layers.{i}."
+        for leaf in ("ln_1", "ln_2"):
+            t[f"{sp}{leaf}.weight"] = _bf16(VH, generator=g)
+            t[f"{sp}{leaf}.bias"] = _bf16(VH, generator=g)
+        for leaf in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            t[f"{sp}self_attn.{leaf}.weight"] = _bf16(VH, VH, generator=g)
+            t[f"{sp}self_attn.{leaf}.bias"] = _bf16(VH, generator=g)
+        t[sp + "ls_1.gamma"] = _bf16(VH, generator=g)
+        t[sp + "ls_2.gamma"] = _bf16(VH, generator=g)
+        t[sp + "mlp.c_fc.weight"] = _bf16(2 * VH, VH, generator=g)
+        t[sp + "mlp.c_fc.bias"] = _bf16(2 * VH, generator=g)
+        t[sp + "mlp.c_proj.weight"] = _bf16(VH, 2 * VH, generator=g)
+        t[sp + "mlp.c_proj.bias"] = _bf16(VH, generator=g)
+    t[v + "proj_in.weight"] = _bf16(VPROJ, VMERGE * VMERGE * VH, generator=g)
+    t[v + "proj_out.weight"] = _bf16(H, VPROJ, generator=g)
+    save_file(t, str(source / "model.safetensors"))
+    return t
+
+
+def test_the_vision_tower_converts_word_for_word(tmp_path):
+    from tools.convert.verify_inkling2 import verify
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _checkpoint(source)
+    t = _vision_checkpoint(source)
+    out = tmp_path / "model.infernix"
+    main(["--model", str(source), "--recipe", "inkling2_mini", "--components", "text,dspark,vision", "--out",
+          str(out), "--device", "cpu"])
+    v, e = "model.visual.", "model.visual.backbone.embeddings."
+    with Artifact(out) as artifact:
+        config = artifact.directory.components["vision"]["config"]
+        assert (config["hidden_size"], config["num_hidden_layers"], config["intermediate_size"]) == (VH, VLAYERS, 2 * VH)
+        assert (config["patch_size"], config["spatial_merge_size"], config["position_grid"]) == (VPATCH, VMERGE, VGRID)
+        assert (config["output_size"], config["rope_theta"], config["image_token"]) == (H, 10000.0, "<|unused_200054|>")
+        assert _bound(artifact, "vision/patch_embedding") == _words(t[e + "patch_embedding.weight"])
+        assert _bound(artifact, "vision/position_embedding") == _words(t[e + "position_embedding"])
+        assert _bound(artifact, "vision/class_row") == _words(t[e + "class_embedding"] + t[e + "cls_position_embedding"])
+        assert _bound(artifact, "vision/layers/1/attention/key") == _words(t[v + "backbone.layers.1.self_attn.k_proj.weight"])
+        assert _bound(artifact, "vision/layers/1/attention/value_bias") == _words(t[v + "backbone.layers.1.self_attn.v_proj.bias"])
+        assert _bound(artifact, "vision/layers/0/mlp_scale") == _words(t[v + "backbone.layers.0.ls_2.gamma"])
+        assert _bound(artifact, "vision/projector/out") == _words(t[v + "proj_out.weight"])
+        # q/k/v (and their biases) share one parent, in that order: the fused projection is one GEMM.
+        parents = [artifact.directory.bindings[f"vision/layers/0/attention/{r}"] for r in ("query", "key", "value")]
+        assert all("parts" in b and len(b["parts"]) == 1 for b in parents)
+        assert len({b["parts"][0]["object"] for b in parents}) == 1
+        assert [b["parts"][0]["range"][0] for b in parents] == [0, VH * VH, 2 * VH * VH]
+        refs = artifact.directory.components["vision"]["resources"]
+        assert artifact.read_object(refs["processor_config.json"]) == (source / "processor_config.json").read_bytes()
+    result = verify(source, out)
+    assert result["derived"] == 3 and "unconverted" not in result
+
+
+def test_a_different_image_processor_is_refused(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _checkpoint(source)
+    _vision_checkpoint(source)
+    processor = json.loads((source / "processor_config.json").read_text(encoding="utf-8"))
+    processor["image_processor"]["image_mean"] = [0.48145466, 0.4578275, 0.40821073]
+    (source / "processor_config.json").write_text(json.dumps(processor), encoding="utf-8")
+    with pytest.raises(ValueError, match="image_mean"):
+        main(["--model", str(source), "--recipe", "inkling2_mini", "--components", "text,vision", "--out",
+              str(tmp_path / "model.infernix"), "--device", "cpu"])
