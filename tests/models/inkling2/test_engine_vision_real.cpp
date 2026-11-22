@@ -1,6 +1,7 @@
 // Inkling 2's image input through the public Engine on the vision artifact (--components text,dspark,vision):
 // 1. Answer: a red disc on a blue ground asked for the disc's colour answers "red" (greedy; reported and judged: a
-//    tower that lost the picture answers at random).
+//    tower that lost the picture answers at random), at 5 x 4 cells and at 48 x 27 (1,296 image tokens: the tower's
+//    chunk loops, and at prefill chunks of 512 the image across three chunks, the same tokens).
 // 2. Request invariance with images: two image requests and a text request, sampled with seeds, give their solo tokens
 //    all at once in reverse order (C = 3), and the greedy image request its tokens at prefill chunks of 16 (the image
 //    tokens split across chunk edges) and in one call, eager and with graphs.
@@ -42,8 +43,8 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact, st
                                        std::uint32_t concurrency, bool vision = true) {
     infernix::EngineOptions options;
     options.artifact_path        = artifact;
-    options.max_context          = 1024;
-    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(concurrency * 1024);
+    options.max_context          = 2048; // the large image's 1,328-token prompt
+    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(concurrency * 2048);
     options.max_concurrency      = concurrency;
     options.max_pending_requests = 16;
     options.prefill_chunk        = chunk;
@@ -68,6 +69,13 @@ std::vector<std::uint8_t> picture(int width, int height, Paint paint) {
 std::vector<std::uint8_t> red_disc() { // 200 x 140: 5 x 4 cells
     return picture(200, 140, [](int x, int y, std::uint8_t* p) {
         const bool disc = (x - 120) * (x - 120) + (y - 65) * (y - 65) < 45 * 45;
+        p[0] = disc ? 220 : 30, p[1] = disc ? 30 : 60, p[2] = disc ? 30 : 200;
+    });
+}
+
+std::vector<std::uint8_t> large_red_disc() { // 1915 x 1079: 48 x 27 = 1,296 cells, past the tower's 4,096-token chunks
+    return picture(1915, 1079, [](int x, int y, std::uint8_t* p) {
+        const bool disc = (x - 1200) * (x - 1200) + (y - 500) * (y - 500) < 380 * 380;
         p[0] = disc ? 220 : 30, p[1] = disc ? 30 : 60, p[2] = disc ? 30 : 200;
     });
 }
@@ -126,8 +134,10 @@ int main() {
             ask(stripes(), "Describe this image in one sentence."),
             ask({}, "Name three rivers in Europe."),
         };
+        const infernix::PromptInput large =
+            ask(large_red_disc(), "What colour is the circle in this image? Answer with one word.");
         std::vector<Tokens> solo;
-        Tokens disc_greedy;
+        Tokens disc_greedy, large_greedy;
         {
             infernix::Engine engine(engine_options(artifact, 0, true, 1));
             const auto answer = engine.generate(engine.prepare(prompts[0]), greedy(200));
@@ -137,6 +147,12 @@ int main() {
                       << answer.prompt.prompt_tokens << " prompt tokens)\n";
             require(lower.find("red") != std::string::npos, "the red disc's colour is not named red");
             disc_greedy = answer.generated_token_ids;
+            const auto big = engine.generate(engine.prepare(large), greedy(200));
+            lower = big.content;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+            std::cout << "large image answer: \"" << big.content << "\" (" << big.prompt.prompt_tokens << " prompt tokens)\n";
+            require(lower.find("red") != std::string::npos, "the large red disc's colour is not named red");
+            large_greedy = big.generated_token_ids;
             for (std::size_t i = 0; i < prompts.size(); ++i) {
                 solo.push_back(engine.generate(engine.prepare(prompts[i]), sampled(i)).generated_token_ids);
             }
@@ -149,6 +165,11 @@ int main() {
                 const std::size_t i = prompts.size() - 1 - j;
                 require_same("C = 3, request " + std::to_string(i), solo[i], handles[j].wait().generated_token_ids);
             }
+        }
+        {
+            infernix::Engine narrow(engine_options(artifact, 512, true, 1));
+            require_same("large image, chunks of 512", large_greedy,
+                         narrow.generate(narrow.prepare(large), greedy(200)).generated_token_ids);
         }
         for (const bool graphs : {false, true}) {
             for (const std::uint32_t chunk : {16U, 4096U}) {

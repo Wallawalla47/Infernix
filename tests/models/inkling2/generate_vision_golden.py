@@ -111,17 +111,21 @@ def image(height: int, width: int, transparent: bool) -> np.ndarray:
 
 
 CASES = (("rgba_57x83", 57, 83, True), ("rgb_41x163", 41, 163, False))
+# --large (a local check, not the committed fixture): 27 x 48 = 1,296 cells, 5,185 tower tokens, past the tower's
+# 4,096-token chunks.
+LARGE = (("rgba_1079x1915", 1079, 1915, True),)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--sglang", type=Path, required=True)
+    parser.add_argument("--large", action="store_true", help="the 1,296-cell image instead of the fixture's")
     parser.add_argument("out", type=Path)
     args = parser.parse_args()
     encoder = load_encoder(args.checkpoint, args.sglang)
     cases = []
-    for name, height, width, transparent in CASES:
+    for name, height, width, transparent in (LARGE if args.large else CASES):
         pixels_u8 = image(height, width, transparent)
         chw = torch.from_numpy(pixels_u8).permute(2, 0, 1).contiguous()
         pixels, grid = preprocess(convert_to_rgb(chw) if transparent else chw)

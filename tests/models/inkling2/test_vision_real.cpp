@@ -9,6 +9,9 @@
 // 3. An image's rows are the same bits encoded first, after another image, and again.
 //
 //   INFERNIX_INKLING2_VISION_ARTIFACT  an artifact converted with the vision component (part 1 runs without it)
+//   INFERNIX_INKLING2_VISION_GOLDEN    another golden (generate_vision_golden.py --large), in place of the fixture
+
+#include <algorithm>
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -99,8 +102,12 @@ std::vector<std::uint16_t> cell_words(const m::ProcessedImage& image, const m::V
 
 int main() {
     try {
+        // INFERNIX_INKLING2_VISION_GOLDEN: another golden of generate_vision_golden.py's (--large: 1,296 cells, past the
+        // tower's 4,096-token chunks).
+        const char* golden_override = std::getenv("INFERNIX_INKLING2_VISION_GOLDEN");
         const std::filesystem::path fixture =
-            std::filesystem::path(INFERNIX_SOURCE_DIR) / "tests/fixtures/inkling2/vision_golden.json";
+            golden_override != nullptr ? std::filesystem::path(golden_override)
+                                       : std::filesystem::path(INFERNIX_SOURCE_DIR) / "tests/fixtures/inkling2/vision_golden.json";
         std::ifstream file(fixture);
         const nlohmann::json golden = nlohmann::json::parse(file);
         const m::VisionConfig config = inkling2_mini_vision();
@@ -135,7 +142,9 @@ int main() {
         load.vision = true;
         auto model = m::materialize_model(m::plan_load(reader, load), device);
         const m::Parameters parameters(*model);
-        m::VisionTower tower(*model->config().vision, *parameters.vision, 16);
+        std::int32_t max_cells = 1;
+        for (const auto& image : images) { max_cells = std::max(max_cells, image.cells()); }
+        m::VisionTower tower(*model->config().vision, *parameters.vision, static_cast<std::uint32_t>(max_cells));
         const auto rows_of = [&](const m::ProcessedImage& image) {
             const std::uint16_t* rows = tower.encode(
                 {image.rows, image.cols, std::span<const std::uint16_t>(*image.patches)}, device.stream);
@@ -156,6 +165,10 @@ int main() {
                 const double r = bf16(static_cast<std::uint16_t>(raw[2 * i] | (raw[2 * i + 1] << 8)));
                 const double g = bf16(got[i]);
                 err += (g - r) * (g - r), ref2 += r * r, dot += g * r, got2 += g * g;
+            }
+            if (const char* dump = std::getenv("INFERNIX_INKLING2_VISION_DUMP")) { // diagnostics: the rows, raw BF16
+                std::ofstream out(std::string(dump) + "." + name + ".bf16", std::ios::binary);
+                out.write(reinterpret_cast<const char*>(got.data()), static_cast<std::streamsize>(got.size() * 2));
             }
             const double rel = std::sqrt(err / ref2), cosine = dot / std::sqrt(ref2 * got2);
             std::cout << name << ": tower vs reference rel RMS " << rel << ", cosine " << cosine << '\n';

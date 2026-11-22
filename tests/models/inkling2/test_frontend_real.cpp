@@ -14,6 +14,7 @@
 //
 //   INFERNIX_TEST_INKLING_TOKENIZER_DIR  tokenizer.json, tokenizer_config.json and generation_config.json
 
+#include "media/decode/decode.h"
 #include "models/inkling2/frontend/frontend.h"
 #include "text/tokenizer.h"
 
@@ -326,6 +327,28 @@ int main() {
             video.messages.back().parts.push_back({.kind = infernix::MessagePartKind::Media, .media = media_of(0)});
             video.messages.back().parts.back().media.kind = infernix::MediaKind::Video;
             check(throws([&] { (void)seeing.prepare(video); }), "video is refused");
+
+            // Past the budget: a 400 x 400 image (10 x 10 cells) under 64 image tokens is downscaled to 8 x 8 whole
+            // cells (smart_resize's floor), its summary keeping the submitted size; refused when the request asks.
+            const ink::Frontend budget(resources, {.max_context = 4096, .vision = vision, .vision_max_cells = 64});
+            std::vector<std::uint8_t> rgb(400 * 400 * 3);
+            for (std::size_t i = 0; i < rgb.size(); ++i) { rgb[i] = static_cast<std::uint8_t>((i * 7) % 251); }
+            PromptInput big = question;
+            big.messages.back().parts.push_back({.kind = infernix::MessagePartKind::Media});
+            big.messages.back().parts.back().media.bytes = infernix::media::decode::encode_raw_rgb(400, 400, rgb);
+            const ink::PreparedPrompt shrunk = budget.prepare(big);
+            check(shrunk.data().images.size() == 1 && shrunk.data().images[0].image.rows == 8 &&
+                      shrunk.data().images[0].image.cols == 8 && shrunk.summary().media[0].width == 400,
+                  "an image past the budget is downscaled to the whole cells that fit");
+            check(budget.count_tokens(big) == shrunk.token_ids().size(), "count_tokens counts the downscaled image");
+            big.messages.back().parts.back().media.image_resize_policy = infernix::ImageResizePolicy::RejectOversized;
+            bool rejected = false;
+            try {
+                (void)budget.prepare(big);
+            } catch (const infernix::RequestError& error) {
+                rejected = error.kind() == infernix::RequestErrorKind::MediaBudgetExceeded;
+            }
+            check(rejected, "an oversized image is refused when its request refuses downsizing");
         }
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
