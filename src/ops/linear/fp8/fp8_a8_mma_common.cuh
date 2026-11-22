@@ -173,26 +173,36 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
     constexpr int output_stride = BN + 8;
     auto* shared_output         = reinterpret_cast<__nv_bfloat16*>(shared_raw);
     constexpr bool kLora = kLoraEpilogue<Epilogue>;
-    // A wide term whose B rows and a 16-token U buffer a token group fit the tile's free shared memory takes the
-    // group-staged form (lora_add_tokens_tile_group_staged) on the scaled values; the others keep their forms.
+    // The term's operands staged in the tile's free shared memory, on the scaled values. A narrow term takes the
+    // whole tile's U a pass (lora_add_tokens_tile_staged) when B's rows and one segment's U columns fit; a wide one
+    // whose B rows and a 16-token U buffer a token group fit takes the group-staged form
+    // (lora_add_tokens_tile_group_staged, low-register: the FP8 tiles' accumulators leave few registers). The others
+    // read them from L2 a fragment at a time (the form below), which took the QAD 27B's q/k/v tile 24 % more cycles at
+    // rank 32 (ncu, RTX 5090, 2026-11-22) against 19 % for the wide group-staged form at rank 128; the group-staged
+    // form on a narrow term kept 442 local loads and stores where the whole-tile form keeps none of its own.
     constexpr int kScratchBytes = [] {
         if constexpr (requires { Schedule::kStorageBytes; })
             return Schedule::kStorageBytes;
         else
             return Schedule::kSharedBytes;
     }();
+    constexpr bool kStagedLora = [] {
+        if constexpr (kLora && requires { Schedule::kWarpsTokens; }) {
+            if constexpr (kLoraStageRank<Epilogue> > kLoraNarrowRank) { return false; }
+            return (BN + BM) * (2 * kLoraNarrowRank + 16) <= kScratchBytes;
+        } else {
+            return false;
+        }
+    }();
     constexpr bool kGroupLora = [] {
         if constexpr (kLora && requires { Schedule::kWarpsTokens; }) {
-            // A wide instance stages its operands: the low-register form (the FP8 tiles' accumulators leave few
-            // registers) double-buffers U. A 2,048-token QAD prefill's FP8 tiles took 3.4 ms less at rank 128, the
-            // same at rank 32 (RTX 5090, 2026-11-22), so a narrow instance keeps reading them from L2.
             if constexpr (kLoraStageRank<Epilogue> <= kLoraNarrowRank) { return false; }
             return (BN + Schedule::kWarpsTokens * 2 * 16) * (2 * kLoraStageRank<Epilogue> + 16) <= kScratchBytes;
         } else {
             return false;
         }
     }();
-    if constexpr (kLora && !collective && !kGroupLora) {
+    if constexpr (kLora && !collective && !kGroupLora && !kStagedLora) {
         // --lora, a fragment-wise epilogue: per fragment column its term operands, then per fragment the scaled
         // values plus the term, finished and stored at once, so the accumulators retire as they go (the operations
         // of each element are the scaling pass's, lora_add_tokens_tile's and the epilogue's, as in the else branch).
@@ -302,6 +312,14 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     [&](int mr, int j) { return warp_row * Schedule::kWarpRows + mr * 8 + j; },
                     [&](int i) { return row_policy.weight_row(row_begin, i, rows); }, token_begin, tokens, shared_raw,
                     tid, warp_token, [] { asm volatile("bar.sync 1, %0;" ::"r"(THREADS) : "memory"); });
+            } else if constexpr (kStagedLora) {
+                // The same: the storage is free.
+                lora_add_tokens_tile_staged<BM, BN, kScratchBytes>(
+                    epilogue.lora, accumulators,
+                    [&](int mt, int i) { return warp_token * Schedule::kWarpTokens + mt * 16 + i; },
+                    [&](int mr, int j) { return warp_row * Schedule::kWarpRows + mr * 8 + j; },
+                    [&](int i) { return row_policy.weight_row(row_begin, i, rows); }, token_begin, tokens, shared_raw,
+                    tid, THREADS, [] { asm volatile("bar.sync 1, %0;" ::"r"(THREADS) : "memory"); });
             } else {
                 const int token_base = token_begin + warp_token * Schedule::kWarpTokens;
                 lora_add_tokens_tile<Schedule::kMmaTokens, Schedule::kMmaRows>(
