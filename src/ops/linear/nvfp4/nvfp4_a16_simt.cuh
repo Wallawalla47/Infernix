@@ -245,7 +245,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
         parent[r] = nvfp4_a16_parent_row<Schedule>(rb, local0 + r, rows, policy);
-    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, Schedule::kBlockTokens>;
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, Schedule::kBlockTokens, kLoraStageRank<Epilogue>>;
     [[maybe_unused]] LoraStage* lora_stage = nullptr;
     if constexpr (kLoraEpilogue<Epilogue>) {
         // The finishing warp's term operands (B rows, U columns) stage in shared memory beside the main loop.

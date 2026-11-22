@@ -1,6 +1,18 @@
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router";
 import { useQuery } from "@tanstack/react-query";
-import { BadgeCheck, CloudDownload, Database, Download, ExternalLink, Library as LibraryIcon, Search, Sparkles } from "lucide-react";
+import {
+  BadgeCheck,
+  Boxes,
+  CloudDownload,
+  Database,
+  Download,
+  ExternalLink,
+  Library as LibraryIcon,
+  Puzzle,
+  Search,
+  Sparkles,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/common";
@@ -9,12 +21,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { api } from "@/lib/api";
 import type { Catalog, CatalogEntry, ModelFamily } from "@/lib/api-types";
 import { FAMILY_LABELS, FAMILY_ORDER, NGRAM_FORMAT_LABELS, formatBytes } from "@/lib/format";
 import { useLibrary } from "@/lib/hooks";
 import { cn, parseRepo } from "@/lib/utils";
+import { AdaptersTab } from "@/pages/discover/AdaptersTab";
 import { DownloadDialog, inLibrary, repoName, sameRepo } from "@/pages/discover/DownloadDialog";
 import { DownloadsPanel } from "@/pages/discover/DownloadsPanel";
 
@@ -133,9 +147,13 @@ function EntryCard({
   );
 }
 
+type Tab = "models" | "adapters";
+
 export function DiscoverPage() {
   const catalog = useQuery<Catalog>({ queryKey: ["catalog"], queryFn: api.catalog, staleTime: Infinity });
   const { data: library } = useLibrary();
+  const [params, setParams] = useSearchParams();
+  const tab: Tab = params.get("tab") === "adapters" ? "adapters" : "models";
   const [query, setQuery] = useState("");
   const [source, setSource] = useState<Source>("all");
   const [custom, setCustom] = useState("");
@@ -183,7 +201,7 @@ export function DiscoverPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title="Discover"
-        description="Supported Infernix and NInfer artifacts on Hugging Face. Downloads resume after interruptions, and their folders join your model folders."
+        description="Supported Infernix and NInfer artifacts, and LoRA adapters, on Hugging Face. Downloads resume after interruptions, and their folders join your model folders."
       />
 
       <DownloadsPanel />
@@ -213,62 +231,85 @@ export function DiscoverPage() {
         </CardContent>
       </Card>
 
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <div className="relative w-full sm:max-w-xs">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search the catalog"
-            className="pl-8"
-            aria-label="Search the catalog"
-          />
-        </div>
-        <ToggleGroup
-          type="single"
-          value={source}
-          onValueChange={(value) => {
-            if (value === "all" || value === "infernix" || value === "ninfer") setSource(value);
-          }}
-          aria-label="Source"
-          className="sm:ml-auto"
-        >
-          <ToggleGroupItem value="all">All ({total})</ToggleGroupItem>
-          <ToggleGroupItem value="infernix">Infernix conversions ({total - officialCount})</ToggleGroupItem>
-          <ToggleGroupItem value="ninfer">NInfer official ({officialCount})</ToggleGroupItem>
-        </ToggleGroup>
-      </div>
+      <Tabs
+        value={tab}
+        onValueChange={(value) => setParams(value === "adapters" ? { tab: "adapters" } : {}, { replace: true })}
+        className="gap-5"
+      >
+        <TabsList aria-label="What to discover">
+          <TabsTrigger value="models">
+            <Boxes />
+            Models
+          </TabsTrigger>
+          <TabsTrigger value="adapters">
+            <Puzzle />
+            LoRA adapters
+          </TabsTrigger>
+        </TabsList>
 
-      {catalog.isLoading ? (
-        <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-          {[0, 1, 2, 3].map((index) => (
-            <Skeleton key={index} className="h-72 rounded-xl" />
-          ))}
-        </div>
-      ) : groups.length === 0 ? (
-        <div className="rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">Nothing matches.</div>
-      ) : (
-        groups.map(({ family, entries }) => (
-          <section key={family} className="flex flex-col gap-3">
-            <div className="flex items-baseline gap-2">
-              <h2 className="text-sm font-semibold">{FAMILY_LABELS[family]}</h2>
-              <span className="text-xs text-muted-foreground">
-                {entries.length} item{entries.length === 1 ? "" : "s"}
-              </span>
+        <TabsContent value="models" className="flex flex-col gap-5">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <div className="relative w-full sm:max-w-xs">
+              <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search the catalog"
+                className="pl-8"
+                aria-label="Search the catalog"
+              />
             </div>
+            <ToggleGroup
+              type="single"
+              value={source}
+              onValueChange={(value) => {
+                if (value === "all" || value === "infernix" || value === "ninfer") setSource(value);
+              }}
+              aria-label="Source"
+              className="sm:ml-auto"
+            >
+              <ToggleGroupItem value="all">All ({total})</ToggleGroupItem>
+              <ToggleGroupItem value="infernix">Infernix conversions ({total - officialCount})</ToggleGroupItem>
+              <ToggleGroupItem value="ninfer">NInfer official ({officialCount})</ToggleGroupItem>
+            </ToggleGroup>
+          </div>
+
+          {catalog.isLoading ? (
             <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-              {entries.map((entry) => (
-                <EntryCard
-                  key={entry.repo}
-                  entry={entry}
-                  present={inLibrary(entry, library)}
-                  onDownload={(item) => setDialog({ repo: item.repo, entry: item })}
-                />
+              {[0, 1, 2, 3].map((index) => (
+                <Skeleton key={index} className="h-72 rounded-xl" />
               ))}
             </div>
-          </section>
-        ))
-      )}
+          ) : groups.length === 0 ? (
+            <div className="rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">Nothing matches.</div>
+          ) : (
+            groups.map(({ family, entries }) => (
+              <section key={family} className="flex flex-col gap-3">
+                <div className="flex items-baseline gap-2">
+                  <h2 className="text-sm font-semibold">{FAMILY_LABELS[family]}</h2>
+                  <span className="text-xs text-muted-foreground">
+                    {entries.length} item{entries.length === 1 ? "" : "s"}
+                  </span>
+                </div>
+                <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+                  {entries.map((entry) => (
+                    <EntryCard
+                      key={entry.repo}
+                      entry={entry}
+                      present={inLibrary(entry, library)}
+                      onDownload={(item) => setDialog({ repo: item.repo, entry: item })}
+                    />
+                  ))}
+                </div>
+              </section>
+            ))
+          )}
+        </TabsContent>
+
+        <TabsContent value="adapters">
+          <AdaptersTab onDownload={(repo) => setDialog({ repo, entry: null })} />
+        </TabsContent>
+      </Tabs>
 
       <DownloadDialog
         open={dialog !== null}

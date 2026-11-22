@@ -36,13 +36,18 @@ enum class RowSplitGroupedMmaCodec : std::uint8_t {
 
 // --lora: the term of a grouped call (include/infernix/ops/lora.h), one addend over the call's logical rows: job j's
 // row r is logical row row_base[j] + r. Its U columns are the call's (a token slice passes lora_columns_from).
-// Kernels take LoraNone (no term; the kernel as it was) or this.
+// Kernels take LoraNone (no term; the kernel as it was), this (a narrow adapter) or RowSplitGroupedLoraWide.
 struct RowSplitGroupedLora {
     LoraDeviceAddend addend;
     std::int32_t row_base[4] = {};
 };
+struct RowSplitGroupedLoraWide {
+    LoraDeviceAddendWide addend;
+    std::int32_t row_base[4] = {};
+};
 template <class Lora>
-inline constexpr bool kRowSplitGroupedLora = std::is_same_v<Lora, RowSplitGroupedLora>;
+inline constexpr bool kRowSplitGroupedLora =
+    std::is_same_v<Lora, RowSplitGroupedLora> || std::is_same_v<Lora, RowSplitGroupedLoraWide>;
 
 template <class Cfg, bool FullTiles, RowSplitGroupedMmaCodec Codec = RowSplitGroupedMmaCodec::Mixed,
           int Jobs = 4, class Lora = LoraNone>

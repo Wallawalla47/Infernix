@@ -153,17 +153,23 @@ folder levels deep, reading file headers only:
 - **N-gram volumes**: `.ngram` files of Qwen3.8-Flash-Next, matched to the models that can read them:
   a model's own table first, then FP8, NVFP4, IQ4_NL and BF16 (an FP8 table without a recorded scale
   serves only its own artifact).
+- **LoRA adapters** ([`--lora`](lora.md)): a folder holding a Hugging Face PEFT adapter's
+  `adapter_config.json` and `adapter_model.safetensors`, named by the folder, with the base model,
+  rank and modules its config names. It is matched to the dense models of that base (an adapter of
+  `Qwen/Qwen3.8-27B`, or of a repackaging such as `unsloth/Qwen3.8-27B-bnb-4bit`, to the Qwen3.8-27B
+  artifacts); whether `infernix-serve` can apply it is the server's to say (below).
 
 Folders are rescanned when they change in the launcher, after a download and every minute. A folder
 whose listing fails part way (a network share that goes away, say) is marked as scanned only in
 part, with the reason; the files found before it stay listed.
 
 **Models** shows each folder's size, the free space on its drive (read by the last scan, so a
-sleeping network drive never holds up the web UI or the API), and each model's, drafter's and
-volume's size on disk. **Delete files** removes a model's artifact (every part), a drafter or an
-n-gram volume from the disk after you type its file name. A model's deletion takes the files at
-the location shown (every part, its `.conversion.json` and `.expert-state`) and its
-configurations; files a running server uses cannot be deleted.
+sleeping network drive never holds up the web UI or the API), and each model's, drafter's,
+volume's and adapter's size on disk. **Delete files** removes a model's artifact (every part), a
+drafter, an n-gram volume or a LoRA adapter from the disk after you type its file (an adapter's:
+folder) name. A model's deletion takes the files at the location shown (every part, its
+`.conversion.json` and `.expert-state`) and its configurations; an adapter's takes its two files
+and then its folder when nothing else is left in it; files a running server uses cannot be deleted.
 
 ## Configure a model
 
@@ -171,7 +177,9 @@ Each model's page edits its launch parameters, the `infernix-serve` options afte
 path. The form and the **Launch parameters** text are two views of the same list: a control changes
 its option in the text, an edit to the text moves the controls, and options without a control are
 kept. The **DFlash2 drafter** and **N-gram volume** pickers (Qwen3.8-Flash-Next) list the compatible
-files found and write `--draft-model` and `--ngram-volume`. The full command line is previewed with
+files found and write `--draft-model` and `--ngram-volume`; the **LoRA adapter** picker (the dense
+27Bs) lists the adapters found, those of the model's base first (another base's is marked, and
+picking it warns), or takes a folder or file elsewhere, and writes `--lora`. The full command line is previewed with
 warnings (an option this `infernix-serve` does not have, a missing file, a Flash-Next model without
 a volume). Every option of the installed `infernix-serve --help` is listed in the reference drawer,
 **All options** (read once per build of `infernix-serve`; a `--help` that fails is run again when
@@ -269,6 +277,18 @@ model also needs, unless a compatible one is already in a model folder: Qwen3.8-
 drafter and an n-gram volume (the recommended table preselected). Choose the destination folder with
 the folder browser; by default each repository gets its own subfolder. Any other repository can be
 entered by its `owner/name`.
+
+**Discover → LoRA adapters** asks Hugging Face for the PEFT LoRA adapters of a dense 27B base model
+(Qwen3.8-27B or Qwen3.6-27B) whose repository holds `adapter_config.json` and
+`adapter_model.safetensors` at its root, the files [`--lora`](lora.md) reads (GGUF exports and merged
+models are left out): [Harness Hub](https://huggingface.co/harness-hub)'s adapters for agent
+harnesses first (the rank-32 specialists for Pi, OpenCode and Hermes, and the rank-96 super-adapter
+for all three), then the 60 most downloaded, with a search by name. Gated
+ones need a token. **Download** reads the adapter's config first and shows its base model, rank and
+modules (an adapter above rank 128, which `infernix-serve` refuses, is flagged) and selects its two
+files; an adapter always gets a folder of its own, named after the repository, since every
+adapter's files have the same names. Once it is scanned, pick it on a 27B's Configure page; **Will
+it fit?** then asks the server whether it applies it and what it takes.
 
 Downloads run one repository at a time, each file in 64 MiB pieces over several connections
 (**Settings → Downloads**), into `<file>.part`. Pausing, a dropped connection or a launcher restart

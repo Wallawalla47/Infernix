@@ -1,5 +1,7 @@
 #include "launcher/artifact_scan.h"
 
+#include "launcher/sha256.h"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -18,6 +20,9 @@ constexpr char kNgramMagic[8]  = {'N', 'I', 'N', 'F', 'E', 'R', 'N', 'G'};
 constexpr std::uint64_t kPayloadAlignment = 4096;
 constexpr std::uint64_t kMaxDirectoryBytes = 512ull << 20;
 constexpr std::size_t kNgramHeaderBytes   = 68;
+constexpr std::uint64_t kMaxAdapterConfigBytes = 4ull << 20; // a PEFT adapter_config.json is about 1 kB
+constexpr const char* kAdapterConfig  = "adapter_config.json";
+constexpr const char* kAdapterWeights = "adapter_model.safetensors";
 
 // NVIDIA's published FP8 table records no scale in its header; infernix-serve knows it by id.
 constexpr const char* kKnownFp8Volumes[] = {"59e5d77e802ac95d8faf0a800b8f2301"};
@@ -134,6 +139,44 @@ void classify_family(ScannedModel& model) {
     }
     model.family       = "unknown";
     model.family_label = model.model_type.empty() ? "Unknown" : model.model_type;
+}
+
+// An adapter folder: adapter_config.json with adapter_model.safetensors beside it. Nothing when the weights are not
+// there (a download still running, or a GGUF adapter's folder); `issue` when the config cannot be read.
+std::optional<ScannedAdapter> read_adapter(const std::filesystem::path& config_path, std::optional<std::string>& issue) {
+    const std::filesystem::path folder = config_path.parent_path();
+    const std::uint64_t weights_bytes  = file_size_or_zero(folder / kAdapterWeights);
+    if (weights_bytes == 0) { return std::nullopt; }
+    const std::uint64_t config_bytes = file_size_or_zero(config_path);
+    if (config_bytes == 0 || config_bytes > kMaxAdapterConfigBytes) {
+        issue = std::string(kAdapterConfig) + ": empty or too large";
+        return std::nullopt;
+    }
+    std::ifstream in(config_path, std::ios::binary);
+    std::string text(static_cast<std::size_t>(config_bytes), '\0');
+    if (!in.read(text.data(), static_cast<std::streamsize>(text.size()))) {
+        issue = std::string(kAdapterConfig) + ": cannot be read";
+        return std::nullopt;
+    }
+    Json config;
+    try {
+        config = Json::parse(text);
+    } catch (const Json::exception&) {
+        issue = std::string(kAdapterConfig) + ": not JSON";
+        return std::nullopt;
+    }
+    if (!config.is_object()) {
+        issue = std::string(kAdapterConfig) + ": not a JSON object";
+        return std::nullopt;
+    }
+    ScannedAdapter adapter;
+    adapter.path     = folder;
+    adapter.key      = sha256_hex(path_utf8(folder)).substr(0, 32);
+    adapter.name     = path_utf8(folder.filename());
+    adapter.bytes    = weights_bytes;
+    adapter.config   = parse_adapter_config(config);
+    adapter.modified = modified_ms(folder / kAdapterWeights);
+    return adapter;
 }
 
 std::optional<std::string> recipe_of(const Json& provenance) {
@@ -500,6 +543,17 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             }
             if (!entry.is_regular_file(status_error)) { continue; }
             const std::filesystem::path& path = entry.path();
+            if (iequals(path_utf8(path.filename()), kAdapterConfig)) {
+                const std::string id = path_utf8(std::filesystem::weakly_canonical(path, status_error));
+                if (!visited_files.insert(id).second) { continue; }
+                std::optional<std::string> issue;
+                if (std::optional<ScannedAdapter> adapter = read_adapter(path, issue)) {
+                    ++dir.adapters;
+                    scan.adapters.push_back(std::move(*adapter));
+                }
+                if (issue) { scan.issues.push_back({path, *issue}); }
+                continue;
+            }
             if (!has_extension(path, ".infernix") && !has_extension(path, ".ninfer") &&
                 !has_extension(path, ".ngram")) {
                 continue;
@@ -599,6 +653,14 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             if (*rank == 0) { volume.own_for.push_back(model.key); }
         }
     }
+    for (ScannedAdapter& adapter : scan.adapters) {
+        for (const ScannedModel& model : scan.models) {
+            if (adapter_matches(model, adapter)) { adapter.compatible_models.push_back(model.key); }
+        }
+    }
+    std::sort(scan.adapters.begin(), scan.adapters.end(), [](const ScannedAdapter& a, const ScannedAdapter& b) {
+        return std::tie(a.name, a.key) < std::tie(b.name, b.key);
+    });
     std::sort(scan.models.begin(), scan.models.end(), [](const ScannedModel& a, const ScannedModel& b) {
         return std::tie(a.family_label, a.name) < std::tie(b.family_label, b.name);
     });
@@ -613,6 +675,7 @@ Json to_json(const LibraryScan& scan) {
                         {"models", dir.models},
                         {"drafters", dir.drafters},
                         {"ngram_volumes", dir.ngram_volumes},
+                        {"adapters", dir.adapters},
                         {"free_bytes", dir.free_bytes ? Json(*dir.free_bytes) : Json(nullptr)},
                         {"total_bytes", dir.total_bytes ? Json(*dir.total_bytes) : Json(nullptr)},
                         {"error", dir.error ? Json(*dir.error) : Json(nullptr)}});
@@ -690,6 +753,19 @@ Json to_json(const LibraryScan& scan) {
             {"modified", v.modified},
         });
     }
+    Json adapters = Json::array();
+    for (const ScannedAdapter& a : scan.adapters) {
+        adapters.push_back({
+            {"key", a.key},
+            {"name", a.name},
+            {"path", path_utf8(a.path)},
+            {"dir", path_utf8(a.path.parent_path())},
+            {"bytes", a.bytes},
+            {"config", to_json(a.config)},
+            {"compatible_models", a.compatible_models},
+            {"modified", a.modified},
+        });
+    }
     Json issues = Json::array();
     for (const ScanIssue& issue : scan.issues) {
         issues.push_back({{"path", path_utf8(issue.path)}, {"message", issue.message}});
@@ -700,7 +776,63 @@ Json to_json(const LibraryScan& scan) {
             {"models", models},
             {"drafters", drafters},
             {"ngram_volumes", volumes},
+            {"adapters", adapters},
             {"issues", issues}};
+}
+
+AdapterConfigFacts parse_adapter_config(const Json& config) {
+    AdapterConfigFacts facts;
+    if (!config.is_object()) { return facts; }
+    const auto text = [&](const char* key) -> std::optional<std::string> {
+        const auto it = config.find(key);
+        return it != config.end() && it->is_string() ? std::optional<std::string>(it->get<std::string>()) : std::nullopt;
+    };
+    const auto count = [](const Json& value) -> std::optional<std::uint64_t> {
+        return value.is_number_unsigned() || (value.is_number_integer() && value.get<std::int64_t>() > 0)
+                   ? std::optional<std::uint64_t>(value.get<std::uint64_t>())
+                   : std::nullopt;
+    };
+    facts.peft_type  = text("peft_type");
+    facts.base_model = text("base_model_name_or_path");
+    if (const auto it = config.find("r"); it != config.end()) { facts.rank = count(*it); }
+    if (const auto it = config.find("lora_alpha"); it != config.end() && it->is_number()) {
+        facts.alpha = it->get<double>();
+    }
+    facts.max_rank = facts.rank;
+    if (const auto it = config.find("rank_pattern"); it != config.end() && it->is_object()) {
+        for (const auto& [key, value] : it->items()) {
+            if (const std::optional<std::uint64_t> rank = count(value)) {
+                facts.max_rank = std::max(facts.max_rank.value_or(0), *rank);
+            }
+        }
+    }
+    if (const auto it = config.find("target_modules"); it != config.end() && it->is_array()) {
+        for (const Json& module : *it) {
+            if (module.is_string()) { facts.target_modules.push_back(module.get<std::string>()); }
+        }
+    }
+    if (const auto it = config.find("use_rslora"); it != config.end() && it->is_boolean()) {
+        facts.rslora = it->get<bool>();
+    }
+    return facts;
+}
+
+Json to_json(const AdapterConfigFacts& facts) {
+    const auto optional = [](const auto& value) { return value ? Json(*value) : Json(nullptr); };
+    return {{"peft_type", optional(facts.peft_type)},
+            {"base_model", optional(facts.base_model)},
+            {"rank", optional(facts.rank)},
+            {"max_rank", optional(facts.max_rank)},
+            {"alpha", optional(facts.alpha)},
+            {"target_modules", facts.target_modules},
+            {"rslora", facts.rslora}};
+}
+
+bool adapter_matches(const ScannedModel& model, const ScannedAdapter& adapter) {
+    if (model.model_type != "qwen3_5_text" || model.num_experts || !adapter.config.base_model) { return false; }
+    if (model.family != "qwen3.8-27b" && model.family != "qwen3.6-27b") { return false; }
+    // "Qwen/Qwen3.8-27B", "unsloth/Qwen3.8-27B-bnb-4bit", ...: the family's name in the base model's.
+    return lower(*adapter.config.base_model).find(model.family) != std::string::npos;
 }
 
 } // namespace infernix::launcher

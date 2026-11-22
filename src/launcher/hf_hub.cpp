@@ -4,6 +4,7 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <cctype>
 #include <memory>
 #include <stdexcept>
@@ -136,6 +137,60 @@ HfListing hf_list_files(const std::string& repo, const std::string& token, const
         throw std::runtime_error(std::string("unexpected answer from huggingface.co: ") + error.what());
     }
     return listing;
+}
+
+std::vector<HfAdapter> parse_adapter_search(const std::string& body) {
+    std::vector<HfAdapter> adapters;
+    try {
+        const Json models = Json::parse(body);
+        if (!models.is_array()) { throw std::runtime_error("unexpected answer from huggingface.co: not a list"); }
+        for (const Json& model : models) {
+            if (!model.is_object()) { continue; }
+            bool config = false, weights = false;
+            for (const Json& sibling : model.value("siblings", Json::array())) {
+                const std::string path = json_or<std::string>(sibling, "rfilename", "");
+                config  = config || path == "adapter_config.json";
+                weights = weights || path == "adapter_model.safetensors";
+            }
+            // GGUF exports, merged models and folders of several adapters are not what --lora reads.
+            if (!config || !weights) { continue; }
+            HfAdapter adapter;
+            adapter.repo = json_or<std::string>(model, "id", "");
+            if (!valid_repo_id(adapter.repo)) { continue; }
+            adapter.downloads     = json_or<std::uint64_t>(model, "downloads", 0);
+            adapter.likes         = json_or<std::uint64_t>(model, "likes", 0);
+            adapter.last_modified = json_or<std::string>(model, "lastModified", "");
+            // `gated` is false, or "auto" / "manual" (how access is granted).
+            const auto gated = model.find("gated");
+            adapter.gated    = gated != model.end() && (gated->is_string() || (gated->is_boolean() && gated->get<bool>()));
+            adapters.push_back(std::move(adapter));
+        }
+    } catch (const Json::exception& error) {
+        throw std::runtime_error(std::string("unexpected answer from huggingface.co: ") + error.what());
+    }
+    return adapters;
+}
+
+std::vector<HfAdapter> hf_search_adapters(const std::string& base, const std::string& author, const std::string& search,
+                                          int limit, const std::string& token, const std::atomic<bool>* cancel) {
+    if (!valid_repo_id(base)) { throw std::runtime_error("not a Hugging Face repository id: " + base); }
+    // `filter=peft` keeps PEFT repositories (`library=peft` is not a filter of this API); the file list tells
+    // which hold the two files --lora reads.
+    std::string url = "https://huggingface.co/api/models?filter=peft&filter=base_model:adapter:" + base +
+                      "&sort=downloads&direction=-1&limit=" + std::to_string(std::clamp(limit, 1, 500)) +
+                      "&expand%5B%5D=siblings&expand%5B%5D=downloads&expand%5B%5D=likes"
+                      "&expand%5B%5D=lastModified&expand%5B%5D=gated";
+    if (!author.empty()) {
+        if (!valid_repo_id(author + "/x")) { throw std::runtime_error("not a Hugging Face account: " + author); }
+        url += "&author=" + author;
+    }
+    if (!search.empty()) { url += "&search=" + url_encode_path(search); }
+    const HttpResult result = http_get(url, token, 60, cancel);
+    if (!result.error.empty()) { throw std::runtime_error("cannot reach huggingface.co: " + result.error); }
+    if (result.status != 200) {
+        throw std::runtime_error("huggingface.co answered HTTP " + std::to_string(result.status));
+    }
+    return parse_adapter_search(result.body);
 }
 
 } // namespace infernix::launcher

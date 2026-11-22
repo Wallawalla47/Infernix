@@ -137,7 +137,7 @@ export function loadedArtifactKey(instance: InstanceInfo | null): string | null 
   return live.artifact_key ?? artifactKeyOf(live.model_key);
 }
 
-function samePath(a: string, b: string): boolean {
+export function samePath(a: string, b: string): boolean {
   // Windows paths compare ignoring case and separator style.
   const norm = (path: string) => path.replace(/\\/g, "/").toLowerCase();
   return norm(a) === norm(b);
@@ -212,10 +212,10 @@ export function useDeleteConfig() {
   });
 }
 
-export type FileKind = "model" | "drafter" | "ngram";
+export type FileKind = "model" | "drafter" | "ngram" | "adapter";
 
-/** Deletes an artifact's, a drafter's or an n-gram volume's files; the launcher answers the new
- * library. `confirm` is the file name the user typed. */
+/** Deletes an artifact's, a drafter's, an n-gram volume's or a LoRA adapter's files; the launcher
+ * answers the new library. `confirm` is the file (an adapter's: folder) name the user typed. */
 export function useDeleteFiles() {
   const qc = useQueryClient();
   return useMutation({
@@ -224,7 +224,9 @@ export function useDeleteFiles() {
         ? api.deleteModelFiles(key, confirm)
         : kind === "drafter"
           ? api.deleteDrafter(key, confirm)
-          : api.deleteNgramVolume(key, confirm),
+          : kind === "adapter"
+            ? api.deleteAdapter(key, confirm)
+            : api.deleteNgramVolume(key, confirm),
     onSuccess: (library, { kind, key }) => {
       qc.setQueryData(["library"], library);
       if (kind === "model") {

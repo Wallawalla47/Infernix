@@ -189,7 +189,7 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                 weight_scale = make_float2(fp8_widen(weight_scales[parent_row0]),
                                            fp8_widen(weight_scales[parent_row1]));
             }
-            const LoraTokensColumn column = lora_tokens_column(
+            const auto column = lora_tokens_column(
                 epilogue.lora, row_policy.weight_row(row_begin, column_row, rows),
                 row_policy.weight_row(row_begin, column_row + accumulator_token, rows));
 #pragma unroll

@@ -143,9 +143,8 @@ float wide_value(std::mt19937& rng, float scale) {
     return std::ldexp(unit(rng), exponent(rng)) * scale;
 }
 
-int check_case(std::int32_t rows, std::int32_t k, std::int32_t t, std::uint32_t seed) {
+int check_case(std::int32_t rows, std::int32_t k, std::int32_t t, std::uint32_t seed, std::int32_t rank = 32) {
     std::mt19937 rng(seed);
-    const std::int32_t rank = 32;
     std::vector<float> a(static_cast<std::size_t>(rows) * k), b(static_cast<std::size_t>(rows) * rank);
     for (auto& v : a) { v = wide_value(rng, 0.03F); }
     for (auto& v : b) { v = wide_value(rng, 0.05F); }
@@ -190,7 +189,8 @@ int check_case(std::int32_t rows, std::int32_t k, std::int32_t t, std::uint32_t 
     y_d.copy_to_host(y.data(), y.size() * 2);
 
     int failures = 0;
-    const std::string label = "rows=" + std::to_string(rows) + " K=" + std::to_string(k) + " T=" + std::to_string(t);
+    const std::string label = "rows=" + std::to_string(rows) + " K=" + std::to_string(k) + " T=" + std::to_string(t) +
+                              " r=" + std::to_string(rank);
     std::vector<std::uint32_t> got, want;
     for (std::int32_t c = 0; c < t; ++c) {
         for (std::int32_t r = 0; r < rows; ++r) {
@@ -271,6 +271,7 @@ INFERNIX_OP_TEST(lossless_lora) {
         failures += check_case(96, 5120, 37, 2U);
         failures += check_case(64, 17408, 5, 3U);
         failures += check_case(32, 1024, 600, 4U); // two column chunks
+        failures += check_case(256, 5120, 37, 5U, 128); // the largest rank, 128
     } catch (const std::exception& error) {
         std::cerr << "lossless lora test: " << error.what() << '\n';
         return 1;

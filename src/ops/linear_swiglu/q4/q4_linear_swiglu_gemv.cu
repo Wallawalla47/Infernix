@@ -156,10 +156,10 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     const std::uint8_t* up_scale_row =
         scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
-    [[maybe_unused]] LoraWarpStage<2, 1>* lora_stage = nullptr;
+    [[maybe_unused]] LoraWarpStage<2, 1, kLoraStageRank<Lora>>* lora_stage = nullptr;
     if constexpr (kLoraTerm<Lora>) {
         // The gate and up rows' B and their U columns stage in shared memory beside the main loop.
-        __shared__ LoraWarpStage<2, 1> lora_stages[kWarpsPerBlock];
+        __shared__ LoraWarpStage<2, 1, kLoraStageRank<Lora>> lora_stages[kWarpsPerBlock];
         lora_stage             = &lora_stages[warp];
         const int term_rows[2] = {out_row, out_row + kIntermediate};
         lora_stage_warp_b(lora, term_rows, *lora_stage);

@@ -269,6 +269,8 @@ private:
     void toast(const std::string& level, const std::string& message);
     [[nodiscard]] Json state_json() const;
     [[nodiscard]] Json hf_files_json(const std::string& repo) const;
+    // The LoRA adapters on the Hub for a base model: Harness Hub's first, then the most downloaded.
+    [[nodiscard]] Json hf_adapters_json(const std::string& base, const std::string& search) const;
     void download_finished(const std::filesystem::path& dest_dir, const std::filesystem::path& target_dir);
 
     static constexpr std::size_t kRestartLimit = 3;

@@ -45,10 +45,10 @@ q5_a16_direct_simt_kernel(
     const int logical_k     = Schedule::kStaticK ? Schedule::kStaticK : k;
     const int iterations    = (logical_k + BK - 1) / BK;
     const auto group0       = std::int64_t(R == 1 || row < rows ? row : 0) * (padded_k / 64);
-    [[maybe_unused]] LoraWarpStage<1, T>* lora_stage = nullptr;
+    [[maybe_unused]] LoraWarpStage<1, T, kLoraStageRank<Epilogue>>* lora_stage = nullptr;
     if constexpr (kLoraEpilogue<Epilogue>) {
         // The row's term operands (B row, U columns) stage in shared memory beside the main loop.
-        __shared__ LoraWarpStage<1, T> lora_stages[R];
+        __shared__ LoraWarpStage<1, T, kLoraStageRank<Epilogue>> lora_stages[R];
         lora_stage = &lora_stages[local_row];
         if (part == 0) {
             const int term_rows[1] = {row < rows ? row : -1};

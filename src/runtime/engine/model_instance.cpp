@@ -62,10 +62,15 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     }
     if (!options.lora_path.empty()) {
         if (architecture == models::Architecture::Qwen4Exp) {
-            throw std::invalid_argument("--lora adapts dense Qwen3.5 models; Qwen3.8-Flash-Next is a mixture of experts");
+            throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
+                                        " is refused: Qwen3.8-Flash-Next is a mixture-of-experts model, and Infernix "
+                                        "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) only");
         }
         if (offloaded_experts) {
-            throw std::invalid_argument("--lora adapts dense Qwen3.5 models; this artifact's experts are offloaded");
+            throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
+                                        " is refused: this artifact is a mixture-of-experts model (its experts are "
+                                        "offloaded), and Infernix applies LoRA adapters to the dense Qwen3.5-family "
+                                        "models (the 27B) only");
         }
     }
     // An automatic context takes all the VRAM the KV pool may have: offloaded experts size their cache from what

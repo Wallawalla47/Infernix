@@ -505,6 +505,9 @@ void Launcher::register_download_routes(const std::string& api) {
     server_.Get(api + "/hf/files", admin([this](const Request& q, Response& s) {
                     send_json(s, hf_files_json(trim(q.get_param_value("repo"))));
                 }));
+    server_.Get(api + "/hf/adapters", admin([this](const Request& q, Response& s) {
+                    send_json(s, hf_adapters_json(trim(q.get_param_value("base")), trim(q.get_param_value("search"))));
+                }));
     server_.Get(api + "/downloads", admin([this](const Request&, Response& s) { send_json(s, downloads_->list()); }));
     server_.Post(api + "/downloads", admin([this](const Request& q, Response& s) {
                      const Json request = body_json(q);
@@ -587,7 +590,7 @@ void Launcher::register_update_routes(const std::string& api) {
 }
 
 void Launcher::register_disk_routes(const std::string& api) {
-    // Disk: deleting an artifact's files, a drafter or an n-gram volume.
+    // Disk: deleting an artifact's files, a drafter, an n-gram volume or a LoRA adapter.
     const auto check_confirm = [](const Request& q, const std::string& file_name) {
         if (json_or<std::string>(body_json(q), "confirm", "") != file_name) {
             throw std::invalid_argument("type the file name (" + file_name + ") to confirm");
@@ -646,34 +649,53 @@ void Launcher::register_disk_routes(const std::string& api) {
                        request_scan();
                        send_json(s, library_json());
                    }));
-    server_.Delete(api + R"(/(drafters|ngram)/([0-9a-f]{32}))", admin([this, check_confirm, remove_files](const Request& q, Response& s) {
-                       std::filesystem::path path;
+    server_.Delete(api + R"(/(drafters|ngram|adapters)/([0-9a-f]{32}))", admin([this, check_confirm, remove_files](const Request& q, Response& s) {
+                       // The files to delete; what a running server would name (an adapter: its folder or its
+                       // weights file); the name the user types to confirm.
+                       std::vector<std::filesystem::path> files;
+                       std::vector<std::filesystem::path> named_as;
+                       std::filesystem::path folder;
                        std::string file_name;
                        {
                            std::lock_guard lock(library_mutex_);
-                           const std::string key = q.matches[2].str();
-                           if (q.matches[1].str() == "drafters") {
+                           const std::string kind = q.matches[1].str(), key = q.matches[2].str();
+                           if (kind == "drafters") {
                                for (const ScannedDrafter& drafter : library_.drafters) {
-                                   if (drafter.key == key) { path = drafter.path, file_name = drafter.file_name; }
+                                   if (drafter.key == key) { files = named_as = {drafter.path}, file_name = drafter.file_name; }
+                               }
+                           } else if (kind == "ngram") {
+                               for (const ScannedNgramVolume& volume : library_.ngram_volumes) {
+                                   if (volume.key == key) { files = named_as = {volume.path}, file_name = volume.file_name; }
                                }
                            } else {
-                               for (const ScannedNgramVolume& volume : library_.ngram_volumes) {
-                                   if (volume.key == key) { path = volume.path, file_name = volume.file_name; }
+                               for (const ScannedAdapter& adapter : library_.adapters) {
+                                   if (adapter.key != key) { continue; }
+                                   folder    = adapter.path;
+                                   files     = {adapter.path / "adapter_model.safetensors", adapter.path / "adapter_config.json"};
+                                   named_as  = {adapter.path, files.front()};
+                                   file_name = adapter.name;
                                }
                            }
                        }
-                       if (path.empty()) { throw std::invalid_argument("no such file in the library"); }
+                       if (files.empty()) { throw std::invalid_argument("no such file in the library"); }
                        // A running server may have it open.
                        const InstanceSnapshot instance = supervisor_->snapshot();
                        if (instance.state != InstanceState::Idle && instance.state != InstanceState::Failed) {
                            for (const std::string& arg : instance.argv) {
-                               if (iequals(arg, path_utf8(path))) {
-                                   throw std::invalid_argument(file_name + " is in use by " + instance.alias + ": unload it first");
+                               for (const std::filesystem::path& path : named_as) {
+                                   if (iequals(arg, path_utf8(path))) {
+                                       throw std::invalid_argument(file_name + " is in use by " + instance.alias + ": unload it first");
+                                   }
                                }
                            }
                        }
                        check_confirm(q, file_name);
-                       remove_files({path}, file_name);
+                       remove_files(files, file_name);
+                       if (!folder.empty()) {
+                           // The adapter's folder goes too when nothing else is left in it.
+                           std::error_code ignored;
+                           if (std::filesystem::is_empty(folder, ignored)) { std::filesystem::remove(folder, ignored); }
+                       }
                        request_scan();
                        send_json(s, library_json());
                    }));
