@@ -150,10 +150,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int stages          = FullK ? groups / G : (groups + G - 1) / G;
     const int token0          = static_cast<int>(blockIdx.y) * T;
     const int active_tokens   = Full ? T : min(T, tokens - token0);
-    [[maybe_unused]] LoraWarpStage<1, T>* lora_stage = nullptr;
+    [[maybe_unused]] LoraWarpStage<1, T, kLoraStageRank<Epilogue>>* lora_stage = nullptr;
     if constexpr (kLoraEpilogue<Epilogue>) {
         // The row's term operands (B row, U columns) stage in shared memory beside the main loop.
-        __shared__ LoraWarpStage<1, T> lora_stages[R];
+        __shared__ LoraWarpStage<1, T, kLoraStageRank<Epilogue>> lora_stages[R];
         lora_stage = &lora_stages[local_row];
         if (split == 0) {
             const int term_rows[1] = {row < rows ? row : -1};

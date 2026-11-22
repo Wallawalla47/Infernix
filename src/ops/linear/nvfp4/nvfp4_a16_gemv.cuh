@@ -264,7 +264,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int block = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     // The scales and codes are immutable: a programmatic dependent stages the scales before it waits.
     nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared, block, rows, policy);
-    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, 1>;
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, 1, kLoraStageRank<Epilogue>>;
     [[maybe_unused]] LoraStage* lora_stage = nullptr;
     if constexpr (kLoraEpilogue<Epilogue>) {
         // The term's B rows (immutable) stage before the wait, after the scales' own copies have been waited for.

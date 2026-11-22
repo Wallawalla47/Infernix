@@ -225,10 +225,10 @@ int run_case(const Weight& weight, const quantized_weight::PackedWeight& host, i
 
 // --lora (include/infernix/ops/lora.h): the adapter form against rmsnorm(), lora_shrink(h) and
 // attn_input_proj(+term) (qualified with its term by the lora Op test), and the h it stores against
-// rmsnorm()'s. q_proj's rank-32 A feeds the query and gate rows, v_proj's the value rows; key is
-// unadapted.
-int run_lora_case(const Weight& weight, int tokens, bool zero_b = false) {
-    constexpr int kRank   = 32;
+// rmsnorm()'s. q_proj's A feeds the query and gate rows, v_proj's the value rows; key is unadapted.
+// Rank 32 runs the narrow adapter instances, 128 the wide ones.
+int run_lora_case(const Weight& weight, int tokens, bool zero_b = false, int rank = 32) {
+    const int kRank       = rank;
     constexpr int kQRows  = 6144;
     constexpr int kKvRows = 1024;
     const auto uniform    = [](std::size_t count, std::uint32_t seed, float bound) {
@@ -288,7 +288,8 @@ int run_lora_case(const Weight& weight, int tokens, bool zero_b = false) {
                                              ops::LinearPolicy::AllowA4, fused_workspace, nullptr,
                                              &site, &stored);
     cuda_synchronize();
-    const std::string suffix = std::string(zero_b ? " zero-B lora T=" : " lora T=") + std::to_string(tokens);
+    const std::string suffix = std::string(zero_b ? " zero-B lora rank " : " lora rank ") + std::to_string(rank) +
+                               " T=" + std::to_string(tokens);
     int failures = compare_bytes("h" + suffix, static_cast<const std::uint8_t*>(hidden_buffer.p),
                                  static_cast<const std::uint8_t*>(stored_buffer.p), hidden_buffer.bytes);
     const char* names[4] = {"q", "gate", "k", "v"};
@@ -348,9 +349,12 @@ INFERNIX_OP_TEST(attn_input_proj_fused_rmsnorm) {
             failures += run_case(weight, parent.host, tokens, measure);
         }
         // --lora: a ragged 256-token tile, the 128-token tiles and a production prefill chunk.
-        for (const int tokens : {129, 300, 3584}) { failures += run_lora_case(weight, tokens); }
+        for (const int rank : {32, 128}) {
+            for (const int tokens : {129, 300, 3584}) { failures += run_lora_case(weight, tokens, false, rank); }
+        }
         // B = 0: the adapter form returns the no-adapter call's bits.
         for (const int tokens : {129, 256, 257, 300, 513, 3584}) { failures += run_lora_case(weight, tokens, true); }
+        failures += run_lora_case(weight, 513, true, 128);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "fused attention input test: " << error.what() << '\n';

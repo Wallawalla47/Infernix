@@ -348,10 +348,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                                                  Q4RowSplitStorage::kScaleBytesPerGroup;
     const __nv_bfloat16* activation =
         Schedule::kActivationAccess == Q4GemvActivationAccess::CtaSharedFullK ? shared_x : x;
-    [[maybe_unused]] LoraWarpStage<1, 1>* lora_stage = nullptr;
+    [[maybe_unused]] LoraWarpStage<1, 1, kLoraStageRank<Epilogue>>* lora_stage = nullptr;
     if constexpr (kLoraEpilogue<Epilogue>) {
         // The term's B row and U column stage in shared memory beside the main loop (after the start's wait).
-        __shared__ LoraWarpStage<1, 1> lora_stages[kBlockRows];
+        __shared__ LoraWarpStage<1, 1, kLoraStageRank<Epilogue>> lora_stages[kBlockRows];
         lora_stage = &lora_stages[row_in_cta];
         if (warp_in_row == 0) {
             const int term_rows[1] = {row < rows ? row : -1};

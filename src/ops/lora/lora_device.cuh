@@ -15,8 +15,17 @@
 
 namespace infernix::ops::detail {
 
-// Kernel argument form of LoraAddend (passed by value).
+// Two classes of adapter instance: an adapter of padded rank up to kLoraNarrowRank runs the narrow instances (the
+// term's k-step operands sized for 4 steps), a larger one, up to kLoraMaxRank, the wide instances (8 steps). They are
+// separate instances of every kernel, so the narrow ones are exactly the kernels they were before the wide class
+// existed: a wide adapter costs a narrow one nothing.
+inline constexpr int kLoraNarrowRank = 64;
+static_assert(kLoraMaxRank == 2 * kLoraNarrowRank, "the wide class holds twice the narrow class's k-steps");
+
+// Kernel argument form of LoraAddend (passed by value): a narrow adapter (padded rank <= kLoraNarrowRank).
 struct LoraDeviceAddend {
+    static constexpr int kMaxRank = kLoraNarrowRank;
+
     const __nv_bfloat16* b = nullptr; // [rows][rank]
     const __nv_bfloat16* u = nullptr; // [T][u_rows]
     std::int32_t rank      = 0;       // multiple of 16
@@ -43,8 +52,21 @@ struct LoraDeviceAddend {
     }
 };
 
-[[nodiscard]] inline LoraDeviceAddend lora_device_addend(const LoraAddend& addend) {
-    LoraDeviceAddend d;
+// The same for a wide adapter (kLoraNarrowRank < padded rank <= kLoraMaxRank): the narrow form's fields and lookups
+// (a narrow adapter's kernels see the narrow struct exactly as before the wide class existed). The helpers whose
+// operands are sized by the rank take the class as a template parameter (P::kMaxRank); the rank-agnostic ones take
+// the narrow form by reference, which a wide one binds to.
+struct LoraDeviceAddendWide : LoraDeviceAddend {
+    static constexpr int kMaxRank = kLoraMaxRank;
+};
+
+// The k-steps (16 values of the rank each) an instance's term operands hold.
+template <class P>
+inline constexpr int kLoraSteps = P::kMaxRank / 16;
+
+template <class P = LoraDeviceAddend>
+[[nodiscard]] inline P lora_device_addend(const LoraAddend& addend) {
+    P d;
     d.b        = static_cast<const __nv_bfloat16*>(addend.b);
     d.u        = static_cast<const __nv_bfloat16*>(addend.u);
     d.rank     = addend.rank;
@@ -61,17 +83,24 @@ struct LoraDeviceAddend {
 // Marks a projection kernel instantiated with the addend; kernels without it keep their code unchanged.
 struct LoraNone {};
 
-// Kernels that take their term as a parameter of their own (no epilogue type) take LoraNone or LoraDeviceAddend.
+// Kernels that take their term as a parameter of their own (no epilogue type) take LoraNone, LoraDeviceAddend or
+// LoraDeviceAddendWide.
 template <class L>
-inline constexpr bool kLoraTerm = std::is_same_v<L, LoraDeviceAddend>;
+inline constexpr bool kLoraTerm = std::is_same_v<L, LoraDeviceAddend> || std::is_same_v<L, LoraDeviceAddendWide>;
 
-// Calls launch(term) with LoraNone, or with the device form of `lora` (from column `first_column`: a token slice's).
+// Whether a term of this padded rank runs the narrow instances.
+[[nodiscard]] inline bool lora_narrow(const LoraAddend& addend) { return addend.rank <= kLoraNarrowRank; }
+
+// Calls launch(term) with LoraNone, or with the device form of `lora` (from column `first_column`: a token slice's)
+// of its rank's class.
 template <class Launch>
 void with_lora_term(const LoraAddend* lora, std::int32_t first_column, Launch&& launch) {
     if (lora == nullptr || !lora->present()) {
         launch(LoraNone{});
+    } else if (lora_narrow(*lora)) {
+        launch(lora_device_addend<LoraDeviceAddend>(lora_columns_from(*lora, first_column)));
     } else {
-        launch(lora_device_addend(lora_columns_from(*lora, first_column)));
+        launch(lora_device_addend<LoraDeviceAddendWide>(lora_columns_from(*lora, first_column)));
     }
 }
 
@@ -158,10 +187,11 @@ __device__ __forceinline__ void lora_warp_rows_with(const LoraDeviceAddend& p, c
 // them there waits a DRAM round trip, in every wave. The warp copies its Rows rows of B before the PDL wait
 // (B is immutable) and, after it, U's columns token0 .. token0 + Tokens - 1 of each adapted segment its rows touch
 // (contiguous or paired rows touch at most min(Rows, 4)); lora_warp_rows_staged reads both from here. Rows of
-// rank * 2 + 16 bytes (an odd number of 16-byte pieces).
-template <int Rows, int Tokens>
+// rank * 2 + 16 bytes (an odd number of 16-byte pieces), sized for the instance's class (MaxRank: the addend's
+// kMaxRank, kLoraStageRank of the kernel's epilogue or term type).
+template <int Rows, int Tokens, int MaxRank = kLoraNarrowRank>
 struct LoraWarpStage {
-    static constexpr int kStride = 2 * kLoraMaxRank + 16;
+    static constexpr int kStride = 2 * MaxRank + 16;
     static constexpr int kSlots  = Rows < 4 ? Rows : 4;
     alignas(16) unsigned char b[Rows][kStride];
     alignas(16) unsigned char u[kSlots][Tokens][kStride];
@@ -180,9 +210,10 @@ __device__ __forceinline__ unsigned lora_touched_segments(const LoraDeviceAddend
 }
 
 // B's rows of the warp (before the PDL wait: immutable). Warp-wide; the copies complete at lora_warp_rows_staged.
-template <int Rows, int Tokens>
-__device__ __forceinline__ void lora_stage_warp_b(const LoraDeviceAddend& p, const int (&rows)[Rows],
-                                                  LoraWarpStage<Rows, Tokens>& stage) {
+template <int Rows, int Tokens, class P, int MaxRank>
+__device__ __forceinline__ void lora_stage_warp_b(const P& p, const int (&rows)[Rows],
+                                                  LoraWarpStage<Rows, Tokens, MaxRank>& stage) {
+    static_assert(MaxRank == P::kMaxRank, "the stage is sized for the addend's class");
     const int lane = threadIdx.x & 31, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
 #pragma unroll
     for (int r = 0; r < Rows; ++r) {
@@ -196,15 +227,16 @@ __device__ __forceinline__ void lora_stage_warp_b(const LoraDeviceAddend& p, con
 
 // U's columns token0 .. token0 + Tokens - 1 (zero from live) of the warp's adapted segments (after the PDL wait: the
 // shrink's output). Warp-wide.
-template <int Rows, int Tokens>
-__device__ __forceinline__ void lora_stage_warp_u(const LoraDeviceAddend& p, const int (&rows)[Rows], int token0,
-                                                  int live, LoraWarpStage<Rows, Tokens>& stage) {
+template <int Rows, int Tokens, class P, int MaxRank>
+__device__ __forceinline__ void lora_stage_warp_u(const P& p, const int (&rows)[Rows], int token0, int live,
+                                                  LoraWarpStage<Rows, Tokens, MaxRank>& stage) {
+    static_assert(MaxRank == P::kMaxRank, "the stage is sized for the addend's class");
     const int lane = threadIdx.x & 31, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
     const unsigned touched = lora_touched_segments(p, rows);
     int slot               = 0;
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-        if (((touched >> s) & 1U) == 0U || slot >= LoraWarpStage<Rows, Tokens>::kSlots) { continue; }
+        if (((touched >> s) & 1U) == 0U || slot >= LoraWarpStage<Rows, Tokens, MaxRank>::kSlots) { continue; }
         const int uo = p.offset_of(s);
 #pragma unroll
         for (int t = 0; t < Tokens; ++t) {
@@ -223,12 +255,13 @@ __device__ __forceinline__ void lora_stage_warp_u(const LoraDeviceAddend& p, con
 // The warp's addend (as lora_warp_rows_with describes) on the operands lora_stage_warp_b / lora_stage_warp_u copied
 // (the same rows and live; U staged from column stage_token0, these Tokens columns within it). Waits for the warp's
 // copies. Warp-wide.
-template <int Rows, int Tokens, int StageTokens>
-__device__ __forceinline__ void lora_warp_rows_staged(const LoraDeviceAddend& p, const int (&rows)[Rows], int token0,
-                                                      int live, float (&add)[Rows][Tokens], bool (&has)[Rows],
-                                                      const LoraWarpStage<Rows, StageTokens>& stage,
+template <int Rows, int Tokens, int StageTokens, class P, int MaxRank>
+__device__ __forceinline__ void lora_warp_rows_staged(const P& p, const int (&rows)[Rows], int token0, int live,
+                                                      float (&add)[Rows][Tokens], bool (&has)[Rows],
+                                                      const LoraWarpStage<Rows, StageTokens, MaxRank>& stage,
                                                       int stage_token0) {
     static_assert(Tokens <= StageTokens);
+    static_assert(MaxRank == P::kMaxRank, "the stage is sized for the addend's class");
     cp_wait<0>();
     __syncwarp();
     const int q = threadIdx.x & 3, stride = 2 * p.rank + 16;
@@ -255,19 +288,19 @@ __device__ __forceinline__ void lora_warp_rows_staged(const LoraDeviceAddend& p,
         });
 }
 
-template <int Rows, int Tokens>
-__device__ __forceinline__ void lora_warp_rows_staged(const LoraDeviceAddend& p, const int (&rows)[Rows], int token0,
-                                                      int live, float (&add)[Rows][Tokens], bool (&has)[Rows],
-                                                      const LoraWarpStage<Rows, Tokens>& stage) {
+template <int Rows, int Tokens, class P, int MaxRank>
+__device__ __forceinline__ void lora_warp_rows_staged(const P& p, const int (&rows)[Rows], int token0, int live,
+                                                      float (&add)[Rows][Tokens], bool (&has)[Rows],
+                                                      const LoraWarpStage<Rows, Tokens, MaxRank>& stage) {
     lora_warp_rows_staged<Rows, Tokens, Tokens>(p, rows, token0, live, add, has, stage, token0);
 }
 
 // One staged row's term (lora_stage_warp_b / lora_stage_warp_u with Tokens = T from token0) over the columns
 // token0 .. token0 + T - 1 (any T; columns >= live get none): every lane receiving all T (row_all), or lane t
 // column t's and other lanes 0 (row_tokens). Warp-wide.
-template <int T>
-__device__ __forceinline__ void lora_warp_row_all_staged(const LoraDeviceAddend& p, int row, int token0, int live,
-                                                         float (&add)[T], bool& has, const LoraWarpStage<1, T>& stage) {
+template <int T, class P, int MaxRank>
+__device__ __forceinline__ void lora_warp_row_all_staged(const P& p, int row, int token0, int live, float (&add)[T],
+                                                         bool& has, const LoraWarpStage<1, T, MaxRank>& stage) {
     constexpr int kChunk = T < 8 ? T : 8;
     const int rows[1]    = {row};
     has                  = false;
@@ -284,9 +317,9 @@ __device__ __forceinline__ void lora_warp_row_all_staged(const LoraDeviceAddend&
     }
 }
 
-template <int T>
-__device__ __forceinline__ float lora_warp_row_tokens_staged(const LoraDeviceAddend& p, int row, int token0, int live,
-                                                             bool& has, const LoraWarpStage<1, T>& stage) {
+template <int T, class P, int MaxRank>
+__device__ __forceinline__ float lora_warp_row_tokens_staged(const P& p, int row, int token0, int live, bool& has,
+                                                             const LoraWarpStage<1, T, MaxRank>& stage) {
     constexpr int kChunk = T < 8 ? T : 8;
     const int lane       = threadIdx.x & 31;
     const int rows[1]    = {row};
@@ -306,15 +339,14 @@ __device__ __forceinline__ float lora_warp_row_tokens_staged(const LoraDeviceAdd
     return mine;
 }
 
-inline constexpr int kLoraMaxSteps = kLoraMaxRank / 16;
-
 // Row orientation tile: acc[MM][MN][4] are MMA C fragments whose rows are weight rows row_of(mm, i) (i in 0..15) and
 // whose columns are tokens token_of(mn, j) (j in 0..7; < 0 past the call). Each element must already hold the
 // kernel's scaled value; the canonical term is added to the elements of adapted rows. Rows 0-7 and 8-15 of a fragment
 // may lie in different segments (paired gate/up rows); each 8-row half lies in one. Warp-wide.
-template <int MM, int MN, class RowOf, class TokenOf>
-__device__ __forceinline__ void lora_add_rows_tile(const LoraDeviceAddend& p, float (&acc)[MM][MN][4], RowOf row_of,
+template <int MM, int MN, class P, class RowOf, class TokenOf>
+__device__ __forceinline__ void lora_add_rows_tile(const P& p, float (&acc)[MM][MN][4], RowOf row_of,
                                                    TokenOf token_of) {
+    constexpr int kLoraMaxSteps = kLoraSteps<P>;
     const int lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
     const int steps = p.rank >> 4;
 #pragma unroll
@@ -375,16 +407,19 @@ __device__ __forceinline__ void lora_add_rows_tile(const LoraDeviceAddend& p, fl
 
 // Token orientation, one fragment column: the 8 weight rows of an MMA C fragment's columns (one segment), their
 // segment's U offset (< 0: unadapted, nothing else loaded) and scale, and this lane's B operand (row_g = the
-// fragment's column g's parent row, lane g = lane / 4).
+// fragment's column g's parent row, lane g = lane / 4), for an addend of class P.
+template <class P>
 struct LoraTokensColumn {
     int uo;
     float scale;
-    unsigned b[kLoraMaxSteps][2];
+    unsigned b[kLoraSteps<P>][2];
 };
 
-__device__ __forceinline__ LoraTokensColumn lora_tokens_column(const LoraDeviceAddend& p, int row0, int row_g) {
+template <class P>
+__device__ __forceinline__ LoraTokensColumn<P> lora_tokens_column(const P& p, int row0, int row_g) {
+    constexpr int kLoraMaxSteps = kLoraSteps<P>;
     const int q = threadIdx.x & 3, steps = p.rank >> 4;
-    LoraTokensColumn column;
+    LoraTokensColumn<P> column;
     const int seg = p.segment_of(row0);
     column.uo     = p.offset_of(seg);
     if (column.uo < 0) { return column; }
@@ -403,8 +438,10 @@ __device__ __forceinline__ LoraTokensColumn lora_tokens_column(const LoraDeviceA
 // The chain c of one token-orientation fragment of an adapted column: fragment rows = tokens t_lo (row g) and t_hi
 // (row g + 8), < 0 past the call (zero operands), the m16n8k16 MMA chain over the rank from +0 with U's columns as
 // the A operand. Warp-wide.
-__device__ __forceinline__ void lora_tokens_fragment(const LoraDeviceAddend& p, const LoraTokensColumn& column,
-                                                     int t_lo, int t_hi, float (&c)[4]) {
+template <class P>
+__device__ __forceinline__ void lora_tokens_fragment(const P& p, const LoraTokensColumn<P>& column, int t_lo, int t_hi,
+                                                     float (&c)[4]) {
+    constexpr int kLoraMaxSteps = kLoraSteps<P>;
     const int q = threadIdx.x & 3, steps = p.rank >> 4;
     const __nv_bfloat16* u_lo = p.u + static_cast<std::int64_t>(t_lo < 0 ? 0 : t_lo) * p.u_rows + column.uo;
     const __nv_bfloat16* u_hi = p.u + static_cast<std::int64_t>(t_hi < 0 ? 0 : t_hi) * p.u_rows + column.uo;
@@ -425,9 +462,10 @@ __device__ __forceinline__ void lora_tokens_fragment(const LoraDeviceAddend& p, 
 // Token orientation tile: acc[MT][MR][4] are MMA C fragments whose rows are tokens token_of(mt, i) (i in 0..15; < 0
 // past the call) and whose columns are weight rows row_of(mr, j) (j in 0..7, one segment a fragment). As above.
 // (The chain is lora_tokens_fragment's, written out: the tile kernels' register allocation was measured on this form.)
-template <int MT, int MR, class TokenOf, class RowOf>
-__device__ __forceinline__ void lora_add_tokens_tile(const LoraDeviceAddend& p, float (&acc)[MT][MR][4],
-                                                     TokenOf token_of, RowOf row_of) {
+template <int MT, int MR, class P, class TokenOf, class RowOf>
+__device__ __forceinline__ void lora_add_tokens_tile(const P& p, float (&acc)[MT][MR][4], TokenOf token_of,
+                                                     RowOf row_of) {
+    constexpr int kLoraMaxSteps = kLoraSteps<P>;
     const int lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
     const int steps = p.rank >> 4;
 #pragma unroll
@@ -468,6 +506,127 @@ __device__ __forceinline__ void lora_add_tokens_tile(const LoraDeviceAddend& p, 
     }
 }
 
+// lora_add_tokens_tile_staged (below) for a wide instance whose B rows and one segment's U columns over the whole tile
+// do not fit the free shared memory (the NVFP4 A4 tile of 256 tokens): the same staging with U's columns copied for
+// half the tile's tokens at a time. A warp's fragments lie in one half (its tokens are a contiguous kWarpTokens-run that
+// divides half the tile), so each fragment's chain is lora_add_tokens_tile_staged's on the same operands in the same
+// order: the same bits. B's rows stay staged for both halves.
+template <int BlockTokens, int BlockRows, int SmemBytes, int MT, int MR, class P, class LocalToken, class LocalRow,
+          class CtaRow, class Barrier>
+__device__ __forceinline__ void lora_add_tokens_tile_staged_halves(const P& p, float (&acc)[MT][MR][4],
+                                                                   LocalToken local_token, LocalRow local_row,
+                                                                   CtaRow cta_row, int token_begin, int token_count,
+                                                                   unsigned char* smem, int thread, int threads,
+                                                                   Barrier barrier) {
+    constexpr int kLoraMaxSteps = kLoraSteps<P>;
+    constexpr int kPieces       = P::kMaxRank / 8;
+    constexpr int kPieceBits    = kPieces == 16 ? 4 : 3;
+    static_assert(kPieces == 1 << kPieceBits);
+    constexpr int kMaxStride = 2 * P::kMaxRank + 16;
+    constexpr int kHalf      = BlockTokens / 2;
+    static_assert(BlockRows % 8 == 0 && kHalf % 16 == 0 && (BlockRows + kHalf) * kMaxStride <= SmemBytes,
+                  "the tile's B rows and one segment's U columns over half the tile must fit");
+    const int lane  = threadIdx.x & 31;
+    const int steps = p.rank >> 4, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
+    unsigned touched = 0;
+#pragma unroll
+    for (int f = 0; f < BlockRows / 8; ++f) {
+        const int s = p.segment_of(cta_row(8 * f));
+        touched |= p.offset_of(s) >= 0 ? 1U << s : 0U;
+    }
+    if (touched == 0) { return; } // tile-uniform; shared memory untouched
+    unsigned char* b_s = smem;
+    unsigned char* u_s = smem + BlockRows * stride;
+    const int u_bytes  = kHalf * stride;
+    const int fit      = (SmemBytes - BlockRows * stride) / u_bytes;
+    const int live     = token_count - token_begin;
+    for (int i = thread; i < BlockRows * kPieces; i += threads) {
+        const int row = i >> kPieceBits, piece = i & (kPieces - 1);
+        if (piece < pieces) {
+            cp_async<16>(b_s + row * stride + piece * 16,
+                         p.b + static_cast<std::int64_t>(cta_row(row)) * p.rank + piece * 8);
+        }
+    }
+    const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_piece = lane >> 4;
+    const int b_row = lane & 7, b_piece = lane >> 3;
+    bool first = true;
+    for (int half = 0; half < 2; ++half) {
+        const int half_begin = half * kHalf;
+        unsigned remaining   = touched;
+        while (remaining != 0) {
+            unsigned pass = 0;
+            int slots     = 0;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                if (((remaining >> s) & 1U) != 0U && slots < fit) {
+                    pass |= 1U << s;
+                    ++slots;
+                }
+            }
+            remaining &= ~pass;
+            if (!first) { barrier(); } // the previous pass's reads finish before its U rows are overwritten
+            first    = false;
+            int slot = 0;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                if (((pass >> s) & 1U) == 0U) { continue; }
+                const int uo        = p.offset_of(s);
+                unsigned char* dest = u_s + slot * u_bytes;
+                for (int i = thread; i < kHalf * kPieces; i += threads) {
+                    const int t = i >> kPieceBits, piece = i & (kPieces - 1);
+                    if (piece < pieces) {
+                        const bool valid = half_begin + t < live;
+                        cp_async_zfill<16>(dest + t * stride + piece * 16,
+                                           p.u + static_cast<std::int64_t>(token_begin + (valid ? half_begin + t : 0)) *
+                                                     p.u_rows +
+                                               uo + piece * 8,
+                                           valid ? 16 : 0);
+                    }
+                }
+                ++slot;
+            }
+            cp_commit();
+            cp_wait<0>();
+            barrier();
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int seg = p.segment_of(cta_row(local_row(mr, 0)));
+                if (((pass >> seg) & 1U) == 0U) { continue; }
+                const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg) - 1U)) * u_bytes;
+                const float scale           = p.scale_of(seg);
+                const unsigned char* b_base = b_s + local_row(mr, b_row) * stride;
+                unsigned b[kLoraMaxSteps][2];
+#pragma unroll
+                for (int ks = 0; ks < kLoraMaxSteps; ks += 2) {
+                    if (ks + 1 < steps) {
+                        ldmatrix_x4(b[ks][0], b[ks][1], b[ks + 1][0], b[ks + 1][1],
+                                    smem_addr(b_base + (2 * ks + b_piece) * 16));
+                    } else if (ks < steps) {
+                        ldmatrix_x2(b[ks][0], b[ks][1], smem_addr(b_base + (2 * ks + (b_piece & 1)) * 16));
+                    }
+                }
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    if (local_token(mt, 0) / kHalf != half) { continue; } // the fragment's tokens are in the other half
+                    const unsigned char* u_base = u_slot + (local_token(mt, a_row) - half_begin) * stride;
+                    float c[4]                  = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                    for (int ks = 0; ks < kLoraMaxSteps; ++ks) {
+                        if (ks < steps) {
+                            unsigned a0, a1, a2, a3;
+                            ldmatrix_x4(a0, a1, a2, a3, smem_addr(u_base + (2 * ks + a_piece) * 16));
+                            mma_bf16(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b[ks][0], b[ks][1]);
+                        }
+                    }
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) { acc[mt][mr][v] = __fadd_rn(acc[mt][mr][v], __fmul_rn(c[v], scale)); }
+                }
+            }
+        }
+    }
+    barrier(); // the last pass's reads finish before the caller reuses shared memory
+}
+
 // lora_add_tokens_tile for a CTA tile kernel whose consumer threads have finished with `smem` (SmemBytes, free) and
 // hold the tile's fragments; every consumer thread calls it. Per warp, the plain form reloads U from global memory
 // for each of its MR row fragments (576 scalar loads a thread on the NVFP4 A4 TMA tile); here the CTA copies its
@@ -478,17 +637,41 @@ __device__ __forceinline__ void lora_add_tokens_tile(const LoraDeviceAddend& p, 
 // the same order: the same bits. local_token(mt, i) is fragment row i's tile token (0 .. BlockTokens - 1),
 // local_row(mr, j) fragment column j's tile row; a fragment's 8 columns lie in one segment. The touched segments are
 // staged together when they fit, else as many a pass as fit. barrier() synchronizes the consumer threads; the call
-// ends with one, so the caller may reuse `smem` at once.
-template <int BlockTokens, int BlockRows, int SmemBytes, int MT, int MR, class LocalToken, class LocalRow, class CtaRow,
-          class Barrier>
-__device__ __forceinline__ void lora_add_tokens_tile_staged(const LoraDeviceAddend& p, float (&acc)[MT][MR][4],
+// ends with one, so the caller may reuse `smem` at once. A wide instance whose rows (P::kMaxRank) do not fit the free
+// shared memory over the whole tile stages U half the tile at a time (lora_add_tokens_tile_staged_halves), or, when
+// not even that fits, reads its operands from L2 (lora_add_tokens_tile): the same chains, the same bits.
+template <int BlockTokens, int BlockRows, int SmemBytes, int MT, int MR, class P, class LocalToken, class LocalRow,
+          class CtaRow, class Barrier>
+__device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&acc)[MT][MR][4],
                                                             LocalToken local_token, LocalRow local_row,
                                                             CtaRow cta_row, int token_begin, int token_count,
                                                             unsigned char* smem, int thread, int threads,
                                                             Barrier barrier) {
-    constexpr int kMaxStride = 2 * kLoraMaxRank + 16;
-    static_assert(BlockRows % 8 == 0 && (BlockRows + BlockTokens) * kMaxStride <= SmemBytes,
-                  "the tile's B rows and one segment's U columns must fit in the free shared memory");
+    constexpr int kLoraMaxSteps = kLoraSteps<P>;
+    constexpr int kPieces       = P::kMaxRank / 8; // 16-byte pieces of a row: 8 or 16
+    constexpr int kPieceBits    = kPieces == 16 ? 4 : 3;
+    static_assert(kPieces == 1 << kPieceBits);
+    constexpr int kMaxStride    = 2 * P::kMaxRank + 16;
+    static_assert(BlockRows % 8 == 0);
+    if constexpr ((BlockRows + BlockTokens) * kMaxStride > SmemBytes &&
+                  (BlockRows + BlockTokens / 2) * kMaxStride <= SmemBytes && BlockTokens % 32 == 0) {
+        static_assert(P::kMaxRank > kLoraNarrowRank, "a narrow instance's B rows and one segment's U columns fit");
+        lora_add_tokens_tile_staged_halves<BlockTokens, BlockRows, SmemBytes>(p, acc, local_token, local_row, cta_row,
+                                                                              token_begin, token_count, smem, thread,
+                                                                              threads, barrier);
+        return;
+    } else if constexpr ((BlockRows + BlockTokens) * kMaxStride > SmemBytes) {
+        static_assert(P::kMaxRank > kLoraNarrowRank, "a narrow instance's B rows and one segment's U columns fit");
+        lora_add_tokens_tile<MT, MR>(
+            p, acc,
+            [&](int mt, int i) {
+                const int token = token_begin + local_token(mt, i);
+                return token < token_count ? token : -1;
+            },
+            [&](int mr, int j) { return cta_row(local_row(mr, j)); });
+        barrier();
+        return;
+    }
     const int lane = threadIdx.x & 31;
     const int steps = p.rank >> 4, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
     unsigned touched = 0;
@@ -503,8 +686,8 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const LoraDeviceAdde
     const int u_bytes  = BlockTokens * stride;
     const int fit      = (SmemBytes - BlockRows * stride) / u_bytes;
     const int live     = token_count - token_begin;
-    for (int i = thread; i < BlockRows * 8; i += threads) {
-        const int row = i >> 3, piece = i & 7;
+    for (int i = thread; i < BlockRows * kPieces; i += threads) {
+        const int row = i >> kPieceBits, piece = i & (kPieces - 1);
         if (piece < pieces) {
             cp_async<16>(b_s + row * stride + piece * 16,
                          p.b + static_cast<std::int64_t>(cta_row(row)) * p.rank + piece * 8);
@@ -534,8 +717,8 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const LoraDeviceAdde
             if (((pass >> s) & 1U) == 0U) { continue; }
             const int uo        = p.offset_of(s);
             unsigned char* dest = u_s + slot * u_bytes;
-            for (int i = thread; i < BlockTokens * 8; i += threads) {
-                const int t = i >> 3, piece = i & 7;
+            for (int i = thread; i < BlockTokens * kPieces; i += threads) {
+                const int t = i >> kPieceBits, piece = i & (kPieces - 1);
                 if (piece < pieces) {
                     const bool valid = t < live;
                     cp_async_zfill<16>(dest + t * stride + piece * 16,
@@ -695,38 +878,59 @@ __device__ __forceinline__ void lora_prefetch_tile(const LoraDeviceAddend& p, in
 // to gate and up before a SwiGLU; for a single value, to the value the kernel hands its epilogue where that is an
 // exactly rounded value (an accumulator, an explicitly rounded product), or to the epilogue's result where the
 // kernel hands it a product the residual's add may fuse (lora_finish_rows_tile, lora_epilogue_apply), so that the
-// adapter instance's arithmetic is the kernel's own. Every other instantiation is the kernel as it was.
+// adapter instance's arithmetic is the kernel's own. Every other instantiation is the kernel as it was. A narrow
+// adapter's (LoraEpilogue) and a wide one's (LoraEpilogueWide) are separate instances.
 template <class Inner>
 struct LoraEpilogue : Inner {
     LoraDeviceAddend lora;
+};
+template <class Inner>
+struct LoraEpilogueWide : Inner {
+    LoraDeviceAddendWide lora;
 };
 
 template <class E>
 inline constexpr bool kLoraEpilogue = false;
 template <class Inner>
 inline constexpr bool kLoraEpilogue<LoraEpilogue<Inner>> = true;
+template <class Inner>
+inline constexpr bool kLoraEpilogue<LoraEpilogueWide<Inner>> = true;
+
+// The rank an instance's staged term operands are sized for (LoraWarpStage): its addend class's, for an epilogue or a
+// term type (kLoraNarrowRank for every other instance, whose stage is never used).
+template <class T>
+inline constexpr int kLoraStageRank = kLoraNarrowRank;
+template <class Inner>
+inline constexpr int kLoraStageRank<LoraEpilogueWide<Inner>> = kLoraMaxRank;
+template <>
+inline constexpr int kLoraStageRank<LoraDeviceAddendWide> = kLoraMaxRank;
 
 // The blocks-per-SM bound of a register-capped kernel's adapter instance: the largest bound at most `blocks` whose
-// register cap (65,536 registers an SM, allocated by 8) is at least 8 above `blocks`' own (the term's operands and
-// addresses), so the instance keeps the no-adapter kernel's registers instead of spilling them.
-constexpr int lora_min_blocks(int threads, int blocks) {
+// register cap (65,536 registers an SM, allocated by 8) is at least `extra` above `blocks`' own (the term's operands
+// and addresses: 8 for a narrow instance, 16 for a wide one, whose k-step operands are twice as many), so the instance
+// keeps the no-adapter kernel's registers instead of spilling them.
+constexpr int lora_min_blocks(int threads, int blocks, int extra = 8) {
     const auto cap = [threads](int n) { return 65536 / (n * threads) / 8 * 8; };
     int n = blocks;
-    while (n > 1 && cap(n) < cap(blocks) + 8) { --n; }
+    while (n > 1 && cap(n) < cap(blocks) + extra) { --n; }
     return n;
 }
 template <class Epilogue>
 constexpr int lora_launch_min_blocks(int threads, int blocks) {
-    return kLoraEpilogue<Epilogue> ? lora_min_blocks(threads, blocks) : blocks;
+    return !kLoraEpilogue<Epilogue>                       ? blocks
+           : kLoraStageRank<Epilogue> > kLoraNarrowRank ? lora_min_blocks(threads, blocks, 16)
+                                                          : lora_min_blocks(threads, blocks);
 }
 
-// Calls launch(epilogue) with `inner`, or with its adapter form when `lora` is given.
+// Calls launch(epilogue) with `inner`, or with its adapter form of the rank's class when `lora` is given.
 template <class Inner, class Launch>
 void with_lora_epilogue(const LoraAddend* lora, const Inner& inner, Launch&& launch) {
     if (lora == nullptr || !lora->present()) {
         launch(inner);
+    } else if (lora_narrow(*lora)) {
+        launch(LoraEpilogue<Inner>{inner, lora_device_addend<LoraDeviceAddend>(*lora)});
     } else {
-        launch(LoraEpilogue<Inner>{inner, lora_device_addend(*lora)});
+        launch(LoraEpilogueWide<Inner>{inner, lora_device_addend<LoraDeviceAddendWide>(*lora)});
     }
 }
 

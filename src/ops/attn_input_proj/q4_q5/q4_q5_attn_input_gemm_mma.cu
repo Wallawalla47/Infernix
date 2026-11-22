@@ -41,8 +41,8 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std
     };
 }
 
-// Calls launch(term) with LoraNone, or with the term from column `begin` (a token slice's first column) whose jobs
-// start at the logical rows `bases`.
+// Calls launch(term) with LoraNone, or with the term of the rank's class from column `begin` (a token slice's first
+// column) whose jobs start at the logical rows `bases`.
 template <class Launch>
 void with_grouped_lora(const LoraAddend* lora, std::int32_t begin, std::initializer_list<std::int32_t> bases,
                        Launch&& launch) {
@@ -50,11 +50,18 @@ void with_grouped_lora(const LoraAddend* lora, std::int32_t begin, std::initiali
         launch(LoraNone{});
         return;
     }
-    RowSplitGroupedLora term;
-    term.addend = lora_device_addend(lora_columns_from(*lora, begin));
-    int j       = 0;
-    for (const std::int32_t base : bases) { term.row_base[j++] = base; }
-    launch(term);
+    const auto with_class = [&]<class Term, class Addend>() {
+        Term term;
+        term.addend = lora_device_addend<Addend>(lora_columns_from(*lora, begin));
+        int j       = 0;
+        for (const std::int32_t base : bases) { term.row_base[j++] = base; }
+        launch(term);
+    };
+    if (lora_narrow(*lora)) {
+        with_class.template operator()<RowSplitGroupedLora, LoraDeviceAddend>();
+    } else {
+        with_class.template operator()<RowSplitGroupedLoraWide, LoraDeviceAddendWide>();
+    }
 }
 
 template <class Schedule, RowSplitGroupedMmaCodec Codec>

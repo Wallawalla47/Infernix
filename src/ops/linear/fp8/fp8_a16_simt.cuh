@@ -90,7 +90,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
     const int row_begin = row_block * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     float accumulators[Schedule::kRowsPerWarp][Schedule::kBlockTokens]
                       [Schedule::kAccumulatorChains] = {};
-    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, Schedule::kBlockTokens>;
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, Schedule::kBlockTokens, kLoraStageRank<Epilogue>>;
     [[maybe_unused]] LoraStage* lora_stage = nullptr;
     if constexpr (kLoraEpilogue<Epilogue>) {
         // The term's operands (B rows, U columns) stage in shared memory beside the main loop.
