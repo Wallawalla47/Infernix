@@ -387,21 +387,25 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
         w0 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r0) * K) + t;
         w1 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r1) * K) + t;
     }
-    uint4 a0[kDmmaAhead], a1[kDmmaAhead];
-    float sc0[kDmmaAhead], sc1[kDmmaAhead];
+    // In flight a warp: kDmmaAhead blocks of BF16 storage, twice as many of Q8 (half the bytes a block). Q8 codes and
+    // scales stay raw until their block's MMAs, so a fetch never waits on its own load.
+    constexpr int Ahead = Q8 ? 2 * kDmmaAhead : kDmmaAhead;
+    uint4 a0[Ahead], a1[Ahead];
+    uint2 q0[Ahead], q1[Ahead];
+    unsigned short h0[Ahead], h1[Ahead];
     const auto fetch = [&](int i, int b) {
         if constexpr (Q8) {
-            a0[i]  = q8_words(__ldcs(c0 + 4 * b));
-            a1[i]  = q8_words(__ldcs(c1 + 4 * b));
-            sc0[i] = __half2float(__ushort_as_half(__ldg(s0 + b)));
-            sc1[i] = __half2float(__ushort_as_half(__ldg(s1 + b)));
+            q0[i] = __ldcs(c0 + 4 * b);
+            q1[i] = __ldcs(c1 + 4 * b);
+            h0[i] = __ldg(s0 + b);
+            h1[i] = __ldg(s1 + b);
         } else {
             a0[i] = __ldcs(w0 + 4 * b);
             a1[i] = __ldcs(w1 + 4 * b);
         }
     };
 #pragma unroll
-    for (int i = 0; i < kDmmaAhead; ++i) {
+    for (int i = 0; i < Ahead; ++i) {
         if (i < blocks) { fetch(i, b0 + i); }
     }
     pdl::enter_streaming();
@@ -415,30 +419,38 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
         x[n]        = reinterpret_cast<const uint4*>(seg.x + static_cast<std::size_t>(live[n] ? c : 0) * K) + t;
     }
     float acc[NT][4] = {};
-    for (int i = 0; i < blocks; i += kDmmaAhead) {
+    for (int i = 0; i < blocks; i += Ahead) {
 #pragma unroll
-        for (int j = 0; j < kDmmaAhead; ++j) {
+        for (int j = 0; j < Ahead; ++j) {
             const int b = i + j;
             if (b >= blocks) { break; }
             uint4 xv[NT];
 #pragma unroll
             for (int n = 0; n < NT; ++n) { xv[n] = live[n] ? x[n][4 * (b0 + b)] : make_uint4(0U, 0U, 0U, 0U); }
+            uint4 wa{}, wb{};
+            float sa = 0.0F, sb = 0.0F;
+            if constexpr (Q8) {
+                wa = q8_words(q0[j]);
+                wb = q8_words(q1[j]);
+                sa = __half2float(__ushort_as_half(h0[j]));
+                sb = __half2float(__ushort_as_half(h1[j]));
+            }
 #pragma unroll
             for (int n = 0; n < NT; ++n) {
                 if constexpr (Q8) {
                     float gs[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-                    mma_bf16(gs[0], gs[1], gs[2], gs[3], a0[j].x, a1[j].x, a0[j].y, a1[j].y, xv[n].x, xv[n].y);
-                    mma_bf16(gs[0], gs[1], gs[2], gs[3], a0[j].z, a1[j].z, a0[j].w, a1[j].w, xv[n].z, xv[n].w);
-                    acc[n][0] = __fmaf_rn(gs[0], sc0[j], acc[n][0]);
-                    acc[n][1] = __fmaf_rn(gs[1], sc0[j], acc[n][1]);
-                    acc[n][2] = __fmaf_rn(gs[2], sc1[j], acc[n][2]);
-                    acc[n][3] = __fmaf_rn(gs[3], sc1[j], acc[n][3]);
+                    mma_bf16(gs[0], gs[1], gs[2], gs[3], wa.x, wb.x, wa.y, wb.y, xv[n].x, xv[n].y);
+                    mma_bf16(gs[0], gs[1], gs[2], gs[3], wa.z, wb.z, wa.w, wb.w, xv[n].z, xv[n].w);
+                    acc[n][0] = __fmaf_rn(gs[0], sa, acc[n][0]);
+                    acc[n][1] = __fmaf_rn(gs[1], sa, acc[n][1]);
+                    acc[n][2] = __fmaf_rn(gs[2], sb, acc[n][2]);
+                    acc[n][3] = __fmaf_rn(gs[3], sb, acc[n][3]);
                 } else {
                     mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].x, a1[j].x, a0[j].y, a1[j].y, xv[n].x, xv[n].y);
                     mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a0[j].z, a1[j].z, a0[j].w, a1[j].w, xv[n].z, xv[n].w);
                 }
             }
-            const int next = b + kDmmaAhead;
+            const int next = b + Ahead;
             if (next < blocks) { fetch(j, b0 + next); }
         }
     }

@@ -81,7 +81,8 @@ void add_segment(ik::ProjectionArgs& args, const Weight& w, std::int32_t input, 
 }
 
 // The fused projections: a prompt call's on projections_mma, a decode-route call's (decode, verification, forced
-// tokens; any width) on projections_dmma (BF16 or Q8 storage both); bf16_p12 segments on the fold (projections).
+// tokens; any width) on projections_dmma (BF16 or Q8 storage both: one route at every width, since a call's width
+// depends on the other requests); bf16_p12 segments on the fold (projections).
 bool use_mma(bool prompt, const ik::ProjectionArgs& a) {
     return prompt && (a.segments[0].weight != nullptr || a.segments[0].q8_scales != nullptr) && a.k % 64 == 0;
 }
@@ -539,9 +540,11 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     at.ws  = b_.attention_ws;
     at.out = b_.attention;
-    // The decode route's prologue inside attention's launch: padding columns need its zeros, and a lane in two groups
+    // The decode route's prologue inside attention's launch, for one lane of at most 4 columns (2026-11-21, against the
+    // prologue kernel: the decode round at 4K -0.44 % at one column, -0.17 % at two, -0.09 % at four, +0.25 % at eight;
+    // infernix_bench C = 4 -0.8 %, C = 8 -1.3 %). Padding columns need the prologue's zeros, and a lane in two groups
     // its keys before the second group reads them.
-    at.fused = !padding_ && one_group_lanes_;
+    at.fused = !padding_ && one_group_lanes_ && call_lanes_.size() == 1 && T <= 4;
     prompt_ ? ik::attention_prompt(at, stream) : ik::attention(at, stream);
     mark("attention");
     if (staged) {
