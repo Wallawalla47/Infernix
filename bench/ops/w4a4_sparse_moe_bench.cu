@@ -4,7 +4,8 @@
 // between two of its calls). Random weights and router: each call routes T columns to their own top 8.
 //
 //   infernix_w4a4_sparse_moe_bench [--format nvfp4|mxfp8] [--tokens 1,2,4,8,16,32] [--repeat 20] [--warmup 3]
-//                                  [--part all|route|experts|single] [--layers 8]   (single: moe_single, T = 1)
+//                                  [--part all|route|experts|single] [--layers 8] [--warm]   (single: moe_single, T = 1;
+//                                  --warm: no L2 flush between replays, with --layers 1 the weights stay in L2)
 //
 // Per T: the median and minimum call time, the distinct experts the call reads and their record bytes, and the
 // effective bandwidth over those bytes (the floor a weight-streaming kernel approaches).
@@ -56,6 +57,7 @@ int main(int argc, char** argv) {
     std::vector<int> tokens = {1, 2, 4, 8, 16, 32};
     int repeat = 20, warmup = 3;
     std::string part = "all"; // all | route | experts | single (moe_single: T = 1)
+    bool warm = false;        // --warm: no L2 flush between replays (with --layers 1 the bank stays in L2)
     int layers = 8;            // layer calls a graph (each its own bank: cold weights, as consecutive visits)
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -64,6 +66,7 @@ int main(int argc, char** argv) {
         else if (arg == "--repeat" && i + 1 < argc) { repeat = std::atoi(argv[++i]); }
         else if (arg == "--warmup" && i + 1 < argc) { warmup = std::atoi(argv[++i]); }
         else if (arg == "--part" && i + 1 < argc) { part = argv[++i]; }
+        else if (arg == "--warm") { warm = true; }
         else if (arg == "--layers" && i + 1 < argc) { layers = std::max(1, std::atoi(argv[++i])); }
         else {
             std::fprintf(stderr, "usage: %s [--format nvfp4|mxfp8] [--tokens 1,2,4] [--repeat N] [--warmup N]\n", argv[0]);
@@ -218,7 +221,7 @@ int main(int argc, char** argv) {
         check(cudaEventCreate(&stop), "event");
         std::vector<float> times;
         for (int r = 0; r < warmup + repeat; ++r) {
-            check(cudaMemsetAsync(flush, r & 0xFF, flush_bytes, stream), "flush");
+            if (!warm) { check(cudaMemsetAsync(flush, r & 0xFF, flush_bytes, stream), "flush"); }
             check(cudaEventRecord(start, stream), "record");
             check(cudaGraphLaunch(exec, stream), "launch");
             check(cudaEventRecord(stop, stream), "record");
