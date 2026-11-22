@@ -651,6 +651,24 @@ L2-clipped (‖k‖ ≤ 22.6) and V is RMS-normalized per head, so both are boun
 is deterministic and request-invariant (`--reproducible` accepts it); the lossy ones change the output and are
 qualified like any profile ([model quality §6](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
 
+Measured quality (2026-11-22, RTX 5090, inkling2-mini, `infernix-perplexity` on the perplexity corpus's quick set,
+291,842 tokens, context 4,096 / stride 2,048, each profile's KL from `bf16`'s own top tokens of the same build):
+
+| Profile | PPL | KL from `bf16` | top-1 agreement |
+|---|---:|---:|---:|
+| `bf16` | 4.03144 | (reference) | |
+| `bf16p` | 4.03144 | 0 (−5.8 × 10⁻¹⁸) | 100.00 % |
+| `int8` | 4.03172 | 9.41 × 10⁻³ | 96.31 % |
+| `fp8` | 4.03503 | 9.62 × 10⁻³ | 96.25 % |
+| `k8v4` | 4.03418 | 9.88 × 10⁻³ | 96.14 % |
+| `nvfp4` | 4.03641 | 1.069 × 10⁻² | 95.98 % |
+| `k4v2` | 4.04620 | 1.403 × 10⁻² | 95.47 % |
+| `vq2` | 4.09501 | 2.578 × 10⁻² | 93.74 % |
+
+`bf16p` reading exactly 0 shows the statistic and the reference are sound. The 8-bit profiles and `nvfp4` sit
+within 9.4–10.7 × 10⁻³ of each other, about the level `--q8-weights` reads as well: that is this model's response to
+any small perturbation on this corpus (a floor), not a ranking among them. `k4v2` and `vq2` are clearly above it.
+
 ---
 
 ## 8. Decode pipeline

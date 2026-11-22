@@ -340,9 +340,10 @@ std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const
 // each attention's fused input projections (the K2 parent and the sink/taps parent beside it, one launch) -7.6 % at
 // one column, -5.6 % at two, -1.3 % at eight; the head (in place of its bf16_p12 packing) -1.6 %, -1.4 %, -0.2 %.
 // W_o since 2026-11-22 (re-timed on the fused projections' kernel at context 128, three runs each: 4.677 -> 4.571 ms
-// at one column, 5.878 -> 5.796 at two, 9.428 -> 9.256 at eight; KL from BF16 on the perplexity corpus's quick set
-// 1.064e-2 with it against 1.066e-2 without, top-1 96.01 % against 96.05 %). The message gates' downs (-0.1 %,
-// +0.1 %, +0.1 %) stay BF16.
+// at one column, 5.878 -> 5.796 at two, 9.428 -> 9.256 at eight; on the perplexity corpus's quick set, against one
+// earlier BF16 reference, KL 1.064e-2 with it and 1.066e-2 without, top-1 96.01 % and 96.05 %; against the current
+// build's BF16 the whole set reads KL 1.05e-2, top-1 96.06 %, PPL 4.03419 vs 4.03144). The message gates' downs
+// (-0.1 %, +0.1 %, +0.1 %) stay BF16.
 std::vector<artifact::ObjectHandle> q8_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
                                                const artifact::Reader& reader) {
     std::vector<bool> selected(pending.size(), false);
