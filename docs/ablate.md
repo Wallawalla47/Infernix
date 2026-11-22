@@ -96,5 +96,6 @@ run-to-run spread measured at about 5 %. Decode follows DFlash2's acceptance, wh
 A direction is the difference between the mean hidden states of prompts the model refuses and of matched prompts it
 answers, at the last prompt token, orthogonalized against the harmless mean; the alphas are then searched per lane to
 minimize refusals on held-out prompts while bounding the first-token KL divergence from the original model. This
-follows [heretic](https://github.com/p-e-w/heretic) 1.4's projected abliteration. The tooling that captures the
-activations and fits the alphas is not part of this repository yet.
+follows [heretic](https://github.com/p-e-w/heretic) 1.4's projected abliteration.
+[Fitting an ablation sidecar](ablate-fitting.md) covers the tool that does it on your own setup
+(`tools/ablate/ablate.py`): prompt sets, the fit, evaluation and export.
