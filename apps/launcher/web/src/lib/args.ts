@@ -205,6 +205,7 @@ export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--cors",
   "--usage-chunk-choice",
   "--claude-code-usage-compat",
+  "--causal-scoring",
   "--greedy",
   "--ngram-native-sessions",
   "--use-original-int8-prefill-kernel",
