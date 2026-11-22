@@ -9,8 +9,10 @@
 // Shapes are Inkling 2 Mini's drafter: H = 2304, 24 query heads and 8 KV heads of 128, MLP 9216, a block of 8 rows,
 // Markov rank 256, 4 context features (the partial block sums entering visits 5, 23 and 41, and the final-normed state).
 //
-// Drafter caches: a layer's context K and V, BF16 [kv heads][slots][128] a lane (lane_stride words apart), position p
-// at slot p (a full layer) or p % ring (a sliding layer's ring).
+// Drafter caches: a sliding layer's context K and V, BF16 [kv heads][ring][128] a lane (lane_stride words apart),
+// position p at slot p % ring; the full layer's in the target's KV pages (its two planes of each page, page-major
+// [pages][kv heads][64][128]) through the lane's block-table row, so a page carries the drafter's context with the
+// target's (the prefix cache shares and restores them together).
 
 #include <cuda_runtime.h>
 
@@ -79,7 +81,10 @@ struct DSparkRotateArgs {
     std::int64_t lane_stride = 0;
     const std::int32_t* lanes = nullptr;                  // [rows]: each row's lane (null: `lane`, or round->lane)
     std::int32_t lane = -1, ring = 0;                     // lane -1: round->lane
-    std::int32_t slots = 0;                               // a full layer's slots a head (ring 0)
+    // The full layer (ring 0): the cache is a page-major pool [pages][kv heads][64][128], position p of a lane at page
+    // table[lane * table_stride + p / 64], row p % 64 (lane_stride unused).
+    const std::int32_t* table = nullptr;
+    std::int32_t table_stride = 0;
     std::uint16_t* dense = nullptr;
 };
 void dspark_rotate(const DSparkRotateArgs& args, cudaStream_t stream);
@@ -96,8 +101,9 @@ struct DSparkAttentionArgs {
     const std::uint16_t* q = nullptr; // BF16 [8][24][128] (normed, rotated)
     const std::uint16_t *cache_k = nullptr, *cache_v = nullptr;
     std::int64_t lane_stride = 0;
-    std::int32_t ring        = 0; // 0: the full layer
-    std::int32_t slots_full  = 0; // the full layer's slots a head
+    std::int32_t ring        = 0; // 0: the full layer, its keys through the lane's block-table row (dspark_rotate's)
+    const std::int32_t* table = nullptr;
+    std::int32_t table_stride = 0;
     std::int32_t splits      = 0;
     const DSparkRound* round = nullptr;
     float* scratch           = nullptr; // dspark_attention_scratch_bytes(splits)

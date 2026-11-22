@@ -43,13 +43,13 @@ struct StateLayout {
 struct StateView {
     std::uint16_t* images   = nullptr; // [lanes][lane_words]
     std::int64_t lane_words = 0;
-    std::vector<std::uint16_t*> pool_k, pool_v; // per full slot: [kKvHeads][pool_pages][64][128] (codec's elements)
+    std::vector<std::uint16_t*> pool_k, pool_v; // per full slot: [pool_pages][kKvHeads][64][128] (codec's elements)
     std::int64_t pool_pages     = 0;
     const std::int32_t* table   = nullptr; // [lanes][table_stride]
     std::int32_t table_stride   = 0;
     // The full pools' storage (--kv-dtype; inkling2_attention.h KvCodec) and, quantized, their FP16 scale planes.
     ops::inkling2::KvCodec codec = ops::inkling2::KvCodec::Bf16;
-    std::vector<std::uint8_t*> side_k, side_v; // per full slot: [kKvHeads][pool_pages][64][the form's side bytes]
+    std::vector<std::uint8_t*> side_k, side_v; // per full slot: [pool_pages][kKvHeads][64][the form's side bytes]
     std::uint32_t* unpackable = nullptr;       // bf16p: [lanes] flags of rows with no packed form
 };
 

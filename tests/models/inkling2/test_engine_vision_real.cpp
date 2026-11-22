@@ -49,6 +49,9 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact, st
     options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(concurrency * 2048);
     options.max_concurrency      = concurrency;
     options.max_pending_requests = 16;
+    // The prefix cache stays on (the Engine's default): requests sharing a prompt resume from it, which must not change
+    // their tokens; a small Host tier keeps the start quick.
+    options.context_cache.host_capacity_bytes = std::size_t{2} << 30U;
     options.prefill_chunk        = chunk;
     options.use_cuda_graph       = graphs;
     options.enable_vision        = vision;

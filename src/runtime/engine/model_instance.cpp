@@ -295,16 +295,6 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
 
 namespace {
 
-// The free device memory a start sizes its KV against: cudaMemGetInfo's, bounded under WDDM by the OS
-// budget less this process's usage, as the expert frames are (size_expert_frames). The two differ (an RTX
-// 5090: 24.10 GiB free against 21.88 the budget left, Basalt #28), and a KV sized past the budget is
-// demoted to system memory, which the Program's spill guard refuses at startup (candidates VR-04).
-std::size_t free_device_bytes(const VramSnapshot& s) {
-    if (!s.has_budget) { return s.device_free; }
-    const std::uint64_t left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
-    return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
-}
-
 // What a start resolves its KV capacity in (kv_available_bytes): an automatic capacity leaves `headroom` of
 // free device memory and, of the OS budget, the expert frames' margin (size_expert_frames) with the retry's
 // extra headroom, so a budget below free memory is not stacked on the display headroom (it cost up to 960 MiB

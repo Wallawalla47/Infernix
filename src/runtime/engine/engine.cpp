@@ -94,14 +94,15 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
     std::optional<models::qwen3_5::BundledDrafters> drafters;
     std::vector<std::filesystem::path> dflash2_companions;
     std::exception_ptr unreadable;
-    bool inkling2 = false;
+    bool inkling2 = false, inkling2_drafter = false;
     try {
         const artifact::Reader reader(engine_options.artifact_path);
-        inkling2 = runtime::artifact_is_inkling2(reader);
+        inkling2         = runtime::artifact_is_inkling2(reader);
+        inkling2_drafter = inkling2 && runtime::artifact_has_inkling2_drafter(reader);
     } catch (const std::exception&) {}
     if (inkling2) { // its own options (runtime/engine/inkling2_instance.h); none of the Qwen families' defaults apply
         architecture = models::Architecture::Inkling2Loop;
-        return runtime::normalize_inkling2_options(std::move(engine_options));
+        return runtime::normalize_inkling2_options(std::move(engine_options), inkling2_drafter);
     }
     try {
         const artifact::Reader reader(engine_options.artifact_path);
@@ -468,15 +469,17 @@ public:
 
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
         return (std::holds_alternative<std::unique_ptr<GenerationCore>>(core) ||
-                std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core)) &&
+                std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core) ||
+                std::holds_alternative<std::unique_ptr<Inkling2Core>>(core)) &&
                options.context_cache.enabled &&
                !options.context_cache.hybrid.persistent_file.empty();
     }
 
     void report_prefix_cache_save() const noexcept {
         try {
-            if (inkling) { return; } // no prefix cache (persists_prefix_cache is false)
-            if (qwen4) {
+            if (inkling) {
+                report_prefix_cache_save(inkling->program->prefix_shutdown_save());
+            } else if (qwen4) {
                 report_prefix_cache_save(qwen4->program->prefix_shutdown_save());
             } else {
                 report_prefix_cache_save(active->program->hybrid_shutdown_save());

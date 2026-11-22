@@ -59,8 +59,8 @@ struct LoadOptions {
     bool proposal_head_screen = false;
     bool lm_head_screen       = false;
     bool screened_lm_head     = false;
-    // Qwen3.5 (EngineOptions::embedding_host): the token embedding stays in pinned host memory, gathered
-    // zero-copy, as an artifact with offloaded experts already keeps it.
+    // Qwen3.5 and Inkling 2 (EngineOptions::embedding_host): the token embedding stays in pinned host memory,
+    // gathered zero-copy, as an artifact with offloaded experts already keeps it.
     bool embedding_host = false;
     // --spec mtp generation off the lossless route (candidates §22 VM-01 variant B): the MTP drafter's routed experts
     // stay in pinned host memory and its draft steps route among the experts a pool of device slots holds

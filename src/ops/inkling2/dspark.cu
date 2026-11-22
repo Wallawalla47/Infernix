@@ -178,10 +178,14 @@ __global__ void __launch_bounds__(32) rotate_kernel(const DSparkRotateArgs a) {
         return;
     }
     const int lane_index = a.lanes != nullptr ? a.lanes[r] : (a.lane >= 0 ? a.lane : a.round->lane);
-    const int slots      = a.ring > 0 ? a.ring : a.slots;
-    const int slot       = a.ring > 0 ? position % a.ring : position;
-    const std::size_t at = static_cast<std::size_t>(lane_index) * a.lane_stride +
-                           (static_cast<std::size_t>(h) * slots + slot) * kD + 4 * lane;
+    std::size_t at;
+    if (a.ring > 0) {
+        at = static_cast<std::size_t>(lane_index) * a.lane_stride +
+             (static_cast<std::size_t>(h) * a.ring + position % a.ring) * kD + 4 * lane;
+    } else { // the full layer's page (the lane's block-table row)
+        const std::int64_t page = a.table[static_cast<std::int64_t>(lane_index) * a.table_stride + position / 64];
+        at = ((static_cast<std::size_t>(page) * kDSparkKvHeads + h) * 64 + position % 64) * kD + 4 * lane;
+    }
     *reinterpret_cast<uint2*>(a.cache_k + at) = packed;
     if (a.values != nullptr) {
         *reinterpret_cast<uint2*>(a.cache_v + at) =
@@ -203,6 +207,7 @@ struct AttnSmem {
     float v[kTileKeys][kD];
     float p[kGroupRows][kTileKeys];
     float m[kGroupRows], l[kGroupRows], scale[kGroupRows];
+    std::uint32_t rows[kTileKeys]; // the tile's keys' rows (of 128 values) in the cache
 };
 
 __device__ __forceinline__ void key_range(const DSparkAttentionArgs& a, int& lo, int& hi) {
@@ -232,11 +237,17 @@ __global__ void __launch_bounds__(kAttnThreads, 1) attention_split_kernel(const 
         sm.l[tid] = 0.0F;
     }
     const int lane_index = a.round->lane;
-    const int slots      = a.ring > 0 ? a.ring : a.slots_full;
-    const std::uint16_t* kbase = a.cache_k + static_cast<std::size_t>(lane_index) * a.lane_stride +
-                                 static_cast<std::size_t>(g) * slots * kD;
-    const std::uint16_t* vbase = a.cache_v + static_cast<std::size_t>(lane_index) * a.lane_stride +
-                                 static_cast<std::size_t>(g) * slots * kD;
+    // A key's row of 128 values: a sliding layer's ring slot, or the full layer's page row (the lane's block-table row).
+    // Rows fit 32 bits (a pool of 2^32 / 512 pages), offsets do not.
+    const auto row_of = [&](int position) -> std::uint32_t {
+        if (a.ring > 0) {
+            return static_cast<std::uint32_t>(static_cast<std::size_t>(lane_index) * a.lane_stride / kD +
+                                              static_cast<std::size_t>(g) * a.ring + position % a.ring);
+        }
+        const std::uint32_t page = static_cast<std::uint32_t>(
+            a.table[static_cast<std::int64_t>(lane_index) * a.table_stride + position / 64]);
+        return (page * kDSparkKvHeads + static_cast<std::uint32_t>(g)) * 64U + static_cast<std::uint32_t>(position % 64);
+    };
     // P x V: thread t < 192 owns row t / 8 and dims 16 (t % 8) .. + 15.
     const int pv_row = tid / 8, pv_d = 16 * (tid % 8);
     float acc[16] = {};
@@ -244,14 +255,15 @@ __global__ void __launch_bounds__(kAttnThreads, 1) attention_split_kernel(const 
     for (int t0 = k0; t0 < k1; t0 += kTileKeys) {
         const int n = min(kTileKeys, k1 - t0);
         __syncthreads(); // the previous tile's readers are done
+        if (tid < n) { sm.rows[tid] = row_of(t0 + tid); } // each key's row, looked up once a tile
+        __syncthreads();
         for (int i = tid; i < kTileKeys * kD; i += kAttnThreads) {
             const int k = i / kD, d = i % kD;
             float kv = 0.0F, vv = 0.0F;
             if (k < n) {
-                const int position = t0 + k;
-                const int slot     = a.ring > 0 ? position % a.ring : position;
-                kv                 = bf(kbase[static_cast<std::size_t>(slot) * kD + d]);
-                vv                 = bf(vbase[static_cast<std::size_t>(slot) * kD + d]);
+                const std::size_t at = static_cast<std::size_t>(sm.rows[k]) * kD + d;
+                kv                   = bf(a.cache_k[at]);
+                vv                   = bf(a.cache_v[at]);
             }
             sm.kt[d][k] = kv;
             sm.v[k][d]  = vv;
@@ -636,7 +648,7 @@ void dspark_rotate(const DSparkRotateArgs& a, cudaStream_t stream) {
         (a.positions == nullptr && a.round == nullptr) || a.inv_freq == nullptr ||
         (a.dense == nullptr && (a.cache_k == nullptr || (a.values != nullptr && a.cache_v == nullptr) ||
                                 (a.lanes == nullptr && a.lane < 0 && a.round == nullptr) ||
-                                (a.ring <= 0 && a.slots <= 0)))) {
+                                (a.ring <= 0 && (a.table == nullptr || a.table_stride <= 0))))) {
         throw std::invalid_argument("inkling2 dspark_rotate: rows, heads, a norm, positions and one destination");
     }
     check(pdl::launch_consumer(config(dim3(a.rows, a.heads), dim3(32), 0, stream), rotate_kernel, a), "rotate");
@@ -654,7 +666,7 @@ std::size_t dspark_attention_scratch_bytes(std::int32_t splits) {
 
 void dspark_attention(const DSparkAttentionArgs& a, cudaStream_t stream) {
     if (a.q == nullptr || a.cache_k == nullptr || a.cache_v == nullptr || a.round == nullptr || a.scratch == nullptr ||
-        a.out == nullptr || a.splits <= 0 || (a.ring <= 0 && a.slots_full <= 0)) {
+        a.out == nullptr || a.splits <= 0 || (a.ring <= 0 && (a.table == nullptr || a.table_stride <= 0))) {
         throw std::invalid_argument("inkling2 dspark_attention: queries, a cache, the round, scratch and splits");
     }
     static const bool configured = [] {

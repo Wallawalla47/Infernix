@@ -62,8 +62,8 @@ inline constexpr std::int32_t kMaxAttentionGroups =
 //            position p in page (p / 64) % ring_pages (the state's ring has kWindowRingPages; a call writing more
 //            than kKeyUnit positions a lane runs over a staging ring of staging_ring_pages(its width), window_copy filling it
 //            from the state's ring before and returning its last positions after);
-//   full: a head-major page pool [kKvHeads][pool_pages][64][128] and each lane's block table row
-//            table[lane * table_stride + p / 64].
+//   full: a page-major page pool [pool_pages][kKvHeads][64][128] (a page contiguous in each plane) and each lane's
+//            block table row table[lane * table_stride + p / 64].
 //
 // A full visit's pool may hold a quantized form instead (`codec`, the K and V planes each in one of the forms below;
 // sliding rings are always BF16 K / FP16 V). A row is one position's 128 values of one KV head, row r the one at
@@ -122,7 +122,7 @@ struct KvView {
     std::int32_t table_stride    = 0;
     std::int64_t pool_pages      = 0;
     KvCodec codec                = KvCodec::Bf16; // full pools (table set) only
-    std::uint8_t* k_side         = nullptr;       // a quantized pool's side records [heads][pool_pages][64][side bytes]
+    std::uint8_t* k_side         = nullptr;       // a quantized pool's side records [pool_pages][heads][64][side bytes]
     std::uint8_t* v_side         = nullptr;
     // bf16p: [lanes] device words, each lowered (atomicMin) to the position of a row its lane appends with no packed
     // form; the caller sets them to 0xFFFFFFFF (none) and reads them.

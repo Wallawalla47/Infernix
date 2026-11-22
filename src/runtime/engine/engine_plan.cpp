@@ -25,6 +25,12 @@ void plan_refuse(EnginePlan& plan, std::string refusal) {
     plan.fits = false;
 }
 
+std::size_t free_device_bytes(const VramSnapshot& s) noexcept {
+    if (!s.has_budget) { return s.device_free; }
+    const std::uint64_t left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
+    return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
+}
+
 std::size_t planned_free_after_weights(std::size_t free_now, std::uint64_t weights_bytes,
                                        std::uint64_t beside_weights_bytes) noexcept {
     const std::uint64_t taken = weights_bytes + beside_weights_bytes;

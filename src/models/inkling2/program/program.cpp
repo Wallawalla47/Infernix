@@ -3,14 +3,20 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/layout.h"
+#include "core/paged_kv_cache.h"
 #include "infernix/ops/inkling2_attention.h"
 #include "infernix/ops/sampling.h"
 #include "models/inkling2/execution/dspark.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/vision.h"
+#include "models/inkling2/program/prefix_cache.h"
+#include "runtime/prefix_cache/prefix_holds.h"
+#include "runtime/prefix_cache/tap_planner.h"
 #include "runtime/speculative/draft_length.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -31,6 +37,17 @@ struct BasePlanImpl {
     std::shared_ptr<const std::vector<PromptImage>> images; // null: a text prompt
     runtime::RequestPlanSummary summary;
     runtime::ResolvedExecutionOptions options;
+    // The prefix cache's keys (frontend PreparedPromptData) and whether the request reuses and publishes.
+    bool reuse = false;
+    std::vector<std::uint64_t> block_hashes, block_extras;
+    std::vector<runtime::prefix_cache::TapHint> tap_hints;
+};
+
+// A snapshot source quoted for an admission (Program::hybrid_sources): its snapshot, frontier and anchor path.
+struct QuoteImpl {
+    runtime::prefix_cache::SnapshotRef snapshot;
+    std::uint32_t frontier = 0;
+    std::vector<runtime::prefix_cache::NodeRef> path; // the full blocks below the frontier, root first
 };
 
 struct ContractAccess {
@@ -91,22 +108,70 @@ ops::w4a4_moe::ExpertActivation expert_activation(const ProgramOptions& o) {
     return o.expert_a16 ? ops::w4a4_moe::ExpertActivation::A16 : ops::w4a4_moe::ExpertActivation::Checkpoint;
 }
 
-std::uint32_t pages_per_lane(std::uint32_t max_context) {
-    return (max_context + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit + 1;
+// The planes of one full visit's page: K and V (16-bit words, BF16 storage), and a quantized form's side records.
+std::size_t kv_planes_per_visit(ops::inkling2::KvCodec codec) { return codec == ops::inkling2::KvCodec::Bf16 ? 2 : 4; }
+
+// The full visits' page geometry (core/paged_kv_cache.h): per full visit its K and V planes, then a quantized form's
+// K and V side planes, each page-major [pages][kKvHeads][64][a row] (attention_common.cuh kv_row): a row of 128 BF16
+// (K) or FP16 (V) words, or a quantized form's codes and side record (inkling2_attention.h KvCodec); then, with DSpark,
+// the drafter's full layer's K and V (BF16, inkling2_dspark.h), so a page carries the drafter's context with the
+// target's.
+KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec codec, bool dspark) {
+    const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
+    const auto plane                  = [](DType dtype, std::int32_t row) {
+        return KVPlaneGeometry{.dtype = dtype, .leading_extent = row, .head_extent = ops::inkling2::kKvHeads};
+    };
+    KVPageGeometry g;
+    g.device_plane_order = PagedKVPlaneOrder::PageMajor;
+    for (std::int32_t s = 0; s < full_visits; ++s) {
+        if (codec == ops::inkling2::KvCodec::Bf16) {
+            g.planes.push_back(plane(DType::BF16, ops::inkling2::kHeadDim));
+            g.planes.push_back(plane(DType::FP16, ops::inkling2::kHeadDim));
+        } else {
+            g.planes.push_back(plane(DType::U8, b.key_code));
+            g.planes.push_back(plane(DType::U8, b.value_code));
+            g.planes.push_back(plane(DType::U8, b.key_side));
+            g.planes.push_back(plane(DType::U8, b.value_side));
+        }
+    }
+    if (dspark) {
+        static_assert(ops::inkling2::kDSparkKvHeads == ops::inkling2::kKvHeads &&
+                      ops::inkling2::kDSparkHeadDim == ops::inkling2::kHeadDim);
+        g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+        g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+    }
+    return g;
 }
 
-// One full slot's K (which 0) or V pool for `pages` pages, [kKvHeads][pages][64] rows: 16-bit words (BF16 storage) or
-// a quantized form's codes; and a quantized form's side records (inkling2_attention.h KvCodec).
-std::uint64_t pool_bytes(std::uint64_t pages, ops::inkling2::KvCodec codec, int which) {
-    const std::uint64_t rows        = std::uint64_t{ops::inkling2::kKvHeads} * pages * ops::inkling2::kKeyUnit;
-    const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
-    const std::uint64_t code         = static_cast<std::uint64_t>(which == 0 ? b.key_code : b.value_code);
-    return rows * (code == 0 ? std::uint64_t{ops::inkling2::kHeadDim} * 2 : code);
-}
-std::uint64_t side_bytes(std::uint64_t pages, ops::inkling2::KvCodec codec, int which) {
-    const std::uint64_t rows        = std::uint64_t{ops::inkling2::kKvHeads} * pages * ops::inkling2::kKeyUnit;
-    const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
-    return rows * static_cast<std::uint64_t>(which == 0 ? b.key_side : b.value_side);
+// Whether the Program runs the drafter (its two planes in every page).
+bool dspark_planes(const ProgramOptions& o) { return o.dspark && !o.causal_scoring; }
+
+// The full visits' page pool (its scratch page included) and the lanes' block-table rows in one backing allocation.
+struct KvLayout {
+    DeviceKVPagePoolLayout pool;
+    KVExecutionTableLayout tables;
+    std::uint64_t bytes      = 0;
+    std::uint64_t page_bytes = 0; // one page of every plane
+};
+KvLayout kv_layout(const ProgramOptions& o, std::int32_t full_visits) {
+    const std::uint32_t row   = pages_per_lane(o.max_context);
+    const std::uint64_t rows  = static_cast<std::uint64_t>(row) * o.max_concurrency;
+    const std::uint64_t pages = std::max<std::uint64_t>(rows, o.kv_pages) + 1;
+    if (pages > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Inkling 2: the KV pool has more pages than a block table names");
+    }
+    KvLayout out;
+    LayoutBuilder builder;
+    out.pool   = plan_device_kv_page_pool(builder, {.page_group_count = static_cast<std::uint32_t>(pages),
+                                                    .geometry = kv_page_geometry(full_visits, o.kv_codec, dspark_planes(o))});
+    out.tables = plan_kv_execution_tables(builder, {.logical_page_capacity = row,
+                                                    .table_rows = static_cast<std::int32_t>(o.max_concurrency)});
+    out.bytes  = builder.finish(256);
+    for (const KVPlaneGeometry& plane : out.pool.spec.geometry.planes) {
+        out.page_bytes += dtype_size(plane.dtype) * static_cast<std::uint64_t>(plane.leading_extent) *
+                          ops::inkling2::kKeyUnit * static_cast<std::uint64_t>(plane.head_extent);
+    }
+    return out;
 }
 
 std::uint64_t align_256(std::uint64_t bytes) { return (bytes + 255) / 256 * 256; }
@@ -127,33 +192,40 @@ public:
         const StateLayout& layout = forward_.layout();
         const std::uint32_t pages = pages_per_lane(o_.max_context);
         images_ = DeviceBuffer(static_cast<std::size_t>(layout.lane_words) * 2 * lanes_.size());
-        const std::uint64_t pool_pages = static_cast<std::uint64_t>(pages) * lanes_.size();
-        for (std::int32_t s = 0; s < 2 * layout.full_visits; ++s) {
-            pools_.emplace_back(pool_bytes(pool_pages, o_.kv_codec, s % 2));
-            pools_.back().fill(0); // a key beyond a lane's frontier is masked; never NaN
-            if (o_.kv_codec != ops::inkling2::KvCodec::Bf16) {
-                sides_.emplace_back(side_bytes(pool_pages, o_.kv_codec, s % 2));
-                sides_.back().fill(0); // zero scales decode zero codes to zero
-            }
+        // The full visits' page pool and the lanes' block-table rows (kv_layout), zeroed: a key beyond a lane's frontier
+        // is masked, never NaN, and zero scales decode zero codes to zero.
+        const KvLayout kv = kv_layout(o_, layout.full_visits);
+        kv_backing_       = DeviceBuffer(kv.bytes);
+        kv_backing_.fill(0);
+        const DeviceSpan span{kv_backing_.p, kv_backing_.bytes};
+        pool_   = std::make_unique<DeviceKVPagePool>(span, kv.pool);
+        tables_ = std::make_unique<KVExecutionTablePool>(span, kv.tables, *pool_);
+        // The scratch page (the lowest) every unmapped table entry names: a row past its lane's frontier is never read.
+        std::optional<DeviceKVPageReservation> scratch = pool_->reserve(1);
+        if (!scratch) { throw std::logic_error("Inkling 2: the KV pool has no scratch page"); }
+        scratch_ = pool_->materialize_one(*scratch);
+        for (std::uint32_t i = 0; i < lanes_.size(); ++i) {
+            kv_rows_.push_back(tables_->acquire(static_cast<std::int32_t>(i)));
+            tables_->publish_repeated(kv_rows_.back().handle(), scratch_.handle(), pages, device_.stream);
         }
-        std::vector<std::int32_t> rows(static_cast<std::size_t>(pages) * lanes_.size());
-        for (std::size_t i = 0; i < rows.size(); ++i) { rows[i] = static_cast<std::int32_t>(i); }
-        table_ = DeviceBuffer(rows.size() * 4);
-        table_.copy_from_host(rows.data(), rows.size() * 4);
+        kv_lanes_.resize(lanes_.size());
+        for (LaneKv& kv : kv_lanes_) { kv.pages.resize(pages); }
         view_.images     = static_cast<std::uint16_t*>(images_.p);
         view_.lane_words = layout.lane_words;
+        const std::size_t per_visit = kv_planes_per_visit(o_.kv_codec);
         for (std::int32_t s = 0; s < layout.full_visits; ++s) {
-            view_.pool_k.push_back(static_cast<std::uint16_t*>(pools_[2 * s].p));
-            view_.pool_v.push_back(static_cast<std::uint16_t*>(pools_[2 * s + 1].p));
-            if (o_.kv_codec != ops::inkling2::KvCodec::Bf16) {
-                view_.side_k.push_back(static_cast<std::uint8_t*>(sides_[2 * s].p));
-                view_.side_v.push_back(static_cast<std::uint8_t*>(sides_[2 * s + 1].p));
+            const std::size_t at = static_cast<std::size_t>(s) * per_visit;
+            view_.pool_k.push_back(static_cast<std::uint16_t*>(pool_->plane(at).data));
+            view_.pool_v.push_back(static_cast<std::uint16_t*>(pool_->plane(at + 1).data));
+            if (per_visit == 4) {
+                view_.side_k.push_back(static_cast<std::uint8_t*>(pool_->plane(at + 2).data));
+                view_.side_v.push_back(static_cast<std::uint8_t*>(pool_->plane(at + 3).data));
             }
         }
         view_.codec        = o_.kv_codec;
-        view_.pool_pages   = static_cast<std::int64_t>(pages) * lanes_.size();
-        view_.table        = static_cast<const std::int32_t*>(table_.p);
-        view_.table_stride = static_cast<std::int32_t>(pages);
+        view_.pool_pages   = static_cast<std::int64_t>(pool_->capacity_pages());
+        view_.table        = static_cast<const std::int32_t*>(tables_->matrix().data);
+        view_.table_stride = static_cast<std::int32_t>(tables_->logical_page_capacity());
         counts_            = DeviceBuffer(static_cast<std::size_t>(vocab_) * 4 * lanes_.size());
         configs_           = DeviceBuffer(sizeof(ops::SamplingConfig) * kMaximumConcurrency);
         positions_         = DeviceBuffer(4 * kMaximumConcurrency);
@@ -179,8 +251,14 @@ public:
             if (o_.draft_tokens < 1 || o_.draft_tokens > static_cast<std::uint32_t>(ops::inkling2::kMarkovSteps)) {
                 throw std::invalid_argument("Inkling 2: DSpark drafts 1-7 tokens a round");
             }
+            // The full layer's context: the pool's last two planes, through the lanes' block-table rows.
+            const std::size_t planes = pool_->plane_count();
+            const DSparkPagedContext full{.k            = static_cast<std::uint16_t*>(pool_->plane(planes - 2).data),
+                                          .v            = static_cast<std::uint16_t*>(pool_->plane(planes - 1).data),
+                                          .table        = view_.table,
+                                          .table_stride = view_.table_stride};
             drafter_ = std::make_unique<Drafter>(p_, forward_, static_cast<std::int32_t>(lanes_.size()), o_.max_context,
-                                                 forward_capacity(o_));
+                                                 forward_capacity(o_), full);
         }
         if (o_.vision) {
             if (!p_.vision || !parameters.model.config().vision) {
@@ -191,7 +269,40 @@ public:
             vision_ = std::make_unique<VisionTower>(*parameters.model.config().vision, *p_.vision, o_.vision_max_cells,
                                                     host ? &*host : nullptr, device_.transfer_stream);
         }
+        if (o_.prefix_cache && !o_.causal_scoring) {
+            // A snapshot's image: the lane's state image and, with DSpark, the drafter's sliding rings.
+            prefix::PrefixCacheConfig config;
+            config.taps     = {.max_new_taps   = o_.prefix_max_new_taps,
+                               .ladder_tokens  = o_.prefix_ladder_tokens,
+                               .min_gap_tokens = o_.prefix_min_gap_tokens};
+            config.kv_pages = pool_->capacity_pages();
+            // The source choice's machine model (runtime/prefix_cache/cost.h), a linear fit of the prompt route's measured
+            // rates (RTX 5090, infernix_bench C = 1, pp2048, 2026-11-21: 9,514 tokens a second in chunks of 512, 16,400
+            // in chunks of 2,048): ~30 ms a call and 1 / 21,600 s a token. Host-to-Device at 22 GB/s, an estimate for
+            // the PCIe x8 link (restores are not measured yet). It only ranks a snapshot against a root start.
+            config.index.cost.chunk_tokens           = o_.prefill_chunk;
+            config.index.cost.chunk_seconds          = 30.0e-3;
+            config.index.cost.token_seconds          = 1.0 / 21600.0;
+            config.index.cost.attention_pair_seconds = 0.0;
+            config.index.cost.h2d_bytes_per_second   = 22.0e9;
+            prefix::LaneImages images;
+            const std::size_t lane_bytes = static_cast<std::size_t>(forward_.layout().lane_words) * 2;
+            images.parts.push_back({static_cast<std::byte*>(images_.p), lane_bytes, lane_bytes});
+            if (drafter_) {
+                for (const DSparkStatePart& part : drafter_->snapshot_parts()) {
+                    const std::size_t bytes = static_cast<std::size_t>(part.lane_words) * 2;
+                    images.parts.push_back({reinterpret_cast<std::byte*>(part.base), bytes, bytes});
+                }
+            }
+            prefix_ = std::make_unique<prefix::PrefixCache>(config, *pool_, images, o_.prefix_host_bytes, device_.stream);
+        }
         if (o_.use_cuda_graph && !o_.causal_scoring) { capture_decode_graphs(); }
+    }
+
+    ~ProgramImpl() {
+        // The cache's transfers and the compute stream's last calls land before any buffer they read is freed.
+        (void)cudaStreamSynchronize(device_.stream);
+        prefix_.reset();
     }
 
     // ---------------------------------------------------------------- admission
@@ -213,6 +324,12 @@ public:
         }
         base->tokens                          = std::move(data->token_ids);
         base->options                         = options;
+        // Background requests (next-turn prefill) are not built for this model; a request that may not reuse history
+        // also publishes none.
+        base->reuse        = prefix_ != nullptr && options.allow_prefix_reuse && !options.background && data->reusable;
+        base->block_hashes = std::move(data->block_hashes);
+        base->block_extras = std::move(data->block_extras);
+        base->tap_hints    = std::move(data->tap_hints);
         base->summary.prompt_tokens           = n;
         base->summary.requested_output_tokens = options.requested_output_tokens;
         const std::uint32_t capacity_output   = o_.max_context - n + 1U;
@@ -224,17 +341,120 @@ public:
         return RequestBasePlan(std::move(base));
     }
 
-    std::vector<SourceCandidate> sources(const ResumeState* resume) const {
-        if (resume != nullptr) { throw std::logic_error("Inkling 2: no request is paused"); }
-        return {SourceCandidate{}};
+    // The prompt's images as spans no resume point may lie in (tap_planner.h media_exclusion).
+    static std::vector<runtime::prefix_cache::TapExclusion>
+    image_spans(const std::shared_ptr<const std::vector<PromptImage>>& images) {
+        std::vector<runtime::prefix_cache::TapExclusion> out;
+        if (images) {
+            for (const PromptImage& image : *images) {
+                out.push_back(runtime::prefix_cache::media_exclusion(
+                    image.first_token, image.first_token + static_cast<std::uint32_t>(image.image.cells())));
+            }
+        }
+        return out;
+    }
+    static std::vector<runtime::prefix_cache::TapExclusion> exclusions(const BasePlanImpl& b) { return image_spans(b.images); }
+    static bool excluded(std::span<const runtime::prefix_cache::TapExclusion> spans, std::uint32_t frontier) {
+        return std::any_of(spans.begin(), spans.end(), [&](const auto& s) { return frontier > s.begin && frontier < s.end; });
     }
 
-    BindingReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane_id, const ResumeState* resume) {
+    // Admission's sources: the snapshot the cost model chooses (the deepest worth restoring, outside every image), then
+    // a root start.
+    std::vector<SourceCandidate> sources(const RequestBasePlan& base, const ResumeState* resume) {
+        if (resume != nullptr) { throw std::logic_error("Inkling 2: no request is paused"); }
+        SourceCandidate root;
+        const BasePlanImpl& b = *base.impl_;
+        if (!prefix_ || !b.reuse || prefix_failed_) { return {root}; }
+        namespace pc = runtime::prefix_cache;
+        const auto n = static_cast<std::uint32_t>(b.tokens.size());
+        prefix_->poll();
+        pc::MatchResult match = prefix_->index().match(b.tokens, b.block_hashes, b.block_extras, n);
+        // A tap another lane is still copying out that this prompt extends: it publishes first.
+        if (prefix_->await_extended_capture(match.path, b.tokens)) {
+            match = prefix_->index().match(b.tokens, b.block_hashes, b.block_extras, n);
+        }
+        root.cached_block_tokens = static_cast<std::uint32_t>(match.path.size()) * pc::kBlockTokens;
+        const auto spans = exclusions(b);
+        std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
+            return excluded(spans, c.frontier) || c.filling_blocks != 0 || c.ssd_only_blocks != 0 || c.image_on_ssd_only ||
+                   c.tail_on_ssd_only;
+        });
+        if (match.candidates.empty()) { return {root}; }
+        const pc::AdmissionChoice choice = prefix_->index().choose(match, n);
+        if (!choice.candidate) { return {root}; }
+        const pc::MatchCandidate& c = match.candidates[*choice.candidate];
+        auto quote      = std::make_shared<QuoteImpl>();
+        quote->snapshot = c.snapshot;
+        quote->frontier = c.frontier;
+        quote->path.assign(match.path.begin(), match.path.begin() + c.path_blocks);
+        SourceCandidate chosen;
+        chosen.reused_tokens       = c.frontier;
+        chosen.quote               = std::move(quote);
+        chosen.reuse_path          = PrefixReusePath::HybridSnapshot;
+        chosen.cached_block_tokens = root.cached_block_tokens;
+        return {chosen, root};
+    }
+
+    // Makes `pages` free in the pool: evicts cached blocks (none a lane maps), waiting for a transfer when only
+    // transfers hold the rest. Every lane reserves at most its whole context and the pool holds every lane's, so the
+    // pages exist once the cache gives them up.
+    void make_room(std::uint32_t pages) {
+        while (pool_->available_pages() < pages) {
+            if (prefix_ && prefix_->index().evict_device_blocks(pages - pool_->available_pages()) != 0) { continue; }
+            if (!prefix_ || !prefix_->settle_oldest_transfer()) {
+                throw std::logic_error("Inkling 2: the KV pool cannot give a lane its context");
+            }
+        }
+    }
+
+    BindingReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane_id, const SourceCandidate& source,
+                                     const ResumeState* resume) {
         if (resume != nullptr) { throw std::logic_error("Inkling 2: no request is paused"); }
         if (binding_) { throw std::logic_error("Inkling 2: a binding is already open"); }
         if (lane_id.value >= lanes_.size() || lanes_[lane_id.value].bound) {
             throw std::logic_error("Inkling 2: the binding's lane is not free");
         }
+        namespace pc            = runtime::prefix_cache;
+        const BasePlanImpl& b   = *base.impl_;
+        const std::uint32_t idx = lane_id.value;
+        // A snapshot source still as quoted: its snapshot, path and image on the Host, nothing of it being filled.
+        const QuoteImpl* quote = source.quote.get();
+        if (quote != nullptr) {
+            const auto bad = [&] {
+                BindingReservation out;
+                out.source_valid = false;
+                return out;
+            };
+            if (!prefix_ || !b.reuse) { return bad(); }
+            prefix_->poll();
+            pc::PrefixCacheIndex& index = prefix_->index();
+            if (!index.valid(quote->snapshot)) { return bad(); }
+            const pc::SnapshotView view = index.snapshot(quote->snapshot);
+            const std::uint32_t k       = quote->frontier / pc::kBlockTokens;
+            if (view.frontier != quote->frontier || quote->path.size() != k || view.host != pc::CopyState::Resident ||
+                (k > 0 && view.anchor != quote->path.back()) || (k == 0 && view.anchor.valid())) {
+                return bad();
+            }
+            for (const pc::NodeRef node : quote->path) {
+                if (!index.valid(node)) { return bad(); }
+                const pc::NodeView n = index.node(node);
+                if (n.device == pc::CopyState::Filling || (n.device != pc::CopyState::Resident && n.host != pc::CopyState::Resident)) {
+                    return bad();
+                }
+            }
+        }
+        const std::uint32_t k = quote != nullptr ? quote->frontier / runtime::prefix_cache::kBlockTokens : 0U;
+        // The path's pins hold its blocks through the room-making below (a binding never evicts what it maps).
+        pc::PathPin pins;
+        if (quote != nullptr && k > 0) { pins = pc::PathPin(prefix_->index(), quote->path); }
+        std::uint32_t host_only = 0;
+        for (std::uint32_t i = 0; i < k; ++i) {
+            host_only += prefix_->index().node(quote->path[i]).device != runtime::prefix_cache::CopyState::Resident ? 1U : 0U;
+        }
+        // The lane reserves its context less the path's blocks, which it maps from the cache; the Host-only ones take
+        // pages of their own, which the cache owns once restored.
+        make_room(lane_pages() - k + host_only);
+        reserve_pages(idx, lane_pages() - k);
         Lane& lane         = lanes_[lane_id.value];
         lane               = Lane{};
         lane.bound         = true;
@@ -246,18 +466,89 @@ public:
         lane.penalties     = lane.options.sampling.presence_penalty != 0.0F || lane.options.sampling.frequency_penalty != 0.0F;
         lane.calibration.reset();
         clear_unpackable(lane_id.value);
-        // A fresh state: the conv rings' history before position 0 is zero, and the window's rows are rewritten.
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint16_t*>(images_.p) +
-                                       static_cast<std::size_t>(lane_id.value) * forward_.layout().lane_words,
-                                   0, static_cast<std::size_t>(forward_.layout().lane_words) * 2, device_.stream));
         if (lane.penalties) {
             CUDA_CHECK(cudaMemsetAsync(lane_counts(lane_id.value), 0, static_cast<std::size_t>(vocab_) * 4,
                                        device_.stream));
         }
+        lane.prefix.reuse  = b.reuse;
+        lane.prefix.hashes = b.block_hashes;
+        lane.prefix.extras = b.block_extras;
+        if (quote == nullptr) {
+            // A fresh state: the conv rings' history before position 0 is zero, and the window's rows are rewritten.
+            CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint16_t*>(images_.p) +
+                                           static_cast<std::size_t>(lane_id.value) * forward_.layout().lane_words,
+                                       0, static_cast<std::size_t>(forward_.layout().lane_words) * 2, device_.stream));
+        } else {
+            bind_snapshot(idx, *quote, k);
+            (void)pins.release(); // the lane's now (released with it)
+        }
+        if (lane.prefix.reuse) { plan_lane_taps(idx, b); }
         binding_ = lane_id.value;
         BindingReservation out;
         out.reserved = true;
         return out;
+    }
+
+    // A binding from snapshot `quote` (its path pinned by the caller, `k` full blocks): the path's Device blocks mapped,
+    // its Host-only blocks restored into new cache pages, the tail page (a frontier inside a block) restored into the
+    // lane's first own page, and the image into the lane; the lane's first call waits for the restore.
+    void bind_snapshot(std::uint32_t idx, const QuoteImpl& quote, std::uint32_t k) {
+        Lane& lane = lanes_[idx];
+        namespace pc                 = runtime::prefix_cache;
+        pc::PrefixCacheIndex& index  = prefix_->index();
+        LaneKv& kv                   = kv_lanes_[idx];
+        const std::uint32_t tail_len = quote.frontier - k * pc::kBlockTokens;
+        std::optional<DeviceKVPageReservation> restored;
+        std::uint32_t host_only = 0;
+        for (const pc::NodeRef node : quote.path) { host_only += index.node(node).device != pc::CopyState::Resident ? 1U : 0U; }
+        if (host_only != 0) {
+            restored = pool_->reserve(host_only); // make_room left them free
+            if (!restored) { throw std::logic_error("Inkling 2: the KV pool has no room for a restored path"); }
+        }
+        prefix_->open_restore(device_.stream);
+        try {
+            for (const pc::NodeRef node : quote.path) {
+                if (index.node(node).device != pc::CopyState::Resident) {
+                    prefix_->restore_block(node, pool_->materialize_one(*restored));
+                }
+            }
+            if (tail_len != 0) {
+                kv.pages[k] = pool_->materialize_one(kv.reservation);
+                prefix_->restore_tail_page(quote.snapshot, kv.pages[k].handle());
+            }
+            prefix_->restore_image(quote.snapshot, idx);
+            lane.prefix.restore = prefix_->submit_restore();
+        } catch (...) {
+            prefix_->fail_restore();
+            throw;
+        }
+        // The row: the path's cache pages, then the tail's own page.
+        std::vector<DeviceKVPageHandle> row;
+        row.reserve(k + 1U);
+        for (const pc::NodeRef node : quote.path) { row.push_back(prefix_->page(index.node(node).device_id)); }
+        if (tail_len != 0) { row.push_back(kv.pages[k].handle()); }
+        if (!row.empty()) {
+            tables_->publish(kv_rows_[idx].handle(), 0, std::span<const DeviceKVPageHandle>(row), device_.stream);
+        }
+        kv.mapped           = k + (tail_len != 0 ? 1U : 0U);
+        lane.prefix.path    = quote.path;
+        lane.prefix.base    = quote.frontier;
+        lane.processed      = quote.frontier;
+        index.note_hit(quote.snapshot);
+        ++prefix_->counters().admissions;
+        prefix_->counters().reused_tokens += quote.frontier;
+    }
+
+    // The lane's taps (tap_planner.h): past its base, outside its images, away from the snapshots on its path.
+    void plan_lane_taps(std::uint32_t idx, const BasePlanImpl& b) {
+        Lane& lane = lanes_[idx];
+        namespace pc = runtime::prefix_cache;
+        const auto n = static_cast<std::uint32_t>(b.tokens.size());
+        const pc::MatchResult match = prefix_->index().match(b.tokens, b.block_hashes, b.block_extras, n);
+        lane.prefix.frontiers.clear();
+        for (const pc::MatchCandidate& c : match.candidates) { lane.prefix.frontiers.push_back(c.frontier); }
+        const auto spans = exclusions(b);
+        lane.prefix.taps = pc::plan_taps(n, lane.prefix.base, b.tap_hints, lane.prefix.frontiers, spans, prefix_->taps());
     }
 
     ContextProgress poll_context() {
@@ -282,8 +573,14 @@ public:
         const std::uint32_t index = lane_of(sequence);
         Lane& lane                = lanes_[index];
         if (lane.processed >= lane.prompt_tokens) { throw std::logic_error("Inkling 2: the prompt is already prefilled"); }
-        const std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, lane.prompt_tokens - lane.processed);
-        const bool last           = lane.processed + chunk == lane.prompt_tokens;
+        std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, lane.prompt_tokens - lane.processed);
+        // An exact tap the image after this call would not reach ends the call there (every chunk gives the same bits).
+        for (const runtime::prefix_cache::PlannedTap& tap : lane.prefix.taps) {
+            if (tap.placement != runtime::prefix_cache::TapPlacement::Exact || tap.position <= lane.processed) { continue; }
+            if (tap.position + capture_reach() < lane.processed + chunk) { chunk = tap.position - lane.processed; }
+            break;
+        }
+        const bool last = lane.processed + chunk == lane.prompt_tokens;
         CallPlan call;
         // first: the sequence's first position (every lane's sequence starts at 0), not the call's first column.
         call.first.assign(index + 1, 0);
@@ -298,8 +595,14 @@ public:
                     [&] { overlay_images(lane.images, lane.processed, chunk); });
         if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(chunk), device_.stream); } // the chunk's context rows
         lane.processed += chunk;
+        const std::size_t captured = lane.prefix.captures.size();
+        publish_prefill(index);
         PrefillProgress out;
-        out.summary                 = {.prompt_tokens = lane.prompt_tokens};
+        out.snapshot_published = lane.prefix.captures.size() != captured;
+        // The admission's terms: the tokens the binding restored from a snapshot (none at a root start).
+        out.summary = {.prompt_tokens        = lane.prompt_tokens,
+                       .reused_prompt_tokens = lane.prefix.base,
+                       .prefix_reuse_path    = lane.prefix.base != 0 ? PrefixReusePath::HybridSnapshot : PrefixReusePath::Root};
         out.processed_prompt_tokens = chunk; // this unit's tokens (the Engine sums them)
         out.complete                = last;
         if (last) {
@@ -542,6 +845,8 @@ public:
         }
         CUDA_CHECK(cudaMemsetAsync(images_.p, 0, static_cast<std::size_t>(forward_.layout().lane_words) * 2, device_.stream));
         clear_unpackable(0);
+        release_pages(0); // a failed window's pages
+        reserve_pages(0, lane_pages()); // lane 0 maps its pages as the window's calls reach them
         ScoreResult out;
         std::vector<float> row(static_cast<std::size_t>(vocab_));
         std::size_t next_logits = 0;
@@ -603,6 +908,7 @@ public:
             at += chunk;
         }
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+        release_pages(0);
         if (unpackable_.p != nullptr) {
             CUDA_CHECK(cudaMemcpy(unpackable_seen_.data(), unpackable_.p, 4, cudaMemcpyDeviceToHost));
             if (unpackable_seen_[0] != kNoPosition) {
@@ -617,15 +923,12 @@ public:
     // ---------------------------------------------------------------- diagnostics
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept {
         PhysicalUsageSnapshot out;
-        const std::uint32_t pages = pages_per_lane(o_.max_context);
         for (const Lane& lane : lanes_) {
-            if (lane.bound) {
-                ++out.occupied.state_slots;
-                out.occupied.main_kv_pages += pages;
-            }
+            if (lane.bound) { ++out.occupied.state_slots; }
         }
+        out.occupied.main_kv_pages = static_cast<std::uint32_t>(mapped_pages());
         out.capacity.state_slots   = static_cast<std::uint32_t>(lanes_.size());
-        out.capacity.main_kv_pages = pages * static_cast<std::uint32_t>(lanes_.size());
+        out.capacity.main_kv_pages = plan_.kv_pages - 1; // the scratch page holds nothing
         return out;
     }
 
@@ -635,11 +938,7 @@ public:
         out.device.kv        = plan_.kv;
         out.device.state     = plan_.state + plan_.io;
         out.device.workspace = plan_.workspace;
-        std::uint64_t used   = 0;
-        for (const Lane& lane : lanes_) {
-            if (lane.bound) { used += plan_.kv / lanes_.size(); }
-        }
-        out.device.kv_used = used;
+        out.device.kv_used   = mapped_pages() * plan_.page_bytes;
         out.host.staging   = host_.size();
         return out;
     }
@@ -673,6 +972,23 @@ private:
         std::uint64_t rounds = 0, drafted = 0, accepted = 0, fallback = 0;
         double draft_ms = 0, gap_ms = 0, verify_ms = 0; // device-side sums over the rounds (CUDA events)
         std::array<std::uint64_t, ops::inkling2::kMarkovSteps> accepted_at{}; // rounds accepting draft i
+        // The prefix cache: whether the request reuses and publishes, its keys, the blocks its row maps from the
+        // cache (path, root first: pinned for the lane), the taps still to take, the snapshot frontiers on its path,
+        // what it published (withdrawn when its logits go non-finite), the restore its first call waits for and the
+        // capture its next call's image writes wait for.
+        struct Prefix {
+            bool reuse = false;
+            std::vector<std::uint64_t> hashes, extras;
+            std::vector<runtime::prefix_cache::NodeRef> path;
+            std::vector<runtime::prefix_cache::PlannedTap> taps;
+            std::vector<std::uint32_t> frontiers;
+            std::uint32_t base = 0; // the frontier the lane resumed at (0: root)
+            std::vector<runtime::prefix_cache::NodeRef> published;
+            std::vector<std::uint64_t> captures;
+            std::optional<prefix::RestoreTicket> restore;
+            std::uint64_t capture = 0;
+            bool withdraw = false;
+        } prefix;
     };
     // A DSpark round's row awaiting its commit: the lane, the anchor's position and the tokens it licenses.
     struct PendingDraft {
@@ -697,7 +1013,12 @@ private:
         return static_cast<std::int32_t*>(counts_.p) + static_cast<std::size_t>(index) * vocab_;
     }
     void release(std::uint32_t index) noexcept {
-        if (index < lanes_.size()) { lanes_[index] = Lane{}; }
+        if (index < lanes_.size()) {
+            release_prefix(index);
+            release_pages(index);
+            lanes_[index] = Lane{};
+            clear_failed_prefix();
+        }
     }
     // bf16p: forgets a lane's rows with no packed form (a new request, or rejected draft rows the next calls overwrite).
     void clear_unpackable(std::uint32_t index) {
@@ -724,13 +1045,337 @@ private:
     }
 
     // The call plan through the next staging slot: a slot is rewritten only once the copies that read it ran (calls
-    // queue without a host wait between them).
-    void upload(const CallPlan& call) {
+    // queue without a host wait between them). `map` (every call but a graph's capture, whose lanes are free) first maps
+    // the pages the call's columns write (map_call_pages).
+    void upload(const CallPlan& call, bool map = true) {
+        if (map) {
+            map_call_pages(call);
+            if (prefix_) { order_after_cache(call); }
+        }
         slot_ = (slot_ + 1) % kStagingSlots;
         if (slot_used_[slot_]) { CUDA_CHECK(cudaEventSynchronize(slot_events_[slot_])); }
         forward_.upload(call, staging_ + slot_ * forward_.upload_words(), device_.stream);
         CUDA_CHECK(cudaEventRecord(slot_events_[slot_], device_.stream));
         slot_used_[slot_] = true;
+    }
+
+    // ---------------------------------------------------------------- KV pages
+    // The full visits' pages (core/paged_kv_cache.h): a lane reserves its whole context when it binds (so no request ever
+    // waits for pages) and maps its leading pages from that reservation as its calls first write a position in them; its
+    // block-table row names the scratch page past them (a row past a lane's frontier is never read). The row's
+    // publications are ordered on the compute stream ahead of the call that reads them.
+    [[nodiscard]] std::uint32_t lane_pages() const noexcept { return tables_->logical_page_capacity(); }
+
+    // Reserves `pages` of a lane's context (all of it at a root start, less its path's blocks at a restore): at a
+    // binding, and lane 0's for a scoring window.
+    void reserve_pages(std::uint32_t lane, std::uint32_t pages) {
+        LaneKv& kv = kv_lanes_[lane];
+        if (kv.reservation.valid() || kv.mapped != 0) { throw std::logic_error("Inkling 2: the lane holds KV pages"); }
+        make_room(pages);
+        std::optional<DeviceKVPageReservation> reserved = pool_->reserve(pages);
+        if (!reserved) { throw std::logic_error("Inkling 2: the KV pool cannot hold the lane's context"); }
+        kv.reservation = std::move(*reserved);
+    }
+
+    // Maps every page the call's columns write (each lane's positions through its last column).
+    void map_call_pages(const CallPlan& call) {
+        std::array<std::int32_t, kMaximumConcurrency> end{};
+        end.fill(0);
+        for (std::size_t i = 0; i < call.lane.size(); ++i) {
+            const auto lane = static_cast<std::size_t>(call.lane[i]);
+            end[lane]       = std::max(end[lane], call.position[i] + 1);
+        }
+        for (std::uint32_t lane = 0; lane < lanes_.size(); ++lane) { map_lane_pages(lane, end[lane]); }
+    }
+
+    // Maps a lane's pages through position `end` (exclusive): a call's writes, or a draft's block rows.
+    void map_lane_pages(std::uint32_t lane, std::int32_t end) {
+        LaneKv& kv      = kv_lanes_[lane];
+        const auto need = static_cast<std::uint32_t>((end + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit);
+        if (need <= kv.mapped) { return; }
+        if (need > lane_pages() || !kv.reservation.valid()) {
+            throw std::logic_error("Inkling 2: a call writes past its lane's reserved context");
+        }
+        std::vector<DeviceKVPageHandle> fresh;
+        fresh.reserve(need - kv.mapped);
+        for (std::uint32_t p = kv.mapped; p < need; ++p) {
+            kv.pages[p] = pool_->materialize_one(kv.reservation);
+            fresh.push_back(kv.pages[p].handle());
+        }
+        tables_->publish(kv_rows_[lane].handle(), kv.mapped, std::span<const DeviceKVPageHandle>(fresh), device_.stream);
+        kv.mapped = need;
+    }
+
+    // Returns a lane's pages and reservation to the pool, after any capture still reading one of them (a tap's tail).
+    // Its row keeps naming the pages until its next binding's calls publish theirs: only a lane's own calls read its row,
+    // and the compute stream runs its last call before any writer of a page it held.
+    void release_pages(std::uint32_t lane) noexcept {
+        if (lane >= kv_lanes_.size()) { return; }
+        LaneKv& kv = kv_lanes_[lane];
+        if (prefix_) {
+            try {
+                prefix_->order_page_reuse(std::span<const DeviceKVPageLease>(kv.pages).first(kv.mapped));
+            } catch (...) {}
+        }
+        // The row names the scratch page again before its pages go: no later write through it (a draft's block rows,
+        // a stale entry) can reach a page another lane or the cache holds.
+        if (kv.mapped != 0) {
+            try {
+                tables_->publish_repeated(kv_rows_[lane].handle(), scratch_.handle(), kv.mapped, device_.stream);
+            } catch (...) {}
+        }
+        for (std::uint32_t p = 0; p < kv.mapped; ++p) { (void)kv.pages[p].release(); }
+        kv.mapped = 0;
+        kv.reservation.release();
+    }
+
+    [[nodiscard]] std::uint64_t mapped_pages() const noexcept {
+        std::uint64_t out = 0;
+        for (const LaneKv& kv : kv_lanes_) {
+            for (std::uint32_t p = 0; p < kv.mapped; ++p) { out += kv.pages[p].valid() ? 1U : 0U; }
+        }
+        return out;
+    }
+
+    // ---------------------------------------------------------------- prefix cache (prefix_cache.h)
+public:
+    runtime::prefix_cache::PersistResult attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
+                                                                  const StartupObserver& observer) {
+        if (!prefix_) { return {.message = "the prefix cache is not enabled"}; }
+        if (path.empty()) { throw std::invalid_argument("prefix cache file path is empty"); }
+        runtime::prefix_cache::PersistResult loaded = prefix_->load(path, fingerprint, observer);
+        prefix_file_         = path;
+        prefix_fingerprint_  = std::move(fingerprint);
+        prefix_saved_writes_ = prefix_->counters().host_write_bytes;
+        return loaded;
+    }
+
+    // The periodic save: only when the Host tier was written since the last one. Copies land first (the save reads
+    // the slabs; lanes mapping a path do not matter).
+    std::optional<runtime::prefix_cache::PersistResult> save_prefix_cache_now(const CancellationView& abandoned) {
+        if (!prefix_ || prefix_file_.empty() || prefix_->counters().host_write_bytes == prefix_saved_writes_) {
+            return std::nullopt;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+        prefix_->drain();
+        const std::uint64_t written                 = prefix_->counters().host_write_bytes;
+        runtime::prefix_cache::PersistResult saved = prefix_->save(prefix_file_, prefix_fingerprint_, abandoned);
+        if (saved.ok) { prefix_saved_writes_ = written; }
+        return saved;
+    }
+
+    // After every lane is released (shutdown_cleanup): copies land, then the save reads the slabs.
+    void save_prefix_cache_for_shutdown() noexcept {
+        if (!prefix_ || prefix_file_.empty()) { return; }
+        try {
+            CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+            prefix_->drain();
+            const PrefixCacheSaveControl& control = o_.prefix_save;
+            if (!control.begin()) {
+                prefix_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = "abandoned before it began"};
+                return;
+            }
+            struct Ended {
+                const PrefixCacheSaveControl& control;
+                bool saved = false;
+                ~Ended() { control.end(saved); }
+            } ended{control};
+            prefix_shutdown_save_ =
+                prefix_->save(prefix_file_, prefix_fingerprint_, CancellationView([&control] { return control.abandoned(); }));
+            ended.saved = prefix_shutdown_save_->ok;
+        } catch (const std::exception& error) {
+            prefix_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = error.what()};
+        } catch (...) { prefix_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = "unknown error"}; }
+    }
+
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save() const {
+        return prefix_shutdown_save_;
+    }
+
+    [[nodiscard]] std::uint64_t prefix_epoch() const noexcept { return prefix_ ? prefix_->index().snapshot_epoch() : 0U; }
+
+    [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept {
+        HybridPrefixCacheStats out;
+        if (!prefix_) { return out; }
+        const runtime::prefix_cache::PrefixIndexStats s = prefix_->index().stats();
+        const prefix::PrefixCacheCounters& c          = prefix_->counters();
+        out.nodes                   = s.nodes;
+        out.snapshots               = s.snapshots;
+        out.device_resident_blocks  = s.device_resident_blocks;
+        out.device_evictable_blocks = s.device_evictable_blocks;
+        out.host_slabs              = prefix_->host_layout().slabs;
+        out.host_free_slabs         = s.host_free_slabs;
+        out.host_slab_bytes         = prefix_->host_layout().slab_bytes;
+        out.snapshot_hits           = s.snapshot_hits;
+        out.reused_tokens           = c.reused_tokens;
+        out.blocks_inserted         = c.blocks_inserted;
+        out.blocks_reattached       = c.blocks_reattached;
+        out.blocks_duplicate        = c.blocks_duplicate;
+        out.taps_created            = c.taps_created;
+        out.taps_skipped            = c.taps_skipped;
+        out.host_image_writes       = c.host_image_writes;
+        out.host_block_writes       = c.host_block_writes;
+        out.host_image_restores     = c.host_image_restores;
+        out.host_block_restores     = c.host_block_restores;
+        out.host_write_bytes        = c.host_write_bytes;
+        out.host_restore_bytes      = c.host_restore_bytes;
+        out.evicted_blocks          = s.device_block_evictions;
+        out.host_snapshot_evictions = s.host_snapshot_evictions;
+        out.host_dead_reclaims      = s.host_dead_reclaims;
+        out.unbacked_node_losses    = s.unbacked_node_losses;
+        return out;
+    }
+
+private:
+
+    // A call of lanes whose image a restore is still writing, or a capture still reading, runs after it (the compute
+    // stream waits: the call writes the image's rings).
+    void order_after_cache(const CallPlan& call) {
+        for (std::uint32_t lane = 0; lane < lanes_.size(); ++lane) {
+            if (std::find(call.lane.begin(), call.lane.end(), static_cast<std::int32_t>(lane)) == call.lane.end()) { continue; }
+            Lane::Prefix& p = lanes_[lane].prefix;
+            if (p.restore) {
+                prefix_->order_after_restore(*p.restore, device_.stream);
+                p.restore.reset();
+            }
+            if (p.capture != 0) {
+                for (const cudaEvent_t event : prefix_->capture_events(p.capture)) {
+                    CUDA_CHECK(cudaStreamWaitEvent(device_.stream, event, 0));
+                }
+                p.capture = 0;
+            }
+        }
+    }
+
+    // The positions an image captured after a call ending at `end` serves (state_image's rings: the conv rings hold 32
+    // positions, of which a frontier reads its 3 before; the drafter's Markov ring 16, of which it reads 1).
+    [[nodiscard]] std::uint32_t capture_reach() const noexcept { return drafter_ ? 15U : 29U; }
+
+    // After a prompt call: the lane's full blocks the call completed are published (each keyed by the prompt's block
+    // hash; the cache takes the lane's page unless an identical block is mapped elsewhere), then each tap the call
+    // reached is captured. Only prompt-computed state is published: a resumed request's output equals a cold one's.
+    void publish_prefill(std::uint32_t idx) {
+        Lane& lane = lanes_[idx];
+        namespace pc     = runtime::prefix_cache;
+        Lane::Prefix& p  = lane.prefix;
+        if (!prefix_ || !p.reuse || prefix_failed_) { return; }
+        if (unpackable_.p != nullptr) {
+            // bf16p: a row with no packed form fails the request; nothing it reached is published.
+            CUDA_CHECK(cudaMemcpyAsync(&unpackable_seen_[idx], static_cast<std::uint32_t*>(unpackable_.p) + idx, 4,
+                                       cudaMemcpyDeviceToHost, device_.stream));
+            CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+            if (unpackable_seen_[idx] != kNoPosition) {
+                p.reuse = false;
+                return;
+            }
+        }
+        const std::uint32_t end = lane.processed;
+        LaneKv& kv              = kv_lanes_[idx];
+        const auto blocks       = std::min<std::size_t>(end / pc::kBlockTokens, p.hashes.size());
+        while (p.path.size() < blocks) {
+            const std::size_t bi     = p.path.size();
+            const pc::NodeRef parent = p.path.empty() ? pc::NodeRef{} : p.path.back();
+            const std::span<const TokenId> tokens(lane.tokens.data() + bi * pc::kBlockTokens, pc::kBlockTokens);
+            const pc::InsertResult r = prefix_->insert_block(parent, p.hashes[bi], tokens,
+                                                             p.extras.empty() ? 0U : p.extras[bi], kv.pages[bi]);
+            p.path.push_back(r.node); // pinned for the lane (insert_block), its Device copy held
+            if (r.device_attached) {
+                p.published.push_back(r.node);
+            } else if (const pc::NodeView view = prefix_->index().node(r.node); view.device == pc::CopyState::Resident) {
+                // An identical block another lane maps (the same bits: only prompt-computed blocks are published): the
+                // row names its page and the lane's own goes back to the pool, so one block never holds two pages.
+                // The calls before read the lane's page; the row's publication runs after them on the compute stream.
+                const DeviceKVPageHandle shared = prefix_->page(view.device_id);
+                tables_->publish(kv_rows_[idx].handle(), static_cast<std::uint32_t>(bi),
+                                 std::span<const DeviceKVPageHandle>(&shared, 1), device_.stream);
+                prefix_->order_page_reuse(std::span<const DeviceKVPageLease>(&kv.pages[bi], 1));
+                (void)kv.pages[bi].release();
+            }
+        }
+        // Each tap the call reached: at its own position when the image serves it, else (a flexible tap the call passed)
+        // at the call's end; never the prompt's last position (one token is always prefilled).
+        const auto n = static_cast<std::uint32_t>(lane.prompt_tokens);
+        while (!p.taps.empty() && p.taps.front().position <= end) {
+            const pc::PlannedTap tap = p.taps.front();
+            p.taps.erase(p.taps.begin());
+            std::uint32_t F = tap.position + capture_reach() >= end ? tap.position : end;
+            F               = std::min(F, n - 1U);
+            if (F <= p.base || std::find(p.frontiers.begin(), p.frontiers.end(), F) != p.frontiers.end()) { continue; }
+            if (F != tap.position && excluded(image_spans(lane.images), F)) { continue; } // moved into an image
+            capture_tap(idx, F, tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap);
+        }
+    }
+
+    void capture_tap(std::uint32_t idx, std::uint32_t F, runtime::prefix_cache::SnapshotKind kind) {
+        Lane& lane = lanes_[idx];
+        namespace pc     = runtime::prefix_cache;
+        Lane::Prefix& p  = lane.prefix;
+        const std::uint32_t k = F / pc::kBlockTokens;
+        if (p.path.size() < k) { return; } // its blocks are not all published (cannot happen past publish_prefill)
+        prefix::PrefixCache::Capture c;
+        c.id       = ++capture_ids_;
+        c.anchor   = k > 0 ? p.path[k - 1] : pc::NodeRef{};
+        c.frontier = F;
+        c.tail.assign(lane.tokens.begin() + static_cast<std::ptrdiff_t>(k) * pc::kBlockTokens,
+                      lane.tokens.begin() + F);
+        if (!c.tail.empty()) {
+            // The lane's page of block k: its own, or the cache's once the block was published.
+            const DeviceKVPageLease& own = kv_lanes_[idx].pages[k];
+            c.tail_page = own.valid() ? own.handle()
+                                      : prefix_->page(prefix_->index().node(p.path[k]).device_id);
+        }
+        c.kind = kind;
+        // Valued against the nearest snapshot below it on the path (its base, or an earlier tap or cached snapshot).
+        std::uint32_t below = p.base;
+        for (const std::uint32_t f : p.frontiers) {
+            if (f < F) { below = std::max(below, f); }
+        }
+        c.claim                = prefix_->index().estimate_priority(below, F, !c.tail.empty());
+        const std::uint64_t id = c.id;
+        if (prefix_->capture(idx, std::move(c), device_.stream)) {
+            p.capture = id;
+            p.captures.push_back(id);
+            p.frontiers.push_back(F);
+            // The path's Device-only blocks go to the Host tier behind the image (the lane's next call waits only for
+            // the image): a snapshot outlives its blocks' Device copies only with their Host copies.
+            prefix_->write_blocks(std::span<const pc::NodeRef>(p.path).first(k), device_.stream);
+        }
+    }
+
+    // The lane's cache references at its release: its path's pins, and (a request whose logits went non-finite) what it
+    // published withdrawn (hybrid-prefix-cache-spec §7.8). A failure empties the cache.
+    void release_prefix(std::uint32_t idx) noexcept {
+        Lane& lane = lanes_[idx];
+        if (!prefix_) { return; }
+        namespace pc    = runtime::prefix_cache;
+        Lane::Prefix& p = lane.prefix;
+        try {
+            if (!p.path.empty()) { prefix_->index().release_path(p.path); }
+            if (p.withdraw && (!p.published.empty() || !p.captures.empty())) {
+                prefix_->drain();
+                pc::Withdrawal w;
+                w.nodes = p.published;
+                for (const std::uint64_t id : p.captures) {
+                    if (const auto r = prefix_->capture_result(id); r && r->created) { w.snapshots.push_back(r->snapshot); }
+                }
+                (void)prefix_->index().withdraw(w);
+            }
+            for (const std::uint64_t id : p.captures) { prefix_->forget_capture(id); }
+        } catch (...) {
+            // Emptied once no lane maps it (release); until then nothing is reused or published.
+            prefix_failed_ = true;
+        }
+        p = Lane::Prefix{};
+    }
+
+    // A cache whose bookkeeping failed is rebuilt empty once the last lane that maps it is released.
+    void clear_failed_prefix() noexcept {
+        if (!prefix_ || !prefix_failed_ ||
+            std::any_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.bound; })) {
+            return;
+        }
+        prefix_->clear();
+        prefix_failed_ = false;
     }
 
     // The Forward over the uploaded call, its head over columns [head_first, head_first + head_columns); `after_embed`
@@ -823,7 +1468,9 @@ private:
         const std::int32_t steps =
             std::min({most, static_cast<std::int32_t>(o_.max_context) - 1 - F,
                       static_cast<std::int32_t>(std::min<std::uint32_t>(remaining - 1U, ops::inkling2::kMarkovSteps))});
-        // The drafts: the block, the head over its rows and the Markov steps, read back before the verify call.
+        // The drafts: the block, the head over its rows and the Markov steps, read back before the verify call. The
+        // block's rows F .. F + 7 go to the full layer's pages first (mapped here: the verify call maps no more).
+        map_lane_pages(index, F + ops::inkling2::kDSparkBlock);
         drafter_->stage({F, lane.tokens[static_cast<std::size_t>(F)], static_cast<std::int32_t>(index)});
         CUDA_CHECK(cudaEventRecord(round_events_[0], device_.stream));
         if (o_.use_cuda_graph) {
@@ -1108,6 +1755,10 @@ private:
             failures_[row]        = nonfinite_[row] != 0 ? runtime::PendingRowFailure::NonFiniteLogits
                                     : unpackable         ? runtime::PendingRowFailure::UnpackableKv
                                                          : runtime::PendingRowFailure::None;
+            // A request whose state may be wrong takes back what it published (release_prefix).
+            if (failures_[row] != runtime::PendingRowFailure::None && sample_lanes_[row] < lanes_.size()) {
+                lanes_[sample_lanes_[row]].prefix.withdraw = true;
+            }
         }
     }
 
@@ -1162,7 +1813,7 @@ private:
                     call.lane.push_back(lanes - columns + c);
                     call.position.push_back(0);
                 }
-                upload(call);
+                upload(call, false); // free lanes: their rows name the scratch page
                 (void)capture_decode(lanes, columns);
             }
         }
@@ -1207,9 +1858,7 @@ private:
     std::array<std::int32_t, kMaximumConcurrency> row_counts_{};
     std::int32_t vocab_ = 0;
     std::vector<Lane> lanes_;
-    DeviceBuffer images_, table_, counts_, configs_, positions_, sampled_, gathered_;
-    std::vector<DeviceBuffer> pools_;
-    std::vector<DeviceBuffer> sides_; // a quantized pool's side records, K and V per full slot
+    DeviceBuffer images_, counts_, configs_, positions_, sampled_, gathered_;
     StateView view_;
     WorkspaceArena sampling_;
     PinnedHostBuffer host_;
@@ -1218,6 +1867,31 @@ private:
     std::int32_t* host_positions_         = nullptr;
     std::int32_t* host_sampled_           = nullptr;
     std::int32_t* nonfinite_              = nullptr;
+    // The full visits' KV (map_call_pages): the pool and the lanes' block-table rows over kv_backing_, the scratch page,
+    // and each lane's reservation and mapped pages. Declared in teardown order: leases before their pool.
+    // A lane's pages: block b is mapped for b < mapped, its page pages[b] while the lane owns it (an invalid lease
+    // where the row names a cache page: a block the binding mapped from its path, or one it published).
+    struct LaneKv {
+        DeviceKVPageReservation reservation;
+        std::vector<DeviceKVPageLease> pages; // lane_pages() entries
+        std::uint32_t mapped = 0;
+    };
+    DeviceBuffer kv_backing_;
+    std::unique_ptr<DeviceKVPagePool> pool_;
+    std::unique_ptr<KVExecutionTablePool> tables_;
+    std::vector<KVExecutionRowLease> kv_rows_;
+    DeviceKVPageLease scratch_;
+    std::vector<LaneKv> kv_lanes_;
+    // The prefix cache (ProgramOptions::prefix_cache): destroyed before the pool its blocks' leases return to.
+    std::unique_ptr<prefix::PrefixCache> prefix_;
+    std::uint64_t capture_ids_ = 0;
+    bool prefix_failed_        = false; // clear_failed_prefix
+    // --prefix-cache-file (attach_prefix_cache_file): the file, its fingerprint, the Host bytes written at the last
+    // save, and the shutdown save's result.
+    std::filesystem::path prefix_file_;
+    std::string prefix_fingerprint_;
+    std::uint64_t prefix_saved_writes_ = 0;
+    std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save_;
     // bf16p: device [kMaximumConcurrency], each lane's lowest appended position with no packed form, and its last
     // reading.
     static constexpr std::uint32_t kNoPosition = 0xFFFFFFFFU;
@@ -1305,6 +1979,10 @@ RequestBasePlan& RequestBasePlan::operator=(RequestBasePlan&&) noexcept = defaul
 RequestBasePlan::~RequestBasePlan()                                     = default;
 const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept { return impl_->summary; }
 
+std::uint32_t pages_per_lane(std::uint32_t max_context) noexcept {
+    return (max_context + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit + 1;
+}
+
 ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Config& config) {
     if (options.max_context == 0) { throw std::invalid_argument("Inkling 2: max_context must be positive"); }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
@@ -1315,14 +1993,11 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     }
     const StateLayout layout   = state_layout(config.text);
     const std::uint64_t lanes  = options.max_concurrency;
-    const std::uint64_t pages  = static_cast<std::uint64_t>(detail::pages_per_lane(options.max_context)) * lanes;
+    const detail::KvLayout kv  = detail::kv_layout(options, layout.full_visits);
     ProgramDevicePlan out;
-    out.kv_pages  = static_cast<std::uint32_t>(pages);
-    out.kv = pages * 4;
-    for (int which = 0; which < 2; ++which) {
-        out.kv += static_cast<std::uint64_t>(layout.full_visits) * (detail::pool_bytes(pages, options.kv_codec, which) +
-                                                                    detail::side_bytes(pages, options.kv_codec, which));
-    }
+    out.kv_pages   = kv.pool.spec.page_group_count;
+    out.kv         = kv.bytes;
+    out.page_bytes = kv.page_bytes;
     out.state     = static_cast<std::uint64_t>(layout.lane_words) * 2 * lanes;
     out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2;
     const bool dspark = options.dspark && !options.causal_scoring;
@@ -1354,14 +2029,17 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
     return impl_->plan_request(std::move(prompt), options);
 }
 
-std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan&, const ResumeState* resume) {
-    return impl_->sources(resume);
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, const ResumeState* resume) {
+    return impl_->sources(base, resume);
 }
 
-BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane, const SourceCandidate&,
+BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane, const SourceCandidate& source,
                                           ResumeState* resume, ExecutionUnitKind, std::uint32_t) {
-    return impl_->start_binding(base, lane, resume);
+    return impl_->start_binding(base, lane, source, resume);
 }
+
+HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
+std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->prefix_epoch(); }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView) { return impl_->poll_context(); }
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
@@ -1397,7 +2075,22 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->f
 AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
 void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 bool Program::recover_after_failure() noexcept { return impl_->recover(); }
-void Program::shutdown_cleanup() noexcept { impl_->release_all(); }
+void Program::shutdown_cleanup() noexcept {
+    impl_->release_all();
+    impl_->save_prefix_cache_for_shutdown();
+}
+
+runtime::prefix_cache::PersistResult Program::attach_prefix_cache_file(const std::filesystem::path& path,
+                                                                       std::string fingerprint,
+                                                                       const StartupObserver& observer) {
+    return impl_->attach_prefix_cache_file(path, std::move(fingerprint), observer);
+}
+std::optional<runtime::prefix_cache::PersistResult> Program::save_prefix_cache_now(const CancellationView& abandoned) {
+    return impl_->save_prefix_cache_now(abandoned);
+}
+std::optional<runtime::prefix_cache::PersistResult> Program::prefix_shutdown_save() const {
+    return impl_->prefix_shutdown_save();
+}
 
 ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options) {
     return impl_->causal_score(std::move(prompt), first_target, options);

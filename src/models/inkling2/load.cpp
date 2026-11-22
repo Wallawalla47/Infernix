@@ -4,6 +4,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "artifact/views.h"
+#include "core/device.h"
 #include "core/weight_view.h"
 
 #include <algorithm>
@@ -126,10 +127,14 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p, Expe
     return out;
 }
 
-TextWeights bind_text(Bindings& b, const TextConfig& c) {
+// `embedding_host` (--embedding-host): the token embedding (0.86 GiB) in pinned host memory, its rows gathered
+// zero-copy by ik::embed (one row a decode token; a prefill chunk's rows over the link), as Qwen3.5's option.
+TextWeights bind_text(Bindings& b, const TextConfig& c, bool embedding_host) {
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
     TextWeights out;
+    b.residency         = embedding_host ? Residency::HostPinned : Residency::Device;
     out.token_embedding = b.direct("text/token_embedding", {v, h});
+    b.residency         = Residency::Device;
     out.embedding_norm  = b.direct("text/embedding_norm", {h});
     out.output_head     = b.parameter("text/output_head", {v, h}, "text/final_hidden");
     out.final_norm      = b.direct("text/final_norm", {h});
@@ -449,7 +454,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config.text);
     Bindings bindings(binder);
-    out->weights = bind_text(bindings, out->config.text);
+    out->weights = bind_text(bindings, out->config.text, options.embedding_host);
     if (out->config.dspark) { out->weights.dspark = bind_dspark(bindings, *out->config.dspark, out->config.text); }
     if (out->config.vision) {
         // --vision-offload on: the tower in pinned host memory, staged through the tower's device slots per encode.
@@ -528,6 +533,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         const std::span<const std::byte> pinned = backing.pinned_bytes_range();
         if (pinned.empty()) { throw ArtifactError("--vision-offload on: the tower has no pinned block"); }
         data->vision_host->block = pinned.data();
+        void* mapped             = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&mapped, const_cast<std::byte*>(pinned.data()), 0));
+        data->vision_host->block_device = static_cast<const std::byte*>(mapped);
     }
     return std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
                                             std::move(bound), std::move(data->resources), std::move(data->info),

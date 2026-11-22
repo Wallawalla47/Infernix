@@ -17,6 +17,7 @@
 #include "models/inkling2/frontend/output_session.h"
 #include "models/inkling2/model.h"
 #include "models/inkling2/ngram.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include <cstdint>
 #include <memory>
@@ -48,6 +49,15 @@ struct PreparedPromptData {
     std::vector<TokenId> token_ids;
     std::shared_ptr<const ToolNames> tools; // null: the prompt declares no tools
     std::vector<PromptImage> images;        // in prompt order
+    // Prefix-cache lookup keys over token_ids (runtime/prefix_cache/block_hash.h): one chained hash per full 64-token
+    // block and, with images, one cumulative image key per block (every image that begins before the block's end).
+    std::vector<std::uint64_t> block_hashes;
+    std::vector<std::uint64_t> block_extras;
+    // Where the prompt's structure suggests snapshots (runtime/prefix_cache/tap_planner.h): every message's start, the
+    // leading system block's last message and its end, and the generation opener.
+    std::vector<runtime::prefix_cache::TapHint> tap_hints;
+    // False: the prompt neither reuses nor publishes cached state (Engine::prepare_tokens without a prefix identity).
+    bool reusable = true;
     PromptPreparationStats stats;
 };
 

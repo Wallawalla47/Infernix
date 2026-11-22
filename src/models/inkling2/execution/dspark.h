@@ -24,22 +24,48 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace infernix::models::inkling2 {
 
+// The full layer's context K and V: two planes of the target's KV pages (page-major [pages][8][64][128] BF16) and the
+// lanes' block-table rows, which the Program owns (its pool's planes; a page holds the drafter's context with the
+// target's, so the prefix cache shares and restores both).
+struct DSparkPagedContext {
+    std::uint16_t* k            = nullptr;
+    std::uint16_t* v            = nullptr;
+    const std::int32_t* table   = nullptr;
+    std::int32_t table_stride   = 0;
+};
+
+// One lane's part of the drafter's state a snapshot carries (the sliding layers' rings): `words` 16-bit words at
+// `base + lane * lane_words`.
+struct DSparkStatePart {
+    std::uint16_t* base      = nullptr;
+    std::int64_t lane_words  = 0;
+};
+
 class Drafter {
 public:
     // `capacity`: the widest forward call whose context rows are appended at once (the forward's capacity).
     Drafter(const Parameters& parameters, const Forward& forward, std::int32_t lanes, std::uint32_t max_context,
-            std::int32_t capacity);
+            std::int32_t capacity, const DSparkPagedContext& full);
     Drafter(const Drafter&)            = delete;
     Drafter& operator=(const Drafter&) = delete;
 
-    // The device memory a drafter of these lanes, context and capacity allocates.
+    // The device memory a drafter of these lanes, context and capacity allocates (the full layer's context is the
+    // Program's pages).
     [[nodiscard]] static std::size_t device_bytes(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity,
                                                   std::uint32_t vocab);
+
+    // The lane state a prefix-cache snapshot copies with the target's image: the sliding layers' K and V rings (the
+    // Markov ring needs none: a resumed request prefills at least one column, whose row the first draft reads).
+    [[nodiscard]] std::array<DSparkStatePart, 4> snapshot_parts() const noexcept {
+        return {DSparkStatePart{cache_k_[0], lane_words_[0]}, DSparkStatePart{cache_v_[0], lane_words_[0]},
+                DSparkStatePart{cache_k_[2], lane_words_[2]}, DSparkStatePart{cache_v_[2], lane_words_[2]}};
+    }
 
     // The context rows of columns [first, first + count) of the forward's last call (its positions and lanes).
     void append(std::int32_t first, std::int32_t count, cudaStream_t stream);
@@ -59,14 +85,16 @@ private:
     const Parameters& p_;
     const DSparkOperands& d_;
     const Forward& forward_;
-    std::int32_t lanes_ = 0, capacity_ = 0, full_slots_ = 0, full_splits_ = 0;
+    std::int32_t lanes_ = 0, capacity_ = 0, full_splits_ = 0;
     std::uint32_t vocab_ = 0;
     DeviceBuffer memory_;
     PinnedHostBuffer pinned_;
-    // Caches: per layer K and V, [lanes][8][slots][128] BF16; the Markov context ring [lanes][16][H].
+    // Caches: the sliding layers' K and V, [lanes][8][ring][128] BF16, and the full layer's paged context (full_); the
+    // Markov context ring [lanes][16][H].
     std::uint16_t* cache_k_[3] = {};
     std::uint16_t* cache_v_[3] = {};
     std::int64_t lane_words_[3] = {};
+    DSparkPagedContext full_;
     std::uint16_t* f_ring_ = nullptr;
     // Append workspace: the mixed contexts [3][capacity][H], their K and V [3][capacity][1024].
     std::uint16_t* mixed_[3] = {};

@@ -239,6 +239,52 @@ void rotate_case() {
                 worst.ratio, values_exact ? "bit for bit" : "DIFFER");
     check(worst.ratio <= 1.0, "dspark_rotate outside its bound");
     check(values_exact, "dspark_rotate's values differ from their source");
+    // The full layer: the same keys into lane 1's pages (a page-major pool, a shuffled block-table row) at 4092-4099,
+    // across a page edge: each key head within the bound of its reference, its values bit for bit, every other row
+    // untouched.
+    constexpr int kStride = 80, kPages = 2 * kStride + 2;
+    std::vector<std::int32_t> block_rows(2 * kStride);
+    for (std::size_t i = 0; i < block_rows.size(); ++i) { block_rows[i] = static_cast<std::int32_t>(i); }
+    std::shuffle(block_rows.begin(), block_rows.end(), rng);
+    const std::size_t pool_words = static_cast<std::size_t>(kPages) * 8 * 64 * D;
+    std::uint16_t* pool_k = zeros<std::uint16_t>(pool_words);
+    std::uint16_t* pool_v = zeros<std::uint16_t>(pool_words);
+    for (int r = 0; r < R; ++r) { positions[r] = 4092 + r; }
+    ik::DSparkRotateArgs f = b;
+    f.positions    = upload(positions);
+    f.cache_k      = pool_k;
+    f.cache_v      = pool_v;
+    f.lane_stride  = 0;
+    f.ring         = 0;
+    f.table        = upload(block_rows);
+    f.table_stride = kStride;
+    ik::dspark_rotate(f, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "rotate (paged)");
+    const auto paged_k = download(pool_k, pool_words), paged_v = download(pool_v, pool_words);
+    std::vector<bool> written(pool_words, false);
+    bool paged_exact = true;
+    for (int r = 0; r < R; ++r) {
+        const std::size_t page = static_cast<std::size_t>(block_rows[kStride + positions[r] / 64]);
+        for (int h = 0; h < 8; ++h) {
+            rotate_reference(k.data() + (static_cast<std::size_t>(r) * 8 + h) * D, kw, positions[r], ref);
+            const std::size_t at = ((page * 8 + h) * 64 + positions[r] % 64) * D;
+            for (int d = 0; d < D; ++d) {
+                written[at + d] = true;
+                paged_exact = paged_exact && paged_v[at + d] == v[(static_cast<std::size_t>(r) * 8 + h) * D + d];
+            }
+            double peak = 0;
+            for (double x : ref) { peak = std::max(peak, std::fabs(x)); }
+            for (int d = 0; d < D; ++d) { worst.add(bf(paged_k[at + d]), ref[d], std::ldexp(1.0, -8), std::ldexp(peak, -10)); }
+        }
+    }
+    for (std::size_t i = 0; i < pool_words; ++i) {
+        paged_exact = paged_exact && (written[i] || (paged_k[i] == 0 && paged_v[i] == 0));
+    }
+    std::printf("dspark_rotate (8 key heads into lane 1's pages at 4092-4099): worst %.3f of the bound; values and "
+                "untouched rows %s\n",
+                worst.ratio, paged_exact ? "bit for bit" : "DIFFER");
+    check(worst.ratio <= 1.0, "dspark_rotate (paged) outside its bound");
+    check(paged_exact, "dspark_rotate (paged) wrote the wrong rows");
 }
 
 // ---------------------------------------------------------------------------- attention
@@ -246,13 +292,24 @@ void rotate_case() {
 void attention_case(bool sliding, int first) {
     std::mt19937 rng(sliding ? 13 : 14);
     constexpr int kMaxContext = 2048;
-    const int slots  = sliding ? ik::kDSparkRing : (kMaxContext + 16 + 63) / 64 * 64;
     const int splits = sliding ? (ik::kDSparkWindow + 8 + 127) / 128 : (kMaxContext + 8 + 127) / 128;
-    const std::int64_t lane_words = 8LL * slots * D;
+    // Sliding: each lane's ring [8][ring][128]. Full: a page-major pool [pages][8][64][128] and two lanes' block-table
+    // rows, lane 1's pages a shuffled set (so a key's page comes from the table, not its position).
+    const int stride = (kMaxContext + 8 + 63) / 64, pages = 2 * stride + 3;
+    const std::int64_t lane_words = sliding ? 8LL * ik::kDSparkRing * D : 0;
+    std::vector<std::int32_t> table(2 * static_cast<std::size_t>(stride));
+    for (std::size_t i = 0; i < table.size(); ++i) { table[i] = static_cast<std::int32_t>(i); }
+    std::shuffle(table.begin(), table.end(), rng);
+    const auto offset = [&](int g, int p) -> std::size_t {
+        if (sliding) { return lane_words + (static_cast<std::size_t>(g) * ik::kDSparkRing + p % ik::kDSparkRing) * D; }
+        const std::size_t page = static_cast<std::size_t>(table[static_cast<std::size_t>(stride) + p / 64]);
+        return ((page * 8 + g) * 64 + p % 64) * D;
+    };
+    const std::size_t words = sliding ? 2 * static_cast<std::size_t>(lane_words) : static_cast<std::size_t>(pages) * 8 * 64 * D;
     const int lo = sliding ? std::max(0, first - ik::kDSparkWindow) : 0, hi = first + 8;
-    // Lane 1's keys and values at positions [lo, hi) (each at its slot), the rest of the cache random too.
-    const auto k = random_bf16(2 * static_cast<std::size_t>(lane_words), rng, 1.0);
-    const auto v = random_bf16(2 * static_cast<std::size_t>(lane_words), rng, 1.0);
+    // Lane 1's keys and values at positions [lo, hi) (each at its row), the rest of the cache random too.
+    const auto k = random_bf16(words, rng, 1.0);
+    const auto v = random_bf16(words, rng, 1.0);
     const auto q = random_bf16(8ULL * 24 * D, rng, 0.35);
     ik::DSparkAttentionArgs a;
     a.q           = upload(q);
@@ -260,7 +317,10 @@ void attention_case(bool sliding, int first) {
     a.cache_v     = upload(v);
     a.lane_stride = lane_words;
     a.ring        = sliding ? ik::kDSparkRing : 0;
-    a.slots_full  = slots;
+    if (!sliding) {
+        a.table        = upload(table);
+        a.table_stride = stride;
+    }
     a.splits      = splits;
     a.round       = upload(std::vector<ik::DSparkRound>{{first, 0, 1}});
     a.scratch     = zeros<float>(ik::dspark_attention_scratch_bytes(splits) / 4);
@@ -277,11 +337,9 @@ void attention_case(bool sliding, int first) {
             std::vector<double> s;
             double top = -1e300;
             for (int p = lo; p < hi; ++p) {
-                const int slot = sliding ? p % ik::kDSparkRing : p;
-                double dot     = 0;
+                double dot = 0;
                 for (int d = 0; d < D; ++d) {
-                    dot += bf(q[(static_cast<std::size_t>(row) * 24 + h) * D + d]) *
-                           bf(k[lane_words + (static_cast<std::size_t>(g) * slots + slot) * D + d]);
+                    dot += bf(q[(static_cast<std::size_t>(row) * 24 + h) * D + d]) * bf(k[offset(g, p) + d]);
                 }
                 s.push_back(dot / std::sqrt(128.0));
                 top = std::max(top, s.back());
@@ -290,10 +348,7 @@ void attention_case(bool sliding, int first) {
             for (double& x : s) { sum += x = std::exp(x - top); }
             for (int d = 0; d < D; ++d) {
                 double o = 0;
-                for (int p = lo; p < hi; ++p) {
-                    const int slot = sliding ? p % ik::kDSparkRing : p;
-                    o += s[static_cast<std::size_t>(p - lo)] * bf(v[lane_words + (static_cast<std::size_t>(g) * slots + slot) * D + d]);
-                }
+                for (int p = lo; p < hi; ++p) { o += s[static_cast<std::size_t>(p - lo)] * bf(v[offset(g, p) + d]); }
                 worst.add(bf(got[(static_cast<std::size_t>(row) * 24 + h) * D + d]), o / sum, std::ldexp(1.0, -8),
                           std::ldexp(vmax, -12));
             }

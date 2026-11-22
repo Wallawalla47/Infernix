@@ -1,12 +1,19 @@
 #include "runtime/engine/inkling2_instance.h"
 
 #include "core/device.h"
+#include "core/host_memory.h"
+#include "core/vram_budget.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/load.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/engine_plan.h"
+#include "runtime/engine/expert_memory.h"
+#include "runtime/engine/model_instance.h"
+#include "runtime/expert_offload/memory_plan.h"
 
 #include <chrono>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -48,7 +55,41 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
             .vision            = options.enable_vision,
             .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
             .kv_codec          = models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
+            .prefix_cache      = options.context_cache.enabled && options.purpose == EnginePurpose::Generation,
+            .prefix_host_bytes = options.context_cache.host_capacity_bytes.value_or(0U),
+            .prefix_max_new_taps   = options.context_cache.hybrid.max_new_taps.value_or(8U),
+            .prefix_ladder_tokens  = options.context_cache.hybrid.tap_ladder_tokens.value_or(4096U),
+            .prefix_min_gap_tokens = options.context_cache.hybrid.tap_min_gap_tokens.value_or(1024U),
+            .prefix_save           = options.context_cache.hybrid.persistent_save,
             .diagnostics       = options.diagnostic_observer};
+}
+
+// The prefix cache's Device pool: with --kv-capacity auto every page the free VRAM holds beside the Program's other
+// buffers and the display headroom (the lanes' contexts first, the rest cache-only), else the explicit capacity; never
+// less than every lane's context.
+std::uint32_t cache_pool_pages(const EngineOptions& options, models::inkling2::ProgramOptions program,
+                               const models::inkling2::Config& config, std::uint64_t free_bytes, std::uint64_t headroom) {
+    const std::uint64_t lanes = static_cast<std::uint64_t>(models::inkling2::pages_per_lane(options.max_context)) *
+                                options.max_concurrency;
+    if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+        const std::uint64_t asked =
+            (std::uint64_t{options.kv_capacity.explicit_tokens} + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit;
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(std::max(asked, lanes), 0x7FFFFFF0U));
+    }
+    program.kv_pages                                = 0;
+    const models::inkling2::ProgramDevicePlan plan = models::inkling2::Program::plan_device(program, config);
+    const std::uint64_t used                       = plan.fixed_bytes() + headroom;
+    const std::uint64_t extra = free_bytes > used && plan.page_bytes != 0 ? (free_bytes - used) / plan.page_bytes : 0U;
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(lanes + extra, 0x7FFFFFF0U));
+}
+
+// --host-context-mib auto: the Host tier takes the RAM the plan (its pinned weights) leaves beyond --ram-free-mib, as
+// the other models' tiers do (expert_memory.h).
+std::uint64_t cache_host_bytes(const EngineOptions& options, std::uint64_t pinned_bytes, const VramSnapshot& vram) {
+    if (options.context_cache.host_capacity_bytes) { return *options.context_cache.host_capacity_bytes; }
+    const expert_offload::HostMemoryDemand demand =
+        expert_ram_demand(options, {.expert_banks = 0, .other_pinned = pinned_bytes}, 0, vram);
+    return auto_host_context_bytes(expert_offload::plan_host_memory(host_memory_snapshot(), demand));
 }
 
 std::string read_text(const std::filesystem::path& path) {
@@ -63,7 +104,11 @@ std::string read_text(const std::filesystem::path& path) {
 
 bool artifact_is_inkling2(const artifact::Reader& reader) { return models::inkling2::is_inkling2(reader); }
 
-EngineOptions normalize_inkling2_options(EngineOptions options) {
+bool artifact_has_inkling2_drafter(const artifact::Reader& reader) {
+    return reader.directory().components.contains("dspark");
+}
+
+EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter) {
     refuse(options.lossless || options.reference, "the lossless and reference routes are a later milestone");
     refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
     refuse(options.a8_activations, "--a8-activations is not built for Inkling 2 yet");
@@ -95,6 +140,12 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
                             "FP16 values; the output differs from bf16's)");
     }
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
+    refuse(options.rope_yarn_factor != 1.0F, "--rope-yarn does not apply: the model has no RoPE (its relative attention "
+                                             "and log-scaled scores reach 1,048,576 positions natively)");
+    if (options.embedding_host) {
+        report(options, "Inkling 2: --embedding-host: the token embedding (0.86 GiB) stays in pinned host memory, its "
+                        "rows read over the link");
+    }
     refuse(!options.enable_vision && options.vision_offload == VisionOffload::On, "--vision-offload on needs --vision");
     if (options.enable_vision && options.vision_offload == VisionOffload::On) {
         report(options, "Inkling 2: --vision-offload on: the vision tower's weights (~0.6 GiB) stay in pinned host memory "
@@ -107,7 +158,8 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
     }
     refuse(!options.ngram_volume_path.empty() || options.speculative.ngram_draft_tokens != 0,
            "no n-gram drafting");
-    refuse(options.max_context_auto, "--max-context auto is not resolved yet: give a context limit");
+    refuse(options.max_context_auto && options.purpose != EnginePurpose::Generation,
+           "--max-context auto sizes a generation server: causal scoring takes N");
     refuse(options.max_concurrency == 0 || options.max_concurrency > models::inkling2::kMaximumConcurrency,
            "max_concurrency must be 1-8");
     // 4,096: the fastest chunk measured on the prompt route (2026-11-21, infernix_bench C = 1, pp2048 / pp10000 tok/s:
@@ -116,15 +168,47 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
     if (options.prefill_chunk == 0) { options.prefill_chunk = models::inkling2::kDefaultPrefillChunk; }
     refuse(options.prefill_chunk > static_cast<std::uint32_t>(models::inkling2::kMaxPrefillChunk),
            "prefill chunks are at most 8191 columns");
-    if (options.context_cache.enabled) {
-        options.context_cache.enabled = false;
-        report(options, "Inkling 2: the prefix cache is not available yet; it is off");
+    // The prefix cache (models/inkling2/program/prefix_cache.h): generation only, its snapshots born in the Host tier.
+    ContextCacheOptions& cache = options.context_cache;
+    if (options.purpose != EnginePurpose::Generation) { cache.enabled = false; }
+    if (cache.enabled) {
+        HybridPrefixCacheOptions& hybrid = cache.hybrid;
+        refuse(cache.host_capacity_bytes && *cache.host_capacity_bytes == 0,
+               "the prefix cache keeps its snapshots in the Host tier: --host-context-mib must be positive");
+        refuse(hybrid.device_snapshot_slots.value_or(0U) != 0, "the prefix cache has no Device snapshot slots");
+        refuse(hybrid.host_state_precision != HybridHostStatePrecision::Fp32,
+               "the prefix cache keeps snapshot state exact (--cache-host-state fp32)");
+        refuse(hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0,
+               "the prefix cache has no tool-call holds");
+        refuse(hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0,
+               "no idle next-turn prefill yet");
+        refuse(cache.ssd_capacity_bytes != 0, "the prefix cache has no SSD tier yet");
+        hybrid.device_snapshot_slots   = 0U;
+        hybrid.tool_call_hold          = std::chrono::milliseconds{0};
+        hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{0};
+        hybrid.max_new_taps            = hybrid.max_new_taps.value_or(8U);
+        hybrid.tap_ladder_tokens = hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * options.prefill_chunk));
+        hybrid.tap_min_gap_tokens = hybrid.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, options.prefill_chunk));
+    } else {
+        cache.host_capacity_bytes = 0U;
     }
     SpeculativeOptions& spec = options.speculative;
     if (spec.backend_auto) {
-        spec.backend      = SpeculativeBackend::None;
+        // As the Qwen families' --spec auto: the choice follows the drafter's --draft-tokens auto calibration.
+        if (!spec.draft_tokens_auto) { throw std::invalid_argument("--spec auto chooses the drafter: it takes --draft-tokens auto"); }
         spec.backend_auto = false;
-        report(options, "Inkling 2: --spec auto decodes without a drafter (--spec dspark drafts with the bundled one)");
+        if (options.purpose != EnginePurpose::Generation) {
+            spec.backend = SpeculativeBackend::None;
+        } else if (options.lossless || options.reference) {
+            spec.backend = SpeculativeBackend::None;
+            report(options, "Inkling 2: --spec auto: no speculation on the lossless and reference routes");
+        } else if (bundled_drafter) {
+            spec.backend = SpeculativeBackend::DSpark;
+            report(options, "Inkling 2: --spec auto drafts with the bundled DSpark drafter (--draft-tokens auto)");
+        } else {
+            spec.backend = SpeculativeBackend::None;
+            report(options, "Inkling 2: --spec auto: the artifact bundles no drafter (convert with --components text,dspark)");
+        }
     }
     if (spec.backend == SpeculativeBackend::DSpark) {
         refuse(options.purpose != EnginePurpose::Generation, "DSpark drafts for generation only");
@@ -148,16 +232,55 @@ Inkling2Instance::Inkling2Instance(std::unique_ptr<models::inkling2::Model> sour
 
 Inkling2Instance::~Inkling2Instance() = default;
 
-ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceContext& device, EnginePlan* planned) {
+namespace {
+
+// The largest context every lane's KV holds beside the weights in `free_bytes` less the display headroom (each of the
+// --max-concurrency lanes reserves its whole context, so no request is ever paused), up to the model's positions, on
+// the 64-position page grid; empty when none fits. `vision_host`: the tower's pinned groups, as the Program plans them.
+std::optional<std::uint32_t> largest_context(const EngineOptions& options, const models::inkling2::Config& config,
+                                             const models::inkling2::VisionHostWeights* vision_host,
+                                             std::uint64_t free_bytes, std::uint64_t headroom) {
+    const auto fits = [&](std::uint32_t context) {
+        EngineOptions trial                      = options;
+        trial.max_context                        = context;
+        models::inkling2::ProgramOptions program = program_options(trial);
+        program.vision_host                      = vision_host;
+        return models::inkling2::Program::plan_device(program, config).fixed_bytes() + headroom <= free_bytes;
+    };
+    const auto found = largest_fitting_context(config.text.max_position_embeddings, options.max_context, fits);
+    if (!found) { return std::nullopt; }
+    const std::uint32_t unit = static_cast<std::uint32_t>(ops::inkling2::kKeyUnit);
+    return *found >= unit ? *found / unit * unit : *found;
+}
+
+} // namespace
+
+ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceContext& device, EnginePlan* planned) {
     const auto start = std::chrono::steady_clock::now();
-    const artifact::Reader reader(options.artifact_path);
+    const artifact::Reader reader(requested.artifact_path);
     if (!models::inkling2::is_inkling2(reader)) { throw std::invalid_argument("artifact is not Inkling2LoopForCausalLM"); }
+    EngineOptions options    = requested; // --max-context auto resolves below
     models::LoadOptions load = models::load_options(options, models::Architecture::Inkling2Loop);
     auto plan                = models::inkling2::plan_load(reader, load);
-    models::inkling2::ProgramOptions program = program_options(options);
-    program.vision_host = plan.vision_host() ? &*plan.vision_host() : nullptr; // the plan's until materialized
-    const models::inkling2::ProgramDevicePlan device_plan = models::inkling2::Program::plan_device(program, plan.config());
+    const VramSnapshot vram  = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+    const std::uint64_t headroom =
+        expert_offload::display_headroom(vram.display, false, options.vram_headroom_bytes);
     if (planned != nullptr) {
+        // Engine::plan: the free memory a start reads after its weights, so the largest context is the start's.
+        const std::uint64_t free_after = planned_free_after_weights(free_device_bytes(vram), plan.device_bytes());
+        const auto* vision_host        = plan.vision_host() ? &*plan.vision_host() : nullptr;
+        planned->max_context           = largest_context(options, plan.config(), vision_host, free_after, headroom);
+        if (options.max_context_auto) {
+            if (!planned->max_context) {
+                plan_refuse(*planned, "--max-context auto: no context fits beside the weights in the free VRAM");
+            } else {
+                options.max_context = *planned->max_context;
+            }
+        }
+        models::inkling2::ProgramOptions program = program_options(options);
+        program.vision_host                      = vision_host;
+        if (program.prefix_cache) { program.kv_pages = cache_pool_pages(options, program, plan.config(), free_after, headroom); }
+        const models::inkling2::ProgramDevicePlan device_plan = models::inkling2::Program::plan_device(program, plan.config());
         planned->architecture                   = std::string(models::architecture_name(models::Architecture::Inkling2Loop));
         planned->vram.weights_bytes             = plan.device_bytes();
         planned->vram.kv_bytes                  = device_plan.kv;
@@ -167,8 +290,37 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         return {};
     }
     std::string template_override;
+    const std::uint64_t pinned_bytes = plan.materialization().pinned_capacity_bytes;
     auto model = models::inkling2::materialize_model(std::move(plan), device, &options.startup_observer);
-    program.vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
+    const auto* vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
+    if (options.max_context_auto) {
+        const VramSnapshot after = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+        const auto context       = largest_context(options, model->config(), vision_host, free_device_bytes(after), headroom);
+        if (!context) { throw std::runtime_error("--max-context auto: no context fits beside the weights in the free VRAM"); }
+        options.max_context = *context;
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "--max-context auto: %u tokens, the largest context each of the %u lanes holds here (every "
+                           "lane reserves its whole context: no request is paused)",
+                           options.max_context, options.max_concurrency);
+    }
+    models::inkling2::ProgramOptions program = program_options(options);
+    program.vision_host                      = vision_host;
+    if (program.prefix_cache) {
+        const VramSnapshot now                     = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+        options.context_cache.host_capacity_bytes  = cache_host_bytes(options, pinned_bytes, now);
+        program.prefix_host_bytes                  = *options.context_cache.host_capacity_bytes;
+        program.kv_pages = cache_pool_pages(options, program, model->config(), free_device_bytes(now), headroom);
+        const models::inkling2::ProgramDevicePlan sized = models::inkling2::Program::plan_device(program, model->config());
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const std::uint64_t lane_pages =
+            static_cast<std::uint64_t>(models::inkling2::pages_per_lane(options.max_context)) * options.max_concurrency;
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Inkling 2: prefix cache: %u KV pages (%.1f GiB: the lanes' contexts and %llu pages of cached "
+                           "blocks), Host tier %.1f GiB",
+                           sized.kv_pages - 1U, static_cast<double>(sized.kv) / kGiB,
+                           static_cast<unsigned long long>(sized.kv_pages - 1U > lane_pages ? sized.kv_pages - 1U - lane_pages : 0U),
+                           static_cast<double>(program.prefix_host_bytes) / kGiB);
+    }
     const auto& packed = model->packed();
     if (packed.source_bytes != 0) {
         constexpr double kMiB = 1024.0 * 1024.0;
@@ -192,6 +344,31 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         instance->frontend = models::inkling2::Frontend(resources, frontend_options(*instance->model, options));
     }
     instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
+    // --prefix-cache-file: the Host tier restored from a file written for this artifact and these options (the KV
+    // format, the drafter, the 8-bit weights and 16-bit expert activations change what the cache holds).
+    LoadSummary::PrefixCacheRestore restore;
+    if (program.prefix_cache && !options.context_cache.hybrid.persistent_file.empty()) {
+        std::string signature = "inkling2";
+        signature += ";q8=" + std::to_string(options.q8_weights ? 1 : 0);
+        signature += ";a16=" + std::to_string(options.expert_a16_activations ? 1 : 0);
+        signature += ";vision=" + std::to_string(options.enable_vision ? 1 : 0);
+        const runtime::prefix_cache::PersistResult loaded = instance->program->attach_prefix_cache_file(
+            options.context_cache.hybrid.persistent_file, hybrid_cache_fingerprint(options, signature, device.props),
+            options.startup_observer);
+        restore = LoadSummary::PrefixCacheRestore{
+            .attempted           = true,
+            .restored            = loaded.ok,
+            .message             = loaded.message,
+            .blocks              = loaded.blocks,
+            .snapshots           = loaded.snapshots,
+            .bytes               = loaded.bytes,
+            .seconds             = loaded.seconds,
+            .saved_blocks        = loaded.saved_blocks,
+            .saved_snapshots     = loaded.saved_snapshots,
+            .required_host_bytes = loaded.required_host_bytes,
+            .host_bytes          = loaded.host_bytes,
+        };
+    }
 
     const auto& stats = instance->model->storage_stats();
     const auto& text  = instance->model->config().text;
@@ -210,6 +387,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     if (instance->model->q8().source_bytes != 0) { summary.weight_formats.push_back("q8_g32_fp16"); }
     summary.fast_paths_disabled  = !options.fast_paths;
     summary.request_invariant    = true; // every route is column-invariant and the decode rows independent
+    summary.prefix_cache         = std::move(restore);
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

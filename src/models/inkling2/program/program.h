@@ -10,6 +10,7 @@
 // call runs the same per-column bits; the wide-route milestone moves each Op's pass loop inside its kernel), decode
 // rounds are B lanes x 1 column as CUDA graphs per (B, T) captured at startup.
 
+#include "core/startup.h"
 #include "infernix/types.h"
 #include "models/inkling2/execution/parameters.h"
 #include "models/inkling2/frontend/frontend.h"
@@ -43,6 +44,7 @@ namespace detail {
 class ProgramImpl;
 struct BasePlanImpl;
 struct ContractAccess;
+struct QuoteImpl;
 } // namespace detail
 
 inline constexpr std::size_t kMaximumConcurrency = 8;
@@ -109,10 +111,12 @@ private:
     friend struct detail::ContractAccess;
 };
 
-// A root start (the only source without a prefix cache).
+// A root start, or (quote set) a prefix-cache snapshot the binding restores.
 struct SourceCandidate {
     std::uint32_t reused_tokens    = 0;
+    std::shared_ptr<const detail::QuoteImpl> quote;
     PrefixReusePath reuse_path     = PrefixReusePath::Root;
+    // The prompt prefix held as cached full blocks, reusable or not (diagnostics).
     std::uint32_t cached_block_tokens = 0;
 };
 
@@ -294,8 +298,23 @@ struct ProgramOptions {
     const VisionHostWeights* vision_host = nullptr;
     // --kv-dtype: the full visits' pools (sliding windows stay BF16 K / FP16 V).
     ops::inkling2::KvCodec kv_codec = ops::inkling2::KvCodec::Bf16;
+    // The full visits' pool: at least every lane's whole context (pages_per_lane(max_context) a lane); more holds
+    // the prefix cache's blocks. 0: every lane's whole context.
+    std::uint32_t kv_pages = 0;
+    // The prefix cache (generation only; prefix_cache.h): its pinned Host tier, which holds every snapshot, and the
+    // tap planner's limits. Off: no request reuses or publishes anything.
+    bool prefix_cache                = false;
+    std::uint64_t prefix_host_bytes  = 0;
+    std::uint32_t prefix_max_new_taps   = 8;
+    std::uint32_t prefix_ladder_tokens  = 4096;
+    std::uint32_t prefix_min_gap_tokens = 1024;
+    // The product's control over the shutdown save (--prefix-cache-file; a second Ctrl+C abandons it).
+    PrefixCacheSaveControl prefix_save;
     DiagnosticObserver diagnostics;
 };
+
+// A lane's block-table row: the pages of max_context positions and of a call's write lead past them.
+[[nodiscard]] std::uint32_t pages_per_lane(std::uint32_t max_context) noexcept;
 
 // --kv-dtype's forms of the full visits' pools: the KvCodec of a storage (none: not built for Inkling 2), and back.
 [[nodiscard]] std::optional<ops::inkling2::KvCodec> kv_codec(KvCacheStorage storage);
@@ -303,7 +322,9 @@ struct ProgramOptions {
 
 // Device memory the Program allocates, from the options and the configuration alone.
 struct ProgramDevicePlan {
-    std::uint32_t kv_pages      = 0; // every lane's pages: lanes x ceil((max_context + 16) / 64)
+    std::uint32_t kv_pages      = 0; // the pool's pages (scratch page included): max(options.kv_pages, lanes x
+                                     // pages_per_lane(max_context)) + 1
+    std::uint64_t page_bytes    = 0; // one page of every full visit's K and V planes (side records included)
     std::uint64_t kv            = 0; // the full visits' K and V pools and the block table
     std::uint64_t state         = 0; // the lanes' state images
     std::uint64_t workspace     = 0; // the Forward's call buffers and the sampling workspace
@@ -378,24 +399,28 @@ public:
         return std::nullopt;
     }
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept { return 16; }
-    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_prefix_cache_now(const CancellationView&) {
-        return std::nullopt;
-    }
+    // --prefix-cache-file: restores the Host tier from `path` (a file written for this fingerprint), and saves it there
+    // at shutdown (shutdown_cleanup) and whenever save_prefix_cache_now runs (the periodic save).
+    [[nodiscard]] runtime::prefix_cache::PersistResult attach_prefix_cache_file(const std::filesystem::path& path,
+                                                                                std::string fingerprint,
+                                                                                const StartupObserver& observer);
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_prefix_cache_now(const CancellationView& abandoned);
+    // The shutdown save's result (empty: none ran).
+    [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save() const;
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept { return std::nullopt; }
-    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept { return {}; }
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
-    // No prefix cache: nothing to prefetch, reclaim or hold.
+    // Every lane reserves its whole context, so the cache never has to give up room for a lane (a binding evicts what
+    // it needs itself), and no prefetch, queue hold or tool-call hold is built.
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&, bool = false) {
         return std::nullopt;
     }
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage) { return false; }
-    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
     void hybrid_hold_queue(std::span<const RequestBasePlan* const>, std::span<const ResumeState* const>) {}
-    void hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
-        throw std::logic_error("Inkling 2: the prefix cache has no tool-call holds");
-    }
+    void hybrid_hold_continuation(std::chrono::steady_clock::time_point) {}
     // Every lane's KV is reserved at startup, so no shortage ever pauses a request.
     [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle) const noexcept { return 0; }
     [[nodiscard]] bool start_pause(SequenceHandle, runtime::ExecutionTiming* = nullptr) {

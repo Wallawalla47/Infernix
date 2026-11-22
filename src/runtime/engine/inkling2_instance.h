@@ -44,10 +44,13 @@ struct ConstructedInkling2 {
 
 // True when the artifact's text component is Inkling2LoopForCausalLM.
 [[nodiscard]] bool artifact_is_inkling2(const artifact::Reader& reader);
+// True when the artifact bundles the DSpark drafter (its dspark component).
+[[nodiscard]] bool artifact_has_inkling2_drafter(const artifact::Reader& reader);
 
-// The options this slice runs (models/inkling2/program/program.h): the prefix cache, speculation, the n-gram archive,
-// preemption and next-turn prefill off, the context limit's KV reserved for every lane; refuses what it cannot run.
-[[nodiscard]] EngineOptions normalize_inkling2_options(EngineOptions options);
+// The options this slice runs (models/inkling2/program/program.h): the prefix cache, the n-gram archive, preemption and
+// next-turn prefill off, the context limit's KV reserved for every lane; --spec auto drafts with the bundled DSpark
+// drafter when `bundled_drafter` (generation, not --lossless); refuses what it cannot run.
+[[nodiscard]] EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter);
 
 // With `plan` (Engine::plan) the construction stops before any weight is read: the device plan lands in *plan and the
 // result is empty.

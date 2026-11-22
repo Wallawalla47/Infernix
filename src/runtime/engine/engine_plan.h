@@ -24,6 +24,12 @@ namespace infernix::runtime {
 void plan_readings(EnginePlan& plan, std::string gpu_name, const VramSnapshot& vram, const HostMemorySnapshot& host,
                    const EngineOptions& options);
 
+// The free device memory a start sizes its KV against: cudaMemGetInfo's, bounded under WDDM by the OS
+// budget less this process's usage, as the expert frames are (size_expert_frames). The two differ (an RTX
+// 5090: 24.10 GiB free against 21.88 the budget left, Basalt #28), and a KV sized past the budget is
+// demoted to system memory, which the Program's spill guard refuses at startup (candidates VR-04).
+[[nodiscard]] std::size_t free_device_bytes(const VramSnapshot& s) noexcept;
+
 // A start's memory refusal: the plan does not fit, and the first refusal is its error.
 void plan_refuse(EnginePlan& plan, std::string refusal);
 

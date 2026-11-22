@@ -600,11 +600,35 @@ integrates over positions outside the window.
 
 ### 7.4 Prefix cache
 
-A snapshot is the StateImage (rings whole at the snapshot frontier: [§14.4](#144-window-rings-and-taps-in-prefill)) plus
-the Main and Draft Full pages of its path, as for Qwen3.5's hybrid layers. Taps, endpoint and output-boundary snapshots,
-the Host slab tier, persistence and eviction are the [hybrid prefix cache](hybrid-prefix-cache-spec.md)'s, unchanged;
-this family supplies the image layout, the tap Op (a Device copy of the image) and its cost coefficients (103 / 182
-MiB per image; ~4-8 ms to restore over PCIe against ~0.3 s to recompute 4K).
+Built 2026-11-22 (`src/models/inkling2/program/prefix_cache.{h,cpp}`, the Program's admission, prefill and release),
+on the [hybrid prefix cache](hybrid-prefix-cache-spec.md)'s index, tap planner, cost model and Host slab store, in the
+form Qwen3.8-Flash-Next's binding takes:
+
+- **Pages.** The full visits' pools are one core `DeviceKVPagePool` of page-major planes (`[pages][8][64][row]`: a
+  page is one contiguous run in each plane, so Host records copy whole pages), the lanes' block-table rows a
+  `KVExecutionTablePool`. With DSpark the pool has two more planes, the drafter's full layer's K and V (BF16), read
+  and written through the same rows, so a cached page carries the drafter's context with the model's. A lane
+  reserves its whole context at its binding and maps a page when a call (or a draft's block rows) first writes into
+  it; an unmapped row names a scratch page. Every lane's context fits the pool, so a binding always gets its pages
+  (evicting cached blocks, or waiting for a Host write to land): no request is paused.
+- **Snapshots are Host-born.** A tap copies the lane's StateImage (window rings, conv rings) and the drafter's sliding
+  rings straight to reserved Host slabs, and its partial page as the tail record; the lane's next call waits for the
+  copy. No Device snapshot slots. An image copied after a call ending at `end` serves every frontier in
+  `[end - 29, end]` (the conv rings' 32 slots hold the 3 taps before it; 15 with DSpark, whose Markov ring keeps 16
+  rows), so a tap splits a prompt call only when it lies further back; the prompt-end tap is the image after the
+  prompt's last call, labelled `n - 1`.
+- **Only prompt-computed state is published**: blocks whose 64 positions were prefilled, and taps. No endpoint and no
+  decode-computed block (they would make a resumed request's output depend on what the cache held), so a resumed
+  request's output equals a cold run's, bit for bit, on every route: the prompt route is chunk-invariant. The
+  drafter's context depends on its call widths (projections_dmma at 16 columns or fewer, projections_mma above),
+  which changes drafts only.
+- **Persistence** (`--prefix-cache-file`): the common file format, Inkling's magic and geometry (slab, page record,
+  the image's parts); the fingerprint adds the KV format, drafter, `--q8-weights`, `--a16-activations` and vision.
+- **Not built yet**: the SSD tier, next-turn prefill, tool-call holds, queue holds and prefetching for waiting
+  requests.
+
+Sizes: an image is 190 MiB (BF16 rings) plus 9 MiB of drafter rings; restoring one takes ~8 ms over the PCIe link,
+against ~0.25 s to recompute 4K tokens.
 
 The alternative (TokenSpeed's): window K/V in a paged pool whose pages behind the window are freed unless a cached
 path holds them, with each page carrying its convs' checkpoints, so any page boundary is a restore point and
@@ -1203,7 +1227,9 @@ Built with `--vision` (images; no video). The semantics, from transformers' `Ink
   prompt chunk, right after the embedding and its norm, encodes the images it overlaps (an image across chunks once)
   and copies their rows over its embedding columns, as the reference scatters them after `embed_norm`. Scoring does
   the same. The text model has no positional encoding beyond the relative bias, so image tokens are ordinary positions
-  (no MRoPE). The images ride in the request's base plan (no prefix cache yet: its media keys come with M4).
+  (no MRoPE). The images ride in the request's base plan; the prefix cache keys each block by the images that begin
+  before its end (a hash of each image's processed patches and its placement), and no resume point lies inside an
+  image or past its start in its first block (tap_planner.h media_exclusion).
 - **Offload** (`--vision-offload on`; `auto` keeps it off for Inkling 2): the loader binds the tower's weights
   HostPinned (`Model::vision_host()`: each group's objects with their pinned and staging offsets); the tower keeps a
   device region of the patch embedding, position table, class row, pre-norm and projector (uploaded once) and two

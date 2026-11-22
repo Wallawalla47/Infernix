@@ -650,7 +650,7 @@ std::size_t kv_row(const Problem& p, int lane, int head, int pos) {
         return ((std::size_t(lane * NKV + head) * ik::kWindowRingPages + page) * U + pos % U) * D;
     }
     const int page = p.block_table[std::size_t(lane) * kTableStride + pos / U];
-    return ((std::size_t(head) * kPoolPages + page) * U + pos % U) * D;
+    return ((std::size_t(page) * NKV + head) * U + pos % U) * D; // page-major pool
 }
 
 Problem make_problem(bool full, const Call& call, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf16) {
@@ -1309,7 +1309,7 @@ void prompt_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec:
     std::snprintf(names[2], sizeof names[2], "  %s: calls of 37, 64, 49 = one call", kind);
     const auto row_of = [&](int head, int pos) -> std::size_t {
         if (!full) { return ((std::size_t(head) * pages + (pos / U) % pages) * U + pos % U) * D; }
-        return ((std::size_t(head) * kPoolPages + block_table[pos / U]) * U + pos % U) * D;
+        return ((std::size_t(block_table[pos / U]) * NKV + head) * U + pos % U) * D; // page-major pool
     };
     // Device state.
     std::uint16_t *dq = upload(q), *dr = upload(r), *dk = upload(k), *dv = upload(v), *dsink = upload(sink);

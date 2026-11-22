@@ -43,20 +43,35 @@ void taps(std::int32_t i, std::int32_t n, std::int32_t side, std::int32_t (&inde
     }
 }
 
-// --vision-offload on: a pointer inside a group's pinned objects, at its place in the group's device region.
-const std::byte* staged(const VisionStagingGroup& group, std::byte* region, const std::byte* block, const void* p) {
+// The pinned block holding the offloaded tower: its host address (linear operands name it there) and its device-mapped
+// address (direct parameters name it there: execution/parameters.cpp reads every direct weight where device code
+// reads it, which under WDDM may differ).
+struct PinnedBase {
+    const std::byte* host   = nullptr;
+    const std::byte* device = nullptr;
+};
+
+// --vision-offload on: a pointer inside a group's pinned objects (at either address of the block), at its place in the
+// group's device region.
+const std::byte* staged(const VisionStagingGroup& group, std::byte* region, const PinnedBase& block, const void* p) {
     if (p == nullptr) { return nullptr; }
-    const auto at = static_cast<std::size_t>(static_cast<const std::byte*>(p) - block);
-    for (const VisionStagingSegment& s : group.segments) {
-        if (at >= s.pinned_offset && at < s.pinned_offset + s.bytes) { return region + s.staging_offset + (at - s.pinned_offset); }
+    const auto* q = static_cast<const std::byte*>(p);
+    for (const std::byte* base : {block.host, block.device}) {
+        if (base == nullptr || q < base) { continue; }
+        const auto at = static_cast<std::size_t>(q - base);
+        for (const VisionStagingSegment& s : group.segments) {
+            if (at >= s.pinned_offset && at < s.pinned_offset + s.bytes) {
+                return region + s.staging_offset + (at - s.pinned_offset);
+            }
+        }
     }
     throw std::logic_error("Inkling 2 vision: an offloaded weight lies outside its staged group");
 }
-const std::uint16_t* staged(const VisionStagingGroup& group, std::byte* region, const std::byte* block,
+const std::uint16_t* staged(const VisionStagingGroup& group, std::byte* region, const PinnedBase& block,
                             const std::uint16_t* p) {
     return reinterpret_cast<const std::uint16_t*>(staged(group, region, block, static_cast<const void*>(p)));
 }
-Weight staged(const VisionStagingGroup& group, std::byte* region, const std::byte* block, const Weight& w) {
+Weight staged(const VisionStagingGroup& group, std::byte* region, const PinnedBase& block, const Weight& w) {
     Weight out  = w;
     out.payload = staged(group, region, block, w.payload);
     out.qdata   = staged(group, region, block, w.qdata);
@@ -128,7 +143,7 @@ VisionTower::VisionTower(const VisionConfig& config, const VisionOperands& opera
         auto* resident    = static_cast<std::byte*>(staging_.p);
         slot_[0]          = resident + aligned(host_->resident.bytes);
         slot_[1]          = slot_[0] + aligned(host_->slot_bytes);
-        const std::byte* b = host_->block;
+        const PinnedBase b{host_->block, host_->block_device};
         const VisionStagingGroup& r = host_->resident;
         staged_                 = operands;
         staged_.patch_embedding = staged(r, resident, b, operands.patch_embedding);
@@ -163,7 +178,7 @@ VisionTower::VisionTower(const VisionConfig& config, const VisionOperands& opera
             CUDA_CHECK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
         }
         // The resident region once: the patch embedding, the position table, the class row, the pre-norm, the projector.
-        upload_group(r, resident, b, transfer_);
+        upload_group(r, resident, b.host, transfer_);
         CUDA_CHECK(cudaStreamSynchronize(transfer_));
     }
     const Layout l(c_, max_cells);

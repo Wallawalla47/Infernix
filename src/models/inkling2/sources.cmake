@@ -20,4 +20,5 @@ target_sources(infernix_model_runtime PRIVATE
 # Program: lanes, state, the Forward's calls, sampling and commit behind the common EngineCore.
 target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix_cache.cpp"
 )

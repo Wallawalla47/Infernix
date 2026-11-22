@@ -21,9 +21,6 @@ constexpr std::int32_t kSplitKeys = 128;
 
 std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 
-std::int32_t full_slots(std::uint32_t max_context) {
-    return static_cast<std::int32_t>((static_cast<std::uint64_t>(max_context) + 16 + 63) / 64 * 64);
-}
 std::int32_t full_splits(std::uint32_t max_context) {
     return static_cast<std::int32_t>((static_cast<std::uint64_t>(max_context) + kB + kSplitKeys - 1) / kSplitKeys);
 }
@@ -46,9 +43,11 @@ struct Layout {
 template <class Add>
 void walk(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity, std::uint32_t vocab, Layout& b,
           Add&& add) {
+    (void)max_context; // the full layer's context is the Program's pages
     const std::size_t L = static_cast<std::size_t>(lanes), T = static_cast<std::size_t>(capacity);
     for (int l = 0; l < 3; ++l) {
-        const std::size_t slots = l == 1 ? static_cast<std::size_t>(full_slots(max_context)) : ik::kDSparkRing;
+        if (l == 1) { continue; } // the full layer's context: the Program's pages (DSparkPagedContext)
+        const std::size_t slots = ik::kDSparkRing;
         add(b.cache_k[l], L * ik::kDSparkKvHeads * slots * ik::kDSparkHeadDim * 2);
         add(b.cache_v[l], L * ik::kDSparkKvHeads * slots * ik::kDSparkHeadDim * 2);
     }
@@ -109,9 +108,9 @@ std::size_t Drafter::device_bytes(std::int32_t lanes, std::uint32_t max_context,
 }
 
 Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int32_t lanes, std::uint32_t max_context,
-                 std::int32_t capacity)
+                 std::int32_t capacity, const DSparkPagedContext& full)
     : p_(parameters), d_(parameters.dspark.value()), forward_(forward), lanes_(lanes), capacity_(capacity),
-      full_slots_(full_slots(max_context)), full_splits_(full_splits(max_context)),
+      full_splits_(full_splits(max_context)),
       vocab_(parameters.model.config().text.vocab_size),
       pinned_(align(sizeof(ik::DSparkRound)) + align(kB * 4) + align(kB * 4)) {
     if (d_.layers.size() != 3 || !d_.layers[0].sliding || d_.layers[1].sliding || !d_.layers[2].sliding) {
@@ -135,9 +134,15 @@ Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int3
         mixed_[l]      = b.mixed[l];
         ctx_k_[l]      = b.ctx_k[l];
         ctx_v_[l]      = b.ctx_v[l];
-        lane_words_[l] = static_cast<std::int64_t>(ik::kDSparkKvHeads) * (l == 1 ? full_slots_ : ik::kDSparkRing) *
+        lane_words_[l] = l == 1 ? 0 : static_cast<std::int64_t>(ik::kDSparkKvHeads) * ik::kDSparkRing *
                          ik::kDSparkHeadDim;
     }
+    if (full.k == nullptr || full.v == nullptr || full.table == nullptr || full.table_stride <= 0) {
+        throw std::invalid_argument("inkling2 dspark: the full layer's context needs the Program's pages");
+    }
+    full_       = full;
+    cache_k_[1] = full.k; // the full layer's cache: the pool's planes, through the lanes' block-table rows
+    cache_v_[1] = full.v;
     f_ring_ = b.f_ring, round_ = b.round, block_in_ = b.block_in, residual_ = b.residual, normed_ = b.normed;
     q_ = b.q, k_ = b.k, v_ = b.v, qr_ = b.qr, attention_ = b.attention, a_ = b.a, y_ = b.y;
     gate_ = b.gate, up_ = b.up, h_ = b.h, final_ = b.final_rows, base_ = b.base;
@@ -219,7 +224,8 @@ void Drafter::append(std::int32_t first, std::int32_t count, cudaStream_t stream
         r.cache_v       = cache_v_[l];
         r.lane_stride   = lane_words_[l];
         r.ring          = d_.layers[l].sliding ? ik::kDSparkRing : 0;
-        r.slots         = full_slots_;
+        r.table         = full_.table;
+        r.table_stride  = full_.table_stride;
         r.inv_freq      = inv_freq_;
         ik::dspark_rotate(r, stream);
     }
@@ -273,7 +279,8 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
         rk.cache_v       = cache_v_[l];
         rk.lane_stride   = lane_words_[l];
         rk.ring          = o.sliding ? ik::kDSparkRing : 0;
-        rk.slots         = full_slots_;
+        rk.table         = full_.table;
+        rk.table_stride  = full_.table_stride;
         rk.inv_freq      = inv_freq_;
         ik::dspark_rotate(rk, stream);
         ik::DSparkAttentionArgs at;
@@ -282,7 +289,8 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
         at.cache_v     = cache_v_[l];
         at.lane_stride = lane_words_[l];
         at.ring        = o.sliding ? ik::kDSparkRing : 0;
-        at.slots_full  = full_slots_;
+        at.table       = full_.table;
+        at.table_stride = full_.table_stride;
         at.splits      = o.sliding ? kSlidingSplits : full_splits_;
         at.round       = round_;
         at.scratch     = attention_scratch_;

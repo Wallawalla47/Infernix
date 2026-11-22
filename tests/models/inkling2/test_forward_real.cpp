@@ -261,7 +261,7 @@ void appended_kv(const m::StateView& s, const m::VisitState& vs, int c0, int T, 
                       pos % 64) * ik::kHeadDim;
                 kb = s.images + vs.window_k, vb = s.images + vs.window_v;
             } else {
-                at = ((static_cast<std::size_t>(head) * s.pool_pages + 0) * 64 + pos % 64) * ik::kHeadDim;
+                at = ((static_cast<std::size_t>(0) * ik::kKvHeads + head) * 64 + pos % 64) * ik::kHeadDim; // page 0
                 kb = s.pool_k[vs.full_slot], vb = s.pool_v[vs.full_slot];
             }
             const auto kr = download(kb + at, ik::kHeadDim), vr = download(vb + at, ik::kHeadDim);

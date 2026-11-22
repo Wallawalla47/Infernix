@@ -9,18 +9,19 @@
 namespace infernix::models::inkling2 {
 namespace {
 
-// A direct parameter's device words (BF16 or FP32, contiguous and resident).
+// A direct parameter's words as device code reads them (BF16 or FP32, contiguous): in device memory, or in pinned
+// host memory at its mapped address (--embedding-host's token embedding), which may differ from its host address.
 template <class T>
 const T* words(const Model& model, WeightId id) {
     const BoundWeight& w     = model.weight(id);
     const WeightRegion region = contiguous_weight_region(w.view);
     const WeightGeometry& g  = region.parent->geometry;
     const QType want         = sizeof(T) == 4 ? QType::FP32 : QType::BF16;
-    if (g.layout != QuantLayout::Contiguous || g.format != want || region.parent->data == nullptr) {
-        throw std::invalid_argument(w.name + ": a resident contiguous " + (sizeof(T) == 4 ? "FP32" : "BF16") +
+    if (g.layout != QuantLayout::Contiguous || g.format != want || region.parent->device == nullptr) {
+        throw std::invalid_argument(w.name + ": a device-readable contiguous " + (sizeof(T) == 4 ? "FP32" : "BF16") +
                                     " tensor is needed");
     }
-    return reinterpret_cast<const T*>(region.parent->data + region.begin * sizeof(T));
+    return reinterpret_cast<const T*>(region.parent->device + region.begin * sizeof(T));
 }
 
 const std::uint16_t* bf16(const Model& model, WeightId id) { return words<std::uint16_t>(model, id); }

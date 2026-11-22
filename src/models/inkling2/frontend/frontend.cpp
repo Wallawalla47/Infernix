@@ -1,5 +1,6 @@
 #include "models/inkling2/frontend/frontend.h"
 
+#include "runtime/prefix_cache/block_hash.h"
 #include "text/jinja.h"
 #include "text/tokenizer.h"
 #include "text/unicode.h"
@@ -7,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <span>
@@ -105,6 +107,28 @@ std::string tool_name(const Json& tool) {
     return fn.at("name").get<std::string>();
 }
 
+constexpr std::uint64_t mix64(std::uint64_t state, std::uint64_t value) noexcept {
+    state ^= value + 0x9e3779b97f4a7c15ULL + (state << 6U) + (state >> 2U);
+    state *= 0xbf58476d1ce4e5b9ULL;
+    return state ^ (state >> 31U);
+}
+
+// The prefix key `cumulative` extended by an image (the blocks from its first token's on carry it): its placement,
+// its cells and every word of its processed patches, which are all the model reads of it.
+std::uint64_t image_prefix_key(std::uint64_t cumulative, const PromptImage& image) {
+    std::uint64_t key = mix64(cumulative == 0 ? 0x696e6b6c696e6732ULL : cumulative, image.first_token);
+    key               = mix64(key, static_cast<std::uint32_t>(image.image.rows));
+    key               = mix64(key, static_cast<std::uint32_t>(image.image.cols));
+    const std::vector<std::uint16_t>& words = *image.image.patches;
+    std::size_t i                           = 0;
+    for (; i + 4 <= words.size(); i += 4) {
+        key = mix64(key, std::uint64_t{words[i]} | std::uint64_t{words[i + 1]} << 16U |
+                             std::uint64_t{words[i + 2]} << 32U | std::uint64_t{words[i + 3]} << 48U);
+    }
+    for (; i < words.size(); ++i) { key = mix64(key, words[i]); }
+    return mix64(key, words.size());
+}
+
 } // namespace
 
 struct Frontend::Impl {
@@ -118,6 +142,39 @@ struct Frontend::Impl {
     std::optional<VisionConfig> vision; // --vision
     std::uint32_t max_cells = 0;
     TokenId image_token     = -1;       // one per image cell (the template renders one an image part)
+    TokenId message_system  = -1;
+    std::array<TokenId, 4> message_starts{}; // <|message_{user,model,system,tool}|>: each message's first token
+
+    // The prompt's tap hints (prepared_prompt's tap_hints): each message start; the leading system block's last
+    // message (the template's thinking effort, which differs between requests that share the system prompt and the
+    // tools before it) and the block's end; and the generation opener when the prompt ends inside the last model
+    // message (the next turn's history departs there when its client re-renders the reply).
+    [[nodiscard]] std::vector<runtime::prefix_cache::TapHint> tap_hints(std::span<const TokenId> ids) const {
+        using runtime::prefix_cache::TapHint;
+        using runtime::prefix_cache::TapHintKind;
+        std::vector<TapHint> out;
+        std::vector<std::uint32_t> starts;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (std::find(message_starts.begin(), message_starts.end(), ids[i]) != message_starts.end()) {
+                starts.push_back(static_cast<std::uint32_t>(i));
+            }
+        }
+        for (const std::uint32_t s : starts) {
+            if (s != 0) { out.push_back(TapHint{s, TapHintKind::MessageBoundary}); }
+        }
+        std::size_t leading = 0; // the leading system messages
+        while (leading < starts.size() && ids[starts[leading]] == message_system) { ++leading; }
+        if (leading > 0 && leading < starts.size()) {
+            if (starts[leading - 1] != 0) { out.push_back(TapHint{starts[leading - 1], TapHintKind::Structural}); }
+            out.push_back(TapHint{starts[leading], TapHintKind::Structural});
+        }
+        if (!starts.empty() && ids[starts.back()] == markers.message_model && starts.back() != 0 &&
+            std::find(ids.begin() + starts.back(), ids.end(), markers.end_message) == ids.end()) {
+            out.push_back(TapHint{starts.back(), TapHintKind::GenerationOpener});
+        }
+        std::sort(out.begin(), out.end(), [](const TapHint& a, const TapHint& b) { return a.position < b.position; });
+        return out;
+    }
 
     Impl(const FrontendResources& resources, const FrontendOptions& options)
         : tokenizer(resources.tokenizer),
@@ -131,6 +188,8 @@ struct Frontend::Impl {
             return static_cast<TokenId>(token->id);
         };
         markers.message_model = id("<|message_model|>");
+        message_system        = id("<|message_system|>");
+        message_starts        = {id("<|message_user|>"), markers.message_model, message_system, id("<|message_tool|>")};
         markers.thinking      = id("<|content_thinking|>");
         markers.content       = {id("<|content_text|>"), id("<|content_tool_error|>"), id("<|content_invoke_tool_text|>")};
         markers.tool_call     = id("<|content_invoke_tool_json|>");
@@ -370,6 +429,27 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     data->token_ids = std::move(rendered.ids);
     data->tools     = impl_->tool_names(input.options);
+    // The prefix cache's keys: each image's content key accumulated into every block at or past its first token's.
+    {
+        namespace pc         = runtime::prefix_cache;
+        const std::size_t blocks = data->token_ids.size() / pc::kBlockTokens;
+        if (!data->images.empty()) {
+            data->block_extras.resize(blocks);
+            std::uint64_t cumulative = 0;
+            std::size_t next         = 0;
+            for (std::size_t block = 0; block < blocks; ++block) {
+                const std::uint64_t end = static_cast<std::uint64_t>(block + 1) * pc::kBlockTokens;
+                while (next < data->images.size() && data->images[next].first_token < end) {
+                    check_control(control);
+                    cumulative = image_prefix_key(cumulative, data->images[next]);
+                    ++next;
+                }
+                data->block_extras[block] = cumulative;
+            }
+        }
+        data->block_hashes = pc::block_lookup_hashes(data->token_ids, data->block_extras);
+        data->tap_hints    = impl_->tap_hints(data->token_ids);
+    }
     data->stats.seconds          = std::chrono::duration<double>(Clock::now() - start).count();
     data->stats.tokenize_seconds = std::chrono::duration<double>(encoded - start).count();
     return PreparedPrompt(std::move(data));
@@ -398,7 +478,7 @@ VisionImageBudget Frontend::vision_image_budget() const noexcept {
             .max_pixels    = static_cast<std::uint64_t>(impl_->max_cells) * cell * cell};
 }
 
-PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool) const {
+PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity) const {
     const auto start = Clock::now();
     if (token_ids.size() > impl_->max_context) {
         throw RequestError(ContextLengthDetails{.prompt_tokens = token_ids.size(), .max_context = impl_->max_context});
@@ -408,8 +488,13 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool) co
             throw std::out_of_range("prompt token is outside the checkpoint vocabulary: " + std::to_string(token));
         }
     }
-    auto data           = std::make_unique<PreparedPromptData>();
-    data->token_ids     = std::move(token_ids);
+    auto data       = std::make_unique<PreparedPromptData>();
+    data->token_ids = std::move(token_ids);
+    data->reusable  = allow_prefix_identity;
+    if (allow_prefix_identity) {
+        data->block_hashes = runtime::prefix_cache::block_lookup_hashes(data->token_ids, {});
+        data->tap_hints    = impl_->tap_hints(data->token_ids);
+    }
     data->stats.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(data));
 }

@@ -50,7 +50,8 @@ struct VisionStagingGroup {
     std::size_t bytes = 0;
 };
 struct VisionHostWeights {
-    const std::byte* block = nullptr;     // the pinned block (host address: the operands' pointers lie inside it)
+    const std::byte* block = nullptr;        // the pinned block (host address: the linear operands' pointers lie inside it)
+    const std::byte* block_device = nullptr; // its device-mapped address (the direct parameters' pointers lie inside it)
     VisionStagingGroup resident;          // patch embedding, position table, class row, pre-norm, projector
     std::vector<VisionStagingGroup> layers;
     std::size_t slot_bytes = 0;           // the largest layer group

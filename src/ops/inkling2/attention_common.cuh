@@ -39,8 +39,9 @@ __device__ __forceinline__ std::size_t kv_row(const KvView& kv, int lane, int he
                                                             : (pos / kKeyUnit) % kv.ring_pages;
         return lane * kv.lane_stride + ((static_cast<std::size_t>(head) * pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
     }
+    // A page-major pool: one page's rows are contiguous in each plane (the prefix cache copies a page as one run).
     const std::int64_t page = kv.table[static_cast<std::int64_t>(lane) * kv.table_stride + pos / kKeyUnit];
-    return ((static_cast<std::size_t>(head) * kv.pool_pages + page) * kKeyUnit + (pos % kKeyUnit)) * kD;
+    return ((static_cast<std::size_t>(page) * kKvHeads + head) * kKeyUnit + (pos % kKeyUnit)) * kD;
 }
 
 // ---------------------------------------------------------------------------- quantized pools (kv_codec.cuh)

@@ -78,6 +78,12 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact, st
     options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(concurrency * context);
     options.max_concurrency      = concurrency;
     options.max_pending_requests = 16;
+    // The prefix cache stays on (the Engine's default): requests sharing a prompt resume from it, which must not change
+    // their tokens; a small Host tier keeps the start quick.
+    options.context_cache.host_capacity_bytes = std::size_t{2} << 30U;
+    // INFERNIX_INKLING2_NO_PREFIX_CACHE: the cache off (its taps split prompt calls, which changes the drafter's context
+    // rows and so its drafts, never the tokens: the drafts then compare with a run of the same calls).
+    if (std::getenv("INFERNIX_INKLING2_NO_PREFIX_CACHE") != nullptr) { options.context_cache.enabled = false; }
     options.prefill_chunk        = chunk;
     options.use_cuda_graph       = graphs;
     // Every diagnostic, Debug included (a failed request's cause is one).
