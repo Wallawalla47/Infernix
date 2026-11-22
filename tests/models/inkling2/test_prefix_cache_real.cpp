@@ -18,6 +18,7 @@
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (skips without it)
 
 #include "infernix/engine.h"
+#include "media/decode/decode.h"
 #include "models/resume_cold_probe.h"
 
 #include <algorithm>
@@ -234,6 +235,114 @@ int main() {
             std::cout << "host restore: reused " << resumed.reused_prompt_tokens << " prompt tokens\n";
             require(resumed.reused_prompt_tokens >= 2048, "host restore: the continuation reused too little");
             require(resumed.generated_token_ids == cold.generated_token_ids, "host restore: the tokens differ from cold");
+        }
+        // 8. The other routes: --a16-activations with --reproducible (its prompt calls run the narrow kernels) and
+        //    --q8-weights: a resume equals a cold run bit for bit there too.
+        for (int arm = 0; arm < 2; ++arm) {
+            infernix::EngineOptions options = cache_options(artifact, KvCacheStorage::BFloat16, 4096, pool);
+            if (arm == 0) {
+                options.expert_a16_activations = true;
+                options.fast_paths             = false;
+            } else {
+                options.q8_weights = true;
+            }
+            infernix::Engine engine(options);
+            const infernix::TokenId sep = engine.tokenize_text("\n").front();
+            check_probe(arm == 0 ? "a16 reproducible" : "q8 weights",
+                        infernix::test::resume_probe(engine, long_prompt(engine, 2300, 23 + arm), 0, sep), 2048);
+        }
+        // 9. Taps inside a call's reach: a token prompt whose generation opener (an exact tap) lies k tokens before a
+        //    prefill call's end. The image after that call serves it when k <= 29 (15 with DSpark, which splits the call
+        //    at k = 16); a prompt that diverges right after the opener resumes there, with the cold run's bits.
+        for (const bool dspark : {false, true}) {
+            infernix::EngineOptions options = cache_options(artifact, KvCacheStorage::BFloat16, 1024, pool);
+            if (dspark) {
+                options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                options.speculative.draft_tokens_auto = true;
+            }
+            infernix::Engine engine(options);
+            // The system and model message ids, from a rendered chat: its first id, and the opener's (its first
+            // generated position).
+            infernix::PromptInput chat;
+            chat.messages.push_back({.role = infernix::ChatRole::System, .parts = {{.text = "Be brief."}}});
+            chat.messages.push_back({.role = infernix::ChatRole::User, .parts = {{.text = "Hello."}}});
+            const infernix::ChatTokens rendered = engine.tokenize_chat(chat);
+            std::size_t opener = 0;
+            while (opener < rendered.generated.size() && rendered.generated[opener] == 0) { ++opener; }
+            require(opener < rendered.ids.size(), "reach: the chat has no generation opener");
+            const infernix::TokenId system = rendered.ids.front(), model = rendered.ids[opener];
+            for (const std::uint32_t k : dspark ? std::vector<std::uint32_t>{2, 15, 16} : std::vector<std::uint32_t>{2, 15, 29}) {
+                const std::uint32_t P = 1024 - k;
+                const Tokens filler   = long_prompt(engine, 2300, 31 + static_cast<int>(k));
+                Tokens first          = filler;
+                first[0]              = system;
+                first[P]              = model;
+                (void)engine.generate(engine.prepare_tokens(first), infernix::test::resume_probe_request(1, true));
+                Tokens second(first.begin(), first.begin() + P + 1);
+                const Tokens other = long_prompt(engine, 400, 77 + static_cast<int>(k));
+                second.insert(second.end(), other.begin(), other.end());
+                const infernix::GenerationResult cold =
+                    engine.generate(engine.prepare_tokens(second), infernix::test::resume_probe_request(16, false));
+                infernix::RequestOptions read          = infernix::test::resume_probe_request(16, true);
+                infernix::RequestOptions read_cold     = infernix::test::resume_probe_request(16, false);
+                read.execution.readout_tokens          = {cold.generated_token_ids.front()};
+                read_cold.execution.readout_tokens     = {cold.generated_token_ids.front()};
+                const infernix::GenerationResult warm  = engine.generate(engine.prepare_tokens(second), read);
+                const infernix::GenerationResult again = engine.generate(engine.prepare_tokens(second), read_cold);
+                std::cout << "reach" << (dspark ? " (dspark)" : "") << ", opener " << k << " before the call's end: reused "
+                          << warm.reused_prompt_tokens << '\n';
+                require(warm.reused_prompt_tokens >= P, "reach: the diverging prompt did not resume at the opener");
+                require(warm.generated_token_ids == cold.generated_token_ids, "reach: tokens differ from cold");
+                require(warm.readout && again.readout && warm.readout->logprobs == again.readout->logprobs,
+                        "reach: the first token's log-probability differs from cold");
+            }
+        }
+        // 10. Images (INFERNIX_INKLING2_VISION_ARTIFACT): two images of the same cell count after a long system prompt.
+        //     The second must not resume past the image's start (its key differs; placeholders are equal tokens), and
+        //     each equals its cold run; the first image again resumes past it.
+        if (const char* vision = std::getenv("INFERNIX_INKLING2_VISION_ARTIFACT"); vision != nullptr) {
+            infernix::EngineOptions options = cache_options(vision, KvCacheStorage::BFloat16, 4096, pool);
+            options.enable_vision           = true;
+            infernix::Engine engine(options);
+            const auto picture = [](int phase) {
+                std::vector<std::uint8_t> rgb(200 * 140 * 3);
+                for (int y = 0; y < 140; ++y) {
+                    for (int x = 0; x < 200; ++x) {
+                        std::uint8_t* p = rgb.data() + (static_cast<std::size_t>(y) * 200 + x) * 3;
+                        const bool disc  = (x - 60 - phase) * (x - 60 - phase) + (y - 65) * (y - 65) < 45 * 45;
+                        p[0] = disc ? 220 : 30, p[1] = disc ? 30 : 60, p[2] = disc ? 30 : 200;
+                    }
+                }
+                return infernix::media::decode::encode_raw_rgb(200, 140, rgb);
+            };
+            std::string system_text;
+            for (int i = 0; i < 300; ++i) { system_text += "Rule " + std::to_string(i) + ": answer in plain words. "; }
+            const auto ask = [&](const std::vector<std::uint8_t>& image) {
+                infernix::PromptInput input;
+                input.messages.push_back({.role = infernix::ChatRole::System, .parts = {{.text = system_text}}});
+                infernix::ChatMessage user{.role = infernix::ChatRole::User};
+                infernix::MessagePart part{.kind = infernix::MessagePartKind::Media};
+                part.media.bytes = image;
+                user.parts.push_back(std::move(part));
+                user.parts.push_back({.text = "What is in this picture?"});
+                input.messages.push_back(std::move(user));
+                input.options.reasoning_effort = infernix::ReasoningEffort::Low;
+                return input;
+            };
+            const auto run = [&](const std::vector<std::uint8_t>& image, bool reuse) {
+                return engine.generate(engine.prepare(ask(image)), infernix::test::resume_probe_request(12, reuse));
+            };
+            const std::vector<std::uint8_t> a = picture(0), b = picture(70);
+            const infernix::GenerationResult cold_a = run(a, false), cold_b = run(b, false);
+            (void)run(a, true); // publishes
+            const infernix::GenerationResult warm_b = run(b, true);
+            const infernix::GenerationResult warm_a = run(a, true);
+            std::cout << "images: another image reused " << warm_b.reused_prompt_tokens << ", the same image reused "
+                      << warm_a.reused_prompt_tokens << " of " << warm_a.prompt.prompt_tokens << " prompt tokens\n";
+            require(warm_b.generated_token_ids == cold_b.generated_token_ids, "images: another image's tokens differ from cold");
+            require(warm_a.generated_token_ids == cold_a.generated_token_ids, "images: the same image's tokens differ from cold");
+            require(warm_a.reused_prompt_tokens > warm_b.reused_prompt_tokens,
+                    "images: the same image did not resume past the other's divergence");
         }
         // 7. --prefix-cache-file: an Engine saves its Host tier at shutdown, a new one restores it, and the continuation
         //    resumes there with the cold run's tokens.

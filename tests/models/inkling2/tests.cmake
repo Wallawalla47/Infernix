@@ -44,7 +44,7 @@ set_tests_properties(infernix_inkling2_engine_real_test PROPERTIES SKIP_RETURN_C
 # chunks of 100, a decoded prefix, DSpark, a Host-tier restore); skips without INFERNIX_INKLING2_ARTIFACT.
 infernix_add_test(infernix_inkling2_prefix_cache_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_cache_real.cpp"
-  LIBRARIES infernix_engine)
+  LIBRARIES infernix_engine infernix_media_decode)
 set_tests_properties(infernix_inkling2_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
   LABELS "gpu;real" TIMEOUT 1800)
 
