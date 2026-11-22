@@ -732,7 +732,13 @@ the attention output; the cached K/V values are an observable boundary (the KV c
   speculation invariance needs ([§13.4](#134-draft-length-and-verification)).
 - **Launches.** A prologue kernel per (column, KV head) (the K/V convs over their rings, clips, v-norm, τ, the append,
   the final q and r), then the attention kernel per (split, KV head, lane). Built 2026-11-21:
-  `src/ops/inkling2/attention.cu`, qualified by `tests/ops/test_inkling2_attention.cu`.
+  `src/ops/inkling2/attention.cu`, qualified by `tests/ops/test_inkling2_attention.cu`. A decode-route call of one
+  lane with at most 4 columns (no padding, every lane one group) runs the prologue inside the attention kernel instead
+  (`AttentionArgs::fused`: each CTA forms its rows' q and r and patches the call's new keys and values into its tile;
+  the same bits) and issues its first unit's pages before the dependency wait, since no kernel of the round writes a
+  visit's past keys and values. Against the prologue kernel (decode round at 4K, 2026-11-21): −0.44 % at one column,
+  −0.17 % at two, −0.09 % at four, +0.25 % at eight; infernix_bench C = 4 and 8 ran 0.8 % and 1.3 % faster with the
+  separate prologue, hence the one-lane rule. The early pages: −0.43 % at one column at context 128 (2026-11-22).
 - **Shape (L15).** 512-thread CTAs; a unit's K and V pages copied to shared memory by cp.async (one stage; a 2-stage
   ring for multi-unit full splits is an M5 item); scores a thread per (row group, key) as 4 fold chains, the unit
   softmax a warp per row, P×V a thread per (row group, 4 dims); accumulators in registers.
@@ -861,8 +867,10 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   +0.03 s (the conversion 12-16 ms); device weights 17,792.6 → 17,173.6 MiB, 620 MiB more VRAM free after load.
   Re-measured at 4dc97419 (the default's decode projections on decode-width tensor-core MMA, the prompt route's on
   tensor cores, the single-column MoE in one launch; the Q8 matrices on the prompt route's Q8 MMA, still on the fold at
-  decode widths): tg128 176.6 → 199.4 tok/s at C = 1, 423.2 → 438.6 at C = 4, 601.0 → 586.3 at C = 8 (now a loss: a Q8
-  decode-width MMA would close it); pp2048 16,362 → 16,010, pp10000 16,276 → 15,928. On the perplexity corpus's quick
+  decode widths): tg128 176.6 → 199.4 tok/s at C = 1, 423.2 → 438.6 at C = 4, 601.0 → 586.3 at C = 8 (a loss);
+  pp2048 16,362 → 16,010, pp10000 16,276 → 15,928. Since 6a3f2657 the Q8 matrices decode on `projections_dmma` too
+  ([§14.1](#141-chunk-width-invariance)): C = 8 586.3 → 613.3 tok/s (above the default's 595.9), C = 1 tg128 199.4 →
+  198.0 while the default gained 176.6 → 184.0. On the perplexity corpus's quick
   set (291,842 tokens, context 4,096 / stride 2,048): perplexity 4.0348 → 4.0328, KL(BF16 ‖ Q8) mean 0.0107 (p99
   0.108), top-1 agreement 96.0 % (code 98.2 %, the prose and Chinese streams 95.1-95.6 %). Its FP16 group scales on the
   real matrices: none rounds to zero, 47 of 29.3 M are subnormal.
@@ -1053,7 +1061,12 @@ chosen per shape the decode round at 4K context (forward test, graphs; K2 and ga
 12.399 → 10.574 at 8 (−14.7 %). The decode route's bits changed with it: the forward test's free-running logits moved
 by a mean KL of 0.27 (max 3.4) from the fold's, through the routing's amplification of last-bit differences (the
 teacher-forced stages stay within their bounds; greedy agreement with the reference from position 23 holds).
-`--q8-weights` keeps the fold at decode widths (no Q8 decode-width MMA yet).
+`--q8-weights` runs its Q8 matrices on `projections_dmma` too (6a3f2657): a thread's 8 codes of a 32-block widened to
+BF16 exactly, the block's two MMAs from zero, then the block sum times the row's FP16 group scale fused into the
+accumulator; codes and scales stay raw in flight, 8 blocks a warp (29c91402). Against the fold (decode round at 4K,
+2026-11-22): +5.1 % at one column, +2.6 % at two, −1.5 % at four, −4.3 % at eight. The fold below four columns was
+built and withdrawn: a call's width depends on the other requests, so the Engine test's `--q8-weights` C = 4 tokens
+differed from the request alone.
 
 ### 14.2 Pass schedule
 
