@@ -967,10 +967,11 @@ void router_case() {
 // moe_single against moe_route + moe_experts over the same workspace: routing and outputs byte for byte, for several
 // columns; eagerly and in a CUDA graph that interleaves the two paths (single, separate, single: each leaves the
 // workspace's state as the other needs it), replayed three times.
-void single_case(bool a8) {
-    const char* name   = a8 ? "MXFP8" : "NVFP4";
+void single_case(bool a8, bool a16 = false) {
+    const char* name   = a8 ? "MXFP8" : a16 ? "NVFP4 A16" : "NVFP4";
     const auto format  = a8 ? moe::ExpertFormat::Mxfp8 : moe::ExpertFormat::Nvfp4FourOverSix;
-    if (!moe::moe_single_supported(format)) {
+    const auto activation = a16 ? moe::ExpertActivation::A16 : moe::ExpertActivation::Checkpoint;
+    if (!moe::moe_single_supported(format, activation)) {
         std::printf("%s single-column launch: not supported on this device (the separate kernels run instead)\n", name);
         return;
     }
@@ -1009,10 +1010,16 @@ void single_case(bool a8) {
             xf[k] = canon::bf16_to_f32(x[k]);
         }
         const QuantRow q     = a8 ? quantize_a8(xf) : quantize_a4(xf);
+        const LimbRow l      = encode_a16(xf);
         std::uint16_t* d_x   = upload(x);
-        std::uint8_t* d_rows = upload(q.bytes);
+        std::uint8_t* d_rows = upload(a16 ? l.bytes : q.bytes);
         float* d_amax        = upload(std::vector<float>{q.amax});
-        const moe::Activations rows{d_rows, d_amax, 1};
+        std::int32_t* d_emax = upload(std::vector<std::int32_t>{l.emax});
+        moe::Activations rows{d_rows, d_amax, 1};
+        if (a16) {
+            rows.activation = moe::ExpertActivation::A16;
+            rows.emax       = d_emax;
+        }
         const auto separate = [&](cudaStream_t s) {
             moe::moe_route(d_x, 1, d_w, d_bias, E, H, 8.0F, ws, s);
             moe::moe_experts(rows, moe::routed_routing(ws), bank, ws, d_ref, s);
@@ -1050,7 +1057,8 @@ void single_case(bool a8) {
         cuda_check(cudaGraphExecDestroy(exec), "destroy");
         cuda_check(cudaGraphDestroy(graph), "destroy");
         cuda_check(cudaStreamDestroy(stream), "stream");
-        for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rows), static_cast<void*>(d_amax)}) {
+        for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rows), static_cast<void*>(d_amax),
+                        static_cast<void*>(d_emax)}) {
             cuda_check(cudaFree(p), "cudaFree");
         }
     }
@@ -1074,6 +1082,7 @@ INFERNIX_OP_TEST(w4a4_sparse_moe) {
     router_case();
     single_case(false);
     single_case(true);
+    single_case(false, true);
     bank_case(false);
     bank_case(true);
     a16_case();

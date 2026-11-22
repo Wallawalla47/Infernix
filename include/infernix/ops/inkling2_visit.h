@@ -120,11 +120,14 @@ struct EntryArgs {
 };
 void visit_entry(const EntryArgs& args, cudaStream_t stream);
 
-// The experts' activation rows of the MLP input: [T][row_bytes(format, H)], and for NVFP4 each row's amax [T].
+// The experts' activation rows of the MLP input: [T][row_bytes(format, H)], and for NVFP4 each row's amax [T]. With
+// emax (an NVFP4 layer under --a16-activations): rows are A16 limb rows [T][w4a4_moe::kA16XRowBytes] and emax [T]
+// their exponents (canon::a16_column_exponent of the BF16 row). rows null: none (an MXFP8 layer under A16 reads x).
 struct ExpertRows {
     w4a4_moe::ExpertFormat format = w4a4_moe::ExpertFormat::Nvfp4FourOverSix;
     std::uint8_t* rows            = nullptr;
     float* amax                   = nullptr;
+    std::int32_t* emax            = nullptr;
 };
 
 struct MlpEntryArgs {

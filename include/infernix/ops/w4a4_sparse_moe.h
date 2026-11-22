@@ -163,7 +163,7 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
 // 18 CTAs of 8 warps, each warp streaming both through one ring). x: the router's BF16 row; rows: the column's
 // quantized row. Needs moe_single_supported(bank.format): the device holds the grid resident (otherwise moe_route and
 // moe_experts).
-[[nodiscard]] bool moe_single_supported(ExpertFormat format);
+[[nodiscard]] bool moe_single_supported(ExpertFormat format, ExpertActivation activation = ExpertActivation::Checkpoint);
 void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint16_t* router, const float* bias,
                 float route_scale, const Bank& bank, const Workspace& workspace, std::uint16_t* outputs,
                 cudaStream_t stream);

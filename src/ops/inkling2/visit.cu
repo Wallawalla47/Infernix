@@ -11,6 +11,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/canonical_math.h"
 #include "ops/inkling2/column.cuh"
+#include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
 #include "ops/inkling2/visit_math.h"
 
 #include <cuda_runtime.h>
@@ -25,6 +26,7 @@ namespace infernix::ops::inkling2 {
 namespace {
 
 namespace moe = infernix::ops::w4a4_moe;
+namespace a16 = infernix::ops::offloaded_moe::wide;
 
 constexpr int kThreads  = kGroups;
 constexpr unsigned kAll = 0xFFFFFFFFU;
@@ -328,6 +330,28 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
 __device__ __forceinline__ void quantize_row(const float (&v)[8], const ExpertRows& rows, int t,
                                              float (&scratch)[kWarpsH]) {
     const int g = static_cast<int>(threadIdx.x);
+    if (rows.emax != nullptr) {
+        // A16: the row's exponent from its largest BF16 magnitude bits (a NaN's bits exceed every finite one's), then a
+        // block's two halves on a thread pair (store_a16_half: store_a16_block's bytes).
+        std::uint16_t bits[8];
+        unsigned key = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            bits[j] = canon::f32_to_bf16_rn(v[j]);
+            key     = max(key, static_cast<unsigned>(bits[j] & 0x7FFFU));
+        }
+        key = __reduce_max_sync(kAll, key);
+        auto& keys = reinterpret_cast<unsigned (&)[kWarpsH]>(scratch);
+        if ((g & 31) == 0) { keys[g / 32] = key; }
+        __syncthreads();
+        unsigned all = 0;
+#pragma unroll
+        for (int w = 0; w < kWarpsH; ++w) { all = max(all, keys[w]); }
+        const int e = a16::a16_emax(all);
+        a16::store_a16_half(rows.rows + static_cast<std::size_t>(t) * moe::kA16XRowBytes, g / 2, g & 1, bits, e);
+        if (g == 0) { rows.emax[t] = e; }
+        return;
+    }
     float a     = 0.0F;
     bool nan    = false;
 #pragma unroll
@@ -641,7 +665,7 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
         for (int j = 0; j < 8; ++j) { xm[j] = canon::mul_rn(nw[j], canon::mul_rn(out[0][j], r)); }
         round8(xm);
         store8(a.x + row, xm);
-        quantize_row(xm, a.rows, t, s4);
+        if (a.rows.rows != nullptr) { quantize_row(xm, a.rows, t, s4); }
     } else {
         store8(a.mixed + row, out[0]);
         store8(a.message + row, out[1]);
@@ -740,10 +764,12 @@ void check_blocks(const Blocks& blocks, const char* op) {
     }
 }
 
+// The experts' rows: checkpoint rows (NVFP4 with its amax) or, with emax, NVFP4 A16 limb rows.
 void check_rows(const ExpertRows& rows, const char* op) {
     if (rows.rows == nullptr || reinterpret_cast<std::uintptr_t>(rows.rows) % 8 != 0 ||
-        (rows.format == moe::ExpertFormat::Nvfp4FourOverSix && rows.amax == nullptr)) {
-        throw std::invalid_argument(std::string(op) + ": the experts' rows (and NVFP4's amax) are needed");
+        (rows.format == moe::ExpertFormat::Nvfp4FourOverSix && rows.amax == nullptr && rows.emax == nullptr) ||
+        (rows.emax != nullptr && rows.format != moe::ExpertFormat::Nvfp4FourOverSix)) {
+        throw std::invalid_argument(std::string(op) + ": the experts' rows (and NVFP4's amax, or A16's exponents) are needed");
     }
 }
 
@@ -834,7 +860,7 @@ void mlp_entry(const MlpEntryArgs& a, cudaStream_t stream) {
         CUDA_CHECK(pdl::launch_consumer(config, mlp_entry_kernel<true>, a));
     } else {
         if (a.norm == nullptr || a.x == nullptr) { throw std::invalid_argument("inkling2 mlp_entry: norm and x"); }
-        check_rows(a.rows, op);
+        if (a.rows.rows != nullptr) { check_rows(a.rows, op); } // none: an MXFP8 layer under --a16-activations
         CUDA_CHECK(pdl::launch_consumer(config, mlp_entry_kernel<false>, a));
     }
 }

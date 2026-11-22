@@ -970,12 +970,16 @@ struct SingleArgs {
     float route_scale = 0.0F;
 };
 
-template <class G, bool A8>
+// A16 (NVFP4 only): x and h as limb rows, with their exponents.
+template <class G, bool A8, bool A16 = false>
 struct SingleSmem {
     using S = Shape<G, A8>;
+    static_assert(!(A8 && A16), "A16 limb rows are the NVFP4 layers'");
     alignas(16) std::uint8_t ring[kSingleWarps][kSingleDepth][S::kStageBytes];
-    alignas(16) std::uint8_t x[S::kXStride];
-    alignas(16) std::uint8_t h[S::kHStride];
+    alignas(16) std::uint8_t x[A16 ? kA16XRowBytes : S::kXStride];
+    alignas(16) std::uint8_t h[A16 ? kA16HRowBytes : S::kHStride];
+    int x_emax;
+    int h_emax;
     std::int32_t scaled[256];
     alignas(16) float keys[kSingleExperts];
     float sel[kTopK];
@@ -987,11 +991,11 @@ struct SingleSmem {
     int stalled;
 };
 
-template <class G, bool A8>
+template <class G, bool A8, bool A16 = false>
 __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleArgs a) {
     using S = Shape<G, A8>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto& sm      = *reinterpret_cast<SingleSmem<G, A8>*>(smem_raw);
+    auto& sm      = *reinterpret_cast<SingleSmem<G, A8, A16>*>(smem_raw);
     const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
     const int g = lane / 4, t = lane % 4;
     const int cta = static_cast<int>(blockIdx.x);
@@ -1033,8 +1037,12 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         }
     }
     // The column's activation row (the gate/up's B operand) while the router finishes.
-    for (int i = tid; i < S::kXRowBytes / 8; i += kSingleThreads) {
+    constexpr int kXBytes = A16 ? kA16XRowBytes : S::kXRowBytes;
+    for (int i = tid; i < kXBytes / 8; i += kSingleThreads) {
         reinterpret_cast<uint2*>(sm.x)[i] = reinterpret_cast<const uint2*>(a.e.x.rows)[i];
+    }
+    if constexpr (A16) {
+        if (tid == 0) { sm.x_emax = a.e.x.emax[0]; }
     }
     if (tid == 0) { sm.stalled = wait_count(counters + 0, kRouterCtas, a.e.ws.error) ? 0 : 1; }
     __syncthreads();
@@ -1124,6 +1132,10 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
             const int b = first + u;
             if constexpr (A8) {
                 a8_mma_unit(stage + u * S::kUnit, b_row + 32 * b, b_row[scales + b], lane, g, t, acc);
+            } else if constexpr (A16) {
+                (void)scales;
+                a16::a16_unit<a16::LimbLoad::Shared>(stage + u * S::kUnit, b_row + a16::a16_block_offset(b, t), sm.scaled,
+                                                     g, t, s);
             } else {
                 const int sa = sm.scaled[b_row[scales + b]];
                 a4_mma_unit(stage + u * S::kUnit, a4_x_quad(*reinterpret_cast<const unsigned short*>(b_row + 8 * b + 2 * t)),
@@ -1141,6 +1153,10 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     if constexpr (A8) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) { y[i] = canon::f32_to_bf16_rn(canon::add_rn(c0[i], c1[i])); }
+    } else if constexpr (A16) {
+        const float m = a16_multiplier(a.e.bank.amax[2 * expert], a.e.bank.denominators[0]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { y[i] = canon::a16_row_output(s[i], sm.x_emax, m); }
     } else {
         const float rs = detail::nvfp4_row_scale(a.e.x.amax[0], a.e.bank.amax[2 * expert],
                                                  detail::nvfp4_rcp(a.e.bank.denominators[0]));
@@ -1201,6 +1217,7 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
 #pragma unroll
             for (int i = 0; i < kSingleWarps; ++i) { all = max(all, sm.red[i]); }
             sm.h_amax = canon::f32_from_bits(all);
+            if constexpr (A16) { sm.h_emax = a16::a16_emax(all >> 16); } // the BF16 bits of max |h|
         }
         __syncthreads();
         constexpr int kBlocks = G::kInter / 16;
@@ -1208,42 +1225,57 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         const int i    = tid;
         const bool on  = i < 2 * kBlocks;
         const int half = i & 1, b = on ? i >> 1 : 0;
-        const canon::FourOverSixRow fos = canon::four_over_six_row(on ? sm.h_amax : 1.0F);
-        float xv[8] = {};
-        float mag   = 0.0F;
-        if (on) {
-            const uint4 q = __ldcg(reinterpret_cast<const uint4*>(h_row + 16 * b) + half);
-            const std::uint32_t hw[4] = {q.x, q.y, q.z, q.w};
+        if constexpr (A16) {
+            // A16: the row's limbs, a block's halves on a thread pair.
+            if (on) {
+                const uint4 q = __ldcg(reinterpret_cast<const uint4*>(h_row + 16 * b) + half);
+                const std::uint32_t hw[4] = {q.x, q.y, q.z, q.w};
+                std::uint16_t bits[8];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                xv[2 * j]     = canon::f32_from_bits(hw[j] << 16);
-                xv[2 * j + 1] = canon::f32_from_bits(hw[j] & 0xFFFF0000U);
+                for (int j = 0; j < 4; ++j) {
+                    bits[2 * j]     = static_cast<std::uint16_t>(hw[j] & 0xFFFFU);
+                    bits[2 * j + 1] = static_cast<std::uint16_t>(hw[j] >> 16);
+                }
+                a16::store_a16_half(sm.h, b, half, bits, sm.h_emax);
             }
+        } else {
+            const canon::FourOverSixRow fos = canon::four_over_six_row(on ? sm.h_amax : 1.0F);
+            float xv[8] = {};
+            float mag   = 0.0F;
+            if (on) {
+                const uint4 q = __ldcg(reinterpret_cast<const uint4*>(h_row + 16 * b) + half);
+                const std::uint32_t hw[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const float mj = canon::f32_from_bits(canon::f32_bits(xv[j]) & 0x7FFFFFFFU);
-                mag            = mj > mag ? mj : mag;
-            }
-        }
-        const float other = __shfl_xor_sync(0xFFFFFFFFU, mag, 1);
-        const canon::FourOverSixWords words = canon::four_over_six_words(other > mag ? other : mag, fos);
-        std::uint8_t c6[8], c4[8];
-        const float e6 = canon::four_over_six_half(xv, words.six, fos, c6);
-        const float e4 = canon::four_over_six_half(xv, words.four, fos, c4);
-        const float p6 = __shfl_xor_sync(0xFFFFFFFFU, e6, 1), p4 = __shfl_xor_sync(0xFFFFFFFFU, e4, 1);
-        const float err6 = half == 0 ? canon::add_rn(e6, p6) : canon::add_rn(p6, e6);
-        const float err4 = half == 0 ? canon::add_rn(e4, p4) : canon::add_rn(p4, e4);
-        const bool four  = err4 < err6;
-        if (on) {
-            std::uint32_t packed = 0;
+                for (int j = 0; j < 4; ++j) {
+                    xv[2 * j]     = canon::f32_from_bits(hw[j] << 16);
+                    xv[2 * j + 1] = canon::f32_from_bits(hw[j] & 0xFFFF0000U);
+                }
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const std::uint32_t lo = four ? c4[2 * j] : c6[2 * j];
-                const std::uint32_t hi = four ? c4[2 * j + 1] : c6[2 * j + 1];
-                packed |= (lo | (hi << 4)) << (8 * j);
+                for (int j = 0; j < 8; ++j) {
+                    const float mj = canon::f32_from_bits(canon::f32_bits(xv[j]) & 0x7FFFFFFFU);
+                    mag            = mj > mag ? mj : mag;
+                }
             }
-            *reinterpret_cast<std::uint32_t*>(sm.h + 8 * b + 4 * half) = packed;
-            if (half == 0) { sm.h[S::kHScales + b] = four ? words.four : words.six; }
+            const float other = __shfl_xor_sync(0xFFFFFFFFU, mag, 1);
+            const canon::FourOverSixWords words = canon::four_over_six_words(other > mag ? other : mag, fos);
+            std::uint8_t c6[8], c4[8];
+            const float e6 = canon::four_over_six_half(xv, words.six, fos, c6);
+            const float e4 = canon::four_over_six_half(xv, words.four, fos, c4);
+            const float p6 = __shfl_xor_sync(0xFFFFFFFFU, e6, 1), p4 = __shfl_xor_sync(0xFFFFFFFFU, e4, 1);
+            const float err6 = half == 0 ? canon::add_rn(e6, p6) : canon::add_rn(p6, e6);
+            const float err4 = half == 0 ? canon::add_rn(e4, p4) : canon::add_rn(p4, e4);
+            const bool four  = err4 < err6;
+            if (on) {
+                std::uint32_t packed = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const std::uint32_t lo = four ? c4[2 * j] : c6[2 * j];
+                    const std::uint32_t hi = four ? c4[2 * j + 1] : c6[2 * j + 1];
+                    packed |= (lo | (hi << 4)) << (8 * j);
+                }
+                *reinterpret_cast<std::uint32_t*>(sm.h + 8 * b + 4 * half) = packed;
+                if (half == 0) { sm.h[S::kHScales + b] = four ? words.four : words.six; }
+            }
         }
     }
     __syncthreads();
@@ -1257,6 +1289,10 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         if constexpr (A8) {
             lo = canon::f32_to_bf16_rn(cd[0]);
             hi = canon::f32_to_bf16_rn(cd[2]);
+        } else if constexpr (A16) {
+            const float m = a16_multiplier(a.e.bank.amax[2 * expert + 1], a.e.bank.denominators[1]);
+            lo            = canon::a16_row_output(sd[0], sm.h_emax, m);
+            hi            = canon::a16_row_output(sd[2], sm.h_emax, m);
         } else {
             const float rs = detail::nvfp4_row_scale(sm.h_amax, a.e.bank.amax[2 * expert + 1],
                                                      detail::nvfp4_rcp(a.e.bank.denominators[1]));
@@ -1400,23 +1436,25 @@ void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t exp
 }
 
 namespace {
-template <bool A8>
+template <bool A8, bool A16>
 bool single_fits() {
     using G = Inkling;
-    allow_shared(single_kernel<G, A8>, sizeof(SingleSmem<G, A8>));
+    allow_shared(single_kernel<G, A8, A16>, sizeof(SingleSmem<G, A8, A16>));
     int device = 0, sms = 0, blocks = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, single_kernel<G, A8>, kSingleThreads,
-                                                             sizeof(SingleSmem<G, A8>)));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, single_kernel<G, A8, A16>, kSingleThreads,
+                                                             sizeof(SingleSmem<G, A8, A16>)));
     return blocks >= 1 && static_cast<long long>(blocks) * sms >= kSingleCtas;
 }
 } // namespace
 
-bool moe_single_supported(ExpertFormat format) {
-    static const bool a4 = single_fits<false>();
-    static const bool a8 = single_fits<true>();
-    return format == ExpertFormat::Mxfp8 ? a8 : a4;
+bool moe_single_supported(ExpertFormat format, ExpertActivation activation) {
+    static const bool a4  = single_fits<false, false>();
+    static const bool a8  = single_fits<true, false>();
+    static const bool a16 = single_fits<false, true>();
+    if (format == ExpertFormat::Mxfp8) { return activation == ExpertActivation::Checkpoint && a8; }
+    return activation == ExpertActivation::A16 ? a16 : a4;
 }
 
 void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint16_t* router, const float* bias,
@@ -1427,8 +1465,12 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
         rows.columns != 1 || workspace.capacity < 1) {
         throw std::invalid_argument("w4a4_sparse_moe single: one column of Inkling 2's [128, 2304, 1152] banks");
     }
-    if (!moe_single_supported(bank.format)) {
+    if (!moe_single_supported(bank.format, rows.activation)) {
         throw std::invalid_argument("w4a4_sparse_moe single: the device cannot hold its grid resident");
+    }
+    const bool a16 = rows.activation == ExpertActivation::A16;
+    if (a16 && (rows.rows == nullptr || rows.emax == nullptr)) {
+        throw std::invalid_argument("w4a4_sparse_moe single A16: the column's limb row and exponent");
     }
     SingleArgs args;
     args.e           = Args{rows, Routing{workspace.routed, workspace.gamma}, bank, workspace, outputs};
@@ -1436,7 +1478,11 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
     args.router      = router;
     args.bias        = bias;
     args.route_scale = route_scale;
-    if (bank.format == ExpertFormat::Nvfp4FourOverSix) {
+    if (bank.format == ExpertFormat::Nvfp4FourOverSix && a16) {
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
+                                    {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, false, true>), stream},
+                                    single_kernel<G, false, true>, args));
+    } else if (bank.format == ExpertFormat::Nvfp4FourOverSix) {
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
                                     {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, false>), stream},
                                     single_kernel<G, false>, args));
