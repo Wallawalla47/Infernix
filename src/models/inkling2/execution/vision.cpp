@@ -43,6 +43,41 @@ void taps(std::int32_t i, std::int32_t n, std::int32_t side, std::int32_t (&inde
     }
 }
 
+// --vision-offload on: a pointer inside a group's pinned objects, at its place in the group's device region.
+const std::byte* staged(const VisionStagingGroup& group, std::byte* region, const std::byte* block, const void* p) {
+    if (p == nullptr) { return nullptr; }
+    const auto at = static_cast<std::size_t>(static_cast<const std::byte*>(p) - block);
+    for (const VisionStagingSegment& s : group.segments) {
+        if (at >= s.pinned_offset && at < s.pinned_offset + s.bytes) { return region + s.staging_offset + (at - s.pinned_offset); }
+    }
+    throw std::logic_error("Inkling 2 vision: an offloaded weight lies outside its staged group");
+}
+const std::uint16_t* staged(const VisionStagingGroup& group, std::byte* region, const std::byte* block,
+                            const std::uint16_t* p) {
+    return reinterpret_cast<const std::uint16_t*>(staged(group, region, block, static_cast<const void*>(p)));
+}
+Weight staged(const VisionStagingGroup& group, std::byte* region, const std::byte* block, const Weight& w) {
+    Weight out  = w;
+    out.payload = staged(group, region, block, w.payload);
+    out.qdata   = staged(group, region, block, w.qdata);
+    out.qhigh   = staged(group, region, block, w.qhigh);
+    out.scales  = staged(group, region, block, w.scales);
+    out.escapes = staged(group, region, block, w.escapes);
+    return out;
+}
+
+// A group's pinned objects copied into its device region on `stream`.
+void upload_group(const VisionStagingGroup& group, std::byte* region, const std::byte* block, cudaStream_t stream) {
+    for (const VisionStagingSegment& s : group.segments) {
+        CUDA_CHECK(cudaMemcpyAsync(region + s.staging_offset, block + s.pinned_offset, s.bytes, cudaMemcpyHostToDevice,
+                                   stream));
+    }
+}
+
+std::uint64_t staging_bytes(const VisionHostWeights& host) {
+    return aligned(host.resident.bytes) + 2 * aligned(host.slot_bytes);
+}
+
 } // namespace
 
 struct VisionTower::Layout {
@@ -74,14 +109,62 @@ struct VisionTower::Layout {
     }
 };
 
-std::uint64_t VisionTower::device_bytes(const VisionConfig& config, std::uint32_t max_cells) {
-    return Layout(config, max_cells).total;
+std::uint64_t VisionTower::device_bytes(const VisionConfig& config, std::uint32_t max_cells,
+                                        const VisionHostWeights* host) {
+    return Layout(config, max_cells).total + (host != nullptr ? staging_bytes(*host) : 0);
 }
 
-VisionTower::VisionTower(const VisionConfig& config, const VisionOperands& operands, std::uint32_t max_cells)
-    : c_(config), w_(operands), max_cells_(max_cells) {
-    if (max_cells == 0 || c_.head_dim() != 64 || c_.heads != 16 || w_.layers.size() != c_.layers) {
+VisionTower::VisionTower(const VisionConfig& config, const VisionOperands& operands, std::uint32_t max_cells,
+                         const VisionHostWeights* host, cudaStream_t transfer)
+    : c_(config), w_(&operands), max_cells_(max_cells), host_(host), transfer_(transfer) {
+    if (max_cells == 0 || c_.head_dim() != 64 || c_.heads != 16 || operands.layers.size() != c_.layers) {
         throw std::invalid_argument("Inkling 2 vision: a tower of 16 heads of 64 and at least one cell an image");
+    }
+    if (host_ != nullptr) {
+        if (host_->block == nullptr || host_->layers.size() != c_.layers || transfer_ == nullptr) {
+            throw std::invalid_argument("Inkling 2 vision: an offloaded tower needs its pinned groups and a transfer stream");
+        }
+        staging_          = DeviceBuffer(staging_bytes(*host_));
+        auto* resident    = static_cast<std::byte*>(staging_.p);
+        slot_[0]          = resident + aligned(host_->resident.bytes);
+        slot_[1]          = slot_[0] + aligned(host_->slot_bytes);
+        const std::byte* b = host_->block;
+        const VisionStagingGroup& r = host_->resident;
+        staged_                 = operands;
+        staged_.patch_embedding = staged(r, resident, b, operands.patch_embedding);
+        staged_.position_table  = staged(r, resident, b, operands.position_table);
+        staged_.class_row       = staged(r, resident, b, operands.class_row);
+        staged_.pre_norm        = staged(r, resident, b, operands.pre_norm);
+        staged_.pre_norm_bias   = staged(r, resident, b, operands.pre_norm_bias);
+        staged_.projector_in    = staged(r, resident, b, operands.projector_in);
+        staged_.projector_out   = staged(r, resident, b, operands.projector_out);
+        for (std::size_t i = 0; i < operands.layers.size(); ++i) {
+            const VisionStagingGroup& g = host_->layers[i];
+            std::byte* slot             = slot_[i % 2];
+            const VisionLayerOperands& s = operands.layers[i];
+            VisionLayerOperands& d       = staged_.layers[i];
+            d.attention_norm      = staged(g, slot, b, s.attention_norm);
+            d.attention_norm_bias = staged(g, slot, b, s.attention_norm_bias);
+            d.qkv                 = staged(g, slot, b, s.qkv);
+            d.qkv_bias            = staged(g, slot, b, s.qkv_bias);
+            d.output              = staged(g, slot, b, s.output);
+            d.output_bias         = staged(g, slot, b, s.output_bias);
+            d.attention_scale     = staged(g, slot, b, s.attention_scale);
+            d.mlp_norm            = staged(g, slot, b, s.mlp_norm);
+            d.mlp_norm_bias       = staged(g, slot, b, s.mlp_norm_bias);
+            d.up                  = staged(g, slot, b, s.up);
+            d.up_bias             = staged(g, slot, b, s.up_bias);
+            d.down                = staged(g, slot, b, s.down);
+            d.down_bias           = staged(g, slot, b, s.down_bias);
+            d.mlp_scale           = staged(g, slot, b, s.mlp_scale);
+        }
+        w_ = &staged_;
+        for (cudaEvent_t* e : {&uploaded_[0], &uploaded_[1], &fence_}) {
+            CUDA_CHECK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+        }
+        // The resident region once: the patch embedding, the position table, the class row, the pre-norm, the projector.
+        upload_group(r, resident, b, transfer_);
+        CUDA_CHECK(cudaStreamSynchronize(transfer_));
     }
     const Layout l(c_, max_cells);
     buffer_     = DeviceBuffer(l.total);
@@ -97,6 +180,23 @@ VisionTower::VisionTower(const VisionConfig& config, const VisionOperands& opera
     tap_index_  = reinterpret_cast<std::int32_t*>(base + l.index);
     tap_weight_ = reinterpret_cast<float*>(base + l.weight);
     arena_      = base + l.arena;
+}
+
+VisionTower::~VisionTower() {
+    if (host_ == nullptr) { return; }
+    (void)cudaStreamSynchronize(transfer_); // no upload still lands in the slots
+    for (cudaEvent_t e : {uploaded_[0], uploaded_[1], fence_}) {
+        if (e != nullptr) { (void)cudaEventDestroy(e); }
+    }
+}
+
+// Layer `layer`'s pinned objects into its slot on the transfer stream (which already waits for the slot's last reader).
+void VisionTower::upload_layer(std::uint32_t layer) {
+    const VisionStagingGroup& g = host_->layers[layer];
+    upload_group(g, slot_[layer % 2], host_->block, transfer_);
+    CUDA_CHECK(cudaEventRecord(uploaded_[layer % 2], transfer_));
+    streamed_bytes_ += g.bytes;
+    next_upload_ = layer + 1;
 }
 
 const std::uint16_t* VisionTower::encode(const VisionImage& image, cudaStream_t stream) {
@@ -130,14 +230,15 @@ const std::uint16_t* VisionTower::encode(const VisionImage& image, cudaStream_t 
                                stream));
 
     // Patch embedding plus the resized position table, a chunk at a time, into token columns 1..P.
-    const Tensor table = matrix(w_.position_table, H, grid * grid); // [H, grid^2]: row gy * grid + gx
+    const VisionOperands& w = *w_;
+    const Tensor table = matrix(w.position_table, H, grid * grid); // [H, grid^2]: row gy * grid + gx
     for (std::int32_t first = 0; first < P; first += kVisionChunk) {
         const std::int32_t n = std::min(kVisionChunk, P - first);
         CUDA_CHECK(cudaMemcpyAsync(patches_, image.patches.data() + static_cast<std::size_t>(first) * K,
                                    static_cast<std::size_t>(n) * K * 2, cudaMemcpyHostToDevice, stream));
         Tensor in  = matrix(patches_, K, n);
         Tensor out = matrix(x_ + static_cast<std::size_t>(1 + first) * H, H, n);
-        ops::linear(in, w_.patch_embedding, out, stream);
+        ops::linear(in, w.patch_embedding, out, stream);
         host_index_.assign(static_cast<std::size_t>(4) * n, 0);
         host_weight_.assign(static_cast<std::size_t>(4) * n, 0.0F);
         for (std::int32_t j = 0; j < n; ++j) {
@@ -161,7 +262,7 @@ const std::uint16_t* VisionTower::encode(const VisionImage& image, cudaStream_t 
         Tensor weight(tap_weight_, DType::FP32, {4, n});
         ops::vision_pos_embed_add(table, index, weight, out, stream);
     }
-    CUDA_CHECK(cudaMemcpyAsync(x_, w_.class_row, static_cast<std::size_t>(H) * 2, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(x_, w.class_row, static_cast<std::size_t>(H) * 2, cudaMemcpyDeviceToDevice, stream));
 
     const auto chunks = [&](auto&& body) {
         for (std::int32_t first = 0; first < T; first += kVisionChunk) { body(first, std::min(kVisionChunk, T - first)); }
@@ -173,14 +274,33 @@ const std::uint16_t* VisionTower::encode(const VisionImage& image, cudaStream_t 
     };
     // The pre-norm: the residual stream is its output.
     chunks([&](std::int32_t first, std::int32_t n) {
-        norm(w_.pre_norm, w_.pre_norm_bias, first, n);
+        norm(w.pre_norm, w.pre_norm_bias, first, n);
         CUDA_CHECK(cudaMemcpyAsync(x_ + static_cast<std::size_t>(first) * H, h_, static_cast<std::size_t>(n) * H * 2,
                                    cudaMemcpyDeviceToDevice, stream));
     });
 
     const std::int32_t D = static_cast<std::int32_t>(c_.head_dim()), heads = static_cast<std::int32_t>(c_.heads);
     DeviceArena arena(DeviceSpan{arena_, kArenaBytes});
-    for (const VisionLayerOperands& l : w_.layers) {
+    // An offloaded tower: layers 0 and 1 into their slots once everything issued so far (the previous image's layers)
+    // is past; then each layer waits for its slot, and refills the slot the layer before it read.
+    const auto layer_count = static_cast<std::uint32_t>(w.layers.size());
+    if (host_ != nullptr) {
+        streamed_bytes_ = 0;
+        CUDA_CHECK(cudaEventRecord(fence_, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(transfer_, fence_, 0));
+        upload_layer(0);
+        if (layer_count > 1) { upload_layer(1); }
+    }
+    for (std::uint32_t li = 0; li < layer_count; ++li) {
+        const VisionLayerOperands& l = w.layers[li];
+        if (host_ != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, uploaded_[li % 2], 0));
+            if (li >= 1 && next_upload_ == li + 1 && next_upload_ < layer_count) {
+                CUDA_CHECK(cudaEventRecord(fence_, stream)); // past layer li - 1, the slot's last reader
+                CUDA_CHECK(cudaStreamWaitEvent(transfer_, fence_, 0));
+                upload_layer(li + 1);
+            }
+        }
         chunks([&](std::int32_t first, std::int32_t n) {
             norm(l.attention_norm, l.attention_norm_bias, first, n);
             Tensor out = matrix(qkv_ + static_cast<std::size_t>(first) * 3 * H, 3 * H, n);
@@ -221,10 +341,10 @@ const std::uint16_t* VisionTower::encode(const VisionImage& image, cudaStream_t 
         const std::int32_t n = std::min(step, cells - first);
         Tensor in  = matrix(x_ + static_cast<std::size_t>(1 + first * m * m) * H, merged, n);
         Tensor mid = matrix(u_, hidden, n);
-        ops::linear(in, w_.projector_in, mid, stream);
+        ops::linear(in, w.projector_in, mid, stream);
         ops::gelu(mid, ops::GeluMode::Exact, stream);
         Tensor out = matrix(qkv_ + static_cast<std::size_t>(first) * out_width, out_width, n);
-        ops::linear(mid, w_.projector_out, out, stream);
+        ops::linear(mid, w.projector_out, out, stream);
     }
     return qkv_;
 }

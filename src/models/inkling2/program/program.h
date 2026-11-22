@@ -289,6 +289,9 @@ struct ProgramOptions {
     // --vision (the tower bound in the Parameters): the tower's buffers for images of up to vision_max_cells cells.
     bool vision                    = false;
     std::uint32_t vision_max_cells = 0;
+    // --vision-offload on: the tower's pinned groups (the model's vision_host(), or the load plan's when planning),
+    // whose device staging the plan counts; the Program's tower streams through it.
+    const VisionHostWeights* vision_host = nullptr;
     // --kv-dtype: the full visits' pools (sliding windows stay BF16 K / FP16 V).
     ops::inkling2::KvCodec kv_codec = ops::inkling2::KvCodec::Bf16;
     DiagnosticObserver diagnostics;

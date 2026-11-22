@@ -95,8 +95,12 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
                             "FP16 values; the output differs from bf16's)");
     }
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
-    refuse(options.enable_vision && options.vision_offload == VisionOffload::On,
-           "--vision-offload on: the vision tower (~0.6 GiB) stays resident");
+    refuse(!options.enable_vision && options.vision_offload == VisionOffload::On, "--vision-offload on needs --vision");
+    if (options.enable_vision && options.vision_offload == VisionOffload::On) {
+        report(options, "Inkling 2: --vision-offload on: the vision tower's weights (~0.6 GiB) stay in pinned host memory "
+                        "and stream through ~0.1 GiB of device slots per image (the same rows; each image's encode "
+                        "waits on the PCIe link)");
+    }
     if (options.enable_vision && (options.vision_max_merged_tokens > 32768U ||
                                   (options.vision_max_merged_tokens != 0 && options.vision_max_merged_tokens < 64U))) {
         throw std::invalid_argument("--vision-max-merged must be 64-32768 image tokens");
@@ -150,7 +154,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     if (!models::inkling2::is_inkling2(reader)) { throw std::invalid_argument("artifact is not Inkling2LoopForCausalLM"); }
     models::LoadOptions load = models::load_options(options, models::Architecture::Inkling2Loop);
     auto plan                = models::inkling2::plan_load(reader, load);
-    const models::inkling2::ProgramOptions program = program_options(options);
+    models::inkling2::ProgramOptions program = program_options(options);
+    program.vision_host = plan.vision_host() ? &*plan.vision_host() : nullptr; // the plan's until materialized
     const models::inkling2::ProgramDevicePlan device_plan = models::inkling2::Program::plan_device(program, plan.config());
     if (planned != nullptr) {
         planned->architecture                   = std::string(models::architecture_name(models::Architecture::Inkling2Loop));
@@ -163,6 +168,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     std::string template_override;
     auto model = models::inkling2::materialize_model(std::move(plan), device, &options.startup_observer);
+    program.vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
     const auto& packed = model->packed();
     if (packed.source_bytes != 0) {
         constexpr double kMiB = 1024.0 * 1024.0;

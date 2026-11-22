@@ -31,7 +31,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -141,12 +143,13 @@ int main() {
         infernix::models::LoadOptions load;
         load.vision = true;
         auto model = m::materialize_model(m::plan_load(reader, load), device);
-        const m::Parameters parameters(*model);
+        auto parameters = std::make_unique<m::Parameters>(*model);
         std::int32_t max_cells = 1;
         for (const auto& image : images) { max_cells = std::max(max_cells, image.cells()); }
-        m::VisionTower tower(*model->config().vision, *parameters.vision, static_cast<std::uint32_t>(max_cells));
+        auto tower = std::make_unique<m::VisionTower>(*model->config().vision, *parameters->vision,
+                                                      static_cast<std::uint32_t>(max_cells));
         const auto rows_of = [&](const m::ProcessedImage& image) {
-            const std::uint16_t* rows = tower.encode(
+            const std::uint16_t* rows = tower->encode(
                 {image.rows, image.cols, std::span<const std::uint16_t>(*image.patches)}, device.stream);
             std::vector<std::uint16_t> out(static_cast<std::size_t>(image.cells()) * config.output_size);
             CUDA_CHECK(cudaMemcpyAsync(out.data(), rows, out.size() * 2, cudaMemcpyDeviceToHost, device.stream));
@@ -179,6 +182,58 @@ int main() {
         // The same bits encoded again, and after the other image.
         for (std::size_t i = images.size(); i-- > 0;) {
             check(rows_of(images[i]) == first[i], "an image's rows depend on what the tower encoded before it");
+        }
+        // Each image's encode time (resident), reported.
+        const auto encode_ms = [&](m::VisionTower& t, const m::ProcessedImage& image) {
+            cudaEvent_t a, b;
+            CUDA_CHECK(cudaEventCreate(&a));
+            CUDA_CHECK(cudaEventCreate(&b));
+            double best = 1e30;
+            for (int rep = 0; rep < 3; ++rep) {
+                CUDA_CHECK(cudaEventRecord(a, device.stream));
+                (void)t.encode({image.rows, image.cols, std::span<const std::uint16_t>(*image.patches)}, device.stream);
+                CUDA_CHECK(cudaEventRecord(b, device.stream));
+                CUDA_CHECK(cudaEventSynchronize(b));
+                float ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+                best = std::min(best, static_cast<double>(ms));
+            }
+            CUDA_CHECK(cudaEventDestroy(a));
+            CUDA_CHECK(cudaEventDestroy(b));
+            return best;
+        };
+        std::vector<double> resident_ms;
+        for (const auto& image : images) { resident_ms.push_back(encode_ms(*tower, image)); }
+        std::size_t free_resident = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_resident, &total));
+
+        // 4. --vision-offload on (the tower's weights in pinned host memory, streamed through two device slots a
+        //    layer): every image's rows the resident tower's bit for bit, in order, then again in reverse; the device
+        //    memory it frees (the model and tower loaded each way) and each encode's time, reported.
+        tower.reset();
+        parameters.reset();
+        model.reset();
+        load.vision_offload = true;
+        model      = m::materialize_model(m::plan_load(reader, load), device);
+        parameters = std::make_unique<m::Parameters>(*model);
+        if (!model->vision_host()) { throw std::runtime_error("--vision-offload on: the model holds no pinned tower"); }
+        tower = std::make_unique<m::VisionTower>(*model->config().vision, *parameters->vision,
+                                                 static_cast<std::uint32_t>(max_cells), &*model->vision_host(),
+                                                 device.transfer_stream);
+        std::size_t free_offloaded = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_offloaded, &total));
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            check(rows_of(images[i]) == first[i], "an offloaded tower's rows differ from the resident tower's");
+        }
+        for (std::size_t i = images.size(); i-- > 0;) {
+            check(rows_of(images[i]) == first[i], "an offloaded tower's rows depend on what it encoded before");
+        }
+        std::cout << "offload: rows equal the resident tower's bit for bit (" << images.size() << " images, twice); "
+                  << "device memory freed " << (static_cast<double>(free_offloaded) - free_resident) / (1 << 20)
+                  << " MiB (reported); streamed " << tower->streamed_bytes() / double(1 << 20) << " MiB an encode\n";
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            std::cout << "  image " << i << " (" << images[i].cells() << " cells): encode " << resident_ms[i]
+                      << " ms resident, " << encode_ms(*tower, images[i]) << " ms offloaded (best of 3, reported)\n";
         }
         std::cout << (g_failures == 0 ? "PASS\n" : "FAILED\n");
         return g_failures == 0 ? 0 : 1;

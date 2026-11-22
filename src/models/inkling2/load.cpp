@@ -6,6 +6,8 @@
 #include "artifact/views.h"
 #include "core/weight_view.h"
 
+#include <algorithm>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -36,7 +38,8 @@ struct PendingWeight {
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
 };
 
-// Logical demands of the model; each parameter is declared exactly once, device-resident.
+// Logical demands of the model; each parameter is declared exactly once, device-resident (or at `residency` while it
+// is set: an offloaded vision tower's HostPinned).
 class Bindings {
 public:
     explicit Bindings(artifact::Binder& binder) : binder_(binder) {}
@@ -44,7 +47,7 @@ public:
     WeightId parameter(std::string name, Shape shape, std::string_view input = {}, std::optional<QType> format = {}) {
         if (ids_.contains(name)) { throw ArtifactError(name + ": duplicate parameter declaration"); }
         PendingWeight pending;
-        pending.reference = binder_.parameter(name, std::move(shape), Residency::Device, format);
+        pending.reference = binder_.parameter(name, std::move(shape), residency, format);
         if (!input.empty()) {
             const auto& use = binder_.use(name, input);
             if (!use.activation_policy) {
@@ -64,6 +67,7 @@ public:
     }
 
     std::vector<PendingWeight> weights;
+    Residency residency = Residency::Device;
 
 private:
     artifact::Binder& binder_;
@@ -234,6 +238,50 @@ VisionWeights bind_vision(Bindings& b, const VisionConfig& c) {
     return out;
 }
 
+// --vision-offload on: the tower's groups in the pinned block (design §15.5). A group's distinct objects in the order
+// listed, each at the next 16-byte boundary of its device region (a parent shared by several weights, as q/k/v, is
+// staged once).
+constexpr std::size_t kStagedObjectAlignment = 16;
+
+VisionStagingGroup staging_group(const std::vector<PendingWeight>& pending,
+                                 const std::map<std::size_t, artifact::PinnedPlacement>& pinned,
+                                 std::initializer_list<WeightId> ids) {
+    VisionStagingGroup group;
+    std::vector<std::size_t> seen;
+    for (const WeightId id : ids) {
+        for (const auto& part : pending.at(id.index).reference.binding.parts) {
+            if (std::find(seen.begin(), seen.end(), part.object.index) != seen.end()) { continue; }
+            seen.push_back(part.object.index);
+            const auto it = pinned.find(part.object.index);
+            if (it == pinned.end()) { throw ArtifactError(pending.at(id.index).reference.name + ": not pinned"); }
+            group.bytes = (group.bytes + kStagedObjectAlignment - 1) / kStagedObjectAlignment * kStagedObjectAlignment;
+            group.segments.push_back({static_cast<std::size_t>(it->second.offset), group.bytes,
+                                      static_cast<std::size_t>(it->second.bytes)});
+            group.bytes += static_cast<std::size_t>(it->second.bytes);
+        }
+    }
+    return group;
+}
+
+VisionHostWeights vision_host_layout(const VisionWeights& w, const std::vector<PendingWeight>& pending,
+                                     const artifact::MaterializationPlan& plan) {
+    std::map<std::size_t, artifact::PinnedPlacement> pinned;
+    for (const artifact::PinnedPlacement& placement : plan.pinned_objects) { pinned.emplace(placement.object.index, placement); }
+    VisionHostWeights out;
+    out.resident = staging_group(pending, pinned,
+                                 {w.patch_embedding, w.position_embedding, w.class_row, w.pre_norm, w.pre_norm_bias,
+                                  w.projector_in, w.projector_out});
+    for (const VisionLayerWeights& l : w.layers) {
+        out.layers.push_back(staging_group(
+            pending, pinned,
+            {l.attention_norm, l.attention_norm_bias, l.query, l.key, l.value, l.query_bias, l.key_bias, l.value_bias,
+             l.output, l.output_bias, l.attention_scale, l.mlp_norm, l.mlp_norm_bias, l.up, l.up_bias, l.down,
+             l.down_bias, l.mlp_scale}));
+        out.slot_bytes = std::max(out.slot_bytes, out.layers.back().bytes);
+    }
+    return out;
+}
+
 // The stored experts must carry the arithmetic the config names: their Use permits it, and an A16Only Use (a
 // recipe that withheld the trained activation rule) is refused rather than run in another arithmetic.
 void check_expert_uses(const std::vector<PendingWeight>& pending, const TextWeights& weights, const TextConfig& c) {
@@ -348,6 +396,7 @@ struct LoadPlan::Impl {
     std::vector<artifact::ObjectHandle> q8_objects; // LoadOptions::q8_weights: loaded transient, converted at load
     std::uint64_t q8_bytes = 0;
     artifact::MaterializationPlan materialization;
+    std::optional<VisionHostWeights> vision_host; // --vision-offload on (block filled at materialization)
     FrontendResources resources;
     InstanceInfo info;
 };
@@ -364,6 +413,7 @@ std::uint64_t LoadPlan::device_bytes() const {
     return impl_->materialization.device_capacity_bytes + impl_->packed_bytes + impl_->q8_bytes;
 }
 std::uint32_t LoadPlan::public_token_count() const { return impl_->resources.public_token_count; }
+const std::optional<VisionHostWeights>& LoadPlan::vision_host() const { return impl_->vision_host; }
 
 bool is_inkling2(const artifact::Reader& reader) {
     const auto& config = reader.directory().component("text").config;
@@ -379,7 +429,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text);
     if (out->config.dspark) { out->weights.dspark = bind_dspark(bindings, *out->config.dspark, out->config.text); }
-    if (out->config.vision) { out->weights.vision = bind_vision(bindings, *out->config.vision); }
+    if (out->config.vision) {
+        // --vision-offload on: the tower in pinned host memory, staged through the tower's device slots per encode.
+        bindings.residency  = options.vision_offload ? Residency::HostPinned : Residency::Device;
+        out->weights.vision = bind_vision(bindings, *out->config.vision);
+        bindings.residency  = Residency::Device;
+    }
     check_expert_uses(bindings.weights, out->weights, out->config.text);
     out->pending = std::move(bindings.weights);
     if (options.pack_bf16) {
@@ -397,6 +452,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         }
     }
     out->materialization = std::move(binder).finish();
+    if (out->config.vision && options.vision_offload) {
+        out->vision_host = vision_host_layout(*out->weights.vision, out->pending, out->materialization);
+    }
     out->info.name            = reader.directory().metadata.value("name", std::string("Inkling2LoopForCausalLM"));
     out->info.metadata_json   = reader.directory().metadata.dump();
     out->info.provenance_json = reader.directory().provenance.dump();
@@ -406,9 +464,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
              FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed,
-             Q8Weights q8)
+             Q8Weights q8, std::optional<VisionHostWeights> vision_host)
     : backing_(std::move(backing)), packed_(std::move(packed)), q8_(std::move(q8)), config_(std::move(config)), options_(options),
-      weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)) {}
+      weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)),
+      vision_host_(std::move(vision_host)) {}
 
 Model::~Model() = default;
 
@@ -435,9 +494,15 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         }
         backing.release_transient();
     }
+    if (data->vision_host) {
+        const std::span<const std::byte> pinned = backing.pinned_bytes_range();
+        if (pinned.empty()) { throw ArtifactError("--vision-offload on: the tower has no pinned block"); }
+        data->vision_host->block = pinned.data();
+    }
     return std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
                                             std::move(bound), std::move(data->resources), std::move(data->info),
-                                            std::move(backing), std::move(packed), std::move(q8)));
+                                            std::move(backing), std::move(packed), std::move(q8),
+                                            std::move(data->vision_host)));
 }
 
 } // namespace infernix::models::inkling2

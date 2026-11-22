@@ -8,7 +8,9 @@
 #include "models/inkling2/weights.h"
 #include "text/tokenizer.h"
 
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -36,7 +38,26 @@ struct InstanceInfo {
 
 class LoadPlan;
 
-// A loaded Inkling 2 model: every weight device-resident (design §20), frozen after materialization.
+// --vision-offload on (design §15.5): the tower's weights in the pinned host block, grouped as the tower stages them:
+// each group's objects in order, each at a 16-byte-aligned offset of its device region.
+struct VisionStagingSegment {
+    std::size_t pinned_offset  = 0; // in the pinned block
+    std::size_t staging_offset = 0; // in the group's device region
+    std::size_t bytes          = 0;
+};
+struct VisionStagingGroup {
+    std::vector<VisionStagingSegment> segments;
+    std::size_t bytes = 0;
+};
+struct VisionHostWeights {
+    const std::byte* block = nullptr;     // the pinned block (host address: the operands' pointers lie inside it)
+    VisionStagingGroup resident;          // patch embedding, position table, class row, pre-norm, projector
+    std::vector<VisionStagingGroup> layers;
+    std::size_t slot_bytes = 0;           // the largest layer group
+};
+
+// A loaded Inkling 2 model: every weight device-resident (design §20) but an offloaded vision tower's, frozen after
+// materialization.
 class Model {
 public:
     ~Model();
@@ -60,12 +81,14 @@ public:
     [[nodiscard]] const PackedWeights& packed() const noexcept { return packed_; }
     // The matrices converted to 8-bit weights at load (LoadOptions::q8_weights), which the bound views address.
     [[nodiscard]] const Q8Weights& q8() const noexcept { return q8_; }
+    // --vision-offload on: the tower's pinned weights (the bound views address the pinned block); otherwise empty.
+    [[nodiscard]] const std::optional<VisionHostWeights>& vision_host() const noexcept { return vision_host_; }
 
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed,
-          Q8Weights q8);
+          Q8Weights q8, std::optional<VisionHostWeights> vision_host);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
@@ -77,6 +100,7 @@ private:
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
+    std::optional<VisionHostWeights> vision_host_;
 };
 
 } // namespace infernix::models::inkling2

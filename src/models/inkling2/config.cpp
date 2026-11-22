@@ -216,8 +216,8 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             throw ArtifactError("--vision: the artifact has no vision component (convert with --components "
                                 "text,dspark,vision)");
         }
-        if (options.vision_offload) {
-            throw ArtifactError("--vision-offload on: Inkling 2's tower (~0.6 GiB) stays resident");
+        if (options.vision_offload && !options.vision) {
+            throw ArtifactError("--vision-offload on needs --vision");
         }
         // A stored drafter must fit the model even when it is not bound.
         if (directory.components.contains("dspark")) {

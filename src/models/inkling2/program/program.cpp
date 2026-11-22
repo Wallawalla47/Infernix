@@ -186,7 +186,10 @@ public:
             if (!p_.vision || !parameters.model.config().vision) {
                 throw std::invalid_argument("Inkling 2: --vision needs the tower's parameters");
             }
-            vision_ = std::make_unique<VisionTower>(*parameters.model.config().vision, *p_.vision, o_.vision_max_cells);
+            // --vision-offload on: the model's pinned tower, streamed through the tower's slots on the transfer stream.
+            const auto& host = parameters.model.vision_host();
+            vision_ = std::make_unique<VisionTower>(*parameters.model.config().vision, *p_.vision, o_.vision_max_cells,
+                                                    host ? &*host : nullptr, device_.transfer_stream);
         }
         if (o_.use_cuda_graph && !o_.causal_scoring) { capture_decode_graphs(); }
     }
@@ -1335,7 +1338,7 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
         if (!config.vision || options.vision_max_cells == 0) {
             throw std::invalid_argument("Inkling 2: --vision needs the vision config and a positive image budget");
         }
-        out.workspace += VisionTower::device_bytes(*config.vision, options.vision_max_cells);
+        out.workspace += VisionTower::device_bytes(*config.vision, options.vision_max_cells, options.vision_host);
     }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     return out;

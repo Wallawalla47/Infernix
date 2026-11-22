@@ -1157,6 +1157,14 @@ Built with `--vision` (images; no video). The semantics, from transformers' `Ink
   and copies their rows over its embedding columns, as the reference scatters them after `embed_norm`. Scoring does
   the same. The text model has no positional encoding beyond the relative bias, so image tokens are ordinary positions
   (no MRoPE). The images ride in the request's base plan (no prefix cache yet: its media keys come with M4).
+- **Offload** (`--vision-offload on`; `auto` keeps it off for Inkling 2): the loader binds the tower's weights
+  HostPinned (`Model::vision_host()`: each group's objects with their pinned and staging offsets); the tower keeps a
+  device region of the patch embedding, position table, class row, pre-norm and projector (uploaded once) and two
+  layer slots, ~0.1 GB of device memory for the resident tower's 0.63 GB. Each encode streams the 23 layers through
+  the slots on the transfer stream: layers 0 and 1 once the previous encode's kernels are past (an event fence), then
+  at the top of layer l the compute stream waits for its slot's upload and, layer l − 1 having been issued, the other
+  slot refills with layer l + 1, so an upload overlaps a layer's compute. The kernels and their order are the resident
+  tower's, so the rows are the same bits.
 
 Qualification: the processor's BF16 pixel words equal transformers' processor's exactly (`test_vision_real.cpp`, cell
 SHA-256s of `tests/fixtures/inkling2/vision_golden.json`); an FP64 oracle of the tower written from this statement
@@ -1167,8 +1175,12 @@ agreed with SGLang's tower run in FP32 to 1.0-1.3e-6 relative RMS on three asymm
 2 × 5-cell images, the same bits re-encoded. Through the Engine (`test_engine_vision_real.cpp`, RTX 5090,
 2026-11-22): a red disc on blue asked for its colour answers "red"; two image requests and a text request give their
 solo tokens at C = 3; prefill chunks of 16 and 4,096, eager and graphs, the same tokens; DSpark the same tokens as
-plain decoding; an Engine without `--vision` refuses images. Not measured: the tower's time a image and prefill
-throughput with images.
+plain decoding; an Engine without `--vision` refuses images. Offload (2026-11-22): an offloaded tower's rows equal the
+resident tower's bit for bit on both fixture images (encoded twice, in either order), 504 MiB of device memory freed,
+553 MiB streamed an encode; the 6- and 10-cell images encode in 22.1 and 22.8 ms against 14.3 and 15.8 ms resident
+(best of 3: 553 MiB at ~26 GB/s, the link's rate, so a small image's encode is link-bound); through the Engine, the
+small and the 1,296-cell image and a sampled request give the resident tower's tokens. Not measured: a large image's
+offloaded encode time and prefill throughput with images.
 
 ---
 

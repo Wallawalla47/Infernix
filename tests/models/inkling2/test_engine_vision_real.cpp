@@ -6,7 +6,9 @@
 //    all at once in reverse order (C = 3), and the greedy image request its tokens at prefill chunks of 16 (the image
 //    tokens split across chunk edges) and in one call, eager and with graphs.
 // 3. DSpark (--spec dspark): the greedy image request's tokens equal plain decoding's.
-// 4. Without --vision the same artifact refuses an image request (InvalidMedia) and serves text.
+// 4. --vision-offload on (the tower streamed from pinned host memory): the greedy small and large image requests and
+//    a sampled one give the resident tower's tokens.
+// 5. Without --vision the same artifact refuses an image request (InvalidMedia) and serves text.
 //
 //   INFERNIX_INKLING2_VISION_ARTIFACT  the artifact converted with the vision component
 
@@ -187,6 +189,17 @@ int main() {
             infernix::Engine engine(options);
             const auto drafted = engine.generate(engine.prepare(prompts[0]), greedy(200));
             require_same("DSpark", disc_greedy, drafted.generated_token_ids);
+        }
+        {
+            infernix::EngineOptions options = engine_options(artifact, 0, true, 1);
+            options.vision_offload          = infernix::VisionOffload::On;
+            infernix::Engine engine(options);
+            require_same("--vision-offload on", disc_greedy,
+                         engine.generate(engine.prepare(prompts[0]), greedy(200)).generated_token_ids);
+            require_same("--vision-offload on, large image", large_greedy,
+                         engine.generate(engine.prepare(large), greedy(200)).generated_token_ids);
+            require_same("--vision-offload on, sampled stripes", solo[1],
+                         engine.generate(engine.prepare(prompts[1]), sampled(1)).generated_token_ids);
         }
         {
             infernix::Engine engine(engine_options(artifact, 0, true, 1, false));

@@ -26,6 +26,8 @@ public:
     // Device bytes of the weights, and the tokenizer's public token count.
     [[nodiscard]] std::uint64_t device_bytes() const;
     [[nodiscard]] std::uint32_t public_token_count() const;
+    // --vision-offload on: the tower's pinned groups (their block address set at materialization); otherwise empty.
+    [[nodiscard]] const std::optional<VisionHostWeights>& vision_host() const;
 
 private:
     struct Impl;
