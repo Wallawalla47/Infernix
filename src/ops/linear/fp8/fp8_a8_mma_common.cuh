@@ -186,16 +186,19 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
         else
             return Schedule::kSharedBytes;
     }();
+    // A wide term's whole-tile stage fits the 384-row FP8 tiles' 98,304 bytes only unpadded (lora_add_tokens_tile_
+    // staged_swizzled, its row fragments one at a time: low-register); the group-staged form serves the others.
     constexpr bool kStagedLora = [] {
         if constexpr (kLora && requires { Schedule::kWarpsTokens; }) {
-            if constexpr (kLoraStageRank<Epilogue> > kLoraNarrowRank) { return false; }
+            if constexpr (kLoraStageRank<Epilogue> > kLoraNarrowRank)
+                return (BN + BM) * (2 * kLoraStageRank<Epilogue>) <= kScratchBytes;
             return (BN + BM) * (2 * kLoraNarrowRank + 16) <= kScratchBytes;
         } else {
             return false;
         }
     }();
     constexpr bool kGroupLora = [] {
-        if constexpr (kLora && requires { Schedule::kWarpsTokens; }) {
+        if constexpr (kLora && !kStagedLora && requires { Schedule::kWarpsTokens; }) {
             if constexpr (kLoraStageRank<Epilogue> <= kLoraNarrowRank) { return false; }
             return (BN + Schedule::kWarpsTokens * 2 * 16) * (2 * kLoraStageRank<Epilogue> + 16) <= kScratchBytes;
         } else {
@@ -314,7 +317,7 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     tid, warp_token, [] { asm volatile("bar.sync 1, %0;" ::"r"(THREADS) : "memory"); });
             } else if constexpr (kStagedLora) {
                 // The same: the storage is free.
-                lora_add_tokens_tile_staged<BM, BN, kScratchBytes>(
+                lora_add_tokens_tile_staged<BM, BN, kScratchBytes, true>(
                     epilogue.lora, accumulators,
                     [&](int mt, int i) { return warp_token * Schedule::kWarpTokens + mt * 16 + i; },
                     [&](int mr, int j) { return warp_row * Schedule::kWarpRows + mr * 8 + j; },

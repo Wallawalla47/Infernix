@@ -852,9 +852,9 @@ __device__ __forceinline__ void lora_add_tokens_tile_group_staged(const P& p, fl
 // same order: the same bits.
 // Swizzled: the staged rows hold exactly the rank's 16-byte pieces, piece i of row r at position i ^ (r & 7) (eight
 // consecutive rows' same piece in distinct banks without a padding piece); otherwise rows of `stride` bytes, piece i at
-// position i.
-template <bool Swizzled = false, class P, int MT, int MR, class LocalToken, class LocalRow, class CtaRow,
-          class InSlice>
+// position i. Paired false: every row fragment alone (half the B operands live at once, for a register-capped tile).
+template <bool Swizzled = false, bool Paired = true, class P, int MT, int MR, class LocalToken, class LocalRow,
+          class CtaRow, class InSlice>
 __device__ __forceinline__ void lora_staged_pairs(const P& p, float (&acc)[MT][MR][4], unsigned pass,
                                                   const unsigned char* b_s, const unsigned char* u_s, int u_bytes,
                                                   int stride, LocalToken local_token, LocalRow local_row,
@@ -886,7 +886,7 @@ __device__ __forceinline__ void lora_staged_pairs(const P& p, float (&acc)[MT][M
         for (int mr0 = 0; mr0 < MR; mr0 += 2) {
             const int seg0 = p.segment_of(cta_row(local_row(mr0, 0)));
             const int seg1 = p.segment_of(cta_row(local_row(mr0 + 1, 0)));
-            if (seg0 == seg1) {
+            if (Paired && seg0 == seg1) {
                 if (((pass >> seg0) & 1U) == 0U) { continue; }
                 const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg0) - 1U)) * u_bytes;
                 const float scale           = p.scale_of(seg0);
@@ -1033,8 +1033,10 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged_halves(const P& p, f
 // columns over every token a pass. Every warp runs its fragments of the pass's segment each pass (the halves form
 // above stages half the tokens a pass, so half the warps wait at each barrier: 6 % of the A4 gate/up tile's samples at
 // rank 128). Each chain is lora_add_tokens_tile_staged's on the same operands in the same order: the same bits.
-template <int BlockTokens, int BlockRows, int SmemBytes, int MT, int MR, class P, class LocalToken, class LocalRow,
-          class CtaRow, class Barrier>
+// LowRegisters: the row fragments one at a time (lora_staged_pairs<true, false>), for a tile whose accumulators leave
+// few registers (the FP8 tiles).
+template <int BlockTokens, int BlockRows, int SmemBytes, bool LowRegisters = false, int MT, int MR, class P,
+          class LocalToken, class LocalRow, class CtaRow, class Barrier>
 __device__ __forceinline__ void lora_add_tokens_tile_staged_swizzled(const P& p, float (&acc)[MT][MR][4],
                                                                      LocalToken local_token, LocalRow local_row,
                                                                      CtaRow cta_row, int token_begin, int token_count,
@@ -1084,7 +1086,7 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged_swizzled(const P& p,
         cp_commit();
         cp_wait<0>();
         barrier();
-        lora_staged_pairs<true>(p, acc, 1U << s, b_s, u_s, 0, kRowBytes, local_token, local_row, cta_row,
+        lora_staged_pairs<true, !LowRegisters>(p, acc, 1U << s, b_s, u_s, 0, kRowBytes, local_token, local_row, cta_row,
                                 [](int) { return true; }, 0);
     }
     barrier(); // the last pass's reads finish before the caller reuses shared memory
@@ -1103,9 +1105,10 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged_swizzled(const P& p,
 // ends with one, so the caller may reuse `smem` at once. A wide instance whose padded rows (P::kMaxRank) do not fit
 // the free shared memory over the whole tile stages them unpadded and swizzled (lora_add_tokens_tile_staged_swizzled)
 // when that fits, else U half the tile at a time (lora_add_tokens_tile_staged_halves), or, when not even that fits,
-// reads its operands from L2 (lora_add_tokens_tile): the same chains, the same bits.
-template <int BlockTokens, int BlockRows, int SmemBytes, int MT, int MR, class P, class LocalToken, class LocalRow,
-          class CtaRow, class Barrier>
+// reads its operands from L2 (lora_add_tokens_tile): the same chains, the same bits. LowRegisters: the swizzled form
+// takes the row fragments one at a time (a register-capped tile).
+template <int BlockTokens, int BlockRows, int SmemBytes, bool LowRegisters = false, int MT, int MR, class P,
+          class LocalToken, class LocalRow, class CtaRow, class Barrier>
 __device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&acc)[MT][MR][4],
                                                             LocalToken local_token, LocalRow local_row,
                                                             CtaRow cta_row, int token_begin, int token_count,
@@ -1119,7 +1122,7 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&
     static_assert(BlockRows % 8 == 0);
     if constexpr (P::kMaxRank > kLoraNarrowRank && (BlockRows + BlockTokens) * kMaxStride > SmemBytes &&
                   (BlockRows + BlockTokens) * 2 * P::kMaxRank <= SmemBytes) {
-        lora_add_tokens_tile_staged_swizzled<BlockTokens, BlockRows, SmemBytes>(
+        lora_add_tokens_tile_staged_swizzled<BlockTokens, BlockRows, SmemBytes, LowRegisters>(
             p, acc, local_token, local_row, cta_row, token_begin, token_count, smem, thread, threads, barrier);
         return;
     } else if constexpr ((BlockRows + BlockTokens) * kMaxStride > SmemBytes &&
@@ -1202,8 +1205,8 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&
         cp_wait<0>();
         barrier();
         if constexpr (P::kMaxRank > kLoraNarrowRank && MR % 2 == 0) {
-            lora_staged_pairs(p, acc, pass, b_s, u_s, u_bytes, stride, local_token, local_row, cta_row,
-                              [](int) { return true; }, 0);
+            lora_staged_pairs<false, !LowRegisters>(p, acc, pass, b_s, u_s, u_bytes, stride, local_token, local_row,
+                                                     cta_row, [](int) { return true; }, 0);
         } else {
             // The rank's k-steps as a compile-time count (an instance per count): the unrolled loads and MMAs carry no
             // per-step branch (each one, around ldmatrix's warp-wide form, cost a reconvergence and a WARPSYNC), so a
