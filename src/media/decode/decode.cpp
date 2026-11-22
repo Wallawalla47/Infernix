@@ -175,6 +175,8 @@ Image apply_orientation(Image image, int orientation) {
     rotated.width  = swap ? height : width;
     rotated.height = swap ? width : height;
     rotated.rgb.resize(image.rgb.size());
+    rotated.alpha.resize(image.alpha.size());
+    const bool alpha = !image.alpha.empty();
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             int rx = 0;
@@ -201,9 +203,10 @@ Image apply_orientation(Image image, int orientation) {
                 rx = y;
                 ry = width - 1 - x;
             }
-            const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
-            const std::size_t dst = (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
-            std::copy_n(image.rgb.data() + src, 3, rotated.rgb.data() + dst);
+            const std::size_t src = static_cast<std::size_t>(y) * width + x;
+            const std::size_t dst = static_cast<std::size_t>(ry) * rotated.width + rx;
+            std::copy_n(image.rgb.data() + 3 * src, 3, rotated.rgb.data() + 3 * dst);
+            if (alpha) { rotated.alpha[dst] = image.alpha[src]; }
         }
     }
     return rotated;
@@ -448,7 +451,9 @@ public:
         (void)receive();
     }
 
-    Image rgb(const AVFrame* frame, int orientation, bool composite_alpha = false) {
+    // composite_alpha (video): alpha over white. keep_alpha (an image for a processor that composites it): the colour
+    // samples as stored and the alpha plane beside them.
+    Image rgb(const AVFrame* frame, int orientation, bool composite_alpha = false, bool keep_alpha = false) {
         const int width  = frame->width;
         const int height = frame->height;
         if (width <= 0 || height <= 0) {
@@ -462,8 +467,9 @@ public:
         out.height = height;
         const AVPixFmtDescriptor* descriptor =
             av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-        const bool alpha = composite_alpha && descriptor != nullptr &&
-                           (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool has_alpha = descriptor != nullptr && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool alpha     = composite_alpha && has_alpha;
+        const bool keep      = keep_alpha && has_alpha && !composite_alpha;
         const std::size_t pixels = static_cast<std::size_t>(width) * height;
         const bool lossy_webp =
             webp_codec(codec_->codec_id) &&
@@ -471,6 +477,14 @@ public:
         if (lossy_webp) {
             out.rgb.resize(pixels * 3);
             webp_rgb(frame, out.rgb.data());
+            if (keep && frame->format == AV_PIX_FMT_YUVA420P) {
+                out.alpha.resize(pixels);
+                for (int y = 0; y < height; ++y) {
+                    std::memcpy(out.alpha.data() + static_cast<std::size_t>(y) * width,
+                                frame->data[3] + static_cast<std::ptrdiff_t>(y) * frame->linesize[3],
+                                static_cast<std::size_t>(width));
+                }
+            }
             if (alpha) {
                 for (int y = 0; y < height; ++y) {
                     const std::uint8_t* a_row =
@@ -487,7 +501,7 @@ public:
             }
             return apply_orientation(std::move(out), orientation);
         }
-        const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+        const AVPixelFormat destination_format = alpha || keep ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
         // Subsampled chroma is interpolated to every pixel and rounded accurately, as libjpeg's
         // fancy upsampling does for JPEG images, instead of repeating the nearest chroma sample.
@@ -500,7 +514,21 @@ public:
                                    converted.linesize());
         if (rows != height) { throw std::runtime_error("failed to convert media frame to RGB"); }
         out.rgb.resize(pixels * 3);
-        if (!alpha) {
+        if (keep) {
+            out.alpha.resize(pixels);
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* source =
+                    converted.data()[0] + static_cast<std::size_t>(y) * converted.linesize()[0];
+                std::uint8_t* destination = out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+                std::uint8_t* a           = out.alpha.data() + static_cast<std::size_t>(y) * width;
+                for (int x = 0; x < width; ++x) {
+                    destination[3 * x]     = source[4 * x];
+                    destination[3 * x + 1] = source[4 * x + 1];
+                    destination[3 * x + 2] = source[4 * x + 2];
+                    a[x]                   = source[4 * x + 3];
+                }
+            }
+        } else if (!alpha) {
             const std::size_t row_bytes = static_cast<std::size_t>(width) * 3;
             for (int y = 0; y < height; ++y) {
                 std::memcpy(out.rgb.data() + static_cast<std::size_t>(y) * row_bytes,
@@ -880,7 +908,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     // native path decodes png directly so those builds accept png images too.
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
     if (is_png(bytes)) {
-        return decode_png(bytes, policy.max_decoded_pixels);
+        return decode_png(bytes, policy.max_decoded_pixels, policy.keep_alpha);
     }
 #endif
     // JPEG through libjpeg with Pillow's settings, so the pixels equal the reference processors';
@@ -894,7 +922,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
         if (index == 0) {
-            result = decoder.rgb(frame, orientation);
+            result = decoder.rgb(frame, orientation, false, policy.keep_alpha);
             return false;
         }
         return true;

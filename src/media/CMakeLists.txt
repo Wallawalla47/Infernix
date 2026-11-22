@@ -3,7 +3,7 @@
 # from the same tree. Cross-platform builds use system FFmpeg (which includes png) and
 # skip the native path. JPEG images decode through libjpeg(-turbo) on every platform
 # (jpeg_decode.cpp), so their pixels equal Pillow's.
-set(_infernix_media_sources decode/decode.cpp decode/jpeg_decode.cpp)
+set(_infernix_media_sources decode/decode.cpp decode/jpeg_decode.cpp decode/resize.cpp)
 if(WIN32)
   list(APPEND _infernix_media_sources decode/png_decode.cpp)
 endif()

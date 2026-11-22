@@ -221,6 +221,16 @@ void test_webp_gif_references() {
             worst = std::max(worst, std::abs(static_cast<int>(image.rgb[i]) - static_cast<int>(expected[i])));
         }
         if (worst != 0) { failures += " " + name + " (largest channel difference " + std::to_string(worst) + ")"; }
+        // keep_alpha: the same colour samples, an alpha plane of the image's size or none.
+        infernix::media::decode::Policy keep;
+        keep.keep_alpha  = true;
+        const auto kept = infernix::media::decode::decode_image(encoded, keep);
+        const bool transparent = name.find("alpha") != std::string::npos || name.find("rgba") != std::string::npos ||
+                                 name.find("trns") != std::string::npos;
+        if (kept.rgb != image.rgb || (transparent && kept.alpha.empty()) ||
+            (!kept.alpha.empty() && kept.alpha.size() != static_cast<std::size_t>(fixture.width) * fixture.height)) {
+            failures += " " + name + " (keep_alpha changed the colours or sized its alpha plane wrong)";
+        }
         // One pixel under the image's own count is refused as over the budget (audit 2026-11-17 SV-05: the FFmpeg
         // decoders now meet the budget before they allocate a frame, from the declared size and the codec's limit).
         expect_error(encoded,
@@ -476,6 +486,26 @@ void test_png_decoders() {
         expect_exact(image, 0, 0, {10, 20, 30});
         expect_exact(image, 1, 0, {40, 50, 60});
         expect_exact(image, 2, 0, {70, 80, 90});
+    }
+
+    // keep_alpha (a processor that composites itself, Inkling 2's): the same colour samples, and the alpha plane of a
+    // transparent image (RGBA's samples; a palette's tRNS entries, the rest opaque); none for an opaque image.
+    {
+        Policy keep;
+        keep.keep_alpha = true;
+        const auto alpha_of = [&](const std::uint8_t* bytes, std::size_t size) { return decode_image(sp(bytes, size), keep); };
+        const Image rgba = alpha_of(png_rgba8, std::size(png_rgba8));
+        expect_exact(rgba, 0, 0, {255, 0, 0});
+        expect_exact(rgba, 1, 0, {0, 255, 0});
+        if (rgba.alpha != std::vector<std::uint8_t>{128, 255}) { throw std::runtime_error("RGBA png: alpha plane"); }
+        const Image palette = alpha_of(png_palette_trns, std::size(png_palette_trns));
+        expect_exact(palette, 1, 0, {40, 50, 60});
+        if (palette.alpha.size() != 3 || palette.alpha[1] != 128 || palette.alpha[2] != 255) {
+            throw std::runtime_error("palette + tRNS png: alpha plane");
+        }
+        if (!alpha_of(png_rgb8, std::size(png_rgb8)).alpha.empty()) {
+            throw std::runtime_error("an opaque png returned an alpha plane");
+        }
     }
 
     // Pixel budget is enforced before decode (throws Error, a runtime_error).

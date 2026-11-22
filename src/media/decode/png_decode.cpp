@@ -36,10 +36,18 @@ struct Palette {
     std::vector<std::array<std::uint8_t, 3>> rgb;
 };
 
+// tRNS: a palette's per-entry alpha (entries past it opaque), or the one transparent gray or RGB sample value.
+struct Transparency {
+    bool present = false;
+    std::vector<std::uint8_t> palette_alpha;
+    std::array<std::uint32_t, 3> key{};
+};
+
 struct Parse {
     Header header;
     std::vector<std::uint8_t> idat;
     Palette palette;
+    Transparency transparency;
     bool have_ihdr = false;
 };
 
@@ -55,8 +63,8 @@ struct Parse {
     }
 }
 
-// Walk the chunk stream, collecting IHDR, PLTE and the concatenated IDAT. Transparency (tRNS, and the alpha
-// samples of color types 4 and 6) is not read: the decode drops alpha.
+// Walk the chunk stream, collecting IHDR, PLTE, tRNS and the concatenated IDAT. The decode reads transparency (tRNS,
+// and the alpha samples of color types 4 and 6) only when asked to keep alpha.
 void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
     std::size_t offset = 8;
     while (offset + 8 <= bytes.size()) {
@@ -115,6 +123,19 @@ void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
             }
         } else if (std::memcmp(tag, "IDAT", 4) == 0) {
             out.idat.insert(out.idat.end(), data, data + length);
+        } else if (std::memcmp(tag, "tRNS", 4) == 0 && out.have_ihdr) {
+            Transparency& t = out.transparency;
+            const auto be16 = [&](std::size_t at) { return (std::uint32_t{data[at]} << 8) | data[at + 1]; };
+            if (out.header.color_type == 3) {
+                t.present = true;
+                t.palette_alpha.assign(data, data + length);
+            } else if (out.header.color_type == 0 && length >= 2) {
+                t.present = true;
+                t.key     = {be16(0), 0, 0};
+            } else if (out.header.color_type == 2 && length >= 6) {
+                t.present = true;
+                t.key     = {be16(0), be16(2), be16(4)};
+            }
         }
     }
     if (!out.have_ihdr) { throw std::invalid_argument("png is missing its IHDR chunk"); }
@@ -231,7 +252,7 @@ ImageInfo png_image_info(std::span<const std::uint8_t> bytes, std::uint64_t max_
     return ImageInfo{.width = parse.header.width, .height = parse.header.height};
 }
 
-Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
+Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels, bool keep_alpha) {
     if (!is_png(bytes)) { throw std::invalid_argument("not a png image"); }
     Parse parse;
     parse_chunks(bytes, parse);
@@ -284,6 +305,11 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
     out.height = height;
     out.rgb.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
     std::uint8_t* px = out.rgb.data();
+    // The alpha plane (keep_alpha and a transparent source): colour types 4 and 6 their alpha sample (8 bits as the
+    // colour samples), tRNS a palette entry's alpha or 0 where the full-precision sample equals the key.
+    const bool alpha = keep_alpha && (color_type == 4 || color_type == 6 || parse.transparency.present);
+    if (alpha) { out.alpha.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 255); }
+    std::uint8_t* ap = out.alpha.data();
     // The previous scanline (zeros above the first) and this one, and this one's filter byte and filtered bytes.
     std::vector<std::uint8_t> previous(static_cast<std::size_t>(row_bytes), 0), current(static_cast<std::size_t>(row_bytes));
     std::vector<std::uint8_t> filtered(static_cast<std::size_t>(row_bytes) + 1);
@@ -330,6 +356,32 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
             px[1] = g;
             px[2] = b;
             px += 3;
+            if (alpha) {
+                const Transparency& t = parse.transparency;
+                switch (color_type) {
+                case 0:
+                    *ap = raw_value(row, x, 0) == t.key[0] ? 0 : 255;
+                    break;
+                case 2:
+                    *ap = raw_value(row, x, 0) == t.key[0] && raw_value(row, x, 1) == t.key[1] &&
+                                  raw_value(row, x, 2) == t.key[2]
+                              ? 0
+                              : 255;
+                    break;
+                case 3: {
+                    const std::uint32_t idx = raw_value(row, x, 0);
+                    *ap = idx < t.palette_alpha.size() ? t.palette_alpha[idx] : 255;
+                    break;
+                }
+                case 4:
+                    *ap = to8(raw_value(row, x, 1), bit_depth);
+                    break;
+                case 6:
+                    *ap = to8(raw_value(row, x, 3), bit_depth);
+                    break;
+                }
+                ++ap;
+            }
         }
         previous.swap(current);
     }

@@ -34,6 +34,10 @@ struct Policy {
     std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
     int max_video_source_frames            = 100'000;
     double max_video_duration_seconds      = 600.0;
+    // decode_image: also return the alpha plane of an image that carries transparency (an alpha channel, or PNG
+    // tRNS), for a processor that composites it itself (Inkling 2's checkerboard). Without it alpha is dropped and
+    // the colour samples stay as stored (Pillow's convert("RGB")).
+    bool keep_alpha = false;
     std::function<void()> checkpoint;
 };
 
@@ -41,6 +45,8 @@ struct Image {
     int width  = 0;
     int height = 0;
     std::vector<std::uint8_t> rgb;
+    // Policy::keep_alpha and a source with transparency: [height][width] alpha (255 opaque); otherwise empty.
+    std::vector<std::uint8_t> alpha;
 };
 
 struct ImageInfo {
