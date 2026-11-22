@@ -21,6 +21,9 @@
 //    tokens equal plain decoding's (the golden continuation, a 160-token greedy reply raw and parsed: the parsed one
 //    samples under its reasoning ban, the four sampled requests alone
 //    and C = 2; under --a16-activations the greedy reply equals that route's plain tokens); the acceptance is reported.
+// 8. --kv-dtype (the full visits' pools quantized): each format as a variant of 6 (accepted with --reproducible),
+//    DSpark (auto, graphs) giving its plain tokens, and a 10,000-token prompt's greedy continuation the same in chunks
+//    of 4,096 and 1,000; bf16p (lossless) gives bf16's tokens throughout, the others' agreement with BF16's is reported.
 // Reported, not judged: a chat turn's channels, a turn whose thinking budget (6) injects the control (the mixed-width
 // decode after forced tokens), and how long --q8-weights' tokens agree with the BF16 weights'.
 //
@@ -32,6 +35,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -133,23 +137,29 @@ void require_same(const std::string& label, const Tokens& a, const Tokens& b) {
     std::cout << label << ": " << a.size() << " tokens identical\n";
 }
 
-// A long prompt: numbered sentences, the first kLongPrompt ids of their raw-text encoding.
+// A long prompt: numbered sentences, the first `count` ids of their raw-text encoding.
 constexpr std::size_t kLongPrompt  = 2300;
 constexpr std::uint32_t kLongContext = 4096;
-Tokens long_prompt(const infernix::Engine& engine) {
+Tokens long_prompt(const infernix::Engine& engine, std::size_t count = kLongPrompt) {
     static const char* const adjectives[] = {"quiet", "amber", "distant", "narrow", "restless", "silver", "patient"};
     static const char* const nouns[]      = {"harbour", "ledger", "orchard", "signal", "bridge", "lantern",
                                              "archive", "valley", "engine", "garden", "compass"};
     std::string text;
-    for (int i = 0; text.size() < 24000; ++i) {
+    for (int i = 0; text.size() < std::max<std::size_t>(24000, count * 12); ++i) {
         text += "Item " + std::to_string(i) + ": the " + adjectives[i % 7] + " " + nouns[i % 11] + " in section " +
                 std::to_string(i * 37 % 101) + " was logged at " + std::to_string(i * 13 % 60) + " minutes past " +
                 std::to_string(i % 12 + 1) + ".\n";
     }
     Tokens ids = engine.tokenize_text(text);
-    require(ids.size() >= kLongPrompt, "the long prompt's text encodes to at least 2,300 ids");
-    ids.resize(kLongPrompt);
+    require(ids.size() >= count, "the long prompt's text encodes to at least " + std::to_string(count) + " ids");
+    ids.resize(count);
     return ids;
+}
+
+std::size_t agree(const Tokens& a, const Tokens& b) {
+    std::size_t at = 0;
+    while (at < a.size() && at < b.size() && a[at] == b[at]) { ++at; }
+    return at;
 }
 
 // Scoring logits of the long prompt at positions inside the first chunk, across chunk edges (16, 100, 128 columns),
@@ -465,6 +475,79 @@ int main() {
                 o.q8_weights             = true;
                 o.expert_a16_activations = true;
             });
+
+            // 8. --kv-dtype: the full visits' pools in a quantized format (the sliding windows stay BF16 K / FP16 V),
+            // deterministic and request-invariant, so accepted with --reproducible: the variant's checks above; DSpark
+            // (auto, graphs) gives the format's plain tokens; a 10,000-token prompt's greedy continuation is the same in
+            // chunks of 4,096 and 1,000. Reported: how long the format's tokens agree with BF16's.
+            constexpr std::size_t kTenThousand    = 10000;
+            constexpr std::uint32_t kTenThousandContext = 10240 + 256;
+            Tokens ten_k, bf16_ten_k, bf16_long_reply;
+            {
+                infernix::Engine engine(engine_options(artifact, 4096, true, 1, kTenThousandContext));
+                ten_k      = long_prompt(engine, kTenThousand);
+                bf16_ten_k = engine.generate(engine.prepare_tokens(ten_k), greedy(32)).generated_token_ids;
+                bf16_long_reply = engine.generate(engine.prepare(chat(texts()[1])), greedy(160)).generated_token_ids;
+            }
+            for (const infernix::KvCacheStorage storage :
+                 {infernix::KvCacheStorage::Int8Group64, infernix::KvCacheStorage::Fp8E4M3Row256,
+                  infernix::KvCacheStorage::Nvfp4Group16, infernix::KvCacheStorage::Fp8KeyNvfp4Value,
+                  infernix::KvCacheStorage::Vq2, infernix::KvCacheStorage::Q4KeyVq2Value,
+                  infernix::KvCacheStorage::Bf16Packed}) {
+                const std::string name = std::string("kv ") + infernix::kv_cache_cli_name(storage);
+                const bool lossless    = storage == infernix::KvCacheStorage::Bf16Packed; // bf16's bits
+                const auto set = [storage](infernix::EngineOptions& o) { o.kv_cache = storage; };
+                variant(name, "--kv-dtype", true, set);
+                infernix::EngineOptions plain = engine_options(artifact, 0, true, 1);
+                set(plain);
+                Tokens plain_reply;
+                {
+                    infernix::Engine engine(plain);
+                    plain_reply = engine.generate(engine.prepare(chat(texts()[1])), greedy(160)).generated_token_ids;
+                    if (lossless) {
+                        require_same(name + ": the golden continuation", continuation,
+                                     engine.generate(engine.prepare_tokens(prompt), greedy(8)).generated_token_ids);
+                        require_alone(name + " alone = bf16", engine, reference_tokens);
+                    }
+                }
+                if (lossless) {
+                    require_same(name + ": a 160-token greedy reply = bf16's", bf16_long_reply, plain_reply);
+                } else {
+                    std::cout << name << ": a 160-token greedy reply agrees with BF16's for "
+                              << agree(plain_reply, bf16_long_reply) << " tokens (reported)\n";
+                }
+                infernix::EngineOptions spec          = plain;
+                spec.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                spec.speculative.draft_tokens_auto = true;
+                spec.speculative.draft_tokens      = 7;
+                {
+                    infernix::Engine engine(spec);
+                    const auto result = engine.generate(engine.prepare(chat(texts()[1])), greedy(160));
+                    require_same(name + ", dspark (auto, graphs): a 160-token greedy reply", plain_reply,
+                                 result.generated_token_ids);
+                    const infernix::SpeculativeStats& s = result.speculative;
+                    std::cout << name << ", dspark (auto, graphs): " << s.rounds << " rounds, " << s.accepted_tokens
+                              << " of " << s.drafted_tokens << " drafts accepted\n";
+                }
+                Tokens ten_k_reply;
+                for (const std::uint32_t chunk : {4096U, 1000U}) {
+                    infernix::EngineOptions options = engine_options(artifact, chunk, true, 1, kTenThousandContext);
+                    set(options);
+                    infernix::Engine engine(options);
+                    const Tokens reply = engine.generate(engine.prepare_tokens(ten_k), greedy(32)).generated_token_ids;
+                    if (chunk == 4096U) {
+                        ten_k_reply = reply;
+                        if (lossless) {
+                            require_same(name + ": the 10,000-token prompt's greedy continuation = bf16's", bf16_ten_k, reply);
+                        } else {
+                            std::cout << name << ": the 10,000-token prompt's greedy continuation agrees with BF16's for "
+                                      << agree(reply, bf16_ten_k) << " of 32 tokens (reported)\n";
+                        }
+                    } else {
+                        require_same(name + ": the 10,000-token prompt in chunks of 1,000 = 4,096", ten_k_reply, reply);
+                    }
+                }
+            }
         }
         if (guard != nullptr) {
             infernix::EngineOptions options = engine_options(artifact, 16, false, 1);

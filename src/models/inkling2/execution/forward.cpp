@@ -531,6 +531,12 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         at.kv.table        = s.table;
         at.kv.table_stride = s.table_stride;
         at.kv.pool_pages   = s.pool_pages;
+        at.kv.codec        = s.codec;
+        if (s.codec != ik::KvCodec::Bf16) {
+            at.kv.k_side     = s.side_k.at(vs.full_slot);
+            at.kv.v_side     = s.side_v.at(vs.full_slot);
+            at.kv.unpackable = s.unpackable;
+        }
     } else if (staged) {
         // A lane appending more than a page: its window runs over the staging ring, filled from the state's ring and
         // returned to it after.

@@ -95,9 +95,18 @@ std::uint32_t pages_per_lane(std::uint32_t max_context) {
     return (max_context + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit + 1;
 }
 
-// One full slot's K or V pool for `pages` pages: [kKvHeads][pages][64][128] 16-bit words.
-std::uint64_t pool_bytes(std::uint64_t pages) {
-    return std::uint64_t{ops::inkling2::kKvHeads} * pages * ops::inkling2::kKeyUnit * ops::inkling2::kHeadDim * 2;
+// One full slot's K (which 0) or V pool for `pages` pages, [kKvHeads][pages][64] rows: 16-bit words (BF16 storage) or
+// a quantized form's codes; and a quantized form's side records (inkling2_attention.h KvCodec).
+std::uint64_t pool_bytes(std::uint64_t pages, ops::inkling2::KvCodec codec, int which) {
+    const std::uint64_t rows        = std::uint64_t{ops::inkling2::kKvHeads} * pages * ops::inkling2::kKeyUnit;
+    const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
+    const std::uint64_t code         = static_cast<std::uint64_t>(which == 0 ? b.key_code : b.value_code);
+    return rows * (code == 0 ? std::uint64_t{ops::inkling2::kHeadDim} * 2 : code);
+}
+std::uint64_t side_bytes(std::uint64_t pages, ops::inkling2::KvCodec codec, int which) {
+    const std::uint64_t rows        = std::uint64_t{ops::inkling2::kKvHeads} * pages * ops::inkling2::kKeyUnit;
+    const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
+    return rows * static_cast<std::uint64_t>(which == 0 ? b.key_side : b.value_side);
 }
 
 std::uint64_t align_256(std::uint64_t bytes) { return (bytes + 255) / 256 * 256; }
@@ -118,9 +127,14 @@ public:
         const StateLayout& layout = forward_.layout();
         const std::uint32_t pages = pages_per_lane(o_.max_context);
         images_ = DeviceBuffer(static_cast<std::size_t>(layout.lane_words) * 2 * lanes_.size());
+        const std::uint64_t pool_pages = static_cast<std::uint64_t>(pages) * lanes_.size();
         for (std::int32_t s = 0; s < 2 * layout.full_visits; ++s) {
-            pools_.emplace_back(pool_bytes(static_cast<std::uint64_t>(pages) * lanes_.size()));
+            pools_.emplace_back(pool_bytes(pool_pages, o_.kv_codec, s % 2));
             pools_.back().fill(0); // a key beyond a lane's frontier is masked; never NaN
+            if (o_.kv_codec != ops::inkling2::KvCodec::Bf16) {
+                sides_.emplace_back(side_bytes(pool_pages, o_.kv_codec, s % 2));
+                sides_.back().fill(0); // zero scales decode zero codes to zero
+            }
         }
         std::vector<std::int32_t> rows(static_cast<std::size_t>(pages) * lanes_.size());
         for (std::size_t i = 0; i < rows.size(); ++i) { rows[i] = static_cast<std::int32_t>(i); }
@@ -131,7 +145,12 @@ public:
         for (std::int32_t s = 0; s < layout.full_visits; ++s) {
             view_.pool_k.push_back(static_cast<std::uint16_t*>(pools_[2 * s].p));
             view_.pool_v.push_back(static_cast<std::uint16_t*>(pools_[2 * s + 1].p));
+            if (o_.kv_codec != ops::inkling2::KvCodec::Bf16) {
+                view_.side_k.push_back(static_cast<std::uint8_t*>(sides_[2 * s].p));
+                view_.side_v.push_back(static_cast<std::uint8_t*>(sides_[2 * s + 1].p));
+            }
         }
+        view_.codec        = o_.kv_codec;
         view_.pool_pages   = static_cast<std::int64_t>(pages) * lanes_.size();
         view_.table        = static_cast<const std::int32_t*>(table_.p);
         view_.table_stride = static_cast<std::int32_t>(pages);
@@ -149,6 +168,12 @@ public:
         host_sampled_ = reinterpret_cast<std::int32_t*>(base);
         base += align_256(4 * kMaximumConcurrency);
         nonfinite_ = reinterpret_cast<std::int32_t*>(base);
+        if (o_.kv_codec == ops::inkling2::KvCodec::Bf16Packed) {
+            // bf16p: each lane's lowest appended position with no packed form (atomicMin; 0xFFFFFFFF: none).
+            unpackable_ = DeviceBuffer(4 * kMaximumConcurrency);
+            CUDA_CHECK(cudaMemset(unpackable_.p, 0xFF, 4 * kMaximumConcurrency));
+            view_.unpackable = static_cast<std::uint32_t*>(unpackable_.p);
+        }
         if (o_.dspark && !o_.causal_scoring) {
             if (!p_.dspark) { throw std::invalid_argument("Inkling 2: --spec dspark needs the drafter's parameters"); }
             if (o_.draft_tokens < 1 || o_.draft_tokens > static_cast<std::uint32_t>(ops::inkling2::kMarkovSteps)) {
@@ -217,6 +242,7 @@ public:
         lane.options       = base.impl_->options;
         lane.penalties     = lane.options.sampling.presence_penalty != 0.0F || lane.options.sampling.frequency_penalty != 0.0F;
         lane.calibration.reset();
+        clear_unpackable(lane_id.value);
         // A fresh state: the conv rings' history before position 0 is zero, and the window's rows are rewritten.
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint16_t*>(images_.p) +
                                        static_cast<std::size_t>(lane_id.value) * forward_.layout().lane_words,
@@ -512,6 +538,7 @@ public:
             images = std::make_shared<const std::vector<PromptImage>>(std::move(data->images));
         }
         CUDA_CHECK(cudaMemsetAsync(images_.p, 0, static_cast<std::size_t>(forward_.layout().lane_words) * 2, device_.stream));
+        clear_unpackable(0);
         ScoreResult out;
         std::vector<float> row(static_cast<std::size_t>(vocab_));
         std::size_t next_logits = 0;
@@ -572,6 +599,15 @@ public:
             }
             at += chunk;
         }
+        CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+        if (unpackable_.p != nullptr) {
+            CUDA_CHECK(cudaMemcpy(unpackable_seen_.data(), unpackable_.p, 4, cudaMemcpyDeviceToHost));
+            if (unpackable_seen_[0] != kNoPosition) {
+                clear_unpackable(0);
+                throw std::runtime_error("Inkling 2: --kv-dtype bf16p: the prompt has a K or V row with no packed form "
+                                         "(more than 14 exponents outside its window), so its scores would not be bf16's");
+            }
+        }
         return out;
     }
 
@@ -609,7 +645,7 @@ public:
         MemorySummary out;
         out.max_context      = o_.max_context;
         out.kv_capacity      = o_.max_context * o_.max_concurrency;
-        out.kv_cache         = KvCacheStorage::BFloat16;
+        out.kv_cache         = kv_storage(o_.kv_codec);
         out.kv_payload_bytes = plan_.kv;
         return out;
     }
@@ -659,6 +695,13 @@ private:
     }
     void release(std::uint32_t index) noexcept {
         if (index < lanes_.size()) { lanes_[index] = Lane{}; }
+    }
+    // bf16p: forgets a lane's rows with no packed form (a new request, or rejected draft rows the next calls overwrite).
+    void clear_unpackable(std::uint32_t index) {
+        if (unpackable_.p != nullptr) {
+            CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint32_t*>(unpackable_.p) + index, 0xFF, 4, device_.stream));
+            unpackable_seen_[index] = kNoPosition;
+        }
     }
     static GenerationTimings timings(const Lane& lane) {
         GenerationTimings out;
@@ -835,7 +878,7 @@ private:
             launch_sample(n, {logit_rows.data(), n}, ops::kSamplePurposeDecode);
         }
         CUDA_CHECK(cudaEventRecord(round_events_[3], device_.stream));
-        finish_sample(n);
+        finish_sample(n, true);
         {
             float draft = 0, gap = 0, verify = 0;
             CUDA_CHECK(cudaEventElapsedTime(&draft, round_events_[0], round_events_[1]));
@@ -856,7 +899,6 @@ private:
                 break;
             }
         }
-        failures_[0] = failure;
         lane.calibration.observe(std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)),
                                  static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(a), kAcceptanceWeight);
         // The round ends at the first reasoning close it draws: later columns sampled under the ban the close lifts.
@@ -868,6 +910,16 @@ private:
                 }
             }
         }
+        // bf16p: a row with no packed form at a kept position (the anchor's F .. F + a) fails the request as plain
+        // decoding would; one at a rejected draft's position is forgotten (the next calls rewrite that row).
+        if (const std::uint32_t at = unpackable_seen_[index]; at != kNoPosition) {
+            if (at <= static_cast<std::uint32_t>(F + a)) {
+                if (failure == runtime::PendingRowFailure::None) { failure = runtime::PendingRowFailure::UnpackableKv; }
+            } else {
+                clear_unpackable(index);
+            }
+        }
+        failures_[0] = failure;
         ++lane.rounds;
         lane.drafted += static_cast<std::uint64_t>(k);
         lane.accepted += static_cast<std::uint64_t>(a);
@@ -986,6 +1038,7 @@ private:
             config.token_counts      = lane.penalties ? lane_counts(lanes[row]) : nullptr;
             nonfinite_[row]          = 0;
             config.nonfinite         = &nonfinite_[row];
+            sample_lanes_[row]       = lanes[row];
             if (masks != nullptr) {
                 const runtime::ReasoningBan ban = masks->reasoning_ban(mask_row_zero ? 0 : row);
                 config.reasoning_close          = ban.close;
@@ -1037,13 +1090,21 @@ private:
         launch_sample(lanes.size(), logit_rows, purpose);
     }
 
-    void finish_sample(std::size_t rows) {
+    // `verify`: a DSpark verify call, whose rows with no packed form fail the request only at accepted positions
+    // (decode_dspark decides once the accepted prefix is known).
+    void finish_sample(std::size_t rows, bool verify = false) {
         const auto wait = Clock::now();
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
         wait_ns_ += elapsed_ns(wait);
+        if (unpackable_.p != nullptr) {
+            CUDA_CHECK(cudaMemcpy(unpackable_seen_.data(), unpackable_.p, 4 * kMaximumConcurrency, cudaMemcpyDeviceToHost));
+        }
         for (std::size_t row = 0; row < rows; ++row) {
             sampled_tokens_[row] = host_sampled_[row];
-            failures_[row] = nonfinite_[row] != 0 ? runtime::PendingRowFailure::NonFiniteLogits : runtime::PendingRowFailure::None;
+            const bool unpackable = !verify && unpackable_seen_[sample_lanes_[row]] != kNoPosition;
+            failures_[row]        = nonfinite_[row] != 0 ? runtime::PendingRowFailure::NonFiniteLogits
+                                    : unpackable         ? runtime::PendingRowFailure::UnpackableKv
+                                                         : runtime::PendingRowFailure::None;
         }
     }
 
@@ -1145,6 +1206,7 @@ private:
     std::vector<Lane> lanes_;
     DeviceBuffer images_, table_, counts_, configs_, positions_, sampled_, gathered_;
     std::vector<DeviceBuffer> pools_;
+    std::vector<DeviceBuffer> sides_; // a quantized pool's side records, K and V per full slot
     StateView view_;
     WorkspaceArena sampling_;
     PinnedHostBuffer host_;
@@ -1153,6 +1215,16 @@ private:
     std::int32_t* host_positions_         = nullptr;
     std::int32_t* host_sampled_           = nullptr;
     std::int32_t* nonfinite_              = nullptr;
+    // bf16p: device [kMaximumConcurrency], each lane's lowest appended position with no packed form, and its last
+    // reading.
+    static constexpr std::uint32_t kNoPosition = 0xFFFFFFFFU;
+    DeviceBuffer unpackable_;
+    std::array<std::uint32_t, kMaximumConcurrency> unpackable_seen_ = [] {
+        std::array<std::uint32_t, kMaximumConcurrency> a{};
+        a.fill(kNoPosition);
+        return a;
+    }();
+    std::array<std::uint32_t, kMaximumConcurrency> sample_lanes_{}; // the staged sample rows' lanes
     std::array<TokenId, kMaximumConcurrency> sampled_tokens_{};
     std::array<runtime::PendingRowFailure, kMaximumConcurrency> failures_{};
     std::map<std::uint64_t, DecodeGraphExecutable> graphs_;
@@ -1194,6 +1266,34 @@ private:
 
 } // namespace detail
 
+std::optional<ops::inkling2::KvCodec> kv_codec(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16: return ops::inkling2::KvCodec::Bf16;
+    case KvCacheStorage::Int8Group64: return ops::inkling2::KvCodec::Int8G64;
+    case KvCacheStorage::Fp8E4M3Row256: return ops::inkling2::KvCodec::Fp8Row;
+    case KvCacheStorage::Nvfp4Group16: return ops::inkling2::KvCodec::Nvfp4G16;
+    case KvCacheStorage::Fp8KeyNvfp4Value: return ops::inkling2::KvCodec::Fp8KeyNvfp4V;
+    case KvCacheStorage::Bf16Packed: return ops::inkling2::KvCodec::Bf16Packed;
+    case KvCacheStorage::Vq2: return ops::inkling2::KvCodec::Vq2;
+    case KvCacheStorage::Q4KeyVq2Value: return ops::inkling2::KvCodec::Q4KeyVq2V;
+    }
+    return std::nullopt;
+}
+
+KvCacheStorage kv_storage(ops::inkling2::KvCodec codec) {
+    switch (codec) {
+    case ops::inkling2::KvCodec::Bf16: return KvCacheStorage::BFloat16;
+    case ops::inkling2::KvCodec::Int8G64: return KvCacheStorage::Int8Group64;
+    case ops::inkling2::KvCodec::Fp8Row: return KvCacheStorage::Fp8E4M3Row256;
+    case ops::inkling2::KvCodec::Nvfp4G16: return KvCacheStorage::Nvfp4Group16;
+    case ops::inkling2::KvCodec::Fp8KeyNvfp4V: return KvCacheStorage::Fp8KeyNvfp4Value;
+    case ops::inkling2::KvCodec::Bf16Packed: return KvCacheStorage::Bf16Packed;
+    case ops::inkling2::KvCodec::Vq2: return KvCacheStorage::Vq2;
+    case ops::inkling2::KvCodec::Q4KeyVq2V: return KvCacheStorage::Q4KeyVq2Value;
+    }
+    return KvCacheStorage::BFloat16;
+}
+
 using detail::ContractAccess;
 
 RequestBasePlan::RequestBasePlan(std::unique_ptr<detail::BasePlanImpl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1215,7 +1315,11 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     const std::uint64_t pages  = static_cast<std::uint64_t>(detail::pages_per_lane(options.max_context)) * lanes;
     ProgramDevicePlan out;
     out.kv_pages  = static_cast<std::uint32_t>(pages);
-    out.kv        = 2ULL * layout.full_visits * detail::pool_bytes(pages) + pages * 4;
+    out.kv = pages * 4;
+    for (int which = 0; which < 2; ++which) {
+        out.kv += static_cast<std::uint64_t>(layout.full_visits) * (detail::pool_bytes(pages, options.kv_codec, which) +
+                                                                    detail::side_bytes(pages, options.kv_codec, which));
+    }
     out.state     = static_cast<std::uint64_t>(layout.lane_words) * 2 * lanes;
     out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2;
     const bool dspark = options.dspark && !options.causal_scoring;

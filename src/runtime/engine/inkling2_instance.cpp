@@ -47,6 +47,7 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
             .expert_a16        = options.expert_a16_activations,
             .vision            = options.enable_vision,
             .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
+            .kv_codec          = models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
             .diagnostics       = options.diagnostic_observer};
 }
 
@@ -78,8 +79,21 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
         report(options, "Inkling 2: --q8-weights: the attention input projections and the head run as 8-bit weights "
                         "(approximate: the output differs from the artifact's BF16 weights)");
     }
-    refuse(options.kv_cache != KvCacheStorage::BFloat16, "the KV cache stores BF16 keys and FP16 values (INT8 KV is "
-                                                         "a later milestone)");
+    refuse(!models::inkling2::kv_codec(options.kv_cache).has_value(),
+           "--kv-dtype: bf16 (BF16 keys, FP16 values), bf16p, int8, fp8, nvfp4, k8v4, vq2 or k4v2");
+    if (options.kv_cache == KvCacheStorage::Vq2 || options.kv_cache == KvCacheStorage::Q4KeyVq2Value) {
+        report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
+                            " stores the full visits' keys and values as Hadamard-rotated vector codes (2-4 bits a "
+                            "value, no exact recent window; the sliding windows stay BF16 keys, FP16 values; the output "
+                            "differs from bf16's)");
+    } else if (options.kv_cache == KvCacheStorage::Bf16Packed) {
+        report(options, "Inkling 2: --kv-dtype bf16p packs the full visits' BF16 keys and values losslessly to 12 bits "
+                        "(the output is bf16's; a request with a row that has no packed form fails)");
+    } else if (options.kv_cache != KvCacheStorage::BFloat16) {
+        report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
+                            " stores the full visits' keys and values quantized (the sliding windows stay BF16 keys, "
+                            "FP16 values; the output differs from bf16's)");
+    }
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
     refuse(options.enable_vision && options.vision_offload == VisionOffload::On,
            "--vision-offload on: the vision tower (~0.6 GiB) stays resident");

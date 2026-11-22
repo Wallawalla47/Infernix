@@ -500,7 +500,13 @@ checkpoint with its own reader. The Inkling 2 Op tests (GPU, family `inkling2`):
 routed experts, also as a captured graph), `infernix_inkling2_visit_test` (embed, the mixers, message gates, short
 convs and the experts' rows: bit for bit their host emulation of the pinned orders, FP64 stage criteria, and
 single-column calls equal to a 22-column call, rings included) and `infernix_inkling2_attention_test` (sliding and full:
-the prologue bit for bit its emulation, the output against FP64 over the represented K/V, decode = verify).
+the prologue bit for bit its emulation, the output against FP64 over the represented K/V, decode = verify; the full
+pool again in every `--kv-dtype` form with its codes and side records bit for bit against a host encoder, bf16p equal
+to the bf16 storage of its words and a row with no packed form flagging its lane alone; the rotated vq2 / k4v2 pools
+against a host emulation of their Hadamard rotation and exhaustive pattern search, their rotated queries bit for bit and
+within FP64 of the rotation, attention against FP64 in the rotated domain). `infernix_w4a4_sparse_moe_test` also
+requires the one-column launch (`moe_single`) to give the separate kernels' routing and outputs byte for byte, eagerly
+and in graphs interleaving both paths.
 `infernix_inkling2_chat_template_test` (CPU only) renders `tools/chat_templates/inkling2.jinja` (the checkpoint's,
 byte for byte) through the Jinja engine against transformers' `apply_chat_template`
 (`tests/fixtures/inkling2/chat_template_golden.json`, from `generate_chat_template_golden.py`).
@@ -533,7 +539,9 @@ requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's lo
 128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of
 16 byte for byte; under `--q8-weights` (refused with `--reproducible`) an eager one-request Engine is again the
 reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it reports a chat turn, a thinking-budget
-turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them.
+turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them. Each `--kv-dtype` format of
+the full pools runs as such a variant too (accepted with `--reproducible`), with DSpark equal to its plain tokens and a
+10,000-token prompt's continuation the same in chunks of 4,096 and 1,000; bf16p must give bf16's tokens throughout.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

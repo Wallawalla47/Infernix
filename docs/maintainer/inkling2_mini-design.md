@@ -587,8 +587,9 @@ A window ring is whole pages, so a 64-key unit of attention is one contiguous pa
 at row p mod 64); 1088 = 1024 + 64 lets a call append up to 65 positions a lane before a write reaches a key the call's
 first query reads. A conv ring of 32 slots (p at slot p mod 32) holds 3 taps of history plus the call's columns, up to
 29 a lane. Each lane's image is contiguous (the kernels take a lane stride), so a snapshot is one copy. The ring holds
-the KV profile's rows (INT8-G64, or BF16 K and FP16 V as the paged `bf16` profile; BF16 V on the lossless route). The
-size is close to the 27B's StateImage (186.8 MiB), so the prefix cache's slot and Host-tier policies apply as they are.
+BF16 K and FP16 V in every KV profile ([§7.6](#76-kv-profiles): `--kv-dtype` selects the full visits' pools only; the
+INT8 column above was the plan's, not built). The size is close to the 27B's StateImage (186.8 MiB), so the prefix
+cache's slot and Host-tier policies apply as they are.
 
 ### 7.3 Speculative rollback
 
@@ -618,19 +619,37 @@ snapshot.
 
 ### 7.6 KV profiles
 
-Some paged profiles assume 256-wide heads (FP8-row256; VQ2/K4V2's H256 rotation). Inkling's heads are 128 wide:
+`--kv-dtype` selects the full visits' paged pools only: the 40 sliding visits' window rings in the StateImage stay BF16
+K / FP16 V in every profile (they are a fixed ~170 MiB a lane, independent of context, while the full pools grow with
+it). Every profile decodes into the attention kernels' existing tiles (K as BF16 words, V as FP16), so the decode route's
+pinned score chain and the prompt route's MMAs are unchanged; the append (the prologue, or the fused prologue inside
+the attention launch) encodes each new row with a warp and returns its represented words. The contract and byte layouts
+are `inkling2_attention.h`'s `KvCodec`; the codecs are `src/ops/inkling2/kv_codec.cuh`, each the shared codec's
+arithmetic at a 128-value row:
 
-| Profile | Status |
-|---|---|
-| `int8` (G64), `bf16` | first; INT8-G64 is head-width agnostic |
-| `bf16p` (exact BF16 in 784/1024 of the bytes) | second wave (L25) |
-| FP8 E4M3 with unit scales (vLLM's choice for this model) | candidate: ‖k‖ ≤ 22.6 and V's unit RMS keep every element inside E4M3's range without per-row scales (2 KiB per token per visit, no scale planes); qualified like any profile |
-| `fp8` (row), `k8v4` | need a row-128 variant |
-| `nvfp4` (G16) | width-agnostic; second wave |
-| `vq2`, `k4v2` | need an H128 rotation and D128 kernels; their codebooks are model-free (VQ2's 512 patterns trained on i.i.d. Gaussian 8-value words, `tools/kv_codebook/make_vq2_codebook.py`; Q4's unit-Gaussian Lloyd-Max levels, `q4_lloyd_codec.cuh`), so whether Inkling's H128-rotated rows are Gaussian enough is to be measured; out of scope until asked |
+| Profile | Row (codes + side) | Encoding | Status |
+|---|---|---|---|
+| `bf16` (default) | 256 B (BF16 K, FP16 V words) | as stored | built |
+| `bf16p` | 192 + 16 B | lossless 12-bit packing of the BF16 values (V's BF16 source), `bf16p_codec.cuh`'s form with a 16-byte record of up to 14 escapes (the D256 form's 6 failed real prompts: position 0's key row on KV head 4 spans 18 binades and needs 7 escapes, the only row of a 2,300- and a 10,000-token prompt needing more than 3); a row with more fails its request (`UnpackableKv`) | built: the output is `bf16`'s |
+| `int8` | 128 + 4 B | two 64-value groups, an FP16 scale each (`int8_g64_codec.cuh`'s) | built |
+| `fp8` | 128 + 2 B | E4M3 codes, one FP16 scale for the row of 128 (`fp8_e4m3_row_codec.cuh`'s rule at 128) | built |
+| `nvfp4` | 64 + 8 B | E2M1 codes, an E4M3 scale per 16 by the five-target least-error rule (`nvfp4_group16_codec.cuh`'s) | built |
+| `k8v4` | K 128 + 2, V 64 + 8 B | `fp8` keys, `nvfp4` values | built |
+| `vq2` | 32 + 2 B | the rotated row y = 2^-3 H128 x (H4 over a lane's 4 values, then H32 over the lanes), 16 words of 8 as 16-bit codes of `vq2_codec.cuh`'s 512 patterns (σ over 128, the first nearest pattern: each lane of a pair searches 256, ties to the lower), S = fp16_rn(Σy² / Σyc) | built |
+| `k4v2` | K 64 + 2, V 32 + 2 B | `q4_lloyd_codec.cuh`'s 4-bit Lloyd-Max levels of the rotated key row, `vq2` values | built |
 
-K is L2-clipped (‖k‖ ≤ 22.6) and V is RMS-normalized per head, so both are bounded: favourable for 8-bit rows. Every
-enabled profile is qualified ([model quality §6](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
+The represented values every route reads are K = bf16_rn(code value × scale) and V = fp16_rn(code value × scale), each
+product exact in FP32; every division is IEEE, so the op test's host encoders reproduce the stored bytes. The rotated
+profiles' attention runs in the rotated domain instead of rotating every row back: the query rows are q' =
+bf16_rn(2^-4 H128 q) (so q'·y = q·k, H128 H128 = 128 I), the tiles hold the rotated S c, and the output o = 2^-4 H128 o'
+is applied once a row (the decode combine's warp, the prompt epilogue's quad shuffles) before the division by the
+softmax sum: no row is rotated back on a read, and the fused prologue stays. Their codebooks are
+model-free (VQ2's 512 patterns trained on i.i.d. Gaussian 8-value words, `tools/kv_codebook/make_vq2_codebook.py`;
+Q4's unit-Gaussian Lloyd-Max levels), and they carry no exact recent-key window: the 40 sliding visits keep the last
+1,024 positions exact. K is
+L2-clipped (‖k‖ ≤ 22.6) and V is RMS-normalized per head, so both are bounded: favourable for 8-bit rows. Every profile
+is deterministic and request-invariant (`--reproducible` accepts it); the lossy ones change the output and are
+qualified like any profile ([model quality §6](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
 
 ---
 
@@ -767,8 +786,9 @@ width (a width threshold broke prefix restores on Flash-Next: L16).
 
 ### 9.4 Formats
 
-INT8-G64 and BF16 first (rings and pages), in decode and prefill kernels; other codecs per [§7.6](#76-kv-profiles). The
-lossless route has its own attention kernel (exact scores, correctly rounded softmax, BF16 V), as for Qwen.
+BF16 rings; the full pools in every profile of [§7.6](#76-kv-profiles), decoded into the decode and prompt kernels'
+tiles by `decode_unit` (`attention_common.cuh`) and encoded by the append. The lossless route (a later milestone) has
+its own attention kernel (exact scores, correctly rounded softmax, BF16 V), as for Qwen.
 
 ---
 
@@ -1251,7 +1271,7 @@ component, kept byte for byte after the converter checks it names the processor 
 |---|---|
 | `--spec` | `none`, `dspark`, `auto` (= `dspark` when the artifact carries the drafter) |
 | `--draft-tokens` | `auto` (calibrated), 1-7 |
-| `--kv-dtype` | `int8` (default), `bf16`, later `bf16p`, `nvfp4`, `fp8`, `k8v4` |
+| `--kv-dtype` | the full visits' pools ([§7.6](#76-kv-profiles)): `bf16` (default), `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`; the sliding windows stay BF16 K / FP16 V |
 | `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` refused |
 | `--prefill-chunk` | default 16K if chunk-width invariance holds ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |

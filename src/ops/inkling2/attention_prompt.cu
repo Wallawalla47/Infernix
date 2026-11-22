@@ -74,6 +74,53 @@ __device__ __forceinline__ unsigned pack_half2(float lo, float hi) {
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
+// A rotated pool's output (attention_common.cuh rotated_pool): the accumulators' two rows (g: elements 0, 1; g + 8: 2,
+// 3; dim 8 n + 2 t4 + (e & 1)) through 2^-4 H128 in FP32, the dims' bit 0 (e), bits 1-2 (the quad's lanes t4), then
+// bits 3-6 (n).
+__device__ __forceinline__ void unrotate_rows(float (&acc)[16][4], int t4) {
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+#pragma unroll
+        for (int hr = 0; hr < 2; ++hr) {
+            const float x = acc[n][2 * hr], y = acc[n][2 * hr + 1];
+            acc[n][2 * hr]     = canon::add_rn(x, y);
+            acc[n][2 * hr + 1] = canon::add_rn(x, -y);
+        }
+    }
+#pragma unroll
+    for (int s = 1; s <= 2; s <<= 1) {
+#pragma unroll
+        for (int n = 0; n < 16; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float v    = acc[n][e];
+                const float peer = __shfl_xor_sync(kAll, v, s);
+                acc[n][e]        = (t4 & s) == 0 ? canon::add_rn(v, peer) : canon::add_rn(peer, -v);
+            }
+        }
+    }
+#pragma unroll
+    for (int s = 1; s < 16; s <<= 1) {
+#pragma unroll
+        for (int n = 0; n < 16; ++n) {
+            if ((n & s) != 0) { continue; }
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float x = acc[n][e], y = acc[n + s][e];
+                acc[n][e]     = canon::add_rn(x, y);
+                acc[n + s][e] = canon::add_rn(x, -y);
+            }
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { acc[n][e] = canon::mul_rn(acc[n][e], 0x1p-4F); }
+    }
+}
+
+// Quantized: the instance for a quantized full pool (attention.cu's split): the BF16 instance has no decoders.
+template <bool Quantized>
 __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const AttentionArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Shared& sm = *reinterpret_cast<Shared*>(smem_raw);
@@ -133,6 +180,15 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
 
     const auto load_unit = [&](int stage, int unit) {
         const std::size_t page = kv_row(a.kv, lane, kv, unit * kKeyUnit);
+        if constexpr (Quantized) {
+            if (a.layer.full) {
+                // A quantized pool's rows decoded into the stage's represented words (synchronous: the other stage is
+                // the one being read).
+                detail::decode_unit(a.kv, page, sm.k[stage], sm.v[stage], [](int row, int d) { return swz(row, d); }, tid,
+                                    kThreads);
+                return;
+            }
+        }
         for (int i = tid; i < 2 * kKeyUnit * (kD / 8); i += kThreads) {
             const int plane = i / (kKeyUnit * (kD / 8)), rest = i % (kKeyUnit * (kD / 8));
             const int row = rest / (kD / 8), chunk = rest % (kD / 8);
@@ -279,6 +335,9 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
     }
     pdl::trigger_dependents();
     if (!warp_live) { return; }
+    if constexpr (Quantized) {
+        if (detail::rotated_pool(a)) { unrotate_rows(acc, t4); }
+    }
     // The sink, the division, the gate.
 #pragma unroll
     for (int hr = 0; hr < 2; ++hr) {
@@ -318,13 +377,16 @@ void attention_prompt(const AttentionArgs& a, cudaStream_t stream) {
     detail::launch_attention_prologue(a, stream);
     constexpr int bytes = static_cast<int>(sizeof(Shared));
     static const bool attribute = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(attention_prompt_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        for (auto* kernel : {attention_prompt_kernel<false>, attention_prompt_kernel<true>}) {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        }
         return true;
     }();
     (void)attribute;
     const dim3 grid(static_cast<unsigned>((a.columns + kTileColumns - 1) / kTileColumns), kKvHeads);
-    CUDA_CHECK(pdl::launch_consumer({grid, dim3(kThreads), static_cast<std::size_t>(bytes), stream}, attention_prompt_kernel,
-                                    a));
+    const pdl::LaunchConfig config{grid, dim3(kThreads), static_cast<std::size_t>(bytes), stream};
+    CUDA_CHECK(detail::quantized_pool(a) ? pdl::launch_consumer(config, attention_prompt_kernel<true>, a)
+                                         : pdl::launch_consumer(config, attention_prompt_kernel<false>, a));
 }
 
 } // namespace infernix::ops::inkling2

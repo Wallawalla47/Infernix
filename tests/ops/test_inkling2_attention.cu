@@ -18,8 +18,21 @@
 //     row's largest |v|; ex2.approx makes the bits the kernel's own, so they are pinned by the next check;
 //   - decode against verify: the columns run one at a time, in call order, from the same initial state give the call's
 //     outputs, K/V pages and rings bit for bit.
+//
+// The full visit again with its pool in each quantized form (KvCodec int8, fp8, nvfp4, k8v4; the earlier positions'
+// keys and values encoded on the host from the same kind of random represented words): the appended codes and side
+// records bit for bit against a host encoder of the contract's encoding over the emulation's BF16 K / FP16 V (every
+// represented value within half a step of the value it encodes, plus half an ulp of its own rounding), attention
+// against FP64 over the decoded represented values at the same criterion, and the same decode = verify and fused =
+// prologue bit checks (codes and side records included). The prompt route likewise.
+//
+// The rotated forms (vq2, k4v2): the codes and FP16 scales bit for bit against a host emulation of the encoder
+// (y = 2^-3 H128 x in the kernel's butterfly order, the exhaustive first-nearest pattern search, the lane-ordered
+// sums), each row's distortion |S c - y|^2 / |y|^2 within a sanity bound, the stored q' = bf16(2^-4 H128 q) bit for
+// bit and within FP64 of the rotation; attention against FP64 in the rotated domain with the output rotated back.
 
 #include "infernix/ops/inkling2_attention.h"
+#include "kv_cache_vq_reference.h"
 #include "ops/common/canonical_math.h"
 #include "ops/inkling2/visit_math.h"
 #include "ops/op_family.h"
@@ -29,11 +42,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace canon = infernix::ops::canon;
@@ -113,6 +129,487 @@ struct Tally {
     }
 };
 
+// ---------------------------------------------------------------------------- quantized pools on the host
+
+// The forms of inkling2_attention.h's KvCodec, encoded operation by operation as the contract states (IEEE divisions,
+// single rounded products), so the stored bytes match exactly.
+enum class Form { Words, Int8, Fp8, Nvfp4, Bf16p, Vq2, Q4 };
+Form key_form(ik::KvCodec c) {
+    switch (c) {
+    case ik::KvCodec::Int8G64: return Form::Int8;
+    case ik::KvCodec::Fp8Row:
+    case ik::KvCodec::Fp8KeyNvfp4V: return Form::Fp8;
+    case ik::KvCodec::Nvfp4G16: return Form::Nvfp4;
+    case ik::KvCodec::Bf16Packed: return Form::Bf16p;
+    case ik::KvCodec::Vq2: return Form::Vq2;
+    case ik::KvCodec::Q4KeyVq2V: return Form::Q4;
+    default: return Form::Words;
+    }
+}
+Form value_form(ik::KvCodec c) {
+    switch (c) {
+    case ik::KvCodec::Int8G64: return Form::Int8;
+    case ik::KvCodec::Fp8Row: return Form::Fp8;
+    case ik::KvCodec::Nvfp4G16:
+    case ik::KvCodec::Fp8KeyNvfp4V: return Form::Nvfp4;
+    case ik::KvCodec::Bf16Packed: return Form::Bf16p;
+    case ik::KvCodec::Vq2:
+    case ik::KvCodec::Q4KeyVq2V: return Form::Vq2;
+    default: return Form::Words;
+    }
+}
+bool rotated(Form f) { return f == Form::Vq2 || f == Form::Q4; }
+bool rotated(ik::KvCodec c) { return c == ik::KvCodec::Vq2 || c == ik::KvCodec::Q4KeyVq2V; }
+int code_bytes(Form f) {
+    return f == Form::Int8 || f == Form::Fp8 ? 128
+           : f == Form::Nvfp4 || f == Form::Q4 ? 64
+           : f == Form::Bf16p                 ? 192
+           : f == Form::Vq2                   ? 32
+                                              : 0;
+}
+int side_bytes(Form f) {
+    return f == Form::Int8 ? 4 : f == Form::Fp8 || rotated(f) ? 2 : f == Form::Nvfp4 ? 8 : f == Form::Bf16p ? 16 : 0;
+}
+const char* codec_name(ik::KvCodec c) {
+    switch (c) {
+    case ik::KvCodec::Int8G64: return "int8";
+    case ik::KvCodec::Fp8Row: return "fp8";
+    case ik::KvCodec::Nvfp4G16: return "nvfp4";
+    case ik::KvCodec::Fp8KeyNvfp4V: return "k8v4";
+    case ik::KvCodec::Bf16Packed: return "bf16p";
+    case ik::KvCodec::Vq2: return "vq2";
+    case ik::KvCodec::Q4KeyVq2V: return "k4v2";
+    default: return "bf16";
+    }
+}
+
+// ---- the rotated forms at 128 (kv_codec.cuh vq2 / q4): a warp's lane l holds dims 4 l .. 4 l + 3.
+
+float rounded_product(float a, float b); // below
+
+// kv_hadamard128 in FP32: H4 over a lane's 4 (pairs (0, 1), (2, 3), then (0, 2), (1, 3)), H32 over the lanes (strides
+// 1 .. 16: the lower lane x + y, the upper x - y), then times `scale` (a power of two).
+void h128(float* v, float scale) {
+    for (int l = 0; l < 32; ++l) {
+        float* w = v + 4 * l;
+        float a = w[0], b = w[1], c = w[2], d = w[3];
+        w[0] = a + b, w[1] = a - b, w[2] = c + d, w[3] = c - d;
+        a = w[0], b = w[1], c = w[2], d = w[3];
+        w[0] = a + c, w[1] = b + d, w[2] = a - c, w[3] = b - d;
+    }
+    for (int s = 1; s <= 16; s <<= 1) {
+        for (int l = 0; l < 32; ++l) {
+            if ((l & s) != 0) { continue; }
+            for (int j = 0; j < 4; ++j) {
+                const float x = v[4 * l + j], y = v[4 * (l | s) + j];
+                v[4 * l + j] = x + y, v[4 * (l | s) + j] = x - y;
+            }
+        }
+    }
+    for (int i = 0; i < D; ++i) { v[i] = v[i] * scale; }
+}
+// The FP64 transform 2^-4 H128 (the inverse of 2^-3 H128 up to rounding): o_i = 2^-4 sum_j (-1)^popc(i & j) x_j, by
+// the fast transform's butterflies.
+void h128_64(const double* x, double* o) {
+    std::copy_n(x, D, o);
+    for (int len = 1; len < D; len <<= 1) {
+        for (int i = 0; i < D; i += 2 * len) {
+            for (int j = i; j < i + len; ++j) {
+                const double a = o[j], b = o[j + len];
+                o[j] = a + b, o[j + len] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < D; ++i) { o[i] *= 0x1p-4; }
+}
+// Each row's largest |2^-4 H128 v| (the original domain's represented values of a rotated pool's rows).
+std::vector<double> original_row_max(const std::vector<float>& values) {
+    std::vector<double> out(values.size() / D);
+    double x[D], o[D];
+    for (std::size_t row = 0; row < out.size(); ++row) {
+        for (int e = 0; e < D; ++e) { x[e] = values[row * D + e]; }
+        h128_64(x, o);
+        double m = 0;
+        for (int e = 0; e < D; ++e) { m = std::max(m, std::fabs(o[e])); }
+        out[row] = m;
+    }
+    return out;
+}
+// kv_row_dot: a lane's fma fold of its 4 products, then the xor tree over the 32 lanes.
+float row_dot(const float* a, const float* b) {
+    float lanes[32];
+    for (int l = 0; l < 32; ++l) {
+        float s = 0.0F;
+        for (int j = 0; j < 4; ++j) { s = std::fma(a[4 * l + j], b[4 * l + j], s); }
+        lanes[l] = s;
+    }
+    for (int o = 16; o >= 1; o >>= 1) {
+        float next[32];
+        for (int l = 0; l < 32; ++l) { next[l] = lanes[l] + lanes[l ^ o]; }
+        std::copy_n(next, 32, lanes);
+    }
+    return lanes[0];
+}
+// A rotated row's signed integer levels c from its codes.
+void rotated_levels(Form form, const std::uint8_t* codes, int* c) {
+    for (int e = 0; e < D; ++e) {
+        if (form == Form::Vq2) {
+            const unsigned code  = codes[2 * (e / 8)] | (unsigned{codes[2 * (e / 8) + 1]} << 8);
+            const unsigned seven = (code >> 9) & 0x7FU;
+            const unsigned sign  = seven | ((std::popcount(seven) & 1U) << 7);
+            const int v          = infernix::ops::kKVCacheVq2Codebook[8 * (code & 0x1FFU) + e % 8];
+            c[e]                 = ((sign >> (e % 8)) & 1U) != 0 ? -v : v;
+        } else {
+            const int n = (codes[e / 2] >> (4 * (e % 2))) & 0xF;
+            c[e]        = n >= 8 ? infernix::test::vq::q4_level(n - 8) : -infernix::test::vq::q4_level(7 - n);
+        }
+    }
+}
+// The encoder (kv_encode_vq2 / kv_encode_q4) over x, the BF16 storage's values: y = 2^-3 H128 x in FP32, the codes,
+// S = fp16_rn(sum y^2 / sum y c) (2 side bytes); y returned (the distortion check's reference).
+void rotated_encode(Form form, const float* x, std::uint8_t* codes, std::uint8_t* side, float* y) {
+    std::copy_n(x, D, y);
+    h128(y, 0x1p-3F);
+    const float sum_sq = row_dot(y, y);
+    const float sigma  = std::sqrt(sum_sq * (1.0F / 128.0F));
+    std::fill(codes, codes + code_bytes(form), std::uint8_t{0});
+    float c[D];
+    if (form == Form::Vq2) {
+        const float to_units = sigma > 0.0F ? 16.0F / sigma : 0.0F;
+        for (int w = 0; w < 16; ++w) {
+            float A[8];
+            unsigned negative = 0;
+            for (int j = 0; j < 8; ++j) {
+                A[j] = rounded_product(std::fabs(y[8 * w + j]), to_units);
+                negative |= (y[8 * w + j] < 0.0F ? 1U : 0U) << j;
+            }
+            const bool odd = (std::popcount(negative) & 1) != 0;
+            int best_p     = 0;
+            float best     = std::numeric_limits<float>::infinity();
+            for (int p = 0; p < 512; ++p) {
+                const float d = infernix::test::vq::vq2_distance(A, odd, p);
+                if (d < best) { best = d, best_p = p; }
+            }
+            unsigned code = 0;
+            for (int j = 0; j < 8; ++j) { c[8 * w + j] = 0.0F; }
+            if (sigma > 0.0F) {
+                unsigned sign = negative;
+                if (odd) {
+                    int flip = 0;
+                    float m  = rounded_product(A[0], infernix::test::vq::codebook(best_p, 0));
+                    for (int j = 1; j < 8; ++j) {
+                        const float t = rounded_product(A[j], infernix::test::vq::codebook(best_p, j));
+                        if (t < m) { m = t, flip = j; }
+                    }
+                    sign ^= 1U << flip;
+                }
+                for (int j = 0; j < 8; ++j) {
+                    const int v  = infernix::ops::kKVCacheVq2Codebook[8 * best_p + j];
+                    c[8 * w + j] = static_cast<float>(((sign >> j) & 1U) != 0 ? -v : v);
+                }
+                code = static_cast<unsigned>(best_p) | ((sign & 0x7FU) << 9);
+            }
+            codes[2 * w]     = static_cast<std::uint8_t>(code & 0xFFU);
+            codes[2 * w + 1] = static_cast<std::uint8_t>(code >> 8);
+        }
+    } else {
+        const float to_units = sigma > 0.0F ? 32.0F / sigma : 0.0F;
+        for (int e = 0; e < D; ++e) {
+            const float A  = rounded_product(std::fabs(y[e]), to_units);
+            const int m    = (A > 8.0F) + (A > 16.5F) + (A > 25.5F) + (A > 35.0F) + (A > 46.0F) + (A > 59.0F) + (A > 76.5F);
+            const bool neg = y[e] < 0.0F;
+            int n          = neg ? 7 - m : 8 + m;
+            c[e]           = static_cast<float>(neg ? -infernix::test::vq::q4_level(m) : infernix::test::vq::q4_level(m));
+            if (sigma == 0.0F) { n = 7, c[e] = -4.0F; }
+            codes[e / 2] |= static_cast<std::uint8_t>(n << (4 * (e % 2)));
+        }
+    }
+    const float dot       = row_dot(y, c);
+    const std::uint16_t s = h16(sigma > 0.0F && dot > 0.0F ? sum_sq / dot : 0.0F);
+    std::memcpy(side, &s, 2);
+}
+
+// bf16p at 128 (inkling2_attention.h): the row's BF16 words packed; returns whether it has a packed form.
+bool bf16p_encode(const std::uint16_t* bits, std::uint8_t* codes, std::uint8_t* side) {
+    unsigned e[D];
+    unsigned lowest = 255, highest = 0;
+    for (int d = 0; d < D; ++d) {
+        e[d] = (bits[d] >> 7) & 0xFFU;
+        if (e[d] != 0 && e[d] != 255) { lowest = std::min(lowest, e[d]), highest = std::max(highest, e[d]); }
+    }
+    unsigned base = 1;
+    if (highest >= lowest && highest - lowest < 14) {
+        base = std::clamp(lowest, 1U, 240U);
+    } else if (highest >= lowest) {
+        unsigned best = 0;
+        for (unsigned b = 1; b <= 240; ++b) {
+            unsigned count = 0;
+            for (int d = 0; d < D; ++d) { count += e[d] != 0 && e[d] != 255 && e[d] >= b && e[d] <= b + 13 ? 1 : 0; }
+            if (count > best || b == 1) { best = count, base = b; } // the most, ties to the lowest base
+        }
+    }
+    std::fill(codes, codes + 192, std::uint8_t{0});
+    std::fill(side, side + 16, std::uint8_t{0});
+    unsigned escapes = 0;
+    bool zero        = false;
+    for (int d = 0; d < D; ++d) {
+        const bool normal     = e[d] != 0 && e[d] != 255;
+        const unsigned nibble = e[d] == 0 ? 14U : normal && e[d] >= base && e[d] - base < 14 ? e[d] - base : 15U;
+        codes[d]              = static_cast<std::uint8_t>(((bits[d] >> 8) & 0x80U) | (bits[d] & 0x7FU));
+        codes[128 + d / 2] |= static_cast<std::uint8_t>(nibble << (4 * (d % 2)));
+        if (nibble == 15U) {
+            if (escapes < 14) { side[2 + escapes] = static_cast<std::uint8_t>(e[d]); }
+            ++escapes;
+        }
+        zero = zero || e[d] == 0;
+    }
+    side[0] = static_cast<std::uint8_t>(base);
+    side[1] = static_cast<std::uint8_t>(std::min(escapes, 14U) | (zero ? 0x80U : 0U));
+    return escapes <= 14;
+}
+// A packed row's 128 BF16 words.
+void bf16p_decode(const std::uint8_t* codes, const std::uint8_t* side, std::uint16_t* out) {
+    unsigned index = 0;
+    for (int d = 0; d < D; ++d) {
+        const unsigned n        = (codes[128 + d / 2] >> (4 * (d % 2))) & 0xFU;
+        const unsigned exponent = n < 14 ? side[0] + n : n == 14 ? 0U : index < 14 ? side[2 + index] : 0U;
+        index += n == 15 ? 1 : 0;
+        out[d] = static_cast<std::uint16_t>(((codes[d] & 0x80U) << 8) | ((exponent & 0xFFU) << 7) | (codes[d] & 0x7FU));
+    }
+}
+
+float rounded_product(float a, float b) {
+    volatile float product = a * b; // one rounding, never contracted
+    return product;
+}
+float e4m3_value(std::uint8_t code) {
+    const int exponent = (code >> 3) & 0x0F, mantissa = code & 0x07;
+    const float magnitude = exponent == 0 ? std::ldexp(static_cast<float>(mantissa), -9)
+                                          : std::ldexp(1.0F + static_cast<float>(mantissa) / 8.0F, exponent - 7);
+    return (code & 0x80U) != 0 ? -magnitude : magnitude;
+}
+std::uint8_t e4m3_rne_satfinite(float value) {
+    const bool negative   = std::signbit(value);
+    const float magnitude = std::fabs(value);
+    int selected          = 126;
+    if (magnitude < 448.0F) {
+        int upper = 0;
+        while (upper < 126 && e4m3_value(static_cast<std::uint8_t>(upper)) < magnitude) { ++upper; }
+        if (upper == 0) {
+            selected = 0;
+        } else {
+            const int lower = upper - 1;
+            const float lo = magnitude - e4m3_value(static_cast<std::uint8_t>(lower));
+            const float hi = e4m3_value(static_cast<std::uint8_t>(upper)) - magnitude;
+            selected       = lo < hi ? lower : hi < lo ? upper : (lower % 2 == 0 ? lower : upper);
+        }
+    }
+    return static_cast<std::uint8_t>(selected | (negative ? 0x80 : 0));
+}
+float e2m1_value(std::uint8_t code) {
+    constexpr float magnitude[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+    return (code & 0x08U) != 0 ? -magnitude[code & 7] : magnitude[code & 7];
+}
+std::uint8_t e2m1_rne_satfinite(float value) {
+    const bool negative   = std::signbit(value);
+    const float magnitude = std::fabs(value);
+    std::uint8_t selected = 7;
+    if (magnitude < 6.0F) {
+        for (std::uint8_t upper = 1; upper <= 7; ++upper) {
+            if (e2m1_value(upper) < magnitude) { continue; }
+            const auto lower = static_cast<std::uint8_t>(upper - 1);
+            const float lo = magnitude - e2m1_value(lower), hi = e2m1_value(upper) - magnitude;
+            selected = lo < hi ? lower : hi < lo ? upper : ((lower & 1U) == 0U ? lower : upper);
+            break;
+        }
+    }
+    return static_cast<std::uint8_t>(selected | (negative ? 0x08U : 0U));
+}
+
+// Encodes a row of 128 values (x: the BF16 K or FP16 V the BF16 storage would hold; bits: their BF16 source words,
+// bf16p's input) into its codes and side record; returns the half-step bound of each value (the codec's own criterion:
+// |represented - x| <= bound) and whether the row has a packed form (bf16p).
+bool encode_row(Form form, const float* x, const std::uint16_t* bits, std::uint8_t* codes, std::uint8_t* side,
+                double* bound, float* rotated_y = nullptr) {
+    if (form == Form::Bf16p) {
+        std::fill(bound, bound + D, 0.0);
+        return bf16p_encode(bits, codes, side);
+    }
+    if (rotated(form)) { // no per-value bound: the rotated row's distortion is checked instead (rotated_y: its y)
+        float y[D];
+        rotated_encode(form, x, codes, side, y);
+        if (rotated_y != nullptr) { std::copy_n(y, D, rotated_y); }
+        std::fill(bound, bound + D, 0.0);
+        return true;
+    }
+    if (form == Form::Int8) {
+        for (int g = 0; g < 2; ++g) {
+            float m = 0.0F;
+            for (int e = 0; e < 64; ++e) { m = std::max(m, std::fabs(x[64 * g + e])); }
+            const std::uint16_t s = h16(m > 0.0F ? m / 127.0F : 0.0F);
+            std::memcpy(side + 2 * g, &s, 2);
+            const float scale   = hf(s);
+            const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+            for (int e = 0; e < 64; ++e) {
+                const float y  = rounded_product(x[64 * g + e], inverse);
+                const int code = inverse == 0.0F ? 0 : std::clamp(static_cast<int>(std::nearbyint(y)), -127, 127);
+                codes[64 * g + e] = static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
+                bound[64 * g + e] = 0.5 * scale * (1.0 + 0x1p-16) + (scale == 0.0F ? std::fabs(x[64 * g + e]) : 0.0);
+            }
+        }
+    } else if (form == Form::Fp8) {
+        float m = 0.0F;
+        for (int e = 0; e < D; ++e) { m = std::max(m, std::fabs(x[e])); }
+        const std::uint16_t s = m == 0.0F ? 0 : h16(std::clamp(m / 448.0F, 0x1p-24F, 65504.0F));
+        std::memcpy(side, &s, 2);
+        const float scale   = hf(s);
+        const float inverse = m == 0.0F ? 0.0F : 1.0F / scale;
+        for (int e = 0; e < D; ++e) {
+            const float q = rounded_product(x[e], inverse);
+            codes[e]      = inverse == 0.0F ? 0 : e4m3_rne_satfinite(q);
+            // Half the E4M3 step at |q| (subnormal step 2^-9).
+            const double a    = std::fabs(double{q});
+            const double step = a < 0x1p-6 ? 0x1p-9 : std::ldexp(1.0, std::ilogb(a) - 3);
+            bound[e]          = 0.5 * step * scale * (1.0 + 0x1p-16);
+        }
+    } else {
+        constexpr float kTargets[5] = {6.0F, 4.0F, 4.5F, 5.0F, 5.5F};
+        for (int g = 0; g < 8; ++g) {
+            const float* v = x + 16 * g;
+            float absmax   = 0.0F;
+            for (int i = 0; i < 16; ++i) { absmax = std::max(absmax, std::fabs(v[i])); }
+            side[g] = 0;
+            std::fill(codes + 8 * g, codes + 8 * g + 8, std::uint8_t{0});
+            float best = 0.0F;
+            if (absmax != 0.0F) {
+                for (int t = 0; t < 5; ++t) {
+                    const float bounded = std::clamp(rounded_product(absmax, 1.0F / kTargets[t]), 0x1p-9F, 448.0F);
+                    const std::uint8_t candidate = e4m3_rne_satfinite(bounded);
+                    const float scale            = e4m3_value(candidate);
+                    const float inverse          = 1.0F / scale;
+                    std::uint8_t nib[16];
+                    float error = 0.0F;
+                    for (int i = 0; i < 16; ++i) {
+                        nib[i]            = e2m1_rne_satfinite(rounded_product(v[i], inverse));
+                        const float diff  = v[i] - rounded_product(e2m1_value(nib[i]), scale);
+                        error             = error + rounded_product(diff, diff);
+                    }
+                    if (t == 0 || error < best) {
+                        best    = error;
+                        side[g] = candidate;
+                        for (int p = 0; p < 8; ++p) { codes[8 * g + p] = static_cast<std::uint8_t>(nib[2 * p] | (nib[2 * p + 1] << 4)); }
+                    }
+                }
+            }
+            const float scale = e4m3_value(side[g]);
+            for (int i = 0; i < 16; ++i) {
+                const double a    = std::fabs(double{v[i]}) / (scale == 0.0F ? 1.0 : scale);
+                const double step = a < 2.0 ? 0.5 : a < 4.0 ? 1.0 : 2.0;
+                bound[16 * g + i] = scale == 0.0F ? std::fabs(v[i]) : 0.5 * step * scale * (1.0 + 0x1p-16);
+            }
+        }
+    }
+    return true;
+}
+
+// The represented value of element e of a row (K BF16, V FP16).
+float decode_value(Form form, const std::uint8_t* codes, const std::uint8_t* side, int e, bool value) {
+    float x = 0.0F;
+    if (form == Form::Bf16p) {
+        std::uint16_t row[D];
+        bf16p_decode(codes, side, row);
+        return value ? hf(h16(f(row[e]))) : f(row[e]);
+    }
+    if (rotated(form)) { // the rotated domain's value S c (exact), rounded as a K / V word
+        int c[D];
+        rotated_levels(form, codes, c);
+        std::uint16_t s;
+        std::memcpy(&s, side, 2);
+        x = static_cast<float>(c[e]) * hf(s);
+    } else if (form == Form::Int8) {
+        std::uint16_t s;
+        std::memcpy(&s, side + 2 * (e / 64), 2);
+        x = static_cast<float>(static_cast<std::int8_t>(codes[e])) * hf(s);
+    } else if (form == Form::Fp8) {
+        std::uint16_t s;
+        std::memcpy(&s, side, 2);
+        x = e4m3_value(codes[e]) * hf(s);
+    } else {
+        const std::uint8_t byte = codes[e / 2];
+        x = e2m1_value(static_cast<std::uint8_t>(e % 2 == 0 ? byte & 0x0F : byte >> 4)) * e4m3_value(side[e / 16]);
+    }
+    return value ? hf(h16(x)) : f(b16(x));
+}
+
+// A row's codes and side record in a plane (pool: the BF16 layout's words, its bytes reused; row = element / 128).
+std::uint8_t* codes_of(std::vector<std::uint16_t>& pool, Form form, std::size_t element) {
+    return reinterpret_cast<std::uint8_t*>(pool.data()) + element / D * code_bytes(form);
+}
+const std::uint8_t* codes_of(const std::vector<std::uint16_t>& pool, Form form, std::size_t element) {
+    return reinterpret_cast<const std::uint8_t*>(pool.data()) + element / D * code_bytes(form);
+}
+
+// A pool's represented values by element offset (a BF16 pool: its own words, K BF16 and V FP16).
+std::vector<float> represented(Form form, const std::vector<std::uint16_t>& pool, const std::vector<std::uint8_t>& side,
+                               bool value) {
+    std::vector<float> out(pool.size());
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        const std::size_t row = i / D;
+        if (form == Form::Bf16p) {
+            if (i % D == 0) {
+                std::uint16_t words[D];
+                bf16p_decode(codes_of(pool, form, i), side.data() + row * side_bytes(form), words);
+                for (int d = 0; d < D; ++d) { out[i + d] = value ? hf(h16(f(words[d]))) : f(words[d]); }
+            }
+            continue;
+        }
+        if (rotated(form)) {
+            if (i % D == 0) {
+                int c[D];
+                rotated_levels(form, codes_of(pool, form, i), c);
+                std::uint16_t s;
+                std::memcpy(&s, side.data() + row * side_bytes(form), 2);
+                for (int d = 0; d < D; ++d) {
+                    const float x = static_cast<float>(c[d]) * hf(s);
+                    out[i + d]    = value ? hf(h16(x)) : f(b16(x));
+                }
+            }
+            continue;
+        }
+        out[i] = form == Form::Words ? (value ? hf(pool[i]) : f(pool[i]))
+                                     : decode_value(form, codes_of(pool, form, i), side.data() + row * side_bytes(form),
+                                                    static_cast<int>(i % D), value);
+    }
+    return out;
+}
+// Encodes every row of a BF16 pool (K BF16 words, V FP16 words) into codes and side records in place (a V row's BF16
+// source: the BF16 rounding of its FP16 value).
+void encode_pool(Form form, std::vector<std::uint16_t>& pool, std::vector<std::uint8_t>& side, bool value) {
+    const std::vector<std::uint16_t> words = pool;
+    std::fill(pool.begin(), pool.end(), std::uint16_t{0});
+    side.assign(words.size() / D * side_bytes(form), 0);
+    const std::size_t rows = words.size() / D;
+    // Rows are independent: the rotated forms' exhaustive host search (~65K multiply-adds a row) runs over threads.
+    const unsigned workers = rotated(form) ? std::max(1U, std::min(16U, std::thread::hardware_concurrency())) : 1U;
+    const auto encode_rows = [&](unsigned w) {
+        float x[D];
+        std::uint16_t bits[D];
+        double bound[D];
+        for (std::size_t row = w; row < rows; row += workers) {
+            const std::size_t at = row * D;
+            for (int e = 0; e < D; ++e) {
+                x[e]    = value ? hf(words[at + e]) : f(words[at + e]);
+                bits[e] = b16(x[e]);
+            }
+            encode_row(form, x, bits, codes_of(pool, form, at), side.data() + row * side_bytes(form), bound);
+        }
+    };
+    std::vector<std::thread> threads;
+    for (unsigned w = 1; w < workers; ++w) { threads.emplace_back(encode_rows, w); }
+    encode_rows(0);
+    for (std::thread& t : threads) { t.join(); }
+}
+
 // ---------------------------------------------------------------------------- the call
 
 struct Call {
@@ -133,13 +630,18 @@ Call the_call() {
 
 struct Problem {
     bool full = false;
+    ik::KvCodec codec = ik::KvCodec::Bf16; // the full pool's form
     // Projections [T][width].
     std::vector<std::uint16_t> q, r, k, v, sink, gate, ktaps, vtaps;
     // Layer.
     std::vector<std::uint16_t> qscale, rscale, table, kconv, vconv;
-    // State: KV (ring [3][8][17][64][128] or pool [8][128 pages][64][128]), its block table, conv rings.
+    // State: KV (ring [4][8][17][64][128] or pool [8][256 pages][64][128]; quantized: row r's codes at byte r * code
+    // bytes of the pool's words, its side record at r * side bytes), its block table, conv rings.
     std::vector<std::uint16_t> kv_k, kv_v, kring, vring;
+    std::vector<std::uint8_t> k_side, v_side;
     std::vector<int> block_table;
+    [[nodiscard]] Form form(int which) const { return which == 0 ? key_form(codec) : value_form(codec); }
+    [[nodiscard]] bool quantized() const { return codec != ik::KvCodec::Bf16; }
 };
 
 std::size_t kv_row(const Problem& p, int lane, int head, int pos) {
@@ -151,7 +653,7 @@ std::size_t kv_row(const Problem& p, int lane, int head, int pos) {
     return ((std::size_t(head) * kPoolPages + page) * U + pos % U) * D;
 }
 
-Problem make_problem(bool full, const Call& call, std::uint32_t seed) {
+Problem make_problem(bool full, const Call& call, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf16) {
     std::mt19937 gen(seed);
     const auto normal = [&](std::size_t n, float sd) {
         std::normal_distribution<float> d(0.0F, sd);
@@ -200,12 +702,19 @@ Problem make_problem(bool full, const Call& call, std::uint32_t seed) {
         }
         check(next <= kPoolPages, "the test's pool holds its lanes");
     }
+    p.codec = full ? codec : ik::KvCodec::Bf16;
+    if (p.quantized()) {
+        encode_pool(p.form(0), p.kv_k, p.k_side, false);
+        encode_pool(p.form(1), p.kv_v, p.v_side, true);
+    }
     return p;
 }
 
 struct Device {
     std::uint16_t *q, *r, *k, *v, *sink, *gate, *ktaps, *vtaps, *qscale, *rscale, *table, *kconv, *vconv;
     std::uint16_t *kv_k, *kv_v, *kring, *vring, *out;
+    std::uint8_t *k_side, *v_side;
+    std::uint32_t* unpackable; // [kLanes]
     int *block_table, *lane, *pos, *first, *groups;
     void* ws;
 };
@@ -213,6 +722,8 @@ struct Device {
 // Runs the attention over columns `subset` of the call as one call; the state lives in `state` (kv and rings).
 struct Outputs {
     std::vector<std::uint16_t> out, q, r, kv_k, kv_v, kring, vring;
+    std::vector<std::uint8_t> k_side, v_side;
+    std::vector<std::uint32_t> unpackable;
 };
 
 Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, Device& d, bool fused = false) {
@@ -267,6 +778,10 @@ Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, 
     a.kv.table        = p.full ? d.block_table : nullptr;
     a.kv.table_stride = p.full ? kTableStride : 0;
     a.kv.pool_pages   = p.full ? kPoolPages : 0;
+    a.kv.codec        = p.codec;
+    a.kv.k_side       = p.quantized() ? d.k_side : nullptr;
+    a.kv.v_side       = p.quantized() ? d.v_side : nullptr;
+    a.kv.unpackable   = p.codec == ik::KvCodec::Bf16Packed ? d.unpackable : nullptr;
     a.ws               = ik::carve_attention_workspace(d.ws);
     a.out              = d.out;
     a.fused            = fused;
@@ -278,6 +793,11 @@ Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, 
     o.r     = download(a.ws.r, std::size_t(T) * RW);
     o.kv_k  = download(d.kv_k, p.kv_k.size());
     o.kv_v  = download(d.kv_v, p.kv_v.size());
+    if (p.quantized()) {
+        o.k_side = download(d.k_side, p.k_side.size());
+        o.v_side = download(d.v_side, p.v_side.size());
+    }
+    o.unpackable = download(d.unpackable, kLanes);
     o.kring = download(d.kring, p.kring.size());
     o.vring = download(d.vring, p.vring.size());
     return o;
@@ -286,8 +806,22 @@ Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, 
 void reset_state(const Problem& p, Device& d) {
     upload_to(d.kv_k, p.kv_k);
     upload_to(d.kv_v, p.kv_v);
+    if (p.quantized()) {
+        upload_to(d.k_side, p.k_side);
+        upload_to(d.v_side, p.v_side);
+    }
+    upload_to(d.unpackable, std::vector<std::uint32_t>(kLanes, 0xFFFFFFFFU));
     upload_to(d.kring, p.kring);
     upload_to(d.vring, p.vring);
+}
+
+// The pools (and a quantized pool's side records) of two runs: the same bits.
+void same_pools(Tally& tally, const Outputs& a, const Outputs& b) {
+    tally.exact(a.kv_k.data(), b.kv_k.data(), b.kv_k.size());
+    tally.exact(a.kv_v.data(), b.kv_v.data(), b.kv_v.size());
+    tally.exact(a.k_side.data(), b.k_side.data(), b.k_side.size());
+    tally.exact(a.v_side.data(), b.v_side.data(), b.v_side.size());
+    tally.exact(a.unpackable.data(), b.unpackable.data(), b.unpackable.size());
 }
 
 // ---------------------------------------------------------------------------- host prologue emulation
@@ -305,9 +839,19 @@ float history(const Call& c, int t, int k, int ch, const std::vector<std::uint16
 }
 
 void prologue_check(const Problem& p, const Call& call, const Outputs& got, const char* name) {
-    Tally tally{name};
+    Tally tally{name}, codec{"  codec: each value within half a step"};
+    // Rotated forms: every row's |S c - y|^2 / |y|^2 within 0.15 (vq2: 2 bits a value, the Gaussian rate-distortion
+    // floor 0.0625) or 0.02 (q4: 16-level Lloyd-Max, ~0.0095) plus the row's overload term (below); q' within half a
+    // BF16 ulp of the FP64 rotation of the emulated query plus 2^-18 of its largest |q| (seven FP32 butterfly roundings).
+    Tally distortion{"  codec: rotated rows' |S c - y|^2 / |y|^2 within 0.15 (vq2) / 0.02 (q4) + overload"};
+    Tally rotation{"  q' = bf16(2^-4 H128 q) vs FP64"};
+    double mean_distortion[2] = {0, 0};
+    int distortion_rows[2]    = {0, 0};
     const int T = call.size();
     std::vector<std::uint16_t> kv_k = p.kv_k, kv_v = p.kv_v, kring = p.kring, vring = p.vring;
+    std::vector<std::uint8_t> k_side = p.k_side, v_side = p.v_side;
+    const bool quantized = p.quantized();
+    std::vector<std::uint32_t> flags(kLanes, 0xFFFFFFFFU); // bf16p: each lane's lowest unpackable position
     for (int t = 0; t < T; ++t) {
         const int lane = call.lane[t], pos = call.pos[t];
         if (lane < 0) {
@@ -340,19 +884,73 @@ void prologue_check(const Problem& p, const Call& call, const Outputs& got, cons
                 double s64      = 0;
                 for (int e = 0; e < D; ++e) { s64 += double{c[e]} * c[e]; }
                 const std::size_t at = kv_row(p, lane, kv, pos);
+                // held: the BF16 storage's value (a quantized form's encoder input); its FP64 check is the kernel's on
+                // a BF16 pool and the emulation's (bit for bit the kernel's there) on a quantized one.
+                float held[D];
+                std::uint16_t src[D]; // their BF16 source words (bf16p's input)
                 for (int e = 0; e < D; ++e) {
                     if (which == 0) {
                         const float y        = bf(canon::mul_rn(c[e], ik::clip_factor(sum, 22.627416997969522F)));
-                        kv_k[at + e]         = b16(y);
+                        held[e]              = y;
+                        src[e]               = b16(y);
+                        if (!quantized) { kv_k[at + e] = b16(y); }
                         const double y64     = c[e] * std::min(1.0, 22.627416997969522 / (std::sqrt(s64) + 1e-6));
-                        tally.ratio(std::fabs(f(got.kv_k[at + e]) - y64) /
+                        tally.ratio(std::fabs((quantized ? y : f(got.kv_k[at + e])) - y64) /
                                     (0.5 * ulp_bf16(y64) + ulp_bf16(c64[e]) + 1e-30));
                     } else {
                         const float y    = bf(canon::mul_rn(c[e], ik::rms_factor(sum, 128.0F)));
-                        kv_v[at + e]     = h16(y);
+                        held[e]          = hf(h16(y));
+                        src[e]           = b16(y);
+                        if (!quantized) { kv_v[at + e] = h16(y); }
                         const double y64 = c[e] / std::sqrt(s64 / 128.0 + 1e-6);
-                        tally.ratio(std::fabs(hf(got.kv_v[at + e]) - y64) /
+                        tally.ratio(std::fabs((quantized ? held[e] : hf(got.kv_v[at + e])) - y64) /
                                     (0.5 * ulp_bf16(y64) + ulp_f16(y64) + ulp_bf16(c64[e]) + 1e-30));
+                    }
+                }
+                if (quantized) {
+                    const Form form     = p.form(which);
+                    auto& pool          = which == 0 ? kv_k : kv_v;
+                    std::uint8_t* side  = (which == 0 ? k_side : v_side).data() + at / D * side_bytes(form);
+                    std::uint8_t* codes = codes_of(pool, form, at);
+                    double bound[D];
+                    float y[D];
+                    if (!encode_row(form, held, src, codes, side, bound, y)) { flags[lane] = std::min(flags[lane], static_cast<std::uint32_t>(pos)); }
+                    if (rotated(form)) {
+                        // The rotated row's distortion |S c - y|^2 / |y|^2 (y = 2^-3 H128 x, S c as represented).
+                        double err = 0, norm = 0;
+                        for (int e = 0; e < D; ++e) {
+                            const double d = double{decode_value(form, codes, side, e, which == 1)} - y[e];
+                            err += d * d, norm += double{y[e]} * y[e];
+                        }
+                        // The bound: the Gaussian-row figure plus the row's own overload term, sum (|y| - top)_+^2 /
+                        // |y|^2 with top the form's largest level at the row's sigma (q4 87/32, vq2 127/16 sigma). As
+                        // first run (13:28) the bound had no overload term and one q4 key row (column 5, KV head 2:
+                        // 0.0237, a coordinate at 4.16 sigma against the top level's 2.72) failed it.
+                        const double limit = form == Form::Vq2 ? 0.15 : 0.02;
+                        const double sigma = std::sqrt(norm / D);
+                        const double top   = (form == Form::Vq2 ? 127.0 / 16.0 : 87.0 / 32.0) * sigma;
+                        double over = 0, peak = 0;
+                        for (int e = 0; e < D; ++e) {
+                            const double a = std::fabs(double{y[e]});
+                            over += a > top ? (a - top) * (a - top) : 0.0;
+                            peak = std::max(peak, a);
+                        }
+                        const double bound = norm == 0.0 ? 0.0 : limit + over / norm;
+                        distortion.ratio(norm == 0.0 ? err : err / norm / bound);
+                        if (norm != 0.0 && err / norm > limit) {
+                            std::printf("    row past the Gaussian figure: %s %s, column %d KV head %d: %.4f (bound %.4f "
+                                        "with its overload), max |y| / sigma %.2f (reported)\n",
+                                        form == Form::Vq2 ? "vq2" : "q4", which == 0 ? "key" : "value", t, kv, err / norm,
+                                        bound, peak / sigma);
+                        }
+                        mean_distortion[form == Form::Vq2 ? 0 : 1] += norm == 0.0 ? 0.0 : err / norm;
+                        ++distortion_rows[form == Form::Vq2 ? 0 : 1];
+                    } else {
+                        for (int e = 0; e < D; ++e) {
+                            const float rep = decode_value(form, codes, side, e, which == 1);
+                            codec.ratio(std::fabs(double{rep} - held[e]) /
+                                        (bound[e] + 0.5 * (which == 0 ? ulp_bf16(rep) : ulp_f16(rep)) + 1e-30));
+                        }
                     }
                 }
                 auto& out_ring = which == 0 ? kring : vring;
@@ -371,6 +969,7 @@ void prologue_check(const Problem& p, const Call& call, const Outputs& got, cons
             const float fq = ik::clip_factor(ik::head_dot_reference(s, s), 22.627416997969522F);
             const double f64 = std::min(1.0, 22.627416997969522 / (std::sqrt(s64) + 1e-6));
             std::uint16_t want[D];
+            const bool rot = p.full && rotated(p.codec);
             for (int e = 0; e < D; ++e) {
                 float y = bf(canon::mul_rn(s[e], fq));
                 double y64 = s[e] * f64;
@@ -380,8 +979,22 @@ void prologue_check(const Problem& p, const Call& call, const Outputs& got, cons
                     y64                = bf(static_cast<float>(inner)) * (1.0 + 0.1 * std::log(std::max(1.0, (pos + 1) / 8192.0)));
                 }
                 want[e] = b16(y);
-                tally.ratio(std::fabs(f(got.q[(std::size_t(t) * NH + h) * D + e]) - y64) /
+                // A rotated pool's kernel stores q' (checked below): its FP64 stage check is the emulation's (q' is
+                // bit for bit the rotation of this q).
+                tally.ratio(std::fabs((rot ? y : f(got.q[(std::size_t(t) * NH + h) * D + e])) - y64) /
                             (0.5 * ulp_bf16(y64) + (p.full ? ulp_bf16(y64) : 0.0) + 1e-30));
+            }
+            if (rot) {
+                float qv[D];
+                double x64[D], r64[D], qmax = 0;
+                for (int e = 0; e < D; ++e) { qv[e] = f(want[e]), x64[e] = qv[e], qmax = std::max(qmax, std::fabs(x64[e])); }
+                h128_64(x64, r64);
+                h128(qv, 0x1p-4F);
+                for (int e = 0; e < D; ++e) {
+                    want[e] = b16(qv[e]);
+                    rotation.ratio(std::fabs(f(got.q[(std::size_t(t) * NH + h) * D + e]) - r64[e]) /
+                                   (0.5 * ulp_bf16(r64[e]) + 0x1p-18 * qmax + 1e-30));
+                }
             }
             tally.exact(got.q.data() + (std::size_t(t) * NH + h) * D, want, D);
             float rs[RD];
@@ -406,9 +1019,23 @@ void prologue_check(const Problem& p, const Call& call, const Outputs& got, cons
     }
     tally.exact(got.kv_k.data(), kv_k.data(), kv_k.size());
     tally.exact(got.kv_v.data(), kv_v.data(), kv_v.size());
+    tally.exact(got.k_side.data(), k_side.data(), k_side.size());
+    tally.exact(got.v_side.data(), v_side.data(), v_side.size());
+    if (p.codec == ik::KvCodec::Bf16Packed) { tally.exact(got.unpackable.data(), flags.data(), flags.size()); }
     tally.exact(got.kring.data(), kring.data(), kring.size());
     tally.exact(got.vring.data(), vring.data(), vring.size());
     tally.report();
+    if (quantized && !(rotated(p.form(0)) && rotated(p.form(1)))) { codec.report(); }
+    if (p.full && rotated(p.codec)) {
+        distortion.report();
+        rotation.report();
+        for (int i = 0; i < 2; ++i) {
+            if (distortion_rows[i] > 0) {
+                std::printf("    mean %s row distortion %.4f over %d rows (reported)\n", i == 0 ? "vq2" : "q4",
+                            mean_distortion[i] / distortion_rows[i], distortion_rows[i]);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------- attention against FP64
@@ -416,6 +1043,12 @@ void prologue_check(const Problem& p, const Call& call, const Outputs& got, cons
 void attention_check(const Problem& p, const Call& call, const Outputs& got, const char* name) {
     Tally tally{name}, bias_tally{"  bias table (pinned FP32 fold vs FP64)"};
     const int T = call.size();
+    const std::vector<float> keys   = represented(p.form(0), got.kv_k, got.k_side, false);
+    const std::vector<float> values = represented(p.form(1), got.kv_v, got.v_side, true);
+    // A rotated pool (fixed before the first run): scores over the stored q' and the rotated represented keys, the
+    // output 2^-4 H128 of the FP64 rotated output; the FP32 term through that transform's infinity-norm gain of 8
+    // (2^-13 of the rows' largest rotated |v|, which also covers the kernel's seven FP32 butterfly roundings).
+    const bool rot = p.full && rotated(p.codec);
     for (int t = 0; t < T; ++t) {
         const int lane = call.lane[t], pos = call.pos[t];
         if (lane < 0) { continue; }
@@ -425,12 +1058,12 @@ void attention_check(const Problem& p, const Call& call, const Outputs& got, con
             const std::uint16_t* r = got.r.data() + (std::size_t(t) * NH + h) * RD;
             const int lo = std::max(call.first[lane], p.full ? 0 : std::max(0, pos - (ik::kWindow - 1)));
             std::vector<double> score;
-            std::vector<const std::uint16_t*> vrows;
+            std::vector<const float*> vrows;
             double vmax = 0;
             for (int j = lo; j <= pos; ++j) {
                 const std::size_t at = kv_row(p, lane, kv, j);
                 double dot = 0;
-                for (int e = 0; e < D; ++e) { dot += double{f(q[e])} * f(got.kv_k[at + e]); }
+                for (int e = 0; e < D; ++e) { dot += double{f(q[e])} * keys[at + e]; }
                 const int dist = pos - j;
                 double bias = 0;
                 if (dist < ik::kRelativeExtent) {
@@ -445,23 +1078,32 @@ void attention_check(const Problem& p, const Call& call, const Outputs& got, con
                     bias_tally.ratio(std::fabs(bias - b64) / (ulp_bf16(b64) + 1e-30));
                 }
                 score.push_back(dot / std::sqrt(128.0) + bias);
-                vrows.push_back(got.kv_v.data() + at);
-                for (int e = 0; e < D; ++e) { vmax = std::max(vmax, std::fabs(double{hf(got.kv_v[at + e])})); }
+                vrows.push_back(values.data() + at);
+                for (int e = 0; e < D; ++e) { vmax = std::max(vmax, std::fabs(double{values[at + e]})); }
             }
             const double sink = f(p.sink[std::size_t(t) * NH + h]);
             double m = sink;
             for (double s : score) { m = std::max(m, s); }
             double den = std::exp(sink - m);
             for (double& s : score) { den += (s = std::exp(s - m)); }
+            double accs[D], unrot[D];
             for (int e = 0; e < D; ++e) {
                 double acc = 0;
-                for (std::size_t j = 0; j < score.size(); ++j) { acc += score[j] * hf(vrows[j][e]); }
-                const double a64   = acc / den;
+                for (std::size_t j = 0; j < score.size(); ++j) { acc += score[j] * vrows[j][e]; }
+                accs[e] = acc;
+            }
+            if (rot) {
+                h128_64(accs, unrot);
+                std::copy_n(unrot, D, accs);
+            }
+            for (int e = 0; e < D; ++e) {
+                const double a64   = accs[e] / den;
                 const double g     = f(p.gate[std::size_t(t) * QW + h * D + e]);
                 const double sg    = 1.0 / (1.0 + std::exp(-g));
                 const double out64 = a64 * sg;
                 const double y     = f(got.out[std::size_t(t) * QW + h * D + e]);
-                tally.ratio(std::fabs(y - out64) / (0.5 * ulp_bf16(out64) + sg * ulp_bf16(a64) + 0x1p-16 * vmax));
+                tally.ratio(std::fabs(y - out64) /
+                            (0.5 * ulp_bf16(out64) + sg * ulp_bf16(a64) + (rot ? 0x1p-13 : 0x1p-16) * vmax));
             }
         }
     }
@@ -469,10 +1111,19 @@ void attention_check(const Problem& p, const Call& call, const Outputs& got, con
     tally.report();
 }
 
-void run_case(bool full, std::uint32_t seed) {
+void run_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf16) {
     const Call call  = the_call();
     const int T      = call.size();
-    const Problem p  = make_problem(full, call, seed);
+    const Problem p  = make_problem(full, call, seed, codec);
+    char kind[32];
+    std::snprintf(kind, sizeof kind, "%s%s%s", full ? "full" : "sliding", p.quantized() ? " " : "",
+                  p.quantized() ? codec_name(p.codec) : "");
+    char names[5][96];
+    std::snprintf(names[0], sizeof names[0], "%s prologue (emulation, FP64)", kind);
+    std::snprintf(names[1], sizeof names[1], "%s attention vs FP64", kind);
+    std::snprintf(names[2], sizeof names[2], "  %s: one column at a time = the call", kind);
+    std::snprintf(names[3], sizeof names[3], "  %s: the fused prologue = the prologue kernel", kind);
+    std::snprintf(names[4], sizeof names[4], "  %s: repeated call", kind);
     Device d{};
     d.q = dalloc<std::uint16_t>(std::size_t(T) * QW), d.r = dalloc<std::uint16_t>(std::size_t(T) * RW);
     d.k = dalloc<std::uint16_t>(std::size_t(T) * KVW), d.v = dalloc<std::uint16_t>(std::size_t(T) * KVW);
@@ -481,6 +1132,9 @@ void run_case(bool full, std::uint32_t seed) {
     d.qscale = upload(p.qscale), d.rscale = upload(p.rscale), d.table = upload(p.table);
     d.kconv = upload(p.kconv), d.vconv = upload(p.vconv);
     d.kv_k = upload(p.kv_k), d.kv_v = upload(p.kv_v), d.kring = upload(p.kring), d.vring = upload(p.vring);
+    d.k_side = p.quantized() ? upload(p.k_side) : dalloc<std::uint8_t>(1);
+    d.v_side = p.quantized() ? upload(p.v_side) : dalloc<std::uint8_t>(1);
+    d.unpackable = upload(std::vector<std::uint32_t>(kLanes, 0xFFFFFFFFU)); // none, as reset_state leaves them
     d.out = dalloc<std::uint16_t>(std::size_t(T) * QW);
     d.block_table = full ? upload(p.block_table) : dalloc<int>(1);
     d.lane = dalloc<int>(T), d.pos = dalloc<int>(T), d.first = upload(call.first), d.groups = dalloc<int>(3 * ik::kMaxAttentionGroups);
@@ -491,26 +1145,25 @@ void run_case(bool full, std::uint32_t seed) {
     std::vector<int> all(T);
     for (int t = 0; t < T; ++t) { all[t] = t; }
     const Outputs got = run(p, call, all, d);
-    prologue_check(p, call, got, full ? "full prologue (emulation, FP64)" : "sliding prologue (emulation, FP64)");
-    attention_check(p, call, got, full ? "full attention vs FP64" : "sliding attention vs FP64");
+    prologue_check(p, call, got, names[0]);
+    attention_check(p, call, got, names[1]);
 
     // A second identical call over the same initial state: the same bits (no state left in the workspace).
     reset_state(p, d);
     const Outputs again = run(p, call, all, d);
-    Tally repeat{"  repeated call"};
+    Tally repeat{names[4]};
     repeat.exact(again.out.data(), got.out.data(), got.out.size());
     repeat.report();
 
     // Decode against verify.
     reset_state(p, d);
-    Tally inv{full ? "  full: one column at a time = the call" : "  sliding: one column at a time = the call"};
+    Tally inv{names[2]};
     Outputs one;
     for (int t = 0; t < T; ++t) {
         one = run(p, call, {t}, d);
         if (call.lane[t] >= 0) { inv.exact(one.out.data(), got.out.data() + std::size_t(t) * QW, QW); }
     }
-    inv.exact(one.kv_k.data(), got.kv_k.data(), got.kv_k.size());
-    inv.exact(one.kv_v.data(), got.kv_v.data(), got.kv_v.size());
+    same_pools(inv, one, got);
     inv.exact(one.kring.data(), got.kring.data(), got.kring.size());
     inv.exact(one.vring.data(), got.vring.data(), got.vring.size());
     inv.report();
@@ -525,12 +1178,11 @@ void run_case(bool full, std::uint32_t seed) {
     const Outputs plain = run(p, call, grouped, d);
     reset_state(p, d);
     const Outputs fused = run(p, call, grouped, d, true);
-    Tally fu{full ? "  full: the fused prologue = the prologue kernel" : "  sliding: the fused prologue = the prologue kernel"};
+    Tally fu{names[3]};
     fu.exact(fused.out.data(), plain.out.data(), plain.out.size());
     fu.exact(fused.q.data(), plain.q.data(), plain.q.size());
     fu.exact(fused.r.data(), plain.r.data(), plain.r.size());
-    fu.exact(fused.kv_k.data(), plain.kv_k.data(), plain.kv_k.size());
-    fu.exact(fused.kv_v.data(), plain.kv_v.data(), plain.kv_v.size());
+    same_pools(fu, fused, plain);
     fu.exact(fused.kring.data(), plain.kring.data(), plain.kring.size());
     fu.exact(fused.vring.data(), plain.vring.data(), plain.vring.size());
     reset_state(p, d);
@@ -540,9 +1192,45 @@ void run_case(bool full, std::uint32_t seed) {
         one_fused = run(p, call, {t}, d, true);
         fu.exact(one_fused.out.data(), got.out.data() + std::size_t(t) * QW, QW);
     }
-    fu.exact(one_fused.kv_k.data(), got.kv_k.data(), got.kv_k.size());
-    fu.exact(one_fused.kv_v.data(), got.kv_v.data(), got.kv_v.size());
+    same_pools(fu, one_fused, got);
     fu.exact(one_fused.kring.data(), got.kring.data(), got.kring.size());
+
+    if (p.codec == ik::KvCodec::Bf16Packed) {
+        // Lossless: the BF16 storage holding the packed pool's decoded words gives the same outputs and appended words.
+        Problem words = p;
+        words.codec   = ik::KvCodec::Bf16;
+        words.k_side.clear(), words.v_side.clear();
+        const std::vector<float> keys = represented(Form::Bf16p, p.kv_k, p.k_side, false);
+        const std::vector<float> vals = represented(Form::Bf16p, p.kv_v, p.v_side, true);
+        for (std::size_t i = 0; i < keys.size(); ++i) { words.kv_k[i] = b16(keys[i]), words.kv_v[i] = h16(vals[i]); }
+        reset_state(words, d);
+        const Outputs plain = run(words, call, all, d);
+        Tally lossless{"  full bf16p: = the bf16 storage of its words"};
+        lossless.exact(plain.out.data(), got.out.data(), got.out.size());
+        const std::vector<float> got_keys = represented(Form::Bf16p, got.kv_k, got.k_side, false);
+        const std::vector<float> got_vals = represented(Form::Bf16p, got.kv_v, got.v_side, true);
+        std::vector<std::uint16_t> packed_k(got_keys.size()), packed_v(got_vals.size());
+        for (std::size_t i = 0; i < got_keys.size(); ++i) { packed_k[i] = b16(got_keys[i]), packed_v[i] = h16(got_vals[i]); }
+        lossless.exact(plain.kv_k.data(), packed_k.data(), packed_k.size());
+        lossless.exact(plain.kv_v.data(), packed_v.data(), packed_v.size());
+        lossless.report();
+
+        // A key row with no packed form: lane 0's first column's KV head 0 channels 0-15 and their conv history at
+        // 2^-100 (sixteen exponents far below the window: more escapes than the record holds) sets lane 0's flag alone.
+        Problem odd = p;
+        for (int ch = 0; ch < 16; ++ch) {
+            odd.k[ch] = b16(0x1p-100F);
+            for (int back = 1; back <= 3; ++back) {
+                odd.kring[(std::size_t(0) * R + (1100 - back) % R) * KVW + ch] = b16(0x1p-100F);
+            }
+        }
+        reset_state(odd, d);
+        const Outputs flagged = run(odd, call, all, d);
+        check(flagged.unpackable.size() == kLanes && flagged.unpackable[0] == 1100U && flagged.unpackable[1] == 0xFFFFFFFFU &&
+                  flagged.unpackable[2] == 0xFFFFFFFFU && flagged.unpackable[3] == 0xFFFFFFFFU,
+              "bf16p: only lane 0 is flagged");
+        prologue_check(odd, call, flagged, "full bf16p: a key row with no packed form (emulation)");
+    }
     fu.exact(one_fused.vring.data(), got.vring.data(), got.vring.size());
     fu.report();
 
@@ -550,7 +1238,8 @@ void run_case(bool full, std::uint32_t seed) {
                     static_cast<void*>(d.sink), static_cast<void*>(d.gate), static_cast<void*>(d.ktaps),
                     static_cast<void*>(d.vtaps), static_cast<void*>(d.qscale), static_cast<void*>(d.rscale),
                     static_cast<void*>(d.table), static_cast<void*>(d.kconv), static_cast<void*>(d.vconv),
-                    static_cast<void*>(d.kv_k), static_cast<void*>(d.kv_v), static_cast<void*>(d.kring),
+                    static_cast<void*>(d.kv_k), static_cast<void*>(d.kv_v), static_cast<void*>(d.k_side),
+                    static_cast<void*>(d.v_side), static_cast<void*>(d.unpackable), static_cast<void*>(d.kring),
                     static_cast<void*>(d.vring), static_cast<void*>(d.out), static_cast<void*>(d.block_table),
                     static_cast<void*>(d.lane), static_cast<void*>(d.pos), static_cast<void*>(d.first),
                     static_cast<void*>(d.groups), d.ws}) {
@@ -567,8 +1256,10 @@ void run_case(bool full, std::uint32_t seed) {
 // within half a BF16 ulp of FP64 (scores over the kernel's stored q, r and represented K/V, the bias at its pinned
 // BF16 boundary, softmax with the sink) plus sigmoid(gate) times (one ulp of the inner BF16 a + 2^-11 of the row's
 // largest |v|: p is rounded to FP16 for P x V) plus 2^-16 of the row's largest |v|; the call as calls of 37, 64 and 49
-// columns from the same initial state gives the same bits; a repeated call the same bits.
-void prompt_case(bool full, std::uint32_t seed) {
+// columns from the same initial state gives the same bits; a repeated call the same bits. A quantized full pool
+// (`codec`): the same criteria over its decoded represented values, and the chunked calls' codes and side records the
+// one call's.
+void prompt_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf16) {
     constexpr int T = 150, P0 = 1000, First = 37;
     const int pages = ik::staging_ring_pages(T);
     std::mt19937 gen(seed);
@@ -601,6 +1292,21 @@ void prompt_case(bool full, std::uint32_t seed) {
         block_table.assign(kTableStride, -1);
         for (int b = 0; b <= (P0 + T - 1) / U; ++b) { block_table[b] = order[b]; }
     }
+    if (!full) { codec = ik::KvCodec::Bf16; }
+    const bool quantized = codec != ik::KvCodec::Bf16;
+    const Form kform = key_form(codec), vform = value_form(codec);
+    std::vector<std::uint8_t> k_side, v_side;
+    if (quantized) {
+        encode_pool(kform, kv_k, k_side, false);
+        encode_pool(vform, kv_v, v_side, true);
+    }
+    char kind[32];
+    std::snprintf(kind, sizeof kind, "%s%s%s", full ? "full" : "sliding", quantized ? " " : "",
+                  quantized ? codec_name(codec) : "");
+    char names[3][96];
+    std::snprintf(names[0], sizeof names[0], "%s prompt attention vs FP64", kind);
+    std::snprintf(names[1], sizeof names[1], "  %s: repeated prompt call", kind);
+    std::snprintf(names[2], sizeof names[2], "  %s: calls of 37, 64, 49 = one call", kind);
     const auto row_of = [&](int head, int pos) -> std::size_t {
         if (!full) { return ((std::size_t(head) * pages + (pos / U) % pages) * U + pos % U) * D; }
         return ((std::size_t(head) * kPoolPages + block_table[pos / U]) * U + pos % U) * D;
@@ -611,6 +1317,9 @@ void prompt_case(bool full, std::uint32_t seed) {
     std::uint16_t *dqs = upload(qscale), *drs = upload(rscale), *dtable = upload(table), *dkc = upload(kconv),
                   *dvc = upload(vconv);
     std::uint16_t *dkr = upload(kring), *dvr = upload(vring), *dkk = upload(kv_k), *dvv = upload(kv_v);
+    std::uint8_t *dks = quantized ? upload(k_side) : dalloc<std::uint8_t>(1),
+                 *dvs = quantized ? upload(v_side) : dalloc<std::uint8_t>(1);
+    std::uint32_t* dflags = dalloc<std::uint32_t>(1);
     std::uint16_t *dkh = dalloc<std::uint16_t>(std::size_t(ik::kHistorySlots) * KVW),
                   *dvh = dalloc<std::uint16_t>(std::size_t(ik::kHistorySlots) * KVW);
     std::uint16_t* dout = dalloc<std::uint16_t>(std::size_t(T) * QW);
@@ -620,9 +1329,11 @@ void prompt_case(bool full, std::uint32_t seed) {
     void* dws = dalloc<unsigned char>(ik::attention_workspace_bytes(T));
     const auto reset = [&] {
         upload_to(dkk, kv_k), upload_to(dvv, kv_v), upload_to(dkr, kring), upload_to(dvr, vring);
+        if (quantized) { upload_to(dks, k_side), upload_to(dvs, v_side); }
     };
     struct Got {
         std::vector<std::uint16_t> out, q, r, kk, vv;
+        std::vector<std::uint8_t> ks, vs;
     };
     // Columns [c0, c0 + n) of the call as one prompt call.
     const auto run_prompt = [&](int c0, int n) {
@@ -665,6 +1376,10 @@ void prompt_case(bool full, std::uint32_t seed) {
         a.kv.table          = full ? dbt : nullptr;
         a.kv.table_stride   = full ? kTableStride : 0;
         a.kv.pool_pages     = full ? kPoolPages : 0;
+        a.kv.codec          = codec;
+        a.kv.k_side         = quantized ? dks : nullptr;
+        a.kv.v_side         = quantized ? dvs : nullptr;
+        a.kv.unpackable     = codec == ik::KvCodec::Bf16Packed ? dflags : nullptr;
         a.ws                = ik::carve_attention_workspace(dws, T);
         a.out               = dout;
         ik::attention_prompt(a, nullptr);
@@ -675,12 +1390,19 @@ void prompt_case(bool full, std::uint32_t seed) {
         g.r   = download(a.ws.r, std::size_t(n) * RW);
         g.kk  = download(dkk, kv_k.size());
         g.vv  = download(dvv, kv_v.size());
+        if (quantized) { g.ks = download(dks, k_side.size()), g.vs = download(dvs, v_side.size()); }
         return g;
     };
     reset();
     const Got got = run_prompt(0, T);
+    const std::vector<float> keys   = represented(kform, got.kk, got.ks, false);
+    const std::vector<float> values = represented(vform, got.vv, got.vs, true);
+    // A rotated pool (fixed before the first run): as attention_check's, the FP16 p term over the original domain's
+    // largest |v| (its error is linear in p: sum dp v'_rot -> sum dp v_orig), the FP32 term 2^-13 of the rotated one.
+    const bool rot = full && rotated(codec);
+    const std::vector<double> orig_max = rot ? original_row_max(values) : std::vector<double>{};
     // FP64 over the kernel's own q, r and represented K/V.
-    Tally tally{full ? "full prompt attention vs FP64" : "sliding prompt attention vs FP64"};
+    Tally tally{names[0]};
     for (int t = 0; t < T; ++t) {
         const int pos = P0 + t;
         for (int h = 0; h < NH; ++h) {
@@ -690,11 +1412,11 @@ void prompt_case(bool full, std::uint32_t seed) {
             const int lo = std::max(First, full ? 0 : std::max(0, pos - (ik::kWindow - 1)));
             std::vector<double> score;
             std::vector<std::size_t> rows;
-            double vmax = 0;
+            double vmax = 0, omax = 0;
             for (int j = lo; j <= pos; ++j) {
                 const std::size_t at = row_of(kvh, j);
                 double dot = 0;
-                for (int e = 0; e < D; ++e) { dot += double{f(qv[e])} * f(got.kk[at + e]); }
+                for (int e = 0; e < D; ++e) { dot += double{f(qv[e])} * keys[at + e]; }
                 const int dist = pos - j;
                 double bias    = 0;
                 if (dist < ik::kRelativeExtent) {
@@ -706,44 +1428,61 @@ void prompt_case(bool full, std::uint32_t seed) {
                 }
                 score.push_back(dot / std::sqrt(128.0) + bias);
                 rows.push_back(at);
-                for (int e = 0; e < D; ++e) { vmax = std::max(vmax, std::fabs(double{hf(got.vv[at + e])})); }
+                for (int e = 0; e < D; ++e) { vmax = std::max(vmax, std::fabs(double{values[at + e]})); }
+                omax = rot ? std::max(omax, orig_max[at / D]) : vmax;
             }
             const double s_sink = f(sink[std::size_t(t) * NH + h]);
             double m = s_sink;
             for (double s : score) { m = std::max(m, s); }
             double den = std::exp(s_sink - m);
             for (double& s : score) { den += (s = std::exp(s - m)); }
+            double accs[D], unrot[D];
             for (int e = 0; e < D; ++e) {
                 double acc = 0;
-                for (std::size_t j = 0; j < score.size(); ++j) { acc += score[j] * hf(got.vv[rows[j] + e]); }
-                const double a64 = acc / den;
+                for (std::size_t j = 0; j < score.size(); ++j) { acc += score[j] * values[rows[j] + e]; }
+                accs[e] = acc;
+            }
+            if (rot) {
+                h128_64(accs, unrot);
+                std::copy_n(unrot, D, accs);
+            }
+            for (int e = 0; e < D; ++e) {
+                const double a64 = accs[e] / den;
                 const double sg  = 1.0 / (1.0 + std::exp(-double{f(gate[std::size_t(t) * QW + h * D + e])}));
                 const double y   = f(got.out[std::size_t(t) * QW + h * D + e]);
-                tally.ratio(std::fabs(y - a64 * sg) /
-                            (0.5 * ulp_bf16(a64 * sg) + sg * (ulp_bf16(a64) + 0x1p-11 * vmax) + 0x1p-16 * vmax));
+                tally.ratio(std::fabs(y - a64 * sg) / (0.5 * ulp_bf16(a64 * sg) + sg * (ulp_bf16(a64) + 0x1p-11 * omax) +
+                                                       (rot ? 0x1p-13 : 0x1p-16) * vmax));
             }
         }
     }
     tally.report();
     reset();
     const Got again = run_prompt(0, T);
-    Tally repeat{"  repeated prompt call"};
+    Tally repeat{names[1]};
     repeat.exact(again.out.data(), got.out.data(), got.out.size());
     repeat.report();
     reset();
-    Tally chunks{full ? "  full: calls of 37, 64, 49 = one call" : "  sliding: calls of 37, 64, 49 = one call"};
+    Tally chunks{names[2]};
     int c0 = 0;
+    Got part;
     for (const int n : {37, 64, 49}) {
-        const Got part = run_prompt(c0, n);
+        part = run_prompt(c0, n);
         chunks.exact(part.out.data(), got.out.data() + std::size_t(c0) * QW, std::size_t(n) * QW);
         c0 += n;
+    }
+    if (quantized) {
+        chunks.exact(part.kk.data(), got.kk.data(), got.kk.size());
+        chunks.exact(part.vv.data(), got.vv.data(), got.vv.size());
+        chunks.exact(part.ks.data(), got.ks.data(), got.ks.size());
+        chunks.exact(part.vs.data(), got.vs.data(), got.vs.size());
     }
     chunks.report();
     for (void* x : {static_cast<void*>(dq), static_cast<void*>(dr), static_cast<void*>(dk), static_cast<void*>(dv),
                     static_cast<void*>(dsink), static_cast<void*>(dgate), static_cast<void*>(dktaps),
                     static_cast<void*>(dvtaps), static_cast<void*>(dqs), static_cast<void*>(drs), static_cast<void*>(dtable),
                     static_cast<void*>(dkc), static_cast<void*>(dvc), static_cast<void*>(dkr), static_cast<void*>(dvr),
-                    static_cast<void*>(dkk), static_cast<void*>(dvv), static_cast<void*>(dkh), static_cast<void*>(dvh),
+                    static_cast<void*>(dkk), static_cast<void*>(dvv), static_cast<void*>(dks), static_cast<void*>(dvs),
+                    static_cast<void*>(dflags), static_cast<void*>(dkh), static_cast<void*>(dvh),
                     static_cast<void*>(dout), static_cast<void*>(dbt), static_cast<void*>(dlane), static_cast<void*>(dpos),
                     static_cast<void*>(dfirst), static_cast<void*>(dgroups), dws}) {
         cudaFree(x);
@@ -757,6 +1496,14 @@ INFERNIX_OP_TEST(inkling2_attention) {
     run_case(true, 8);
     prompt_case(false, 17);
     prompt_case(true, 18);
+    // The quantized full pools (each form in both planes; k8v4 mixes them).
+    std::uint32_t seed = 30;
+    for (const ik::KvCodec codec : {ik::KvCodec::Int8G64, ik::KvCodec::Fp8Row, ik::KvCodec::Nvfp4G16,
+                                    ik::KvCodec::Fp8KeyNvfp4V, ik::KvCodec::Bf16Packed, ik::KvCodec::Vq2,
+                                    ik::KvCodec::Q4KeyVq2V}) {
+        run_case(true, seed++, codec);
+        prompt_case(true, seed++, codec);
+    }
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

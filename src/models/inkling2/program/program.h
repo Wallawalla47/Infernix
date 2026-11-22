@@ -289,8 +289,14 @@ struct ProgramOptions {
     // --vision (the tower bound in the Parameters): the tower's buffers for images of up to vision_max_cells cells.
     bool vision                    = false;
     std::uint32_t vision_max_cells = 0;
+    // --kv-dtype: the full visits' pools (sliding windows stay BF16 K / FP16 V).
+    ops::inkling2::KvCodec kv_codec = ops::inkling2::KvCodec::Bf16;
     DiagnosticObserver diagnostics;
 };
+
+// --kv-dtype's forms of the full visits' pools: the KvCodec of a storage (none: not built for Inkling 2), and back.
+[[nodiscard]] std::optional<ops::inkling2::KvCodec> kv_codec(KvCacheStorage storage);
+[[nodiscard]] KvCacheStorage kv_storage(ops::inkling2::KvCodec codec);
 
 // Device memory the Program allocates, from the options and the configuration alone.
 struct ProgramDevicePlan {

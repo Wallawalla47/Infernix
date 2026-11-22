@@ -64,6 +64,55 @@ inline constexpr std::int32_t kMaxAttentionGroups =
 //            from the state's ring before and returning its last positions after);
 //   full: a head-major page pool [kKvHeads][pool_pages][64][128] and each lane's block table row
 //            table[lane * table_stride + p / 64].
+//
+// A full visit's pool may hold a quantized form instead (`codec`, the K and V planes each in one of the forms below;
+// sliding rings are always BF16 K / FP16 V). A row is one position's 128 values of one KV head, row r the one at
+// element offset 128 r of the BF16 layout; its codes at byte offset r * code bytes of k (v) and its side record at
+// byte offset r * side bytes of k_side (v_side). x is the value the BF16 storage holds (the BF16 key, the FP16 value);
+// every division is IEEE (a host encoder forms the same bytes).
+//
+//   form   code  side  encoding
+//   int8   128   4     two 64-value groups (ops/kv_cache/int8_g64_codec.cuh's at 128): FP16 scale fp16_rn(max|x| / 127),
+//                      code = clamp(rn(x * rn(1 / scale)), -127, 127); a zero scale codes zeros
+//   fp8    128   2     the row (ops/kv_cache/fp8_e4m3_row_codec.cuh's at 128): FP16 scale
+//                      fp16_rn(clamp(max|x| / 448, 2^-24, 65504)), code = E4M3_rn_satfinite(x * rn(1 / scale)); a zero
+//                      row scale 0 and zero codes
+//   nvfp4  64    8     16-value groups (ops/kv_cache/nvfp4_group16_codec.cuh's): an E4M3 scale byte a group, E2M1 codes
+//                      (value 2i the low nibble of byte i of the group's 8), the scale of the five targets with the least
+//                      squared error
+//   bf16p  192   16    lossless (ops/kv_cache/bf16p_codec.cuh's form at 128: sign and fraction bytes [0, 128), exponent
+//                      nibbles [128, 192); a 16-byte record: the base, min(escapes, 14) | 0x80 when some exponent is 0,
+//                      the escapes' exponents in column order) of the BF16 values: K's own, V's BF16 source (its FP16
+//                      storage the rounding of it); 14 escapes, not the D256 form's 6 (Inkling's position-0 key rows
+//                      reach 7); a row with more has no packed form (the record keeps the first 14): its position
+//                      lowers its lane's `unpackable` word
+//
+//   vq2    32    2     the rotated row y = 2^-3 H128 x (H128 the Sylvester Hadamard matrix, value d = 4 l + j applied as H4
+//                      over j then H32 over l, ops/kv_cache/hadamard_d256.cuh's butterflies, FP32), 16 words of 8
+//                      coordinates, each a 16-bit code of ops/kv_cache/vq2_codec.cuh's 512 patterns (its encoding
+//                      at 128: sigma = sqrt(sum(y^2) / 128), the first nearest pattern, the parity sign), one FP16
+//                      scale S = fp16_rn(sum(y^2) / sum(y c)) a row
+//   q4     64    2     the rotated row's coordinates as q4_lloyd_codec.cuh's 4-bit Lloyd-Max levels (sigma at 128),
+//                      coordinate 2i the low nibble of byte i, the same scale
+// A lane's sums (sum(y^2), sum(y c)) fold its 4 values by fma, then the warp's xor tree. A rotated pool's attention runs
+// in the rotated domain: its represented values are the rotated ones (below: c S), each query row is q' = bf16_rn(2^-4
+// H128 q) in the same butterfly order (q' . y = q . k: H128 H128 = 128 I), and the output o = 2^-4 H128 o' (FP32, the
+// route's own butterfly order) of the rotated output o', before the division by the softmax sum. Neither form carries
+// the D256 forms' exact recent-key window: Inkling's 40 sliding visits keep the last 1,024 positions exact in BF16.
+//
+// The represented values every route reads: K = bf16_rn(code value * scale), V = fp16_rn(code value * scale) (each
+// product exact in FP32; nvfp4's exact in BF16 and FP16 too); bf16p: the BF16 storage's words.
+enum class KvCodec : std::uint8_t {
+    Bf16,          // BF16 K, FP16 V words
+    Int8G64,       // int8 K and V
+    Fp8Row,        // fp8 K and V
+    Nvfp4G16,      // nvfp4 K and V
+    Fp8KeyNvfp4V,  // fp8 K, nvfp4 V
+    Bf16Packed,    // bf16p K and V
+    Vq2,           // vq2 K and V
+    Q4KeyVq2V,     // q4 K, vq2 V
+};
+
 struct KvView {
     std::uint16_t* k             = nullptr;
     std::uint16_t* v             = nullptr;
@@ -72,7 +121,31 @@ struct KvView {
     const std::int32_t* table    = nullptr;
     std::int32_t table_stride    = 0;
     std::int64_t pool_pages      = 0;
+    KvCodec codec                = KvCodec::Bf16; // full pools (table set) only
+    std::uint8_t* k_side         = nullptr;       // a quantized pool's side records [heads][pool_pages][64][side bytes]
+    std::uint8_t* v_side         = nullptr;
+    // bf16p: [lanes] device words, each lowered (atomicMin) to the position of a row its lane appends with no packed
+    // form; the caller sets them to 0xFFFFFFFF (none) and reads them.
+    std::uint32_t* unpackable    = nullptr;
 };
+
+// A quantized row's code and side bytes in each plane (0, 0: BF16 words).
+struct KvRowBytes {
+    std::int32_t key_code = 0, key_side = 0, value_code = 0, value_side = 0;
+};
+[[nodiscard]] constexpr KvRowBytes kv_row_bytes(KvCodec codec) noexcept {
+    switch (codec) {
+    case KvCodec::Bf16: return {};
+    case KvCodec::Int8G64: return {128, 4, 128, 4};
+    case KvCodec::Fp8Row: return {128, 2, 128, 2};
+    case KvCodec::Nvfp4G16: return {64, 8, 64, 8};
+    case KvCodec::Fp8KeyNvfp4V: return {128, 2, 64, 8};
+    case KvCodec::Bf16Packed: return {192, 16, 192, 16};
+    case KvCodec::Vq2: return {32, 2, 32, 2};
+    case KvCodec::Q4KeyVq2V: return {64, 2, 32, 2};
+    }
+    return {};
+}
 
 // Copies positions [from, to) of a lane's sliding K and V from one ring view to another (by position: the views'
 // page counts may differ).
