@@ -831,8 +831,10 @@ struct EngineOptions {
     // 16-bit activations where the checkpoint specifies fewer bits (--a16-activations): Qwen3.8-Flash-Next routed
     // experts that are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and B, Dense8, NVFP4-QAD) run the
     // arithmetic of the weight-only banks (design §16.2.1); on a Qwen3.5-family artifact every text projection
-    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations).
-    // Changes the output; the engine warns at launch that the default follows NVIDIA's specification and is
+    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations); on an
+    // Inkling 2 artifact the routed experts' NVFP4 and MXFP8 layers take 16-bit activations (w4a4_sparse_moe.h's
+    // ExpertActivation::A16), deterministic and request-invariant, which the reproducible route accepts.
+    // Changes the output; the engine warns at launch that the default follows the checkpoint's specification and is
     // recommended. Artifacts that already run 16-bit activations accept it unchanged; --expert-a4-activations,
     // --a8-activations and the lossless route refuse it.
     bool expert_a16_activations        = false;

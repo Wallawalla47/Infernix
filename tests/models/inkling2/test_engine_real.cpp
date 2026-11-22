@@ -14,7 +14,7 @@
 // 5. Scoring: a CausalScoring Engine's logits of the 32 golden ids (positions 0-30) equal the forward test's
 //    prompt-route logits (INFERNIX_INKLING2_PROMPT_LOGITS_GUARD: scoring runs the prompt route) byte for byte.
 // 6. --q8-weights (approximate 8-bit weights; refused with --reproducible) and --a16-activations (16-bit expert
-//    activations; accepted with --reproducible, giving the same tokens): under each, an eager Engine at chunks of 16
+//    activations; accepted with --reproducible, giving the same tokens), and both together: under each, an eager Engine at chunks of 16
 //    serving one request at a time is the reference, and graphs (alone and C = 4 in reverse order), chunks of 7, and
 //    the long prompt in one 4,096-column call give its tokens.
 // 7. DSpark (--spec dspark, auto and 7 drafts, graphs and eager; INFERNIX_INKLING2_NO_DSPARK skips it): speculative
@@ -461,6 +461,10 @@ int main() {
             };
             variant("q8", "--q8-weights", false, [](infernix::EngineOptions& o) { o.q8_weights = true; });
             variant("a16", "--a16-activations", true, [](infernix::EngineOptions& o) { o.expert_a16_activations = true; });
+            variant("q8 + a16", "--q8-weights", false, [](infernix::EngineOptions& o) {
+                o.q8_weights             = true;
+                o.expert_a16_activations = true;
+            });
         }
         if (guard != nullptr) {
             infernix::EngineOptions options = engine_options(artifact, 16, false, 1);

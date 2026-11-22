@@ -1215,6 +1215,7 @@ vision tower (M7).
 | `--prefill-chunk` | default 16K if chunk-width invariance holds ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |
 | `--q8-weights` | approximate 8-bit K2 and head ([§11](#11-dense-projections-and-the-head)); refused with `--reproducible` and `--lossless` |
+| `--a16-activations` | the routed experts on 16-bit activations (`w4a4_sparse_moe.h`'s `ExpertActivation::A16`): NVFP4 layers on Qwen3.8-Flash-Next's exact W4A16 arithmetic (x and h as 21-bit fixed point per column, exact int64 sums, the multiplier fl32(amax / denominator)), MXFP8 layers W8A16 (E4M3 widened exactly to BF16, a block's two MMAs from zero, its power-of-two scale fused); accepted with `--reproducible`; prompt calls run the narrow kernels (no A16 grouped GEMM: pp2048 16,387 → 3,383 tok/s, tg128 184.9 → 188.1, 2026-11-22); MXFP8 decode at one column runs the separate router and experts. `--a8-activations`: not built |
 
 No family-specific tuning switches ship; experiments use temporary `INFERNIX_TMP_*` switches removed before merge.
 
