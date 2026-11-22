@@ -106,8 +106,8 @@ struct Workspace {
     std::uint16_t* h          = nullptr; // [capacity * kTopK][I] BF16
     std::uint32_t* h_amax     = nullptr; // [capacity * kTopK]: binary32 bits of max |h| (NVFP4)
     std::uint8_t* h_rows      = nullptr; // [capacity * kTopK][row_bytes(I)]
-    // A16 NVFP4 (narrow calls): h as limb rows [min(capacity, kMaxColumns) * kTopK][kA16HRowBytes], their exponent
-    // a16_emax of h_amax's BF16 bits.
+    // A16 NVFP4 (a workspace carved for A16): h as limb rows [capacity * kTopK][kA16HRowBytes], their exponent a16_emax
+    // of h_amax's BF16 bits.
     std::uint8_t* h_limbs     = nullptr;
     // [1]: kErrorDownStalled once a down CTA's wait for its job made no progress for 2 s (zero: no error).
     std::uint32_t* error      = nullptr;
@@ -142,11 +142,13 @@ void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t
     return Routing{workspace.routed, workspace.gamma};
 }
 
-// A workspace for calls of up to `capacity` columns (1..kMaxCapacity).
+// A workspace for calls of up to `capacity` columns (1..kMaxCapacity); with A16 also the h limb rows.
 [[nodiscard]] std::size_t workspace_bytes(std::int32_t experts, std::int32_t intermediate,
-                                         std::int32_t capacity = kMaxColumns);
+                                         std::int32_t capacity = kMaxColumns,
+                                         ExpertActivation activation = ExpertActivation::Checkpoint);
 [[nodiscard]] Workspace carve_workspace(void* base, std::int32_t experts, std::int32_t intermediate,
-                                        std::int32_t capacity = kMaxColumns);
+                                        std::int32_t capacity = kMaxColumns,
+                                        ExpertActivation activation = ExpertActivation::Checkpoint);
 
 // Groups the call's (column, slot) entries by expert and clears the per-entry and per-job state the expert passes
 // accumulate into (h_amax, job_done), so the call depends on nothing a previous call left.

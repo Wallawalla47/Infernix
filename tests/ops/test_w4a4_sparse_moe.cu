@@ -397,7 +397,13 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     std::vector<std::uint8_t> rows;
     std::vector<float> amax;
     std::vector<std::int32_t> emax;
+    std::vector<std::uint16_t> x16;
     for (const auto& x : call.x) {
+        for (const float v : x) { x16.push_back(canon::f32_to_bf16_rn(v)); }
+        if (a16 && b.a8) { // MXFP8 A16: the BF16 rows alone
+            amax.push_back(0.0F);
+            continue;
+        }
         if (a16) {
             const LimbRow l = encode_a16(x);
             rows.insert(rows.end(), l.bytes.begin(), l.bytes.end());
@@ -410,20 +416,25 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
         amax.push_back(q.amax);
     }
     if (emax.empty()) { emax.push_back(0); }
-    std::uint8_t* d_rows = upload(rows);
-    float* d_amax        = upload(amax);
-    std::int32_t* d_emax = upload(emax);
+    if (rows.empty()) { rows.push_back(0); }
+    std::uint8_t* d_rows  = upload(rows);
+    float* d_amax         = upload(amax);
+    std::int32_t* d_emax  = upload(emax);
+    std::uint16_t* d_x16  = upload(x16);
     moe::Activations act{d_rows, d_amax, call.columns};
     if (a16) {
         act.activation = moe::ExpertActivation::A16;
-        act.emax       = d_emax;
+        act.rows       = b.a8 ? nullptr : d_rows;
+        act.emax       = b.a8 ? nullptr : d_emax;
+        act.x16        = d_x16;
     }
     std::int32_t* d_exp  = upload(call.experts);
     float* d_gamma       = upload(call.gamma);
     std::uint16_t* d_out = nullptr;
     const std::size_t entries = std::size_t(call.columns) * K;
     cuda_check(cudaMalloc(&d_out, entries * H * 2), "cudaMalloc");
-    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, capacity);
+    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, capacity,
+                                                   a16 ? moe::ExpertActivation::A16 : moe::ExpertActivation::Checkpoint);
     const moe::Routing routing{d_exp, d_gamma};
     moe::Bank bank;
     bank.records       = db.records;
@@ -466,7 +477,8 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     r.h_rows = download(ws.h_rows, entries * moe::row_bytes(bank.format, I));
     r.h_amax = download(ws.h_amax, entries);
     for (void* p : {static_cast<void*>(d_rows), static_cast<void*>(d_amax), static_cast<void*>(d_exp),
-                    static_cast<void*>(d_gamma), static_cast<void*>(d_out), static_cast<void*>(d_emax)}) {
+                    static_cast<void*>(d_gamma), static_cast<void*>(d_out), static_cast<void*>(d_emax),
+                    static_cast<void*>(d_x16)}) {
         cuda_check(cudaFree(p), "cudaFree");
     }
     return r;
@@ -508,20 +520,22 @@ std::vector<std::uint16_t> oracle_a16(const HostBank& b, const Matrix& gu, const
 void a16_case() {
     const HostBank b = make_bank(false, 41U);
     DeviceBank db{upload(b.records), upload(b.amax), upload(std::vector<float>{b.den[0], b.den[1]})};
+    constexpr int kCapacity = 300; // a prefill-width call too
+    const std::size_t bytes = moe::workspace_bytes(E, I, kCapacity, moe::ExpertActivation::A16);
     void* workspace = nullptr;
-    cuda_check(cudaMalloc(&workspace, moe::workspace_bytes(E, I)), "cudaMalloc");
-    cuda_check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I)), "cudaMemset");
+    cuda_check(cudaMalloc(&workspace, bytes), "cudaMalloc");
+    cuda_check(cudaMemset(workspace, 0, bytes), "cudaMemset");
     std::vector<Matrix> cache_gu(E), cache_dn(E);
     std::vector<bool> decoded(E, false);
     int differ = 0, checked = 0;
     Result wide;
     Call wide_call;
-    for (const int columns : {1, 5, 32, 128}) {
+    for (const int columns : {1, 5, 32, 128, kCapacity}) {
         Call call = make_call(columns, 900U + static_cast<std::uint32_t>(columns), columns == 32 ? 16.0F : 1.0F);
         if (columns == 32) { call.x[3][100] = INFINITY; } // a non-finite column
-        const Result got = run(b, db, call, workspace, moe::kMaxColumns, true);
-        // The exact arithmetic over a sample of entries (every entry of the narrow calls, 64 of the widest).
-        const int entries = columns * K, step = columns == 128 ? 16 : 1;
+        const Result got = run(b, db, call, workspace, kCapacity, true);
+        // The exact arithmetic over a sample of entries (every entry of the narrow calls, every 16th of the wider).
+        const int entries = columns * K, step = columns >= 128 ? 16 : 1;
         for (int entry = 0; entry < entries; entry += step) {
             const int t = entry / K, e = call.experts[entry];
             if (!decoded[e]) {
@@ -539,24 +553,24 @@ void a16_case() {
                 check(all_nan, "A16: a non-finite column's outputs are not the canonical NaN");
             }
         }
-        if (columns == 128) {
+        if (columns == kCapacity) {
             wide      = got;
             wide_call = call;
         }
     }
-    // Columns of the 128-column call alone.
+    // Columns of the widest call alone.
     int alone_differ = 0;
-    for (const int t : {0, 9, 64, 127}) {
+    for (const int t : {0, 9, 150, 299}) {
         Call one;
         one.columns = 1;
         one.x       = {wide_call.x[t]};
         one.experts.assign(wide_call.experts.begin() + t * K, wide_call.experts.begin() + (t + 1) * K);
         one.gamma.assign(wide_call.gamma.begin() + t * K, wide_call.gamma.begin() + (t + 1) * K);
-        const Result alone = run(b, db, one, workspace, moe::kMaxColumns, true);
+        const Result alone = run(b, db, one, workspace, kCapacity, true);
         for (int i = 0; i < K * H; ++i) { alone_differ += alone.out[i] != wide.out[std::size_t(t) * K * H + i] ? 1 : 0; }
     }
     std::printf("NVFP4 A16: %d of %d outputs differ from the exact arithmetic; %d outputs of 4 columns alone differ "
-                "from the 128-column call\n",
+                "from the 300-column call\n",
                 differ, checked, alone_differ);
     check(differ == 0, "A16 outputs differ from the exact arithmetic");
     check(alone_differ == 0, "an A16 column alone differs from the column in a wider call");
@@ -674,6 +688,90 @@ void bank_case(bool a8) {
         check(wide_differ == 0, "a column's outputs in a 300-column call differ from the column alone");
         cuda_check(cudaFree(wide_ws), "cudaFree");
     }
+    for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den), workspace}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
+}
+
+// ---------------------------------------------------------------------------- A16, MXFP8 (W8A16)
+
+// Criteria (fixed before the first run): h within 2^-6 of max|h| of FP64 h from FP64 gate/up sums over the BF16 x; each
+// output within half a BF16 ulp of FP64 over the kernel's own BF16 h plus (K/16 + K/32 + 5) 2^-23 sum|w h| (the FP32
+// chain: a block's two MMAs from zero, its scaled fma); columns alone give the bits they get in a 300-column call.
+void mx_a16_case() {
+    const HostBank b = make_bank(true, 81U);
+    DeviceBank db{upload(b.records), upload(b.amax), upload(std::vector<float>{b.den[0], b.den[1]})};
+    constexpr int kCapacity = 300;
+    const std::size_t bytes = moe::workspace_bytes(E, I, kCapacity, moe::ExpertActivation::A16);
+    void* workspace = nullptr;
+    cuda_check(cudaMalloc(&workspace, bytes), "cudaMalloc");
+    cuda_check(cudaMemset(workspace, 0, bytes), "cudaMemset");
+    std::vector<Matrix> cache_gu(E), cache_dn(E);
+    std::vector<bool> decoded(E, false);
+    const auto weight = [](const Matrix& m, int r, int k) {
+        return e4m3_signed(m.code[std::size_t(r) * m.k + k]) * ue8m0(m.scale[std::size_t(r) * (m.k / 32) + k / 32]);
+    };
+    double worst_h = 0, worst_y = 0;
+    Result wide;
+    Call wide_call;
+    for (const int columns : {1, 32, kCapacity}) {
+        const Call call  = make_call(columns, 950U + static_cast<std::uint32_t>(columns), 1.0F);
+        const Result got = run(b, db, call, workspace, kCapacity, true);
+        const int step   = columns >= 128 ? 16 : 1;
+        for (int entry = 0; entry < columns * K; entry += step) {
+            const int t = entry / K, e = call.experts[entry];
+            if (!decoded[e]) {
+                cache_gu[e] = decode(b, e, false);
+                cache_dn[e] = decode(b, e, true);
+                decoded[e]  = true;
+            }
+            std::vector<double> h64(I);
+            double h_max = 0;
+            for (int i = 0; i < I; ++i) {
+                double gs = 0, us = 0;
+                for (int k = 0; k < H; ++k) {
+                    gs += weight(cache_gu[e], 2 * i, k) * call.x[t][k];
+                    us += weight(cache_gu[e], 2 * i + 1, k) * call.x[t][k];
+                }
+                h64[i] = swiglu64(gs, us, call.gamma[entry]);
+                h_max  = std::max(h_max, std::fabs(h64[i]));
+            }
+            const std::uint16_t* hk = got.h.data() + std::size_t(entry) * I;
+            for (int i = 0; i < I; ++i) { worst_h = std::max(worst_h, std::fabs(canon::bf16_to_f32(hk[i]) - h64[i]) / h_max); }
+            for (int r = 0; r < H; ++r) {
+                double y = 0, mag = 0;
+                for (int k = 0; k < I; ++k) {
+                    const double p = weight(cache_dn[e], r, k) * canon::bf16_to_f32(hk[k]);
+                    y += p;
+                    mag += std::fabs(p);
+                }
+                const double half_ulp = y == 0.0 ? 0.0 : std::ldexp(1.0, std::ilogb(y) - 8);
+                const double bound    = half_ulp + (I / 16 + I / 32 + 5) * std::ldexp(mag, -23);
+                const double out      = canon::bf16_to_f32(got.out[std::size_t(entry) * H + r]);
+                worst_y = std::max(worst_y, bound == 0.0 ? (out == 0.0 ? 0.0 : 1e9) : std::fabs(out - y) / bound);
+            }
+        }
+        if (columns == kCapacity) {
+            wide      = got;
+            wide_call = call;
+        }
+    }
+    int alone_differ = 0;
+    for (const int t : {0, 9, 150, 299}) {
+        Call one;
+        one.columns = 1;
+        one.x       = {wide_call.x[t]};
+        one.experts.assign(wide_call.experts.begin() + t * K, wide_call.experts.begin() + (t + 1) * K);
+        one.gamma.assign(wide_call.gamma.begin() + t * K, wide_call.gamma.begin() + (t + 1) * K);
+        const Result alone = run(b, db, one, workspace, kCapacity, true);
+        for (int i = 0; i < K * H; ++i) { alone_differ += alone.out[i] != wide.out[std::size_t(t) * K * H + i] ? 1 : 0; }
+    }
+    std::printf("MXFP8 A16: h vs FP64 worst %.3e (criterion 2^-6 = %.3e); outputs vs FP64 over the kernel's h worst %.3f of "
+                "the bound (criterion 1); %d outputs of 4 columns alone differ from the 300-column call\n",
+                worst_h, std::ldexp(1.0, -6), worst_y, alone_differ);
+    check(worst_h <= std::ldexp(1.0, -6), "MXFP8 A16: h is further from FP64 than its criterion");
+    check(worst_y <= 1.0, "MXFP8 A16: an output is outside its bound");
+    check(alone_differ == 0, "MXFP8 A16: a column alone differs from the column in a wider call");
     for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den), workspace}) {
         cuda_check(cudaFree(p), "cudaFree");
     }
@@ -995,9 +1093,10 @@ void single_case(bool a8, bool a16 = false) {
     std::uint16_t* d_w = upload(w);
     float* d_bias      = upload(bias);
     void* workspace    = nullptr;
-    cuda_check(cudaMalloc(&workspace, moe::workspace_bytes(E, I)), "cudaMalloc");
-    cuda_check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I)), "cudaMemset");
-    const moe::Workspace ws = moe::carve_workspace(workspace, E, I);
+    const std::size_t ws_bytes = moe::workspace_bytes(E, I, moe::kMaxColumns, activation);
+    cuda_check(cudaMalloc(&workspace, ws_bytes), "cudaMalloc");
+    cuda_check(cudaMemset(workspace, 0, ws_bytes), "cudaMemset");
+    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, moe::kMaxColumns, activation);
     std::uint16_t *d_ref = nullptr, *d_one = nullptr;
     cuda_check(cudaMalloc(&d_ref, std::size_t(K) * H * 2), "cudaMalloc");
     cuda_check(cudaMalloc(&d_one, std::size_t(K) * H * 2), "cudaMalloc");
@@ -1086,6 +1185,7 @@ INFERNIX_OP_TEST(w4a4_sparse_moe) {
     bank_case(false);
     bank_case(true);
     a16_case();
+    mx_a16_case();
     prompt_case(false);
     prompt_case(true);
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
