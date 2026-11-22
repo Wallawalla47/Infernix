@@ -163,6 +163,66 @@ and its gate as in Qwen3.5; out = bf16(experts + shared).
 
 **Head.** x = the final mixer's output (BF16, H); logits fp32(x W_head) as for Qwen3.5.
 
+## 2b. Inkling 2 operations (`Inkling2LoopForCausalLM`; draft, 2026-11-22)
+
+The authority is Transformers PR #51050's `modeling_inkling2_loop.py` (copied to `.local/inkling2/ref/tfloop`), read
+with §2a's rules (a Python scalar meets a tensor as binary32; an operation on BF16 tensors returns the BF16 rounding of
+its exact value; matmuls, `F.conv1d`, `mean`, `vector_norm` and `F.softmax` are each one exact operation rounded once),
+except for the routed experts, whose authority is the checkpoint's declared quantized arithmetic ([Inkling design
+§2.4, §16.1](inkling2_mini-design.md#24-numerics-the-checkpoint-declares)) rather than the code's dequantized BF16
+path. H = 2304; 48 layer visits (prelude 0-5, the core 6-17 three times, coda 18-23). Not built yet: this section is
+the target the kernels and the shadow evaluation implement. Points marked **(decision)** wait for the owner.
+
+**Weights.** Every tensor is BF16 but the attention-residual and message queries and the router bias (FP32);
+`_keep_in_fp32_modules_strict` upcasts the router weight, the static and post-sublayer conv taps and the message gates'
+F and G exactly. The experts: NVFP4 `c s (amax / den)` (layers 0-19) and MXFP8 `e4m3 2^(e-127)` (20-23), exactly.
+
+**Norms.** Unweighted rms of x (upcast exactly): `m = fp32(mean(fp32(x^2)))`, `r = fp32(rsqrt(fp32(m + eps)))`,
+`y = fp32(x r)` (x · rsqrt, not x / sqrt; the square exact for BF16 inputs, rounded for FP32 ones). RMSNorm (weight w,
+no 1 + w): `out = bf16(fp32(w y))`. Embedding: `e = RMSNorm(E[t])`.
+
+**Mix** (block attention residuals): sources `[blocks (BF16); partial]` upcast (the partial BF16 for attention-input
+mixes and the final mix, FP32 for MLP-input mixes); `n_j = rms(s_j)`; `l_j = fp32(w · n_j)`, then
+`l_j = fp32(l_j fp32(2304^-0.5))`; `p = fp32(softmax(l))` over at most 5 sources; `out = fp32(Σ p_j n_j)`, FP32 into
+the gate or the norm. Full layers' attention input has three queries (x_q, x_k, x_v).
+
+**Message gate** (core passes 2-3): messages `m = mix_u([h12^(p-1), h18^(p-1)])` (four FP32 queries: q, k, v, mlp);
+`z = bf16([rms(x); rms(m)])`, `z = bf16(z W_down)` (4608 to 64), `f = fp32(tanh(fp32(z F)))`, `g = fp32(tanh(fp32(z G)))`,
+`out = fp32(fp32(fp32(1 - f) x) + fp32(g m))`, then the layer's RMSNorm.
+
+**Attention** (x_q, x_k, x_v the normed BF16 rows):
+- `q = bf16(x_q W_q)` [24 x 128], `k = bf16(x_k W_k)`, `v = bf16(x_v W_v)` [8 x 128], `r = bf16(x_q W_r)` [24 x 16],
+  `gate = bf16(x_q W_gate)`, `sink = bf16(x_q W_sink)`.
+- Scaled L2 clip (q with s_q, r with s_r): `y = fp32(q s)` (exact), `ν = fp32(norm2(y))` per head,
+  `c = min(fp32(fp32(1 / fp32(ν + 1e-6)) t), 1)` (`t / tensor` is the reciprocal times t), `out = bf16(fp32(y c))`;
+  t = 22.6274166 for q, 8 for r. Full layers then `out = bf16(fp32(out τ))`,
+  `τ = fp32(1 + fp32(0.1 fp32(ln(max(fp32((pos + 1) / 8192), 1)))))`.
+- Static conv (sliding K and V; every post-sublayer conv; taps w[0..3], w[3] the current token):
+  `c_t = fp32(Σ_k w[k] x_{t-3+k})` (zeros before the sequence), `out = bf16(fp32(fp32(c_t + x_t) / fp32(√5)))`. Dynamic conv
+  (full layers' K and V): `tap_t = bf16(x_t W_tap)` (32), `w_{c,d} = fp32(static[d,c] + tap_t[(c / 128) 4 + d])`,
+  `c_t = fp32(Σ_d fp32(x_{t-d,c} w_{c,d}))`, `out = bf16(fp32(fp32(c_t + x_t) / 3))`.
+- `k = clip_22.6(conv_k)`, `v = rms(conv_v)` per head (BF16).
+- Relative bias `T_h(i, d) = bf16(Σ_c r_{h,c} P[c, d])` for 0 <= d < 1024, else +0.
+- **(decision)** Scores, as the code's eager path computes them: `a = bf16(q_h · k_j)`, `a = bf16(a fp32(128^-0.5))`,
+  `a = bf16(a + T)`, `a = bf16(a + mask)` (finfo(bf16).min off the window: sliding i - 1024 < j <= i, full j <= i);
+  `p = fp32(softmax([a; sink_h]))` over the visible keys and the sink; the sink's column dropped; `p = bf16(p)`;
+  `o = bf16(Σ_j p_j v_j)`. (The reproducible route's FP32 scores, NUMERICS.md, are its own pin.)
+- `σ = fp32(sigmoid(gate))`, `a' = bf16(fp32(o σ))`, `y = bf16(a' W_o)`, then the post-attention conv.
+
+**Residuals.** At a block boundary (layer index a multiple of 6) ρ = c, else `ρ = fp32(h + c)` (FP32, not rounded);
+the MLP input mix over `[blocks; ρ]`, the gate, RMSNorm, the MoE, the post-MLP conv d; `h' = bf16(fp32(ρ + d))`.
+
+**MoE.** `l = fp32(x W_router)`, `s = fp32(sigmoid(l))`, the top 8 of `fp32(s + bias)` (ties: the lower expert),
+`γ = 8 fp32(s / fp32(fp32(Σ_8 s) + 1e-20))`. Each expert: x quantized four-over-six (layers 0-19) or MXFP8 (20-23)
+as design §2.4 states, `[g | u]` the exact sums of the quantized x against the exact weights, rounded once;
+`h = bf16(fp32(4 tanh(g / 4) σ(g)) fp32(25 tanh(u / 25)))`; h quantized the same way; `y_e` the exact down
+projection. **(decision, D4)** where γ applies (the CUDA engines: on h before its quantizer; Transformers: on y_e),
+the rounding of the gate/up sums (BF16 here), and whether amax / den is exact (here) or fp32(amax / den)
+(Transformers); the block's output is the exact sum of the experts' y_e γ_e rounded once to BF16 (the order then moot).
+
+**Head.** `x = RMSNorm(mix_out([e, h6, h12^3, h18; h]))`; `ℓ = fp32(x W_head)` (each an exact sum rounded once to
+binary32, as for the Qwen families: owner 2026-10-21) over the 200,058 real rows; `L = fp32(fp32(tanh(fp32(ℓ / 30))) 30)`.
+
 ## 3. Kernels
 
 **Linear** (`lossless_linear`, `include/infernix/ops/lossless_linear.h`): each 64-element block of an

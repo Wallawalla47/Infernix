@@ -973,6 +973,18 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   multiples of 16, so the head kernel handles the tail rather than padding with zero rows, which would score 0 and need
   a mask), softcap 30 in the epilogue, FP32 logits; the checkpoint's padded rows (non-zero, unreachable) are never
   stored; one read for all T columns; evict-first loads (read once per step).
+- **`--a8-activations` (planned, 2026-11-22; not built).** The opt-in Basalt-style route: the dense BF16 matrices
+  (K2's fused input projections, W_o, the message gates' W_down, the head) become Q8 at load as under `--q8-weights`
+  (the 8-bit floor: no lower-bit copy), and their inputs are quantized per token in groups of 32 (INT8 codes, an FP32
+  scale `amax / 127` a group, as Basalt's q8_1), fused into the producers (the norms and gates that write them). Decode
+  and verify widths run INT8 x INT8 dot products (IMMA m16n8k32: one MMA k-step is one group, its INT32 sum scaled by
+  both groups' scales into an FP32 accumulator); prompt calls an IMMA GEMM, which on the RTX 5090 runs at four times the
+  BF16-with-FP32-accumulation rate. The experts keep their checkpoint arithmetic (NVFP4 W4A4 and MXFP8 W8A8 already),
+  the router stays BF16 with FP32 logits (expert selection), the attention arithmetic is unchanged. Expected: prompt
+  calls gain where the dense projections dominate (their BF16 MMAs are an estimated 20-30 % of a 4,096-column call);
+  decode gains little over `--q8-weights` (the matrices read the same bytes; Basalt's decode lead measured as overlap
+  and L2 reuse, not kernel work, SLOT B2b). Each route registers only where measured faster (the a8 rule); the output
+  changes (approximate, like `--q8-weights`).
 
 ---
 
