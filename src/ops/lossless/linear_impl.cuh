@@ -536,6 +536,42 @@ struct Mxfp8Format {
     }
 };
 
+// MXFP8 expert records (mxfp8_expert_rg16_v1, Inkling 2's layers 20-23): Mxfp8Format's arithmetic over 528-byte
+// units, one per (16-row group, 32-element K block), row group major: row r = 16 rg + 8 hi + g (g < 8) at unit k
+// offset kk = 16 half + 4 t + i has its code at byte 16 (4 g + t) + 8 half + 4 hi + i (the m16n8k32 A fragment), its
+// UE8M0 scale at byte 512 + r % 16.
+struct Mxfp8Rg16Format : Mxfp8Format {
+    __device__ static const std::uint8_t* unit(const WeightView& w, int row, int block32) {
+        return w.codes + (static_cast<std::size_t>(row / 16) * (w.k / 32) + block32) * 528;
+    }
+    __device__ static int offset(int row, int kk) {
+        const int g = row % 8, hi = (row % 16) / 8, half = kk / 16, t = (kk % 16) / 4, i = kk % 4;
+        return 16 * (4 * g + t) + 8 * half + 4 * hi + i;
+    }
+
+    __device__ static void decode16(const WeightView& w, int row, int b, int q, std::int8_t* dst, int plane, bool) {
+        const std::uint8_t* u = unit(w, row, 2 * b + q / 2);
+        alignas(16) std::uint32_t words[4];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            words[t] = *reinterpret_cast<const std::uint32_t*>(u + offset(row, 16 * (q % 2) + 4 * t));
+        }
+        fp8_digits16(reinterpret_cast<const std::uint8_t*>(words), dst, plane);
+    }
+
+    __device__ static void scale(const WeightView& w, int row, int group, int& m, int& e) {
+        m = 1;
+        e = unit(w, row, group)[512 + row % 16];
+    }
+
+    __device__ static void element(const WeightView& w, int row, int k, int& W, int& wexp) {
+        int m = 1, e = 0;
+        scale(w, row, k / kGroup, m, e);
+        W    = e4m3_integer(unit(w, row, k / 32)[offset(row, k % 32)]);
+        wexp = e - 136;
+    }
+};
+
 // Block FP8 rows of length K (fp8_expert_b128_v1's matrices): W = E4M3 value 2^9, the 128 x 128 tile's
 // BF16 scale m 2^(e - 134) (row-major [rows / 128][K / 128]) per 64-element group, so the weight is
 // W m 2^(e - 143).
@@ -1620,7 +1656,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
     }
 }
 
-enum class Route { None, Q2, Q4, Q5, Q6, Q8, Nvfp4, Nvfp4Mul, Fp8Row, Fp8RowF32, Bf16, Mxfp8, Ggml, Rg16, Fp8B128 };
+enum class Route { None, Q2, Q4, Q5, Q6, Q8, Nvfp4, Nvfp4Mul, Fp8Row, Fp8RowF32, Bf16, Mxfp8, Ggml, Rg16, Fp8B128, Mxfp8Rg16 };
 
 // The GGUF formats' launches (lossless_linear_ggml_k.cu: the K-quants and IQ4; lossless_linear_ggml_i.cu:
 // IQ2/IQ3 and Q2_0).

@@ -167,11 +167,14 @@ and its gate as in Qwen3.5; out = bf16(experts + shared).
 
 The authority is Transformers PR #51050's `modeling_inkling2_loop.py` (copied to `.local/inkling2/ref/tfloop`), read
 with §2a's rules (a Python scalar meets a tensor as binary32; an operation on BF16 tensors returns the BF16 rounding of
-its exact value; matmuls, `F.conv1d`, `mean`, `vector_norm` and `F.softmax` are each one exact operation rounded once),
+its exact value; matmuls, `F.conv1d`, `mean`, `vector_norm` and `F.softmax` are each one exact operation rounded once;
+the code's scalar expressions dispatch, traced on torch 2.14: `t / x` as `reciprocal` then `mul`, `x / math.sqrt(k)` as
+`div`, `1 - f` as `rsub`, a BF16 tensor times a Python float as one `mul`),
 except for the routed experts, whose authority is the checkpoint's declared quantized arithmetic ([Inkling design
 §2.4, §16.1](inkling2_mini-design.md#24-numerics-the-checkpoint-declares)) rather than the code's dequantized BF16
-path. H = 2304; 48 layer visits (prelude 0-5, the core 6-17 three times, coda 18-23). Not built yet: this section is
-the target the kernels and the shadow evaluation implement. Points marked **(decision)** wait for the owner.
+path. H = 2304; 48 layer visits (prelude 0-5, the core 6-17 three times, coda 18-23). The scored-window route
+implements this section (§3a); the shadow evaluation does not cover Inkling 2 yet. Points marked **(decision)** wait
+for the owner and run as recommended meanwhile.
 
 **Weights.** Every tensor is BF16 but the attention-residual and message queries and the router bias (FP32);
 `_keep_in_fp32_modules_strict` upcasts the router weight, the static and post-sublayer conv taps and the message gates'
@@ -203,7 +206,8 @@ the gate or the norm. Full layers' attention input has three queries (x_q, x_k, 
   `c_t = fp32(Σ_d fp32(x_{t-d,c} w_{c,d}))`, `out = bf16(fp32(fp32(c_t + x_t) / 3))`.
 - `k = clip_22.6(conv_k)`, `v = rms(conv_v)` per head (BF16).
 - Relative bias `T_h(i, d) = bf16(Σ_c r_{h,c} P[c, d])` for 0 <= d < 1024, else +0.
-- **(decision)** Scores, as the code's eager path computes them: `a = bf16(q_h · k_j)`, `a = bf16(a fp32(128^-0.5))`,
+- **(decision; implemented as recommended: the code has no other attention, `_supports_sdpa` and
+  `_supports_flash_attn` are False)** Scores, as the code's eager path computes them: `a = bf16(q_h · k_j)`, `a = bf16(a fp32(128^-0.5))`,
   `a = bf16(a + T)`, `a = bf16(a + mask)` (finfo(bf16).min off the window: sliding i - 1024 < j <= i, full j <= i);
   `p = fp32(softmax([a; sink_h]))` over the visible keys and the sink; the sink's column dropped; `p = bf16(p)`;
   `o = bf16(Σ_j p_j v_j)`. (The reproducible route's FP32 scores, NUMERICS.md, are its own pin.)
@@ -213,12 +217,15 @@ the gate or the norm. Full layers' attention input has three queries (x_q, x_k, 
 the MLP input mix over `[blocks; ρ]`, the gate, RMSNorm, the MoE, the post-MLP conv d; `h' = bf16(fp32(ρ + d))`.
 
 **MoE.** `l = fp32(x W_router)`, `s = fp32(sigmoid(l))`, the top 8 of `fp32(s + bias)` (ties: the lower expert),
-`γ = 8 fp32(s / fp32(fp32(Σ_8 s) + 1e-20))`. Each expert: x quantized four-over-six (layers 0-19) or MXFP8 (20-23)
-as design §2.4 states, `[g | u]` the exact sums of the quantized x against the exact weights, rounded once;
-`h = bf16(fp32(4 tanh(g / 4) σ(g)) fp32(25 tanh(u / 25)))`; h quantized the same way; `y_e` the exact down
-projection. **(decision, D4)** where γ applies (the CUDA engines: on h before its quantizer; Transformers: on y_e),
-the rounding of the gate/up sums (BF16 here), and whether amax / den is exact (here) or fp32(amax / den)
-(Transformers); the block's output is the exact sum of the experts' y_e γ_e rounded once to BF16 (the order then moot).
+`γ = fp32(fp32(s / fp32(fp32(Σ_8 s) + 1e-20)) 8)`, the slots in descending key order. **(decision, D4; implemented
+as recommended: the trained arithmetic of the reference kernels, each operation correctly rounded)** Each expert: x
+quantized by its layer's rule (four-over-six on layers 0-19, MXFP8 on 20-23, `canonical_math.h`'s binary32 steps),
+whose value is `c s outer` (`outer = fp32(amax fp32(1/1536))`) or `e4m3 2^(e-127)`;
+`[g | u] = bf16(Σ (c s)_w (c s)_x · outer · amax_e / den)` with every factor exact (MXFP8: the exact sum);
+`sc(v, k) = fp32(fp32(tanh(fp32(v / k))) k)`, `h = bf16(fp32(fp32(fp32(sc(g, 4) fp32(σ(g))) sc(u, 25)) γ))` (γ
+inside the activation, before h's quantizer); h quantized the same way; `y_e = bf16(the exact down sum, its factors
+exact)`; the block's output `bf16(v)` with v folded in binary32 from +0 over the 8 slots in order. Transformers'
+dequantized order (γ on y_e, `fp32(amax / den)`, FP32 index_add) is the alternative.
 
 **Head.** `x = RMSNorm(mix_out([e, h6, h12^3, h18; h]))`; `ℓ = fp32(x W_head)` (each an exact sum rounded once to
 binary32, as for the Qwen families: owner 2026-10-21) over the 200,058 real rows; `L = fp32(fp32(tanh(fp32(ℓ / 30))) 30)`.
@@ -341,6 +348,19 @@ selection; the PLE history and the GDN state through the lanes' slots (`lossless
 the Qwen3.5 slot forms). The sampler reads an FP32 copy of the logits. The certification's references are this route
 or the design reference (3b), one scoring pass per window (`infernix-certify reference`; model quality
 §6).
+
+On Inkling 2 (`Inkling2LoopForCausalLM`; `src/models/inkling2/execution/lossless.cpp`, ProgramOptions::lossless)
+causal scoring takes `--lossless` for text windows with `--kv-dtype bf16` and no fast path: each window runs once
+through LosslessForward, §2b's operations over the window's own columns (`include/infernix/ops/lossless_inkling2.h`),
+from zero conv state, writing nothing to the KV pool or the lanes' images. Attention runs a query head at a time over
+256-column query chunks: the scores are lossless_linear's exact products against the KV head's keys as BF16 weight
+rows, `lossless_inkling2_attention_probs` applies the eager form's roundings, bias, mask and sink in place (each
+probability its quotient's correct rounding, decided in binary64 or else double-double), and the values are their
+exact product with the transposed value plane. The routed experts group each layer's entries by expert into 64-column
+tiles of their records (`lossless_linear_tiles`; NVFP4 with `den` as the activation divisor and each column's `outer`
+as its scale, MXFP8 through the `mxfp8_expert_rg16_v1` bank route). `--reference` with `--kv-dtype bf16` rounds each
+visit's V to FP16, as the bf16 profile stores it (`lossless_round_fp16`); the design reference of the coded KV formats
+and lossless generation are not built for Inkling 2 yet.
 
 **Transcendental functions** (`src/ops/lossless/cr_math.cuh`): every one takes a binary32 argument, so
 its correct rounding is decidable: the double evaluation is accepted when both ends of its error

@@ -231,6 +231,75 @@ __device__ std::uint32_t round_magnitude(const std::uint32_t (&mag)[Words], int 
     return sign | (static_cast<std::uint32_t>(biased) << (prec - 1)) | static_cast<std::uint32_t>(q - (1ULL << (prec - 1)));
 }
 
+// sqrt(mag 2^unit) correctly rounded to binary32, for a nonnegative magnitude whose value lies within binary64's
+// normal range (a sum of binary32 products: 2^-298 to 2^276). The top 64 bits give a binary64 within 2^-53 of the
+// value, its sqrt within 2^-52 of the root; when that interval holds a rounding midpoint m (25 significant bits) the
+// root is above m exactly when the value is above m^2, compared exactly.
+template <int Words>
+__device__ float sqrt_magnitude(const std::uint32_t (&mag)[Words], int unit) {
+    int top = -1;
+#pragma unroll
+    for (int i = Words - 1; i >= 0; --i) {
+        if (top < 0 && mag[i] != 0) { top = 32 * i + 31 - __clz(mag[i]); }
+    }
+    if (top < 0) { return 0.0F; }
+    // hi: bits [low, low + 64) of mag (low = top - 63, at least 0).
+    const int low          = top > 63 ? top - 63 : 0;
+    unsigned long long hi  = 0;
+    const int word = low >> 5, bit = low & 31;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int w = word + j;
+        if (w >= Words) { continue; }
+        const int at = 32 * j - bit; // where mag[w]'s bit 0 lands in hi
+        if (at >= 64) { continue; }
+        hi |= at >= 0 ? static_cast<unsigned long long>(mag[w]) << at : static_cast<unsigned long long>(mag[w]) >> -at;
+    }
+    const double v = ldexp(static_cast<double>(hi), unit + low);
+    const double y = sqrt(v);
+    const float a = __double2float_rn(y - y * 0x1p-51), b = __double2float_rn(y + y * 0x1p-51);
+    const float out = __double2float_rn(y);
+    if (a == b && a == out) { return out; }
+    // The candidates out and its neighbour on y's side; m their midpoint, M m's 25-bit integer: m = M 2^em.
+    const float other = y > static_cast<double>(out) ? nextafterf(out, INFINITY) : nextafterf(out, -INFINITY);
+    const double m    = (static_cast<double>(out) + static_cast<double>(other)) / 2;
+    int em            = 0;
+    const double frac = frexp(m, &em); // m = frac 2^em, frac in [1/2, 1)
+    const unsigned long long M = static_cast<unsigned long long>(ldexp(frac, 25)); // exact: 25 bits
+    em -= 25;
+    const unsigned long long M2 = M * M; // m^2 = M2 2^(2 em), M2 < 2^50
+    // Compare mag 2^unit with M2 2^(2 em).
+    int cmp = 0;
+    const int shift = 2 * em - unit;
+    if (shift >= 0) {
+        // M2 << shift on mag's grid, word by word from the top (Words + 3 words cover M2's 50 bits and the shift).
+        std::uint32_t b2[Words + 3] = {};
+        const int sw = shift >> 5, sb = shift & 31;
+        for (int j = 0; j < 2; ++j) {
+            const std::uint32_t part = static_cast<std::uint32_t>(M2 >> (32 * j));
+            if (sw + j < Words + 3) { b2[sw + j] |= part << sb; }
+            if (sb != 0 && sw + j + 1 < Words + 3) { b2[sw + j + 1] |= part >> (32 - sb); }
+        }
+        for (int i = Words + 2; i >= 0 && cmp == 0; --i) {
+            const std::uint32_t av = i < Words ? mag[i] : 0U;
+            if (av != b2[i]) { cmp = av > b2[i] ? 1 : -1; }
+        }
+    } else {
+        // mag << s against M2 (s = -shift > 0): beyond 64 bits it is above M2 (< 2^50), else compared in 64 bits.
+        const int s = -shift;
+        if (top + s >= 64) {
+            cmp = 1;
+        } else {
+            const unsigned long long a2 =
+                ((static_cast<unsigned long long>(Words > 1 ? mag[1] : 0U) << 32) | mag[0]) << s;
+            cmp = a2 > M2 ? 1 : (a2 < M2 ? -1 : 0);
+        }
+    }
+    const bool other_above = static_cast<double>(other) > static_cast<double>(out);
+    if (cmp == 0) { return (__float_as_uint(out) & 1U) == 0 ? out : other; }
+    return (cmp > 0) == other_above ? other : out;
+}
+
 // Words of F32Sum's accumulator: every binary32 (2^-149 to 2^128) and the carries of a few thousand terms.
 constexpr int kF32SumWords = 10;
 
@@ -273,6 +342,66 @@ struct F32Sum {
         const bool negative = acc.finish(mag);
         return __uint_as_float(round_magnitude(mag, -150, negative, false));
     }
+};
+
+// Words of ProductSum's accumulator: every product of two binary32 values (2^-298 to 2^256), at unit 2^-300.
+constexpr int kProductSumWords = 20;
+constexpr int kProductSumUnit  = -300;
+
+// An exact sum of products of binary32 pairs (each product exact: at most 48 significant bits), rounded once; IEEE
+// results for NaN and infinite products (inf times 0 is NaN).
+struct ProductSum {
+    Wide<kProductSumWords> acc;
+    bool nan = false, pos_inf = false, neg_inf = false;
+
+    __device__ __forceinline__ void clear() {
+        acc.clear();
+        nan = pos_inf = neg_inf = false;
+    }
+
+    __device__ __forceinline__ void add(float a, float b) {
+        const std::uint32_t ab = __float_as_uint(a), bb = __float_as_uint(b);
+        const int fa = static_cast<int>((ab >> 23) & 0xFF), fb = static_cast<int>((bb >> 23) & 0xFF);
+        const bool negative = ((ab ^ bb) >> 31) != 0;
+        if (fa == 255 || fb == 255) {
+            const bool a_nan = fa == 255 && (ab & 0x7FFFFF) != 0, b_nan = fb == 255 && (bb & 0x7FFFFF) != 0;
+            if (a_nan || b_nan || (ab & 0x7FFFFFFF) == 0 || (bb & 0x7FFFFFFF) == 0) {
+                nan = true;
+            } else if (negative) {
+                neg_inf = true;
+            } else {
+                pos_inf = true;
+            }
+            return;
+        }
+        if ((ab & 0x7FFFFFFF) == 0 || (bb & 0x7FFFFFFF) == 0) { return; }
+        const unsigned long long ma = fa == 0 ? (ab & 0x7FFFFF) : (0x800000 | (ab & 0x7FFFFF));
+        const unsigned long long mb = fb == 0 ? (bb & 0x7FFFFF) : (0x800000 | (bb & 0x7FFFFF));
+        const unsigned long long m  = ma * mb; // < 2^48
+        const int position          = (fa == 0 ? 1 : fa) + (fb == 0 ? 1 : fb); // the product is m 2^(position - 300)
+        const long long lo = static_cast<long long>(m & 0xFFFFFF), hi = static_cast<long long>(m >> 24);
+        acc.add(negative ? -lo : lo, position);
+        acc.add(negative ? -hi : hi, position + 24);
+    }
+
+    // Combines the warp's sums into every lane's (flags too).
+    __device__ __forceinline__ void warp_sum() {
+        acc.warp_sum();
+        nan     = __any_sync(0xFFFFFFFFU, nan);
+        pos_inf = __any_sync(0xFFFFFFFFU, pos_inf);
+        neg_inf = __any_sync(0xFFFFFFFFU, neg_inf);
+    }
+
+    // The sum's binary32 (bf16: BF16 bits in the low half) rounding.
+    __device__ __forceinline__ std::uint32_t rounded(bool bf16) const {
+        if (nan || (pos_inf && neg_inf)) { return bf16 ? 0x7FC0U : 0x7FC00000U; }
+        if (pos_inf) { return bf16 ? 0x7F80U : 0x7F800000U; }
+        if (neg_inf) { return bf16 ? 0xFF80U : 0xFF800000U; }
+        std::uint32_t mag[kProductSumWords];
+        const bool negative = acc.finish(mag);
+        return round_magnitude(mag, kProductSumUnit, negative, bf16);
+    }
+    __device__ __forceinline__ float result() const { return __uint_as_float(rounded(false)); }
 };
 
 } // namespace infernix::ops::lossless

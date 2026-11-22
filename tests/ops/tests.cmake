@@ -187,6 +187,14 @@ infernix_add_family_op_test(infernix_lossless_ops_test FAMILY lossless NO_TEST
 add_test(NAME infernix_lossless_ops_test
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_ops_oracle.py
           $<TARGET_FILE:infernix_ops_lossless_test> lossless_ops ${CMAKE_CURRENT_BINARY_DIR}/oracle-cache)
+# Inkling 2's operations (norms, mixes, message gates, clips, convolutions, eager attention probabilities, the router,
+# the experts' quantizers, SwiGLU and combine, the softcap) against an exact oracle following lossless-route.md §2b.
+infernix_add_family_op_test(infernix_lossless_inkling2_test FAMILY lossless NO_TEST
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_inkling2.cu"
+  LIBRARIES infernix_ops)
+add_test(NAME infernix_lossless_inkling2_test
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_inkling2_oracle.py
+          $<TARGET_FILE:infernix_ops_lossless_test> lossless_inkling2 ${CMAKE_CURRENT_BINARY_DIR}/oracle-cache)
 # The design reference's KV storage: the production append's planes and window rows, byte for byte.
 infernix_add_family_op_test(infernix_lossless_kv_encode_test FAMILY lossless
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_kv_encode.cu"

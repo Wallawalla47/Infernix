@@ -9,6 +9,7 @@
 #include "infernix/ops/sampling.h"
 #include "models/inkling2/execution/dspark.h"
 #include "models/inkling2/execution/forward.h"
+#include "models/inkling2/execution/lossless.h"
 #include "models/inkling2/execution/vision.h"
 #include "models/inkling2/program/prefix_cache.h"
 #include "runtime/prefix_cache/prefix_holds.h"
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -191,6 +193,9 @@ public:
                 align_256(sizeof(ops::SamplingConfig) * kMaximumConcurrency) + 3 * align_256(4 * kMaximumConcurrency)) {
         const StateLayout& layout = forward_.layout();
         const std::uint32_t pages = pages_per_lane(o_.max_context);
+        if (o_.lossless) {
+            lossless_ = std::make_unique<LosslessForward>(p_, static_cast<std::int32_t>(o_.max_context), o_.reference);
+        }
         images_ = DeviceBuffer(static_cast<std::size_t>(layout.lane_words) * 2 * lanes_.size());
         // The full visits' page pool and the lanes' block-table rows (kv_layout), zeroed: a key beyond a lane's frontier
         // is masked, never NaN, and zero scales decode zero codes to zero.
@@ -285,6 +290,10 @@ public:
             config.index.cost.token_seconds          = 1.0 / 21600.0;
             config.index.cost.attention_pair_seconds = 0.0;
             config.index.cost.h2d_bytes_per_second   = 22.0e9;
+            config.ssd_bytes                         = o_.prefix_ssd_bytes;
+            config.ssd_directory                     = o_.prefix_ssd_directory;
+            config.ssd_write_bytes_per_hour          = o_.prefix_ssd_write_bytes_per_hour;
+            config.ssd_kept_file                     = o_.prefix_ssd_kept_file;
             prefix::LaneImages images;
             const std::size_t lane_bytes = static_cast<std::size_t>(forward_.layout().lane_words) * 2;
             images.parts.push_back({static_cast<std::byte*>(images_.p), lane_bytes, lane_bytes});
@@ -364,6 +373,7 @@ public:
         if (resume != nullptr) { throw std::logic_error("Inkling 2: no request is paused"); }
         SourceCandidate root;
         const BasePlanImpl& b = *base.impl_;
+        prefix_ssd_wait_ = false;
         if (!prefix_ || !b.reuse || prefix_failed_) { return {root}; }
         namespace pc = runtime::prefix_cache;
         const auto n = static_cast<std::uint32_t>(b.tokens.size());
@@ -376,13 +386,23 @@ public:
         root.cached_block_tokens = static_cast<std::uint32_t>(match.path.size()) * pc::kBlockTokens;
         const auto spans = exclusions(b);
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
-            return excluded(spans, c.frontier) || c.filling_blocks != 0 || c.ssd_only_blocks != 0 || c.image_on_ssd_only ||
-                   c.tail_on_ssd_only;
+            return excluded(spans, c.frontier) || c.filling_blocks != 0;
         });
         if (match.candidates.empty()) { return {root}; }
         const pc::AdmissionChoice choice = prefix_->index().choose(match, n);
         if (!choice.candidate) { return {root}; }
         const pc::MatchCandidate& c = match.candidates[*choice.candidate];
+        if (c.ssd_bytes != 0) {
+            // Part of it is only on the SSD tier (hybrid-prefix-cache-spec §5.7): the quote starts the read and the
+            // request waits for it (no sources: hybrid_source_pending), or starts at the root when the Host tier cannot
+            // take it. The cost model already weighed the read.
+            const pc::SsdTier::Promotion promotion = prefix_->promote(c.snapshot);
+            if (promotion == pc::SsdTier::Promotion::Pending) {
+                prefix_ssd_wait_ = true;
+                return {};
+            }
+            if (promotion == pc::SsdTier::Promotion::Unavailable) { return {root}; }
+        }
         auto quote      = std::make_shared<QuoteImpl>();
         quote->snapshot = c.snapshot;
         quote->frontier = c.frontier;
@@ -843,13 +863,58 @@ public:
             check_images(data->images, n);
             images = std::make_shared<const std::vector<PromptImage>>(std::move(data->images));
         }
+        ScoreResult out;
+        std::vector<float> row(static_cast<std::size_t>(vocab_));
+        std::size_t next_logits = 0;
+        // Position `position`'s logits (a device row of vocab_ FP32), predicting token position + 1.
+        const auto consume = [&](std::uint32_t position, const float* device_row) {
+            const std::uint32_t scored = position + 1 - first_target;
+            CUDA_CHECK(cudaMemcpy(row.data(), device_row, row.size() * 4, cudaMemcpyDeviceToHost));
+            double max = -std::numeric_limits<double>::infinity();
+            for (const float v : row) { max = std::max(max, static_cast<double>(v)); }
+            double sum = 0;
+            for (const float v : row) { sum += std::exp(static_cast<double>(v) - max); }
+            const double lse = max + std::log(sum);
+            out.logprobs.push_back(static_cast<float>(row[static_cast<std::size_t>(tokens[position + 1])] - lse));
+            if (options.top_k != 0) {
+                std::vector<std::int32_t> ids(row.size());
+                for (std::size_t i = 0; i < ids.size(); ++i) { ids[i] = static_cast<std::int32_t>(i); }
+                std::partial_sort(ids.begin(), ids.begin() + options.top_k, ids.end(), [&](std::int32_t a, std::int32_t b) {
+                    return row[a] > row[b] || (row[a] == row[b] && a < b);
+                });
+                for (std::uint32_t k = 0; k < options.top_k; ++k) {
+                    out.top_ids.push_back(ids[k]);
+                    out.top_logprobs.push_back(static_cast<float>(row[ids[k]] - lse));
+                }
+            }
+            for (std::uint32_t k = 0; k < options.candidates_per_position; ++k) {
+                const TokenId id = options.candidates[static_cast<std::size_t>(scored) * options.candidates_per_position + k];
+                out.candidate_logprobs.push_back(id >= 0 && id < vocab_ ? static_cast<float>(row[id] - lse)
+                                                                        : -std::numeric_limits<float>::infinity());
+            }
+            if (next_logits < options.logits_positions.size() && options.logits_positions[next_logits] == scored) {
+                out.logits.insert(out.logits.end(), row.begin(), row.end());
+                ++next_logits;
+            }
+        };
+        if (lossless_) {
+            // The lossless route: the window's positions 0 .. n - 2 in one pass, the head a slice of rows at a time.
+            if (images) { throw std::invalid_argument("Inkling 2: the lossless route scores text windows"); }
+            lossless_->run(std::span<const std::int32_t>(tokens.data(), n - 1), device_.stream);
+            for (std::uint32_t c = first_target - 1; c < n - 1; c += LosslessForward::kHeadRows) {
+                const auto count = static_cast<std::int32_t>(std::min<std::uint32_t>(LosslessForward::kHeadRows, n - 1 - c));
+                lossless_->head(static_cast<std::int32_t>(c), count, device_.stream);
+                CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+                for (std::int32_t i = 0; i < count; ++i) {
+                    consume(c + static_cast<std::uint32_t>(i), lossless_->logits() + static_cast<std::size_t>(i) * vocab_);
+                }
+            }
+            return out;
+        }
         CUDA_CHECK(cudaMemsetAsync(images_.p, 0, static_cast<std::size_t>(forward_.layout().lane_words) * 2, device_.stream));
         clear_unpackable(0);
         release_pages(0); // a failed window's pages
         reserve_pages(0, lane_pages()); // lane 0 maps its pages as the window's calls reach them
-        ScoreResult out;
-        std::vector<float> row(static_cast<std::size_t>(vocab_));
-        std::size_t next_logits = 0;
         for (std::uint32_t at = 0; at < n - 1;) {
             const std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, n - 1 - at);
             CallPlan call;
@@ -874,36 +939,7 @@ public:
                                   device_.stream);
                     CUDA_CHECK(cudaStreamSynchronize(device_.stream));
                 }
-                const std::uint32_t position = at + static_cast<std::uint32_t>(c);
-                const std::uint32_t scored   = position + 1 - first_target;
-                CUDA_CHECK(cudaMemcpy(row.data(), forward_.buffers().logits + static_cast<std::size_t>(slice) * vocab_,
-                                      row.size() * 4, cudaMemcpyDeviceToHost));
-                double max = -std::numeric_limits<double>::infinity();
-                for (const float v : row) { max = std::max(max, static_cast<double>(v)); }
-                double sum = 0;
-                for (const float v : row) { sum += std::exp(static_cast<double>(v) - max); }
-                const double lse = max + std::log(sum);
-                out.logprobs.push_back(static_cast<float>(row[static_cast<std::size_t>(tokens[position + 1])] - lse));
-                if (options.top_k != 0) {
-                    std::vector<std::int32_t> ids(row.size());
-                    for (std::size_t i = 0; i < ids.size(); ++i) { ids[i] = static_cast<std::int32_t>(i); }
-                    std::partial_sort(ids.begin(), ids.begin() + options.top_k, ids.end(), [&](std::int32_t a, std::int32_t b) {
-                        return row[a] > row[b] || (row[a] == row[b] && a < b);
-                    });
-                    for (std::uint32_t k = 0; k < options.top_k; ++k) {
-                        out.top_ids.push_back(ids[k]);
-                        out.top_logprobs.push_back(static_cast<float>(row[ids[k]] - lse));
-                    }
-                }
-                for (std::uint32_t k = 0; k < options.candidates_per_position; ++k) {
-                    const TokenId id = options.candidates[static_cast<std::size_t>(scored) * options.candidates_per_position + k];
-                    out.candidate_logprobs.push_back(id >= 0 && id < vocab_ ? static_cast<float>(row[id] - lse)
-                                                                            : -std::numeric_limits<float>::infinity());
-                }
-                if (next_logits < options.logits_positions.size() && options.logits_positions[next_logits] == scored) {
-                    out.logits.insert(out.logits.end(), row.begin(), row.end());
-                    ++next_logits;
-                }
+                consume(at + static_cast<std::uint32_t>(c), forward_.buffers().logits + static_cast<std::size_t>(slice) * vocab_);
             }
             at += chunk;
         }
@@ -1193,6 +1229,12 @@ public:
     }
 
     [[nodiscard]] std::uint64_t prefix_epoch() const noexcept { return prefix_ ? prefix_->index().snapshot_epoch() : 0U; }
+    bool prefix_poll_storage() { return prefix_ && prefix_->poll_ssd(); }
+    [[nodiscard]] bool prefix_ssd_wait() const noexcept { return prefix_ssd_wait_; }
+    [[nodiscard]] bool prefix_storage_due() const noexcept { return prefix_ && prefix_->ssd_due(); }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> prefix_storage_retry_at() const noexcept {
+        return prefix_ ? prefix_->ssd_retry_at() : std::nullopt;
+    }
 
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept {
         HybridPrefixCacheStats out;
@@ -1223,6 +1265,8 @@ public:
         out.host_snapshot_evictions = s.host_snapshot_evictions;
         out.host_dead_reclaims      = s.host_dead_reclaims;
         out.unbacked_node_losses    = s.unbacked_node_losses;
+        out.ssd = runtime::prefix_cache::ssd_tier_stats(prefix_->ssd(), s, prefix_->host_layout().slab_bytes,
+                                                        prefix_->index().config().ssd_slabs);
         return out;
     }
 
@@ -1848,6 +1892,7 @@ private:
     ProgramOptions o_;
     ProgramDevicePlan plan_;
     Forward forward_;
+    std::unique_ptr<LosslessForward> lossless_; // --lossless (causal scoring)
     std::unique_ptr<Drafter> drafter_; // --spec dspark
     std::unique_ptr<VisionTower> vision_; // --vision
     std::shared_ptr<const std::vector<PromptImage>> encoded_set_; // the prompt whose image the tower last encoded
@@ -1886,6 +1931,7 @@ private:
     std::unique_ptr<prefix::PrefixCache> prefix_;
     std::uint64_t capture_ids_ = 0;
     bool prefix_failed_        = false; // clear_failed_prefix
+    bool prefix_ssd_wait_      = false; // a quote is reading its source from the SSD tier (hybrid_source_pending)
     // --prefix-cache-file (attach_prefix_cache_file): the file, its fingerprint, the Host bytes written at the last
     // save, and the shutdown save's result.
     std::filesystem::path prefix_file_;
@@ -2015,6 +2061,10 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
         }
         out.workspace += VisionTower::device_bytes(*config.vision, options.vision_max_cells, options.vision_host);
     }
+    if (options.lossless) {
+        if (!options.causal_scoring) { throw std::invalid_argument("Inkling 2: the lossless route scores windows only"); }
+        out.workspace += LosslessForward::device_bytes(config.text, static_cast<std::int32_t>(options.max_context));
+    }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     return out;
 }
@@ -2039,6 +2089,13 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
 }
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
+bool Program::hybrid_poll_storage() { return impl_->prefix_poll_storage(); }
+void Program::maintain() { (void)impl_->prefix_poll_storage(); }
+bool Program::hybrid_source_pending() const noexcept { return impl_->prefix_ssd_wait(); }
+bool Program::hybrid_storage_due() const noexcept { return impl_->prefix_storage_due(); }
+std::optional<std::chrono::steady_clock::time_point> Program::hybrid_storage_retry_at() const noexcept {
+    return impl_->prefix_storage_retry_at();
+}
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->prefix_epoch(); }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView) { return impl_->poll_context(); }

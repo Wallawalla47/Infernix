@@ -50,11 +50,19 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         throw std::invalid_argument("--host-context-mib is too small for the Inkling 2 prefix cache: one snapshot needs " +
                                     std::to_string(mib) + " MiB");
     }
+    // The SSD tier holds whole Host slabs (hybrid-prefix-cache-spec §5.7).
+    const std::uint64_t ssd_slabs = config.ssd_bytes / host_.slab_bytes;
+    if (config.ssd_bytes != 0 && ssd_slabs < host_.image_slabs + 2U) {
+        throw std::invalid_argument("--ssd-context-gib is too small for the Inkling 2 prefix cache: one snapshot needs " +
+                                    std::to_string(((host_.image_slabs + 2ULL) * host_.slab_bytes + (1ULL << 30U) - 1U) >> 30U) +
+                                    " GiB");
+    }
+    if (ssd_slabs > pc::kNoId / 4U) { throw std::invalid_argument("Inkling 2 prefix cache: the SSD tier is too large"); }
     pc::PrefixIndexConfig index = config.index;
-    index.max_nodes             = config.kv_pages + host_.slabs + 1U;
-    index.max_snapshots         = host_.slabs / host_.image_slabs + 1U;
+    index.max_nodes             = config.kv_pages + host_.slabs + static_cast<std::uint32_t>(ssd_slabs) + 1U;
+    index.max_snapshots         = (host_.slabs + static_cast<std::uint32_t>(ssd_slabs)) / host_.image_slabs + 1U;
     index.host_slabs            = host_.slabs;
-    index.ssd_slabs             = 0;
+    index.ssd_slabs             = static_cast<std::uint32_t>(ssd_slabs);
     index.image_slabs           = host_.image_slabs;
     index.device_snapshot_slots = 0;
     index.block_bytes           = host_.page.page_stride;
@@ -65,10 +73,18 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     try {
         CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
+        if (index.ssd_slabs != 0) {
+            // Its slabs are Host slabs byte for byte (page records and image segments), images packed where that saves
+            // slabs.
+            ssd_ = std::make_unique<pc::SsdTier>(config.ssd_directory, index.ssd_slabs, host_.slab_bytes,
+                                                 [this](std::uint32_t id) { return slab(id); },
+                                                 config.ssd_write_bytes_per_hour, /*codec=*/true, config.ssd_kept_file);
+        }
         blocks_.reserve(index.max_nodes);
         index_.emplace(index, *this);
         store_.limit_index(*index_);
     } catch (...) {
+        ssd_.reset(); // its threads end before the slabs they would read
         index_.reset();
         for (cudaStream_t stream : {transfer_, restore_stream_}) {
             if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
@@ -201,6 +217,7 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     if (tail != capture.tail_page.has_value() || capture.tail.size() >= pc::kBlockTokens) {
         throw std::invalid_argument("Inkling 2 prefix cache: a capture's tail does not match its page");
     }
+    if (ssd_) { make_lossless_room(host_.image_slabs + (tail ? 1U : 0U)); }
     auto reserved = index_->reserve_host_image(tail, capture.claim);
     if (!reserved) {
         ++counters_.taps_skipped;
@@ -354,6 +371,35 @@ void PrefixCache::poll() {
         finish_restore(batch);
         landing_.pop_front();
     }
+    // SSD transfers land on their own threads; the index learns of them here (write-backs start from poll_ssd).
+    if (ssd_) { ssd_->settle(*index_); }
+}
+
+bool PrefixCache::poll_ssd() {
+    service_ssd();
+    return std::exchange(ssd_landed_, false);
+}
+
+void PrefixCache::service_ssd() {
+    if (!ssd_) { return; }
+    // Landed captures and writes first: a just-finished request's snapshots are written back before the next request's
+    // prefill can displace them.
+    poll();
+    ssd_landed_ |= ssd_->poll(*index_);
+}
+
+void PrefixCache::make_lossless_room(std::uint64_t slabs) {
+    // Each pass returns or lands a transfer, and a snapshot is written once, so the loop ends.
+    while (index_->host_lossless_slabs() < slabs) {
+        service_ssd();
+        if (index_->host_lossless_slabs() >= slabs || !ssd_->busy()) { return; }
+        ssd_->drain(*index_);
+    }
+}
+
+pc::SsdTier::Promotion PrefixCache::promote(pc::SnapshotRef snapshot) {
+    if (!ssd_) { return pc::SsdTier::Promotion::Ready; }
+    return ssd_->promote(*index_, snapshot);
 }
 
 void PrefixCache::drain() {
@@ -532,6 +578,7 @@ void PrefixCache::clear() noexcept {
     captures_.clear();
     writes_.clear();
     published_.clear();
+    if (ssd_) { ssd_->abandon(); } // the new index holds no SSD slab: transfers are waited for and forgotten
     store_.abandon();
     pc::PrefixIndexConfig config = index_->config();
     index_.reset();
@@ -569,6 +616,7 @@ pc::PersistBinding PrefixCache::persist_binding() {
     binding.image_slabs = host_.image_slabs;
     binding.host_slabs  = index_->host_slab_limit();
     binding.slab        = [this](std::uint32_t id) { return slab(id); };
+    binding.ssd         = ssd_ && ssd_->kept() ? ssd_.get() : nullptr;
     return binding;
 }
 
@@ -577,6 +625,8 @@ pc::PersistResult PrefixCache::save(const std::filesystem::path& path, std::stri
     if (!captures_.empty() || !writes_.empty() || restore_.open || !landing_.empty()) {
         throw std::logic_error("Inkling 2 prefix cache save requires idle transfers");
     }
+    // A kept SSD tier's copies are named by the file: every transfer lands before (the file then makes them durable).
+    if (ssd_ && ssd_->kept()) { ssd_->drain(*index_); }
     return pc::save_prefix_cache(*index_, persist_binding(), path, fingerprint, abandoned);
 }
 

@@ -600,6 +600,38 @@ GenMatrix gen_rg16(int n, int k, std::mt19937& rng, const std::uint32_t (&alpha)
     return g;
 }
 
+// mxfp8_expert_rg16_v1 [n][k] (n a multiple of 16, k of 32): 528-byte units per (16-row group, 32-element block),
+// row 16 rg + 8 hi + g at block offset 16 half + 4 t + i in byte 16 (4 g + t) + 8 half + 4 hi + i, its UE8M0 scale
+// at byte 512 + r % 16 (W = E4M3 value 2^9, the weight W 2^(e8 - 136)).
+GenMatrix gen_mxfp8_rg16(int n, int k, std::mt19937& rng) {
+    GenMatrix g;
+    const int blocks = k / 32;
+    g.codes.resize(static_cast<std::size_t>(n / 16) * blocks * 528);
+    std::uniform_int_distribution<int> e8(118, 131);
+    HostWeight& h = g.h;
+    h.n = n;
+    h.k = k;
+    h.W.resize(static_cast<std::size_t>(n) * k);
+    h.wexp.resize(h.W.size());
+    for (int r = 0; r < n; ++r) {
+        for (int b = 0; b < blocks; ++b) {
+            std::uint8_t* unit = g.codes.data() + (static_cast<std::size_t>(r / 16) * blocks + b) * 528;
+            const int e = r == n / 2 ? (b % 2 == 0 ? 1 : 250) : e8(rng);
+            unit[512 + r % 16] = static_cast<std::uint8_t>(e);
+            const int gg = r % 8, hi = (r % 16) / 8;
+            for (int kk = 0; kk < 32; ++kk) {
+                const int half = kk / 16, t = (kk % 16) / 4, i = kk % 4;
+                const std::uint8_t code = random_e4m3(rng);
+                unit[16 * (4 * gg + t) + 8 * half + 4 * hi + i] = code;
+                const std::size_t at = static_cast<std::size_t>(r) * k + b * 32 + kk;
+                h.W[at]    = e4m3_int(code);
+                h.wexp[at] = e - 136;
+            }
+        }
+    }
+    return g;
+}
+
 // Block FP8 [n][k] (multiples of 128): E4M3 codes, BF16 tile scales [n / 128][k / 128] of both signs.
 GenMatrix gen_fp8b128(int n, int k, std::mt19937& rng) {
     GenMatrix g;
@@ -1205,9 +1237,12 @@ void run_scaled(const std::string& label, const HostWeight& w, const std::vector
     });
 }
 
-// act: each expert's activation scales of even and odd rows (LosslessTile::act; null: none).
+// act: each expert's activation scales of even and odd rows (LosslessTile::act; null: none); divisor and
+// column_scales: the call's LosslessActivationScale (Inkling 2's den and per-column four-over-six outer; 0 / empty:
+// none).
 void run_tiles(const std::string& label, const HostBank& b, int tiles, int source_columns, bool bf16, std::mt19937& rng,
-               const std::vector<std::array<std::uint32_t, 2>>* act = nullptr) {
+               const std::vector<std::array<std::uint32_t, 2>>* act = nullptr, float divisor = 0.0F,
+               const std::vector<float>& column_scales = {}) {
     const int k = b.matrix.k, rows = b.matrix.rows, columns = 64 * tiles, out_columns = columns + 7;
     const auto x = make_columns(k, source_columns, rng, 4);
     std::vector<std::int32_t> in(static_cast<std::size_t>(columns)), out(static_cast<std::size_t>(columns));
@@ -1246,9 +1281,14 @@ void run_tiles(const std::string& label, const HostBank& b, int tiles, int sourc
     Tensor tout(dout.p, bf16 ? DType::BF16 : DType::FP32, {rows, out_columns});
     DeviceBuffer ws(ops::lossless_linear_tiles_workspace_bytes(b.matrix, columns));
     WorkspaceArena arena(DeviceSpan{ws.p, ws.bytes});
+    DeviceBuffer dscales(std::max<std::size_t>(column_scales.size(), 1) * 4);
+    if (!column_scales.empty()) { dscales.copy_from_host(column_scales.data(), column_scales.size() * 4, 0); }
+    ops::LosslessActivationScale scale;
+    scale.divisor       = divisor;
+    scale.column_scales = column_scales.empty() ? nullptr : static_cast<const float*>(dscales.p);
     ops::lossless_linear_tiles(tx, static_cast<const std::int32_t*>(din.p), columns, b.matrix,
                                static_cast<const ops::LosslessTile*>(dtiles.p), tout,
-                               static_cast<const std::int32_t*>(dout_map.p), arena, nullptr);
+                               static_cast<const std::int32_t*>(dout_map.p), arena, nullptr, scale);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<std::uint8_t> got(static_cast<std::size_t>(rows) * out_columns * esize);
     dout.copy_to_host(got.data(), got.size(), 0);
@@ -1272,6 +1312,8 @@ void run_tiles(const std::string& label, const HostBank& b, int tiles, int sourc
         const int src = in[static_cast<std::size_t>(c)];
         ActScales scales;
         if (act != nullptr) { scales.row_multiplier = (*act)[static_cast<std::size_t>(e)][static_cast<std::size_t>(r & 1)]; }
+        if (divisor != 0.0F) { scales.divisor = f32_bits(divisor); }
+        if (!column_scales.empty()) { scales.column_multiplier = f32_bits(column_scales[static_cast<std::size_t>(c)]); }
         want = oracle(b.experts[static_cast<std::size_t>(e)], r,
                       src < 0 ? zeros.data() : x.data() + static_cast<std::size_t>(src) * k, bf16, scales);
         return true;
@@ -1472,6 +1514,22 @@ INFERNIX_OP_TEST(lossless_linear) {
             }
             run_tiles("nvfp4 rg16 bank tiles with act scales bf16", rg, 9, 40, true, rng, &g);
             run_tiles("nvfp4 rg16 bank tiles with act scales fp32", rg, 3, 70, false, rng, &g);
+            // Inkling 2's NVFP4 experts on the lossless route: the bank's denominator as the call's divisor and each
+            // column's four-over-six outer scale (amax fp32(1 / 1536)), with the experts' amax as the multipliers.
+            {
+                std::vector<float> outer(64 * 9);
+                std::uniform_real_distribution<float> amax(0.05F, 40.0F);
+                for (float& o : outer) { o = amax(rng) * (1.0F / 1536.0F); }
+                run_tiles("nvfp4 rg16 bank tiles, divisor and column scales bf16", rg, 9, 40, true, rng, nullptr, 2688.0F,
+                          outer);
+                run_tiles("nvfp4 rg16 bank tiles, divisor and column scales fp32", rg, 3, 70, false, rng, nullptr,
+                          2688.0F, std::vector<float>(outer.begin(), outer.begin() + 64 * 3));
+            }
+            // Inkling 2's MXFP8 expert records (layers 20-23).
+            HostBank mx = make_bank("mxfp8 rg16 bank", QType::FP8_E4M3FN_G32_E8M0, 64, 640, 3, 0,
+                                    [&](int) { return gen_mxfp8_rg16(64, 640, rng); });
+            run_tiles("mxfp8 rg16 bank tiles bf16", mx, 9, 40, true, rng);
+            run_tiles("mxfp8 rg16 bank tiles fp32", mx, 3, 70, false, rng);
             HostBank fp8 = make_bank("fp8 b128 bank", QType::FP8_E4M3FN_B128, 128, 640, 3, 4096,
                                      [&](int) { return gen_fp8b128(128, 640, rng); });
             run_tiles("fp8 b128 bank tiles bf16", fp8, 9, 40, true, rng);

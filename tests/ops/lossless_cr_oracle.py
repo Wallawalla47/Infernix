@@ -23,7 +23,7 @@ from pathlib import Path
 
 getcontext().prec = 60
 
-EXP, SIGMOID, SIGMOID_BF16, SILU, SILU_BF16, SOFTPLUS, RSQRT, COS, SIN = range(9)
+EXP, SIGMOID, SIGMOID_BF16, SILU, SILU_BF16, SOFTPLUS, RSQRT, COS, SIN, TANH, LOG = range(11)
 
 # pi to 110 digits: arguments below 2^20 reduce with an error far below the 60-digit evaluation's.
 PI = Decimal("3.14159265358979323846264338327950288419716939937510582097494459230781640628620899862803482534211706798214808651")
@@ -127,7 +127,31 @@ def evaluate(func: int, x: float) -> int:
         return round_binary((Decimal(1) + d.exp()).ln(), 24)
     if func == RSQRT:
         return round_binary(Decimal(1) / d.sqrt(), 24)
+    if func == TANH:
+        return round_binary(tanh(d), 24)
+    if func == LOG:
+        return round_binary(d.ln(), 24)
     raise ValueError(func)
+
+
+def tanh(d: Decimal) -> Decimal:
+    """tanh at 60 digits: the odd series below 10^-3 (its truncation after d^11 is below 10^-36 relative),
+    else (1 - t) / (1 + t) with t = exp(-2 |d|) (no overflow, and 1 - t keeps all but 3 digits)."""
+    if d == 0:
+        return d  # tanh(+-0) = +-0
+    a = abs(d)
+    if a < Decimal("1e-3"):
+        d2 = d * d
+        coefficients = [Decimal(1), Decimal(-1) / 3, Decimal(2) / 15, Decimal(-17) / 315, Decimal(62) / 2835,
+                        Decimal(-1382) / 155925]
+        total, power = Decimal(0), d
+        for c in coefficients:
+            total += c * power
+            power *= d2
+        return total
+    t = (-2 * a).exp()
+    r = (Decimal(1) - t) / (Decimal(1) + t)
+    return r if d > 0 else -r
 
 
 def evaluate_record(task: tuple[int, int]) -> tuple[int, int, int]:
@@ -211,6 +235,21 @@ def vectors() -> list[tuple[int, int, int]]:
     for func in (COS, SIN):
         for bits in trig_inputs:
             tasks.append((func, bits))
+    # tanh (Inkling 2's softcaps and message gates) over every BF16 value and random binary32 ones across its
+    # rounding range (beyond 9.1 it is +-1) and its small-argument binades; ln (Inkling 2's log scale) over every
+    # positive BF16 value and random positive binary32 ones.
+    tanh_inputs = list(bf16_inputs)
+    for _ in range(100_000):
+        x = rng.uniform(-10.0, 10.0) if rng.random() < 0.7 else rng.choice((-1.0, 1.0)) * 2.0 ** rng.uniform(-20.0, 0.0)
+        bits = struct.unpack("<I", struct.pack("<f", x))[0]
+        tanh_inputs.append((bits & 0xFFFF0000) | rng.randrange(0x10000))
+    tasks += [(TANH, bits) for bits in tanh_inputs]
+    log_inputs = [b for b in bf16_inputs if float_of_bits(b) > 0.0]
+    log_inputs += [rng.randrange(0x00000001, 0x7F800000) for _ in range(50_000)]
+    for _ in range(50_000):  # Inkling 2's arguments: (position + 1) / 8192 in [1, 128]
+        bits = struct.unpack("<I", struct.pack("<f", rng.uniform(1.0, 128.0)))[0]
+        log_inputs.append((bits & 0xFFFF0000) | rng.randrange(0x10000))
+    tasks += [(LOG, bits) for bits in log_inputs]
     return evaluate_records(tasks)
 
 

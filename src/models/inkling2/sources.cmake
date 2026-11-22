@@ -10,6 +10,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/dspark.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/lossless.cpp"
 )
 # Frontend: the prompt renderer and the output session (channels from the checkpoint's response_template).
 target_sources(infernix_model_runtime PRIVATE

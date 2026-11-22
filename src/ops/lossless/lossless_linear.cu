@@ -62,6 +62,7 @@ void launch_route(const Call& c, Route route, int first, int count, std::uint8_t
     case Route::Mxfp8: launch_chunk_stage<Mxfp8Format>(c, first, count, base, l, stream, stage); break;
     case Route::Rg16: launch_chunk_stage<Rg16Format>(c, first, count, base, l, stream, stage); break;
     case Route::Fp8B128: launch_chunk_stage<Fp8B128Format>(c, first, count, base, l, stream, stage); break;
+    case Route::Mxfp8Rg16: launch_chunk_stage<Mxfp8Rg16Format>(c, first, count, base, l, stream, stage); break;
     case Route::Ggml:
         require(launch_ggml_k(c.qtype, c, first, count, base, l, stream, stage) ||
                     launch_ggml_i(c.qtype, c, first, count, base, l, stream, stage),
@@ -224,6 +225,7 @@ namespace {
 Route bank_route(QType q) {
     if (q == QType::NVFP4_MUL) { return Route::Rg16; }
     if (q == QType::FP8_E4M3FN_B128) { return Route::Fp8B128; }
+    if (q == QType::FP8_E4M3FN_G32_E8M0) { return Route::Mxfp8Rg16; }
     return is_ggml_format(q) ? Route::Ggml : Route::None;
 }
 
@@ -237,7 +239,11 @@ std::size_t lossless_linear_tiles_workspace_bytes(const LosslessBankMatrix& matr
 
 void lossless_linear_tiles(const Tensor& x, const std::int32_t* in_columns, std::int32_t columns,
                            const LosslessBankMatrix& matrix, const LosslessTile* tiles, Tensor& out,
-                           const std::int32_t* out_columns, WorkspaceArena& workspace, cudaStream_t stream) {
+                           const std::int32_t* out_columns, WorkspaceArena& workspace, cudaStream_t stream,
+                           const LosslessActivationScale& scale) {
+    require(scale.multiplier == 0.0F, "the tile mode's activation multipliers are its tiles' act scales");
+    require(scale.divisor == 0.0F || (std::isfinite(scale.divisor) && scale.divisor > 0.0F),
+            "an activation divisor is positive and finite");
     const Route route = bank_route(matrix.qtype);
     require(route != Route::None, "unsupported expert-record format");
     require(x.dtype == DType::BF16 && x.ne[2] == 1 && x.ne[3] == 1 && x.nb[0] == 2 &&
@@ -256,10 +262,12 @@ void lossless_linear_tiles(const Tensor& x, const std::int32_t* in_columns, std:
     v.k         = matrix.k;
     v.row_bytes = matrix.row_bytes;
     v.groups    = matrix.k / 16;
+    std::memcpy(&v.act_div, &scale.divisor, sizeof(v.act_div));
     Call c{&x, v, 0, nullptr, 0, matrix.rows, &out, 0, columns, matrix.qtype};
     c.tiles       = tiles;
     c.in_columns  = in_columns;
     c.out_columns = out_columns;
+    c.act_column  = scale.column_scales;
     run(c, route, workspace, stream);
 }
 

@@ -23,9 +23,12 @@
 #include "runtime/prefix_cache/host_slab_store.h"
 #include "runtime/prefix_cache/persist_file.h"
 #include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/ssd_tier.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
+#include <chrono>
 #include <filesystem>
+#include <memory>
 #include <string_view>
 
 #include <cuda_runtime_api.h>
@@ -91,6 +94,12 @@ struct PrefixCacheConfig {
     runtime::prefix_cache::PrefixIndexConfig index; // capacities filled by the cache from the layouts
     runtime::prefix_cache::TapPlannerConfig taps;
     std::uint32_t kv_pages = 0; // Device pages of the pool
+    // The SSD tier (hybrid-prefix-cache-spec §5.7): its size (whole Host slabs), the directory of its file, its write
+    // budget (0: none) and, with a prefix cache file, the kept file its slabs persist in. 0 bytes: none.
+    std::uint64_t ssd_bytes = 0;
+    std::filesystem::path ssd_directory;
+    std::uint64_t ssd_write_bytes_per_hour = 0;
+    std::filesystem::path ssd_kept_file;
 };
 
 struct RestoreTicket {
@@ -183,6 +192,18 @@ public:
     // A failure with the batch open, possibly part enqueued: waits for the restore stream, then aborts the batch.
     void fail_restore() noexcept;
 
+    // ---- SSD tier (hybrid-prefix-cache-spec §5.7) ---------------------------------------------
+    [[nodiscard]] runtime::prefix_cache::SsdTier* ssd() noexcept { return ssd_.get(); }
+    [[nodiscard]] const runtime::prefix_cache::SsdTier* ssd() const noexcept { return ssd_.get(); }
+    // Applies landed SSD transfers and starts write-backs; returns whether a promotion landed since the last call.
+    bool poll_ssd();
+    // Starts reading the parts of `snapshot` only on the SSD into the Host tier.
+    [[nodiscard]] runtime::prefix_cache::SsdTier::Promotion promote(runtime::prefix_cache::SnapshotRef snapshot);
+    [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> ssd_retry_at() const noexcept {
+        return ssd_ ? ssd_->write_back_retry_at() : std::nullopt;
+    }
+
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;
 
@@ -235,12 +256,19 @@ private:
     // The lane's image between its device bytes and the image slabs, runs of consecutive slabs as one copy.
     void copy_image(std::uint32_t lane, std::span<const std::uint32_t> slabs, bool to_host, cudaStream_t stream) const;
     void finish_restore(RestoreBatch& batch) noexcept;
+    // Before a capture takes `slabs` Host slabs: while the Host tier cannot free them without losing unwritten content,
+    // starts the write-backs it can and waits for them (SSD tier only).
+    void make_lossless_room(std::uint64_t slabs);
+    void service_ssd();
 
     runtime::prefix_cache::TapPlannerConfig taps_;
     DeviceKVPagePool* pool_ = nullptr;
     LaneImages lanes_;
     PrefixHostLayout host_;
     runtime::prefix_cache::HostSlabStore store_;
+    // Declared after the slabs it reads and writes: destroyed first, waiting for its transfers.
+    std::unique_ptr<runtime::prefix_cache::SsdTier> ssd_;
+    bool ssd_landed_ = false;
     cudaStream_t compute_        = nullptr; // not owned
     cudaStream_t transfer_       = nullptr;
     cudaStream_t restore_stream_ = nullptr;

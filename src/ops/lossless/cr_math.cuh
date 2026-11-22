@@ -294,6 +294,40 @@ __device__ inline float cr_softplus(float x) {
     return f32_of_dd(dd_softplus(x));
 }
 
+// tanh(x) for 2^-13 <= |x| <= 9.1 in double-double: (e - 1) / (e + 1), e = exp(2|x|) (e - 1 loses at most 13 of its
+// 106 bits), signed.
+__device__ inline DD dd_tanh(float x) {
+    const double a = fabs(static_cast<double>(x));
+    const DD e     = dd_exp(2.0 * a);
+    const DD t     = dd_div(dd_add(e, {-1.0, 0.0}), dd_add(e, {1.0, 0.0}));
+    return x < 0.0F ? DD{-t.hi, -t.lo} : t;
+}
+
+// Correctly rounded binary32 tanh. Below 2^-13 in magnitude tanh(x) lies within |x|^3 / 3 < 2^-26 |x| of x, under
+// a quarter of x's ulp below it, so it rounds to x; beyond 9.1, 1 - tanh(x) < 2e^-18.2 < 2^-25 rounds to +-1.
+__device__ inline float cr_tanh(float x) {
+    if (isnan(x)) { return x; }
+    const float a = fabsf(x);
+    if (a < 0x1p-13F) { return x; }
+    if (a > 9.1F) { return copysignf(1.0F, x); }
+    const double y = tanh(static_cast<double>(x));
+    float out;
+    if (certain_f32(y, fabs(y) * kDoubleErr, out)) { return out; }
+    return f32_of_dd(dd_tanh(x));
+}
+
+// Correctly rounded binary32 ln(x): +inf, -inf at 0, NaN below 0; 0 at 1 exactly (the only exact case).
+__device__ inline float cr_log(float x) {
+    if (isnan(x) || x < 0.0F) { return NAN; }
+    if (x == 0.0F) { return -INFINITY; }
+    if (isinf(x)) { return x; }
+    if (x == 1.0F) { return 0.0F; }
+    const double y = log(static_cast<double>(x));
+    float out;
+    if (certain_f32(y, fabs(y) * kDoubleErr, out)) { return out; }
+    return f32_of_dd(dd_log({static_cast<double>(x), 0.0}));
+}
+
 // ------------------------------------------------------------------------- cos and sin
 
 // cos(r) and sin(r) for |r| <= pi/4 + 2^-20 in double-double: Taylor to degree 28 / 27 (the remainder

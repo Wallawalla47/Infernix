@@ -37,11 +37,15 @@ __global__ void evaluate(const std::uint32_t* func, const std::uint32_t* input, 
         out[i] = __float_as_uint(func[i] == 7 ? c : s);
         break;
     }
+    case 9: out[i] = __float_as_uint(ll::cr_tanh(x)); break;
+    case 10: out[i] = __float_as_uint(ll::cr_log(x)); break;
     default: out[i] = 0xFFFFFFFFU; break;
     }
 }
 
-const char* kNames[] = {"exp", "sigmoid", "sigmoid_bf16", "silu", "silu_bf16", "softplus", "rsqrt", "cos", "sin"};
+constexpr int kFunctions = 11;
+const char* kNames[kFunctions] = {"exp", "sigmoid", "sigmoid_bf16", "silu", "silu_bf16", "softplus",
+                                  "rsqrt", "cos", "sin", "tanh", "log"};
 
 } // namespace
 
@@ -74,7 +78,7 @@ INFERNIX_OP_TEST(lossless_cr_math) {
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<std::uint32_t> got(count);
     dout.copy_to_host(got.data(), count * 4ULL);
-    std::size_t wrong[9] = {}, total[9] = {};
+    std::size_t wrong[kFunctions] = {}, total[kFunctions] = {};
     for (std::uint32_t i = 0; i < count; ++i) {
         ++total[func[i]];
         if (got[i] != want[i]) {
@@ -85,7 +89,7 @@ INFERNIX_OP_TEST(lossless_cr_math) {
         }
     }
     int failures = 0;
-    for (int f = 0; f < 9; ++f) {
+    for (int f = 0; f < kFunctions; ++f) {
         std::printf("%s: %zu of %zu correctly rounded\n", kNames[f], total[f] - wrong[f], total[f]);
         failures += wrong[f] != 0;
     }

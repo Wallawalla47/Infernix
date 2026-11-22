@@ -11,3 +11,4 @@ target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_flash.cu
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_quantize.cu")
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_kv_encode.cu")
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_lora.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_inkling2.cu")

@@ -280,6 +280,10 @@ struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
     bool causal_scoring           = false;
+    // --lossless (causal scoring only): each window scored in one pass by LosslessForward (lossless.h); with
+    // `reference`, the design reference (--reference: V stored as the bf16 profile's FP16).
+    bool lossless  = false;
+    bool reference = false;
     // Columns a prefill call takes of one lane (1..kMaxPrefillChunk); the forward's call capacity follows it.
     std::uint32_t prefill_chunk = kDefaultPrefillChunk;
     bool use_cuda_graph         = true;
@@ -310,6 +314,11 @@ struct ProgramOptions {
     std::uint32_t prefix_min_gap_tokens = 1024;
     // The product's control over the shutdown save (--prefix-cache-file; a second Ctrl+C abandons it).
     PrefixCacheSaveControl prefix_save;
+    // The SSD tier below the Host tier (0: none): its size, directory, write budget (0: none) and kept file.
+    std::uint64_t prefix_ssd_bytes = 0;
+    std::filesystem::path prefix_ssd_directory;
+    std::uint64_t prefix_ssd_write_bytes_per_hour = 0;
+    std::filesystem::path prefix_ssd_kept_file;
     DiagnosticObserver diagnostics;
 };
 
@@ -387,17 +396,19 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept {}
 
+    // The idle Engine's maintenance (hybrid_storage_due): the SSD tier's write-backs of what the last requests left in
+    // the Host tier.
+    void maintain();
     // ---- the common contract's hooks this slice has nothing behind (runtime/contract/program.h) ----
-    void maintain() {}
     void maintain_busy() {}
     void set_maintenance_waker(std::function<void()>) {}
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
-    [[nodiscard]] bool hybrid_poll_storage() { return false; }
-    [[nodiscard]] bool hybrid_source_pending() const noexcept { return false; }
-    [[nodiscard]] bool hybrid_storage_due() const noexcept { return false; }
-    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> hybrid_storage_retry_at() const noexcept {
-        return std::nullopt;
-    }
+    // The SSD tier (ProgramOptions::prefix_ssd_bytes): landed transfers applied and write-backs started; a source a quote
+    // is reading from the SSD; whether a write-back is due, or when one may be.
+    [[nodiscard]] bool hybrid_poll_storage();
+    [[nodiscard]] bool hybrid_source_pending() const noexcept;
+    [[nodiscard]] bool hybrid_storage_due() const noexcept;
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> hybrid_storage_retry_at() const noexcept;
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept { return 16; }
     // --prefix-cache-file: restores the Host tier from `path` (a file written for this fingerprint), and saves it there
     // at shutdown (shutdown_cleanup) and whenever save_prefix_cache_now runs (the periodic save).

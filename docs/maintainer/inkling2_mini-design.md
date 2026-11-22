@@ -544,7 +544,7 @@ per visit:  [attention mixer] → [projection q,k,v,r,gate,sink(,taps)] → [att
 | Area | Location | Notes |
 |---|---|---|
 | Config, binding, read-only model | `src/models/inkling2/config.*`, `load.*`, `model.h`, `weights.h` | parses `text_config.loop_config`, `mtp_config`, `vision_config`; rejects configs the Ops do not cover |
-| Native parameters, fixed calls | `src/models/inkling2/execution/` | built: `parameters.*` (the native operands), `forward.*` (one call: embed, the 48 visits with the pass restarts and messages, the head; the StateImage layout), `dspark.*`, `vision.*` (the tower, [§15](#15-vision)); planned: `forward_lossless.cpp` |
+| Native parameters, fixed calls | `src/models/inkling2/execution/` | built: `parameters.*` (the native operands), `forward.*` (one call: embed, the 48 visits with the pass restarts and messages, the head; the StateImage layout), `dspark.*`, `vision.*` (the tower, [§15](#15-vision)), `lossless.*` (`--lossless`: one scored window, [lossless route §3a](lossless-route.md#3a-the-route)) |
 | Program | `src/models/inkling2/program/` | planning, stores, transactions, graphs, prefix binding; implements `runtime::EngineProgramContract` |
 | State layout | `src/models/inkling2/execution/forward.h` (`state_layout`) | StateImage parts ([§7.2](#72-stateimage)) |
 | Frontend | `src/models/inkling2/frontend/` | renderer, output session, image preprocessing (the pre-tokenizer is the shared core's `Inkling` pipeline) |
@@ -829,8 +829,10 @@ width (a width threshold broke prefix restores on Flash-Next: L16).
 ### 9.4 Formats
 
 BF16 rings; the full pools in every profile of [§7.6](#76-kv-profiles), decoded into the decode and prompt kernels'
-tiles by `decode_unit` (`attention_common.cuh`) and encoded by the append. The lossless route (a later milestone) has
-its own attention kernel (exact scores, correctly rounded softmax, BF16 V), as for Qwen.
+tiles by `decode_unit` (`attention_common.cuh`) and encoded by the append. The lossless route (scored windows,
+`execution/lossless.cpp`) reads the window's own keys: exact scores (lossless_linear), the eager form's BF16 roundings
+with the bias, mask and sink and a correctly rounded softmax (`lossless_inkling2_attention_probs`), BF16 V
+([lossless route §3a](lossless-route.md#3a-the-route)).
 
 ---
 

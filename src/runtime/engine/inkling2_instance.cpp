@@ -10,6 +10,7 @@
 #include "runtime/engine/expert_memory.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/expert_offload/memory_plan.h"
+#include "runtime/prefix_cache/persist_file.h"
 
 #include <chrono>
 #include <fstream>
@@ -45,6 +46,8 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
     return {.max_context     = options.max_context,
             .max_concurrency = options.max_concurrency,
             .causal_scoring  = options.purpose == EnginePurpose::CausalScoring,
+            .lossless        = options.lossless,
+            .reference       = options.reference,
             .prefill_chunk   = options.prefill_chunk,
             .use_cuda_graph  = options.use_cuda_graph,
             .dspark            = options.speculative.backend == SpeculativeBackend::DSpark &&
@@ -61,6 +64,19 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
             .prefix_ladder_tokens  = options.context_cache.hybrid.tap_ladder_tokens.value_or(4096U),
             .prefix_min_gap_tokens = options.context_cache.hybrid.tap_min_gap_tokens.value_or(1024U),
             .prefix_save           = options.context_cache.hybrid.persistent_save,
+            .prefix_ssd_bytes      = options.context_cache.ssd_capacity_bytes,
+            .prefix_ssd_directory  = options.context_cache.ssd_directory,
+            .prefix_ssd_write_bytes_per_hour =
+                options.context_cache.ssd_write_bytes_per_hour == ContextCacheOptions::kSsdWritesUnlimited
+                    ? 0U
+                    : (options.context_cache.ssd_write_bytes_per_hour == 0 ? ContextCacheOptions::kDefaultSsdWriteBytesPerHour
+                                                                           : options.context_cache.ssd_write_bytes_per_hour),
+            // With a prefix cache file the SSD tier's file is kept beside it across restarts.
+            .prefix_ssd_kept_file = options.context_cache.ssd_capacity_bytes != 0 &&
+                                            !options.context_cache.hybrid.persistent_file.empty()
+                                        ? runtime::prefix_cache::kept_ssd_file(options.context_cache.ssd_directory,
+                                                                               options.context_cache.hybrid.persistent_file)
+                                        : std::filesystem::path{},
             .diagnostics       = options.diagnostic_observer};
 }
 
@@ -109,7 +125,19 @@ bool artifact_has_inkling2_drafter(const artifact::Reader& reader) {
 }
 
 EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter) {
-    refuse(options.lossless || options.reference, "the lossless and reference routes are a later milestone");
+    refuse(options.reference && !options.lossless, "--reference implies --lossless");
+    refuse(options.reference && options.kv_cache != KvCacheStorage::BFloat16,
+           "the design reference is built for --kv-dtype bf16 only (V stored as FP16); the coded formats are not yet");
+    if (options.lossless) {
+        // The lossless route (docs/maintainer/lossless-route.md §2b): a scored window in one pass, text only.
+        refuse(options.purpose != EnginePurpose::CausalScoring,
+               "--lossless scores windows (causal scoring); lossless generation is not built for Inkling 2 yet");
+        refuse(options.enable_vision, "--lossless scores text windows (no --vision)");
+        refuse(options.expert_a16_activations, "--lossless runs the experts' declared arithmetic (no --a16-activations)");
+        refuse(options.q8_weights, "--lossless takes the artifact's exact weights (no --q8-weights)");
+        refuse(options.kv_cache != KvCacheStorage::BFloat16, "--lossless reads the window's own keys (--kv-dtype bf16)");
+        refuse(options.fast_paths, "--lossless has no fast paths");
+    }
     refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
     refuse(options.a8_activations, "--a8-activations is not built for Inkling 2 yet");
     if (options.expert_a16_activations) {
@@ -182,7 +210,9 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "the prefix cache has no tool-call holds");
         refuse(hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0,
                "no idle next-turn prefill yet");
-        refuse(cache.ssd_capacity_bytes != 0, "the prefix cache has no SSD tier yet");
+        // The SSD tier's code is in (prefix_cache.cpp) but its write-backs do not yet keep a snapshot (the prefix test's
+        // SSD case, run alone with INFERNIX_INKLING2_PREFIX_SSD_ONLY): refused until it passes.
+        refuse(cache.ssd_capacity_bytes != 0, "the prefix cache's SSD tier (--ssd-context-gib) is not ready for Inkling 2 yet");
         hybrid.device_snapshot_slots   = 0U;
         hybrid.tool_call_hold          = std::chrono::milliseconds{0};
         hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{0};

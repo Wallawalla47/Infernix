@@ -14,6 +14,11 @@
 // 6. Two lanes, the pool exactly their two contexts: two identical prompts at once (duplicate blocks), then two
 //    near-full prompts at once, then a continuation of the first: every output equals its prompt's cold one.
 // 7. --prefix-cache-file: saved at shutdown, restored by a new Engine, resumed with the cold run's tokens.
+// 8. --a16-activations with --reproducible, and --q8-weights: resumed equals cold there too.
+// 9. Tap reach: a snapshot after a call ending k tokens past a frontier serves it (k up to 29; 15 with DSpark).
+// 10. Images (INFERNIX_INKLING2_VISION_ARTIFACT): another image never resumes past the image; the same image does.
+// 11. The SSD tier (not in the default run: refused until it passes; INFERNIX_INKLING2_PREFIX_SSD_ONLY runs it alone):
+//     what the Host tier gives up is written back, read back on a hit, and resumes as cold.
 //
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (skips without it)
 
@@ -125,6 +130,58 @@ void check_probe(const std::string& label, const infernix::test::ResumeProbe& pr
     require(probe.bit_identical(), label + ": the resumed continuation differs from the cold one");
 }
 
+// 11. The SSD tier (--ssd-context-gib, --ssd-context-dir): a Host tier of about two prompts' snapshots and blocks, so
+//     three unrelated prompts push the first one's out to the SSD; its continuation reads them back (a promotion) and
+//     equals its cold run. INFERNIX_INKLING2_PREFIX_SSD_ONLY runs this case alone.
+void ssd_tier(const std::filesystem::path& artifact) {
+    using infernix::KvCacheStorage;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix_inkling2_ssd_tier";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    std::filesystem::create_directories(dir);
+    infernix::EngineOptions options = cache_options(artifact, KvCacheStorage::BFloat16, 4096, kContext);
+    options.context_cache.host_capacity_bytes      = std::size_t{500} << 20U;
+    options.context_cache.ssd_capacity_bytes       = std::uint64_t{4} << 30U;
+    options.context_cache.ssd_write_bytes_per_hour = infernix::ContextCacheOptions::kSsdWritesUnlimited;
+    options.context_cache.ssd_directory            = dir;
+    {
+        infernix::Engine engine(options);
+        const Tokens prompt         = long_prompt(engine, 2300, 41);
+        const infernix::TokenId sep = engine.tokenize_text("\n").front();
+        (void)engine.generate(engine.prepare_tokens(prompt), infernix::test::resume_probe_request(1, true));
+        for (int k = 0; k < 3; ++k) {
+            (void)engine.generate(engine.prepare_tokens(long_prompt(engine, 2300, 60 + k)),
+                                  infernix::test::resume_probe_request(1, true));
+        }
+        Tokens continuation = prompt;
+        continuation.push_back(sep);
+        const infernix::RuntimeStats before = engine.runtime_stats();
+        const infernix::GenerationResult resumed =
+            engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, true));
+        const infernix::RuntimeStats after = engine.runtime_stats();
+        const infernix::GenerationResult cold =
+            engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, false));
+        std::cout << "ssd tier (" << static_cast<double>(after.hybrid_ssd_capacity_bytes) / 1e9 << " GB): reused "
+                  << resumed.reused_prompt_tokens << " prompt tokens; "
+                  << static_cast<double>(after.hybrid_ssd_write_bytes) / 1e6 << " MB written ("
+                  << after.hybrid_ssd_image_writes << " images, " << after.hybrid_ssd_block_writes << " blocks), "
+                  << static_cast<double>(after.hybrid_ssd_read_bytes) / 1e6 << " MB read in "
+                  << after.hybrid_ssd_promotions - before.hybrid_ssd_promotions << " promotions, "
+                  << after.hybrid_ssd_failures << " failures; Host (" << after.hybrid_host_capacity_bytes / 1048576
+                  << " MiB): " << after.hybrid_host_image_writes << " images and " << after.hybrid_host_block_writes
+                  << " blocks written, " << after.hybrid_host_image_write_refusals << " and "
+                  << after.hybrid_host_block_write_refusals << " refused, " << after.hybrid_host_snapshot_evictions
+                  << " snapshots evicted unwritten, " << after.hybrid_unbacked_node_losses << " blocks lost\n";
+        require(after.hybrid_ssd_write_bytes != 0, "ssd tier: nothing the Host tier gave up was written back");
+        require(after.hybrid_ssd_promotions > before.hybrid_ssd_promotions,
+                "ssd tier: the continuation's source was not read back from the SSD tier");
+        require(resumed.reused_prompt_tokens >= 2048, "ssd tier: the continuation reused too little");
+        require(resumed.generated_token_ids == cold.generated_token_ids, "ssd tier: the tokens differ from cold");
+        require(after.hybrid_ssd_failures == 0, "ssd tier: an SSD transfer failed");
+    }
+    std::filesystem::remove_all(dir, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -135,6 +192,11 @@ int main() {
             return 77;
         }
         using infernix::KvCacheStorage;
+        if (std::getenv("INFERNIX_INKLING2_PREFIX_SSD_ONLY") != nullptr) {
+            ssd_tier(artifact);
+            std::cout << "PASS (the SSD tier case alone)\n";
+            return 0;
+        }
         if (std::getenv("INFERNIX_INKLING2_PREFIX_TIMING") != nullptr) {
             timing(artifact, false);
             timing(artifact, true);
@@ -261,15 +323,16 @@ int main() {
                 options.speculative.draft_tokens_auto = true;
             }
             infernix::Engine engine(options);
-            // The system and model message ids, from a rendered chat: its first id, and the opener's (its first
-            // generated position).
+            // The system and model message ids, from a rendered chat with a reply: its first id, and the reply's first
+            // (its first generated position: tokenize_chat marks the model's messages).
             infernix::PromptInput chat;
             chat.messages.push_back({.role = infernix::ChatRole::System, .parts = {{.text = "Be brief."}}});
             chat.messages.push_back({.role = infernix::ChatRole::User, .parts = {{.text = "Hello."}}});
+            chat.messages.push_back({.role = infernix::ChatRole::Assistant, .parts = {{.text = "Hi."}}});
             const infernix::ChatTokens rendered = engine.tokenize_chat(chat);
             std::size_t opener = 0;
             while (opener < rendered.generated.size() && rendered.generated[opener] == 0) { ++opener; }
-            require(opener < rendered.ids.size(), "reach: the chat has no generation opener");
+            require(opener < rendered.ids.size(), "reach: the chat has no model message");
             const infernix::TokenId system = rendered.ids.front(), model = rendered.ids[opener];
             for (const std::uint32_t k : dspark ? std::vector<std::uint32_t>{2, 15, 16} : std::vector<std::uint32_t>{2, 15, 29}) {
                 const std::uint32_t P = 1024 - k;
@@ -299,7 +362,9 @@ int main() {
         }
         // 10. Images (INFERNIX_INKLING2_VISION_ARTIFACT): two images of the same cell count after a long system prompt.
         //     The second must not resume past the image's start (its key differs; placeholders are equal tokens), and
-        //     each equals its cold run; the first image again resumes past it.
+        //     each equals its cold run; the first image again resumes past it. The question after the image is long, so
+        //     the generation opener lies more than kMinimumTapSeparation past the user message's start (the planner
+        //     keeps one tap of closer hints, the earliest).
         if (const char* vision = std::getenv("INFERNIX_INKLING2_VISION_ARTIFACT"); vision != nullptr) {
             infernix::EngineOptions options = cache_options(vision, KvCacheStorage::BFloat16, 4096, pool);
             options.enable_vision           = true;
@@ -315,8 +380,9 @@ int main() {
                 }
                 return infernix::media::decode::encode_raw_rgb(200, 140, rgb);
             };
-            std::string system_text;
+            std::string system_text, question = "What is in this picture?";
             for (int i = 0; i < 300; ++i) { system_text += "Rule " + std::to_string(i) + ": answer in plain words. "; }
+            for (int i = 0; i < 30; ++i) { question += " Describe its shape number " + std::to_string(i) + " and its colours."; }
             const auto ask = [&](const std::vector<std::uint8_t>& image) {
                 infernix::PromptInput input;
                 input.messages.push_back({.role = infernix::ChatRole::System, .parts = {{.text = system_text}}});
@@ -324,7 +390,7 @@ int main() {
                 infernix::MessagePart part{.kind = infernix::MessagePartKind::Media};
                 part.media.bytes = image;
                 user.parts.push_back(std::move(part));
-                user.parts.push_back({.text = "What is in this picture?"});
+                user.parts.push_back({.text = question});
                 input.messages.push_back(std::move(user));
                 input.options.reasoning_effort = infernix::ReasoningEffort::Low;
                 return input;

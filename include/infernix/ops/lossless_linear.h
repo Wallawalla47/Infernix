@@ -104,7 +104,8 @@ struct LosslessTile {
 };
 
 /** A matrix inside routed-expert records: its format (NVFP4_MUL in nvfp4_expert_rg16_v1 units,
- * FP8_E4M3FN_B128 rows with BF16 128 x 128 tile scales, or GGUF rows), where its codes and scales lie
+ * FP8_E4M3FN_G32_E8M0 in mxfp8_expert_rg16_v1 units, FP8_E4M3FN_B128 rows with BF16 128 x 128 tile scales, or
+ * GGUF rows), where its codes and scales lie
  * in a record, its rows and K, and (GGUF) the bytes of one row. */
 struct LosslessBankMatrix {
     QType qtype                 = QType::NVFP4_MUL;
@@ -120,7 +121,9 @@ struct LosslessBankMatrix {
  * for c in [0, columns) (columns a multiple of 64), column c's weights from tiles[c / 64]'s record. A
  * null map is the identity; a negative in_columns entry reads a zero column, a negative out_columns
  * entry writes nothing. Every output as lossless_linear's (NVFP4 records: the sum times the row
- * parity's multiplier, exactly; a tile's act scales multiply it too). x is contiguous BF16 [K, *]; out
+ * parity's multiplier, exactly; a tile's act scales multiply it too, and `scale`'s divisor and column scales
+ * (FP32 [columns], the product's columns: Inkling 2's per-row four-over-six factors) apply as
+ * LosslessActivationScale's, exactly; its multiplier must be 0). x is contiguous BF16 [K, *]; out
  * contiguous BF16 or FP32 [rows, *].
  * The workspace is lossless_linear_tiles_workspace_bytes(matrix, columns).
  */
@@ -128,7 +131,8 @@ struct LosslessBankMatrix {
 
 void lossless_linear_tiles(const Tensor& x, const std::int32_t* in_columns, std::int32_t columns,
                            const LosslessBankMatrix& matrix, const LosslessTile* tiles, Tensor& out,
-                           const std::int32_t* out_columns, WorkspaceArena& workspace, cudaStream_t stream);
+                           const std::int32_t* out_columns, WorkspaceArena& workspace, cudaStream_t stream,
+                           const LosslessActivationScale& scale = {});
 
 /** Whether lossless_linear takes this weight's format. */
 [[nodiscard]] bool lossless_linear_supports(const Weight& weight) noexcept;
