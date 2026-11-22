@@ -124,13 +124,16 @@ Loading reads one adapted site's factors at a time, so it holds a few MB of RAM,
 
 Each adapted input costs one more kernel, the `A x` of its stacked adapters. A prompt's call takes the schedule
 modelled fastest for its shape: for most prompts a tile schedule, a cluster of CTAs over K's groups in rounds whose
-tile and cluster size follow how many clusters the GPU holds at once; for decode, verification and short prompts of
-the narrow stacks, the split and stream schedules. Every schedule gives the same bits. Each projection adds the term
+tile and cluster size follow how many clusters the GPU holds at once, and how many at one CTA an SM (a cluster stays
+within a GPC, so a wave of more doubles CTAs up on some SMs); a stack of at most 64 rows may run 16-column warps where
+each then has an SM sub-partition to itself; for decode, verification and short prompts of the narrow stacks, the
+split and stream schedules. Every schedule gives the same bits. Each projection adds the term
 in its epilogue. The decode kernels copy their rows of `B` and columns of `U` into shared memory beside their main
 loop (their weights stream through L2, so `B` would be gone by the epilogue); the NVFP4 and FP8 prompt tiles copy
 them once for the whole tile (a wide adapter's NVFP4 tile one adapted module's `U` columns over every token a pass,
 in rows without padding whose 16-byte pieces are swizzled, so all its warps work on every pass; a wide adapter's
-FP8 tile its `U` columns a token group at a time), and so do the groupwise ring tiles (the plain row-split ring only
+FP8 tile in the same swizzled rows where padded ones do not fit, its row fragments one at a time to spare the
+registers its accumulators leave), and so do the groupwise ring tiles (the plain row-split ring only
 for a wide adapter); the other tiles read them from L2, one fragment at a time. The staged term's MMA loop has one
 instance per count of the rank's 16-value steps, so it runs without a branch a step.
 
@@ -209,6 +212,20 @@ operands too. The adapted control's kernel takes 5.1 us a call at decode instead
 16-row tile, the weights copied into shared memory before the kernel waits for its input). A fused projection and
 convolution with the term for the Gated DeltaNet decode was tried and dropped: decode with the Atlassian adapter,
 which it alone would speed up, moved by -0.01 and -0.07 %.
+
+A third pass (2026-11-22, against the second; the same benchmark, two pairs of runs at rank 128, six at rank 32) made
+prefill of 2,048 tokens at rank 128 0.81 % faster on QAD, 0.38 % on the Official NVFP4 27B and 0.54 % on QAD's
+reproducible route (0.24-0.33 % of it the wide adapter's FP8 tiles copying their operands for the whole tile, the rest
+the `A x` plan); decode moved by at most 0.2 %. At rank 32 prefill moved by -0.06 % on QAD and -0.09 % on Official
+(7 of the 12 pairs slower, from -0.26 to +0.16 %), although traces of the QAD prefill show its summed kernel time
+0.3 % lower (`down_proj`'s `A x` at 1,792 tokens 44.2 us a call instead of 49.0); where that gain goes is not
+settled. The plan now counts the clusters
+the GPU holds at one CTA an SM (a rank-128 `down_proj` at 1,792 tokens took clusters of 3, 56 against the 52 the
+GPCs hold that way, so a few SMs ran two CTAs and set the call's 104 us; clusters of 5 take 80), and a stack of at most
+64 rows may take 16-column warps, whose round of a group takes about two thirds of a 32-column warp's where each has
+an SM sub-partition to itself. In the `lora_shrink` bench (the 27B's five sites at ranks 16, 32, 96 and 128,
+256-4,096 columns, two pairs of runs), 54 of 380 calls became 3-34 % faster beyond the runs' spread (rank-32
+`down_proj` at 1,280-1,408 columns by a third) and none slower beyond it (the most, +2.2 %, within the spread).
 
 An adapter of the Gated DeltaNet modules costs more than one of the same rank on the others, mostly in decode: those
 layers then run their projection materialized and the convolution over it, and an adapted control its own kernels.

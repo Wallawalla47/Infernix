@@ -483,10 +483,13 @@ __device__ __forceinline__ int tile_swizzled(int row, int segment) {
 
 int shared_optin_bytes();
 
-template <int BM, int BN>
+// WT: a consumer warp's columns, 32 or 16. A round is each consumer warp's chains over its group, so where every warp
+// has an SM sub-partition to itself, 16-column warps run a round in about two thirds of the time (a rank-32 down_proj
+// at 256 columns: 22.8 against 34.5 us, RTX 5090, 2026-11-22).
+template <int BM, int BN, int WT = 32>
 struct ShrinkTile {
-    static_assert(BM % 32 == 0 && BN % 32 == 0);
-    static constexpr int kWarpsM     = BM / 32; // column (token) warps
+    static_assert(BM % 32 == 0 && BN % 32 == 0 && (WT == 32 || WT == 16) && BM % WT == 0);
+    static constexpr int kWarpsM     = BM / WT; // column (token) warps
     static constexpr int kWarpsN     = BN / 32; // row warps
     static constexpr int kConsumers  = kWarpsM * kWarpsN * 32;
     static constexpr int kThreads    = kConsumers + 32; // the producer warp last
@@ -505,10 +508,11 @@ struct ShrinkTile {
     static constexpr std::size_t bytes(int ranks) { return kShareOffset + share_bytes(ranks); }
 };
 
-// At most 8 consumer warps: the 12- and 16-warp tiles (128 x 96, 128 x 128) spilled at their register cap and ran at
-// half the speed of 64-column tiles, which already fill an SM.
-template <int BM, int BN>
-inline constexpr bool kTileShape = BM * BN <= 64 * 128;
+// At most 8 consumer warps of 32 columns: the 12- and 16-warp tiles (128 x 96, 128 x 128) spilled at their register
+// cap and ran at half the speed of 64-column tiles, which already fill an SM. At most 4 of 16 columns (32 x 32,
+// 64 x 32, 32 x 64): the plan takes them only where each warp has a sub-partition to itself (tile_challenger).
+template <int BM, int BN, int WT = 32>
+inline constexpr bool kTileShape = WT == 32 ? (BM / 32) * (BN / 32) <= 8 : (BM / 16) * (BN / 32) <= 4;
 
 struct alignas(128) ShrinkTileDescriptors {
     CUtensorMap a; // A [rows, k]: boxes of BN rows x 32 values
@@ -531,8 +535,8 @@ __device__ __forceinline__ void shrink_tile_load(void* destination, const CUtens
                  : "memory");
 }
 
-template <int BM, int BN, bool InPlace>
-__global__ __launch_bounds__(ShrinkTile<BM, BN>::kThreads, 1) void lora_shrink_tile_kernel(
+template <int BM, int BN, int WT, bool InPlace>
+__global__ __launch_bounds__(ShrinkTile<BM, BN, WT>::kThreads, 1) void lora_shrink_tile_kernel(
 #ifdef _WIN32
     const __grid_constant__ TmaDescriptorParameter<ShrinkTileDescriptors, InPlace> descriptors_pointer,
 #else
@@ -542,9 +546,10 @@ __global__ __launch_bounds__(ShrinkTile<BM, BN>::kThreads, 1) void lora_shrink_t
 #ifdef _WIN32
     const ShrinkTileDescriptors& descriptors = *descriptors_pointer;
 #endif
-    using S                   = ShrinkTile<BM, BN>;
+    using S                   = ShrinkTile<BM, BN, WT>;
     constexpr int kStages     = S::kStages;
     constexpr int kConsumerWarps = S::kConsumers / 32;
+    constexpr int kTiles         = WT / 8; // a warp's n8 column tiles
     extern __shared__ __align__(1024) unsigned char shared[];
     cg::cluster_group cluster = cg::this_cluster();
     const int rank = static_cast<int>(cluster.block_rank()), ranks = static_cast<int>(cluster.num_blocks());
@@ -632,7 +637,7 @@ __global__ __launch_bounds__(ShrinkTile<BM, BN>::kThreads, 1) void lora_shrink_t
     for (int round = 0; round < rounds; ++round) {
         const int group = round * ranks + rank;
         if (group < groups) {
-            float chunk[2][4][4] = {}, sum[2][4][4] = {};
+            float chunk[2][kTiles][4] = {}, sum[2][kTiles][4] = {};
             for (int kt = 0; kt < kStagesPerGroup; ++kt) {
                 const int n = consumed + kt, slot = n % kStages;
                 cta_mbarrier_wait(full + slot, (n / kStages) & 1U);
@@ -640,21 +645,21 @@ __global__ __launch_bounds__(ShrinkTile<BM, BN>::kThreads, 1) void lora_shrink_t
                 const unsigned char* x_s = a_s + BN * kTileLineB;
 #pragma unroll
                 for (int step = 0; step < kTileStageK / 16; ++step) {
-                    unsigned af[2][4], xf[4][2];
+                    unsigned af[2][4], xf[kTiles][2];
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         ldmatrix_x4(af[mt][0], af[mt][1], af[mt][2], af[mt][3],
                                     smem_addr(a_s + tile_swizzled(warp_n * 32 + mt * 16 + a_row, step * 2 + a_segment)));
                     }
 #pragma unroll
-                    for (int np = 0; np < 2; ++np) {
+                    for (int np = 0; np < kTiles / 2; ++np) {
                         ldmatrix_x4(xf[2 * np][0], xf[2 * np][1], xf[2 * np + 1][0], xf[2 * np + 1][1],
-                                    smem_addr(x_s + tile_swizzled(warp_m * 32 + np * 16 + x_row, step * 2 + x_segment)));
+                                    smem_addr(x_s + tile_swizzled(warp_m * WT + np * 16 + x_row, step * 2 + x_segment)));
                     }
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-                        for (int nt = 0; nt < 4; ++nt) {
+                        for (int nt = 0; nt < kTiles; ++nt) {
                             mma_bf16(chunk[mt][nt][0], chunk[mt][nt][1], chunk[mt][nt][2], chunk[mt][nt][3],
                                      af[mt][0], af[mt][1], af[mt][2], af[mt][3], xf[nt][0], xf[nt][1]);
                         }
@@ -669,7 +674,7 @@ __global__ __launch_bounds__(ShrinkTile<BM, BN>::kThreads, 1) void lora_shrink_t
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-                        for (int nt = 0; nt < 4; ++nt)
+                        for (int nt = 0; nt < kTiles; ++nt)
 #pragma unroll
                             for (int v = 0; v < 4; ++v) {
                                 sum[mt][nt][v]   = first ? chunk[mt][nt][v] : __fadd_rn(sum[mt][nt][v], chunk[mt][nt][v]);
@@ -684,8 +689,8 @@ __global__ __launch_bounds__(ShrinkTile<BM, BN>::kThreads, 1) void lora_shrink_t
 #pragma unroll
             for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    const int r = warp_n * 32 + mt * 16 + g, t = warp_m * 32 + nt * 8 + 2 * q;
+                for (int nt = 0; nt < kTiles; ++nt) {
+                    const int r = warp_n * 32 + mt * 16 + g, t = warp_m * WT + nt * 8 + 2 * q;
                     published[t * BN + r]           = sum[mt][nt][0];
                     published[(t + 1) * BN + r]     = sum[mt][nt][1];
                     published[t * BN + r + 8]       = sum[mt][nt][2];
@@ -753,9 +758,11 @@ CUtensorMap shrink_tile_map(const void* pointer, int outer, int k, int box_outer
     return result;
 }
 
-// The tile schedule's shape for a call: its token tile, row tile and slices, the cluster's ranks, and its modelled time.
+// The tile schedule's shape for a call: its token tile, a warp's columns, row tile and slices, the cluster's ranks, and
+// its modelled time.
 struct TilePlan {
     int bm     = 0;
+    int wt     = 32;
     int bn     = 0;
     int slices = 0;
     int ranks  = 0;
@@ -772,98 +779,183 @@ int sm_count() {
     return count;
 }
 
-// The clusters of `ranks` CTAs of a tile kernel the device runs at once (cudaOccupancyMaxActiveClusters: what the GPCs
-// hold, at most two CTAs an SM; on the RTX 5090 22 clusters of 6 at one CTA an SM, 52 at two), once a shape and ranks.
-// -1: the shape has no kernel or does not fit.
-template <int BM, int BN>
-int tile_capacity(int ranks) {
-    if constexpr (!kTileShape<BM, BN>) {
-        return -1;
+// A tile kernel's residency for a cluster size: the clusters of `ranks` CTAs the device runs at once
+// (cudaOccupancyMaxActiveClusters: what the GPCs hold; on the RTX 5090 22 clusters of 6 at one CTA an SM, 52 at two),
+// those it holds at one CTA an SM (a cluster stays within a GPC, so a wave of more doubles CTAs up on some SMs even
+// below one CTA an SM on average: 56 clusters of 3 against 52, 104 us where clusters of 5 took 80), the CTAs an SM
+// holds, and the instance's consumer warps and ring. capacity <= 0: no kernel, or it does not fit.
+struct TileResidency {
+    int capacity    = -1;
+    int one_per_sm  = 0;
+    int per_sm      = 0;
+    int warps       = 0;
+    int stages      = 0;
+    int stage_bytes = 0;
+};
+
+template <int BM, int BN, int WT>
+TileResidency tile_residency(int ranks) {
+    if constexpr (!kTileShape<BM, BN, WT>) {
+        return {};
     } else {
-        using S        = ShrinkTile<BM, BN>;
-        constexpr auto kernel = lora_shrink_tile_kernel<BM, BN, false>;
+        using S               = ShrinkTile<BM, BN, WT>;
+        constexpr auto kernel = lora_shrink_tile_kernel<BM, BN, WT, false>;
+        // Once a cluster size: capacity << 16 | clusters at one CTA an SM << 6 | CTAs an SM (0: not yet queried, -1:
+        // does not fit).
         static std::atomic<int> cache[kMaxRanks + 1] = {};
         int value = cache[ranks].load(std::memory_order_relaxed);
-        if (value != 0) { return value; }
-        const std::size_t smem = S::bytes(ranks);
-        if (smem > static_cast<std::size_t>(shared_optin_bytes())) {
-            value = -1;
-        } else {
-            // The attribute only bounds a launch: the instance's own launch sets its largest need.
-            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_optin_bytes()));
-            cudaLaunchAttribute attribute{};
-            attribute.id               = cudaLaunchAttributeClusterDimension;
-            attribute.val.clusterDim.x = static_cast<unsigned>(ranks);
-            attribute.val.clusterDim.y = 1;
-            attribute.val.clusterDim.z = 1;
-            cudaLaunchConfig_t config{};
-            config.gridDim          = dim3(static_cast<unsigned>(ranks));
-            config.blockDim         = dim3(static_cast<unsigned>(S::kThreads));
-            config.dynamicSmemBytes = smem;
-            config.attrs            = &attribute;
-            config.numAttrs         = 1;
-            int clusters            = 0;
-            CUDA_CHECK(cudaOccupancyMaxActiveClusters(&clusters, kernel, &config));
-            value = clusters > 0 ? clusters : -1;
+        if (value == 0) {
+            const std::size_t smem = S::bytes(ranks);
+            if (smem > static_cast<std::size_t>(shared_optin_bytes())) {
+                value = -1;
+            } else {
+                // The attribute only bounds a launch: the instance's own launch sets its largest need.
+                CUDA_CHECK(
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_optin_bytes()));
+                cudaLaunchAttribute attribute{};
+                attribute.id               = cudaLaunchAttributeClusterDimension;
+                attribute.val.clusterDim.x = static_cast<unsigned>(ranks);
+                attribute.val.clusterDim.y = 1;
+                attribute.val.clusterDim.z = 1;
+                cudaLaunchConfig_t config{};
+                config.gridDim          = dim3(static_cast<unsigned>(ranks));
+                config.blockDim         = dim3(static_cast<unsigned>(S::kThreads));
+                config.dynamicSmemBytes = smem;
+                config.attrs            = &attribute;
+                config.numAttrs         = 1;
+                int clusters = 0, single = 0, per_sm = 0;
+                CUDA_CHECK(cudaOccupancyMaxActiveClusters(&clusters, kernel, &config));
+                // An SM's whole shared memory a CTA: the clusters held at one CTA an SM.
+                config.dynamicSmemBytes = static_cast<std::size_t>(shared_optin_bytes());
+                CUDA_CHECK(cudaOccupancyMaxActiveClusters(&single, kernel, &config));
+                CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, S::kThreads, smem));
+                value = clusters > 0 && single > 0 && per_sm > 0
+                            ? clusters << 16 | std::min(single, 1023) << 6 | std::min(per_sm, 63)
+                            : -1;
+            }
+            cache[ranks].store(value, std::memory_order_relaxed);
         }
-        cache[ranks].store(value, std::memory_order_relaxed);
-        return value;
+        if (value < 0) { return {}; }
+        return {value >> 16, (value >> 6) & 1023, value & 63, S::kConsumers / 32, S::kStages, S::kStageBytes};
     }
 }
 
-int tile_capacity(int bm, int bn, int ranks) {
-    const auto by_bn = [&]<int BM>() {
+TileResidency tile_residency(int bm, int bn, int wt, int ranks) {
+    const auto by_bn = [&]<int BM, int WT>() {
         switch (bn) {
-        case 32: return tile_capacity<BM, 32>(ranks);
-        case 64: return tile_capacity<BM, 64>(ranks);
-        case 96: return tile_capacity<BM, 96>(ranks);
-        default: return tile_capacity<BM, 128>(ranks);
+        case 32: return tile_residency<BM, 32, WT>(ranks);
+        case 64: return tile_residency<BM, 64, WT>(ranks);
+        case 96: return tile_residency<BM, 96, WT>(ranks);
+        default: return tile_residency<BM, 128, WT>(ranks);
         }
     };
-    if (bm == 128) { return by_bn.template operator()<128>(); }
-    if (bm == 64) { return by_bn.template operator()<64>(); }
-    return by_bn.template operator()<32>();
+    const auto by_bm = [&]<int WT>() {
+        if (bm == 128) { return by_bn.template operator()<128, WT>(); }
+        if (bm == 64) { return by_bn.template operator()<64, WT>(); }
+        return by_bn.template operator()<32, WT>();
+    };
+    return wt == 16 ? by_bm.template operator()<16>() : by_bm.template operator()<32>();
 }
 
-// The tile schedule's modelled time for a shape (us). A round of a CTA takes the longer of the pipeline's latency
-// floor (kTileRoundFloorUs: 32 stages of 32 values, each waiting for copies a few stages old) and its share of the SM:
-// k CTAs on an SM run 2 BM BN 1024 FLOP each at kSmRate (reached from one 4-warp CTA). Waves follow the device's
-// cluster capacity, each a few us of ramp and tail. Fitted on RTX 5090 measurements (2026-11-22, lora_shrink bench,
-// the 27B's five sites at ranks 32 and 128, 256-4,096 columns, every token tile and cluster: 11 % rms error); the
-// plan's pick averaged 1.02x the best measured tile shape and cluster, 1.14x at worst.
+// The most consumer warps one of an SM's four sub-partitions issues for, `ctas` CTAs of `warps` consumers and a
+// producer each on the SM: a CTA's warps take consecutive slots, slot s on sub-partition s % 4. (The RTX 5090's timings
+// follow it: two CTAs of two 16-column warps an SM ran as slowly as two warps a sub-partition.)
+constexpr int most_per_partition(int ctas, int warps) {
+    int count[4] = {};
+    for (int c = 0; c < ctas; ++c) {
+        for (int w = 0; w < warps; ++w) { ++count[(c * (warps + 1) + w) % 4]; }
+    }
+    return std::max(std::max(count[0], count[1]), std::max(count[2], count[3]));
+}
+
+// The tile schedule's modelled time for a shape of 32-column warps (us), the plan's choice among them. A round of a
+// CTA takes the longer of the pipeline's latency floor (kTileRoundFloorUs: 32 stages of 32 values, each waiting for
+// copies a few stages old) and its share of the SM: k CTAs on an SM run 2 BM BN 1024 FLOP each at kSmRate (reached
+// from one 4-warp CTA); a wave of more clusters than the GPCs hold at one CTA an SM has two CTAs on its busiest SMs.
+// Waves follow the device's cluster capacity, each a few us of ramp and tail. Fitted on RTX 5090 measurements
+// (2026-11-22, lora_shrink bench, the 27B's five sites at ranks 32 and 128, 256-4,096 columns, every token tile and
+// cluster: 11 % rms error); the plan's pick averaged 1.02x the best measured tile shape and cluster, 1.14x at worst.
 constexpr double kSmRate           = 1.0e6; // FLOP per us
 constexpr double kTileRoundFloorUs = 11.0;
 constexpr double kWaveOverheadUs   = 3.0;
-double tile_model_us(int bm, int bn, int slices, int ranks, int rounds, int tokens, int capacity) {
+double tile_model_us(const TileResidency& r, int bm, int bn, int slices, int ranks, int rounds, int tokens) {
     const int clusters = (tokens + bm - 1) / bm * slices;
     const int sms      = sm_count();
     const double work  = 2.0 * bm * bn * kGroupValues;
     const auto wave    = [&](int wave_clusters) {
-        const int on_sm = (wave_clusters * ranks + sms - 1) / sms;
+        int on_sm = (wave_clusters * ranks + sms - 1) / sms;
+        if (wave_clusters > r.one_per_sm) { on_sm = std::max(on_sm, 2); }
         return rounds * std::max(kTileRoundFloorUs, on_sm * work / kSmRate);
     };
-    const int full = clusters / capacity, rest = clusters % capacity;
-    return full * wave(capacity) + (rest > 0 ? wave(rest) : 0.0) + (full + (rest > 0)) * kWaveOverheadUs;
+    const int full = clusters / r.capacity, rest = clusters % r.capacity;
+    return full * wave(r.capacity) + (rest > 0 ? wave(rest) : 0.0) + (full + (rest > 0)) * kWaveOverheadUs;
 }
 
-// The modelled fastest token tile and cluster for a call: every token tile, and every distinct split of the groups into
-// rounds (ranks = ceil(groups / rounds), at most kMaxRanks), over row slices of at most 128 rows.
+// A shape's time in the finer model that weighs a 16-column challenger against the plan's choice (us). A wave's round
+// takes the longest of a CTA's own round (kRoundUs of barriers and reduction, then the longer of its busiest
+// sub-partition's chains, kWarpGroupUs a 32-column warp's group, and its ring's copies, kRingPassUs a pass of the
+// ring), the SM's busiest sub-partition over all its CTAs (kSharedWarpGroupUs a 32-column warp's group), and the
+// wave's copies at kL2BytesPerUs; the call adds kFirstWaveUs of ramp and tail and kNextWaveUs a further wave. Fitted
+// on RTX 5090 measurements (2026-11-22, lora_shrink bench with every token tile, warp width and cluster forced: the
+// 27B's five sites at ranks 32 and 128, 128-4,096 columns, 1,870 points: 11 % rms error).
+constexpr double kRoundUs           = 2.592;
+constexpr double kWarpGroupUs       = 6.447;
+constexpr double kRingPassUs        = 0.8834;
+constexpr double kSharedWarpGroupUs = 7.875;
+constexpr double kL2BytesPerUs      = 6.192e6;
+constexpr double kFirstWaveUs       = 6.199;
+constexpr double kNextWaveUs        = 3.301;
+double tile_fitted_us(const TileResidency& r, int bm, int wt, int slices, int ranks, int rounds, int tokens) {
+    const int clusters = (tokens + bm - 1) / bm * slices;
+    const int sms      = sm_count();
+    const double own   = most_per_partition(1, r.warps) * wt / 32.0;
+    const double ring  = static_cast<double>(kGroupValues / kTileStageK) / r.stages; // ring passes a round
+    const auto round   = [&](int wave_clusters) {
+        const int ctas      = wave_clusters * ranks;
+        const int on_sm     = std::min(r.per_sm, (ctas + sms - 1) / sms);
+        const double shared = most_per_partition(on_sm, r.warps) * wt / 32.0;
+        const double bytes  = static_cast<double>(ctas) * (kGroupValues / kTileStageK) * r.stage_bytes;
+        return std::max({kRoundUs + std::max(kWarpGroupUs * own, kRingPassUs * ring), kSharedWarpGroupUs * shared,
+                         bytes / kL2BytesPerUs});
+    };
+    const int full = clusters / r.capacity, rest = clusters % r.capacity;
+    return rounds * (full * round(r.capacity) + (rest > 0 ? round(rest) : 0.0)) + kFirstWaveUs +
+           (full + (rest > 0) - 1) * kNextWaveUs;
+}
+
+// A 16-column challenger replaces the plan's choice (its tile, or the base schedules) when its fitted time times this
+// is below the choice's (the fitted model's error). Over the measurements above, against the plan before both (no
+// challenger, no one-CTA-an-SM bound): the bound changed 11 of 110 calls (rank-128 down_proj at 1,792 columns 23 %
+// faster, the others 0.2-12 %), the challenger 5 (rank-32 down_proj at 1,024, 1,280 and 1,792 columns 17, 31 and 15 %,
+// o_proj at 1,280 16 %, gate/up at 768 5 %), and none was slower.
+constexpr double kChallengeMargin = 1.1;
+// The fastest a challenger can be: one round of a 16-column warp's chains and the call's ramp and tail.
+constexpr double kChallengerMinUs = kRoundUs + kWarpGroupUs / 2 + kFirstWaveUs;
+
+// The plan's row tile and slices for a call: slices of at most 128 rows.
+void plan_rows(TilePlan& plan, int rows) {
+    plan.slices = (rows + 127) / 128;
+    plan.bn     = ((rows + plan.slices - 1) / plan.slices + 31) / 32 * 32;
+    plan.slices = (rows + plan.bn - 1) / plan.bn;
+}
+
+// The modelled fastest token tile and cluster of 32-column warps for a call: every token tile, and every distinct
+// split of the groups into rounds (ranks = ceil(groups / rounds), at most kMaxRanks), over row slices of at most 128
+// rows.
 TilePlan tile_plan(int rows, int k, int tokens) {
     TilePlan plan;
+    plan_rows(plan, rows);
     const int groups = k / kGroupValues;
-    plan.slices      = (rows + 127) / 128;
-    plan.bn          = ((rows + plan.slices - 1) / plan.slices + 31) / 32 * 32;
-    plan.slices      = (rows + plan.bn - 1) / plan.bn;
     for (const int bm : {32, 64, 128}) {
         int previous = 0;
         for (int rounds = 1; rounds <= groups; ++rounds) {
             const int ranks = (groups + rounds - 1) / rounds;
             if (ranks > kMaxRanks || ranks == previous) { continue; }
-            previous           = ranks;
-            const int capacity = tile_capacity(bm, plan.bn, ranks);
-            if (capacity <= 0) { continue; }
+            previous                      = ranks;
+            const TileResidency residency = tile_residency(bm, plan.bn, 32, ranks);
+            if (residency.capacity <= 0) { continue; }
             const double us =
-                tile_model_us(bm, plan.bn, plan.slices, ranks, (groups + ranks - 1) / ranks, tokens, capacity);
+                tile_model_us(residency, bm, plan.bn, plan.slices, ranks, (groups + ranks - 1) / ranks, tokens);
             if (plan.us == 0.0 || us < plan.us) {
                 plan.us    = us;
                 plan.bm    = bm;
@@ -874,16 +966,52 @@ TilePlan tile_plan(int rows, int k, int tokens) {
     return plan;
 }
 
-template <int BM, int BN>
+// The plan's choice in the fitted model.
+double tile_fitted_us(const TilePlan& plan, int k, int tokens) {
+    const int groups = k / kGroupValues;
+    return tile_fitted_us(tile_residency(plan.bm, plan.bn, plan.wt, plan.ranks), plan.bm, plan.wt, plan.slices,
+                          plan.ranks, (groups + plan.ranks - 1) / plan.ranks, tokens);
+}
+
+// The fittest 16-column shape for a call whose every wave holds one CTA an SM (each of its at most 4 warps then has a
+// sub-partition to itself, where the fitted model was measured to hold), or none (bm 0).
+TilePlan tile_challenger(int rows, int k, int tokens) {
+    TilePlan plan;
+    plan.wt = 16;
+    plan_rows(plan, rows);
+    const int groups = k / kGroupValues;
+    for (const int bm : {32, 64}) {
+        int previous = 0;
+        for (int rounds = 1; rounds <= groups; ++rounds) {
+            const int ranks = (groups + rounds - 1) / rounds;
+            if (ranks > kMaxRanks || ranks == previous) { continue; }
+            previous                      = ranks;
+            const TileResidency residency = tile_residency(bm, plan.bn, 16, ranks);
+            if (residency.capacity <= 0) { continue; }
+            const int clusters = (tokens + bm - 1) / bm * plan.slices;
+            if (std::min(clusters, residency.capacity) > residency.one_per_sm) { continue; }
+            const double us =
+                tile_fitted_us(residency, bm, 16, plan.slices, ranks, (groups + ranks - 1) / ranks, tokens);
+            if (plan.us == 0.0 || us < plan.us) {
+                plan.us    = us;
+                plan.bm    = bm;
+                plan.ranks = ranks;
+            }
+        }
+    }
+    return plan;
+}
+
+template <int BM, int BN, int WT>
 void launch_tile_as(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStream_t stream, const TilePlan& plan) {
-    using S          = ShrinkTile<BM, BN>;
+    using S          = ShrinkTile<BM, BN, WT>;
     const int tokens = x.ne[1];
     const ShrinkTileDescriptors descriptors{shrink_tile_map(a.a, a.rows, a.k, BN), shrink_tile_map(x.data, tokens, a.k, BM)};
     const auto launch = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
-        constexpr auto kernel  = lora_shrink_tile_kernel<BM, BN, InPlace>;
+        constexpr auto kernel  = lora_shrink_tile_kernel<BM, BN, WT, InPlace>;
         static bool configured = [] {
             const std::size_t most = std::min(S::bytes(1), static_cast<std::size_t>(shared_optin_bytes()));
-            CUDA_CHECK(cudaFuncSetAttribute(lora_shrink_tile_kernel<BM, BN, InPlace>,
+            CUDA_CHECK(cudaFuncSetAttribute(lora_shrink_tile_kernel<BM, BN, WT, InPlace>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(most)));
             return true;
         }();
@@ -918,25 +1046,33 @@ void launch_tile_as(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaS
 #endif
 }
 
-template <int BM>
+template <int BM, int WT>
 void launch_tile_bn(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStream_t stream, const TilePlan& plan) {
+    const auto as = [&]<int BN>() {
+        if constexpr (kTileShape<BM, BN, WT>) {
+            return launch_tile_as<BM, BN, WT>(x, a, u, stream, plan);
+        } else {
+            throw std::logic_error("lora_shrink: the plan chose a tile without a kernel");
+        }
+    };
     switch (plan.bn) {
-    case 32: return launch_tile_as<BM, 32>(x, a, u, stream, plan);
-    case 64: return launch_tile_as<BM, 64>(x, a, u, stream, plan);
-    case 96:
-        if constexpr (kTileShape<BM, 96>) { return launch_tile_as<BM, 96>(x, a, u, stream, plan); }
-        break;
-    default:
-        if constexpr (kTileShape<BM, 128>) { return launch_tile_as<BM, 128>(x, a, u, stream, plan); }
-        break;
+    case 32: return as.template operator()<32>();
+    case 64: return as.template operator()<64>();
+    case 96: return as.template operator()<96>();
+    default: return as.template operator()<128>();
     }
-    throw std::logic_error("lora_shrink: the plan chose a tile without a kernel");
+}
+
+template <int WT>
+void launch_tile_bm(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStream_t stream, const TilePlan& plan) {
+    if (plan.bm == 128) { return launch_tile_bn<128, WT>(x, a, u, stream, plan); }
+    if (plan.bm == 64) { return launch_tile_bn<64, WT>(x, a, u, stream, plan); }
+    launch_tile_bn<32, WT>(x, a, u, stream, plan);
 }
 
 void launch_tile(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStream_t stream, const TilePlan& plan) {
-    if (plan.bm == 128) { return launch_tile_bn<128>(x, a, u, stream, plan); }
-    if (plan.bm == 64) { return launch_tile_bn<64>(x, a, u, stream, plan); }
-    launch_tile_bn<32>(x, a, u, stream, plan);
+    if (plan.wt == 16) { return launch_tile_bm<16>(x, a, u, stream, plan); }
+    launch_tile_bm<32>(x, a, u, stream, plan);
 }
 
 // From this many columns a call streams x once instead of splitting K: the split schedule reads x once per 16-row tile
@@ -1118,20 +1254,29 @@ void lora_shrink(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStre
         fail("u must be contiguous BF16 [rows, T]");
     }
     // The tile schedule where its modelled time is the lower, else the split schedule below kStreamMinTokens columns
-    // and the stream schedule from there (where it has the height and fits). Every schedule gives the same bits.
-    // A base call faster than any tile (a tile's round and wave) skips the plan's host work. A captured call (a decode or
-    // verification round: at most the lanes times the draft window, 64 columns at 8 lanes of 8) keeps the base
-    // schedules, the faster ones at those widths in every measured shape (the tile's plan would query occupancy and
-    // stage TMA descriptors inside the capture).
+    // and the stream schedule from there (where it has the height and fits); a 16-column challenger replaces that
+    // choice where the fitted model finds it faster by kChallengeMargin. Every schedule gives the same bits.
+    // A base call faster than any tile skips the plan's host work. A captured call (a decode or verification round: at
+    // most the lanes times the draft window, 64 columns at 8 lanes of 8) keeps the base schedules, the faster ones at
+    // those widths in every measured shape (the tile's plan would query occupancy and stage TMA descriptors inside the
+    // capture).
     const std::int32_t tokens = x.ne[1];
     const double base_us      = detail::base_model_us(a.rows, a.k, tokens);
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
     if (capture == cudaStreamCaptureStatusNone && tokens >= detail::kTileMinTokens &&
         a.k >= 2 * kLoraShrinkChunk * kLoraShrinkGroup &&
-        base_us > (detail::kTileRoundFloorUs + detail::kWaveOverheadUs) * detail::kTileMargin) {
-        const detail::TilePlan plan = detail::tile_plan(a.rows, a.k, tokens);
-        if (plan.bm > 0 && plan.us * detail::kTileMargin < base_us) {
+        base_us > std::min((detail::kTileRoundFloorUs + detail::kWaveOverheadUs) * detail::kTileMargin,
+                           detail::kChallengerMinUs * detail::kChallengeMargin)) {
+        const detail::TilePlan plan       = detail::tile_plan(a.rows, a.k, tokens);
+        const bool tile                   = plan.bm > 0 && plan.us * detail::kTileMargin < base_us;
+        const detail::TilePlan challenger = detail::tile_challenger(a.rows, a.k, tokens);
+        if (challenger.bm > 0 &&
+            challenger.us * detail::kChallengeMargin < (tile ? detail::tile_fitted_us(plan, a.k, tokens) : base_us)) {
+            detail::launch_tile(x, a, u, stream, challenger);
+            return;
+        }
+        if (tile) {
             detail::launch_tile(x, a, u, stream, plan);
             return;
         }
