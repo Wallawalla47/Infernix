@@ -19,10 +19,17 @@ using namespace infernix::test;
 
 namespace {
 
-constexpr int kDim     = 72;
-constexpr int kHeads   = 16;
-constexpr float kScale = 0.11785113019775792073F;
-constexpr ops::AttentionHeadGeometry kGeometry{kDim, kHeads, kHeads};
+constexpr int kHeads = 16;
+
+// The registered head widths: Qwen3.5 Vision's D72 and Inkling 2 Vision's D64, each at scale 1/sqrt(D).
+struct Profile {
+    int dim;
+    float scale;
+    [[nodiscard]] ops::AttentionHeadGeometry geometry() const { return {dim, kHeads, kHeads}; }
+};
+constexpr Profile kD72{72, 0.11785113019775792073F};
+constexpr Profile kD64{64, 0.125F};
+constexpr ops::AttentionHeadGeometry kGeometry{72, kHeads, kHeads};
 
 constexpr ReductionCriterion kPackedAttentionBf16Criterion{
     .relative_l2                     = 2.5e-3,
@@ -30,8 +37,8 @@ constexpr ReductionCriterion kPackedAttentionBf16Criterion{
     .gross_relative_to_max_reference = 2.8e-3,
 };
 
-std::size_t index_of(int token, int head, int d) {
-    return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * kDim +
+std::size_t index_of(int dim, int token, int head, int d) {
+    return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * dim +
            static_cast<std::size_t>(d);
 }
 
@@ -41,29 +48,30 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
-void packed_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
+void packed_attention_oracle(int dim, const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
                              std::vector<double>& out, int workers = 1) {
-    const double scale = 1.0 / std::sqrt(72.0);
+    const double scale = 1.0 / std::sqrt(static_cast<double>(dim));
     out.assign(q.size(), 0.0);
+    const ops::AttentionHeadGeometry geometry{dim, kHeads, kHeads};
 
     for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
         const int begin = cu_seqlens[segment];
         const int end   = cu_seqlens[segment + 1];
         naive_dense_softmax_attention(
-            kGeometry, end - begin, end - begin, scale,
+            geometry, end - begin, end - begin, scale,
             [&](int d, int head, int token) {
-                return static_cast<double>(q[index_of(begin + token, head, d)]);
+                return static_cast<double>(q[index_of(dim, begin + token, head, d)]);
             },
             [&](int d, int head, int token) {
-                return static_cast<double>(k[index_of(begin + token, head, d)]);
+                return static_cast<double>(k[index_of(dim, begin + token, head, d)]);
             },
             [&](int d, int head, int token) {
-                return static_cast<double>(v[index_of(begin + token, head, d)]);
+                return static_cast<double>(v[index_of(dim, begin + token, head, d)]);
             },
             [](int, int) { return true; },
             [&](int d, int head, int token, double value) {
-                out[index_of(begin + token, head, d)] = value;
+                out[index_of(dim, begin + token, head, d)] = value;
             },
             workers);
     }
@@ -87,7 +95,7 @@ enum class InputProfile {
 };
 
 // Flat scores (candidates WF-02, ninferpro 8f3d92c41d): Q and every key hold this amplitude, so every key scores
-// 72 * 108^2 = 839,808 exactly (BF16-exact, its partial sums exact in FP32) and the row maximum holds from the first
+// 72 * 108^2 = 839,808 (D64: 746,496) exactly (BF16-exact, its partial sums exact in FP32) and the row maximum holds from the first
 // key tile on. The scaled maximum rounds with a residual of about -4e-3, so the history factor before UV-01,
 // exp2(fma(previous, scale, -rn(maximum * scale))), sat 2^e off 1 at each of a 4,096-token segment's 64 key tiles and
 // tilted the first and last tiles' weights ~19 % apart; V halved at the segment's midpoint (2 then 1, both
@@ -111,7 +119,11 @@ const char* entry_name(PublicEntry entry) {
 }
 
 int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProfile storage_profile,
-             PublicEntry entry, InputProfile input_profile = InputProfile::Random, int oracle_workers = 1) {
+             PublicEntry entry, InputProfile input_profile = InputProfile::Random, int oracle_workers = 1,
+             Profile profile = kD72) {
+    const int kDim                         = profile.dim;
+    const float kScale                     = profile.scale;
+    const ops::AttentionHeadGeometry kGeometry = profile.geometry();
     const int tokens              = cu_seqlens.back();
     const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
     const std::size_t value_count = static_cast<std::size_t>(tokens) * token_plane;
@@ -145,7 +157,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     round_to_bf16(v);
 
     std::vector<double> reference;
-    packed_attention_oracle(q, k, v, cu_seqlens, reference, oracle_workers);
+    packed_attention_oracle(kDim, q, k, v, cu_seqlens, reference, oracle_workers);
 
     const auto q_expected = bf16_bits(q);
     const auto k_expected = bf16_bits(k);
@@ -222,7 +234,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     }
     cuda_synchronize();
 
-    const std::string label = "packed_softmax_attention T=" + std::to_string(tokens) +
+    const std::string label = "packed_softmax_attention D=" + std::to_string(kDim) + " T=" + std::to_string(tokens) +
                               " S=" + std::to_string(cu_seqlens.size() - 1) + " " +
                               storage_name(storage_profile) + " " + entry_name(entry);
     const std::string qualified_label =
@@ -292,6 +304,21 @@ int run_softmax_attention_plain_and_packed_tests() {
     // (a 64 x 64 patch grid): holds the packed kernel's history rescale to exactly 1.
     failures += run_case({0, 4096}, 2027u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments,
                          InputProfile::FlatScores, 16);
+    // D64 (Inkling 2 Vision): one image a call, a class token before its patches (1 + 4 * cells keys, odd), the
+    // fused QKV GEMM's interleaved rows; packed segments and isolation as for D72.
+    failures += run_case({0, 21}, 41u, StorageProfile::InterleavedQkv, PublicEntry::Plain, InputProfile::Random, 1,
+                         kD64);
+    failures += run_case({0, 49}, 43u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments,
+                         InputProfile::Random, 1, kD64);
+    failures += run_case({0, 4, 11}, 47u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena,
+                         InputProfile::SegmentIsolation, 1, kD64);
+    failures += run_case({0, 21, 70, 111}, 53u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena,
+                         InputProfile::Random, 1, kD64);
+    failures += run_case({0, 257}, 59u, StorageProfile::InterleavedQkv, PublicEntry::Plain, InputProfile::Random, 1,
+                         kD64);
+    // A 32 x 32-cell image (4,097 keys) with every key scoring alike.
+    failures += run_case({0, 4097}, 61u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments,
+                         InputProfile::FlatScores, 16, kD64);
 
     if (failures != 0) {
         std::cerr << "packed_softmax_attention failures=" << failures << '\n';

@@ -13,16 +13,16 @@ std::int64_t stride_elements(const Tensor& tensor, int dim) {
     return tensor.nb[dim] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
 }
 
-template <int Br, int Bc>
+template <int D, int Br, int Bc>
 void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
                   const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
                   std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
     constexpr int kThreads = Br * 2;
     constexpr int kSmemBytes =
-        (Br + 2 * Bc) * kPackedAttentionPaddedD * static_cast<int>(sizeof(__nv_bfloat16));
+        (Br + 2 * Bc) * PackedAttentionDim<D>::Padded * static_cast<int>(sizeof(__nv_bfloat16));
     const dim3 grid(static_cast<unsigned>(query_tiles),
                     static_cast<unsigned>(kPackedAttentionHeads), 1u);
-    packed_attention_flash_kernel<Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
+    packed_attention_flash_kernel<D, Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
         static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
@@ -46,9 +46,12 @@ void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
         CUDA_CHECK(cudaGetLastError());
     }
 
-    launch_flash<kPackedAttentionBr, kPackedAttentionBc>(
-        q, k, v, packed_segments ? static_cast<const PackedAttentionTile*>(tiles->data) : nullptr,
-        0, max_tiles, out, stream);
+    const auto* tile_data = packed_segments ? static_cast<const PackedAttentionTile*>(tiles->data) : nullptr;
+    if (q.ne[0] == 64) {
+        launch_flash<64, kPackedAttentionBr, kPackedAttentionBc>(q, k, v, tile_data, 0, max_tiles, out, stream);
+    } else {
+        launch_flash<72, kPackedAttentionBr, kPackedAttentionBc>(q, k, v, tile_data, 0, max_tiles, out, stream);
+    }
 }
 
 std::int32_t packed_attention_uniform_tile(std::int32_t segment_length) {
@@ -72,23 +75,33 @@ std::int32_t packed_attention_uniform_tile(std::int32_t segment_length) {
     return best_tile;
 }
 
+template <int D>
+void uniform_launch(const Tensor& q, const Tensor& k, const Tensor& v, std::int32_t segment_length,
+                    std::int32_t tile_size, std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
+    switch (tile_size) {
+    case 16:
+        launch_flash<D, 16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        return;
+    case 32:
+        launch_flash<D, 32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        return;
+    case 64:
+        launch_flash<D, 64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        return;
+    default:
+        throw std::invalid_argument("packed_softmax_attention: invalid uniform tile size");
+    }
+}
+
 void packed_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k, const Tensor& v,
                                                std::int32_t segment_length, std::int32_t tile_size,
                                                Tensor& out, cudaStream_t stream) {
     const std::int32_t segments    = q.ne[2] / segment_length;
     const std::int32_t query_tiles = segments * ((segment_length + tile_size - 1) / tile_size);
-    switch (tile_size) {
-    case 16:
-        launch_flash<16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
-        return;
-    case 32:
-        launch_flash<32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
-        return;
-    case 64:
-        launch_flash<64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
-        return;
-    default:
-        throw std::invalid_argument("packed_softmax_attention: invalid uniform tile size");
+    if (q.ne[0] == 64) {
+        uniform_launch<64>(q, k, v, segment_length, tile_size, query_tiles, out, stream);
+    } else {
+        uniform_launch<72>(q, k, v, segment_length, tile_size, query_tiles, out, stream);
     }
 }
 

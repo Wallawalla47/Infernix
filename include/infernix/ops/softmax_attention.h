@@ -124,9 +124,9 @@ struct ContextAttentionExecutionEnvelope {
 /**
  * Dense, non-causal single-segment attention.
  *
- * The registered profile is D=72, Hq=Hkv=16, scale=1/sqrt(72). q/k/v are BF16 [72,16,T]
- * with contiguous feature and head dimensions; their token stride may be padded. out is contiguous
- * BF16 [72,16,T]. Every query attends all T keys. q/k/v/out are mutually non-overlapping, inputs
+ * The registered profiles are D=72 (Qwen3.5 Vision) and D=64 (Inkling 2 Vision), Hq=Hkv=16,
+ * scale=1/sqrt(D). q/k/v are BF16 [D,16,T] with contiguous feature and head dimensions; their token
+ * stride may be padded. out is contiguous BF16 [D,16,T]. Every query attends all T keys. q/k/v/out are mutually non-overlapping, inputs
  * are unchanged, out is completely overwritten, and the Op has no persistent state side effect.
  * The single segment needs no transient workspace.
  */
@@ -135,7 +135,7 @@ void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                        Tensor& out, cudaStream_t stream);
 
 /**
- * Packed block-diagonal dense attention for the same D72/H16 profile.
+ * Packed block-diagonal dense attention for the same D72/D64 H16 profiles.
  *
  * cu_seqlens is contiguous device I32 [S+1], starts at 0, ends at T, and is strictly increasing.
  * Each range [cu_seqlens[s],cu_seqlens[s+1]) is an independent non-causal segment; no score crosses

@@ -634,5 +634,11 @@ infernix_add_family_op_test(infernix_inkling2_dspark_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_dspark.cu"
   LIBRARIES infernix_ops)
 
+# Inkling 2's vision-tower elementwise Ops (the fused QKV bias with the axial rotary on interleaved pairs, the
+# layer-scaled residual) against FP64 oracles; single-row calls equal to many-row calls, repeated calls equal.
+infernix_add_family_op_test(infernix_inkling2_vision_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_vision.cu"
+  LIBRARIES infernix_ops)
+
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()
