@@ -627,7 +627,7 @@ Some paged profiles assume 256-wide heads (FP8-row256; VQ2/K4V2's H256 rotation)
 | FP8 E4M3 with unit scales (vLLM's choice for this model) | candidate: ‖k‖ ≤ 22.6 and V's unit RMS keep every element inside E4M3's range without per-row scales (2 KiB per token per visit, no scale planes); qualified like any profile |
 | `fp8` (row), `k8v4` | need a row-128 variant |
 | `nvfp4` (G16) | width-agnostic; second wave |
-| `vq2`, `k4v2` | need an H128 rotation and retrained codebooks: out of scope until asked |
+| `vq2`, `k4v2` | need an H128 rotation and D128 kernels; their codebooks are model-free (VQ2's 512 patterns trained on i.i.d. Gaussian 8-value words, `tools/kv_codebook/make_vq2_codebook.py`; Q4's unit-Gaussian Lloyd-Max levels, `q4_lloyd_codec.cuh`), so whether Inkling's H128-rotated rows are Gaussian enough is to be measured; out of scope until asked |
 
 K is L2-clipped (‖k‖ ≤ 22.6) and V is RMS-normalized per head, so both are bounded: favourable for 8-bit rows. Every
 enabled profile is qualified ([model quality §6](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
