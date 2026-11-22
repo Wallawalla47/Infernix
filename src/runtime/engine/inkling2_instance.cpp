@@ -76,8 +76,8 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
         throw std::invalid_argument("--q8-weights is approximate; the reproducible route (--reproducible) refuses it");
     }
     if (options.q8_weights) {
-        report(options, "Inkling 2: --q8-weights: the attention input projections and the head run as 8-bit weights "
-                        "(approximate: the output differs from the artifact's BF16 weights)");
+        report(options, "Inkling 2: --q8-weights: the attention input and output projections and the head run as 8-bit "
+                        "weights (approximate: the output differs from the artifact's BF16 weights)");
     }
     refuse(!models::inkling2::kv_codec(options.kv_cache).has_value(),
            "--kv-dtype: bf16 (BF16 keys, FP16 values), bf16p, int8, fp8, nvfp4, k8v4, vq2 or k4v2");

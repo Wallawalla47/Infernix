@@ -339,9 +339,10 @@ std::vector<artifact::ObjectHandle> packable_objects(const TextWeights& w, const
 // faster as 8-bit weights in the decode round (2026-11-21, 4K context, captured round, against the shipped route):
 // each attention's fused input projections (the K2 parent and the sink/taps parent beside it, one launch) -7.6 % at
 // one column, -5.6 % at two, -1.3 % at eight; the head (in place of its bf16_p12 packing) -1.6 %, -1.4 %, -0.2 %.
-// W_o (-2.5 %, -1.4 %, +2.7 %: slower at eight, its arm also moving it from ops::linear's kernel to the fused
-// projections'; not re-timed since the wide Q8 kernel's spill fix) and the message gates' downs (-0.1 %, +0.1 %,
-// +0.1 %) stay BF16.
+// W_o since 2026-11-22 (re-timed on the fused projections' kernel at context 128, three runs each: 4.677 -> 4.571 ms
+// at one column, 5.878 -> 5.796 at two, 9.428 -> 9.256 at eight; KL from BF16 on the perplexity corpus's quick set
+// 1.064e-2 with it against 1.066e-2 without, top-1 96.01 % against 96.05 %). The message gates' downs (-0.1 %,
+// +0.1 %, +0.1 %) stay BF16.
 std::vector<artifact::ObjectHandle> q8_objects(const TextWeights& w, const std::vector<PendingWeight>& pending,
                                                const artifact::Reader& reader) {
     std::vector<bool> selected(pending.size(), false);
@@ -350,7 +351,8 @@ std::vector<artifact::ObjectHandle> q8_objects(const TextWeights& w, const std::
     };
     for (const auto& layer : w.layers) {
         const auto& a = layer.attention;
-        for (const WeightId id : {a.query, a.relative, a.gate, a.key, a.value, a.sink, a.key_taps, a.value_taps}) {
+        for (const WeightId id :
+             {a.query, a.relative, a.gate, a.key, a.value, a.sink, a.key_taps, a.value_taps, a.output}) {
             select(id);
         }
     }
