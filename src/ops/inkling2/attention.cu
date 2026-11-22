@@ -309,10 +309,9 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     const int rows  = kGroupHeads * count;
     const int first = a.map.first[lane];
     const int pos0  = a.map.position[c0];
-    pdl::enter();
     const Smem s    = carve(smem_raw, kGroupHeads * a.max_group_columns);
 
-    // Rows: their units of this split.
+    // Rows: their units of this split (the call plan only).
     const int lane_lo = row_units(full, pos0, first).lo;
     if (tid < rows) {
         RowState& r = s.rows[tid];
@@ -344,6 +343,25 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         }
         range[0] = lo, range[1] = hi;
     }
+    // A unit's K and V pages into the tile.
+    const auto issue_unit = [&](int b) {
+        const std::size_t page = kv_row(a.kv, lane, kv, b * kKeyUnit);
+        for (int i = tid; i < 2 * kKeyUnit * (kD / 8); i += kThreads) {
+            const int plane = i / (kKeyUnit * (kD / 8)), rest = i % (kKeyUnit * (kD / 8));
+            const int row = rest / (kD / 8), chunk = rest % (kD / 8);
+            const std::uint16_t* src = (plane == 0 ? a.kv.k : a.kv.v) + page + row * kD + 8 * chunk;
+            cp_async16((plane == 0 ? s.k : s.v) + row * kRowStride + 8 * chunk, src);
+        }
+    };
+    // Fused: no kernel of the round writes the visit's past keys and values (the call's own rows are computed here and
+    // patched into the tile), so the first unit's pages are issued before the dependency wait.
+    bool early = false;
+    if (a.fused) {
+        __syncthreads();
+        early = range[0] <= range[1];
+        if (early) { issue_unit(range[0]); }
+    }
+    pdl::enter();
     // The rows' q and r: from the prologue's workspace, or (fused) computed here in its arithmetic, a warp a row.
     if (a.fused) {
         for (int row = warp; row < rows; row += kWarps) {
@@ -381,14 +399,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     const int key = tid & (kKeyUnit - 1), sc_rg = tid >> 6;
 
     for (int b = range[0]; b <= range[1]; ++b) {
-        // The unit's K and V pages.
-        const std::size_t page = kv_row(a.kv, lane, kv, b * kKeyUnit);
-        for (int i = tid; i < 2 * kKeyUnit * (kD / 8); i += kThreads) {
-            const int plane = i / (kKeyUnit * (kD / 8)), rest = i % (kKeyUnit * (kD / 8));
-            const int row = rest / (kD / 8), chunk = rest % (kD / 8);
-            const std::uint16_t* src = (plane == 0 ? a.kv.k : a.kv.v) + page + row * kD + 8 * chunk;
-            cp_async16((plane == 0 ? s.k : s.v) + row * kRowStride + 8 * chunk, src);
-        }
+        if (!early || b != range[0]) { issue_unit(b); }
         cp_async_wait_all();
         __syncthreads();
         if (a.fused) {

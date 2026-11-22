@@ -779,7 +779,7 @@ struct SingleSmem {
     alignas(16) std::uint8_t x[S::kXStride];
     alignas(16) std::uint8_t h[S::kHStride];
     std::int32_t scaled[256];
-    float keys[kSingleExperts];
+    alignas(16) float keys[kSingleExperts];
     float sel[kTopK];
     std::int32_t routed[kTopK];
     float gamma[kTopK];
@@ -851,11 +851,16 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     }
     __syncthreads();
     if (tid < kSingleExperts) {
+        // Four keys a shared load, every load issued before the compares (a loop of dependent loads was ~2 us).
         const float key = sm.keys[tid];
         int rank        = 0;
-        for (int f = 0; f < kSingleExperts; ++f) {
-            const float other = sm.keys[f];
-            rank += (other > key || (other == key && f < tid)) ? 1 : 0;
+#pragma unroll
+        for (int f = 0; f < kSingleExperts; f += 4) {
+            const float4 o = *reinterpret_cast<const float4*>(sm.keys + f);
+            rank += (o.x > key || (o.x == key && f < tid)) ? 1 : 0;
+            rank += (o.y > key || (o.y == key && f + 1 < tid)) ? 1 : 0;
+            rank += (o.z > key || (o.z == key && f + 2 < tid)) ? 1 : 0;
+            rank += (o.w > key || (o.w == key && f + 3 < tid)) ? 1 : 0;
         }
         if (rank < kTopK) {
             sm.routed[rank] = tid;
