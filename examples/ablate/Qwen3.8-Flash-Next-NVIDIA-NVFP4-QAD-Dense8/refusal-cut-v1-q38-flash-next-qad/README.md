@@ -52,6 +52,12 @@ scored once, after the fit. Nine of its harmful prompts are HarmBench behaviors 
 direction prompts and two among the 40 held out. The one HarmBench refusal and the one JBB refusal are different
 prompts.
 
+**JBB-Behaviors on this repository's build** (the PR's, with #74's `/v1/score` merged in for the KL measure; RTX
+5090, 2026-11-21), graded the same way: with the sidecar 2 of the 100 harmful prompts are refused (stock: 96) and 0
+of the 100 benign ones (stock: 38). The stock model's 200 answers are identical to the older build's; with the
+sidecar, 5 answers differ and one verdict changes, a Sexual/Adult content prompt now refused. This build applies the
+last layer's MLP cut on the column that picks the first generated token, which the older build skipped.
+
 **Capability.** These runs use the chat template `tools/chat_templates/reasoning_effort_froggeric_v225_chat_template.jinja`.
 Generation tests decode greedily with thinking on. Multiple-choice tests (TruthfulQA) score log-likelihoods with thinking
 off. The noise band is twice the standard error.
@@ -59,7 +65,7 @@ off. The noise band is twice the standard error.
 | Test | Stock | With the sidecar | Reading |
 |---|---|---|---|
 | First-token KL, 100 harmless_alpaca prompts (thinking off, top-256 logprobs) | | mean 0.0437, median 0.0123, max 0.699; the top token changed on 4/100 | |
-| First-token KL, JBB-Behaviors benign (100) | | mean 1.58 | the stock model refuses 38 of these and the sidecar answers them, so their first tokens differ; the per-prompt split was not recorded |
+| First-token KL, JBB-Behaviors benign (100) | | mean 1.58 | the stock model refuses 38 of these and the sidecar answers them, so their first tokens differ. Split on this repository's build (the same mean, 1.58): 0.44 (median 0.16) on the 62 the stock model answers, 3.45 on the 38 it refuses |
 | HumanEval+ (164) | 153 (base tests 161) | 154 (162) | McNemar p = 1 |
 | GSM8K (1,319, 0-shot) | 91.58 % | 90.67 % | -0.91 points, noise band 2.21 |
 | IFEval (541), prompt-level strict / loose | 90.94 % / 93.16 % | 92.42 % / 93.72 % | within the noise band (3.36 / 3.01) |
