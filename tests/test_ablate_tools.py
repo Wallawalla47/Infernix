@@ -33,6 +33,7 @@ import ablate  # noqa: E402
 import ablate_fakes as F  # noqa: E402
 from ablatelib import capture as C  # noqa: E402
 from ablatelib import engine as EN  # noqa: E402
+from ablatelib import evaluate as EV  # noqa: E402
 from ablatelib import measure as M  # noqa: E402
 from ablatelib import platform_util as PU  # noqa: E402
 from ablatelib import production as P  # noqa: E402
@@ -150,7 +151,7 @@ def test_every_command_end_to_end_on_the_fake_engine(rig, capsys: pytest.Capture
     assert rig.prod_state.read_text(encoding="utf-8") == "production's own state\n"
     assert (run / "expert.state").read_text(encoding="utf-8") == "fake expert-cache state\n"
 
-    # list, pin, grade (a pinned name and a sidecar path), export
+    # list, pin, grade (a pinned name and a sidecar path), export, eval
     assert cli("list", run, "--study", "s1") == 0
     assert cli("pin", run, "--study", "s1", "--trial", 0, "--name", "c0") == 0
     assert {"sidecar.json", "d.f32.bin", "trial.json", "pinned.json"} <= {p.name for p in (run / "candidates" / "c0").iterdir()}
@@ -172,6 +173,10 @@ def test_every_command_end_to_end_on_the_fake_engine(rig, capsys: pytest.Capture
     shared = json.loads(text)
     assert shared["generation"]["fitted_under"]["artifact"] == rig.model.name
     assert shared["generation"]["fitted_under"]["kv_dtype"] == "bf16"
+    assert cli("eval", run, "c0", "--tasks", "kl") == 0
+    result = json.loads(next((run / "eval").glob("c0-*/results.json")).read_text(encoding="utf-8"))
+    assert result["tasks"]["kl"]["n"] == 6
+    assert math.isclose(result["tasks"]["kl"]["mean"], trials[0]["kl"], rel_tol=1e-9)   # the fit's own KL, re-measured
 
 
 def test_capture_refuses_ids_the_engine_does_not_count(rig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -294,6 +299,15 @@ def test_cli_takes_names_before_between_and_after_options(monkeypatch: pytest.Mo
     cli("chat", "R", "--context", "8192", "mine")
     assert [s.candidates for s in seen[:2]] == [["mine", "theirs"]] * 2
     assert seen[2].candidate == "mine" and seen[2].context == 8192
+
+
+def test_eval_comparisons() -> None:
+    a = {"p1": True, "p2": True, "p3": False, "p4": False}
+    b = {"p1": True, "p2": False, "p3": False, "p4": True}
+    assert EV.mcnemar(a, b) == {"stock_only": 1, "candidate_only": 1, "p_two_sided": 1.0}
+    stock = {"metrics": {"t/acc/none": {"value": 1.0, "stderr": 0.0}}, "truncated": 0}
+    assert EV.compare("gsm8k", stock, stock)["metrics"]["t/acc/none"]["reading"] == "within the noise band"
+    assert EV.compare("gsm8k", stock, stock, limited=True)["metrics"]["t/acc/none"]["reading"] is None
 
 
 if __name__ == "__main__":

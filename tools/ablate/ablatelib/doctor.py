@@ -14,6 +14,7 @@ from .capture import choose_mode, shard_bytes
 from .engine import Engine
 
 REQUIRED = {"numpy": "numpy", "optuna": "optuna", "jinja2": "jinja2", "tokenizers": "tokenizers"}
+OPTIONAL_EVAL = {"lm_eval": "lm-eval (only for `eval`)"}
 
 
 def check(run, log=print) -> int:
@@ -27,12 +28,14 @@ def check(run, log=print) -> int:
         log(f"  {mark} {text}")
 
     say(sys.version_info >= (3, 11), f"Python {sys.version.split()[0]} (3.11 or newer: tomllib)")
-    for module, label in REQUIRED.items():
+    for module, label in {**REQUIRED, **OPTIONAL_EVAL}.items():
         try:
             m = importlib.import_module(module)
             say(True, f"{label} {getattr(m, '__version__', '')}".strip())
         except ImportError:
-            say(False, f"{label} is not installed (pip install -r tools/ablate/requirements.txt)")
+            say(None if module in OPTIONAL_EVAL else False,
+                f"{label} is not installed (pip install -r tools/ablate/requirements"
+                + ("-eval" if module in OPTIONAL_EVAL else "") + ".txt)")
 
     prod = run.production
     say(run.serve_binary.is_file(), f"infernix-serve: {run.serve_binary}")

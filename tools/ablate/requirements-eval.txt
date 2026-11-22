@@ -1,0 +1,3 @@
+# tools/ablate eval (capability tests), on top of requirements.txt. Tested with lm-eval 0.4.13.
+# lm-eval downloads its datasets (gsm8k, IFEval, TruthfulQA) from the Hugging Face Hub on first use.
+lm-eval[ifeval]==0.4.13

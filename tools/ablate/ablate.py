@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Fit a refusal-ablation sidecar (--ablate) for Qwen3.8-Flash-Next on your own setup.
+"""Fit a refusal-ablation sidecar (--ablate) for Qwen3.8-Flash-Next on your own setup, and evaluate it.
 
     python tools/ablate/ablate.py init RUN --production prod.txt      # your infernix-serve command line, once
     python tools/ablate/ablate.py all RUN --harmful H --harmless G --study s1
     python tools/ablate/ablate.py list RUN --study s1                  # pick a trial from the front
     python tools/ablate/ablate.py pin RUN --study s1 --trial 115 --name mine
     python tools/ablate/ablate.py grade RUN --harmful T --benign B mine
+    python tools/ablate/ablate.py eval RUN mine                        # capability: the stock model vs the candidate
     python tools/ablate/ablate.py export RUN mine --name my-cut
 
 `all` is doctor, prompts, capture, direction and fit in order; each also runs on its own. docs/ablate-fitting.md is
@@ -168,6 +169,16 @@ def cmd_export(a) -> int:
     return 0
 
 
+def cmd_eval(a) -> int:
+    from ablatelib import evaluate as E
+    run = Run.load(Path(a.run))
+    need_free_card(run)
+    out = E.evaluate(run, a.candidate, tasks=a.tasks, context=a.context, limit=a.limit, kl_prompts=a.kl_prompts,
+                     field=a.field, unsandboxed=a.unsandboxed_code)
+    print(f"summary: {out / 'summary.md'}")
+    return 0
+
+
 def cmd_all(a) -> int:
     from ablatelib import doctor
     run = Run.load(Path(a.run))
@@ -246,6 +257,16 @@ def main() -> int:
     p.add_argument("candidate", nargs="?")
     p.add_argument("--context", type=int)
     p.add_argument("--no-thinking", action="store_true")
+    p = command("eval", cmd_eval, "capability: the stock model against a candidate (needs requirements-eval.txt)")
+    p.add_argument("candidate")
+    p.add_argument("--tasks", default="kl,gsm8k,ifeval,truthfulqa,humaneval",
+                   help="comma list of kl, gsm8k, ifeval, truthfulqa, humaneval")
+    p.add_argument("--context", type=int, help="context of the evaluation engines (default: the run's, 16384)")
+    p.add_argument("--limit", type=int, help="first N items of each task (a quick look; not comparable to a full run)")
+    p.add_argument("--kl-prompts", help="harmless prompts for the KL test (default: the run's held-out harmless)")
+    p.add_argument("--field")
+    p.add_argument("--unsandboxed-code", action="store_true",
+                   help="humaneval without bubblewrap: the model's code runs as you, with only a 90 s timeout")
     p = command("export", cmd_export, "a shareable copy of a candidate: no local paths, what it was fitted under")
     p.add_argument("candidate")
     p.add_argument("--name", required=True)
