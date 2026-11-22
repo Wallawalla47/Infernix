@@ -13,8 +13,15 @@ namespace {
 
 std::uint32_t round_up16(std::uint32_t value) { return (value + 15U) / 16U * 16U; }
 
+// " (it names <base>)" when the adapter names its base model.
+std::string base_named(const artifact::PeftLoraAdapter& adapter) {
+    return adapter.base_model().empty() ? std::string{} : " (it names " + adapter.base_model() + ")";
+}
+
+// A refusal names the adapter, what it adapts that this model or Infernix cannot, and why.
 [[noreturn]] void refuse(const artifact::PeftLoraAdapter& adapter, const std::string& what) {
-    throw artifact::ArtifactError("--lora " + adapter.weights_path().string() + ": " + what);
+    throw artifact::ArtifactError("LoRA adapter " + adapter.weights_path().parent_path().string() + " is refused: " +
+                                  what);
 }
 
 } // namespace
@@ -28,39 +35,46 @@ LoraBinding bind_lora(const std::filesystem::path& path, const TextConfig& text)
     // text-only export's "model.layers.N".
     static const std::regex kModule(R"(^model\.(language_model\.)?layers\.(\d+)\.(self_attn|mlp|linear_attn)\.(.+)$)");
     std::uint32_t max_rank = 0;
+    std::string max_rank_module;
     for (std::size_t index = 0; index < adapter->modules().size(); ++index) {
         const artifact::PeftLoraModule& m = adapter->modules()[index];
         std::smatch match;
         if (!std::regex_match(m.module, match, kModule)) {
-            refuse(*adapter, "module '" + m.module +
-                                 "' is not a text layer's attention or MLP projection (vision, MTP, embeddings and the "
-                                 "head are not adapted)");
+            refuse(*adapter, "it adapts module '" + m.module +
+                                 "', which is not a text layer's attention or MLP projection. Infernix adapts the text "
+                                 "layers' q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj and down_proj, not the "
+                                 "vision tower, MTP, the embeddings or the head");
         }
         const std::uint64_t layer = std::stoull(match[2].str());
         const std::string block = match[3].str(), leaf = match[4].str();
         if (layer >= text.num_hidden_layers) {
-            refuse(*adapter, "module '" + m.module + "' names layer " + std::to_string(layer) + " of a " +
-                                 std::to_string(text.num_hidden_layers) + "-layer model");
+            refuse(*adapter, "it adapts module '" + m.module + "' in layer " + std::to_string(layer) +
+                                 ", but this model has " + std::to_string(text.num_hidden_layers) +
+                                 " layers: the adapter was trained for another base model" + base_named(*adapter));
         }
         LoraLayer& target = binding.layers[layer];
         const auto expect = [&](std::uint64_t in, std::uint64_t out) {
             if (m.in != in || m.out != out) {
-                refuse(*adapter, "module '" + m.module + "' maps [" + std::to_string(m.in) + "] to [" +
-                                     std::to_string(m.out) + "]; this model's projection maps [" + std::to_string(in) +
-                                     "] to [" + std::to_string(out) + "] (an adapter for another base model?)");
+                refuse(*adapter, "its module '" + m.module + "' maps [" + std::to_string(m.in) + "] to [" +
+                                     std::to_string(m.out) + "], but this model's projection maps [" + std::to_string(in) +
+                                     "] to [" + std::to_string(out) + "]: the adapter was trained for another base model" +
+                                     base_named(*adapter));
             }
         };
         const auto place = [&](std::optional<std::size_t>& slot) {
-            if (slot) { refuse(*adapter, "module '" + m.module + "' appears twice"); }
+            if (slot) { refuse(*adapter, "it holds module '" + m.module + "' twice"); }
             slot = index;
         };
         if (block == "linear_attn") {
-            refuse(*adapter, "module '" + m.module + "' is a linear-attention (Gated DeltaNet) projection, which "
-                                                     "this route does not adapt");
+            refuse(*adapter, "it adapts module '" + m.module +
+                                 "', a linear-attention (Gated DeltaNet) projection. Infernix adapts the full-attention "
+                                 "layers' q/k/v/o projections and the MLPs, not the Gated DeltaNet layers");
         }
         if (block == "self_attn") {
             if (text.layer_types.at(layer) != MixerKind::FullAttention || !text.attention) {
-                refuse(*adapter, "module '" + m.module + "' targets attention in a linear-attention layer");
+                refuse(*adapter, "it adapts attention module '" + m.module +
+                                     "', but that layer is a linear-attention (Gated DeltaNet) layer in this model: the "
+                                     "adapter was trained for another base model" + base_named(*adapter));
             }
             const AttentionConfig& a = *text.attention;
             if (leaf == "q_proj") {
@@ -76,12 +90,14 @@ LoraBinding bind_lora(const std::filesystem::path& path, const TextConfig& text)
                 expect(a.query_width(), text.hidden_size);
                 place(target.output);
             } else {
-                refuse(*adapter, "module '" + m.module + "' is not q_proj, k_proj, v_proj or o_proj");
+                refuse(*adapter, "it adapts attention module '" + m.module +
+                                     "'; Infernix adapts q_proj, k_proj, v_proj and o_proj");
             }
         } else {
             if (dense == nullptr) {
-                refuse(*adapter, "module '" + m.module + "' targets an MLP, but this model's are mixtures of experts, "
-                                                         "which this route does not adapt");
+                refuse(*adapter, "it adapts MLP module '" + m.module +
+                                     "', but this model's MLPs are mixtures of experts. Infernix applies LoRA adapters "
+                                     "to the dense models (the 27B) only");
             }
             if (leaf == "gate_proj") {
                 expect(text.hidden_size, dense->intermediate_size);
@@ -93,20 +109,27 @@ LoraBinding bind_lora(const std::filesystem::path& path, const TextConfig& text)
                 expect(dense->intermediate_size, text.hidden_size);
                 place(target.down);
             } else {
-                refuse(*adapter, "module '" + m.module + "' is not gate_proj, up_proj or down_proj");
+                refuse(*adapter, "it adapts MLP module '" + m.module +
+                                     "'; Infernix adapts gate_proj, up_proj and down_proj");
             }
         }
-        max_rank = std::max(max_rank, m.rank);
+        if (m.rank > max_rank) {
+            max_rank        = m.rank;
+            max_rank_module = m.module;
+        }
     }
     binding.padded_rank = round_up16(max_rank);
     if (binding.padded_rank > static_cast<std::uint32_t>(ops::kLoraMaxRank)) {
-        refuse(*adapter, "rank " + std::to_string(max_rank) + " exceeds " + std::to_string(ops::kLoraMaxRank));
+        refuse(*adapter, "its rank is " + std::to_string(max_rank) + " (module '" + max_rank_module +
+                             "'), and Infernix currently supports LoRA adapters up to rank " +
+                             std::to_string(ops::kLoraMaxRank));
     }
     // The shrink reads its input in groups of 1024 values.
     constexpr std::uint64_t kGroup = static_cast<std::uint64_t>(ops::kLoraShrinkChunk) * ops::kLoraShrinkGroup;
     const auto shrinkable = [&](std::uint64_t k, const char* what) {
         if (k % kGroup != 0) {
-            refuse(*adapter, std::string(what) + " width " + std::to_string(k) + " is not a multiple of 1024");
+            refuse(*adapter, std::string("this model's ") + what + " width " + std::to_string(k) +
+                                 " is not a multiple of 1024, which Infernix's LoRA kernels need");
         }
     };
     shrinkable(text.hidden_size, "the hidden");

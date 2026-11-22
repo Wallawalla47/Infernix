@@ -39,7 +39,7 @@ namespace infernix::ops {
  */
 inline constexpr std::int32_t kLoraShrinkChunk = 256;
 inline constexpr std::int32_t kLoraShrinkGroup = 4; // chunks, so K must be a multiple of 1024
-inline constexpr std::int32_t kLoraMaxRank     = 64; // padded rank of one adapter (a multiple of 16)
+inline constexpr std::int32_t kLoraMaxRank     = 128; // padded rank of one adapter (a multiple of 16)
 
 // A's rows for one input site: BF16 [rows, k] row-major (k fastest).
 struct LoraShrinkWeight {

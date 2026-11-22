@@ -7,7 +7,8 @@
 //   rank 0's shared memory, and rank 0 adds them in order after one cluster barrier. Many small CTAs stream A at full
 //   bandwidth where a whole-K CTA would be limited by one SM's.
 // - Stream (long prompts): one CTA takes every row of A over 32 columns and all of K, staging A and x through a
-//   cp.async ring, and keeps the chunk, group and total sums in registers. x is read once.
+//   cp.async ring, and keeps the chunk, group and total sums in registers. x is read once. A stack too tall for one
+//   CTA's ring (a wide adapter's) streams in slices of rows, one slice a CTA, in one launch.
 // Both add in the same order: chunk partials from +0 (MMA chain), groups from their first chunk, the total from its
 // first group.
 
@@ -154,8 +155,9 @@ __global__ __launch_bounds__(kThreads * G) void lora_shrink_split_kernel(const _
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Stream schedule (prompts). grid (ranks, ceil(T / 32)), cluster (ranks, 1, 1): rank r streams its own groups of K
-// (group_begin) for every row of A over 32 columns, so x is read once in all and the call has ranks x T / 32 CTAs.
+// Stream schedule (prompts). grid (ranks, ceil(T / 32), slices), cluster (ranks, 1, 1): rank r streams its own groups
+// of K (group_begin) for every row of A (of its slice) over 32 columns, so x is read once in all (once a slice) and the
+// call has ranks x T / 32 CTAs (a slice).
 // 4 warps, warp w takes n tile w (8 columns) over every 16-row tile of A. A and x pass through a ring of Stages
 // stages of kStageK values; rows are 128-byte lines (8 segments of 16 B) with the segment index swizzled by row % 8,
 // so ldmatrix's eight row addresses hit distinct banks. Each rank keeps its groups' sums in shared memory; after a
@@ -306,6 +308,153 @@ __global__ __launch_bounds__(kThreads) void lora_shrink_stream_kernel(const __nv
     cluster.sync(); // no rank leaves while rank 0 reads its group sums
 }
 
+// The schedule over one slice of the call's rows: rows [slice * MTiles * 16, + MTiles * 16) of MTiles * 16 * Slices
+// (slice = blockIdx.z), so a wide adapter's 16- to 24-tile stack, whose rows would not fit one CTA's ring, keeps the
+// schedule: x is read once per slice, A still once per 32 columns. A row's sums do not depend on its slice (the same
+// bits). The body is lora_shrink_stream_kernel's but for the slice's offsets and u's row stride; that kernel keeps
+// its own copy, since sharing one inlined body moved its register allocation (the narrow adapters' kernels stay as
+// they were).
+template <int MTiles, int Slices>
+__device__ __forceinline__ void lora_shrink_stream(const __nv_bfloat16* x, const __nv_bfloat16* __restrict__ a,
+                                                   __nv_bfloat16* u, int k, int tokens) {
+    constexpr int kRows       = MTiles * 16;
+    constexpr int kOutRows    = kRows * Slices; // u's row stride
+    static_assert(Slices > 1);
+    a += static_cast<std::int64_t>(blockIdx.z) * kRows * k;
+    u += static_cast<int>(blockIdx.z) * kRows;
+    constexpr int kStages     = kStreamStages<MTiles>;
+    constexpr int kStageBytes = (kRows + kTokenTile) * kLineB;
+    extern __shared__ __align__(16) unsigned char shared[];
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = static_cast<int>(cluster.block_rank()), ranks = static_cast<int>(cluster.num_blocks());
+    const int groups  = k / kGroupValues;
+    const int g_begin = group_begin(rank, ranks, groups), g_end = group_begin(rank + 1, ranks, groups);
+    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
+    const int token_base   = static_cast<int>(blockIdx.y) * kTokenTile;
+    const int k_begin      = g_begin * kGroupValues;
+    const int stages_total = (g_end - g_begin) * (kGroupValues / kStageK);
+    auto* group_sums       = reinterpret_cast<float4*>(shared + kStages * kStageBytes);
+    const auto sum_at      = [&](int local_group, int m) { return ((local_group * MTiles + m) * 4 + warp) * 32 + lane; };
+
+    const auto stage_load = [&](int stage, int kt) {
+        unsigned char* a_s = shared + stage * kStageBytes;
+        unsigned char* x_s = a_s + kRows * kLineB;
+        const int k0       = k_begin + kt * kStageK;
+        for (int i = static_cast<int>(threadIdx.x); i < kRows * 8; i += kThreads) {
+            const int row = i >> 3, segment = i & 7;
+            cp_async<16>(a_s + swizzled(row, segment), a + static_cast<std::int64_t>(row) * k + k0 + segment * 8);
+        }
+        for (int i = static_cast<int>(threadIdx.x); i < kTokenTile * 8; i += kThreads) {
+            const int t = i >> 3, segment = i & 7, token = token_base + t;
+            const bool valid = token < tokens;
+            cp_async_zfill<16>(x_s + swizzled(t, segment),
+                               x + static_cast<std::int64_t>(valid ? token : 0) * k + k0 + segment * 8, valid ? 16 : 0);
+        }
+    };
+
+    pdl::enter();
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) {
+        if (s < stages_total) { stage_load(s, s); }
+        cp_commit();
+    }
+
+    float chunk[MTiles][4] = {}, group[MTiles][4] = {};
+    // ldmatrix lane roles: A x4 (rows 0-15 at k + 0, then k + 8), x x2 (8 tokens at k + 0, then k + 8).
+    const int a_row = lane & 15, a_segment = lane >> 4;
+    const int b_row = lane & 7, b_segment = (lane >> 3) & 1;
+
+    for (int kt = 0; kt < stages_total; ++kt) {
+        cp_wait<kStages - 2>();
+        __syncthreads();
+        {
+            const int next = kt + kStages - 1;
+            if (next < stages_total) { stage_load(next % kStages, next); }
+            cp_commit();
+        }
+        const unsigned char* a_s = shared + (kt % kStages) * kStageBytes;
+        const unsigned char* x_s = a_s + kRows * kLineB;
+#pragma unroll
+        for (int step = 0; step < kStageK / 16; ++step) {
+            unsigned b0, b1;
+            ldmatrix_x2(b0, b1, smem_addr(x_s + swizzled(warp * 8 + b_row, step * 2 + b_segment)));
+#pragma unroll
+            for (int m = 0; m < MTiles; ++m) {
+                unsigned a0, a1, a2, a3;
+                ldmatrix_x4(a0, a1, a2, a3, smem_addr(a_s + swizzled(m * 16 + a_row, step * 2 + a_segment)));
+                mma_bf16(chunk[m][0], chunk[m][1], chunk[m][2], chunk[m][3], a0, a1, a2, a3, b0, b1);
+            }
+        }
+        // A chunk ends every kChunk / kStageK stages: fold it into its group; a group's sum goes to shared memory.
+        constexpr int kStagesPerChunk = kChunk / kStageK;
+        if ((kt + 1) % kStagesPerChunk == 0) {
+            const int chunk_index = kt / kStagesPerChunk; // within this rank's groups, which start at a group
+            const bool first_in_group = chunk_index % kGroup == 0, last_in_group = chunk_index % kGroup == kGroup - 1;
+#pragma unroll
+            for (int m = 0; m < MTiles; ++m)
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    group[m][v] = first_in_group ? chunk[m][v] : __fadd_rn(group[m][v], chunk[m][v]);
+                    chunk[m][v] = 0.0F;
+                }
+            if (last_in_group) {
+#pragma unroll
+                for (int m = 0; m < MTiles; ++m) {
+                    group_sums[sum_at(chunk_index / kGroup, m)] = make_float4(group[m][0], group[m][1], group[m][2],
+                                                                              group[m][3]);
+                }
+            }
+        }
+    }
+    cp_wait<0>();
+    cluster.sync(); // every rank's group sums
+    if (rank == 0) {
+        float total[MTiles][4];
+#pragma unroll
+        for (int m = 0; m < MTiles; ++m) {
+            const float4 s0 = group_sums[sum_at(0, m)]; // group 0 is rank 0's first
+            total[m][0] = s0.x;
+            total[m][1] = s0.y;
+            total[m][2] = s0.z;
+            total[m][3] = s0.w;
+        }
+        int owner = 0;
+        for (int gi = 1; gi < groups; ++gi) {
+            while (gi >= group_begin(owner + 1, ranks, groups)) { ++owner; }
+            const int local = gi - group_begin(owner, ranks, groups);
+#pragma unroll
+            for (int m = 0; m < MTiles; ++m) {
+                const float4 s = *cluster.map_shared_rank(group_sums + sum_at(local, m), owner);
+                total[m][0]    = __fadd_rn(total[m][0], s.x);
+                total[m][1]    = __fadd_rn(total[m][1], s.y);
+                total[m][2]    = __fadd_rn(total[m][2], s.z);
+                total[m][3]    = __fadd_rn(total[m][3], s.w);
+            }
+        }
+        const int g = lane >> 2, q = lane & 3;
+        const int t0 = token_base + warp * 8 + 2 * q;
+#pragma unroll
+        for (int m = 0; m < MTiles; ++m) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const int row = m * 16 + g + (v >= 2 ? 8 : 0), token = t0 + (v & 1);
+                if (token < tokens) {
+                    u[static_cast<std::int64_t>(token) * kOutRows + row] = __float2bfloat16_rn(total[m][v]);
+                }
+            }
+        }
+    }
+    cluster.sync(); // no rank leaves while rank 0 reads its group sums
+}
+
+// grid (ranks, ceil(T / 32), Slices).
+template <int MTiles, int Slices>
+__global__ __launch_bounds__(kThreads) void lora_shrink_stream_sliced_kernel(const __nv_bfloat16* x,
+                                                                             const __nv_bfloat16* __restrict__ a,
+                                                                             __nv_bfloat16* u, int k, int tokens) {
+    lora_shrink_stream<MTiles, Slices>(x, a, u, k, tokens);
+}
+
 // From this many columns a call streams x once instead of splitting K: the split schedule reads x once per 16-row tile
 // of A (from L2 after the first), the stream schedule A once per 32 columns. Measured 2026-11-21 (RTX 5090, the 27B's
 // four sites at rank 32): the split is faster to 256 columns (q/k/v 13.7 against 17.0 us, down 16.6 against 23.1),
@@ -336,9 +485,18 @@ bool stream_fits(int k) {
     return stream_bytes<MTiles>((groups + ranks - 1) / ranks) <= static_cast<std::size_t>(shared_optin_bytes());
 }
 
-template <int MTiles>
+template <int MTiles, int Slices>
+constexpr auto stream_kernel() {
+    if constexpr (Slices == 1) {
+        return lora_shrink_stream_kernel<MTiles>;
+    } else {
+        return lora_shrink_stream_sliced_kernel<MTiles, Slices>;
+    }
+}
+
+template <int MTiles, int Slices>
 void launch_stream(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStream_t stream) {
-    constexpr auto kernel = lora_shrink_stream_kernel<MTiles>;
+    constexpr auto kernel = stream_kernel<MTiles, Slices>();
     static bool configured = [] {
         const std::size_t most = std::min(stream_bytes<MTiles>(kMaxGroupsPerRank),
                                           static_cast<std::size_t>(shared_optin_bytes()));
@@ -361,7 +519,9 @@ void launch_stream(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaSt
         count                                                    = 2;
     }
     cudaLaunchConfig_t config{};
-    config.gridDim          = dim3(static_cast<unsigned>(ranks), static_cast<unsigned>((tokens + kTokenTile - 1) / kTokenTile));
+    config.gridDim          = dim3(static_cast<unsigned>(ranks),
+                                   static_cast<unsigned>((tokens + kTokenTile - 1) / kTokenTile),
+                                   static_cast<unsigned>(Slices));
     config.blockDim         = dim3(kThreads);
     config.dynamicSmemBytes = stream_bytes<MTiles>((groups + ranks - 1) / ranks);
     config.stream           = stream;
@@ -452,19 +612,32 @@ void lora_shrink(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStre
         detail::launch_split(x, a, u, stream);
         return;
     }
-    const auto stream_or_split = [&]<int MTiles>() {
+    const auto stream_or_split = [&]<int MTiles, int Slices>() {
         if (detail::stream_fits<MTiles>(a.k)) {
-            detail::launch_stream<MTiles>(x, a, u, stream);
+            detail::launch_stream<MTiles, Slices>(x, a, u, stream);
         } else {
             detail::launch_split(x, a, u, stream);
         }
     };
     switch (a.rows / 16) {
-    case 2: return stream_or_split.template operator()<2>();
-    case 4: return stream_or_split.template operator()<4>();
-    case 6: return stream_or_split.template operator()<6>();
-    case 8: return stream_or_split.template operator()<8>();
-    case 12: return stream_or_split.template operator()<12>();
+    case 2: return stream_or_split.template operator()<2, 1>();
+    case 4: return stream_or_split.template operator()<4, 1>();
+    case 6: return stream_or_split.template operator()<6, 1>();
+    case 8: return stream_or_split.template operator()<8, 1>();
+    case 12: return stream_or_split.template operator()<12, 1>();
+    // Wide adapters' heights (ranks 80 and 112: 5 / 10 / 15 and 7 / 14 tiles) that fit one CTA. At rank 80 the split
+    // schedule took 24.1 ms of a 2,048-token prefill's shrinks against rank 96's 20.5 (RTX 5090, 2026-11-21).
+    case 5: return stream_or_split.template operator()<5, 1>();
+    case 7: return stream_or_split.template operator()<7, 1>();
+    case 10: return stream_or_split.template operator()<10, 1>();
+    case 14: return stream_or_split.template operator()<14, 1>();
+    case 15: return stream_or_split.template operator()<15, 1>();
+    // The 16-, 18-, 21- and 24-tile stacks (gate/up at rank 128, q/k/v at 96, 112 and 128) exceed a CTA's ring: one
+    // launch streams them in slices. Split, they ran at about 0.56 us a row at 2,048 tokens, against 0.41 streamed.
+    case 16: return stream_or_split.template operator()<8, 2>();
+    case 18: return stream_or_split.template operator()<6, 3>();
+    case 21: return stream_or_split.template operator()<7, 3>();
+    case 24: return stream_or_split.template operator()<12, 2>();
     default: break;
     }
     // Other heights split K at every width (the same bits).

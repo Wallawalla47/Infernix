@@ -122,7 +122,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
         static_cast<int>(blockIdx.x) * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, 1>;
+    using LoraStage = LoraWarpStage<Schedule::kRowsPerWarp, 1, kLoraStageRank<Epilogue>>;
     [[maybe_unused]] LoraStage* lora_stage = nullptr;
     [[maybe_unused]] int term_rows[Schedule::kRowsPerWarp];
     if constexpr (kLoraEpilogue<Epilogue>) {

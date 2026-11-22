@@ -12,6 +12,7 @@ import type {
   EventPage,
   FitPlan,
   FsListing,
+  HubAdapterSearch,
   InfernixRelease,
   InstanceInfo,
   LaunchPreview,
@@ -125,6 +126,7 @@ export const api = {
     request<Library>("DELETE", `models/${enc(artifactKey)}/files`, { confirm }),
   deleteDrafter: (key: string, confirm: string) => request<Library>("DELETE", `drafters/${enc(key)}`, { confirm }),
   deleteNgramVolume: (key: string, confirm: string) => request<Library>("DELETE", `ngram/${enc(key)}`, { confirm }),
+  deleteAdapter: (key: string, confirm: string) => request<Library>("DELETE", `adapters/${enc(key)}`, { confirm }),
 
   load: (id: string, force = false) => request<unknown>("POST", `models/${enc(id)}/load`, { force }),
   unload: (force = false) => request<unknown>("POST", "unload", { force }),
@@ -143,6 +145,8 @@ export const api = {
 
   catalog: () => request<Catalog>("GET", "catalog"),
   repoFiles: (repo: string) => request<RepoListing>("GET", `hf/files?repo=${enc(repo)}`),
+  hubAdapters: (base: string, search: string) =>
+    request<HubAdapterSearch>("GET", `hf/adapters?base=${enc(base)}&search=${enc(search)}`),
 
   downloads: () => request<DownloadJob[]>("GET", "downloads"),
   startDownload: (body: DownloadRequest) => request<DownloadJob>("POST", "downloads", body),

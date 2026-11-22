@@ -107,6 +107,17 @@ void binds_every_projection() {
             "description: " + binding.describe());
 }
 
+// Ranks past 64 (the wide kernels') up to the limit, 128, bind; the padded rank rounds the largest up to 16.
+void binds_wide_ranks() {
+    const TextConfig text = small_text();
+    for (const auto& [rank, padded] : {std::pair<std::uint32_t, std::uint32_t>{72, 80}, {96, 96}, {128, 128}}) {
+        sw::TempDir dir("lora_binding_wide");
+        write_adapter(dir.path, {{kL3 + "mlp.down_proj", 2048, 1024, rank}, {kL0 + "mlp.gate_proj", 1024, 2048}});
+        const LoraBinding binding = bind_lora(dir.path, text);
+        require(binding.padded_rank == padded, "rank " + std::to_string(rank) + " pads to " + std::to_string(padded));
+    }
+}
+
 void refuses() {
     const auto refused = [](const std::string& label, std::vector<Module> modules, const std::string& needle,
                             bool moe = false) {
@@ -116,17 +127,26 @@ void refuses() {
         rejects([&] { (void)bind_lora(dir.path, text); }, needle, label);
     };
     refused("Gated DeltaNet", {{kL0 + "linear_attn.in_proj_qkvz", 1024, 4096}}, "linear-attention");
-    refused("attention on a GDN layer", {{kL0 + "self_attn.q_proj", 1024, 2048}}, "linear-attention layer");
+    refused("attention on a GDN layer", {{kL0 + "self_attn.q_proj", 1024, 2048}},
+            "that layer is a linear-attention (Gated DeltaNet) layer in this model");
     refused("MoE MLP", {{kL3 + "mlp.gate_proj", 1024, 2048}}, "mixtures of experts", true);
-    refused("expert leaf", {{kL3 + "mlp.experts.0.gate_proj", 1024, 2048}}, "not gate_proj");
-    refused("attention leaf", {{kL3 + "self_attn.q_norm", 256, 256}}, "not q_proj");
+    refused("expert leaf", {{kL3 + "mlp.experts.0.gate_proj", 1024, 2048}}, "Infernix adapts gate_proj");
+    refused("attention leaf", {{kL3 + "self_attn.q_norm", 256, 256}}, "Infernix adapts q_proj");
     refused("head", {{"lm_head", 1024, 4096}}, "not a text layer");
     refused("vision", {{"model.visual.blocks.0.attn.qkv", 1024, 3072}}, "not a text layer");
     refused("MTP", {{"mtp.layers.0.mlp.gate_proj", 1024, 2048}}, "not a text layer");
-    refused("layer past the model", {{"model.language_model.layers.4.mlp.gate_proj", 1024, 2048}}, "4-layer model");
+    refused("layer past the model", {{"model.language_model.layers.4.mlp.gate_proj", 1024, 2048}},
+            "this model has 4 layers");
     refused("q_proj without its gate rows", {{kL3 + "self_attn.q_proj", 1024, 1024}}, "another base model");
     refused("another model's MLP", {{kL3 + "mlp.down_proj", 4096, 1024}}, "another base model");
-    refused("rank above 64", {{kL3 + "mlp.down_proj", 2048, 1024, 72}}, "exceeds 64");
+    // Infernix's rank limit, named as such with the adapter's rank and its module.
+    refused("rank above 128", {{kL3 + "mlp.down_proj", 2048, 1024, 144}},
+            "its rank is 144 (module '" + kL3 + "mlp.down_proj'), and Infernix currently supports LoRA adapters up to "
+            "rank 128");
+    refused("rank 129 (padded 144)", {{kL0 + "mlp.gate_proj", 1024, 2048}, {kL3 + "mlp.down_proj", 2048, 1024, 129}},
+            "up to rank 128");
+    // Every refusal names the adapter and says it is refused.
+    refused("refusal wording", {{kL0 + "linear_attn.in_proj_qkvz", 1024, 4096}}, " is refused: it adapts module");
     refused("twice", {{kL3 + "mlp.down_proj", 2048, 1024}, {"model.layers.3.mlp.down_proj", 2048, 1024}}, "twice");
     // A hidden width the shrink cannot read (not a multiple of 1024).
     {
@@ -144,6 +164,7 @@ int main() {
     try {
         binds_every_projection();
         refuses();
+        binds_wide_ranks();
     } catch (const std::exception& error) {
         std::cerr << "lora binding test: " << error.what() << '\n';
         return 1;

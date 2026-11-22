@@ -58,7 +58,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { EnvVar, Library, ModelArtifact, ModelConfig, ServeOption } from "@/lib/api-types";
+import type { EnvVar, Library, LoraAdapter, ModelArtifact, ModelConfig, ServeOption } from "@/lib/api-types";
 import { argsToCommandLine, argsToText, getFlagString, hasFlag, sameArgs, setFlag, tokenize } from "@/lib/args";
 import {
   cleanEnv,
@@ -67,6 +67,7 @@ import {
   freshestConfig,
   liveInstance,
   sameEnv,
+  samePath,
   useDeleteConfig,
   useDownloadScript,
   useResetConfig,
@@ -467,6 +468,86 @@ function NgramVolumeField({ model, form, library }: { model: ModelArtifact; form
             </Link>{" "}
             (the FP8 table is recommended).
           </span>
+        </div>
+      ) : null}
+    </FieldShell>
+  );
+}
+
+/** The Select item that shows the path box for an adapter outside the library. */
+const OTHER_ADAPTER = "__other__";
+
+function AdapterField({ model, form, library }: { model: ModelArtifact; form: FormContext; library: Library }) {
+  const current = getFlagString(form.args, "--lora", form.takesValue);
+  const fits = library.adapters.filter((adapter) => adapter.compatible_models.includes(model.key));
+  const others = library.adapters.filter((adapter) => !adapter.compatible_models.includes(model.key));
+  const known = library.adapters.some((adapter) => samePath(adapter.path, current));
+  const [typing, setTyping] = useState(false);
+  const other = typing || (current.length > 0 && !known);
+  const value = other ? OTHER_ADAPTER : current.length > 0 ? (library.adapters.find((adapter) => samePath(adapter.path, current))?.path ?? current) : UNSET;
+  const set = (next: string | null) => form.setArgs(setFlag(form.args, "--lora", next, form.takesValue));
+  const label = (adapter: LoraAdapter) =>
+    [
+      adapter.name,
+      adapter.config.max_rank !== null ? `rank ${adapter.config.max_rank}` : null,
+      formatBytes(adapter.bytes),
+      adapter.compatible_models.includes(model.key) ? null : `base ${adapter.config.base_model ?? "not named"}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  return (
+    <FieldShell
+      label="LoRA adapter"
+      flag="--lora"
+      help="A Hugging Face PEFT LoRA adapter for this base model (its folder, or its adapter_model.safetensors with adapter_config.json beside it): plain LoRA on the attention and MLP projections, up to rank 128; GGUF adapters are not read. The lossless route computes it as PEFT does. Will it fit? asks the server whether it applies it."
+    >
+      <Select
+        value={value}
+        onValueChange={(next) => {
+          setTyping(next === OTHER_ADAPTER);
+          if (next !== OTHER_ADAPTER) set(next === UNSET ? null : next);
+        }}
+      >
+        <SelectTrigger aria-label="LoRA adapter">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={UNSET}>None</SelectItem>
+          {fits.map((adapter) => (
+            <SelectItem key={adapter.key} value={adapter.path}>
+              {label(adapter)}
+            </SelectItem>
+          ))}
+          {others.map((adapter) => (
+            <SelectItem key={adapter.key} value={adapter.path}>
+              {label(adapter)}
+            </SelectItem>
+          ))}
+          <SelectItem value={OTHER_ADAPTER}>A folder or file elsewhere…</SelectItem>
+        </SelectContent>
+      </Select>
+      {other ? (
+        <CommitInput
+          value={known ? "" : current}
+          onCommit={(text) => set(text.trim().length > 0 ? text.trim() : null)}
+          placeholder="The adapter's folder, or its adapter_model.safetensors"
+          mono
+          ariaLabel="LoRA adapter path"
+        />
+      ) : null}
+      {current.length > 0 && known && !fits.some((adapter) => samePath(adapter.path, current)) ? (
+        <div className="flex items-center gap-1.5 text-xs text-warning">
+          <TriangleAlert className="size-3.5 shrink-0" />
+          <span>This adapter names another base model: its output on this model is not what it was trained for.</span>
+        </div>
+      ) : null}
+      {library.adapters.length === 0 ? (
+        <div className="text-xs text-muted-foreground">
+          No adapter in your folders.{" "}
+          <Link to="/discover?tab=adapters" className="font-medium text-foreground underline-offset-4 hover:underline">
+            Find one on Hugging Face
+          </Link>{" "}
+          (Harness Hub's for Pi, OpenCode and Hermes, and its super-adapter for all three, among them).
         </div>
       ) : null}
     </FieldShell>
@@ -979,6 +1060,7 @@ export function ModelConfigurePage() {
                   <DrafterField model={model} form={form} library={library} />
                 ) : null}
                 {fields.includes("--ngram-volume") && library ? <NgramVolumeField model={model} form={form} library={library} /> : null}
+                {fields.includes("--lora") && library ? <AdapterField model={model} form={form} library={library} /> : null}
                 <Controls controls={controls} form={form} />
               </Section>
             ))}

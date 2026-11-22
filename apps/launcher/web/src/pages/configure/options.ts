@@ -912,17 +912,9 @@ const LORA: FormSection = {
   description: "A fine-tune applied on top of the model's weights at load",
   icon: Puzzle,
   when: denseQwen35,
-  controls: [
-    {
-      kind: "text",
-      flag: "--lora",
-      label: "LoRA adapter",
-      help: "A Hugging Face PEFT LoRA adapter for this base model: its folder (adapter_model.safetensors with adapter_config.json beside it) or the .safetensors file. Plain LoRA on the attention and MLP projections; GGUF adapters are not read. The lossless route computes it as PEFT does.",
-      placeholder: "none",
-      mono: true,
-      wide: true,
-    },
-  ],
+  // The page's own field: the library's adapters (Discover > LoRA adapters downloads them), or a path.
+  fields: ["--lora"],
+  controls: [],
 };
 
 const ABLATE: FormSection = {

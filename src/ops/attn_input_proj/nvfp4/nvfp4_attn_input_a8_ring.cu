@@ -18,4 +18,10 @@ void launch_nvfp4_a8_ring(const Nvfp4A8Operands& p, Nvfp4AttentionInputOutput ou
     launch_nvfp4_a8_ring_tiles(p, output, epilogue, rows, stream);
 }
 
+void launch_nvfp4_a8_ring(const Nvfp4A8Operands& p, Nvfp4AttentionInputOutput output,
+                          const LoraEpilogueWide<LinearIdentityEpilogue>& epilogue, Nvfp4IdentityRows rows,
+                          cudaStream_t stream) {
+    launch_nvfp4_a8_ring_tiles(p, output, epilogue, rows, stream);
+}
+
 } // namespace infernix::ops::detail

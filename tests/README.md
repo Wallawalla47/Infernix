@@ -102,12 +102,14 @@ on its position in the fragment or on which operand role carries its inputs. `in
 `lora_shrink` against an FP64 oracle and its canonical bits (a column's `U` whatever the call's width and schedule),
 then every adapted Op, format and route at the 27B's shapes on zero base weights, where the output is the term
 alone against its FP64 oracle (through the SwiGLU, the residual add and the four-way attention split; an unadapted
-segment must stay exactly zero; ranks 48 and 64 on the routes that stage the term's operands in shared memory), that a
-column's bits under `A16ColumnInvariant` do not depend on the call's width with the term, and that a zero `B` (PEFT's
-initial adapter) on non-zero weights returns the no-adapter call's bits on every route. The fused dense MLP and fused-norm attention tests compare their adapter forms bit for
-bit with the separate Ops. On the host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT
-configuration handling (patterns, rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module
-binding and its refusals.
+segment must stay exactly zero; rank 128, the wide instances, on every family; ranks 48, 64, 80 and 96 on the routes
+that stage the term's operands in shared memory), that a rank-32 adapter padded with zeros to 128 gives the narrow
+instances' bits through the wide ones on every route, that a column's bits under `A16ColumnInvariant` do not depend
+on the call's width with the term, and that a zero `B` (PEFT's initial adapter) on non-zero weights returns the
+no-adapter call's bits on every route. The fused dense MLP and fused-norm attention tests compare their adapter forms
+bit for bit with the separate Ops, at ranks 32 and 128 (both instance classes). On the host, `infernix_artifact_peft_lora_test` covers the safetensors reader and
+PEFT configuration handling (patterns, rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module
+binding, ranks to 128 and its refusals (a rank above 128 by its wording).
 
 `infernix_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and

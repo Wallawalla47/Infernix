@@ -156,6 +156,10 @@ void refusals() {
         rejects([&] { PeftLoraAdapter adapter(dir.path); }, needle, label);
     };
     with_config("DoRA", [](Json& c) { c["use_dora"] = true; }, "use_dora");
+    // A refusal says the adapter is refused, what it uses, and Infernix's plain-LoRA scope.
+    with_config("DoRA wording", [](Json& c) { c["use_dora"] = true; },
+                " is refused: it is a DoRA adapter (use_dora is set): its weights carry magnitudes. Infernix applies "
+                "plain LoRA only");
     with_config("LoRA bias", [](Json& c) { c["lora_bias"] = true; }, "lora_bias");
     with_config("bias all", [](Json& c) { c["bias"] = "all"; }, "bias");
     with_config("modules_to_save", [](Json& c) { c["modules_to_save"] = {"lm_head"}; }, "modules_to_save");
@@ -168,7 +172,8 @@ void refusals() {
     with_config("variant config", [](Json& c) { c["arrow_config"] = {{"top_k", 3}}; }, "arrow_config");
     with_config("not LoRA", [](Json& c) { c["peft_type"] = "IA3"; }, "peft_type");
     with_config("rank mismatch", [](Json& c) { c["r"] = 8; }, "rank");
-    with_config("bad pattern", [](Json& c) { c["rank_pattern"] = {{"(", 4}}; }, "regular expression");
+    with_config("bad pattern", [](Json& c) { c["rank_pattern"] = {{"(", 4}}; },
+                " is refused: its adapter_config.json's rank_pattern / alpha_pattern key '(' is not a regular expression");
 
     const auto with_tensors = [](const std::string& label, std::vector<TensorSpec> tensors, const std::string& needle) {
         Dir dir("tensors");
@@ -179,7 +184,7 @@ void refusals() {
     {
         auto t = factors("BF16");
         t.push_back({kPrefix + kQ + ".lora_magnitude_vector", "BF16", {128, 1}, pattern(128, 5)});
-        with_tensors("DoRA magnitude", t, "not a LoRA A or B weight");
+        with_tensors("DoRA magnitude", t, "not a lora_A or lora_B factor");
     }
     {
         auto t = factors("BF16");
@@ -195,7 +200,7 @@ void refusals() {
     {
         auto t = factors("BF16");
         t.push_back({"model.embed_tokens.weight", "BF16", {4, 4}, pattern(16, 6)});
-        with_tensors("foreign tensor", t, "not a PEFT adapter tensor");
+        with_tensors("foreign tensor", t, "not a PEFT adapter's");
     }
     {
         auto t   = factors("BF16");

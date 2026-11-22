@@ -1,6 +1,6 @@
-// Deleting an artifact's, a drafter's or an n-gram volume's files from disk. The user types the file
-// name to confirm (sent as `confirm`); files a running server holds are refused here as the
-// launcher refuses them.
+// Deleting an artifact's, a drafter's, an n-gram volume's or a LoRA adapter's files from disk. The
+// user types the file (an adapter's: folder) name to confirm (sent as `confirm`); files a running
+// server holds are refused here as the launcher refuses them.
 
 import { useEffect, useState, type ReactNode } from "react";
 import { LoaderCircle, Lock, Trash2 } from "lucide-react";
@@ -17,7 +17,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import type { DrafterArtifact, InstanceInfo, ModelArtifact, NgramVolume } from "@/lib/api-types";
+import type { DrafterArtifact, InstanceInfo, LoraAdapter, ModelArtifact, NgramVolume } from "@/lib/api-types";
 import { loadedArtifactKey, pathInUse, useDeleteFiles, volumeInUse, type FileKind } from "@/lib/configs";
 import { formatBytes } from "@/lib/format";
 
@@ -92,6 +92,24 @@ export function volumeDeleteTarget(volume: NgramVolume, instance: InstanceInfo |
         ? "The n-gram table, which is a model's own <entry>.ngram: that model needs another volume (--ngram-volume) to start."
         : "The n-gram table. Configurations that name it with --ngram-volume fail to start until you pick another.",
     blocked: volumeInUse(instance, volume.path, volume.own_for) ? "The loaded model reads this table. Unload it first." : null,
+  };
+}
+
+export function adapterDeleteTarget(adapter: LoraAdapter, instance: InstanceInfo | null): DeleteTarget {
+  const weights = `${adapter.path}${adapter.path.includes("\\") ? "\\" : "/"}adapter_model.safetensors`;
+  return {
+    kind: "adapter",
+    key: adapter.key,
+    fileName: adapter.name,
+    title: adapter.name,
+    path: adapter.path,
+    bytes: adapter.bytes,
+    details:
+      "The LoRA adapter's adapter_model.safetensors and adapter_config.json (and its folder, when nothing else is in it). Configurations that name it with --lora fail to start until you pick another.",
+    blocked:
+      pathInUse(instance, adapter.path) || pathInUse(instance, weights)
+        ? "The loaded model runs with this adapter. Unload it first."
+        : null,
   };
 }
 

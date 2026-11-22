@@ -199,8 +199,8 @@ int run_case(const Weight& gate_up, const Weight& down, int tokens, ops::LinearP
 
 // --lora (include/infernix/ops/lora.h): the adapter form against the composition rmsnorm(), lora_shrink(h),
 // linear_swiglu(+term), lora_shrink(product), linear_add(+term), each Op qualified with its term by the lora Op test.
-// Gate/up stacks two rank-32 A's (gate rows read U rows 0-31, up rows 32-63); down has one. Both sites, and each
-// alone (the other projection then runs unadapted).
+// Gate/up stacks two A's (at rank 32, gate rows read U rows 0-31, up rows 32-63); down has one. Both sites, and each
+// alone (the other projection then runs unadapted). Rank 32 runs the narrow adapter instances, 128 the wide ones.
 struct LoraFactors {
     DeviceBuffer a_gate_up, b_gate_up, a_down, b_down;
     ops::LoraSite gate_up, down;
@@ -214,8 +214,8 @@ std::vector<std::uint16_t> uniform_bf16(std::size_t count, std::uint32_t seed, f
     return out;
 }
 
-LoraFactors make_lora_factors(bool zero_b = false) {
-    constexpr int kRank = 32;
+LoraFactors make_lora_factors(bool zero_b = false, int rank = 32) {
+    const int kRank = rank;
     LoraFactors f;
     f.a_gate_up = to_device(uniform_bf16(static_cast<std::size_t>(2 * kRank) * kHidden, 61U, 0.03F));
     f.b_gate_up = to_device(zero_b ? std::vector<std::uint16_t>(static_cast<std::size_t>(kGateUpRows) * kRank, 0) : uniform_bf16(static_cast<std::size_t>(kGateUpRows) * kRank, 62U, 0.05F));
@@ -243,7 +243,8 @@ int run_lora_case(const Weight& gate_up, const Weight& down, const LoraFactors& 
     const ops::LoraSite* down_site    = with_down ? &factors.down : nullptr;
     const int gate_up_rows            = with_gate_up ? factors.gate_up.a.rows : 0;
     const int down_rows               = with_down ? factors.down.a.rows : 0;
-    const std::string suffix = std::string(" lora") + (with_gate_up ? " gate_up" : "") + (with_down ? " down" : "") +
+    const std::string suffix = std::string(" lora rank ") + std::to_string(factors.down.addend.rank) +
+                               (with_gate_up ? " gate_up" : "") + (with_down ? " down" : "") +
                                (policy == kPrompt ? " prompt" : " rounds") + " T=" + std::to_string(tokens);
     const auto residual_bits  = bf16_bits(make_bf16_activation(kHidden, tokens, 5051U + tokens));
     const auto gain_bits      = bf16_bits(make_bf16_activation(kHidden, 1, 229U));
@@ -257,7 +258,9 @@ int run_lora_case(const Weight& gate_up, const Weight& down, const LoraFactors& 
     const std::size_t capacity =
         std::max(ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, kGateUpRows, kHidden, policy, tokens, tokens),
                  ops::linear_add_workspace_capacity_bytes(QType::NVFP4, kHidden, kIntermediate, policy, tokens, tokens));
-    DeviceArena reference_workspace(capacity + static_cast<std::size_t>(kHidden + kIntermediate + 128) * tokens * 2 +
+    DeviceArena reference_workspace(capacity +
+                                    static_cast<std::size_t>(kHidden + kIntermediate + gate_up_rows + down_rows) *
+                                        tokens * 2 +
                                     (1U << 16));
     DeviceArena fused_workspace(ops::dense_mlp_fused_rmsnorm_nvfp4_workspace_bytes(tokens, gate_up_rows, down_rows));
 
@@ -404,6 +407,12 @@ INFERNIX_OP_TEST(dense_mlp_fused_rmsnorm) {
         for (const auto [gu, dn] : {std::pair{true, false}, std::pair{false, true}}) {
             failures += run_lora_case(gate_up, down, factors, 33, kRounds, gu, dn);
             failures += run_lora_case(gate_up, down, factors, 513, kPrompt, gu, dn);
+        }
+        // The wide adapter instances (rank 128) on both profiles.
+        const LoraFactors wide = make_lora_factors(false, 128);
+        for (const int tokens : {5, 16, 96}) { failures += run_lora_case(gate_up, down, wide, tokens, kRounds, true, true); }
+        for (const int tokens : {129, 513, 4160}) {
+            failures += run_lora_case(gate_up, down, wide, tokens, kPrompt, true, true);
         }
         const LoraFactors zero = make_lora_factors(true);
         for (const auto [gu, dn] : {std::pair{true, true}, std::pair{true, false}, std::pair{false, true}}) {

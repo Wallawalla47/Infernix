@@ -625,6 +625,9 @@ Json Launcher::library_json() const {
         for (const ScannedNgramVolume& volume : library_.ngram_volumes) {
             if (inside(volume.path)) { bytes += volume.bytes; }
         }
+        for (const ScannedAdapter& adapter : library_.adapters) {
+            if (same_or_inside(adapter.path, path, 64)) { bytes += adapter.bytes; }
+        }
         dir["library_bytes"] = bytes;
     }
     return library;
@@ -1250,10 +1253,44 @@ Json Launcher::hf_files_json(const std::string& repo) const {
             has_model = true;
         }
     }
+    // A PEFT LoRA adapter's two files (--lora), at the repository's root. Every adapter's files have these names, and
+    // adapters of one rank and module set have the same sizes: one is in the library only in a folder of the
+    // repository's name, where a download puts it (adapters always get a folder of their own).
+    const auto adapter_file = [](const std::string& path) {
+        return path == "adapter_config.json" || path == "adapter_model.safetensors";
+    };
+    const bool adapter = !has_model && std::count_if(listing.files.begin(), listing.files.end(), [&](const HfFile& file) {
+                                           return adapter_file(file.path);
+                                       }) == 2;
+    const std::string repo_name = listing.repo.substr(listing.repo.find('/') + 1);
+    const auto adapter_present = [&](const HfFile& file) -> Json {
+        for (const std::string& dir : settings.model_dirs) {
+            const std::filesystem::path root = utf8_path(dir);
+            for (const std::filesystem::path& candidate :
+                 {root / utf8_path(repo_name) / utf8_path(file.path), root / utf8_path(file.path)}) {
+                if (!iequals(path_utf8(candidate.parent_path().filename()), repo_name)) { continue; }
+                std::error_code status;
+                if (std::filesystem::is_regular_file(candidate, status) &&
+                    std::filesystem::file_size(candidate, status) == file.size) {
+                    return path_utf8(candidate);
+                }
+            }
+        }
+        return nullptr;
+    };
     Json files = Json::array();
     for (const HfFile& file : listing.files) {
         const std::string lowered = lower(file.path);
         std::string role          = "other";
+        if (adapter && adapter_file(file.path)) {
+            files.push_back({{"path", file.path},
+                             {"bytes", file.size},
+                             {"sha256", file.sha256 ? Json(*file.sha256) : Json(nullptr)},
+                             {"role", "adapter"},
+                             {"default_selected", true},
+                             {"present_locally", adapter_present(file)}});
+            continue;
+        }
         if (lowered.ends_with(".ngram")) {
             role = "ngram";
         } else if (lowered.ends_with(".expert-state")) {
@@ -1276,7 +1313,50 @@ Json Launcher::hf_files_json(const std::string& repo) const {
                          {"default_selected", selected},
                          {"present_locally", present(file)}});
     }
-    return {{"repo", listing.repo}, {"revision", listing.revision}, {"files", files}};
+    // An adapter's config (about 1 kB) says its base model and rank before its weights are downloaded.
+    Json adapter_facts = nullptr, adapter_error = nullptr;
+    if (adapter) {
+        const HttpResult config =
+            http_get(hf_resolve_url(listing.repo, listing.revision, "adapter_config.json"), store_.hf_token(), 30);
+        if (!config.error.empty() || config.status != 200) {
+            adapter_error = "adapter_config.json: " +
+                            (config.error.empty() ? "HTTP " + std::to_string(config.status) : config.error);
+        } else {
+            try {
+                adapter_facts = to_json(parse_adapter_config(Json::parse(config.body)));
+            } catch (const Json::exception&) { adapter_error = "adapter_config.json is not JSON"; }
+        }
+    }
+    return {{"repo", listing.repo},
+            {"revision", listing.revision},
+            {"kind", adapter ? "adapter" : kind},
+            {"files", files},
+            {"adapter", adapter_facts},
+            {"adapter_error", adapter_error}};
+}
+
+Json Launcher::hf_adapters_json(const std::string& base, const std::string& search) const {
+    if (search.size() > 100) { throw std::invalid_argument("the search is longer than 100 characters"); }
+    // Harness Hub (huggingface.co/harness-hub) trains adapters for agent harnesses (Pi, OpenCode, Hermes): they come
+    // first, whatever their downloads.
+    constexpr const char* kHarnessHub = "harness-hub";
+    const std::string token                 = store_.hf_token();
+    const std::vector<HfAdapter> featured   = hf_search_adapters(base, kHarnessHub, search, 50, token);
+    const std::vector<HfAdapter> downloaded = hf_search_adapters(base, "", search, 60, token);
+    Json adapters = Json::array();
+    std::set<std::string> listed;
+    for (const std::vector<HfAdapter>* list : {&featured, &downloaded}) {
+        for (const HfAdapter& adapter : *list) {
+            if (!listed.insert(lower(adapter.repo)).second) { continue; }
+            adapters.push_back({{"repo", adapter.repo},
+                                {"downloads", adapter.downloads},
+                                {"likes", adapter.likes},
+                                {"last_modified", adapter.last_modified},
+                                {"gated", adapter.gated},
+                                {"harness_hub", iequals(adapter.repo.substr(0, adapter.repo.find('/')), kHarnessHub)}});
+        }
+    }
+    return {{"base", base}, {"search", search}, {"adapters", adapters}};
 }
 
 void Launcher::download_finished(const std::filesystem::path& dest_dir, const std::filesystem::path& target_dir) {

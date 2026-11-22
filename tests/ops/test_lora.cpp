@@ -86,7 +86,10 @@ int check_shrink() {
     struct Shape {
         std::int32_t rows, k;
     };
-    for (const Shape shape : {Shape{96, 5120}, Shape{64, 5120}, Shape{32, 6144}, Shape{32, 17408}, Shape{192, 5120}}) {
+    for (const Shape shape : {Shape{96, 5120}, Shape{64, 5120}, Shape{32, 6144}, Shape{32, 17408}, Shape{192, 5120},
+                              Shape{128, 17408}, Shape{160, 5120}, Shape{240, 5120}, Shape{256, 5120}, Shape{288, 5120},
+                              Shape{384, 5120}, Shape{336, 5120}, Shape{80, 17408}, Shape{112, 6144},
+                              Shape{224, 5120}}) {
         const auto a = random_bf16(static_cast<std::size_t>(shape.rows) * shape.k, 11 + shape.rows, -0.03F, 0.03F);
         // Wide activations with cancellation: alternating large and small values.
         auto x = random_bf16(static_cast<std::size_t>(shape.k) * kMaxT, 7 + shape.k, -2.0F, 2.0F);
@@ -354,20 +357,21 @@ int check_linear_swiglu_terms(QType qtype, qw::PatternedWeightOptions options,
 }
 
 int check_attention_terms(QType qtype, qw::PatternedWeightOptions options,
-                          std::initializer_list<ops::LinearPolicy> policies) {
+                          std::initializer_list<ops::LinearPolicy> policies, std::int32_t rank = 32) {
     constexpr std::int32_t n = 14336, k = 5120, qw_rows = 6144, kv = 1024;
     int failures      = 0;
     const auto packed = zero_weight(qtype, n, k, options);
     test::GuardedDeviceBuffer w_d(packed.payload.size());
     w_d.copy_from_host(packed.payload.data(), packed.payload.size());
     const Weight weight = packed.device_weight(w_d.data());
-    test::GuardedDeviceBuffer b_d(static_cast<std::size_t>(n) * 32 * 2), u_d(static_cast<std::size_t>(64) * kMaxWidth * 2);
-    // Query and gate rows share q_proj's U rows 0-31 (scale 2); key is not adapted (must stay exactly 0); value takes
-    // U rows 32-63 (scale 1.5).
-    const Term term = make_term(n, 64, kMaxWidth, 99U,
+    test::GuardedDeviceBuffer b_d(static_cast<std::size_t>(n) * rank * 2),
+        u_d(static_cast<std::size_t>(2 * rank) * kMaxWidth * 2);
+    // Query and gate rows share q_proj's U rows 0 .. rank - 1 (scale 2); key is not adapted (must stay exactly 0); value
+    // takes the next rank U rows (scale 1.5).
+    const Term term = make_term(n, 2 * rank, kMaxWidth, 99U + rank,
                                 {{qw_rows, 0, 2.0F}, {qw_rows + kv, -1, 0.0F}, {2 * qw_rows + kv, 0, 2.0F},
-                                 {n, 32, 1.5F}},
-                                b_d, u_d);
+                                 {n, rank, 1.5F}},
+                                b_d, u_d, rank);
     const auto x = random_bf16(static_cast<std::size_t>(k) * kMaxWidth, 36U, -1.0F, 1.0F);
     test::GuardedDeviceBuffer x_d(x.size() * 2), q_d(static_cast<std::size_t>(qw_rows) * kMaxWidth * 2),
         g_d(static_cast<std::size_t>(qw_rows) * kMaxWidth * 2), k_d(static_cast<std::size_t>(kv) * kMaxWidth * 2),
@@ -404,7 +408,8 @@ int check_attention_terms(QType qtype, qw::PatternedWeightOptions options,
                 }
             }
             failures += compare("attn_input_proj term " + std::string(policy_name(policy)) + " qtype=" +
-                                    std::to_string(static_cast<int>(qtype)) + " T=" + std::to_string(t),
+                                    std::to_string(static_cast<int>(qtype)) + " r=" + std::to_string(rank) +
+                                    " T=" + std::to_string(t),
                                 got, ref, 1.0 / 128.0, 1.0e-4);
         }
     }
@@ -412,7 +417,7 @@ int check_attention_terms(QType qtype, qw::PatternedWeightOptions options,
 }
 
 // The paired groupwise projection (Q4 query/key, Q5 gate/value): the term over the single parent's logical rows.
-int check_paired_attention_terms(std::initializer_list<ops::LinearPolicy> policies) {
+int check_paired_attention_terms(std::initializer_list<ops::LinearPolicy> policies, std::int32_t rank = 32) {
     constexpr std::int32_t n = 14336, k = 5120, qw_rows = 6144, kv = 1024;
     int failures             = 0;
     const auto first         = zero_weight(QType::Q4_G64_FP16, qw_rows + kv, k, {});
@@ -422,12 +427,13 @@ int check_paired_attention_terms(std::initializer_list<ops::LinearPolicy> polici
     w1_d.copy_from_host(second.payload.data(), second.payload.size());
     const Weight w0 = first.device_weight(w0_d.data());
     const Weight w1 = second.device_weight(w1_d.data());
-    test::GuardedDeviceBuffer b_d(static_cast<std::size_t>(n) * 32 * 2), u_d(static_cast<std::size_t>(64) * kMaxWidth * 2);
-    // As check_attention_terms: query and gate share U rows 0-31, key unadapted, value U rows 32-63.
-    const Term term = make_term(n, 64, kMaxWidth, 101U,
+    test::GuardedDeviceBuffer b_d(static_cast<std::size_t>(n) * rank * 2),
+        u_d(static_cast<std::size_t>(2 * rank) * kMaxWidth * 2);
+    // As check_attention_terms: query and gate share U rows 0 .. rank - 1, key unadapted, value the next rank rows.
+    const Term term = make_term(n, 2 * rank, kMaxWidth, 101U + rank,
                                 {{qw_rows, 0, 2.0F}, {qw_rows + kv, -1, 0.0F}, {2 * qw_rows + kv, 0, 2.0F},
-                                 {n, 32, 1.5F}},
-                                b_d, u_d);
+                                 {n, rank, 1.5F}},
+                                b_d, u_d, rank);
     const auto x = random_bf16(static_cast<std::size_t>(k) * kMaxWidth, 37U, -1.0F, 1.0F);
     test::GuardedDeviceBuffer x_d(x.size() * 2), q_d(static_cast<std::size_t>(qw_rows) * kMaxWidth * 2),
         g_d(static_cast<std::size_t>(qw_rows) * kMaxWidth * 2), k_d(static_cast<std::size_t>(kv) * kMaxWidth * 2),
@@ -462,7 +468,7 @@ int check_paired_attention_terms(std::initializer_list<ops::LinearPolicy> polici
                 }
             }
             failures += compare("paired attn_input_proj term " + std::string(policy_name(policy)) +
-                                    " T=" + std::to_string(t),
+                                    " r=" + std::to_string(rank) + " T=" + std::to_string(t),
                                 got, ref, 1.0 / 128.0, 1.0e-4);
         }
     }
@@ -562,6 +568,109 @@ int check_zero_term_identity(TermOp op, QType qtype, std::int32_t n, std::int32_
                                                                                 : "attn_input_proj") +
                                          " zero-B identity " + (pass == 1 ? "cancelling " : "") + policy_name(policy) +
                                          " qtype=" +
+                                         std::to_string(static_cast<int>(qtype)) + " K=" + std::to_string(k) +
+                                         " T=" + std::to_string(t),
+                                     outputs[1].data(), outputs[0].data(), outputs[0].size());
+        }
+    }
+    return failures;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The wide class against the narrow one: a rank-32 term (random B and U) and the same term zero-padded to rank 128
+// (B's columns 32-127 zero, U's rows 32-127 of each segment random) run the narrow and the wide instances of every
+// route; the chain over the padded rank adds exact zeros, so both must give the same bits, on non-zero weights, at
+// every width.
+int check_padded_term_identity(TermOp op, QType qtype, std::int32_t n, std::int32_t k,
+                               qw::PatternedWeightOptions options, std::initializer_list<ops::LinearPolicy> policies,
+                               ops::LinearRoutes routes) {
+    constexpr std::int32_t kNarrow = 32, kWide = 128;
+    int failures      = 0;
+    const auto packed = qw::make_patterned_weight(qtype, n, k, 79U, options);
+    test::GuardedDeviceBuffer w_d(packed.payload.size());
+    w_d.copy_from_host(packed.payload.data(), packed.payload.size());
+    const Weight weight = packed.device_weight(w_d.data());
+    // Segments in rank units: their U offsets are 0 or 1 rank (-1: unadapted).
+    std::vector<std::pair<std::int32_t, std::int32_t>> segments; // (row_end, u_offset in ranks)
+    float scales[4] = {2.0F, 2.0F, 2.0F, 1.5F};
+    if (op == TermOp::Attention) {
+        segments = {{6144, 0}, {7168, -1}, {13312, 0}, {14336, 1}};
+    } else if (op == TermOp::SwiGlu) {
+        segments = {{n / 2, 0}, {n, 1}};
+        scales[1] = 0.5F;
+    } else {
+        segments = {{n, 0}};
+    }
+    const std::int32_t slots = op == TermOp::LinearAdd ? 1 : 2;
+    const auto b32 = random_bf16(static_cast<std::size_t>(n) * kNarrow, 601U, -0.05F, 0.05F);
+    const auto u32 = random_bf16(static_cast<std::size_t>(slots * kNarrow) * kMaxWidth, 603U, -3.0F, 3.0F);
+    const auto pad = random_bf16(static_cast<std::size_t>(slots * kWide) * kMaxWidth, 605U, -3.0F, 3.0F);
+    std::vector<std::uint16_t> b128(static_cast<std::size_t>(n) * kWide, 0), u128(pad);
+    for (std::int32_t row = 0; row < n; ++row) {
+        std::copy_n(&b32[static_cast<std::size_t>(row) * kNarrow], kNarrow, &b128[static_cast<std::size_t>(row) * kWide]);
+    }
+    for (std::int32_t token = 0; token < kMaxWidth; ++token) {
+        for (std::int32_t s = 0; s < slots; ++s) {
+            std::copy_n(&u32[static_cast<std::size_t>(token) * slots * kNarrow + s * kNarrow], kNarrow,
+                        &u128[static_cast<std::size_t>(token) * slots * kWide + s * kWide]);
+        }
+    }
+    test::GuardedDeviceBuffer b32_d(b32.size() * 2), u32_d(u32.size() * 2), b128_d(b128.size() * 2), u128_d(u128.size() * 2);
+    b32_d.copy_from_host(b32.data(), b32.size() * 2);
+    u32_d.copy_from_host(u32.data(), u32.size() * 2);
+    b128_d.copy_from_host(b128.data(), b128.size() * 2);
+    u128_d.copy_from_host(u128.data(), u128.size() * 2);
+    const auto addend_of = [&](std::int32_t rank, test::GuardedDeviceBuffer& b_d, test::GuardedDeviceBuffer& u_d) {
+        ops::LoraAddend addend;
+        addend.b      = b_d.data();
+        addend.rank   = rank;
+        addend.u      = u_d.data();
+        addend.u_rows = slots * rank;
+        for (std::size_t s = 0; s < segments.size(); ++s) {
+            const auto [row_end, slot] = segments[s];
+            addend.segment[s] = ops::LoraSegment{row_end, slot < 0 ? -1 : slot * rank, slot < 0 ? 0.0F : scales[s]};
+        }
+        addend.segments = static_cast<std::int32_t>(segments.size());
+        return addend;
+    };
+    const ops::LoraAddend narrow = addend_of(kNarrow, b32_d, u32_d), wide = addend_of(kWide, b128_d, u128_d);
+    const auto x        = random_bf16(static_cast<std::size_t>(k) * kMaxWidth, 607U, -1.0F, 1.0F);
+    const auto residual = random_bf16(static_cast<std::size_t>(5120) * kMaxWidth, 609U, -2.0F, 2.0F);
+    const std::int32_t out_rows = op == TermOp::SwiGlu ? n / 2 : n;
+    test::GuardedDeviceBuffer x_d(x.size() * 2), y_d(static_cast<std::size_t>(out_rows) * kMaxWidth * 2);
+    x_d.copy_from_host(x.data(), x.size() * 2);
+    for (const ops::LinearPolicy policy : policies) {
+        const std::size_t capacity =
+            op == TermOp::LinearAdd ? ops::linear_add_workspace_capacity_bytes(qtype, n, k, policy, 1, kMaxWidth)
+            : op == TermOp::SwiGlu  ? ops::linear_swiglu_workspace_capacity_bytes(qtype, n, k, policy, 1, kMaxWidth, routes)
+                                    : ops::attn_input_proj_workspace_capacity_bytes(qtype, n, k, policy, 1, kMaxWidth);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        for (const std::int32_t t : kWidths) {
+            std::vector<std::uint16_t> outputs[2];
+            for (int with = 0; with < 2; ++with) {
+                const ops::LoraAddend* term = with != 0 ? &wide : &narrow;
+                Tensor xt(x_d.data(), DType::BF16, {k, t});
+                if (op == TermOp::LinearAdd) {
+                    y_d.copy_from_host(residual.data(), static_cast<std::size_t>(n) * t * 2);
+                    Tensor yt(y_d.data(), DType::BF16, {n, t});
+                    ops::linear_add(xt, weight, yt, policy, workspace, nullptr, routes, term);
+                } else if (op == TermOp::SwiGlu) {
+                    Tensor yt(y_d.data(), DType::BF16, {out_rows, t});
+                    ops::linear_swiglu(xt, weight, yt, policy, workspace, nullptr, routes, term);
+                } else {
+                    auto* base = static_cast<std::uint16_t*>(y_d.data());
+                    Tensor q(base, DType::BF16, {6144, t}), g(base + 6144 * t, DType::BF16, {6144, t});
+                    Tensor kk(base + 12288 * t, DType::BF16, {1024, t}), v(base + 13312 * t, DType::BF16, {1024, t});
+                    ops::attn_input_proj(xt, weight, q, g, kk, v, policy, workspace, nullptr, term);
+                }
+                test::cuda_synchronize();
+                outputs[with].resize(static_cast<std::size_t>(out_rows) * t);
+                y_d.copy_to_host(outputs[with].data(), outputs[with].size() * 2);
+            }
+            failures += compare_bits(std::string(op == TermOp::LinearAdd ? "linear_add" : op == TermOp::SwiGlu
+                                                                                ? "linear_swiglu"
+                                                                                : "attn_input_proj") +
+                                         " rank 32 padded to 128 (wide = narrow) " + policy_name(policy) + " qtype=" +
                                          std::to_string(static_cast<int>(qtype)) + " K=" + std::to_string(k) +
                                          " T=" + std::to_string(t),
                                      outputs[1].data(), outputs[0].data(), outputs[0].size());
@@ -793,6 +902,81 @@ INFERNIX_OP_TEST(lora) {
             return check_linear_swiglu_terms(QType::Q4_G64_FP16, {}, {P::A16Only}, ops::LinearRoutes::Exact, rank);
         });
     }
+    // The wide class (padded rank 80 to 128): every route at 128 (nonzero factors past the narrow class's 64), and
+    // 80 (an odd last k-step) and 96 (the Harness Hub super-adapter's) on the routes that stage the operands.
+    run("linear_add nvfp4 wide", [&] {
+        return check_linear_add_terms(QType::NVFP4, 17408, nvfp4,
+                                      {P::A16Only, P::AllowA4, P::AllowA4Residual, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("linear_add fp8 bf16 wide", [&] {
+        return check_linear_add_terms(QType::FP8_E4M3FN_ROW_BF16, 6144, {},
+                                      {P::A16Only, P::AllowA8, P::AllowA8Residual, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("linear_add fp8 f32 wide", [&] {
+        return check_linear_add_terms(QType::FP8_E4M3FN_ROW_F32, 6144, fp8_static,
+                                      {P::A16Only, P::AllowA8, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("linear_add q5 wide", [&] {
+        return check_linear_add_terms(QType::Q5_G64_FP16, 17408, {}, {P::A16Only, P::A16ColumnInvariant}, 128);
+    });
+    run("linear_swiglu nvfp4 wide", [&] {
+        return check_linear_swiglu_terms(QType::NVFP4, nvfp4,
+                                         {P::A16Only, P::AllowA4, P::AllowA4Residual, P::A8Only, P::A16ColumnInvariant},
+                                         ops::LinearRoutes::Exact, 128);
+    });
+    run("linear_swiglu fp8 wide", [&] {
+        return check_linear_swiglu_terms(QType::FP8_E4M3FN_ROW_BF16, {},
+                                         {P::A16Only, P::AllowA8, P::AllowA8Residual, P::A8Only, P::A16ColumnInvariant},
+                                         ops::LinearRoutes::Exact, 128);
+    });
+    run("linear_swiglu q4 wide", [&] {
+        return check_linear_swiglu_terms(QType::Q4_G64_FP16, {}, {P::A16Only, P::A16ColumnInvariant},
+                                         ops::LinearRoutes::Exact, 128);
+    });
+    run("linear_swiglu q4 w4a8 wide", [&] {
+        return check_linear_swiglu_terms(QType::Q4_G64_FP16, {}, {P::A16Only}, ops::LinearRoutes::Q4W4A8, 128);
+    });
+    run("attn nvfp4 wide", [&] {
+        return check_attention_terms(QType::NVFP4, nvfp4, {P::A16Only, P::AllowA4, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("attn fp8 bf16 wide", [&] {
+        return check_attention_terms(QType::FP8_E4M3FN_ROW_BF16, {},
+                                     {P::A16Only, P::AllowA8, P::AllowA8Residual, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("attn fp8 f32 wide", [&] {
+        return check_attention_terms(QType::FP8_E4M3FN_ROW_F32, fp8_static,
+                                     {P::A16Only, P::AllowA8, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("paired attn wide", [&] { return check_paired_attention_terms({P::A16Only, P::A16ColumnInvariant}, 128); });
+    run("linear_add nvfp4 K6144 wide", [&] {
+        return check_linear_add_terms(QType::NVFP4, 6144, nvfp4,
+                                      {P::A16Only, P::AllowA4, P::AllowA4Residual, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("linear_add fp8 bf16 K17408 wide", [&] {
+        return check_linear_add_terms(QType::FP8_E4M3FN_ROW_BF16, 17408, {},
+                                      {P::A16Only, P::AllowA8, P::AllowA8Residual, P::A8Only, P::A16ColumnInvariant}, 128);
+    });
+    run("linear_add q5 K6144 wide", [&] {
+        return check_linear_add_terms(QType::Q5_G64_FP16, 6144, {}, {P::A16Only, P::A16ColumnInvariant}, 128);
+    });
+    for (const std::int32_t rank : {80, 96}) {
+        run("linear_add nvfp4 wide rank", [&] {
+            return check_linear_add_terms(QType::NVFP4, 17408, nvfp4, {P::A16Only, P::AllowA4}, rank);
+        });
+        run("linear_swiglu nvfp4 wide rank", [&] {
+            return check_linear_swiglu_terms(QType::NVFP4, nvfp4, {P::A16Only, P::AllowA4}, ops::LinearRoutes::Exact,
+                                             rank);
+        });
+        run("linear_add fp8 wide rank", [&] {
+            return check_linear_add_terms(QType::FP8_E4M3FN_ROW_F32, 6144, fp8_static, {P::A16Only}, rank);
+        });
+        run("linear_add q5 wide rank", [&] {
+            return check_linear_add_terms(QType::Q5_G64_FP16, 17408, {}, {P::A16Only}, rank);
+        });
+        run("linear_swiglu q4 wide rank", [&] {
+            return check_linear_swiglu_terms(QType::Q4_G64_FP16, {}, {P::A16Only}, ops::LinearRoutes::Exact, rank);
+        });
+    }
     run("attn nvfp4", [&] {
         return check_attention_terms(QType::NVFP4, nvfp4, {P::A16Only, P::AllowA4, P::A8Only, P::A16ColumnInvariant});
     });
@@ -856,5 +1040,35 @@ INFERNIX_OP_TEST(lora) {
     zero("zero-B down q5", TermOp::LinearAdd, QType::Q5_G64_FP16, 5120, 17408, {}, {P::A16Only, P::A16ColumnInvariant});
     zero("zero-B down q5 ksplit", TermOp::LinearAdd, QType::Q5_G64_FP16, 5120, 17408, {}, {P::A16Only},
          ops::LinearRoutes::Q5KSplit);
+    // The wide instances on a rank-32 term padded to 128 give the narrow instances' bits (every Op, format and route).
+    const auto padded = [&](const char* name, TermOp op, QType qtype, std::int32_t n, std::int32_t k,
+                            qw::PatternedWeightOptions options, std::initializer_list<ops::LinearPolicy> policies,
+                            ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
+        run(name, [&] { return check_padded_term_identity(op, qtype, n, k, options, policies, routes); });
+    };
+    padded("padded down nvfp4", TermOp::LinearAdd, QType::NVFP4, 5120, 17408, nvfp4,
+           {P::A16Only, P::AllowA4, P::AllowA4Residual, P::A8Only, P::A16ColumnInvariant});
+    padded("padded down nvfp4 wide tile", TermOp::LinearAdd, QType::NVFP4, 5120, 17408, nvfp4, {P::AllowA4},
+           ops::LinearRoutes::WideDownTile);
+    padded("padded o_proj fp8 bf16", TermOp::LinearAdd, QType::FP8_E4M3FN_ROW_BF16, 5120, 6144, {},
+           {P::A16Only, P::AllowA8, P::AllowA8Residual, P::A8Only, P::A16ColumnInvariant});
+    padded("padded o_proj fp8 f32", TermOp::LinearAdd, QType::FP8_E4M3FN_ROW_F32, 5120, 6144, fp8_static,
+           {P::A16Only, P::AllowA8, P::A8Only, P::A16ColumnInvariant});
+    padded("padded swiglu nvfp4", TermOp::SwiGlu, QType::NVFP4, 34816, 5120, nvfp4,
+           {P::A16Only, P::AllowA4, P::AllowA4Residual, P::A8Only, P::A16ColumnInvariant});
+    padded("padded swiglu nvfp4 mul", TermOp::SwiGlu, QType::NVFP4, 34816, 5120, nvfp4_mul,
+           {P::A16Only, P::AllowA4, P::AllowA4Residual, P::A16ColumnInvariant});
+    padded("padded swiglu fp8", TermOp::SwiGlu, QType::FP8_E4M3FN_ROW_BF16, 34816, 5120, {},
+           {P::A16Only, P::AllowA8, P::AllowA8Residual, P::A8Only, P::A16ColumnInvariant});
+    padded("padded attn nvfp4", TermOp::Attention, QType::NVFP4, 14336, 5120, nvfp4,
+           {P::A16Only, P::AllowA4, P::A8Only, P::A16ColumnInvariant});
+    padded("padded attn fp8 f32", TermOp::Attention, QType::FP8_E4M3FN_ROW_F32, 14336, 5120, fp8_static,
+           {P::A16Only, P::AllowA8, P::A8Only, P::A16ColumnInvariant});
+    padded("padded swiglu q4", TermOp::SwiGlu, QType::Q4_G64_FP16, 34816, 5120, {}, {P::A16Only, P::A16ColumnInvariant});
+    padded("padded swiglu q4 w4a8", TermOp::SwiGlu, QType::Q4_G64_FP16, 34816, 5120, {}, {P::A16Only},
+           ops::LinearRoutes::Q4W4A8);
+    padded("padded down q5", TermOp::LinearAdd, QType::Q5_G64_FP16, 5120, 17408, {}, {P::A16Only, P::A16ColumnInvariant});
+    padded("padded down q5 ksplit", TermOp::LinearAdd, QType::Q5_G64_FP16, 5120, 17408, {}, {P::A16Only},
+           ops::LinearRoutes::Q5KSplit);
     return failures == 0 ? 0 : 1;
 }

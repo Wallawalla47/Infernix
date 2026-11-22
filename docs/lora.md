@@ -3,7 +3,9 @@
 `--lora PATH` applies a LoRA adapter to a Qwen3.5-family dense model (the Qwen3.8-27B artifacts) at runtime. The
 artifact is unchanged: the engine reads the adapter's own Hugging Face files at load and adds the adapter's term to
 every projection it targets. Every product command takes the option: `infernix-serve`, `infernix` (CLI),
-`infernix-perplexity` and `infernix-bench`, and the launcher's model page has a LoRA adapter field.
+`infernix-perplexity` and `infernix-bench`. The launcher finds adapters on Hugging Face and downloads them
+(**Discover → LoRA adapters**), lists the ones in its model folders, and its model page has a LoRA adapter picker
+([launcher guide](launcher.md#download-models)).
 
 ## The adapter's files
 
@@ -16,7 +18,8 @@ is a folder holding two files:
 
 `--lora` takes that folder, or its `adapter_model.safetensors` with `adapter_config.json` beside it. The factors may
 be stored as F32, BF16 or F16. A GGUF adapter (llama.cpp's export of the same factors) is not read: download the
-safetensors repository instead.
+safetensors repository instead. Only these two files are needed; an adapter repository's tokenizer and chat template
+copies are not read (the artifact's own are used).
 
 ```
 infernix-serve Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix.infernix --lora C:\adapters\my-adapter --model-id my-adapter
@@ -40,12 +43,13 @@ For a projection `y = W x` the adapter makes `y = W x + s B (A x)`, with `A` its
 | `self_attn.q_proj`, `k_proj`, `v_proj`, `o_proj` | the full-attention layers (every fourth). `q_proj`'s rows are each head's query and then its output gate's, as in the checkpoint |
 | `mlp.gate_proj`, `up_proj`, `down_proj` | every layer's dense MLP |
 
-Ranks up to 64. Module paths are the checkpoint's (`model.language_model.layers.N...`, or a text-only export's
-`model.layers.N...`) and every module's shapes must be the model's, so an adapter trained for another base model is
-refused by name.
+Ranks up to 128 (the largest of the adapter's modules' ranks, `r` and `rank_pattern`). Module paths are the
+checkpoint's (`model.language_model.layers.N...`, or a text-only export's `model.layers.N...`) and every module's
+shapes must be the model's, so an adapter trained for another base model is refused by name.
 
-Refused, naming the module or option:
+Refused, with a message that names the adapter and says why ("LoRA adapter C:\adapters\x is refused: ..."):
 
+- a rank above 128: "its rank is 256 (module '...'), and Infernix currently supports LoRA adapters up to rank 128";
 - the Gated DeltaNet projections (`linear_attn.*`), vision, MTP, the embeddings and the head;
 - the mixture-of-experts models (Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next);
 - everything that is not plain LoRA on linear weights: DoRA (`use_dora`), LoRA biases (`lora_bias`, `bias` other than
@@ -109,6 +113,11 @@ epilogue. The decode kernels copy their rows of `B` and columns of `U` into shar
 (their weights stream through L2, so `B` would be gone by the epilogue), and the NVFP4 prompt tile copies them once
 for the whole tile; the other tiles read them from L2, one fragment at a time.
 
+Every adapted kernel has two instances, chosen by the adapter's rank (padded to a multiple of 16): up to 64,
+the narrow one, which holds the term's operands for 64; above, to 128, the wide one, which holds them for 128. They
+compute the same chain (a rank-32 adapter padded with zeros to 128 gives the same bits through either), and the narrow
+instances are exactly the kernels a rank-64 limit had, so supporting wide adapters costs a narrow adapter nothing.
+
 The cost of a rank-32 adapter on all seven projections, against the same artifact without one (RTX 5090,
 `infernix_bench` with INT8 KV, one run of three repetitions each, 2026-11-21; the term's cost depends on the rank and
 the adapted modules, not on the factors' values, so a zero adapter measured it):
@@ -125,6 +134,32 @@ the adapted modules, not on the factors' values, so a zero adapter measured it):
 On the QAD and groupwise artifacts, decode at C=2 costs −7.4 % and −7.1 %, prefill of 4,096 tokens −9.8 % and
 −2.2 % (16,384 tokens: −8.7 % and −2.0 %), and on the reproducible route prefill of 2,048 tokens −12.1 % and −2.5 %
 and decode −4.9 % and −9.1 %; decode with `--spec mtp` costs −3.0 to −5.3 % and −5.5 % (two runs each).
+
+A wider adapter costs more. The same trained rank-32 adapter, padded with zeros to ranks 96 and 128 (so all three
+give the same bits), against the same artifact without one (the same benchmark, 2026-11-21; prefill: two rounds of
+every rank and none in turn; decode: three runs at rank 32 and two each at 96 and 128 against four without an adapter,
+measured earlier that day, before a prefill-only change):
+
+| 27B artifact | Rank | Prefill, 2,048 tokens | Decode | Decode, `--spec auto` |
+|---|---|---|---|---|
+| NVIDIA NVFP4 QAD | 32 | −10.1 % | −4.9 % | +0.6 % |
+| | 96 | −23.2 % | −7.4 % | −3.3 % |
+| | 128 | −26.8 % | −8.7 % | −4.9 % |
+| Groupwise (Q4/Q5) | 32 | −2.5 % | −5.7 % | −4.6 % |
+| | 96 | −6.5 % | −8.8 % | −10.2 % |
+| | 128 | −8.1 % | −10.1 % | −12.8 % |
+
+Unlike the zero adapter above, this one changes the model's choices and with them the drafters' acceptance (161
+accepted tokens against 148 without it on QAD, 144 against 141 on groupwise, the same at every rank), so the
+`--spec auto` column holds that change too; the rank's own cost is the difference between its rows. Prefill's cost
+grows a little less than in proportion to the rank (on QAD 14 ms more than the 125 ms of 2,048 tokens without an
+adapter at rank 32, 46 ms at rank 128), decode's much less. At rank 128, prefill of 2,048 tokens on the reproducible
+route costs −28.8 % and −11.4 % and decode at C=2 −11.8 % and −15.8 %; at rank 80 prefill costs −21.4 % and −5.5 %.
+On the Official NVFP4, Uncensored and NVIDIA NVFP4 27Bs prefill of 2,048 tokens costs −8.9, −9.3 and −9.1 % at rank 32
+and −24.5, −24.6 and −24.3 % at rank 128. Harness Hub's super-adapter (rank 96, trained) costs what the padded rank-96
+adapter does: on QAD prefill −23.5 %, decode −7.3 % and decode with `--spec auto` −2.3 % (162 accepted tokens against
+148), on groupwise −6.7, −8.9 and −10.4 %. A rank-128 adapter on all seven projections takes 1,216 MiB of VRAM, a
+rank-96 one 912 MiB.
 
 The zero adapter left the drafters' acceptance exactly as without it; a trained adapter changes acceptance only
 through the model's choices ([above](#speculative-decoding-and-the-prefix-cache)).

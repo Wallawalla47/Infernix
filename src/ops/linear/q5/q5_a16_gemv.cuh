@@ -59,12 +59,12 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const auto row0           = std::int64_t(row < rows ? row : 0) * row_groups + group_begin;
     constexpr bool kFullTiles = Schedule::kStaticK > 0 && (Schedule::kStaticK / 128) % W == 0 &&
                                 (Schedule::kStaticK / 64 / W) % G == 0;
-    [[maybe_unused]] LoraWarpStage<1, 1>* lora_stage = nullptr;
+    [[maybe_unused]] LoraWarpStage<1, 1, kLoraStageRank<Epilogue>>* lora_stage = nullptr;
     if constexpr (kLoraEpilogue<Epilogue>) {
         // --lora: U is read after the start's wait (a joining launch would read it unordered). The term's B row and U
         // column stage in shared memory beside the main loop.
         static_assert(!JoinPdl, "a LoRA term reads U, which a joining launch reads before its wait");
-        __shared__ LoraWarpStage<1, 1> lora_stages[R];
+        __shared__ LoraWarpStage<1, 1, kLoraStageRank<Epilogue>> lora_stages[R];
         lora_stage = &lora_stages[local_row];
         if (split == 0) {
             const int term_rows[1] = {row < rows ? row : -1};
