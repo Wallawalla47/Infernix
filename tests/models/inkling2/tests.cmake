@@ -48,6 +48,24 @@ infernix_add_test(infernix_inkling2_forward_real_test
 set_tests_properties(infernix_inkling2_forward_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
   LABELS "gpu;real" TIMEOUT 1800)
 
+# The vision path against tests/fixtures/inkling2/vision_golden.json: the image processor's pixel words exactly (CPU),
+# and with INFERNIX_INKLING2_VISION_ARTIFACT the tower's rows within the reference criterion, the same bits re-encoded.
+infernix_add_test(infernix_inkling2_vision_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_real.cpp"
+  LIBRARIES infernix_model_runtime infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_inkling2_vision_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 600)
+
+# Images through the public Engine on the vision artifact: the answer to a plain picture, request invariance with
+# images (C = 3, chunk widths, graphs), DSpark equal to plain decoding, refusal without --vision. Skips without
+# INFERNIX_INKLING2_VISION_ARTIFACT.
+infernix_add_test(infernix_inkling2_engine_vision_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_vision_real.cpp"
+  LIBRARIES infernix_engine infernix_media_decode)
+set_tests_properties(infernix_inkling2_engine_vision_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 1800)
+
 # The official chat template through Infernix's Jinja engine against transformers' rendering (CPU only).
 infernix_add_test(infernix_inkling2_chat_template_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_chat_template.cpp"

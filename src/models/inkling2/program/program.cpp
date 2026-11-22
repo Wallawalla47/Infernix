@@ -7,6 +7,7 @@
 #include "infernix/ops/sampling.h"
 #include "models/inkling2/execution/dspark.h"
 #include "models/inkling2/execution/forward.h"
+#include "models/inkling2/execution/vision.h"
 #include "runtime/speculative/draft_length.h"
 
 #include <algorithm>
@@ -27,6 +28,7 @@ using Clock = std::chrono::steady_clock;
 
 struct BasePlanImpl {
     std::vector<TokenId> tokens;
+    std::shared_ptr<const std::vector<PromptImage>> images; // null: a text prompt
     runtime::RequestPlanSummary summary;
     runtime::ResolvedExecutionOptions options;
 };
@@ -155,6 +157,12 @@ public:
             drafter_ = std::make_unique<Drafter>(p_, forward_, static_cast<std::int32_t>(lanes_.size()), o_.max_context,
                                                  forward_capacity(o_));
         }
+        if (o_.vision) {
+            if (!p_.vision || !parameters.model.config().vision) {
+                throw std::invalid_argument("Inkling 2: --vision needs the tower's parameters");
+            }
+            vision_ = std::make_unique<VisionTower>(*parameters.model.config().vision, *p_.vision, o_.vision_max_cells);
+        }
         if (o_.use_cuda_graph && !o_.causal_scoring) { capture_decode_graphs(); }
     }
 
@@ -171,6 +179,10 @@ public:
             if (id < 0 || id >= vocab_) { throw std::invalid_argument("readout token is outside the public token domain"); }
         }
         auto base                             = std::make_unique<BasePlanImpl>();
+        if (!data->images.empty()) {
+            check_images(data->images, n);
+            base->images = std::make_shared<const std::vector<PromptImage>>(std::move(data->images));
+        }
         base->tokens                          = std::move(data->token_ids);
         base->options                         = options;
         base->summary.prompt_tokens           = n;
@@ -200,6 +212,7 @@ public:
         lane.bound         = true;
         lane.epoch         = ++epoch_;
         lane.tokens        = base.impl_->tokens;
+        lane.images        = base.impl_->images;
         lane.prompt_tokens = base.impl_->summary.prompt_tokens;
         lane.options       = base.impl_->options;
         lane.penalties     = lane.options.sampling.presence_penalty != 0.0F || lane.options.sampling.frequency_penalty != 0.0F;
@@ -252,7 +265,8 @@ public:
             call.position.push_back(static_cast<std::int32_t>(lane.processed + i));
         }
         upload(call);
-        run_forward(static_cast<std::int32_t>(chunk) - 1, last ? 1 : 0);
+        run_forward(static_cast<std::int32_t>(chunk) - 1, last ? 1 : 0,
+                    [&] { overlay_images(lane.images, lane.processed, chunk); });
         if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(chunk), device_.stream); } // the chunk's context rows
         lane.processed += chunk;
         PrefillProgress out;
@@ -492,6 +506,11 @@ public:
         if (options.candidates.size() != static_cast<std::size_t>(options.candidates_per_position) * (n - first_target)) {
             throw std::invalid_argument("Inkling 2: candidates must hold candidates_per_position for each scored position");
         }
+        std::shared_ptr<const std::vector<PromptImage>> images;
+        if (!data->images.empty()) {
+            check_images(data->images, n);
+            images = std::make_shared<const std::vector<PromptImage>>(std::move(data->images));
+        }
         CUDA_CHECK(cudaMemsetAsync(images_.p, 0, static_cast<std::size_t>(forward_.layout().lane_words) * 2, device_.stream));
         ScoreResult out;
         std::vector<float> row(static_cast<std::size_t>(vocab_));
@@ -511,7 +530,8 @@ public:
             const std::int32_t from = at + chunk <= first_target - 1
                                           ? static_cast<std::int32_t>(chunk)
                                           : static_cast<std::int32_t>(std::max<std::int64_t>(0, std::int64_t{first_target} - 1 - at));
-            run_forward(from, 0); // the final mix; the head runs below a slice of logits rows at a time
+            // The final mix; the head runs below a slice of logits rows at a time.
+            run_forward(from, 0, [&] { overlay_images(images, at, chunk); });
             for (std::int32_t c = from; c < static_cast<std::int32_t>(chunk); ++c) {
                 const std::int32_t slice = (c - from) % kMaxForwardColumns;
                 if (slice == 0) {
@@ -601,6 +621,7 @@ private:
         bool bound          = false;
         std::uint64_t epoch = 0;
         std::vector<TokenId> tokens; // the prompt, then the committed output and forced tokens
+        std::shared_ptr<const std::vector<PromptImage>> images; // the prompt's images (null: none)
         std::uint32_t prompt_tokens = 0;
         std::uint32_t processed     = 0; // positions whose state the lane holds
         runtime::ResolvedExecutionOptions options;
@@ -666,11 +687,53 @@ private:
         slot_used_[slot_] = true;
     }
 
-    // The Forward over the uploaded call, its head over columns [head_first, head_first + head_columns).
-    void run_forward(std::int32_t head_first, std::int32_t head_columns) {
+    // The Forward over the uploaded call, its head over columns [head_first, head_first + head_columns); `after_embed`
+    // (a prompt chunk's images) runs between the embedding and the first visit.
+    void run_forward(std::int32_t head_first, std::int32_t head_columns, const std::function<void()>& after_embed = {}) {
         forward_.embed(device_.stream);
+        if (after_embed) { after_embed(); }
         for (std::uint32_t v = 0; v < c_.visits(); ++v) { forward_.visit(v, view_, device_.stream); }
         forward_.finish(view_, forward_.final_inputs(), device_.stream, head_first, head_columns);
+    }
+
+    // A prompt's images: inside the prompt, in order, apart, each within the tower's budget (the frontend made them so).
+    void check_images(const std::vector<PromptImage>& images, std::uint32_t tokens) const {
+        if (!vision_) { throw std::invalid_argument("Inkling 2: image input needs --vision"); }
+        std::uint64_t next = 0;
+        for (const PromptImage& image : images) {
+            const std::int32_t cells = image.image.cells();
+            if (cells <= 0 || static_cast<std::uint32_t>(cells) > vision_->max_cells() || image.image.patches == nullptr ||
+                image.first_token < next || std::uint64_t{image.first_token} + cells > tokens) {
+                throw std::invalid_argument("Inkling 2: a prompt image's tokens or size disagree with the prompt");
+            }
+            next = std::uint64_t{image.first_token} + cells;
+        }
+    }
+
+    // The image rows of a prompt chunk [first, first + count) over its embedding columns (after the embedding norm,
+    // as the reference scatters them): each overlapping image encoded, unless the tower still holds its rows (an
+    // image across chunks encodes once), and its overlapping rows copied. `encoded_set_` keeps the encoded image's
+    // prompt alive, so its address names it until another image is encoded.
+    void overlay_images(const std::shared_ptr<const std::vector<PromptImage>>& images, std::uint32_t first,
+                        std::uint32_t count) {
+        if (!images) { return; }
+        const std::size_t width = c_.hidden_size;
+        for (std::size_t i = 0; i < images->size(); ++i) {
+            const PromptImage& image  = (*images)[i];
+            const std::uint32_t begin = image.first_token;
+            const std::uint32_t end   = begin + static_cast<std::uint32_t>(image.image.cells());
+            if (end <= first || begin >= first + count) { continue; }
+            if (encoded_set_ != images || encoded_index_ != i) {
+                encoded_rows_ = vision_->encode(
+                    {image.image.rows, image.image.cols, std::span<const std::uint16_t>(*image.image.patches)},
+                    device_.stream);
+                encoded_set_   = images;
+                encoded_index_ = i;
+            }
+            const std::uint32_t lo = std::max(begin, first), hi = std::min(end, first + count);
+            CUDA_CHECK(cudaMemcpyAsync(forward_.buffers().e + (lo - first) * width, encoded_rows_ + (lo - begin) * width,
+                                       (hi - lo) * width * 2, cudaMemcpyDeviceToDevice, device_.stream));
+        }
     }
 
     // A decode or verify call: the Forward with the head over every column, then (DSpark) its columns' context rows
@@ -1071,6 +1134,10 @@ private:
     ProgramDevicePlan plan_;
     Forward forward_;
     std::unique_ptr<Drafter> drafter_; // --spec dspark
+    std::unique_ptr<VisionTower> vision_; // --vision
+    std::shared_ptr<const std::vector<PromptImage>> encoded_set_; // the prompt whose image the tower last encoded
+    std::size_t encoded_index_          = 0;
+    const std::uint16_t* encoded_rows_  = nullptr;
     std::map<std::int32_t, DecodeGraphExecutable> draft_graphs_;
     PendingDraft pending_draft_;
     std::array<std::int32_t, kMaximumConcurrency> row_counts_{};
@@ -1159,6 +1226,12 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     if (dspark) {
         out.workspace += Drafter::device_bytes(static_cast<std::int32_t>(lanes), options.max_context,
                                                detail::forward_capacity(options), config.text.vocab_size);
+    }
+    if (options.vision) {
+        if (!config.vision || options.vision_max_cells == 0) {
+            throw std::invalid_argument("Inkling 2: --vision needs the vision config and a positive image budget");
+        }
+        out.workspace += VisionTower::device_bytes(*config.vision, options.vision_max_cells);
     }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     return out;

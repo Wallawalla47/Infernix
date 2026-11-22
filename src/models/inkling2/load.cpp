@@ -195,6 +195,45 @@ DSparkWeights bind_dspark(Bindings& b, const DSparkConfig& d, const TextConfig& 
     return out;
 }
 
+// The vision tower's parameters (tools/convert/inkling2_loop.py vision(): names, shapes and the Uses' inputs).
+VisionWeights bind_vision(Bindings& b, const VisionConfig& c) {
+    const std::uint64_t h = c.hidden_size, inter = c.intermediate, grid = c.position_grid;
+    VisionWeights out;
+    out.patch_embedding    = b.parameter("vision/patch_embedding", {h, c.patch_width()}, "vision/patch_input");
+    out.position_embedding = b.direct("vision/position_embedding", {grid * grid, h});
+    out.class_row          = b.direct("vision/class_row", {h});
+    out.pre_norm           = b.direct("vision/pre_norm", {h});
+    out.pre_norm_bias      = b.direct("vision/pre_norm_bias", {h});
+    for (std::uint32_t i = 0; i < c.layers; ++i) {
+        const std::string p = "vision/layers/" + std::to_string(i) + "/", a = p + "attention/", m = p + "mlp/";
+        VisionLayerWeights l;
+        l.attention_norm      = b.direct(p + "attention_norm", {h});
+        l.attention_norm_bias = b.direct(p + "attention_norm_bias", {h});
+        l.query               = b.parameter(a + "query", {h, h}, a + "input");
+        l.key                 = b.parameter(a + "key", {h, h}, a + "input");
+        l.value               = b.parameter(a + "value", {h, h}, a + "input");
+        l.query_bias          = b.direct(a + "query_bias", {h});
+        l.key_bias            = b.direct(a + "key_bias", {h});
+        l.value_bias          = b.direct(a + "value_bias", {h});
+        l.output              = b.parameter(a + "output", {h, h}, a + "attended");
+        l.output_bias         = b.direct(a + "output_bias", {h});
+        l.attention_scale     = b.direct(p + "attention_scale", {h});
+        l.mlp_norm            = b.direct(p + "mlp_norm", {h});
+        l.mlp_norm_bias       = b.direct(p + "mlp_norm_bias", {h});
+        l.up                  = b.parameter(m + "up", {inter, h}, m + "input");
+        l.up_bias             = b.direct(m + "up_bias", {inter});
+        l.down                = b.parameter(m + "down", {h, inter}, m + "hidden");
+        l.down_bias           = b.direct(m + "down_bias", {h});
+        l.mlp_scale           = b.direct(p + "mlp_scale", {h});
+        out.layers.push_back(l);
+    }
+    out.projector_in  = b.parameter("vision/projector/in", {c.projection_hidden, c.merged_width()},
+                                    "vision/projector/merged");
+    out.projector_out = b.parameter("vision/projector/out", {c.output_size, c.projection_hidden},
+                                    "vision/projector/hidden");
+    return out;
+}
+
 // The stored experts must carry the arithmetic the config names: their Use permits it, and an A16Only Use (a
 // recipe that withheld the trained activation rule) is refused rather than run in another arithmetic.
 void check_expert_uses(const std::vector<PendingWeight>& pending, const TextWeights& weights, const TextConfig& c) {
@@ -340,6 +379,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text);
     if (out->config.dspark) { out->weights.dspark = bind_dspark(bindings, *out->config.dspark, out->config.text); }
+    if (out->config.vision) { out->weights.vision = bind_vision(bindings, *out->config.vision); }
     check_expert_uses(bindings.weights, out->weights, out->config.text);
     out->pending = std::move(bindings.weights);
     if (options.pack_bf16) {

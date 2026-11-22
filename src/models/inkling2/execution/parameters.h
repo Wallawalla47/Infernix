@@ -73,6 +73,28 @@ struct DSparkOperands {
     const std::uint16_t* fold_bias              = nullptr; // BF16 [V]
 };
 
+// The vision tower's operands (bound with --vision): BF16 vectors [H] unless noted.
+struct VisionLayerOperands {
+    const std::uint16_t *attention_norm = nullptr, *attention_norm_bias = nullptr;
+    Weight qkv;                              // [3H, H]: q, k, v rows (one parent)
+    const std::uint16_t* qkv_bias = nullptr; // [3H]
+    Weight output;                           // [H, H]
+    const std::uint16_t *output_bias = nullptr, *attention_scale = nullptr;
+    const std::uint16_t *mlp_norm = nullptr, *mlp_norm_bias = nullptr;
+    Weight up;                               // [I, H]
+    const std::uint16_t* up_bias = nullptr;  // [I]
+    Weight down;                             // [H, I]
+    const std::uint16_t *down_bias = nullptr, *mlp_scale = nullptr;
+};
+struct VisionOperands {
+    Weight patch_embedding;                        // [H, 3 p^2]
+    const std::uint16_t* position_table = nullptr; // [grid^2][H]
+    const std::uint16_t* class_row      = nullptr; // [H]
+    const std::uint16_t *pre_norm = nullptr, *pre_norm_bias = nullptr;
+    std::vector<VisionLayerOperands> layers;
+    Weight projector_in, projector_out;            // [P, m^2 H], [text H, P]
+};
+
 struct Parameters {
     explicit Parameters(const Model& model);
 
@@ -84,6 +106,7 @@ struct Parameters {
     Weight head;                                   // BF16 [V][H], FP32 logits
     std::vector<LayerOperands> layers;
     std::optional<DSparkOperands> dspark; // --spec dspark
+    std::optional<VisionOperands> vision; // --vision
 };
 
 } // namespace infernix::models::inkling2

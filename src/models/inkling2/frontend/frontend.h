@@ -4,14 +4,16 @@
 // Infernix's Jinja engine, tokenized with the render's literal spans (client text never becomes an added token), and
 // the output session (output_session.h) of each turn.
 //
-// This slice renders text conversations for a new assistant turn: system/developer, user, assistant (with reasoning
-// and tool calls) and tool turns, declared tools and the template's thinking effort (PromptOptions::reasoning_effort,
-// enable_thinking false = "none", or a chat_template_kwargs reasoning_effort string or number in [0, 0.99]). It
-// refuses what later milestones add: images (the vision tower), continuing a final assistant message, the next-turn
-// history prefill, constrained output and required or named tool choices (the constrained route), and the
+// This slice renders conversations for a new assistant turn: system/developer, user, assistant (with reasoning and
+// tool calls) and tool turns, images in user and tool turns (with --vision: each image part's one placeholder expanded
+// to its cells' image tokens; image.h processes the pixels), declared tools and the template's thinking effort
+// (PromptOptions::reasoning_effort, enable_thinking false = "none", or a chat_template_kwargs reasoning_effort string
+// or number in [0, 0.99]). It refuses what later milestones add: video, continuing a final assistant message, the
+// next-turn history prefill, constrained output and required or named tool choices (the constrained route), and the
 // reasoning-loop guard.
 
 #include "infernix/types.h"
+#include "models/inkling2/frontend/image.h"
 #include "models/inkling2/frontend/output_session.h"
 #include "models/inkling2/model.h"
 #include "models/inkling2/ngram.h"
@@ -31,11 +33,21 @@ struct FrontendOptions {
     // Thinking text injected before the thinking close when a request reaches its thinking budget; empty injects the
     // close alone.
     std::string thinking_budget_message;
+    // --vision: the tower's config (image input accepted) and the image-token budget of an image (--vision-max-merged).
+    std::optional<VisionConfig> vision;
+    std::uint32_t vision_max_cells = 32768;
+};
+
+// One image of a prompt: its image tokens [first_token, first_token + cells) and its processed patches.
+struct PromptImage {
+    std::uint32_t first_token = 0;
+    ProcessedImage image;
 };
 
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
     std::shared_ptr<const ToolNames> tools; // null: the prompt declares no tools
+    std::vector<PromptImage> images;        // in prompt order
     PromptPreparationStats stats;
 };
 
@@ -82,7 +94,7 @@ public:
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
     // The template renders a system turn at any position (developer turns render as system turns).
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const noexcept { return {}; }
-    [[nodiscard]] VisionImageBudget vision_image_budget() const noexcept { return {}; }
+    [[nodiscard]] VisionImageBudget vision_image_budget() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const noexcept { return {}; }
     void warm_constraints() const noexcept {}
 

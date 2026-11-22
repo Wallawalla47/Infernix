@@ -2,6 +2,7 @@
 
 #include "core/weight_view.h"
 
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 
@@ -34,23 +35,45 @@ Weight linear(const Model& model, WeightId id) {
     }
 }
 
-// Two row ranges of one parent, the second right after the first, as one matrix.
-Weight stacked(const Model& model, WeightId first, WeightId second) {
-    const WeightView& a = model.weight(first).view;
-    const WeightView& b = model.weight(second).view;
-    if (a.shape.size() != 2 || b.shape.size() != 2 || a.shape[1] != b.shape[1]) {
-        throw std::invalid_argument(model.weight(first).name + ": stacked matrices need equal K");
-    }
+// Row ranges of one parent, each right after the one before, as one matrix.
+Weight stacked(const Model& model, std::initializer_list<WeightId> ids) {
+    const WeightView& first = model.weight(*ids.begin()).view;
     WeightView view;
-    view.shape = {a.shape[0] + b.shape[0], a.shape[1]};
-    view.parts = a.parts;
-    view.parts.insert(view.parts.end(), b.parts.begin(), b.parts.end());
+    view.shape = {0, first.shape.size() == 2 ? first.shape[1] : 0};
+    std::string names;
+    for (const WeightId id : ids) {
+        const WeightView& part = model.weight(id).view;
+        if (part.shape.size() != 2 || part.shape[1] != view.shape[1]) {
+            throw std::invalid_argument(model.weight(id).name + ": stacked matrices need equal K");
+        }
+        view.shape[0] += part.shape[0];
+        view.parts.insert(view.parts.end(), part.parts.begin(), part.parts.end());
+        names += (names.empty() ? "" : " + ") + model.weight(id).name;
+    }
     try {
         return native_weight(view);
     } catch (const std::exception& e) {
-        throw std::invalid_argument(model.weight(first).name + " + " + model.weight(second).name +
-                                    ": not adjacent rows of one parent (" + e.what() + ")");
+        throw std::invalid_argument(names + ": not adjacent rows of one parent (" + e.what() + ")");
     }
+}
+
+Weight stacked(const Model& model, WeightId first, WeightId second) { return stacked(model, {first, second}); }
+
+// BF16 vectors stored one right after another (one parent), as one pointer to the first.
+const std::uint16_t* adjacent_bf16(const Model& model, std::initializer_list<WeightId> ids) {
+    const std::uint16_t* first = nullptr;
+    std::size_t next           = 0;
+    for (const WeightId id : ids) {
+        const std::uint16_t* p = bf16(model, id);
+        const auto& shape      = model.weight(id).view.shape;
+        if (first == nullptr) {
+            first = p;
+        } else if (p != first + next) {
+            throw std::invalid_argument(model.weight(id).name + ": not stored right after the vector before it");
+        }
+        next += shape.empty() ? 0 : static_cast<std::size_t>(shape[0]);
+    }
+    return first;
 }
 
 ops::w4a4_moe::Bank bank(const Model& model, const MoeWeights& w, const TextConfig& c, ExpertFormat format) {
@@ -167,6 +190,36 @@ DSparkOperands dspark_operands(const Model& model, const DSparkWeights& w, const
     return out;
 }
 
+VisionOperands vision_operands(const Model& model, const VisionWeights& w) {
+    VisionOperands out;
+    out.patch_embedding = linear(model, w.patch_embedding);
+    out.position_table  = bf16(model, w.position_embedding);
+    out.class_row       = bf16(model, w.class_row);
+    out.pre_norm        = bf16(model, w.pre_norm);
+    out.pre_norm_bias   = bf16(model, w.pre_norm_bias);
+    for (const VisionLayerWeights& l : w.layers) {
+        VisionLayerOperands o;
+        o.attention_norm      = bf16(model, l.attention_norm);
+        o.attention_norm_bias = bf16(model, l.attention_norm_bias);
+        o.qkv                 = stacked(model, {l.query, l.key, l.value});
+        o.qkv_bias            = adjacent_bf16(model, {l.query_bias, l.key_bias, l.value_bias});
+        o.output              = linear(model, l.output);
+        o.output_bias         = bf16(model, l.output_bias);
+        o.attention_scale     = bf16(model, l.attention_scale);
+        o.mlp_norm            = bf16(model, l.mlp_norm);
+        o.mlp_norm_bias       = bf16(model, l.mlp_norm_bias);
+        o.up                  = linear(model, l.up);
+        o.up_bias             = bf16(model, l.up_bias);
+        o.down                = linear(model, l.down);
+        o.down_bias           = bf16(model, l.down_bias);
+        o.mlp_scale           = bf16(model, l.mlp_scale);
+        out.layers.push_back(o);
+    }
+    out.projector_in  = linear(model, w.projector_in);
+    out.projector_out = linear(model, w.projector_out);
+    return out;
+}
+
 } // namespace
 
 Parameters::Parameters(const Model& source) : model(source) {
@@ -188,6 +241,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     layers.reserve(w.layers.size());
     for (std::uint32_t i = 0; i < w.layers.size(); ++i) { layers.push_back(layer_operands(model, w.layers[i], c, i)); }
     if (w.dspark) { dspark = dspark_operands(model, *w.dspark, *model.config().dspark); }
+    if (w.vision) { vision = vision_operands(model, *w.vision); }
 }
 
 } // namespace infernix::models::inkling2

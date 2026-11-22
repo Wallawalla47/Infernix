@@ -544,7 +544,7 @@ per visit:  [attention mixer] → [projection q,k,v,r,gate,sink(,taps)] → [att
 | Area | Location | Notes |
 |---|---|---|
 | Config, binding, read-only model | `src/models/inkling2/config.*`, `load.*`, `model.h`, `weights.h` | parses `text_config.loop_config`, `mtp_config`, `vision_config`; rejects configs the Ops do not cover |
-| Native parameters, fixed calls | `src/models/inkling2/execution/` | built: `parameters.*` (the native operands), `forward.*` (one call: embed, the 48 visits with the pass restarts and messages, the head; the StateImage layout); planned: `dspark.cpp`, `vision_tower.cpp`, `forward_lossless.cpp` |
+| Native parameters, fixed calls | `src/models/inkling2/execution/` | built: `parameters.*` (the native operands), `forward.*` (one call: embed, the 48 visits with the pass restarts and messages, the head; the StateImage layout), `dspark.*`, `vision.*` (the tower, [§15](#15-vision)); planned: `forward_lossless.cpp` |
 | Program | `src/models/inkling2/program/` | planning, stores, transactions, graphs, prefix binding; implements `runtime::EngineProgramContract` |
 | State layout | `src/models/inkling2/execution/forward.h` (`state_layout`) | StateImage parts ([§7.2](#72-stateimage)) |
 | Frontend | `src/models/inkling2/frontend/` | renderer, output session, image preprocessing (the pre-tokenizer is the shared core's `Inkling` pipeline) |
@@ -1097,13 +1097,48 @@ chunk width.
 
 ## 15. Vision
 
-Second track (M7). Upstream (SGLang `inkling2_vision.py`): patches of 20 × 20 × 3 (a 1200 → 1024 linear), the learned
-32 × 32 position table bilinearly resized to the image's patch grid, a CLS token per image, 23 pre-norm blocks
-(LayerNorm with bias, attention with 2-D rotary on q/k, exact-GELU MLP, layer scale on both branches), attention within
-each image only, 2 × 2 merge (4096), `proj_in` 4096 → 4096, GELU, `proj_out` → 2304, replacing the image's placeholder
-tokens. The text model has no positional encoding beyond the relative bias, so image tokens are ordinary positions (no
-MRoPE). Ops: the existing BF16 GEMMs (packed where faster), a varlen 2-D-rotary attention (as Qwen3.5 Vision's),
-LayerNorm and bilinear-resize kernels. Media acquisition and prefix-cache media keys reuse Qwen's.
+Built with `--vision` (images; no video). The semantics, from transformers' `Inkling2ImageProcessor` and
+`Inkling2VisionModel` and SGLang's `inkling2_vision.py` (which agree):
+
+- **Processor** (`frontend/image.{h,cpp}`): the decoded RGB; a transparent image (`media::decode::Policy::keep_alpha`:
+  an alpha channel or PNG tRNS) composited over a 204/153 checkerboard of 8-pixel squares,
+  `(rgb · a + bg · (255 − a) + 127) / 255`; padded right and bottom to whole 40-pixel cells with −1 on the 0-255
+  scale; `(v − 127.5) / 127.5` in FP32, then BF16. One image token per cell. The reference never resizes (the model
+  card recommends 40-4,096-pixel sides); an image of more cells than `--vision-max-merged` (default 32,768) is first
+  downscaled bicubically (the shared `media::decode::resize_bicubic`, Qwen3.5's) to the largest whole cells that fit
+  with its aspect kept (smart_resize's floor), or refused when the request asks (`ImageResizePolicy::RejectOversized`).
+- **Prompt** (`frontend/frontend.cpp`): each image part renders the template's `<|content_image|><|unused_200054|>`,
+  whose one placeholder becomes the image's cells' tokens; client text is a literal span, so a typed placeholder stays
+  text. The context check counts the expanded prompt from the images' geometry before any pixel is decoded.
+- **Tower** (`execution/vision.{h,cpp}`), one image at a time: patches of 20 × 20 × 3 in merge-major order (cell
+  row-major, then (dy, dx); values (ky, kx, channel)) through the 1200 → 1024 linear, plus the 32 × 32 position table
+  resized by separable bilinear taps (`src = (i + 0.5) · 32 / n − 0.5`, two taps clamped to the table); the class token
+  `class + cls_position` in front; LayerNorm (ε 1e-5); 23 layers of LayerNorm → fused QKV (+ bias) → the axial rotary
+  on interleaved pairs (pairs 0-15 by column + 1, 16-31 by row + 1, θ_j = 10000^(−(j mod 16)/16); the class token at
+  (0, 0)) → D64 attention over the whole image (scale 1/8) → output projection → `x + ls₁ ⊙ (y + b)`; LayerNorm → MLP
+  (exact GELU) → `x + ls₂ ⊙ (y + b)`; then each cell's 4 consecutive patch rows as one [4096] row through `proj_in`
+  (no bias) → exact GELU → `proj_out` → 2304. Token-parallel stages run 4,096 tokens at a time; Q/K/V and the residual
+  are whole. Ops: `ops::linear` (BF16), `layer_norm`, `gelu`, `add_bias`, `vision_pos_embed_add`, the packed attention's
+  D64 profile (`softmax_attention.h`, added beside Qwen3.5 Vision's D72), and `inkling2_vision.h`'s QKV bias + rotary
+  and layer-scaled residual. An image's rows depend on its patches alone (the same bits in any prompt or batch).
+- **Prefill** (`program/program.cpp`): the Program owns the tower and its buffers (in its device plan: ~10 KB a patch
+  token, 1.31 GiB at 32,768 image tokens, 0.46 GiB at 10,609, a 4,096-pixel square; the tower's weights 0.63 GB); each
+  prompt chunk, right after the embedding and its norm, encodes the images it overlaps (an image across chunks once)
+  and copies their rows over its embedding columns, as the reference scatters them after `embed_norm`. Scoring does
+  the same. The text model has no positional encoding beyond the relative bias, so image tokens are ordinary positions
+  (no MRoPE). The images ride in the request's base plan (no prefix cache yet: its media keys come with M4).
+
+Qualification: the processor's BF16 pixel words equal transformers' processor's exactly (`test_vision_real.cpp`, cell
+SHA-256s of `tests/fixtures/inkling2/vision_golden.json`); an FP64 oracle of the tower written from this statement
+agreed with SGLang's tower run in FP32 to 1.0-1.3e-6 relative RMS on three asymmetric images, and with its BF16 run to
+1.2-3.0 % (the BF16 run's own drift), while plausible slips move the rows 8 % (the position table's axes swapped),
+18 % (align_corners taps) and 53-81 % (a cell's pixels transposed). The GPU tower against SGLang's FP32 rows (criterion
+4 %, stated before the run): 1.46 % and 1.80 % relative RMS (cosine 0.99989, 0.99984) on the fixture's 2 × 3- and
+2 × 5-cell images, the same bits re-encoded. Through the Engine (`test_engine_vision_real.cpp`, RTX 5090,
+2026-11-22): a red disc on blue asked for its colour answers "red"; two image requests and a text request give their
+solo tokens at C = 3; prefill chunks of 16 and 4,096, eager and graphs, the same tokens; DSpark the same tokens as
+plain decoding; an Engine without `--vision` refuses images. Not measured: the tower's time a image and prefill
+throughput with images.
 
 ---
 
@@ -1183,9 +1218,14 @@ input scales: the activation scales are per token by the model's own rule). Valu
 layer's cross-pass queries as [4, H] in (q, k, v, mlp) order; the embedding, head and Markov embedding cut to the real
 200,058 rows (every token id below that is assigned; the padded rows are non-zero but unreachable); static convs
 lag-major [k, C], row 0 the current token; DSpark `Fold` and `fold_bias` derived as `refresh_fold` does at load (FP64
-products copied into BF16; D2 may store FP8). `tools/convert/verify_inkling2.py` re-derives every bound word from the
-checkpoint with its own reader and fails on any difference or unconsumed checkpoint tensor (the vision tower comes with
-M7).
+products copied into BF16; D2 may store FP8). The `vision` component (`--components text,dspark,vision`) stores the
+tower as the checkpoint does (BF16; the patch embedding's columns in (ky, kx, channel) order, the position table
+[1024 = 32 × 32, 1024] row-major by (row, column)), q/k/v and their biases each one parent, and the class token's row
+derived as the one BF16 addition `class_embedding + cls_position_embedding` both references make.
+`tools/convert/verify_inkling2.py` re-derives every bound word from the checkpoint with its own reader and fails on any
+difference or unconsumed checkpoint tensor (the tower's only when the artifact has no vision component). Measured
+2026-11-22: `out/inkling2-mini/inkling2-mini-vision.infernix` (text, dspark, vision) 20.29 GB, 908 objects, converted in
+66 s; the verifier passed (1,168 direct tensors, 24 expert banks, 3 derived).
 
 ### 18.2 Layouts
 
@@ -1199,8 +1239,9 @@ another; the head row-major.
 ### 18.3 Frontend resources
 
 `tokenizer.json`, `tokenizer_config.json` (with `response_template`), `chat_template.jinja`, `generation_config.json`,
-kept byte for byte (the Qwen resource normalizers do not run on this family); `processor_config.json` joins with the
-vision tower (M7).
+kept byte for byte (the Qwen resource normalizers do not run on this family); `processor_config.json` with the vision
+component, kept byte for byte after the converter checks it names the processor the frontend implements
+(`Inkling2ImageProcessor`, mean and std 0.5, rescale 1/255, 40-pixel cells).
 
 ---
 
@@ -1211,7 +1252,7 @@ vision tower (M7).
 | `--spec` | `none`, `dspark`, `auto` (= `dspark` when the artifact carries the drafter) |
 | `--draft-tokens` | `auto` (calibrated), 1-7 |
 | `--kv-dtype` | `int8` (default), `bf16`, later `bf16p`, `nvfp4`, `fp8`, `k8v4` |
-| `--vision` | on when the artifact carries the tower (M7) |
+| `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` refused |
 | `--prefill-chunk` | default 16K if chunk-width invariance holds ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |
 | `--q8-weights` | approximate 8-bit K2 and head ([§11](#11-dense-projections-and-the-head)); refused with `--reproducible` and `--lossless` |

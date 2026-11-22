@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace infernix::artifact {
@@ -102,9 +103,35 @@ struct DSparkConfig {
     std::vector<std::uint32_t> target_layer_ids;
 };
 
+// The vision tower (design §15): a pre-norm ViT over (patch x patch x 3) patches with a class token, the learned
+// position table bilinearly resized to the image's patch grid, axial rotary on interleaved pairs, layer scale, then
+// merge x merge patch rows per image token and the two-layer projector into the text width. One image token per
+// (patch * merge)-pixel cell, its row replacing the image placeholder's embedding.
+struct VisionConfig {
+    std::uint32_t hidden_size       = 0;
+    std::uint32_t layers            = 0;
+    std::uint32_t heads             = 0;
+    std::uint32_t intermediate      = 0;
+    std::uint32_t patch_size        = 0;
+    std::uint32_t merge             = 0;
+    std::uint32_t position_grid     = 0; // the learned table's side
+    std::uint32_t projection_hidden = 0;
+    std::uint32_t output_size       = 0; // the text width
+    float layer_norm_eps            = 0;
+    float rope_theta                = 0;
+    std::string image_token;       // one per cell
+    std::string image_start_token; // the chat template's image part marker
+
+    [[nodiscard]] std::uint32_t head_dim() const noexcept { return hidden_size / heads; }
+    [[nodiscard]] std::uint32_t cell() const noexcept { return patch_size * merge; }
+    [[nodiscard]] std::uint32_t patch_width() const noexcept { return 3 * patch_size * patch_size; }
+    [[nodiscard]] std::uint32_t merged_width() const noexcept { return merge * merge * hidden_size; }
+};
+
 struct Config {
     TextConfig text;
     std::optional<DSparkConfig> dspark; // the drafter is bound (--spec dspark)
+    std::optional<VisionConfig> vision; // the tower is bound (--vision)
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);

@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace infernix::models::inkling2 {
@@ -45,23 +47,37 @@ Json parse_object(std::string_view json, std::string_view what) {
     return value;
 }
 
-// One message as the template reads it (its OpenAI-shaped fields).
-Json message_json(const ChatMessage& message) {
+// One message as the template reads it (its OpenAI-shaped fields); its images, in order, appended to `media` (null:
+// images are refused, the Engine runs without --vision).
+Json message_json(const ChatMessage& message, std::vector<const OwnedMedia*>* media) {
     Json out    = Json::object();
     out["role"] = role_name(message.role);
+    bool images = false;
     for (const MessagePart& part : message.parts) {
-        if (part.kind == MessagePartKind::Media) {
+        if (part.kind != MessagePartKind::Media) { continue; }
+        if (media == nullptr) {
             throw RequestError(RequestErrorKind::InvalidMedia,
-                               "Inkling 2 takes no images yet (its vision tower is a later milestone)");
+                               "Inkling 2 takes images with --vision (an artifact converted with the vision component)");
         }
+        if (part.media.kind != MediaKind::Image) {
+            throw RequestError(RequestErrorKind::InvalidMedia, "Inkling 2 takes images, not video");
+        }
+        images = true;
     }
-    if (message.parts.size() == 1) {
+    if (message.parts.size() == 1 && !images) {
         out["content"] = message.parts.front().text;
     } else if (message.parts.empty()) {
         out["content"] = "";
     } else {
         Json parts = Json::array();
-        for (const MessagePart& part : message.parts) { parts.push_back({{"type", "text"}, {"text", part.text}}); }
+        for (const MessagePart& part : message.parts) {
+            if (part.kind == MessagePartKind::Media) {
+                parts.push_back({{"type", "image"}});
+                media->push_back(&part.media);
+            } else {
+                parts.push_back({{"type", "text"}, {"text", part.text}});
+            }
+        }
         out["content"] = std::move(parts);
     }
     if (!message.reasoning_content.empty()) { out["reasoning_content"] = message.reasoning_content; }
@@ -99,11 +115,14 @@ struct Frontend::Impl {
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control;
     std::uint32_t max_context = 0;
+    std::optional<VisionConfig> vision; // --vision
+    std::uint32_t max_cells = 0;
+    TokenId image_token     = -1;       // one per image cell (the template renders one an image part)
 
     Impl(const FrontendResources& resources, const FrontendOptions& options)
         : tokenizer(resources.tokenizer),
           tmpl(std::string(resources.chat_template_jinja), "chat_template.jinja"),
-          max_context(options.max_context) {
+          max_context(options.max_context), vision(options.vision), max_cells(options.vision_max_cells) {
         if (tokenizer == nullptr) { throw std::invalid_argument("inkling2 frontend: no tokenizer"); }
         if (max_context == 0) { throw std::invalid_argument("frontend max_context must be nonzero"); }
         const auto id = [&](const char* spelling) {
@@ -133,10 +152,53 @@ struct Frontend::Impl {
         }
         control.push_back(markers.end_message);
         thinking_control = std::make_shared<const std::vector<TokenId>>(std::move(control));
+        if (vision) {
+            if (max_cells == 0) { throw std::invalid_argument("inkling2 frontend: the image-token budget must be positive"); }
+            image_token = id(vision->image_token.c_str());
+            (void)id(vision->image_start_token.c_str());
+        }
     }
 
-    // The template's context: messages, the declared tools and the thinking effort.
-    [[nodiscard]] Json context(const PromptInput& input) const {
+    // The template's image placeholders expanded to each image's cells: the ids, and each image's first token.
+    struct Expanded {
+        std::vector<TokenId> ids;
+        std::vector<std::uint32_t> first;
+    };
+    [[nodiscard]] Expanded expand(std::span<const TokenId> ids, std::span<const std::int32_t> cells) const {
+        Expanded out;
+        std::size_t image = 0;
+        for (const TokenId token : ids) {
+            if (token != image_token || image_token < 0) {
+                out.ids.push_back(token);
+                continue;
+            }
+            if (image >= cells.size()) { throw std::logic_error("inkling2 frontend: more image placeholders than images"); }
+            out.first.push_back(static_cast<std::uint32_t>(out.ids.size()));
+            out.ids.insert(out.ids.end(), static_cast<std::size_t>(cells[image++]), token);
+        }
+        if (image != cells.size()) { throw std::logic_error("inkling2 frontend: fewer image placeholders than images"); }
+        return out;
+    }
+
+    // The tokens a render takes once its images are expanded (the context check), from the images' geometry.
+    [[nodiscard]] std::vector<std::int32_t> geometry_cells(std::span<const OwnedMedia* const> media) const {
+        std::vector<std::int32_t> out;
+        for (const OwnedMedia* item : media) {
+            const MediaGeometry g = image_geometry(*item);
+            const ImageCells c    = image_cells(g.width, g.height, *vision, max_cells);
+            if (c.resized && item->image_resize_policy == ImageResizePolicy::RejectOversized) {
+                throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                   "Inkling 2 image: " + std::to_string(g.width) + " x " + std::to_string(g.height) +
+                                       " pixels take more than the " + std::to_string(max_cells) +
+                                       " image tokens --vision-max-merged allows, and the request refuses downsizing");
+            }
+            out.push_back(c.rows * c.cols);
+        }
+        return out;
+    }
+
+    // The template's context: messages, the declared tools and the thinking effort; the images, in order, into `media`.
+    [[nodiscard]] Json context(const PromptInput& input, std::vector<const OwnedMedia*>& media) const {
         const PromptOptions& options = input.options;
         if (options.continuation != PromptContinuationMode::NewAssistantTurn) {
             throw std::invalid_argument("Inkling 2 renders a new assistant turn only (no continuation modes yet)");
@@ -148,7 +210,9 @@ struct Frontend::Impl {
             out["reasoning_effort"] = "none"; // the template's lowest effort (it does not turn thinking off)
         }
         Json messages = Json::array();
-        for (const ChatMessage& message : input.messages) { messages.push_back(message_json(message)); }
+        for (const ChatMessage& message : input.messages) {
+            messages.push_back(message_json(message, vision ? &media : nullptr));
+        }
         out["messages"] = std::move(messages);
         if (!options.tool_jsons.empty()) {
             Json tools = Json::array();
@@ -160,8 +224,10 @@ struct Frontend::Impl {
         return out;
     }
 
-    [[nodiscard]] Rendered render(const PromptInput& input, std::size_t max_tokens) const {
-        const Json ctx = context(input);
+    // The render before image expansion (one placeholder an image), its images in `media`.
+    [[nodiscard]] Rendered render(const PromptInput& input, std::size_t max_tokens,
+                                  std::vector<const OwnedMedia*>& media) const {
+        const Json ctx = context(input, media);
         text::TemplateOutput rendered;
         try {
             rendered = tmpl.render(ctx);
@@ -221,7 +287,10 @@ struct Frontend::Impl {
 
 PromptSummary PreparedPrompt::summary() const {
     if (!data_) { throw std::logic_error("prepared prompt is empty"); }
-    return {.starts_in_reasoning = false, .prompt_tokens = static_cast<std::uint32_t>(data_->token_ids.size())};
+    PromptSummary out{.starts_in_reasoning = false, .prompt_tokens = static_cast<std::uint32_t>(data_->token_ids.size())};
+    out.has_media = !data_->images.empty();
+    for (const PromptImage& image : data_->images) { out.media.push_back(image.image.source); }
+    return out;
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
@@ -236,20 +305,69 @@ Frontend::Frontend(const FrontendResources& resources, FrontendOptions options)
     : impl_(std::make_shared<const Impl>(resources, options)) {}
 
 Frontend::Rendered Frontend::render(const PromptInput& input, std::size_t max_tokens) const {
-    return impl_->render(input, max_tokens);
+    std::vector<const OwnedMedia*> media;
+    Rendered rendered = impl_->render(input, max_tokens, media);
+    if (!media.empty()) { rendered.ids = impl_->expand(rendered.ids, impl_->geometry_cells(media)).ids; }
+    return rendered;
 }
 
-PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl&) const {
-    const auto start   = Clock::now();
-    const auto limit   = static_cast<std::size_t>(impl_->max_context) + 1U;
-    Rendered rendered  = impl_->render(input, limit);
-    const auto encoded = Clock::now();
-    if (rendered.ids.size() > impl_->max_context) {
-        throw RequestError(ContextLengthDetails{.prompt_tokens = rendered.ids.size(),
-                                                .max_context   = impl_->max_context,
-                                                .exact         = rendered.ids.size() < limit});
+namespace {
+
+// A cancelled or expired request stops between images and between an image's cell rows.
+void check_control(const PreparationControl& control) {
+    if (control.cancellation.requested()) {
+        throw RequestError(RequestErrorKind::Cancelled, "inference request was cancelled during image preparation");
     }
-    auto data       = std::make_unique<PreparedPromptData>();
+    if (control.deadline != Clock::time_point{} && Clock::now() >= control.deadline) {
+        throw RequestError(RequestErrorKind::QueueTimeout, "inference request expired during image preparation");
+    }
+}
+
+// The prompt's length past the context limit, as the Engine reports it (`limit` = max_context + 1 bounds the
+// tokenization: a render that reached it is "more than").
+[[noreturn]] void context_exceeded(std::size_t tokens, std::uint32_t max_context, bool exact) {
+    throw RequestError(ContextLengthDetails{.prompt_tokens = tokens, .max_context = max_context, .exact = exact});
+}
+
+} // namespace
+
+PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
+    const auto start  = Clock::now();
+    const auto limit  = static_cast<std::size_t>(impl_->max_context) + 1U;
+    std::vector<const OwnedMedia*> media;
+    Rendered rendered = impl_->render(input, limit, media);
+    const auto encoded = Clock::now();
+    const bool exact   = rendered.ids.size() < limit;
+    if (rendered.ids.size() > impl_->max_context) { context_exceeded(rendered.ids.size(), impl_->max_context, exact); }
+    auto data = std::make_unique<PreparedPromptData>();
+    if (!media.empty()) {
+        // The expanded length from the images' geometry first (an overlong prompt fails before any pixel decode).
+        const std::vector<std::int32_t> cells = impl_->geometry_cells(media);
+        std::size_t total                      = rendered.ids.size() - media.size();
+        for (const std::int32_t c : cells) { total += static_cast<std::size_t>(c); }
+        if (total > impl_->max_context) { context_exceeded(total, impl_->max_context, exact); }
+        const auto media_start = Clock::now();
+        std::vector<std::int32_t> processed_cells;
+        for (const OwnedMedia* item : media) {
+            check_control(control);
+            PromptImage image;
+            image.image = process_image(*item, *impl_->vision, impl_->max_cells,
+                                        [&] { check_control(control); });
+            processed_cells.push_back(image.image.cells());
+            data->stats.media_bytes += item->bytes.size();
+            data->stats.raw_patches += static_cast<std::uint64_t>(image.image.cells()) * impl_->vision->merge *
+                                       impl_->vision->merge;
+            data->stats.vision_tokens += static_cast<std::uint64_t>(image.image.cells());
+            data->stats.patch_bytes += image.image.patches->size() * 2;
+            data->images.push_back(std::move(image));
+        }
+        Impl::Expanded expanded = impl_->expand(rendered.ids, processed_cells);
+        for (std::size_t i = 0; i < data->images.size(); ++i) { data->images[i].first_token = expanded.first[i]; }
+        rendered.ids                       = std::move(expanded.ids);
+        data->stats.media_items            = media.size();
+        data->stats.media_preprocess_seconds = std::chrono::duration<double>(Clock::now() - media_start).count();
+        data->stats.media_preprocess_work_seconds = data->stats.media_preprocess_seconds;
+    }
     data->token_ids = std::move(rendered.ids);
     data->tools     = impl_->tool_names(input.options);
     data->stats.seconds          = std::chrono::duration<double>(Clock::now() - start).count();
@@ -259,13 +377,25 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl&) c
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl&) const {
     const auto limit = static_cast<std::size_t>(impl_->max_context) + 1U;
-    const Rendered rendered = impl_->render(input, limit);
-    if (rendered.ids.size() > impl_->max_context) {
-        throw RequestError(ContextLengthDetails{.prompt_tokens = rendered.ids.size(),
-                                                .max_context   = impl_->max_context,
-                                                .exact         = rendered.ids.size() < limit});
+    std::vector<const OwnedMedia*> media;
+    const Rendered rendered = impl_->render(input, limit, media);
+    const bool exact        = rendered.ids.size() < limit;
+    std::size_t total       = rendered.ids.size();
+    if (!media.empty() && total <= impl_->max_context) {
+        total -= media.size();
+        for (const std::int32_t c : impl_->geometry_cells(media)) { total += static_cast<std::size_t>(c); }
     }
-    return static_cast<std::uint32_t>(rendered.ids.size());
+    if (total > impl_->max_context) { context_exceeded(total, impl_->max_context, exact); }
+    return static_cast<std::uint32_t>(total);
+}
+
+VisionImageBudget Frontend::vision_image_budget() const noexcept {
+    if (!impl_->vision) { return {}; }
+    const std::uint64_t cell = impl_->vision->cell();
+    return {.prompt_tokens = impl_->max_context,
+            .token_edge    = static_cast<std::uint32_t>(cell),
+            .min_pixels    = cell * cell,
+            .max_pixels    = static_cast<std::uint64_t>(impl_->max_cells) * cell * cell};
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool) const {
@@ -296,7 +426,7 @@ std::string Frontend::detokenize_bytes(std::span<const TokenId> token_ids) const
 }
 
 ChatTokens Frontend::tokenize_chat(PromptInput input) const {
-    Rendered rendered = impl_->render(input, std::numeric_limits<std::size_t>::max());
+    Rendered rendered = render(input, std::numeric_limits<std::size_t>::max());
     ChatTokens out;
     out.generated.resize(rendered.ids.size(), 0);
     bool inside = false;

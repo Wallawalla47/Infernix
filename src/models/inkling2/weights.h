@@ -97,6 +97,32 @@ struct DSparkWeights {
     WeightId fold_bias;               // [V]
 };
 
+// One vision layer: LayerNorm (with bias), q/k/v [H, H] each with biases (q, k, v one parent, their biases another:
+// one GEMM, one bias pass), the output projection and bias, the attention branch's layer scale; LayerNorm, the MLP
+// (up [I, H] + bias, exact GELU, down [H, I] + bias) and its layer scale. Vectors BF16 [H] unless noted.
+struct VisionLayerWeights {
+    WeightId attention_norm, attention_norm_bias;
+    WeightId query, key, value;
+    WeightId query_bias, key_bias, value_bias;
+    WeightId output, output_bias;
+    WeightId attention_scale;
+    WeightId mlp_norm, mlp_norm_bias;
+    WeightId up, up_bias; // [I, H], [I]
+    WeightId down, down_bias;
+    WeightId mlp_scale;
+};
+// The vision tower (design §15): the patch embedding [H, 3 p^2] (columns in (ky, kx, channel) order), the learned
+// position table BF16 [grid^2, H] (row gy * grid + gx), the class token's row (class + its position, BF16 [H]), the
+// pre-norm, the layers, and the projector (in [P, m^2 H], exact GELU, out [text H, P]; no biases).
+struct VisionWeights {
+    WeightId patch_embedding;
+    WeightId position_embedding;
+    WeightId class_row;
+    WeightId pre_norm, pre_norm_bias;
+    std::vector<VisionLayerWeights> layers;
+    WeightId projector_in, projector_out;
+};
+
 struct TextWeights {
     WeightId token_embedding; // BF16 [V, H]
     WeightId embedding_norm;  // BF16 [H]
@@ -105,6 +131,7 @@ struct TextWeights {
     WeightId output_query;    // FP32 [H]
     std::vector<LayerWeights> layers;
     std::optional<DSparkWeights> dspark; // bound with --spec dspark
+    std::optional<VisionWeights> vision; // bound with --vision
 };
 
 } // namespace infernix::models::inkling2

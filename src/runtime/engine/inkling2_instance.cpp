@@ -22,6 +22,18 @@ void report(const EngineOptions& options, const std::string& text) {
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "%s", text.c_str());
 }
 
+// --vision-max-merged: image tokens (cells) an image may take; zero is the compiled default.
+std::uint32_t vision_max_cells(const EngineOptions& options) {
+    return options.vision_max_merged_tokens == 0 ? 32768U : options.vision_max_merged_tokens;
+}
+
+models::inkling2::FrontendOptions frontend_options(const models::inkling2::Model& model, const EngineOptions& options) {
+    return {.max_context             = options.max_context,
+            .thinking_budget_message = options.thinking_budget_message,
+            .vision                  = model.config().vision,
+            .vision_max_cells        = vision_max_cells(options)};
+}
+
 models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
     return {.max_context     = options.max_context,
             .max_concurrency = options.max_concurrency,
@@ -33,6 +45,8 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
             .draft_tokens      = options.speculative.draft_tokens == 0 ? 7U : options.speculative.draft_tokens,
             .draft_tokens_auto = options.speculative.draft_tokens_auto,
             .expert_a16        = options.expert_a16_activations,
+            .vision            = options.enable_vision,
+            .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
             .diagnostics       = options.diagnostic_observer};
 }
 
@@ -67,7 +81,12 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
     refuse(options.kv_cache != KvCacheStorage::BFloat16, "the KV cache stores BF16 keys and FP16 values (INT8 KV is "
                                                          "a later milestone)");
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
-    refuse(options.enable_vision, "the vision tower is a later milestone");
+    refuse(options.enable_vision && options.vision_offload == VisionOffload::On,
+           "--vision-offload on: the vision tower (~0.6 GiB) stays resident");
+    if (options.enable_vision && (options.vision_max_merged_tokens > 32768U ||
+                                  (options.vision_max_merged_tokens != 0 && options.vision_max_merged_tokens < 64U))) {
+        throw std::invalid_argument("--vision-max-merged must be 64-32768 image tokens");
+    }
     refuse(!options.ngram_volume_path.empty() || options.speculative.ngram_draft_tokens != 0,
            "no n-gram drafting");
     refuse(options.max_context_auto, "--max-context auto is not resolved yet: give a context limit");
@@ -106,9 +125,7 @@ EngineOptions normalize_inkling2_options(EngineOptions options) {
 }
 
 Inkling2Instance::Inkling2Instance(std::unique_ptr<models::inkling2::Model> source, const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
-      frontend(model->resources(),
-               {.max_context = options.max_context, .thinking_budget_message = options.thinking_budget_message}),
+    : model(std::move(source)), parameters(*model), frontend(model->resources(), frontend_options(*model, options)),
       capacity(options.max_context) {}
 
 Inkling2Instance::~Inkling2Instance() = default;
@@ -152,9 +169,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         template_override = read_text(options.chat_template_path);
         models::inkling2::FrontendResources resources = instance->model->resources();
         resources.chat_template_jinja                 = template_override;
-        instance->frontend = models::inkling2::Frontend(resources, {.max_context = options.max_context,
-                                                                    .thinking_budget_message =
-                                                                        options.thinking_budget_message});
+        instance->frontend = models::inkling2::Frontend(resources, frontend_options(*instance->model, options));
     }
     instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
 

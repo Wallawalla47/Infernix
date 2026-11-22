@@ -159,6 +159,44 @@ DSparkConfig dspark(const Json& value, const TextConfig& text) {
     return out;
 }
 
+VisionConfig vision(const Json& value, const TextConfig& text) {
+    require_members(value,
+                    {"architectures", "model_type", "hidden_size", "num_hidden_layers", "num_attention_heads",
+                     "intermediate_size", "patch_size", "spatial_merge_size", "position_grid",
+                     "projection_hidden_size", "output_size", "layer_norm_eps", "rope_theta", "image_token",
+                     "image_start_token", "image_mean", "image_std", "rescale_factor"},
+                    {}, "vision config");
+    if (value.at("architectures") != Json::array({"Inkling2Vision"}) || value.at("model_type") != "inkling2_vision" ||
+        dimension(value, "output_size") != text.hidden_size) {
+        throw ArtifactError("the vision component is not a tower of this Inkling 2 model");
+    }
+    // The processor the frontend implements (Inkling2ImageProcessor): v / 255, then (x - 0.5) / 0.5.
+    if (value.at("image_mean") != Json::array({0.5, 0.5, 0.5}) || value.at("image_std") != Json::array({0.5, 0.5, 0.5}) ||
+        !value.at("rescale_factor").is_number() || value.at("rescale_factor").get<double>() != 1.0 / 255.0) {
+        throw ArtifactError("the vision component's pixel normalization is not Inkling2ImageProcessor's");
+    }
+    VisionConfig out;
+    out.hidden_size       = dimension(value, "hidden_size");
+    out.layers            = dimension(value, "num_hidden_layers");
+    out.heads             = dimension(value, "num_attention_heads");
+    out.intermediate      = dimension(value, "intermediate_size");
+    out.patch_size        = dimension(value, "patch_size");
+    out.merge             = dimension(value, "spatial_merge_size");
+    out.position_grid     = dimension(value, "position_grid");
+    out.projection_hidden = dimension(value, "projection_hidden_size");
+    out.output_size       = dimension(value, "output_size");
+    out.layer_norm_eps    = positive_float(value, "layer_norm_eps");
+    out.rope_theta        = positive_float(value, "rope_theta");
+    out.image_token       = value.at("image_token").get<std::string>();
+    out.image_start_token = value.at("image_start_token").get<std::string>();
+    // The shapes the tower's Ops cover: 16 heads of 64 (the packed attention's D64 profile), even widths.
+    if (out.heads != 16 || out.hidden_size != 16U * 64U || out.intermediate % 2 || out.projection_hidden % 2 ||
+        out.image_token.empty() || out.image_start_token.empty()) {
+        throw ArtifactError("the Inkling 2 vision config's dimensions are outside the tower's Ops");
+    }
+    return out;
+}
+
 } // namespace
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
@@ -169,9 +207,18 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.speculative != SpeculativeBackend::None && options.speculative != SpeculativeBackend::DSpark) {
             throw ArtifactError("Inkling 2's drafter is DSpark (--spec dspark)");
         }
-        if (options.vision) { throw ArtifactError("the artifact has no vision component"); }
         Config out;
         out.text = text(directory.component("text").config);
+        if (directory.components.contains("vision")) {
+            VisionConfig tower = vision(directory.component("vision").config, out.text);
+            if (options.vision) { out.vision = std::move(tower); }
+        } else if (options.vision) {
+            throw ArtifactError("--vision: the artifact has no vision component (convert with --components "
+                                "text,dspark,vision)");
+        }
+        if (options.vision_offload) {
+            throw ArtifactError("--vision-offload on: Inkling 2's tower (~0.6 GiB) stays resident");
+        }
         // A stored drafter must fit the model even when it is not bound.
         if (directory.components.contains("dspark")) {
             DSparkConfig drafter = dspark(directory.component("dspark").config, out.text);
