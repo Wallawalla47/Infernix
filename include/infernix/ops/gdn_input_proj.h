@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 #include "infernix/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
@@ -47,9 +48,27 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
 /**
  * The two-parent Q4/Q5 projection under a compute policy. Every policy computes A16; under
  * A16ColumnInvariant a column's qkv and z do not depend on the call's width or other columns.
+ *
+ * LoRA (include/infernix/ops/lora.h), every policy-bearing form of the three Ops in this header: with `lora` each
+ * projected value p becomes fl32(p + fl32(c * s)) before its BF16 store or the convolution reads it (the canonical
+ * addend), the term's rows in the single parent's q/k/value/z order [16384 rows] (the two-parent form takes them as
+ * the q/k parent's 4096 rows, then the value/z parent's 12288). U covers the call's columns (W * B for the batched
+ * forms). NVFP4 and row-scaled FP8 [16384,5120] parents and the two-parent Q4/Q5 form
+ * (gdn_input_proj_lora_supported); every other parent throws std::invalid_argument with a term. Every policy and T of
+ * the projection takes the term on its own route, so a zero B gives the no-term call's bits. The snapshot and record
+ * forms with a term run the materialized projection at every B and W, the projection Op with the term and the same
+ * policy over the call's W * B columns, then the convolution over its BF16 values (their capacity queries take
+ * `lora`); widths whose no-term call runs a fused projection and convolution (which convolves the FP32 projected
+ * value, and for NVFP4 under AllowA4 at one row of 1-3 columns projects with A16) differ from it there.
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, LinearPolicy policy, cudaStream_t stream);
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, cudaStream_t stream,
+                    const LoraAddend* lora = nullptr);
+
+// Whether a single parent takes a LoRA term in every form above (NVFP4 and row-scaled FP8 [16384,5120], either row
+// word); the two-parent Q4/Q5 form always does.
+[[nodiscard]] bool gdn_input_proj_lora_supported(QType parent_qtype, std::int32_t parent_rows,
+                                                 std::int32_t input_rows) noexcept;
 
 /**
  * Single-parent GDN projection. Registered parent forms are:
@@ -101,7 +120,7 @@ gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
-                    LinearRoutes routes = LinearRoutes::Exact);
+                    LinearRoutes routes = LinearRoutes::Exact, const LoraAddend* lora = nullptr);
 
 /**
  * Whether a single parent has a dedicated column-invariant route (NVFP4, FP8, MXFP8 and Q8
@@ -138,7 +157,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora = false);
 
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
@@ -148,7 +167,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora = false);
 
 /**
  * Op: gdn_input_proj_conv_snapshot
@@ -203,7 +222,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 /**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are Q8_G32_FP16 RowSplit
@@ -220,7 +239,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 /**
  * Applies the A16-only single-parent form. FP8 accepts every positive W for dense B=1; the batched
@@ -273,7 +292,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 /// The same query for a compute policy; under A16ColumnInvariant every B and T composes.
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora = false);
 
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8
@@ -283,7 +302,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora = false);
 
 /**
  * Op: gdn_input_proj_conv_record
@@ -319,7 +338,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 /**
  * Single-parent record-producing form. Registered parents are Q8_G32_FP16 [12288,2048], NVFP4
@@ -333,7 +352,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 /**
  * Verification-tree form of the single-parent record-producing Op (FP8, NVFP4 and Q8 parents)
@@ -349,7 +368,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 const Tensor& tree_rows, Tensor& conv_record, Tensor& query,
                                 Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
-                                WorkspaceArena& workspace, cudaStream_t stream);
+                                WorkspaceArena& workspace, cudaStream_t stream,
+                                const LoraAddend* lora = nullptr);
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

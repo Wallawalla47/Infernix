@@ -2,6 +2,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_output.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/lora/lora_device.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -19,13 +20,16 @@ std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens) {
 }
 
 void fp8_gdn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                      Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream) {
+                                      Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream,
+                                      const LoraAddend* lora) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                    static_cast<__nv_bfloat16*>(z.data)};
     const auto launch = [&]<class Schedule>() {
-        launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(
-            fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream);
+        with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+            launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(fp8_a8_operands(weight, workspace, x.ne[1]),
+                                                                  output, epilogue, stream);
+        });
     };
     // 32x128 tiles at 65-96 run 87-91 against 91-99 us for 64x64 (RTX 5090).
     const std::int32_t tokens = x.ne[1];
@@ -36,7 +40,7 @@ void fp8_gdn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Ten
 }
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                             Fp8A8Workspace workspace, cudaStream_t stream) {
+                             Fp8A8Workspace workspace, cudaStream_t stream, const LoraAddend* lora) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                    static_cast<__nv_bfloat16*>(z.data)};
@@ -45,11 +49,12 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     with_fp8_a8_operands(weight, workspace, x.ne[1], [&](const auto& operands) {
         const auto launch = [&]<class Schedule>() {
             using S = Fp8ScheduleInstance<Schedule, 5120>;
-            if constexpr (S::kTmaSwizzle)
-                launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
-                                           workspace.partials);
-            else
-                launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+            with_lora_epilogue(lora, LinearIdentityEpilogue{}, [&](auto epilogue) {
+                if constexpr (S::kTmaSwizzle)
+                    launch_fp8_a8_tma_mma<S>(operands, output, epilogue, stream, workspace.partials);
+                else
+                    launch_fp8_a8_mma<S>(operands, output, epilogue, stream);
+            });
         };
         if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
         if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();

@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include <cuda_runtime.h>
@@ -30,8 +31,12 @@ namespace infernix::ops::detail {
                                                                  std::int32_t min_tokens,
                                                                  std::int32_t max_tokens);
 
+// `lora` below: the LoRA term (include/infernix/ops/lora.h) of the [16384,5120] parent, over its rows [q 2048,
+// k 2048, value 6144, z 6144] and the call's columns, added to each projected value before its BF16 store; null keeps
+// every kernel as it was. The [20480,3072] parent takes none (its launchers have no adapter form; the dispatchers
+// refuse one).
 void fp8_gdn_input_n16384_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                           Tensor& z, cudaStream_t stream);
+                                           Tensor& z, cudaStream_t stream, const LoraAddend* lora = nullptr);
 void fp8_gdn_input_n20480_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
                                            Tensor& z, cudaStream_t stream);
 void fp8_gdn_input_n20480_a16_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -40,33 +45,35 @@ void fp8_gdn_input_n20480_a8_launch(const Tensor& x, const Weight& weight, Tenso
                                     Fp8A8Workspace workspace, cudaStream_t stream);
 
 void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                             Fp8A8Workspace workspace, cudaStream_t stream);
+                             Fp8A8Workspace workspace, cudaStream_t stream, const LoraAddend* lora = nullptr);
 // AllowA8Residual: the workspace's two E4M3 planes into two accumulators (MMA tiles).
 void fp8_gdn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                      Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream);
+                                      Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream,
+                                      const LoraAddend* lora = nullptr);
 
 // Exact contraction mechanisms shared by G1/G2/G3. Semantic Ops own their route frontier and
 // call one of these launchers after resolving their complete-form plan.
 // A16ColumnInvariant: one sliced-K schedule (4 K-warps) for every T, so a column's arithmetic does
 // not depend on the call's other columns.
 void fp8_gdn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream, const LoraAddend* lora = nullptr);
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                               WorkspaceArena& workspace, cudaStream_t stream);
+                               WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora = nullptr);
 void fp8_gdn_input_a8_residual_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv,
                                         Tensor& z, WorkspaceArena& workspace,
-                                        cudaStream_t stream);
+                                        cudaStream_t stream, const LoraAddend* lora = nullptr);
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                            LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
+                            LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream,
+                            const LoraAddend* lora = nullptr);
 
 } // namespace infernix::ops::detail

@@ -107,9 +107,15 @@ that stage the term's operands in shared memory), that a rank-32 adapter padded 
 instances' bits through the wide ones on every route, that a column's bits under `A16ColumnInvariant` do not depend
 on the call's width with the term, and that a zero `B` (PEFT's initial adapter) on non-zero weights returns the
 no-adapter call's bits on every route. The fused dense MLP and fused-norm attention tests compare their adapter forms
-bit for bit with the separate Ops, at ranks 32 and 128 (both instance classes). On the host, `infernix_artifact_peft_lora_test` covers the safetensors reader and
-PEFT configuration handling (patterns, rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module
-binding, ranks to 128 and its refusals (a rank above 128 by its wording).
+bit for bit with the separate Ops, at ranks 32 and 128 (both instance classes). `infernix_lora_test` also checks the
+Gated DeltaNet control's adapted kernel (`gdn_gating_proj` with the terms on `a` and `b` before their gates, ranks 32
+and 128 and an adapter of `a` alone) against an FP64 oracle and its column bits, and `infernix_lora_gdn_test` the
+Gated DeltaNet input projection's term (NVFP4, row-scaled FP8 and the Q4/Q5 pair at the 27B shapes): against the
+no-term call plus the FP64 term at every route and policy, a zero `B`'s bits, `A16ColumnInvariant` column bits, and
+the snapshot and record forms bit for bit against the projection with the term and the convolution over it. On the
+host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT configuration handling (patterns,
+rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module binding (the Gated DeltaNet modules
+included), ranks to 128 and its refusals (a rank above 128 by its wording).
 
 `infernix_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and

@@ -1,10 +1,12 @@
 // --lora on Qwen3.5 (models/qwen3_5/load/lora.h): a PEFT adapter's modules bound to a text configuration.
 //
 // Hugging Face's Qwen3.5 module paths ("model.language_model.layers.N" and the text-only "model.layers.N") map to
-// the layer's gated attention (q_proj: each head's query rows then its output gate's, so [2 * query width, hidden])
-// or its dense MLP; ranks round up to the term's 16; the shapes must be this model's. Everything this route does not
-// adapt is refused by name: Gated DeltaNet projections, attention on a linear-attention layer, MoE MLPs, other
-// leaves, vision/MTP/embeddings/head, a layer past the model, ranks above 64 and widths the shrink cannot read.
+// the layer's gated attention (q_proj: each head's query rows then its output gate's, so [2 * query width, hidden]),
+// its Gated DeltaNet projections (in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj) or its dense MLP; ranks
+// round up to the term's 16; the shapes must be this model's. Everything this route does not adapt is refused by name:
+// attention on a linear-attention layer and linear attention on a full-attention one, MoE MLPs, other leaves (Qwen3-
+// Next's in_proj_qkvz among them), vision/MTP/embeddings/head, a layer past the model, ranks above 128 and widths the
+// shrink cannot read.
 
 #include "artifact/safetensors_writer.h"
 #include "artifact/schema.h"
@@ -41,7 +43,8 @@ void rejects(const std::function<void()>& call, const std::string& needle, const
 }
 
 // A small Qwen3.5 text model: hidden 1024, 4 heads of 256 (query width 1024), 2 KV heads, MLP 2048; layers 0-2
-// Gated DeltaNet, layer 3 full attention.
+// Gated DeltaNet (4 key heads and 8 value heads of 128: q/k/value channels 2048, z 1024, a and b 8), layer 3 full
+// attention.
 TextConfig small_text(bool moe = false) {
     TextConfig text;
     text.hidden_size       = 1024;
@@ -49,6 +52,7 @@ TextConfig small_text(bool moe = false) {
     text.layer_types       = {MixerKind::LinearAttention, MixerKind::LinearAttention, MixerKind::LinearAttention,
                               MixerKind::FullAttention};
     text.attention         = AttentionConfig{4, 2, 256};
+    text.gdn               = GdnConfig{4, 128, 8, 128, 4};
     if (moe) {
         text.ffn = MoeConfig{8, 2, 256, 256};
     } else {
@@ -107,6 +111,31 @@ void binds_every_projection() {
             "description: " + binding.describe());
 }
 
+// The Gated DeltaNet projections bind in a linear-attention layer (here beside layer 3's attention and an MLP).
+void binds_gdn_projections() {
+    const TextConfig text = small_text();
+    sw::TempDir dir("lora_binding_gdn");
+    write_adapter(dir.path, {{kL0 + "linear_attn.in_proj_qkv", 1024, 2048},
+                             {kL0 + "linear_attn.in_proj_z", 1024, 1024},
+                             {"model.layers.0.linear_attn.in_proj_a", 1024, 8}, // the text-only path
+                             {kL0 + "linear_attn.in_proj_b", 1024, 8, 40},
+                             {kL0 + "linear_attn.out_proj", 1024, 1024},
+                             {kL3 + "self_attn.o_proj", 1024, 1024},
+                             {kL0 + "mlp.down_proj", 2048, 1024}});
+    const LoraBinding binding = bind_lora(dir.path, text);
+    const LoraLayer& l0       = binding.layers[0];
+    require(l0.gdn_qkv && l0.gdn_z && l0.gdn_a && l0.gdn_b && l0.gdn_output && l0.down && !l0.attention_input(),
+            "layer 0's modules");
+    require(l0.gdn_projection() && l0.gdn_control() && l0.gdn_input(), "layer 0's GDN sites");
+    require(binding.module(*l0.gdn_a).module == "model.layers.0.linear_attn.in_proj_a", "in_proj_a placed");
+    require(binding.module(*l0.gdn_output).module == kL0 + "linear_attn.out_proj", "out_proj placed");
+    require(binding.layers[3].output && !binding.layers[3].gdn_input(), "layer 3's attention");
+    require(binding.padded_rank == 48, "the largest rank (40) rounds up to 48");
+    require(binding.describe().find("1 attention, 5 linear-attention and 1 MLP projections in 2 layers") !=
+                std::string::npos,
+            "description: " + binding.describe());
+}
+
 // Ranks past 64 (the wide kernels') up to the limit, 128, bind; the padded rank rounds the largest up to 16.
 void binds_wide_ranks() {
     const TextConfig text = small_text();
@@ -126,7 +155,11 @@ void refuses() {
         const TextConfig text = small_text(moe);
         rejects([&] { (void)bind_lora(dir.path, text); }, needle, label);
     };
-    refused("Gated DeltaNet", {{kL0 + "linear_attn.in_proj_qkvz", 1024, 4096}}, "linear-attention");
+    refused("Qwen3-Next's fused leaf", {{kL0 + "linear_attn.in_proj_qkvz", 1024, 4096}},
+            "Infernix adapts in_proj_qkv, in_proj_z, in_proj_a, in_proj_b and out_proj");
+    refused("linear attention on a full-attention layer", {{kL3 + "linear_attn.in_proj_qkv", 1024, 2048}},
+            "that layer is a full-attention layer in this model");
+    refused("another model's GDN", {{kL0 + "linear_attn.in_proj_z", 1024, 2048}}, "another base model");
     refused("attention on a GDN layer", {{kL0 + "self_attn.q_proj", 1024, 2048}},
             "that layer is a linear-attention (Gated DeltaNet) layer in this model");
     refused("MoE MLP", {{kL3 + "mlp.gate_proj", 1024, 2048}}, "mixtures of experts", true);
@@ -146,7 +179,7 @@ void refuses() {
     refused("rank 129 (padded 144)", {{kL0 + "mlp.gate_proj", 1024, 2048}, {kL3 + "mlp.down_proj", 2048, 1024, 129}},
             "up to rank 128");
     // Every refusal names the adapter and says it is refused.
-    refused("refusal wording", {{kL0 + "linear_attn.in_proj_qkvz", 1024, 4096}}, " is refused: it adapts module");
+    refused("refusal wording", {{kL3 + "mlp.experts.0.up_proj", 1024, 2048}}, " is refused: it adapts MLP module");
     refused("twice", {{kL3 + "mlp.down_proj", 2048, 1024}, {"model.layers.3.mlp.down_proj", 2048, 1024}}, "twice");
     // A hidden width the shrink cannot read (not a multiple of 1024).
     {
@@ -163,6 +196,7 @@ void refuses() {
 int main() {
     try {
         binds_every_projection();
+        binds_gdn_projections();
         refuses();
         binds_wide_ranks();
     } catch (const std::exception& error) {

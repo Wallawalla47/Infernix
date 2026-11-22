@@ -66,12 +66,22 @@ void q4_linear_swiglu_ring_kernel(const __nv_bfloat16* __restrict__ x, const std
     const int gid = lane >> 2, lid = lane & 3;
     if constexpr (kLoraTerm<Lora>) {
         // --lora: the term on the gate and up fragments (canonical chains), before the SwiGLU.
-        lora_add_rows_tile<MT, NT>(
-            lora, acc, [&](int mm, int i) { return lora_row(wm, mm, i); },
-            [&](int mn, int j) {
-                const int c = t0 + wn * WN + mn * 8 + j;
-                return c < t ? c : -1;
-            });
+        if constexpr ((Cfg::BM + BN) * (2 * Lora::kMaxRank + 16) <= Ring::kBarrierOffset) {
+            // B's rows and U's columns staged in the free ring (every consumer warp busy each pass). The tile's local
+            // row 64 wm + 16 mm + i is fragment mm's row i of warp row wm.
+            lora_add_rows_tile_staged<Cfg::BM, BN, Ring::kBarrierOffset>(
+                lora, acc, [&](int mm, int i) { return wm * 64 + mm * 16 + i; },
+                [&](int mn, int j) { return wn * WN + mn * 8 + j; },
+                [&](int i) { return lora_row(i >> 6, (i & 63) >> 4, i & 15); }, t0, t, Ring::storage(), tid,
+                Cfg::THREADS, [] { asm volatile("bar.sync 1, %0;" ::"r"(Cfg::THREADS) : "memory"); });
+        } else {
+            lora_add_rows_tile<MT, NT>(
+                lora, acc, [&](int mm, int i) { return lora_row(wm, mm, i); },
+                [&](int mn, int j) {
+                    const int c = t0 + wn * WN + mn * 8 + j;
+                    return c < t ? c : -1;
+                });
+        }
     }
 #pragma unroll
     for (int mi = 0; mi < MT / 2; ++mi) {

@@ -1,7 +1,7 @@
 // LoRA (include/infernix/ops/lora.h).
 //
 // 1. lora_shrink against an FP64 oracle at the 27B's stacked shapes, and its canonical bits: a column's U is the same
-//    whatever the call's width and the column's position (both schedules).
+//    whatever the call's width and the column's position (every schedule).
 // 2. The term on every adapted Op, format and route at the 27B shapes, on zero base weights: the projection's output
 //    is then its epilogue of the term alone, so every row, segment and column of the term is observable against an
 //    FP64 oracle (sum of B U times the segment's scale), through the SwiGLU, the residual add and the four-way
@@ -16,6 +16,7 @@
 
 #include "core/weight.h"
 #include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/gdn_gating_proj.h"
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
 #include "infernix/ops/lora.h"
@@ -80,7 +81,8 @@ int compare_bits(const std::string& label, const std::uint16_t* got, const std::
 // ---------------------------------------------------------------------------------------------------------------
 int check_shrink() {
     int failures                 = 0;
-    // Both schedules: split below 512 columns (one to four token tiles), stream from 512.
+    // Every schedule the calls take: split (below 64 columns and the narrow stacks' short prompts), stream and tile
+    // (the modelled fastest); the widest call's bits are then each width's.
     const std::int32_t widths[] = {1, 2, 7, 16, 32, 33, 100, 129, 511, 512, 1024, 4096, 4100};
     constexpr std::int32_t kMaxT = 4100;
     struct Shape {
@@ -89,7 +91,7 @@ int check_shrink() {
     for (const Shape shape : {Shape{96, 5120}, Shape{64, 5120}, Shape{32, 6144}, Shape{32, 17408}, Shape{192, 5120},
                               Shape{128, 17408}, Shape{160, 5120}, Shape{240, 5120}, Shape{256, 5120}, Shape{288, 5120},
                               Shape{384, 5120}, Shape{336, 5120}, Shape{80, 17408}, Shape{112, 6144},
-                              Shape{224, 5120}}) {
+                              Shape{224, 5120}, Shape{512, 5120}}) {
         const auto a = random_bf16(static_cast<std::size_t>(shape.rows) * shape.k, 11 + shape.rows, -0.03F, 0.03F);
         // Wide activations with cancellation: alternating large and small values.
         auto x = random_bf16(static_cast<std::size_t>(shape.k) * kMaxT, 7 + shape.k, -2.0F, 2.0F);
@@ -206,6 +208,118 @@ Term make_term(std::int32_t rows, std::int32_t u_rows, std::int32_t max_tokens, 
         }
     });
     return term;
+}
+
+// gdn_gating_proj's LoRA form (the 27B's Gated DeltaNet control, 48 heads over 5120 inputs): a and b plus their terms
+// before the gates, against FP64 (the projection over the represented h and W, the term over the represented B and U,
+// then g = -exp(A_log) softplus(a + dt_bias) and beta = sigmoid(b)); and the column invariance its one schedule
+// promises (every column's g and beta bits equal those of the widest call). a's rows take rank r over U rows [0, r) at
+// scale 2, b's over [r, 2r) at 0.5; a second check leaves b unadapted (its gate is then the plain projection's).
+int check_gating_terms(std::int32_t rank, bool adapt_b) {
+    constexpr std::int32_t heads = 48, k = 5120, rows = 2 * heads;
+    constexpr std::int32_t kMax  = 300;
+    int failures                 = 0;
+    const auto w = random_bf16(static_cast<std::size_t>(rows) * k, 71U + rank, -0.02F, 0.02F); // a rows, then b rows
+    const auto h = random_bf16(static_cast<std::size_t>(k) * kMax, 72U, -2.0F, 2.0F);
+    std::vector<float> a_log(heads), dt_bias(heads);
+    for (std::int32_t i = 0; i < heads; ++i) {
+        a_log[i]   = -1.0F + 0.05F * static_cast<float>(i);
+        dt_bias[i] = 0.5F - 0.02F * static_cast<float>(i);
+    }
+    test::GuardedDeviceBuffer w_d(w.size() * 2), h_d(h.size() * 2), a_log_d(heads * 4), dt_d(heads * 4),
+        g_d(static_cast<std::size_t>(heads) * kMax * 4), beta_d(static_cast<std::size_t>(heads) * kMax * 4),
+        b_d(static_cast<std::size_t>(rows) * rank * 2), u_d(static_cast<std::size_t>(2 * rank) * kMax * 2);
+    w_d.copy_from_host(w.data(), w.size() * 2);
+    h_d.copy_from_host(h.data(), h.size() * 2);
+    a_log_d.copy_from_host(a_log.data(), heads * 4);
+    dt_d.copy_from_host(dt_bias.data(), heads * 4);
+    const Term term = make_term(rows, 2 * rank, kMax, 73U + rank,
+                                {{heads, 0, 2.0F}, {rows, adapt_b ? rank : -1, adapt_b ? 0.5F : 0.0F}}, b_d, u_d, rank);
+    Weight ab{};
+    ab.qtype           = QType::BF16;
+    ab.layout          = QuantLayout::Contiguous;
+    ab.payload         = w_d.data();
+    ab.payload_bytes   = static_cast<std::uint64_t>(rows) * k * 2;
+    ab.qdata           = w_d.data();
+    ab.ndim            = 2;
+    ab.shape[0]        = rows;
+    ab.shape[1]        = k;
+    ab.padded_shape[0] = rows;
+    ab.padded_shape[1] = k;
+    ab.n               = rows;
+    ab.k               = k;
+    // The FP64 projections and their mass (the FP32 accumulation's error scale).
+    std::vector<double> projection(static_cast<std::size_t>(rows) * kMax), mass(projection.size());
+    test::parallel_ranges(kMax, test::host_thread_count(), [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t t = begin; t < end; ++t) {
+            for (std::int32_t r = 0; r < rows; ++r) {
+                double sum = 0.0, abs_sum = 0.0;
+                for (std::int32_t j = 0; j < k; ++j) {
+                    const double p = bf16(w[static_cast<std::size_t>(r) * k + j]) * bf16(h[static_cast<std::size_t>(t) * k + j]);
+                    sum += p;
+                    abs_sum += std::fabs(p);
+                }
+                projection[static_cast<std::size_t>(t) * rows + r] = sum + term.value(r, static_cast<std::int32_t>(t));
+                mass[static_cast<std::size_t>(t) * rows + r]       = abs_sum + std::fabs(term.value(r, static_cast<std::int32_t>(t)));
+            }
+        }
+    });
+    const auto softplus = [](double v) { return std::max(v, 0.0) + std::log1p(std::exp(-std::fabs(v))); };
+    const auto sigmoid  = [](double v) { return 1.0 / (1.0 + std::exp(-v)); };
+    std::vector<float> widest_g, widest_beta;
+    for (const std::int32_t t : {kMax, 1, 2, 7, 8, 9, 32, 33, 64, 100}) {
+        Tensor ht(h_d.data(), DType::BF16, {k, t});
+        Tensor a_log_t(a_log_d.data(), DType::FP32, {heads});
+        Tensor dt_t(dt_d.data(), DType::FP32, {heads});
+        Tensor gt(g_d.data(), DType::FP32, {heads, t}), bt(beta_d.data(), DType::FP32, {heads, t});
+        ops::gdn_gating_proj(ht, ab, a_log_t, dt_t, term.addend, gt, bt, nullptr);
+        test::cuda_synchronize();
+        std::vector<float> g(static_cast<std::size_t>(heads) * t), beta(g.size());
+        g_d.copy_to_host(g.data(), g.size() * 4);
+        beta_d.copy_to_host(beta.data(), beta.size() * 4);
+        const std::string label = "gdn gating lora r" + std::to_string(rank) + (adapt_b ? "" : " a only") + " T=" + std::to_string(t);
+        if (t == kMax) {
+            // The oracle (every column of the widest call): the gates' slopes bound the FP32 projection's error.
+            std::vector<double> got_g(g.size()), ref_g(g.size()), got_b(g.size()), ref_b(g.size()), slack_g(g.size()),
+                slack_b(g.size());
+            for (std::int32_t c = 0; c < t; ++c) {
+                for (std::int32_t i = 0; i < heads; ++i) {
+                    const std::size_t o  = static_cast<std::size_t>(c) * heads + i;
+                    const double a       = projection[static_cast<std::size_t>(c) * rows + i];
+                    const double b       = projection[static_cast<std::size_t>(c) * rows + heads + i];
+                    const double decay   = std::exp(static_cast<double>(a_log[i]));
+                    got_g[o]             = g[o];
+                    ref_g[o]             = -decay * softplus(a + dt_bias[i]);
+                    got_b[o]             = beta[o];
+                    ref_b[o]             = sigmoid(b);
+                    slack_g[o] = decay * 4.0e-6 * mass[static_cast<std::size_t>(c) * rows + i] + 4.0e-6 * std::fabs(ref_g[o]);
+                    slack_b[o] = 0.25 * 4.0e-6 * mass[static_cast<std::size_t>(c) * rows + heads + i] + 4.0e-6;
+                }
+            }
+            // The criteria's absolute parts carry the per-element slack (compare takes one magnitude vector).
+            for (std::size_t o = 0; o < got_g.size(); ++o) {
+                if (!(std::fabs(got_g[o] - ref_g[o]) <= slack_g[o])) {
+                    std::cerr << label << " g: element " << o << " got " << got_g[o] << " reference " << ref_g[o] << '\n';
+                    ++failures;
+                    break;
+                }
+            }
+            for (std::size_t o = 0; o < got_b.size(); ++o) {
+                if (!(std::fabs(got_b[o] - ref_b[o]) <= slack_b[o])) {
+                    std::cerr << label << " beta: element " << o << " got " << got_b[o] << " reference " << ref_b[o] << '\n';
+                    ++failures;
+                    break;
+                }
+            }
+            widest_g    = g;
+            widest_beta = beta;
+        } else if (std::memcmp(g.data(), widest_g.data(), g.size() * 4) != 0 ||
+                   std::memcmp(beta.data(), widest_beta.data(), beta.size() * 4) != 0) {
+            std::cerr << label << ": a column's bits differ from the widest call's\n";
+            ++failures;
+        }
+    }
+    return failures;
 }
 
 // The weight's codes zeroed (every decoded value 0: Q4/Q5 codes are the nibble's two's complement, with the Q5 high
@@ -852,6 +966,11 @@ INFERNIX_OP_TEST(lora) {
     // the 122B's K 3072 / 8192 only).
     const qw::PatternedWeightOptions fp8_static{.activation_scale = 1.0F / 256.0F};
     run("shrink", [&] { return check_shrink(); });
+    // The Gated DeltaNet control's adapted form (narrow and wide ranks, b adapted or not).
+    for (const std::int32_t rank : {32, 128}) {
+        run("gdn gating", [&] { return check_gating_terms(rank, true); });
+    }
+    run("gdn gating a only", [&] { return check_gating_terms(64, false); });
     // linear_add: NVFP4 down/output (every route), FP8 row-scaled (BF16 and FP32 row words).
     for (const std::int32_t k : {6144, 17408}) {
         run("linear_add nvfp4", [&] {

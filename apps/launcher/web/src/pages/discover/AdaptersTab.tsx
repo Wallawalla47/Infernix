@@ -212,9 +212,9 @@ export function AdaptersTab({ onDownload }: { onDownload: (repo: string) => void
         <Puzzle />
         <AlertDescription>
           A LoRA adapter fine-tunes a model when it loads (--lora), without changing the artifact. Infernix applies
-          plain LoRA on the attention and MLP projections, up to rank 128, to the dense 27B models. Download one here,
-          then pick it on a 27B model's Configure page (LoRA adapter): its "Will it fit?" check asks the server
-          whether it can apply it.
+          plain LoRA on the attention, Gated DeltaNet and MLP projections, up to rank 128, to the dense 27B models.
+          Download one here, then pick it on a 27B model's Configure page (LoRA adapter): its "Will it fit?" check
+          asks the server whether it can apply it.
         </AlertDescription>
       </Alert>
 

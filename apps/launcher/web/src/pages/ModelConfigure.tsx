@@ -499,7 +499,7 @@ function AdapterField({ model, form, library }: { model: ModelArtifact; form: Fo
     <FieldShell
       label="LoRA adapter"
       flag="--lora"
-      help="A Hugging Face PEFT LoRA adapter for this base model (its folder, or its adapter_model.safetensors with adapter_config.json beside it): plain LoRA on the attention and MLP projections, up to rank 128; GGUF adapters are not read. The lossless route computes it as PEFT does. Will it fit? asks the server whether it applies it."
+      help="A Hugging Face PEFT LoRA adapter for this base model (its folder, or its adapter_model.safetensors with adapter_config.json beside it): plain LoRA on the attention, Gated DeltaNet and MLP projections, up to rank 128; GGUF adapters are not read. The lossless route computes it as PEFT does. Will it fit? asks the server whether it applies it."
     >
       <Select
         value={value}

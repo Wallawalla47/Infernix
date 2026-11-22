@@ -17,8 +17,8 @@ namespace infernix::ops::detail {
 
 // Two classes of adapter instance: an adapter of padded rank up to kLoraNarrowRank runs the narrow instances (the
 // term's k-step operands sized for 4 steps), a larger one, up to kLoraMaxRank, the wide instances (8 steps). They are
-// separate instances of every kernel, so the narrow ones are exactly the kernels they were before the wide class
-// existed: a wide adapter costs a narrow one nothing.
+// separate instances of every kernel, so the narrow ones do not depend on the wide class: a wide adapter costs a narrow
+// one nothing.
 inline constexpr int kLoraNarrowRank = 64;
 static_assert(kLoraMaxRank == 2 * kLoraNarrowRank, "the wide class holds twice the narrow class's k-steps");
 
@@ -506,6 +506,412 @@ __device__ __forceinline__ void lora_add_tokens_tile(const P& p, float (&acc)[MT
     }
 }
 
+// lora_add_rows_tile for a CTA tile kernel whose consumer threads have finished with `smem` (SmemBytes, free) and
+// hold the tile's fragments, every consumer thread calling it; a 16-row fragment lies in one segment (its rows a
+// 16-aligned run, as the ring tiles' are). The CTA copies B's rows of the tile once (cta_row(i): parent row of tile
+// row i) and, one adapted segment a pass (as many as fit), U's columns of the tile's BlockTokens tokens from
+// token_begin (zero from token_count); each warp then runs its fragments of the pass's segments: B's rows by ldmatrix
+// into registers (the A operand, the whole rank), U's columns by ldmatrix (the B operand). Every warp has fragments in
+// every segment and pass, so none idles. local_row(mm, i): fragment row i's tile row; local_token(mn, j): fragment
+// column j's tile token. The operands, chain and order are lora_add_rows_tile's: the same bits.
+template <int BlockRows, int BlockTokens, int SmemBytes, int MM, int MN, class P, class LocalRow, class LocalToken,
+          class CtaRow, class Barrier>
+__device__ __forceinline__ void lora_add_rows_tile_staged(const P& p, float (&acc)[MM][MN][4], LocalRow local_row,
+                                                          LocalToken local_token, CtaRow cta_row, int token_begin,
+                                                          int token_count, unsigned char* smem, int thread, int threads,
+                                                          Barrier barrier) {
+    constexpr int kMaxSteps  = kLoraSteps<P>;
+    constexpr int kPieces    = P::kMaxRank / 8;
+    constexpr int kPieceBits = kPieces == 16 ? 4 : 3;
+    static_assert(kPieces == 1 << kPieceBits);
+    constexpr int kMaxStride = 2 * P::kMaxRank + 16;
+    static_assert(BlockRows % 16 == 0 && (BlockRows + BlockTokens) * kMaxStride <= SmemBytes,
+                  "B's rows and one segment's U columns over the tile must fit");
+    const int lane = threadIdx.x & 31;
+    const int steps = p.rank >> 4, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
+    unsigned touched = 0;
+#pragma unroll
+    for (int f = 0; f < BlockRows / 16; ++f) {
+        const int s = p.segment_of(cta_row(16 * f));
+        touched |= p.offset_of(s) >= 0 ? 1U << s : 0U;
+    }
+    if (touched == 0) { return; } // tile-uniform; shared memory untouched
+    cp_wait<0>();
+    barrier(); // every consumer is done with the main loop's shared memory
+    unsigned char* b_s = smem;
+    unsigned char* u_s = smem + BlockRows * stride;
+    const int u_bytes  = BlockTokens * stride;
+    const int fit      = (SmemBytes - BlockRows * stride) / u_bytes;
+    const int live     = token_count - token_begin;
+    for (int i = thread; i < BlockRows * kPieces; i += threads) {
+        const int row = i >> kPieceBits, piece = i & (kPieces - 1);
+        if (piece < pieces) {
+            cp_async<16>(b_s + row * stride + piece * 16, p.b + static_cast<std::int64_t>(cta_row(row)) * p.rank + piece * 8);
+        }
+    }
+    // ldmatrix lane roles: B's rows (the A operand) x4 = rows 0-7 / 8-15 at piece 2ks, then at 2ks + 1; U's tokens (the
+    // B operand) x2 = 8 tokens at piece 2ks, then 2ks + 1.
+    const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_piece = lane >> 4;
+    const int u_row = lane & 7, u_piece = (lane >> 3) & 1;
+    bool first = true;
+    while (touched != 0) {
+        unsigned pass = 0;
+        int slots     = 0;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            if (((touched >> s) & 1U) != 0U && slots < fit) {
+                pass |= 1U << s;
+                ++slots;
+            }
+        }
+        touched &= ~pass;
+        if (!first) { barrier(); } // the previous pass's reads finish before its U columns are overwritten
+        first    = false;
+        int slot = 0;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            if (((pass >> s) & 1U) == 0U) { continue; }
+            const int uo        = p.offset_of(s);
+            unsigned char* dest = u_s + slot * u_bytes;
+            for (int i = thread; i < BlockTokens * kPieces; i += threads) {
+                const int t = i >> kPieceBits, piece = i & (kPieces - 1);
+                if (piece < pieces) {
+                    const bool valid = t < live;
+                    cp_async_zfill<16>(dest + t * stride + piece * 16,
+                                       p.u + static_cast<std::int64_t>(token_begin + (valid ? t : 0)) * p.u_rows + uo +
+                                           piece * 8,
+                                       valid ? 16 : 0);
+                }
+            }
+            ++slot;
+        }
+        cp_commit();
+        cp_wait<0>();
+        barrier();
+#pragma unroll
+        for (int mm = 0; mm < MM; ++mm) {
+            const int seg = p.segment_of(cta_row(local_row(mm, 0)));
+            if (((pass >> seg) & 1U) == 0U) { continue; }
+            const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg) - 1U)) * u_bytes;
+            const float scale           = p.scale_of(seg);
+            const unsigned char* b_base = b_s + local_row(mm, a_row) * stride;
+            unsigned a[kMaxSteps][4];
+#pragma unroll
+            for (int ks = 0; ks < kMaxSteps; ++ks) {
+                if (ks < steps) {
+                    ldmatrix_x4(a[ks][0], a[ks][1], a[ks][2], a[ks][3], smem_addr(b_base + (2 * ks + a_piece) * 16));
+                }
+            }
+#pragma unroll
+            for (int mn = 0; mn < MN; ++mn) {
+                const unsigned char* u_base = u_slot + local_token(mn, u_row) * stride;
+                float c[4]                  = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                for (int ks = 0; ks < kMaxSteps; ++ks) {
+                    if (ks < steps) {
+                        unsigned b0, b1;
+                        ldmatrix_x2(b0, b1, smem_addr(u_base + (2 * ks + u_piece) * 16));
+                        mma_bf16(c[0], c[1], c[2], c[3], a[ks][0], a[ks][1], a[ks][2], a[ks][3], b0, b1);
+                    }
+                }
+#pragma unroll
+                for (int v = 0; v < 4; ++v) { acc[mm][mn][v] = __fadd_rn(acc[mm][mn][v], __fmul_rn(c[v], scale)); }
+            }
+        }
+    }
+    barrier(); // the last pass's reads finish before the caller reuses shared memory
+}
+
+// lora_add_tokens_tile for a CTA tile kernel whose consumer warps (WarpsTokens x WarpsRows: warp (warp_m, warp_n)
+// holds the fragments of token group warp_m and row group warp_n) have finished with `smem` (SmemBytes, free); every
+// consumer thread calls it. The CTA copies B's rows of the tile once (cta_row(i): parent row of tile row i). Each token
+// group's warps then walk their work items, one 16-token fragment row (mt) and one adapted segment at a time: the
+// group's two slots receive the items' U columns two items ahead (the group's warps share the copies), each warp takes
+// the whole rank of U into registers by ldmatrix, the item after next starts into the slot just read, and the warp runs
+// the segment's row fragments with B by ldmatrix from the shared rows under those copies. So every warp works through
+// the whole term, U is read once a tile and each copy has two items' MMAs to land. A group synchronizes on its own named
+// barrier (2 + warp_m, WarpsRows warps). The operands, chain and order are lora_add_tokens_tile's: the same bits.
+// LowRegisters (a kernel whose accumulators leave few registers, the FP8 tiles): instead of the whole rank of U, each
+// warp holds two row fragments' chains and one k-step of U at a time, reading U again from the buffer for each pair (the
+// same chains in the same order: the same bits).
+template <int BlockRows, int SmemBytes, int WarpsTokens, int WarpsRows, bool LowRegisters = false, int MT, int MR,
+          class P, class LocalToken, class LocalRow, class CtaRow, class Barrier>
+__device__ __forceinline__ void lora_add_tokens_tile_group_staged(const P& p, float (&acc)[MT][MR][4],
+                                                                  LocalToken local_token, LocalRow local_row,
+                                                                  CtaRow cta_row, int token_begin, int token_count,
+                                                                  unsigned char* smem, int thread, int warp_m,
+                                                                  Barrier barrier) {
+    constexpr int kMaxSteps   = kLoraSteps<P>;
+    constexpr int kPieces     = P::kMaxRank / 8;
+    constexpr int kPieceBits  = kPieces == 16 ? 4 : 3;
+    static_assert(kPieces == 1 << kPieceBits);
+    constexpr int kMaxStride  = 2 * P::kMaxRank + 16;
+    constexpr int kThreads    = WarpsTokens * WarpsRows * 32;
+    constexpr int kGroupLanes = WarpsRows * 32;
+    constexpr int kSlots      = 2; // two U slots a token group: the next items' copies land under this item's MMAs
+    static_assert(BlockRows % 8 == 0 && WarpsTokens + 2 <= 16, "named barriers 2 .. 1 + WarpsTokens");
+    static_assert((BlockRows + WarpsTokens * kSlots * 16) * kMaxStride <= SmemBytes,
+                  "B's rows and the 16-token U buffers of the token groups must fit");
+    const int lane = threadIdx.x & 31;
+    const int steps = p.rank >> 4, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
+    unsigned touched = 0;
+#pragma unroll
+    for (int f = 0; f < BlockRows / 8; ++f) {
+        const int s = p.segment_of(cta_row(8 * f));
+        touched |= p.offset_of(s) >= 0 ? 1U << s : 0U;
+    }
+    if (touched == 0) { return; } // tile-uniform; shared memory untouched
+    // Every consumer is done with the main loop's shared memory, and no copy of this thread's is in flight.
+    cp_wait<0>();
+    barrier();
+    unsigned char* b_s     = smem;
+    unsigned char* u_group = smem + BlockRows * stride + warp_m * kSlots * 16 * stride;
+    for (int i = thread; i < BlockRows * kPieces; i += kThreads) {
+        const int row = i >> kPieceBits, piece = i & (kPieces - 1);
+        if (piece < pieces) {
+            cp_async<16>(b_s + row * stride + piece * 16, p.b + static_cast<std::int64_t>(cta_row(row)) * p.rank + piece * 8);
+        }
+    }
+    // The segments the group's row fragments touch (every warp of a token group has the same row-fragment segments:
+    // the tile's rows are split among the row warps alike, so this is the union over the tile's segments).
+    const unsigned mine = touched;
+    const int live      = token_count - token_begin;
+    const int group_lane = thread % kGroupLanes;
+    // Item (mt, s)'s U columns into the group's buffer `slot`: the group's lanes share the 16 x pieces copies.
+    const auto copy_u = [&](int mt, int s, int slot) {
+        const int uo     = p.offset_of(s);
+        unsigned char* d = u_group + slot * 16 * stride;
+        for (int i = group_lane; i < 16 * kPieces; i += kGroupLanes) {
+            const int t = i >> kPieceBits, piece = i & (kPieces - 1);
+            if (piece < pieces) {
+                const int token  = local_token(mt, t);
+                const bool valid = token < live;
+                cp_async_zfill<16>(d + t * stride + piece * 16,
+                                   p.u + static_cast<std::int64_t>(token_begin + (valid ? token : 0)) * p.u_rows + uo +
+                                       piece * 8,
+                                   valid ? 16 : 0);
+            }
+        }
+    };
+    const int first_segment = __ffs(static_cast<int>(mine)) - 1;
+    copy_u(0, first_segment, 0);
+    cp_commit();
+    cp_wait<0>();
+    barrier(); // B's rows and every group's first item are in shared memory
+    const int group_barrier = 2 + warp_m;
+    const auto group_sync   = [&] { asm volatile("bar.sync %0, %1;" ::"r"(group_barrier), "r"(kGroupLanes) : "memory"); };
+    const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_piece = lane >> 4;
+    const int b_row = lane & 7, b_piece = lane >> 3;
+    const auto next_item = [&](int mt, int s) {
+        const unsigned later = mine & ~((2U << s) - 1U);
+        return later != 0U ? int2{mt, __ffs(static_cast<int>(later)) - 1} : int2{mt + 1, first_segment};
+    };
+    if constexpr (LowRegisters) {
+        int item = 0;
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                if (((mine >> s) & 1U) == 0U) { continue; }
+                if (item > 0) {
+                    cp_wait<0>();
+                    group_sync(); // this item's copy is visible; the other slot's last reads (the item before) are done
+                }
+                {
+                    const int2 next = next_item(mt, s);
+                    const int next_mt = next.x, next_s = next.y;
+                    if (next_mt < MT) { copy_u(next_mt, next_s, (item + 1) & 1); }
+                    cp_commit();
+                }
+                const unsigned char* u_base = u_group + (item & 1) * 16 * stride + a_row * stride;
+                const float scale           = p.scale_of(s);
+                // Two row fragments' chains at a time; one k-step of U and of each fragment's B in registers.
+#pragma unroll
+                for (int m0 = 0; m0 < MR; m0 += 2) {
+                    const bool take0 = p.segment_of(cta_row(local_row(m0, 0))) == s;
+                    const bool take1 = m0 + 1 < MR && p.segment_of(cta_row(local_row(m0 + 1 < MR ? m0 + 1 : m0, 0))) == s;
+                    if (!take0 && !take1) { continue; }
+                    const unsigned char* b0_base = b_s + local_row(m0, b_row) * stride;
+                    const unsigned char* b1_base = b_s + local_row(m0 + 1 < MR ? m0 + 1 : m0, b_row) * stride;
+                    float c0[4] = {0.0F, 0.0F, 0.0F, 0.0F}, c1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                    for (int ks = 0; ks < kMaxSteps; ++ks) {
+                        if (ks < steps) {
+                            unsigned a0, a1, a2, a3, b00, b01, b10, b11;
+                            ldmatrix_x4(a0, a1, a2, a3, smem_addr(u_base + (2 * ks + a_piece) * 16));
+                            ldmatrix_x4(b00, b01, b10, b11, smem_addr((b_piece < 2 ? b0_base : b1_base) +
+                                                                      (2 * ks + (b_piece & 1)) * 16));
+                            if (take0) { mma_bf16(c0[0], c0[1], c0[2], c0[3], a0, a1, a2, a3, b00, b01); }
+                            if (take1) { mma_bf16(c1[0], c1[1], c1[2], c1[3], a0, a1, a2, a3, b10, b11); }
+                        }
+                    }
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        if (take0) { acc[mt][m0][v] = __fadd_rn(acc[mt][m0][v], __fmul_rn(c0[v], scale)); }
+                        if (m0 + 1 < MR && take1) {
+                            acc[mt][m0 + 1][v] = __fadd_rn(acc[mt][m0 + 1][v], __fmul_rn(c1[v], scale));
+                        }
+                    }
+                }
+                ++item;
+            }
+        }
+        cp_wait<0>();
+        barrier(); // every group's reads finish before the caller reuses shared memory
+        return;
+    }
+    // Two items' copies in flight: U goes into registers right after its wait, so a slot takes the item after next as
+    // soon as both warps of the group have read it, and that copy has two items' MMAs to land.
+    {
+        const int2 second = next_item(0, first_segment);
+        if (second.x < MT) { copy_u(second.x, second.y, 1); }
+        cp_commit();
+    }
+    int item = 0;
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            if (((mine >> s) & 1U) == 0U) { continue; }
+            if (item > 0) {
+                cp_wait<1>(); // this item's copy (the one after it may still be in flight)
+                group_sync(); // the group's copies of this item are visible
+            }
+            const unsigned char* u_base = u_group + (item & 1) * 16 * stride + a_row * stride;
+            unsigned a[kMaxSteps][4];
+#pragma unroll
+            for (int ks = 0; ks < kMaxSteps; ++ks) {
+                if (ks < steps) {
+                    ldmatrix_x4(a[ks][0], a[ks][1], a[ks][2], a[ks][3], smem_addr(u_base + (2 * ks + a_piece) * 16));
+                }
+            }
+            group_sync(); // every warp of the group holds this item's U: its slot takes the item after next
+            {
+                const int2 next  = next_item(mt, s);
+                const int2 after = next.x < MT ? next_item(next.x, next.y) : int2{MT, 0};
+                if (after.x < MT) { copy_u(after.x, after.y, item & 1); }
+                cp_commit();
+            }
+            const float scale = p.scale_of(s);
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                if (p.segment_of(cta_row(local_row(mr, 0))) != s) { continue; }
+                const unsigned char* b_base = b_s + local_row(mr, b_row) * stride;
+                unsigned b[kMaxSteps][2];
+#pragma unroll
+                for (int ks = 0; ks < kMaxSteps; ks += 2) {
+                    if (ks + 1 < steps) {
+                        ldmatrix_x4(b[ks][0], b[ks][1], b[ks + 1][0], b[ks + 1][1],
+                                    smem_addr(b_base + (2 * ks + b_piece) * 16));
+                    } else if (ks < steps) {
+                        ldmatrix_x2(b[ks][0], b[ks][1], smem_addr(b_base + (2 * ks + (b_piece & 1)) * 16));
+                    }
+                }
+                float c[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                for (int ks = 0; ks < kMaxSteps; ++ks) {
+                    if (ks < steps) { mma_bf16(c[0], c[1], c[2], c[3], a[ks][0], a[ks][1], a[ks][2], a[ks][3], b[ks][0], b[ks][1]); }
+                }
+#pragma unroll
+                for (int v = 0; v < 4; ++v) { acc[mt][mr][v] = __fadd_rn(acc[mt][mr][v], __fmul_rn(c[v], scale)); }
+            }
+            ++item;
+        }
+    }
+    cp_wait<0>();
+    barrier(); // every group's reads finish before the caller reuses shared memory
+}
+
+// The term on a warp's staged fragments, for a wide instance (lora_add_tokens_tile_staged's operands in shared
+// memory: B's rows at b_s, the pass's segments' U columns at u_s, u_bytes a segment, rows of `stride` bytes, U's
+// first staged token at tile token `token_offset`; in_slice(mt) whether fragment mt's tokens are staged). Row
+// fragments in pairs: a pair in one segment (gate's, up's or down's) shares each U fragment between its two chains
+// (half the U loads, two independent MMAs a load). Each chain is lora_add_tokens_tile's on the same operands in the
+// same order: the same bits.
+template <class P, int MT, int MR, class LocalToken, class LocalRow, class CtaRow, class InSlice>
+__device__ __forceinline__ void lora_staged_pairs(const P& p, float (&acc)[MT][MR][4], unsigned pass,
+                                                  const unsigned char* b_s, const unsigned char* u_s, int u_bytes,
+                                                  int stride, LocalToken local_token, LocalRow local_row,
+                                                  CtaRow cta_row, InSlice in_slice, int token_offset) {
+    constexpr int kLoraMaxSteps = kLoraSteps<P>;
+    static_assert(MR % 2 == 0);
+    const int lane  = threadIdx.x & 31;
+    const int steps = p.rank >> 4;
+    const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_piece = lane >> 4;
+    const int b_row = lane & 7, b_piece = lane >> 3;
+    // B's fragments of row fragment mr, every k-step.
+    const auto load_b = [&](int mr, unsigned (&b)[kLoraMaxSteps][2]) {
+        const unsigned char* b_base = b_s + local_row(mr, b_row) * stride;
+#pragma unroll
+        for (int ks = 0; ks < kLoraMaxSteps; ks += 2) {
+            if (ks + 1 < steps) {
+                ldmatrix_x4(b[ks][0], b[ks][1], b[ks + 1][0], b[ks + 1][1], smem_addr(b_base + (2 * ks + b_piece) * 16));
+            } else if (ks < steps) {
+                ldmatrix_x2(b[ks][0], b[ks][1], smem_addr(b_base + (2 * ks + (b_piece & 1)) * 16));
+            }
+        }
+    };
+#pragma unroll
+    for (int mr0 = 0; mr0 < MR; mr0 += 2) {
+        const int seg0 = p.segment_of(cta_row(local_row(mr0, 0)));
+        const int seg1 = p.segment_of(cta_row(local_row(mr0 + 1, 0)));
+        if (seg0 == seg1) {
+            if (((pass >> seg0) & 1U) == 0U) { continue; }
+            const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg0) - 1U)) * u_bytes;
+            const float scale           = p.scale_of(seg0);
+            unsigned b0[kLoraMaxSteps][2], b1[kLoraMaxSteps][2];
+            load_b(mr0, b0);
+            load_b(mr0 + 1, b1);
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                if (!in_slice(mt)) { continue; }
+                const unsigned char* u_base = u_slot + (local_token(mt, a_row) - token_offset) * stride;
+                float c0[4] = {0.0F, 0.0F, 0.0F, 0.0F}, c1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                for (int ks = 0; ks < kLoraMaxSteps; ++ks) {
+                    if (ks < steps) {
+                        unsigned a0, a1, a2, a3;
+                        ldmatrix_x4(a0, a1, a2, a3, smem_addr(u_base + (2 * ks + a_piece) * 16));
+                        mma_bf16(c0[0], c0[1], c0[2], c0[3], a0, a1, a2, a3, b0[ks][0], b0[ks][1]);
+                        mma_bf16(c1[0], c1[1], c1[2], c1[3], a0, a1, a2, a3, b1[ks][0], b1[ks][1]);
+                    }
+                }
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    acc[mt][mr0][v]     = __fadd_rn(acc[mt][mr0][v], __fmul_rn(c0[v], scale));
+                    acc[mt][mr0 + 1][v] = __fadd_rn(acc[mt][mr0 + 1][v], __fmul_rn(c1[v], scale));
+                }
+            }
+            continue;
+        }
+#pragma unroll
+        for (int mr = mr0; mr < mr0 + 2; ++mr) {
+            const int seg = mr == mr0 ? seg0 : seg1;
+            if (((pass >> seg) & 1U) == 0U) { continue; }
+            const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg) - 1U)) * u_bytes;
+            const float scale           = p.scale_of(seg);
+            unsigned b[kLoraMaxSteps][2];
+            load_b(mr, b);
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                if (!in_slice(mt)) { continue; }
+                const unsigned char* u_base = u_slot + (local_token(mt, a_row) - token_offset) * stride;
+                float c[4]                  = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                for (int ks = 0; ks < kLoraMaxSteps; ++ks) {
+                    if (ks < steps) {
+                        unsigned a0, a1, a2, a3;
+                        ldmatrix_x4(a0, a1, a2, a3, smem_addr(u_base + (2 * ks + a_piece) * 16));
+                        mma_bf16(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b[ks][0], b[ks][1]);
+                    }
+                }
+#pragma unroll
+                for (int v = 0; v < 4; ++v) { acc[mt][mr][v] = __fadd_rn(acc[mt][mr][v], __fmul_rn(c[v], scale)); }
+            }
+        }
+    }
+}
+
 // lora_add_tokens_tile_staged (below) for a wide instance whose B rows and one segment's U columns over the whole tile
 // do not fit the free shared memory (the NVFP4 A4 tile of 256 tokens): the same staging with U's columns copied for
 // half the tile's tokens at a time. A warp's fragments lie in one half (its tokens are a contiguous kWarpTokens-run that
@@ -518,7 +924,6 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged_halves(const P& p, f
                                                                    CtaRow cta_row, int token_begin, int token_count,
                                                                    unsigned char* smem, int thread, int threads,
                                                                    Barrier barrier) {
-    constexpr int kLoraMaxSteps = kLoraSteps<P>;
     constexpr int kPieces       = P::kMaxRank / 8;
     constexpr int kPieceBits    = kPieces == 16 ? 4 : 3;
     static_assert(kPieces == 1 << kPieceBits);
@@ -526,8 +931,7 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged_halves(const P& p, f
     constexpr int kHalf      = BlockTokens / 2;
     static_assert(BlockRows % 8 == 0 && kHalf % 16 == 0 && (BlockRows + kHalf) * kMaxStride <= SmemBytes,
                   "the tile's B rows and one segment's U columns over half the tile must fit");
-    const int lane  = threadIdx.x & 31;
-    const int steps = p.rank >> 4, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
+    const int pieces = p.rank >> 3, stride = 2 * p.rank + 16;
     unsigned touched = 0;
 #pragma unroll
     for (int f = 0; f < BlockRows / 8; ++f) {
@@ -547,8 +951,6 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged_halves(const P& p, f
                          p.b + static_cast<std::int64_t>(cta_row(row)) * p.rank + piece * 8);
         }
     }
-    const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_piece = lane >> 4;
-    const int b_row = lane & 7, b_piece = lane >> 3;
     bool first = true;
     for (int half = 0; half < 2; ++half) {
         const int half_begin = half * kHalf;
@@ -588,40 +990,8 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged_halves(const P& p, f
             cp_commit();
             cp_wait<0>();
             barrier();
-#pragma unroll
-            for (int mr = 0; mr < MR; ++mr) {
-                const int seg = p.segment_of(cta_row(local_row(mr, 0)));
-                if (((pass >> seg) & 1U) == 0U) { continue; }
-                const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg) - 1U)) * u_bytes;
-                const float scale           = p.scale_of(seg);
-                const unsigned char* b_base = b_s + local_row(mr, b_row) * stride;
-                unsigned b[kLoraMaxSteps][2];
-#pragma unroll
-                for (int ks = 0; ks < kLoraMaxSteps; ks += 2) {
-                    if (ks + 1 < steps) {
-                        ldmatrix_x4(b[ks][0], b[ks][1], b[ks + 1][0], b[ks + 1][1],
-                                    smem_addr(b_base + (2 * ks + b_piece) * 16));
-                    } else if (ks < steps) {
-                        ldmatrix_x2(b[ks][0], b[ks][1], smem_addr(b_base + (2 * ks + (b_piece & 1)) * 16));
-                    }
-                }
-#pragma unroll
-                for (int mt = 0; mt < MT; ++mt) {
-                    if (local_token(mt, 0) / kHalf != half) { continue; } // the fragment's tokens are in the other half
-                    const unsigned char* u_base = u_slot + (local_token(mt, a_row) - half_begin) * stride;
-                    float c[4]                  = {0.0F, 0.0F, 0.0F, 0.0F};
-#pragma unroll
-                    for (int ks = 0; ks < kLoraMaxSteps; ++ks) {
-                        if (ks < steps) {
-                            unsigned a0, a1, a2, a3;
-                            ldmatrix_x4(a0, a1, a2, a3, smem_addr(u_base + (2 * ks + a_piece) * 16));
-                            mma_bf16(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b[ks][0], b[ks][1]);
-                        }
-                    }
-#pragma unroll
-                    for (int v = 0; v < 4; ++v) { acc[mt][mr][v] = __fadd_rn(acc[mt][mr][v], __fmul_rn(c[v], scale)); }
-                }
-            }
+            lora_staged_pairs(p, acc, pass, b_s, u_s, u_bytes, stride, local_token, local_row, cta_row,
+                              [&](int mt) { return local_token(mt, 0) / kHalf == half; }, half_begin);
         }
     }
     barrier(); // the last pass's reads finish before the caller reuses shared memory
@@ -647,7 +1017,7 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&
                                                             CtaRow cta_row, int token_begin, int token_count,
                                                             unsigned char* smem, int thread, int threads,
                                                             Barrier barrier) {
-    constexpr int kLoraMaxSteps = kLoraSteps<P>;
+    [[maybe_unused]] constexpr int kLoraMaxSteps = kLoraSteps<P>;
     constexpr int kPieces       = P::kMaxRank / 8; // 16-byte pieces of a row: 8 or 16
     constexpr int kPieceBits    = kPieces == 16 ? 4 : 3;
     static_assert(kPieces == 1 << kPieceBits);
@@ -672,8 +1042,8 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&
         barrier();
         return;
     }
-    const int lane = threadIdx.x & 31;
-    const int steps = p.rank >> 4, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
+    [[maybe_unused]] const int lane = threadIdx.x & 31;
+    [[maybe_unused]] const int steps = p.rank >> 4, pieces = p.rank >> 3, stride = 2 * p.rank + 16;
     unsigned touched = 0;
 #pragma unroll
     for (int f = 0; f < BlockRows / 8; ++f) {
@@ -695,8 +1065,8 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&
     }
     // ldmatrix lane roles: U (the A operand) x4 = rows 0-7 / 8-15 at piece 2ks, then at 2ks + 1; B x4 = two k-steps
     // of the fragment's 8 rows (pieces 2ks .. 2ks + 3).
-    const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_piece = lane >> 4;
-    const int b_row = lane & 7, b_piece = lane >> 3;
+    [[maybe_unused]] const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_piece = lane >> 4;
+    [[maybe_unused]] const int b_row = lane & 7, b_piece = lane >> 3;
     bool first = true;
     while (touched != 0) {
         unsigned pass = 0;
@@ -732,37 +1102,42 @@ __device__ __forceinline__ void lora_add_tokens_tile_staged(const P& p, float (&
         cp_commit();
         cp_wait<0>();
         barrier();
+        if constexpr (P::kMaxRank > kLoraNarrowRank && MR % 2 == 0) {
+            lora_staged_pairs(p, acc, pass, b_s, u_s, u_bytes, stride, local_token, local_row, cta_row,
+                              [](int) { return true; }, 0);
+        } else {
 #pragma unroll
-        for (int mr = 0; mr < MR; ++mr) {
-            const int seg = p.segment_of(cta_row(local_row(mr, 0)));
-            if (((pass >> seg) & 1U) == 0U) { continue; }
-            const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg) - 1U)) * u_bytes;
-            const float scale           = p.scale_of(seg);
-            const unsigned char* b_base = b_s + local_row(mr, b_row) * stride;
-            unsigned b[kLoraMaxSteps][2];
+            for (int mr = 0; mr < MR; ++mr) {
+                const int seg = p.segment_of(cta_row(local_row(mr, 0)));
+                if (((pass >> seg) & 1U) == 0U) { continue; }
+                const unsigned char* u_slot = u_s + __popc(pass & ((1U << seg) - 1U)) * u_bytes;
+                const float scale           = p.scale_of(seg);
+                const unsigned char* b_base = b_s + local_row(mr, b_row) * stride;
+                unsigned b[kLoraMaxSteps][2];
 #pragma unroll
-            for (int ks = 0; ks < kLoraMaxSteps; ks += 2) {
-                if (ks + 1 < steps) {
-                    ldmatrix_x4(b[ks][0], b[ks][1], b[ks + 1][0], b[ks + 1][1],
-                                smem_addr(b_base + (2 * ks + b_piece) * 16));
-                } else if (ks < steps) {
-                    ldmatrix_x2(b[ks][0], b[ks][1], smem_addr(b_base + (2 * ks + (b_piece & 1)) * 16));
-                }
-            }
-#pragma unroll
-            for (int mt = 0; mt < MT; ++mt) {
-                const unsigned char* u_base = u_slot + local_token(mt, a_row) * stride;
-                float c[4]                  = {0.0F, 0.0F, 0.0F, 0.0F};
-#pragma unroll
-                for (int ks = 0; ks < kLoraMaxSteps; ++ks) {
-                    if (ks < steps) {
-                        unsigned a0, a1, a2, a3;
-                        ldmatrix_x4(a0, a1, a2, a3, smem_addr(u_base + (2 * ks + a_piece) * 16));
-                        mma_bf16(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b[ks][0], b[ks][1]);
+                for (int ks = 0; ks < kLoraMaxSteps; ks += 2) {
+                    if (ks + 1 < steps) {
+                        ldmatrix_x4(b[ks][0], b[ks][1], b[ks + 1][0], b[ks + 1][1],
+                                    smem_addr(b_base + (2 * ks + b_piece) * 16));
+                    } else if (ks < steps) {
+                        ldmatrix_x2(b[ks][0], b[ks][1], smem_addr(b_base + (2 * ks + (b_piece & 1)) * 16));
                     }
                 }
 #pragma unroll
-                for (int v = 0; v < 4; ++v) { acc[mt][mr][v] = __fadd_rn(acc[mt][mr][v], __fmul_rn(c[v], scale)); }
+                for (int mt = 0; mt < MT; ++mt) {
+                    const unsigned char* u_base = u_slot + local_token(mt, a_row) * stride;
+                    float c[4]                  = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                    for (int ks = 0; ks < kLoraMaxSteps; ++ks) {
+                        if (ks < steps) {
+                            unsigned a0, a1, a2, a3;
+                            ldmatrix_x4(a0, a1, a2, a3, smem_addr(u_base + (2 * ks + a_piece) * 16));
+                            mma_bf16(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b[ks][0], b[ks][1]);
+                        }
+                    }
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) { acc[mt][mr][v] = __fadd_rn(acc[mt][mr][v], __fmul_rn(c[v], scale)); }
+                }
             }
         }
     }

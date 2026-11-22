@@ -173,7 +173,26 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
     constexpr int output_stride = BN + 8;
     auto* shared_output         = reinterpret_cast<__nv_bfloat16*>(shared_raw);
     constexpr bool kLora = kLoraEpilogue<Epilogue>;
-    if constexpr (kLora && !collective) {
+    // A wide term whose B rows and a 16-token U buffer a token group fit the tile's free shared memory takes the
+    // group-staged form (lora_add_tokens_tile_group_staged) on the scaled values; the others keep their forms.
+    constexpr int kScratchBytes = [] {
+        if constexpr (requires { Schedule::kStorageBytes; })
+            return Schedule::kStorageBytes;
+        else
+            return Schedule::kSharedBytes;
+    }();
+    constexpr bool kGroupLora = [] {
+        if constexpr (kLora && requires { Schedule::kWarpsTokens; }) {
+            // A wide instance stages its operands: the low-register form (the FP8 tiles' accumulators leave few
+            // registers) double-buffers U. A 2,048-token QAD prefill's FP8 tiles took 3.4 ms less at rank 128, the
+            // same at rank 32 (RTX 5090, 2026-11-22), so a narrow instance keeps reading them from L2.
+            if constexpr (kLoraStageRank<Epilogue> <= kLoraNarrowRank) { return false; }
+            return (BN + Schedule::kWarpsTokens * 2 * 16) * (2 * kLoraStageRank<Epilogue> + 16) <= kScratchBytes;
+        } else {
+            return false;
+        }
+    }();
+    if constexpr (kLora && !collective && !kGroupLora) {
         // --lora, a fragment-wise epilogue: per fragment column its term operands, then per fragment the scaled
         // values plus the term, finished and stored at once, so the accumulators retire as they go (the operations
         // of each element are the scaling pass's, lora_add_tokens_tile's and the epilogue's, as in the else branch).
@@ -275,16 +294,26 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     acc[3]    = __fmul_rn(__fmul_rn(acc[3], activation_scale1), weight_scale.y);
                 }
             }
-            const int token_base = token_begin + warp_token * Schedule::kWarpTokens;
-            lora_add_tokens_tile<Schedule::kMmaTokens, Schedule::kMmaRows>(
-                epilogue.lora, accumulators,
-                [&](int mt, int i) {
-                    const int token = token_base + mt * 16 + i;
-                    return token < tokens ? token : -1;
-                },
-                [&](int mr, int j) {
-                    return row_policy.weight_row(row_begin, warp_row * Schedule::kWarpRows + mr * 8 + j, rows);
-                });
+            if constexpr (kGroupLora) {
+                // Every warp has passed the main loop's last shared reads (the caller's barrier): the storage is free.
+                lora_add_tokens_tile_group_staged<BN, kScratchBytes, Schedule::kWarpsTokens, Schedule::kWarpsRows, true>(
+                    epilogue.lora, accumulators,
+                    [&](int mt, int i) { return warp_token * Schedule::kWarpTokens + mt * 16 + i; },
+                    [&](int mr, int j) { return warp_row * Schedule::kWarpRows + mr * 8 + j; },
+                    [&](int i) { return row_policy.weight_row(row_begin, i, rows); }, token_begin, tokens, shared_raw,
+                    tid, warp_token, [] { asm volatile("bar.sync 1, %0;" ::"r"(THREADS) : "memory"); });
+            } else {
+                const int token_base = token_begin + warp_token * Schedule::kWarpTokens;
+                lora_add_tokens_tile<Schedule::kMmaTokens, Schedule::kMmaRows>(
+                    epilogue.lora, accumulators,
+                    [&](int mt, int i) {
+                        const int token = token_base + mt * 16 + i;
+                        return token < tokens ? token : -1;
+                    },
+                    [&](int mr, int j) {
+                        return row_policy.weight_row(row_begin, warp_row * Schedule::kWarpRows + mr * 8 + j, rows);
+                    });
+            }
         }
 #pragma unroll
         for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
