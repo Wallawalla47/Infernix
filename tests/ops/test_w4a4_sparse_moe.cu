@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -1101,12 +1102,20 @@ void single_case(bool a8, bool a16 = false) {
     cuda_check(cudaMalloc(&d_ref, std::size_t(K) * H * 2), "cudaMalloc");
     cuda_check(cudaMalloc(&d_one, std::size_t(K) * H * 2), "cudaMalloc");
     int differ = 0, routing_differ = 0, graph_differ = 0;
-    for (int column = 0; column < 4; ++column) {
+    // Column 3 at 8x the scale, column 4 all zeros, column 5 one NaN element (every logit NaN: the selection must still
+    // fill its slots, with experts 0-7 in order, and both paths agree).
+    constexpr int kColumns = 6;
+    int nan_routing_wrong = 0;
+    for (int column = 0; column < kColumns; ++column) {
         std::vector<float> xf(H);
         std::vector<std::uint16_t> x(H);
         for (int k = 0; k < H; ++k) {
-            x[k]  = canon::f32_to_bf16_rn(normal(rng) * (column == 3 ? 8.0F : 1.0F));
+            x[k]  = column == 4 ? std::uint16_t{0} : canon::f32_to_bf16_rn(normal(rng) * (column == 3 ? 8.0F : 1.0F));
             xf[k] = canon::bf16_to_f32(x[k]);
+        }
+        if (column == 5) {
+            x[100]  = 0x7FC0U;
+            xf[100] = canon::bf16_to_f32(x[100]);
         }
         const QuantRow q     = a8 ? quantize_a8(xf) : quantize_a4(xf);
         const LimbRow l      = encode_a16(xf);
@@ -1129,12 +1138,20 @@ void single_case(bool a8, bool a16 = false) {
         const auto ref        = download(d_ref, std::size_t(K) * H);
         const auto ref_routed = download(ws.routed, K);
         const auto ref_gamma  = download(ws.gamma, K);
+        if (column == 5) {
+            for (int j = 0; j < K; ++j) { nan_routing_wrong += ref_routed[j] != j ? 1 : 0; }
+        }
         cuda_check(cudaMemset(ws.routed, 0xFF, K * 4), "clear");
         single(nullptr);
         cuda_check(cudaDeviceSynchronize(), "single");
         const auto one = download(d_one, std::size_t(K) * H);
         for (std::size_t i = 0; i < one.size(); ++i) { differ += one[i] != ref[i] ? 1 : 0; }
-        routing_differ += download(ws.routed, K) != ref_routed || download(ws.gamma, K) != ref_gamma ? 1 : 0;
+        // Bitwise (the NaN column's weights are NaN).
+        const auto gamma_one = download(ws.gamma, K);
+        routing_differ += download(ws.routed, K) != ref_routed ||
+                                  std::memcmp(gamma_one.data(), ref_gamma.data(), K * sizeof(float)) != 0
+                              ? 1
+                              : 0;
         // A graph: single, separate, single (each path after the other), replayed three times.
         cudaStream_t stream;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
@@ -1162,10 +1179,13 @@ void single_case(bool a8, bool a16 = false) {
         }
     }
     const bool error_clear = download(ws.error, 1)[0] == 0U;
-    std::printf("%s single-column launch (4 columns): %d of %d outputs differ from moe_route + moe_experts, routing "
-                "differs in %d columns, %d graph replays (single, separate, single) differ, error word %s\n",
-                name, differ, 4 * K * H, routing_differ, graph_differ, error_clear ? "clear" : "SET");
+    std::printf("%s single-column launch (%d columns): %d of %d outputs differ from moe_route + moe_experts, routing "
+                "differs in %d columns, %d graph replays (single, separate, single) differ, error word %s; NaN column's "
+                "slots not experts 0-7: %d\n",
+                name, kColumns, differ, kColumns * K * H, routing_differ, graph_differ, error_clear ? "clear" : "SET",
+                nan_routing_wrong);
     check(differ == 0 && routing_differ == 0, "the single-column launch differs from moe_route + moe_experts");
+    check(nan_routing_wrong == 0, "a NaN column's selection did not fill its slots with experts 0-7 in order");
     check(graph_differ == 0, "a graph interleaving the single-column launch and the separate kernels differs");
     check(error_clear, "the single-column launch set the error word");
     for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den),

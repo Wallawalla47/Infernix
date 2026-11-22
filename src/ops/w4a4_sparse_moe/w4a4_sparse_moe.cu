@@ -1224,13 +1224,13 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     if (tid == 0) { sm.stalled = wait_count(counters + 0, kRouterCtas, a.e.ws.error) ? 0 : 1; }
     __syncthreads();
     if (sm.stalled != 0) { return; }
-    // The column's selection (select_column's rule, a thread an expert): keys sigmoid_c(l_e) + bias_e, the top 8 by
+    // The column's selection (select_column's rule, a thread an expert): keys selection_key(sigmoid_c(l_e), bias_e), the top 8 by
     // key (ties to the lower index) in slots of descending key, gamma_j = (s_j / sum8(s)) * route_scale.
     static_assert(kSingleExperts <= kSingleThreads, "a thread an expert");
     float sig = 0.0F;
     if (tid < kSingleExperts) {
         sig          = canon::sigmoid_c(__ldcg(a.e.ws.logits + tid));
-        sm.keys[tid] = canon::add_rn(sig, a.bias[tid]);
+        sm.keys[tid] = detail::selection_key(sig, a.bias[tid]);
     }
     __syncthreads();
     if (tid < kSingleExperts) {

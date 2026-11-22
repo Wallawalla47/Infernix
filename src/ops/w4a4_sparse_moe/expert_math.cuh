@@ -26,14 +26,22 @@ __device__ __forceinline__ float nvfp4_row_scale(float amax_row, float amax_w, f
     return canon::mul_rn(canon::mul_rn(amax_row, amax_w), rcp);
 }
 
+// An expert's selection key sigmoid_c(l) + bias, a NaN key (a NaN logit: the column's x was not finite) ranked below
+// every other: the ranks stay a permutation, so every slot is filled (with NaN routing weights, which carry the
+// column's non-finite state on), and finite keys keep their order.
+__device__ __forceinline__ float selection_key(float sigmoid, float bias) {
+    const float key = canon::add_rn(sigmoid, bias);
+    return key != key ? canon::f32_from_bits(0xFF800000U) : key; // -inf
+}
+
 // One column's selection by one warp from its FP32 logits [experts] (keys and sel are the warp's shared scratch,
-// 256 and kTopK floats): keys sigmoid_c(l_e) + bias_e; the top kTopK by key (ties to the lower index) in slots of
-// descending key; gamma_j = (s_j / sum8(s)) * route_scale over the selected sigmoids s.
+// 256 and kTopK floats): keys selection_key(sigmoid_c(l_e), bias_e); the top kTopK by key (ties to the lower index) in
+// slots of descending key; gamma_j = (s_j / sum8(s)) * route_scale over the selected sigmoids s.
 __device__ __forceinline__ void select_column(const float* logits, const float* bias, int experts, float route_scale,
                                               float* keys, float* sel, int lane, std::int32_t* routed, float* gamma) {
     for (int e = lane; e < experts; e += 32) {
         const float s = canon::sigmoid_c(__ldcg(logits + e));
-        keys[e]       = canon::add_rn(s, bias[e]);
+        keys[e]       = selection_key(s, bias[e]);
     }
     __syncwarp();
     for (int e = lane; e < experts; e += 32) {

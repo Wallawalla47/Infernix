@@ -129,7 +129,8 @@ inline constexpr std::int32_t kPromptHRowBytes = 1152 / 2 + 80;            // 57
 
 // The router of `columns` columns of x (BF16 [T][H], the MoE input), then the dispatch (moe_dispatch's) of its routing
 // in its last CTA: logits l_e = sum_k x_k W[e, k] in binary32 (BF16 products are exact; one fixed order per column: a
-// lane's strided elements in order, then a fixed warp tree); selection keys sigmoid_c(l_e) + bias_e (FP32); the top
+// lane's strided elements in order, then a fixed warp tree); selection keys sigmoid_c(l_e) + bias_e (FP32; a NaN key,
+// from a non-finite x, ranks below every other, so the slots always hold kTopK distinct experts); the top
 // kTopK by key, ties to the lower expert index, in slots of descending key; gamma_j = (s_j / sum8(s)) * route_scale
 // over the selected sigmoids s, sum8 the pairwise ((s0 + s2) + (s1 + s3)) + ((s4 + s6) + (s5 + s7)). W: BF16 [E][H]
 // (E <= 256), bias FP32 [E]. The routing lands in the workspace (routed_routing).
