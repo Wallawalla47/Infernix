@@ -834,8 +834,18 @@ exact, no serial arg-max), γ, and per-expert job lists. Padded rows of a graph 
   outputs byte for byte, graphs interleaving both paths; the forward test's decode guard). Measured (RTX 5090): the op
   bench at T = 1 (8 cold layers a graph) NVFP4 44.4 → 35.2 µs, MXFP8 58.5 → 49.6 µs (808 → 1,019 and 1,123 → 1,327
   GB/s); the decode round −3.0 % at 4K context (6.107 → 5.921 ms), −3.4 % at 128 (5.818 → 5.622 ms), about −0.19 ms a
-  round against the op bench's −0.44 ms. Verify and multi-request calls keep the three launches (at T = 8 the experts
-  already stream near their floor).
+  round against the op bench's −0.44 ms.
+- **2-8 columns in one launch: tried, rejected (2026-11-22).** Verify and multi-request calls read far more experts
+  than one column (distinct experts a visit on the golden prompt: 8.0 at one column, 12.2 at two, 15.8 at three, 18.9
+  at four, 29.2 at eight; their bytes at 1.5-1.7 TB/s floor a verify round's MoE at 2.1-2.4 ms at three columns
+  against the three launches' 3.76 ms). A persistent grid (one CTA an SM, the router's rows on CTAs 0-15, every CTA
+  grouping the columns' entries itself, quads of 4 warps taking 16-row groups with K split four ways in exact int64
+  quarters, down workers forming each job's four-over-six h rows) gave the three launches' bits but lost at every
+  width, also after a latency pass (one fence a warp, h loaded up front, the scales in shared memory): verify round at
+  context 128, three runs each, 6.523 → 6.838 ms at 2 columns (+4.8 %), 7.454 → 8.207 at 3 (+10.1 %), 8.053 → 9.006
+  at 4 (+11.8 %), 10.304 → 11.996 at 8 (+16.4 %); the MoE alone at 3 columns 3.78 → 4.59 ms. 2-8 columns keep the
+  three launches; their gap to the byte floor (3.78 against 2.1-2.4 ms at three columns) stays open for another
+  design.
 
 ### 10.4 Wide routes (prefill)
 
