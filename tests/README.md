@@ -21,7 +21,10 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
   causal-scoring evaluation;
 - root `test_*.py` — corpus measurement consumption, and the schema-version agreement between
   what Serve writes and what each Python reader accepts (the per-language consumer tests build
-  their fixtures from their own constant, so only that pin can see a one-sided bump).
+  their fixtures from their own constant, so only that pin can see a one-sided bump);
+- `test_ablate_tools.py` — `tools/ablate` (fitting refusal-ablation sidecars) end to end on CPU,
+  against the fake engine and capture test in `ablate_fakes.py`; skipped without the tool's
+  `requirements.txt`.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
