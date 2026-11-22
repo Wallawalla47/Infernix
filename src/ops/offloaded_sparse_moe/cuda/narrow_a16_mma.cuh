@@ -57,53 +57,6 @@ inline bool a16_nmma_call(const MoeExpertSource& source, int columns, const moe:
            layout.x_acts == nullptr;
 }
 
-// D = A B on int8 tensor cores with signed A and unsigned B (ggml::tile::mma_k32 is signed times signed).
-__device__ __forceinline__ void mma_k32_su(int (&d)[4], int a0, int a1, int a2, int a3, int b0, int b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
-}
-
-__device__ __forceinline__ std::uint32_t nmma16_lds32(const std::uint8_t* p) { return *reinterpret_cast<const std::uint32_t*>(p); }
-
-// One unit's contribution to thread (g, t)'s sums: its A fragment from the unit's word 32 t + 4 g (rows g and
-// g + 8, elements 4 t .. 4 t + 3), B from column g's limb words t of the unit's block (`limbs`: that column's
-// limb row at the block's tile, offset by 16 (b % 4) + 4 t), the rows' scales through `scaled`.
-template <bool kGlobal>
-__device__ __forceinline__ void nmma16_unit(const std::uint8_t* unit, const std::uint8_t* limbs, const std::int32_t* scaled,
-                                            int g, int t, long long (&s)[4]) {
-    const std::uint32_t word = nmma16_lds32(unit + 32 * t + 4 * g);
-    const std::uint32_t c_lo = canon::e2m1_x2_quad(word & 0x0F0F0F0FU);        // row g
-    const std::uint32_t c_hi = canon::e2m1_x2_quad((word >> 4) & 0x0F0F0F0FU); // row g + 8
-    const int a0 = static_cast<int>((c_lo << 3) & 0xF8F8F8F8U); // 8 c: each byte's own bits
-    const int a1 = static_cast<int>((c_hi << 3) & 0xF8F8F8F8U);
-    std::uint32_t h1, l1, small;
-    if constexpr (kGlobal) {
-        h1    = __ldg(reinterpret_cast<const unsigned*>(limbs));
-        l1    = __ldg(reinterpret_cast<const unsigned*>(limbs + moe::wide::kA16KTile));
-        small = __ldg(reinterpret_cast<const unsigned*>(limbs + 2 * moe::wide::kA16KTile));
-    } else {
-        h1    = nmma16_lds32(limbs);
-        l1    = nmma16_lds32(limbs + moe::wide::kA16KTile);
-        small = nmma16_lds32(limbs + 2 * moe::wide::kA16KTile);
-    }
-    int hi[4], lo[4];
-    ggml::tile::mma_k32(hi, a0, a1, static_cast<int>(c_lo), static_cast<int>(c_hi), static_cast<int>(h1),
-                  static_cast<int>(small & 0x07070707U));
-    mma_k32_su(lo, a0, a1, static_cast<int>(c_lo), static_cast<int>(c_hi), static_cast<int>(l1),
-               static_cast<int>((small >> 4) & 0x07070707U));
-    const int w_lo = scaled[unit[128 + g]], w_hi = scaled[unit[136 + g]];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        // P = 2048 hi + lo in wrapping arithmetic: its true value fits int32.
-        const int p = static_cast<int>((static_cast<unsigned>(hi[i]) << 11) + static_cast<unsigned>(lo[i]));
-        moe::wide::fold(s[i], p, i < 2 ? w_lo : w_hi);
-    }
-}
-
-// The limb words of block b for thread t within a limb row.
-__device__ __forceinline__ int nmma16_block_offset(int b, int t) { return (b / 4) * moe::wide::kA16LimbTileBytes + 16 * (b % 4) + 4 * t; }
-
 __device__ __forceinline__ void nmma16_fill_scaled(std::int32_t* scaled, int threads) {
     for (int i = static_cast<int>(threadIdx.x); i < 256; i += threads) { scaled[i] = canon::e4m3_scaled(static_cast<unsigned>(i)); }
 }
@@ -270,7 +223,8 @@ __global__ void __launch_bounds__(Nmma16GateUpWarps<KSplit>::kThreads) gate_up_n
 #pragma unroll
             for (int u = 0; u < kNmma16StageUnits; ++u) {
                 const int b = b0 + st * kNmma16StageUnits + u;
-                nmma16_unit<kGlobal>(stage + u * moe::kUnitBytes, limbs + nmma16_block_offset(b, t), sm.scaled, g, t, s);
+                moe::wide::a16_unit<kGlobal ? moe::wide::LimbLoad::Nc : moe::wide::LimbLoad::Shared>(
+                    stage + u * moe::kUnitBytes, limbs + moe::wide::a16_block_offset(b, t), sm.scaled, g, t, s);
             }
             __syncwarp(); // every lane is done with this stage before a later issue refills it
         }
@@ -415,7 +369,8 @@ __global__ void __launch_bounds__(kNmma16Threads) down_nmma16_kernel(Nmma16Args 
     long long s[4] = {0, 0, 0, 0};
 #pragma unroll 8
     for (int b = 0; b < G::kDownBlocks; ++b) {
-        nmma16_unit<false>(units + b * moe::kUnitBytes, limbs + nmma16_block_offset(b, t), sm.scaled, g, t, s);
+        moe::wide::a16_unit<moe::wide::LimbLoad::Shared>(units + b * moe::kUnitBytes, limbs + moe::wide::a16_block_offset(b, t),
+                                                         sm.scaled, g, t, s);
     }
     auto* out = reinterpret_cast<std::uint16_t*>(a.outputs);
 #pragma unroll

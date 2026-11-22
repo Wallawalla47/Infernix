@@ -364,17 +364,60 @@ struct Result {
     std::vector<std::uint32_t> h_amax; // NVFP4: [T * K]
 };
 
+// A column's A16 encoding (the arithmetic's definition, design §16.2.1 of Flash-Next): its exponent, X_j and the limb
+// row in a16_limbs.cuh's planes (per 64-element tile: 64 H1 = X >> 14, 64 L1 = (X >> 3) & 255, 64 H0 | L0 << 4).
+struct LimbRow {
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::int32_t> X;
+    int emax = 0;
+};
+
+LimbRow encode_a16(const std::vector<float>& v) {
+    const int n = static_cast<int>(v.size());
+    std::vector<std::uint16_t> bits(n);
+    for (int j = 0; j < n; ++j) { bits[j] = canon::f32_to_bf16_rn(v[j]); }
+    LimbRow r;
+    r.emax = canon::a16_column_exponent(bits.data(), n);
+    r.X.resize(n);
+    r.bytes.assign(std::size_t(n) / 64 * 192, 0);
+    for (int j = 0; j < n; ++j) {
+        const std::int32_t x = r.emax == canon::kA16NonFinite ? 0 : canon::a16_value(bits[j], r.emax);
+        r.X[j]               = x;
+        const int blk = j / 16, e = j % 16;
+        std::uint8_t* at = r.bytes.data() + (blk / 4) * 192 + 16 * (blk % 4) + e;
+        at[0]            = static_cast<std::uint8_t>(x >> 14);
+        at[64]           = static_cast<std::uint8_t>((x >> 3) & 255);
+        at[128]          = static_cast<std::uint8_t>(((x >> 11) & 7) | ((x & 7) << 4));
+    }
+    return r;
+}
+
 Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* workspace,
-           int capacity = moe::kMaxColumns) {
+           int capacity = moe::kMaxColumns, bool a16 = false) {
     std::vector<std::uint8_t> rows;
     std::vector<float> amax;
+    std::vector<std::int32_t> emax;
     for (const auto& x : call.x) {
+        if (a16) {
+            const LimbRow l = encode_a16(x);
+            rows.insert(rows.end(), l.bytes.begin(), l.bytes.end());
+            emax.push_back(l.emax);
+            amax.push_back(0.0F);
+            continue;
+        }
         const QuantRow q = b.a8 ? quantize_a8(x) : quantize_a4(x);
         rows.insert(rows.end(), q.bytes.begin(), q.bytes.end());
         amax.push_back(q.amax);
     }
+    if (emax.empty()) { emax.push_back(0); }
     std::uint8_t* d_rows = upload(rows);
     float* d_amax        = upload(amax);
+    std::int32_t* d_emax = upload(emax);
+    moe::Activations act{d_rows, d_amax, call.columns};
+    if (a16) {
+        act.activation = moe::ExpertActivation::A16;
+        act.emax       = d_emax;
+    }
     std::int32_t* d_exp  = upload(call.experts);
     float* d_gamma       = upload(call.gamma);
     std::uint16_t* d_out = nullptr;
@@ -392,7 +435,7 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     bank.hidden        = H;
     bank.intermediate  = I;
     moe::moe_dispatch(routing, call.columns, E, ws, nullptr);
-    moe::moe_experts(moe::Activations{d_rows, d_amax, call.columns}, routing, bank, ws, d_out, nullptr);
+    moe::moe_experts(act, routing, bank, ws, d_out, nullptr);
     cuda_check(cudaDeviceSynchronize(), "moe call");
     Result r;
     r.out = download(d_out, entries * H);
@@ -405,7 +448,7 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
         cudaGraphExec_t exec;
         cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
         moe::moe_dispatch(routing, call.columns, E, ws, stream);
-        moe::moe_experts(moe::Activations{d_rows, d_amax, call.columns}, routing, bank, ws, d_out, stream);
+        moe::moe_experts(act, routing, bank, ws, d_out, stream);
         cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
         cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
         for (int replay = 0; replay < 3; ++replay) {
@@ -423,10 +466,103 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     r.h_rows = download(ws.h_rows, entries * moe::row_bytes(bank.format, I));
     r.h_amax = download(ws.h_amax, entries);
     for (void* p : {static_cast<void*>(d_rows), static_cast<void*>(d_amax), static_cast<void*>(d_exp),
-                    static_cast<void*>(d_gamma), static_cast<void*>(d_out)}) {
+                    static_cast<void*>(d_gamma), static_cast<void*>(d_out), static_cast<void*>(d_emax)}) {
         cuda_check(cudaFree(p), "cudaFree");
     }
     return r;
+}
+
+// ---------------------------------------------------------------------------- A16 (--a16-activations), NVFP4
+
+// The exact A16 outputs of entry (x, e, gamma): gate/up S = sum_b P_b e4m3_scaled(s_b) over the column's X, y =
+// a16_row_output(S, emax, fl32(amax_w / den)), h = swiglu(y_gate, y_up) * gamma (BF16), h encoded the same way, and
+// the down outputs likewise.
+std::vector<std::uint16_t> oracle_a16(const HostBank& b, const Matrix& gu, const Matrix& dn, int e, const LimbRow& x,
+                                      float gamma) {
+    const float m1 = canon::div_rn(b.amax[2 * e], b.den[0]), m2 = canon::div_rn(b.amax[2 * e + 1], b.den[1]);
+    const auto row_sum = [](const Matrix& w, int r, const std::vector<std::int32_t>& X) {
+        long long s = 0;
+        for (int blk = 0; blk < w.k / 16; ++blk) {
+            long long p = 0;
+            for (int j = 0; j < 16; ++j) {
+                const int k = 16 * blk + j;
+                p += static_cast<long long>(canon::e2m1_x2(w.code[std::size_t(r) * w.k + k])) * X[k];
+            }
+            s += p * canon::e4m3_scaled(w.scale[std::size_t(r) * (w.k / 16) + blk]);
+        }
+        return s;
+    };
+    std::vector<std::uint16_t> y(2 * I);
+    for (int r = 0; r < 2 * I; ++r) { y[r] = canon::a16_row_output(row_sum(gu, r, x.X), x.emax, m1); }
+    std::vector<float> h(I);
+    for (int i = 0; i < I; ++i) { h[i] = canon::bf16_to_f32(swiglu(y[2 * i], y[2 * i + 1], gamma)); }
+    const LimbRow hl = encode_a16(h);
+    std::vector<std::uint16_t> out(H);
+    for (int r = 0; r < H; ++r) { out[r] = canon::a16_row_output(row_sum(dn, r, hl.X), hl.emax, m2); }
+    return out;
+}
+
+// Criteria (fixed before the first run): every output equals the exact arithmetic bit for bit at widths 1, 5, 32 and
+// 128 (graph replays included, in run()), a non-finite column gives the canonical NaN in all its outputs, and a column
+// alone gives the bits it gets in a wider call.
+void a16_case() {
+    const HostBank b = make_bank(false, 41U);
+    DeviceBank db{upload(b.records), upload(b.amax), upload(std::vector<float>{b.den[0], b.den[1]})};
+    void* workspace = nullptr;
+    cuda_check(cudaMalloc(&workspace, moe::workspace_bytes(E, I)), "cudaMalloc");
+    cuda_check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I)), "cudaMemset");
+    std::vector<Matrix> cache_gu(E), cache_dn(E);
+    std::vector<bool> decoded(E, false);
+    int differ = 0, checked = 0;
+    Result wide;
+    Call wide_call;
+    for (const int columns : {1, 5, 32, 128}) {
+        Call call = make_call(columns, 900U + static_cast<std::uint32_t>(columns), columns == 32 ? 16.0F : 1.0F);
+        if (columns == 32) { call.x[3][100] = INFINITY; } // a non-finite column
+        const Result got = run(b, db, call, workspace, moe::kMaxColumns, true);
+        // The exact arithmetic over a sample of entries (every entry of the narrow calls, 64 of the widest).
+        const int entries = columns * K, step = columns == 128 ? 16 : 1;
+        for (int entry = 0; entry < entries; entry += step) {
+            const int t = entry / K, e = call.experts[entry];
+            if (!decoded[e]) {
+                cache_gu[e] = decode(b, e, false);
+                cache_dn[e] = decode(b, e, true);
+                decoded[e]  = true;
+            }
+            const std::vector<std::uint16_t> want = oracle_a16(b, cache_gu[e], cache_dn[e], e, encode_a16(call.x[t]),
+                                                               call.gamma[entry]);
+            for (int i = 0; i < H; ++i) { differ += got.out[std::size_t(entry) * H + i] != want[i] ? 1 : 0; }
+            checked += H;
+            if (columns == 32 && t == 3) {
+                bool all_nan = true;
+                for (int i = 0; i < H; ++i) { all_nan = all_nan && got.out[std::size_t(entry) * H + i] == 0x7FC0U; }
+                check(all_nan, "A16: a non-finite column's outputs are not the canonical NaN");
+            }
+        }
+        if (columns == 128) {
+            wide      = got;
+            wide_call = call;
+        }
+    }
+    // Columns of the 128-column call alone.
+    int alone_differ = 0;
+    for (const int t : {0, 9, 64, 127}) {
+        Call one;
+        one.columns = 1;
+        one.x       = {wide_call.x[t]};
+        one.experts.assign(wide_call.experts.begin() + t * K, wide_call.experts.begin() + (t + 1) * K);
+        one.gamma.assign(wide_call.gamma.begin() + t * K, wide_call.gamma.begin() + (t + 1) * K);
+        const Result alone = run(b, db, one, workspace, moe::kMaxColumns, true);
+        for (int i = 0; i < K * H; ++i) { alone_differ += alone.out[i] != wide.out[std::size_t(t) * K * H + i] ? 1 : 0; }
+    }
+    std::printf("NVFP4 A16: %d of %d outputs differ from the exact arithmetic; %d outputs of 4 columns alone differ "
+                "from the 128-column call\n",
+                differ, checked, alone_differ);
+    check(differ == 0, "A16 outputs differ from the exact arithmetic");
+    check(alone_differ == 0, "an A16 column alone differs from the column in a wider call");
+    for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den), workspace}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
 }
 
 void bank_case(bool a8) {
@@ -940,6 +1076,7 @@ INFERNIX_OP_TEST(w4a4_sparse_moe) {
     single_case(true);
     bank_case(false);
     bank_case(true);
+    a16_case();
     prompt_case(false);
     prompt_case(true);
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);

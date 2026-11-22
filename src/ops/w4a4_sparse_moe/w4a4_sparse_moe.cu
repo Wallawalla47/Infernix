@@ -23,6 +23,7 @@
 #include "ops/common/canonical_math.h"
 #include "ops/common/mma.cuh"
 #include "ops/ggml/ggml_tile.cuh"
+#include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
 #include "ops/w4a4_sparse_moe/expert_math.cuh"
 
 #include <cuda_runtime.h>
@@ -549,6 +550,203 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a4_kernel(
             }
         }
         __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------- NVFP4 A16 (--a16-activations)
+
+namespace a16 = infernix::ops::offloaded_moe::wide;
+
+// The A16 kernels keep the A4 kernels' shapes (row groups, K halves, rings, passes of kPass columns, the job counts);
+// a unit's B operand is a column's limb row read from L2 (x: complete before the call; h: the job's limb rows,
+// read after its count), and an output is a16_row_output(S, emax, m).
+__device__ __forceinline__ float a16_multiplier(float amax_w, float denominator) { return canon::div_rn(amax_w, denominator); }
+__device__ __forceinline__ int a16_h_emax(std::uint32_t h_amax_bits) { return a16::a16_emax(h_amax_bits >> 16); }
+
+template <class G>
+struct GateUpA16Smem {
+    using S = Shape<G, false>;
+    std::int32_t scaled[256];
+    alignas(16) std::uint8_t ring[kSplit * kWarps][kDepth][S::kStageBytes];
+    std::uint16_t h[kPass][kCtaInter];
+    int last;
+};
+
+template <class G>
+__global__ void __launch_bounds__(kGuThreads) gate_up_a16_kernel(Args a) {
+    using S = Shape<G, false>;
+    constexpr int kXLimbs = kA16XRowBytes, kHLimbs = kA16HRowBytes;
+    static_assert(G::kHidden / 64 * 192 == kXLimbs && G::kInter / 64 * 192 == kHLimbs, "the limb rows of the geometry");
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm = *reinterpret_cast<GateUpA16Smem<G>*>(smem_raw);
+    pdl::trigger_dependents(); // the down pass may launch and copy its weights; it reads h after its job's count
+    const int job = static_cast<int>(blockIdx.y);
+    JobView v;
+    if (!job_view(a, job, v)) { return; }
+    const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
+    const int g = lane / 4, t = lane % 4;
+    const int rg = warp % kWarps, k_half = warp / kWarps;
+    const int group = static_cast<int>(blockIdx.x) * kWarps + rg;
+    const std::uint8_t* units =
+        v.record + (static_cast<std::size_t>(group) * S::kGateUpBlocks + static_cast<std::size_t>(k_half) * S::kHalfBlocks) *
+                       S::kUnit;
+    auto& ring       = sm.ring[warp];
+    const auto issue = [&](int stage) {
+        const std::uint8_t* src = units + static_cast<std::size_t>(stage) * S::kStageBytes;
+        for (int i = lane; i < S::kStageBytes / 16; i += 32) { tile::cp_async16(ring[stage % kDepth] + 16 * i, src + 16 * i, 16); }
+    };
+    a4_mma_fill_scaled(sm.scaled, kGuThreads);
+    const float m     = a16_multiplier(a.bank.amax[2 * v.expert], a.bank.denominators[0]);
+    const int h_first = static_cast<int>(blockIdx.x) * kCtaInter;
+    const auto column_of_entry = [&](int c) { return a.ws.entries[v.first + c] / kTopK; };
+    for (int base = 0; base < v.count; base += kPass) {
+        const int n = min(kPass, v.count - base);
+#pragma unroll
+        for (int k = 0; k < kDepth - 1; ++k) {
+            issue(k);
+            tile::cp_async_commit();
+        }
+        __syncthreads(); // the scale table
+        const int b0               = k_half * S::kHalfBlocks;
+        const std::uint8_t* limbs  = a.x.rows + static_cast<std::size_t>(column_of_entry(base + min(g, n - 1))) * kXLimbs;
+        long long s[4]             = {0, 0, 0, 0};
+        for (int st = 0; st < S::kStages; ++st) {
+            tile::cp_async_wait<kDepth - 2>();
+            __syncwarp();
+            if (st + kDepth - 1 < S::kStages) { issue(st + kDepth - 1); }
+            tile::cp_async_commit();
+            const std::uint8_t* stage = ring[st % kDepth];
+#pragma unroll
+            for (int u = 0; u < S::kStageUnits; ++u) {
+                const int b = b0 + st * S::kStageUnits + u;
+                a16::a16_unit<a16::LimbLoad::Nc>(stage + u * S::kUnit, limbs + a16::a16_block_offset(b, t), sm.scaled, g, t, s);
+            }
+            __syncwarp();
+        }
+        tile::cp_async_wait<0>();
+        __syncthreads();
+        // The second half's sums join the first's (exact int64 adds) through the rings' memory.
+        auto* half = reinterpret_cast<long long (*)[32][4]>(&sm.ring[0][0][0]);
+        if (k_half == 1) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { half[rg][lane][i] = s[i]; }
+        }
+        __syncthreads();
+        if (k_half == 0) {
+            std::uint16_t y[4], up[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[i] += half[rg][lane][i];
+                const int c = min(2 * t + (i & 1), n - 1);
+                y[i]        = canon::a16_row_output(s[i], a.x.emax[column_of_entry(base + c)], m);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
+            if ((g & 1) == 0) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int c = 2 * t + (i & 1);
+                    if (c < n) {
+                        const int entry = a.ws.entries[v.first + base + c];
+                        sm.h[c][rg * 8 + g / 2 + (i < 2 ? 0 : 4)] =
+                            swiglu(y[i], up[i], a.routing.gamma[entry], a.bank.gate_softcap, a.bank.up_softcap);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        // h to global and each column's largest magnitude over this CTA's intermediates.
+        for (int i = tid; i < n * kCtaInter; i += kGuThreads) {
+            const int c = i / kCtaInter, k = i % kCtaInter;
+            const int entry = a.ws.entries[v.first + base + c];
+            a.ws.h[static_cast<std::size_t>(entry) * G::kInter + h_first + k] = sm.h[c][k];
+        }
+        if (warp < n) {
+            const std::uint32_t mag = canon::f32_bits(bf16f(sm.h[warp][lane])) & 0x7FFFFFFFU;
+            std::uint32_t mx        = mag;
+#pragma unroll
+            for (int o = 16; o >= 1; o /= 2) { mx = max(mx, __shfl_xor_sync(0xFFFFFFFFU, mx, o)); }
+            if (lane == 0) { atomicMax(&a.ws.h_amax[a.ws.entries[v.first + base + warp]], mx); }
+        }
+        __syncthreads(); // the next pass reuses the rings and h
+    }
+    // The job's last CTA encodes the job's h rows as limbs once, then counts again: the down CTAs wait for
+    // kGateUpCtas + 1.
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        sm.last = acq_rel_add(&a.ws.job_done[job]) == static_cast<std::uint32_t>(S::kGateUpCtas - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (sm.last == 0) { return; }
+    __threadfence();
+    constexpr int kBlocks = G::kInter / 16;
+    for (int i = tid; i < v.count * kBlocks; i += kGuThreads) {
+        const int c = i / kBlocks, b = i % kBlocks;
+        const int entry = a.ws.entries[v.first + c];
+        const auto* p   = reinterpret_cast<const uint4*>(a.ws.h + static_cast<std::size_t>(entry) * G::kInter + 16 * b);
+        std::uint16_t hv[16];
+        a16::unpack16(__ldcg(p), __ldcg(p + 1), hv);
+        a16::store_a16_block(a.ws.h_limbs + static_cast<std::size_t>(entry) * kHLimbs, b, hv,
+                             a16_h_emax(__ldcg(a.ws.h_amax + entry)));
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        release_add(&a.ws.job_done[job]);
+    }
+}
+
+template <class G>
+struct DownA16Smem {
+    using S = Shape<G, false>;
+    std::int32_t scaled[256];
+    alignas(16) std::uint8_t units[S::kDownWarps][S::kDownBytes];
+};
+
+template <class G>
+__global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a16_kernel(Args a) {
+    using S = Shape<G, false>;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm = *reinterpret_cast<DownA16Smem<G>*>(smem_raw);
+    pdl::trigger_dependents();
+    const int job = static_cast<int>(blockIdx.y);
+    JobView v;
+    if (!job_view(a, job, v)) { return; }
+    const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
+    const int g = lane / 4, t = lane % 4;
+    const int group = static_cast<int>(blockIdx.x) * S::kDownWarps + warp;
+    // The weights do not depend on h: their copies start before the wait.
+    const std::uint8_t* src = v.record + S::kGateUpBytes + static_cast<std::size_t>(group) * S::kDownBytes;
+    for (int i = lane; i < S::kDownBytes / 16; i += 32) { tile::cp_async16(sm.units[warp] + 16 * i, src + 16 * i, 16); }
+    tile::cp_async_commit();
+    a4_mma_fill_scaled(sm.scaled, S::kDownThreads);
+    __shared__ int stalled;
+    if (tid == 0) { stalled = wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpCtas + 1), a.ws.error) ? 0 : 1; }
+    tile::cp_async_wait<0>();
+    __syncthreads();
+    if (stalled != 0) { return; }
+    const float m = a16_multiplier(a.bank.amax[2 * v.expert + 1], a.bank.denominators[1]);
+    const std::uint8_t* units = sm.units[warp];
+    for (int base = 0; base < v.count; base += kPass) {
+        const int n = min(kPass, v.count - base);
+        const std::uint8_t* limbs =
+            a.ws.h_limbs + static_cast<std::size_t>(a.ws.entries[v.first + base + min(g, n - 1)]) * kA16HRowBytes;
+        long long s[4] = {0, 0, 0, 0};
+#pragma unroll 8
+        for (int b = 0; b < S::kDownBlocks; ++b) {
+            a16::a16_unit<a16::LimbLoad::Cg>(units + b * S::kUnit, limbs + a16::a16_block_offset(b, t), sm.scaled, g, t, s);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int c = 2 * t + (i & 1);
+            if (c < n) {
+                const int entry = a.ws.entries[v.first + base + c];
+                const int row   = group * 16 + g + (i < 2 ? 0 : 8);
+                a.outputs[static_cast<std::size_t>(entry) * G::kHidden + row] =
+                    canon::a16_row_output(s[i], a16_h_emax(__ldcg(a.ws.h_amax + entry)), m);
+            }
+        }
     }
 }
 
@@ -1119,6 +1317,8 @@ Workspace layout(std::int32_t experts, std::int32_t intermediate, std::int32_t c
     w.h          = reinterpret_cast<std::uint16_t*>(take(m * i * 2));
     w.h_amax     = reinterpret_cast<std::uint32_t*>(take(m * 4));
     w.h_rows     = reinterpret_cast<std::uint8_t*>(take(m * h_row));
+    w.h_limbs    = reinterpret_cast<std::uint8_t*>(
+        take(std::min<std::size_t>(c, kMaxColumns) * kTopK * (i / 64 * 192)));
     w.error      = reinterpret_cast<std::uint32_t*>(take(4));
     w.single     = reinterpret_cast<std::uint32_t*>(take(kSingleCounters * 4));
     w.x_plane    = reinterpret_cast<std::uint8_t*>(take(m * kPromptXRowBytes));
@@ -1260,6 +1460,30 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
     const Args args{x, routing, bank, workspace, outputs};
     // A job per expert with entries: at most min(E, columns * top_k) jobs; CTAs past the job count exit.
     const int jobs = std::min(bank.experts, x.columns * kTopK);
+    if (x.activation == ExpertActivation::A16) {
+        if (bank.format != ExpertFormat::Nvfp4FourOverSix) {
+            throw std::invalid_argument("w4a4_sparse_moe: A16 activations on MXFP8 layers are not built yet");
+        }
+        if (x.rows == nullptr || x.emax == nullptr || workspace.h_limbs == nullptr || x.columns > kMaxColumns) {
+            throw std::invalid_argument("w4a4_sparse_moe A16: x limb rows and exponents, at most 128 columns");
+        }
+        using S = Shape<G, false>;
+        static const bool configured = [] {
+            allow_shared(gate_up_a16_kernel<G>, sizeof(GateUpA16Smem<G>));
+            allow_shared(down_a16_kernel<G>, sizeof(DownA16Smem<G>));
+            return true;
+        }();
+        (void)configured;
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+                                    {dim3(S::kGateUpCtas, jobs), dim3(kGuThreads), sizeof(GateUpA16Smem<G>), stream},
+                                    gate_up_a16_kernel<G>, args));
+        check_launch("NVFP4 A16 gate/up");
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
+                                    {dim3(S::kDownCtas, jobs), dim3(S::kDownThreads), sizeof(DownA16Smem<G>), stream},
+                                    down_a16_kernel<G>, args));
+        check_launch("NVFP4 A16 down");
+        return;
+    }
     if (bank.format == ExpertFormat::Nvfp4FourOverSix) {
         using S = Shape<G, false>;
         static const bool configured = [] {

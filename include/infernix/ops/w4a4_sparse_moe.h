@@ -55,11 +55,30 @@ struct Bank {
     return format == ExpertFormat::Nvfp4FourOverSix ? width / 2 + width / 16 : width + width / 32;
 }
 
-// The columns' quantized x (the MoE mixer's output): rows [T][row_bytes(H)], and for NVFP4 each row's amax [T].
+// The activations the experts take: the checkpoint's (above) or, with --a16-activations (EngineOptions::
+// expert_a16_activations), 16-bit ones:
+//   NVFP4 layers: Flash-Next's canonical W4A16 arithmetic (docs/maintainer/qwen3_8-flash-next-design.md §16.2.1): x
+//     (BF16, K = H) and h (K = I) each encoded once as X_j = a16_value(v_j, emax), 21-bit fixed point under the
+//     column's largest exponent (canon::a16_column_exponent); P_b = sum_j c2(w) X_j exact in int32, S = sum_b P_b
+//     e4m3_scaled(s_b) exact in int64; a gate/up or down output is canon::a16_row_output(S, emax, m) with
+//     m = fl32(amax_w[e] / denominator) (the weights' c * s * amax / denominator). Exact, so a column's bits depend
+//     on its own inputs alone.
+//   MXFP8 layers: W8A16, x and h BF16 (no rows).
+enum class ExpertActivation : std::uint8_t { Checkpoint, A16 };
+
+// An A16 limb row (a16_limbs.cuh's planes: per 64-element tile 64 H1, 64 L1, 64 H0 | L0 << 4 bytes).
+inline constexpr std::int32_t kA16XRowBytes = 2304 / 64 * 192; // 6,912
+inline constexpr std::int32_t kA16HRowBytes = 1152 / 64 * 192; // 3,456
+
+// The columns' x (the MoE mixer's output). Checkpoint: rows [T][row_bytes(H)], and for NVFP4 each row's amax [T].
+// A16: x16, the BF16 rows [T][H]; NVFP4 layers also rows as limb rows [T][kA16XRowBytes] and emax [T] their exponents.
 struct Activations {
-    const std::uint8_t* rows = nullptr;
-    const float* amax        = nullptr;
-    std::int32_t columns     = 0;
+    const std::uint8_t* rows    = nullptr;
+    const float* amax           = nullptr;
+    std::int32_t columns        = 0;
+    ExpertActivation activation = ExpertActivation::Checkpoint;
+    const std::int32_t* emax    = nullptr;
+    const std::uint16_t* x16    = nullptr;
 };
 
 // The routing of the call's columns: experts [T][top_k] in slot order and their weights gamma [T][top_k].
@@ -87,6 +106,9 @@ struct Workspace {
     std::uint16_t* h          = nullptr; // [capacity * kTopK][I] BF16
     std::uint32_t* h_amax     = nullptr; // [capacity * kTopK]: binary32 bits of max |h| (NVFP4)
     std::uint8_t* h_rows      = nullptr; // [capacity * kTopK][row_bytes(I)]
+    // A16 NVFP4 (narrow calls): h as limb rows [min(capacity, kMaxColumns) * kTopK][kA16HRowBytes], their exponent
+    // a16_emax of h_amax's BF16 bits.
+    std::uint8_t* h_limbs     = nullptr;
     // [1]: kErrorDownStalled once a down CTA's wait for its job made no progress for 2 s (zero: no error).
     std::uint32_t* error      = nullptr;
     // [10]: moe_single's counters (router CTAs, finished CTAs, each job's gate/up row groups), reset by its last CTA.
