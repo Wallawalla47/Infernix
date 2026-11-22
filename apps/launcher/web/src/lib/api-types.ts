@@ -253,13 +253,47 @@ export interface NgramVolume {
   modified: UnixMs;
 }
 
+/** What a PEFT LoRA adapter's adapter_config.json says (null where it does not say it). */
+export interface AdapterConfig {
+  peft_type: string | null;
+  /** base_model_name_or_path: the model it was trained on. */
+  base_model: string | null;
+  /** r */
+  rank: number | null;
+  /** The largest of r and the rank_pattern's ranks. */
+  max_rank: number | null;
+  /** lora_alpha */
+  alpha: number | null;
+  /** target_modules, when the config lists them (empty for a pattern). */
+  target_modules: string[];
+  rslora: boolean;
+}
+
+/** A LoRA adapter (--lora): a folder holding adapter_config.json and adapter_model.safetensors. */
+export interface LoraAdapter {
+  /** 32 hex digits of its folder's path's SHA-256. */
+  key: string;
+  /** Its folder's name (the repository's, when the launcher downloaded it). */
+  name: string;
+  /** The folder: what --lora takes. */
+  path: string;
+  dir: string;
+  /** adapter_model.safetensors */
+  bytes: number;
+  config: AdapterConfig;
+  /** Keys of library models of the base model it names (dense Qwen3.8-27B or Qwen3.6-27B). */
+  compatible_models: string[];
+  modified: UnixMs;
+}
+
 export interface ModelDir {
   path: string;
   exists: boolean;
   models: number;
   drafters: number;
   ngram_volumes: number;
-  /** Bytes of the models, drafters and volumes found in it. */
+  adapters: number;
+  /** Bytes of the models, drafters, volumes and adapters found in it. */
   library_bytes: number;
   /** The drive holding it. */
   free_bytes: number | null;
@@ -279,6 +313,7 @@ export interface Library {
   models: ModelArtifact[];
   drafters: DrafterArtifact[];
   ngram_volumes: NgramVolume[];
+  adapters: LoraAdapter[];
   issues: LibraryIssue[];
 }
 
@@ -814,7 +849,15 @@ export interface Catalog {
   entries: CatalogEntry[];
 }
 
-export type RepoFileRole = "model" | "model-part" | "drafter" | "ngram" | "expert-state" | "report" | "other";
+export type RepoFileRole =
+  | "model"
+  | "model-part"
+  | "drafter"
+  | "ngram"
+  | "expert-state"
+  | "report"
+  | "adapter"
+  | "other";
 
 export interface RepoFile {
   path: string;
@@ -822,14 +865,42 @@ export interface RepoFile {
   sha256: string | null;
   role: RepoFileRole;
   default_selected: boolean;
-  /** Local path of an existing file with the same name and size, if any. */
+  /** Local path of an existing file with the same name and size, if any (an adapter's: in a folder of the
+   * repository's name). */
   present_locally: string | null;
 }
 
 export interface RepoListing {
   repo: string;
   revision: string;
+  /** "adapter" for a LoRA adapter repository (adapter_config.json and adapter_model.safetensors at its root). */
+  kind: "model" | "drafter" | "ngram" | "adapter";
   files: RepoFile[];
+  /** An adapter repository's adapter_config.json, read before the download. */
+  adapter: AdapterConfig | null;
+  /** Why the adapter's config could not be read. */
+  adapter_error: string | null;
+}
+
+/** GET /launcher/api/hf/adapters?base=&search=: LoRA adapters on the Hub that --lora reads. */
+export interface HubAdapter {
+  repo: string;
+  /** The Hub's count of the last 30 days. */
+  downloads: number;
+  likes: number;
+  /** ISO 8601 */
+  last_modified: string;
+  /** Its files need a token from an account that accepted its terms. */
+  gated: boolean;
+  /** Harness Hub's (huggingface.co/harness-hub), trained for an agent harness. */
+  harness_hub: boolean;
+}
+
+export interface HubAdapterSearch {
+  base: string;
+  search: string;
+  /** Harness Hub's first, then the most downloaded. */
+  adapters: HubAdapter[];
 }
 
 export type DownloadFileState = "queued" | "downloading" | "verifying" | "done" | "failed" | "paused" | "skipped";

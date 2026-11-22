@@ -18,6 +18,7 @@ import {
   List,
   Play,
   Plus,
+  Puzzle,
   RefreshCw,
   Search,
   SlidersHorizontal,
@@ -33,6 +34,7 @@ import { ConfirmDialog, EmptyState, PageHeader } from "@/components/common";
 import { FolderPicker } from "@/components/FolderPicker";
 import { ModelIdEditor } from "@/components/models/ConfigEditors";
 import {
+  adapterDeleteTarget,
   DeleteFilesDialog,
   drafterDeleteTarget,
   modelDeleteTarget,
@@ -66,6 +68,7 @@ import type {
   DrafterArtifact,
   InstanceInfo,
   Library,
+  LoraAdapter,
   ModelArtifact,
   ModelConfig,
   ModelDir,
@@ -594,14 +597,14 @@ function DeleteButton({ label, onClick }: { label: string; onClick: () => void }
 }
 
 function Companions({ library, actions }: { library: Library; actions: Actions }) {
-  const { drafters, ngram_volumes: volumes } = library;
-  if (drafters.length === 0 && volumes.length === 0) return null;
+  const { drafters, ngram_volumes: volumes, adapters } = library;
+  if (drafters.length === 0 && volumes.length === 0 && adapters.length === 0) return null;
   return (
     <section className="flex flex-col gap-3">
       <div>
         <h2 className="text-sm font-semibold">Companions</h2>
         <p className="text-xs text-muted-foreground">
-          Drafters and n-gram tables found beside your models; pick them per configuration under Configure.
+          Drafters, n-gram tables and LoRA adapters found beside your models; pick them per configuration under Configure.
         </p>
       </div>
       <div className="grid gap-4 lg:grid-cols-2">
@@ -687,6 +690,58 @@ function Companions({ library, actions }: { library: Library; actions: Actions }
             )}
           </CardContent>
         </Card>
+        <Card className="gap-2">
+          <CardHeader>
+            <CardTitle>
+              <Puzzle className="size-4 text-muted-foreground" />
+              LoRA adapters
+            </CardTitle>
+            <CardDescription>
+              Hugging Face PEFT adapters for the dense 27B models (--lora);{" "}
+              <Link to="/discover?tab=adapters" className="font-medium text-foreground underline-offset-4 hover:underline">
+                find more
+              </Link>
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="px-0">
+            {adapters.length === 0 ? (
+              <div className="px-4 text-sm text-muted-foreground">None found.</div>
+            ) : (
+              <ul className="divide-y">
+                {adapters.map((adapter: LoraAdapter) => (
+                  <li key={adapter.key} className="flex items-center gap-3 py-2.5 pr-2 pl-4">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">{adapter.name}</div>
+                      <Hint label={adapter.path}>
+                        <div className="cursor-default truncate text-xs text-muted-foreground">
+                          {adapter.config.base_model ? `${adapter.config.base_model} · ` : ""}
+                          {adapter.dir}
+                        </div>
+                      </Hint>
+                    </div>
+                    {adapter.config.max_rank !== null ? <Badge variant="muted">rank {adapter.config.max_rank}</Badge> : null}
+                    <Hint
+                      label={
+                        adapter.compatible_models.length > 0
+                          ? `Trained on the base of ${modelNames(library, adapter.compatible_models)}`
+                          : "No model in your folders has the base model it names"
+                      }
+                    >
+                      <span className="w-20 cursor-default text-right text-xs text-muted-foreground tabular-nums">
+                        {adapter.compatible_models.length} model{adapter.compatible_models.length === 1 ? "" : "s"}
+                      </span>
+                    </Hint>
+                    <span className="w-16 text-right text-xs tabular-nums">{formatBytes(adapter.bytes)}</span>
+                    <DeleteButton
+                      label={`Delete ${adapter.name}`}
+                      onClick={() => actions.deleteFiles("adapter", adapter.key)}
+                    />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
       </div>
     </section>
   );
@@ -761,6 +816,10 @@ export function ModelsPage() {
     if (deletingFiles.kind === "drafter") {
       const drafter = library.drafters.find((item) => item.key === deletingFiles.key);
       return drafter ? drafterDeleteTarget(drafter, instance) : null;
+    }
+    if (deletingFiles.kind === "adapter") {
+      const adapter = library.adapters.find((item) => item.key === deletingFiles.key);
+      return adapter ? adapterDeleteTarget(adapter, instance) : null;
     }
     const volume = library.ngram_volumes.find((item) => item.key === deletingFiles.key);
     return volume ? volumeDeleteTarget(volume, instance) : null;

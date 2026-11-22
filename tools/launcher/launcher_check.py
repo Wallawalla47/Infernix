@@ -10,7 +10,7 @@ features: model ids, named configurations, environment, the memory breakdown, sc
           import, the fit plan, keep-alive streams while a model loads (OpenAI and Anthropic, a
           failed load, and the server's error answer after the load), model
           routes and the pin, prompt progress, request labels, usage, API keys and sign-in, chats,
-          and a configuration's idle unload (about four minutes).
+          a configuration's idle unload and LoRA adapter folders (about four minutes).
 watchdog: crash, lock-up, stall, the restart limit, idle servers, loads that do not fit, the RAM
           floor (about 6 GiB of RAM for a few seconds; --skip-ram leaves it out), the event log and
           the request-content log (about three minutes).
@@ -706,6 +706,43 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         check("the default configuration cannot be deleted", call(port, "DELETE", f"{cfg}/config")[0] == 400)
         check("a named configuration can", call(port, "DELETE", f"/launcher/api/models/{named_id}/config")[0] == 200 and
               named_alias not in [m["id"] for m in call(port, "GET", "/v1/models")[1]["data"]])
+
+    with section("LoRA adapters in a model folder"):
+        # A folder with adapter_config.json and adapter_model.safetensors joins the library, matched to the dense
+        # models of the base its config names, and its files can be deleted; a folder without the weights is none.
+        folder = data / "adapters"
+        adapter = folder / "Qwen3.8-27B-check-adapted"
+        adapter.mkdir(parents=True)
+        config = {"peft_type": "LORA", "base_model_name_or_path": "Qwen/Qwen3.8-27B", "r": 16, "lora_alpha": 32,
+                  "target_modules": ["q_proj", "v_proj"]}
+        (adapter / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+        (adapter / "adapter_model.safetensors").write_bytes(b"\0" * 4096)
+        (folder / "no-weights").mkdir()
+        (folder / "no-weights" / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+        dirs = call(port, "GET", "/launcher/api/settings")[1]["model_dirs"]
+        call(port, "PUT", "/launcher/api/settings", {"model_dirs": dirs + [str(folder)]})
+
+        def listed():
+            return [a for a in call(port, "GET", "/launcher/api/library")[1].get("adapters", []) if a["name"] == adapter.name]
+
+        found = (wait_for(listed, 30) or [None])[0]
+        check("an adapter folder joins the library with its config",
+              bool(found) and found["bytes"] == 4096 and found["config"]["rank"] == 16 and
+              found["config"]["base_model"] == "Qwen/Qwen3.8-27B" and found["config"]["target_modules"] == ["q_proj", "v_proj"],
+              str(found)[:200])
+        library = call(port, "GET", "/launcher/api/library")[1]
+        dense = sorted(m["key"] for m in library["models"] if m["family"] == "qwen3.8-27b" and not m.get("num_experts"))
+        check("it fits the Qwen3.8-27B models in the folders", bool(found) and sorted(found["compatible_models"]) == dense,
+              f"{found and found['compatible_models']} vs {dense}")
+        check("a folder without the weights is no adapter", all(a["name"] != "no-weights" for a in library["adapters"]))
+        if found:
+            status, _ = call(port, "DELETE", f"/launcher/api/adapters/{found['key']}", {"confirm": "wrong"})
+            check("deleting an adapter needs its folder name", status == 400 and (adapter / "adapter_model.safetensors").exists(),
+                  str(status))
+            status, _ = call(port, "DELETE", f"/launcher/api/adapters/{found['key']}", {"confirm": adapter.name})
+            check("deleting it removes its files and its emptied folder", status == 200 and not adapter.exists(), str(status))
+            check("and the library drops it", wait_for(lambda: not listed(), 30) is True)
+        call(port, "PUT", "/launcher/api/settings", {"model_dirs": dirs})
 
     code = launcher.stop()
     check("features: an orderly stop", code == 0, str(code))

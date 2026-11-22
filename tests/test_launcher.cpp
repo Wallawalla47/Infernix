@@ -1,7 +1,7 @@
 // infernix-launcher: launch-parameter edits, serve log and --help parsing, the --help cache, the
-// server's log files, artifact and n-gram volume recognition, default launch parameters, the
-// router's drain-then-switch order, the advice for loads that do not fit, the event log, GitHub's
-// release answer and the exit-status wording.
+// server's log files, artifact, n-gram volume and LoRA adapter recognition, the Hub's adapter search,
+// default launch parameters, the router's drain-then-switch order, the advice for loads that do not
+// fit, the event log, GitHub's release answer and the exit-status wording.
 
 #include "launcher/args.h"
 #include "launcher/artifact_scan.h"
@@ -9,6 +9,7 @@
 #include "launcher/downloads.h"
 #include "launcher/event_log.h"
 #include "launcher/events.h"
+#include "launcher/hf_hub.h"
 #include "launcher/http_access.h"
 #include "launcher/launch_script.h"
 #include "launcher/launcher.h"
@@ -976,6 +977,98 @@ void test_scan_folder() {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// LoRA adapters (--lora) in the model folders: a folder with adapter_config.json and adapter_model.safetensors, the
+// models of the base it names, and the Hub's adapter search.
+void test_library_adapters() {
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "infernix-launcher-test-adapters";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    const auto write = [](const std::filesystem::path& path, const std::string& text) {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream(path, std::ios::binary) << text;
+    };
+    const Json pi_config = {{"peft_type", "LORA"},
+                            {"base_model_name_or_path", "Qwen/Qwen3.8-27B"},
+                            {"r", 32},
+                            {"lora_alpha", 64},
+                            {"rank_pattern", {{"model.layers.3.mlp.down_proj", 64}}},
+                            {"target_modules", Json::array({"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"})},
+                            {"use_rslora", false}};
+    write(root / "Qwen3.8-27B-pi-adapted" / "adapter_config.json", pi_config.dump());
+    write(root / "Qwen3.8-27B-pi-adapted" / "adapter_model.safetensors", std::string(100, 'x'));
+    // A GGUF adapter's folder, or a download still running: no weights, so no adapter.
+    write(root / "gguf-only" / "adapter_config.json", pi_config.dump());
+    write(root / "gguf-only" / "adapter.gguf", std::string(10, 'x'));
+    write(root / "broken" / "adapter_config.json", "{not json");
+    write(root / "broken" / "adapter_model.safetensors", std::string(10, 'x'));
+
+    const LibraryScan scan = scan_library({root}, 2);
+    check(scan.adapters.size() == 1 && scan.dirs.size() == 1 && scan.dirs[0].adapters == 1,
+          "an adapter folder needs both files");
+    if (scan.adapters.size() == 1) {
+        const ScannedAdapter& adapter = scan.adapters[0];
+        check(adapter.name == "Qwen3.8-27B-pi-adapted" && adapter.bytes == 100 &&
+                  path_utf8(adapter.path.filename()) == adapter.name,
+              "an adapter is its folder, sized by its weights");
+        check(adapter.config.base_model == "Qwen/Qwen3.8-27B" && adapter.config.rank == 32u &&
+                  adapter.config.max_rank == 64u && adapter.config.alpha == 64.0 &&
+                  adapter.config.target_modules.size() == 7 && !adapter.config.rslora,
+              "the config's base model, ranks, alpha and modules");
+        const Json json = to_json(scan)["adapters"];
+        check(json.size() == 1 && json[0]["config"]["max_rank"] == 64 && json[0]["config"]["base_model"] == "Qwen/Qwen3.8-27B",
+              "the library lists the adapter with its config");
+    }
+    check(std::any_of(scan.issues.begin(), scan.issues.end(),
+                      [](const ScanIssue& issue) { return issue.path.parent_path().filename() == "broken"; }),
+          "an unreadable config is a scan issue");
+
+    ScannedModel qwen38;
+    qwen38.key         = "38";
+    qwen38.model_type  = "qwen3_5_text";
+    qwen38.hidden_size = 5120;
+    qwen38.family      = "qwen3.8-27b";
+    ScannedModel qwen36 = qwen38;
+    qwen36.key          = "36";
+    qwen36.family       = "qwen3.6-27b";
+    ScannedModel moe    = qwen38;
+    moe.model_type      = "qwen3_5_moe_text";
+    moe.num_experts     = 256;
+    moe.family          = "qwen3.6-35b-a3b";
+    ScannedAdapter adapter;
+    adapter.config.base_model = "unsloth/Qwen3.8-27B-bnb-4bit";
+    check(adapter_matches(qwen38, adapter), "an adapter of a Qwen3.8-27B repackaging fits Qwen3.8-27B");
+    check(!adapter_matches(qwen36, adapter) && !adapter_matches(moe, adapter), "nor another base or a MoE model");
+    adapter.config.base_model.reset();
+    check(!adapter_matches(qwen38, adapter), "an adapter that names no base fits no model");
+    std::filesystem::remove_all(root, ignored);
+
+    // The Hub's model list: only repositories with both files at their root.
+    const Json models = Json::array(
+        {{{"id", "harness-hub/Qwen3.8-27B-pi-adapted"},
+          {"downloads", 2383},
+          {"likes", 40},
+          {"lastModified", "2026-11-21T04:31:16.000Z"},
+          {"gated", false},
+          {"siblings", Json::array({{{"rfilename", "adapter_config.json"}}, {{"rfilename", "adapter_model.safetensors"}}})}},
+         {{"id", "someone/gguf-lora"},
+          {"siblings", Json::array({{{"rfilename", "adapter_config.json"}}, {{"rfilename", "lora.gguf"}}})}},
+         {{"id", "someone/checkpoints"},
+          {"siblings",
+           Json::array({{{"rfilename", "step-100/adapter_config.json"}}, {{"rfilename", "step-100/adapter_model.safetensors"}}})}},
+         {{"id", "someone/gated-lora"},
+          {"gated", "manual"},
+          {"siblings", Json::array({{{"rfilename", "adapter_model.safetensors"}}, {{"rfilename", "adapter_config.json"}}})}}});
+    const std::vector<HfAdapter> found = parse_adapter_search(models.dump());
+    check(found.size() == 2 && found[0].repo == "harness-hub/Qwen3.8-27B-pi-adapted" && found[0].downloads == 2383 &&
+              !found[0].gated && found[1].repo == "someone/gated-lora" && found[1].gated,
+          "the Hub search keeps the adapters --lora reads, in order, with their gating");
+    bool refused = false;
+    try {
+        (void)parse_adapter_search("{\"error\": \"x\"}");
+    } catch (const std::runtime_error&) { refused = true; }
+    check(refused, "an answer that is not a list is an error");
+}
+
 void test_exit_meaning() {
 #ifdef _WIN32
     check(exit_status_meaning(static_cast<int>(0xC0000005u), true).find("access violation") != std::string::npos, "0xC0000005");
@@ -1395,6 +1488,7 @@ int main(int argc, char** argv) {
     test_library();
     test_library_part_paths();
     test_scan_folder();
+    test_library_adapters();
     test_router();
     test_router_cancel();
     test_load_advice();

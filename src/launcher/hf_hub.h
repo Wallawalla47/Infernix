@@ -44,6 +44,27 @@ struct HttpResult {
 
 [[nodiscard]] std::string hf_resolve_url(const std::string& repo, const std::string& revision, const std::string& path);
 
+// A PEFT LoRA adapter repository on the Hub (one `--lora` can read: adapter_config.json and adapter_model.safetensors
+// at its root).
+struct HfAdapter {
+    std::string repo;
+    std::uint64_t downloads = 0; // the Hub's count of the last 30 days
+    std::uint64_t likes     = 0;
+    std::string last_modified;   // ISO 8601
+    bool gated = false;          // its files need a token from an account that accepted its terms
+};
+
+// The PEFT adapters of `base` (`owner/name`) whose files `--lora` reads, most downloaded first: at most `limit`,
+// only `author`'s when it is not empty, only those whose name contains `search` when that is not empty. Throws
+// std::runtime_error with a readable reason; `cancel` as http_get.
+[[nodiscard]] std::vector<HfAdapter> hf_search_adapters(const std::string& base, const std::string& author,
+                                                        const std::string& search, int limit,
+                                                        const std::string& token,
+                                                        const std::atomic<bool>* cancel = nullptr);
+
+// The adapters among the Hub's model list (an /api/models answer with `siblings`), in its order (exposed for tests).
+[[nodiscard]] std::vector<HfAdapter> parse_adapter_search(const std::string& body);
+
 // Percent-encodes one URL path (keeps '/').
 [[nodiscard]] std::string url_encode_path(const std::string& path);
 

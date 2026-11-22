@@ -3,7 +3,9 @@
 `--lora PATH` applies a LoRA adapter to a Qwen3.5-family dense model (the Qwen3.8-27B artifacts) at runtime. The
 artifact is unchanged: the engine reads the adapter's own Hugging Face files at load and adds the adapter's term to
 every projection it targets. Every product command takes the option: `infernix-serve`, `infernix` (CLI),
-`infernix-perplexity` and `infernix-bench`, and the launcher's model page has a LoRA adapter field.
+`infernix-perplexity` and `infernix-bench`. The launcher finds adapters on Hugging Face and downloads them
+(**Discover → LoRA adapters**), lists the ones in its model folders, and its model page has a LoRA adapter picker
+([launcher guide](launcher.md#download-models)).
 
 ## The adapter's files
 
@@ -16,7 +18,8 @@ is a folder holding two files:
 
 `--lora` takes that folder, or its `adapter_model.safetensors` with `adapter_config.json` beside it. The factors may
 be stored as F32, BF16 or F16. A GGUF adapter (llama.cpp's export of the same factors) is not read: download the
-safetensors repository instead.
+safetensors repository instead. Only these two files are needed; an adapter repository's tokenizer and chat template
+copies are not read (the artifact's own are used).
 
 ```
 infernix-serve Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix.infernix --lora C:\adapters\my-adapter --model-id my-adapter

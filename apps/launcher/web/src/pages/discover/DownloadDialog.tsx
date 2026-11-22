@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, FolderOpen, HardDriveDownload, LoaderCircle, TriangleAlert } from "lucide-react";
+import { ExternalLink, FolderOpen, HardDriveDownload, LoaderCircle, Puzzle, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import { FolderPicker } from "@/components/FolderPicker";
@@ -31,8 +31,45 @@ const ROLE_LABEL: Record<RepoFileRole, string> = {
   ngram: "n-gram volume",
   "expert-state": "expert state",
   report: "report",
+  adapter: "LoRA adapter",
   other: "other",
 };
+
+/** The largest rank infernix-serve's --lora applies (docs/lora.md). */
+const MAX_LORA_RANK = 128;
+
+function AdapterFacts({ listing }: { listing: RepoListing }) {
+  const config = listing.adapter;
+  return (
+    <div className="flex flex-col gap-1 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+      <span className="flex items-center gap-1.5 font-medium text-foreground">
+        <Puzzle className="size-3.5 shrink-0" />
+        LoRA adapter
+      </span>
+      {config ? (
+        <>
+          <span>
+            Base model: <span className="font-mono">{config.base_model ?? "not named"}</span>
+          </span>
+          <span>
+            {config.rank !== null ? `Rank ${config.rank}` : "Rank not named"}
+            {config.max_rank !== null && config.max_rank !== config.rank ? ` (up to ${config.max_rank})` : ""}
+            {config.alpha !== null ? ` · alpha ${config.alpha}` : ""}
+            {config.rslora ? " · rsLoRA" : ""}
+            {config.peft_type && config.peft_type !== "LORA" ? ` · ${config.peft_type}` : ""}
+          </span>
+          {config.target_modules.length > 0 ? <span>Adapts {config.target_modules.join(", ")}</span> : null}
+        </>
+      ) : (
+        <span>{listing.adapter_error ?? "Its adapter_config.json could not be read."}</span>
+      )}
+      <span>
+        It goes in a folder of its own; then pick it on a 27B model's Configure page (LoRA adapter), whose "Will it
+        fit?" check asks the server whether it can apply it.
+      </span>
+    </div>
+  );
+}
 
 export function sameRepo(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase();
@@ -169,6 +206,12 @@ export function DownloadDialog({
     [listing.data, chooser],
   );
 
+  // A LoRA adapter's files have the same names in every adapter repository: the launcher always gives one a folder
+  // of its own.
+  const adapter = listing.data?.kind === "adapter";
+  const perRepo = adapter || subfolder;
+  const rankTooHigh = (listing.data?.adapter?.max_rank ?? 0) > MAX_LORA_RANK;
+
   const ngramChoice = ngramOptions.find((option) => optionKey(option.repo, option.file) === ngram) ?? null;
   const drafterFiles = (drafterListing.data?.files ?? []).filter((file) => file.default_selected);
 
@@ -186,12 +229,12 @@ export function DownloadDialog({
     const out: DownloadRequest[] = [];
     const main = files.filter((file) => selected.has(file.path)).map((file) => file.path);
     if (ngramChoice && sameRepo(ngramChoice.repo, repo)) main.push(ngramChoice.file);
-    if (main.length > 0) out.push({ repo, files: main, dest_dir: dest, subfolder });
+    if (main.length > 0) out.push({ repo, files: main, dest_dir: dest, subfolder: perRepo });
     if (ngramChoice && !sameRepo(ngramChoice.repo, repo)) {
-      out.push({ repo: ngramChoice.repo, files: [ngramChoice.file], dest_dir: dest, subfolder });
+      out.push({ repo: ngramChoice.repo, files: [ngramChoice.file], dest_dir: dest, subfolder: perRepo });
     }
     if (withDrafter && drafterRepo && drafterFiles.length > 0) {
-      out.push({ repo: drafterRepo, files: drafterFiles.map((file) => file.path), dest_dir: dest, subfolder });
+      out.push({ repo: drafterRepo, files: drafterFiles.map((file) => file.path), dest_dir: dest, subfolder: perRepo });
     }
     return out;
   };
@@ -239,11 +282,13 @@ export function DownloadDialog({
     });
   };
 
-  const target = dest.length > 0 ? (subfolder ? joinPath(dest, repoName(repo)) : dest) : "";
+  const target = dest.length > 0 ? (perRepo ? joinPath(dest, repoName(repo)) : dest) : "";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="gap-4 sm:max-w-2xl">
+      {/* Its sections may shrink below their content, so a long "Already at" path truncates instead of widening them
+          past the dialog. */}
+      <DialogContent className="gap-4 sm:max-w-2xl [&>*]:min-w-0">
         <DialogHeader>
           <DialogTitle>Download {entry?.title ?? repoName(repo)}</DialogTitle>
           <DialogDescription asChild>
@@ -292,7 +337,9 @@ export function DownloadDialog({
                           </span>
                         ) : null}
                       </span>
-                      <Badge variant={file.role === "model" || file.role === "model-part" ? "accent" : "muted"}>
+                      <Badge
+                        variant={file.role === "model" || file.role === "model-part" || file.role === "adapter" ? "accent" : "muted"}
+                      >
                         {ROLE_LABEL[file.role]}
                       </Badge>
                       <span className="w-20 text-right text-xs tabular-nums">{formatBytes(file.bytes)}</span>
@@ -303,6 +350,17 @@ export function DownloadDialog({
             )}
           </div>
         </div>
+
+        {adapter && listing.data ? <AdapterFacts listing={listing.data} /> : null}
+        {rankTooHigh ? (
+          <Alert variant="warning">
+            <TriangleAlert />
+            <AlertDescription>
+              Rank {listing.data?.adapter?.max_rank}: infernix-serve applies adapters up to rank {MAX_LORA_RANK} and
+              refuses this one.
+            </AlertDescription>
+          </Alert>
+        ) : null}
 
         {chooser ? (
           <div className="flex flex-col gap-2">
@@ -382,13 +440,13 @@ export function DownloadDialog({
             </Button>
           </div>
           <label className="flex items-center gap-2 text-sm">
-            <Switch checked={subfolder} onCheckedChange={setSubfolder} />
-            A subfolder per repository
+            <Switch checked={perRepo} onCheckedChange={setSubfolder} disabled={adapter} />
+            A subfolder per repository{adapter ? " (always, for an adapter)" : ""}
           </label>
           {target ? (
             <div className="text-xs text-muted-foreground">
               Files land in <span className="font-mono">{target}</span>
-              {ngramChoice && !sameRepo(ngramChoice.repo, repo) && subfolder
+              {ngramChoice && !sameRepo(ngramChoice.repo, repo) && perRepo
                 ? ` (the n-gram volume in ${baseName(joinPath(dest, repoName(ngramChoice.repo)))})`
                 : ""}
               ; the folder is added to your model folders.
