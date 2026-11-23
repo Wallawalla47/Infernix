@@ -50,8 +50,10 @@ struct ProjectionArgs {
     std::int32_t count   = 0;
     // projections_mma's 8-bit inputs (Q8 segments, `--a8-activations`): 16-byte aligned workspace for input i's encoded
     // columns (projection_a8_column_words(K) words each, T of them), where the call encodes it (an input equal to an
-    // earlier one shares that one's). Null everywhere for the 16-bit route.
+    // earlier one shares that one's). Null everywhere for the 16-bit route. x8_encoded: the inputs' producers already
+    // wrote them there (the same codec of the same BF16 inputs), so the call encodes nothing.
     std::int32_t* x8[3] = {};
+    bool x8_encoded     = false;
 };
 
 // The words of one 8-bit input column of K = k (ops/ggml/ggml_a8.h's codec: K int8 codes, then K / 32 FP32 slice

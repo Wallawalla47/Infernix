@@ -14,6 +14,7 @@
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_a8.h"
 #include "ops/inkling2/attention_common.cuh"
 #include "ops/inkling2/column.cuh"
 #include "ops/inkling2/visit_math.h"
@@ -75,6 +76,26 @@ __device__ __forceinline__ uint2 pack4(const float (&v)[4]) {
 __device__ __forceinline__ void round4(float (&v)[4]) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) { v[j] = bf16f(canon::f32_to_bf16_rn(v[j])); }
+}
+// The A8 codes of v (a row's elements at .. at + 3; aligned groups of 8 lanes hold one 32-slice) and, on a group's
+// first lane, the slice's scale, into a K = kQWidth A8 row: ops/ggml/ggml_a8.h's codec of the BF16 values.
+__device__ __forceinline__ void a8_store4(const float (&v)[4], std::uint8_t* row, int at) {
+    namespace a8 = ::infernix::ggml::a8;
+    std::uint16_t bits[4];
+    unsigned key = 0;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        bits[e] = canon::f32_to_bf16_rn(v[e]);
+        key     = max(key, static_cast<unsigned>(bits[e] & 0x7FFFU));
+    }
+#pragma unroll
+    for (int o = 1; o <= 4; o <<= 1) { key = max(key, __shfl_xor_sync(kAll, key, o)); }
+    const a8::SliceScale sc = a8::slice_scale(key);
+    unsigned packed = 0;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { packed |= (static_cast<unsigned>(a8::code(bits[e], sc.inv)) & 0xFFU) << (8 * e); }
+    *reinterpret_cast<unsigned*>(row + at) = packed;
+    if (at % 32 == 0) { reinterpret_cast<float*>(row + kQWidth)[at / 32] = sc.d; }
 }
 __device__ __forceinline__ std::uint16_t f16_bits(float x) { return __half_as_ushort(__float2half_rn(x)); }
 __device__ __forceinline__ float f16f(std::uint16_t u) { return __half2float(__ushort_as_half(u)); }
@@ -263,6 +284,15 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
     if (col.lane < 0) {
         for (int i = static_cast<int>(threadIdx.x); i < kGroupHeads * kD; i += kPrologueThreads) {
             a.out[static_cast<std::size_t>(t) * kQWidth + kv * kGroupHeads * kD + i] = 0;
+        }
+        if (a.out8 != nullptr) { // the group's codes and slice scales zero (a zero slice's encoding)
+            auto* row = reinterpret_cast<std::uint8_t*>(a.out8 + static_cast<std::size_t>(t) * a.out8_stride);
+            for (int i = static_cast<int>(threadIdx.x); i < kGroupHeads * kD / 4; i += kPrologueThreads) {
+                reinterpret_cast<std::uint32_t*>(row + kv * kGroupHeads * kD)[i] = 0U;
+            }
+            for (int i = static_cast<int>(threadIdx.x); i < kGroupHeads * kD / 32; i += kPrologueThreads) {
+                reinterpret_cast<float*>(row + kQWidth)[kv * kGroupHeads * kD / 32 + i] = 0.0F;
+            }
         }
         return;
     }
@@ -656,6 +686,10 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
             out[e]        = canon::mul_rn(y, canon::sigmoid_c(gate[e]));
         }
         *reinterpret_cast<uint2*>(a.out + static_cast<std::size_t>(t) * kQWidth + head * kD + 4 * wl) = pack4(out);
+        if (a.out8 != nullptr) { // W_o's 8-bit inputs: lanes 8s .. 8s + 7 hold the head's slice s
+            a8_store4(out, reinterpret_cast<std::uint8_t*>(a.out8 + static_cast<std::size_t>(t) * a.out8_stride),
+                      head * kD + 4 * wl);
+        }
     }
     if (tid == 0) { a.ws.counters[group * kKvHeads + kv] = 0; }
 }
@@ -758,6 +792,9 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     detail::check_attention_args(a);
     const AttentionLayer& l = a.layer;
     if (a.fused && a.groups == 0) { throw std::invalid_argument("inkling2 attention: a fused call has no padding column"); }
+    if (a.out8 != nullptr && (reinterpret_cast<std::uintptr_t>(a.out8) % 16 != 0 || a.out8_stride * 4 < kQWidth + kQWidth / 8)) {
+        throw std::invalid_argument("inkling2 attention: 8-bit outputs need 16-byte aligned rows of 3,072 codes and 96 scales");
+    }
     if (!a.fused) { detail::launch_attention_prologue(a, stream); }
     if (a.groups == 0) { return; } // every column is padding: the prologue wrote their zero outputs
     const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns);

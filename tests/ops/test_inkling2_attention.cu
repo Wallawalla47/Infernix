@@ -34,6 +34,7 @@
 #include "infernix/ops/inkling2_attention.h"
 #include "kv_cache_vq_reference.h"
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_a8.h"
 #include "ops/inkling2/visit_math.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
@@ -710,9 +711,13 @@ Problem make_problem(bool full, const Call& call, std::uint32_t seed, ik::KvCode
     return p;
 }
 
+// The out rows' A8 encoding (--a8-activations: W_o's 8-bit inputs): a column's 3,072 codes then 96 FP32 scales.
+constexpr int kOut8Bytes = QW + QW / 8;
+
 struct Device {
     std::uint16_t *q, *r, *k, *v, *sink, *gate, *ktaps, *vtaps, *qscale, *rscale, *table, *kconv, *vconv;
     std::uint16_t *kv_k, *kv_v, *kring, *vring, *out;
+    std::uint8_t* out8; // [T][kOut8Bytes]
     std::uint8_t *k_side, *v_side;
     std::uint32_t* unpackable; // [kLanes]
     int *block_table, *lane, *pos, *first, *groups;
@@ -722,6 +727,7 @@ struct Device {
 // Runs the attention over columns `subset` of the call as one call; the state lives in `state` (kv and rings).
 struct Outputs {
     std::vector<std::uint16_t> out, q, r, kv_k, kv_v, kring, vring;
+    std::vector<std::uint8_t> out8;
     std::vector<std::uint8_t> k_side, v_side;
     std::vector<std::uint32_t> unpackable;
 };
@@ -784,11 +790,14 @@ Outputs run(const Problem& p, const Call& call, const std::vector<int>& subset, 
     a.kv.unpackable   = p.codec == ik::KvCodec::Bf16Packed ? d.unpackable : nullptr;
     a.ws               = ik::carve_attention_workspace(d.ws);
     a.out              = d.out;
+    a.out8             = reinterpret_cast<std::int32_t*>(d.out8);
+    a.out8_stride      = kOut8Bytes / 4;
     a.fused            = fused;
     ik::attention(a, nullptr);
     cuda_check(cudaDeviceSynchronize(), "attention");
     Outputs o;
     o.out   = download(d.out, std::size_t(T) * QW);
+    o.out8  = download(d.out8, std::size_t(T) * kOut8Bytes);
     o.q     = download(a.ws.q, std::size_t(T) * QW);
     o.r     = download(a.ws.r, std::size_t(T) * RW);
     o.kv_k  = download(d.kv_k, p.kv_k.size());
@@ -1136,6 +1145,7 @@ void run_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf
     d.v_side = p.quantized() ? upload(p.v_side) : dalloc<std::uint8_t>(1);
     d.unpackable = upload(std::vector<std::uint32_t>(kLanes, 0xFFFFFFFFU)); // none, as reset_state leaves them
     d.out = dalloc<std::uint16_t>(std::size_t(T) * QW);
+    d.out8 = upload(std::vector<std::uint8_t>(std::size_t(T) * kOut8Bytes, 0xFF)); // garbage: every byte the kernel's
     d.block_table = full ? upload(p.block_table) : dalloc<int>(1);
     d.lane = dalloc<int>(T), d.pos = dalloc<int>(T), d.first = upload(call.first), d.groups = dalloc<int>(3 * ik::kMaxAttentionGroups);
     d.ws = dalloc<unsigned char>(ik::attention_workspace_bytes());
@@ -1147,6 +1157,28 @@ void run_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf
     const Outputs got = run(p, call, all, d);
     prologue_check(p, call, got, names[0]);
     attention_check(p, call, got, names[1]);
+    {
+        // The out rows' A8 encoding (W_o's 8-bit inputs): the codec of ops/ggml/ggml_a8.h applied to the kernel's own BF16
+        // out by its definition, exactly; padding columns all zero (a zero row's encoding).
+        namespace a8 = infernix::ggml::a8;
+        Tally q8{"  out's A8 rows (exact encoder)"};
+        std::vector<std::uint8_t> want(std::size_t(T) * kOut8Bytes, 0);
+        for (int t = 0; t < T; ++t) {
+            const std::uint16_t* x = got.out.data() + std::size_t(t) * QW;
+            std::uint8_t* row      = want.data() + std::size_t(t) * kOut8Bytes;
+            for (int s = 0; s < QW / 32; ++s) {
+                unsigned key = 0;
+                for (int j = 0; j < 32; ++j) { key = std::max(key, static_cast<unsigned>(x[32 * s + j] & 0x7FFFU)); }
+                const a8::SliceScale sc = a8::slice_scale(key);
+                for (int j = 0; j < 32; ++j) {
+                    row[32 * s + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(a8::code(x[32 * s + j], sc.inv)));
+                }
+                std::memcpy(row + QW + 4 * s, &sc.d, 4);
+            }
+        }
+        q8.exact(got.out8.data(), want.data(), want.size());
+        q8.report();
+    }
 
     // A second identical call over the same initial state: the same bits (no state left in the workspace).
     reset_state(p, d);
@@ -1240,7 +1272,7 @@ void run_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf
                     static_cast<void*>(d.table), static_cast<void*>(d.kconv), static_cast<void*>(d.vconv),
                     static_cast<void*>(d.kv_k), static_cast<void*>(d.kv_v), static_cast<void*>(d.k_side),
                     static_cast<void*>(d.v_side), static_cast<void*>(d.unpackable), static_cast<void*>(d.kring),
-                    static_cast<void*>(d.vring), static_cast<void*>(d.out), static_cast<void*>(d.block_table),
+                    static_cast<void*>(d.vring), static_cast<void*>(d.out), static_cast<void*>(d.out8), static_cast<void*>(d.block_table),
                     static_cast<void*>(d.lane), static_cast<void*>(d.pos), static_cast<void*>(d.first),
                     static_cast<void*>(d.groups), d.ws}) {
         cudaFree(x);

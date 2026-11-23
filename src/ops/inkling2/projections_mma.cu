@@ -15,6 +15,7 @@
 #include "core/tensor.h"
 #include "ops/common/dynamic_shared.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/ggml/ggml_a8.h"
 #include "ops/ggml/ggml_a8_mma.cuh"
 #include "ops/ggml/ggml_linear_a8.h"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
@@ -564,6 +565,66 @@ __global__ void __launch_bounds__(Sched::kThreads, Sched::kMinBlocksPerSm) proje
     pdl::trigger_dependents();
     store_tile<Sched, Out>(shared_raw, accum, seg, m0, n0, T);
 }
+// A call's distinct 8-bit inputs (up to three) encoded in one launch: a8_encode_columns' codec and layout
+// (ops/ggml/ggml_a8.h: per 32-slice the scale of its largest magnitude and the codes; a column's K codes, then its
+// K / 32 FP32 scales, `stride` words apart). Four threads a slice, thread c taking elements 8c .. 8c + 7 (one 16-byte
+// load); the slice's maximum is the quad's.
+struct A8Inputs {
+    const std::uint16_t* x[3] = {};
+    std::int32_t* out[3]      = {};
+    int count                 = 0;
+};
+
+constexpr int kEncodeThreads = 256;
+
+__global__ void __launch_bounds__(kEncodeThreads) encode_inputs_kernel(const A8Inputs in, int k, int columns, int stride) {
+    namespace a8     = ::infernix::ggml::a8;
+    const int slices = k / 32;
+    const long long per = static_cast<long long>(columns) * slices * 4; // threads an input (a multiple of 4)
+    const long long i   = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int input     = static_cast<int>(i / per);
+    const bool live     = input < in.count;
+    const long long r   = live ? i - input * per : 0;
+    const int item = static_cast<int>(r / 4), c = static_cast<int>(r % 4);
+    const int t = item / slices, s = item % slices;
+    pdl::wait_for_dependencies();
+    uint4 u = make_uint4(0, 0, 0, 0);
+    if (live) { u = *reinterpret_cast<const uint4*>(in.x[input] + static_cast<std::size_t>(t) * k + 32 * s + 8 * c); }
+    const unsigned w[4] = {u.x, u.y, u.z, u.w};
+    std::uint16_t e[8];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        e[2 * m]     = static_cast<std::uint16_t>(w[m] & 0xFFFFU);
+        e[2 * m + 1] = static_cast<std::uint16_t>(w[m] >> 16);
+    }
+    unsigned key = 0;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) { key = max(key, static_cast<unsigned>(e[m] & 0x7FFFU)); }
+    key = max(key, __shfl_xor_sync(0xFFFFFFFFU, key, 1));
+    key = max(key, __shfl_xor_sync(0xFFFFFFFFU, key, 2));
+    const a8::SliceScale sc = a8::slice_scale(key);
+    unsigned packed[2] = {0, 0};
+#pragma unroll
+    for (int m = 0; m < 8; ++m) { packed[m / 4] |= (static_cast<unsigned>(a8::code(e[m], sc.inv)) & 0xFFU) << (8 * (m % 4)); }
+    pdl::trigger_dependents();
+    if (live) {
+        std::int32_t* column = in.out[input] + static_cast<std::size_t>(t) * stride;
+        *reinterpret_cast<uint2*>(column + s * a8::kSliceWords + 2 * c) = make_uint2(packed[0], packed[1]);
+        if (c == 0) { reinterpret_cast<float*>(column + a8::scales_offset(k))[s] = sc.d; }
+    }
+}
+
+void encode_inputs(const A8Inputs& in, int k, int columns, int stride, cudaStream_t stream) {
+    for (int i = 0; i < in.count; ++i) {
+        if (reinterpret_cast<std::uintptr_t>(in.x[i]) % 16 != 0) {
+            throw std::invalid_argument("inkling2 projections_mma: 8-bit inputs need 16-byte aligned BF16 inputs");
+        }
+    }
+    const long long threads = static_cast<long long>(in.count) * columns * (k / 32) * 4;
+    const dim3 grid(static_cast<unsigned>((threads + kEncodeThreads - 1) / kEncodeThreads));
+    CUDA_CHECK(pdl::launch_consumer({grid, dim3(kEncodeThreads), 0, stream}, encode_inputs_kernel, in, k, columns, stride));
+}
+
 // Each segment's first row tile of BM rows (grid x) into q; returns the call's tiles.
 std::int32_t segment_tiles(MmaParams& q, const ProjectionArgs& a, int bm) {
     std::int32_t tiles = 0;
@@ -894,6 +955,7 @@ void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
         if (!q8) { throw std::invalid_argument("inkling2 projections_mma: 8-bit inputs (x8) take Q8 segments"); }
         const std::int32_t words = projection_a8_column_words(a.k);
         const std::int32_t* encoded[3] = {};
+        A8Inputs in{};
         for (int i = 0; i < 3; ++i) {
             bool used = false;
             for (int s = 0; s < a.count; ++s) { used = used || a.segments[s].input == i; }
@@ -906,11 +968,11 @@ void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
                 throw std::invalid_argument("inkling2 projections_mma: every input of an 8-bit call needs 16-byte aligned "
                                             "x8 workspace");
             }
-            const Tensor x(const_cast<std::uint16_t*>(a.x[i]), DType::BF16, {a.k, a.columns});
-            Tensor codes(a.x8[i], DType::I32, {words, a.columns});
-            a8_encode_columns(x, codes, stream);
-            encoded[i] = a.x8[i];
+            in.x[in.count]     = a.x[i];
+            in.out[in.count++] = a.x8[i];
+            encoded[i]         = a.x8[i];
         }
+        if (!a.x8_encoded) { encode_inputs(in, a.k, a.columns, words, stream); } // the distinct inputs in one launch
         p.x8_stride = words;
         for (int s = 0; s < a.count; ++s) { p.seg[s].x8 = encoded[a.segments[s].input]; }
         a.fp32_out ? launch_a8_shape<float>(p, a, small, stream) : launch_a8_shape<__nv_bfloat16>(p, a, small, stream);

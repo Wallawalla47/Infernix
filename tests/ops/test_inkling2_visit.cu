@@ -19,6 +19,7 @@
 
 #include "infernix/ops/inkling2_visit.h"
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_a8.h"
 #include "ops/inkling2/visit_math.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
@@ -290,6 +291,23 @@ std::vector<std::uint8_t> limbs_host(const std::uint16_t* x, std::int32_t* emax_
     return row;
 }
 
+// The A8 row of a BF16 row (--a8-activations: ops/ggml/ggml_a8.h's codec by its definition): per 32-slice the scale of
+// its largest magnitude and the codes, 2,304 codes then 72 FP32 scales.
+std::vector<std::uint8_t> a8_host(const std::uint16_t* x) {
+    namespace a8 = infernix::ggml::a8;
+    std::vector<std::uint8_t> row(moe::kA8XRowBytes, 0);
+    for (int s = 0; s < H / 32; ++s) {
+        unsigned key = 0;
+        for (int j = 0; j < 32; ++j) { key = std::max(key, static_cast<unsigned>(x[32 * s + j] & 0x7FFFU)); }
+        const a8::SliceScale sc = a8::slice_scale(key);
+        for (int j = 0; j < 32; ++j) {
+            row[32 * s + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(a8::code(x[32 * s + j], sc.inv)));
+        }
+        std::memcpy(row.data() + H + 4 * s, &sc.d, 4);
+    }
+    return row;
+}
+
 std::vector<std::uint8_t> quantize_host(const std::uint16_t* x, moe::ExpertFormat format, float* amax_out) {
     std::vector<std::uint8_t> row(moe::row_bytes(format, H), 0);
     if (format == moe::ExpertFormat::Nvfp4FourOverSix) {
@@ -393,6 +411,7 @@ EntryData entry_data(const EntryConfig& cfg, int T, std::uint32_t seed) {
 
 struct EntryResult {
     std::vector<std::uint16_t> tail_out, x[3], gate_input;
+    std::vector<std::uint8_t> x8[3]; // the x outputs' A8 rows (--a8-activations; non-message calls)
     std::vector<float> mixed, message;
     HostRing ring;
 };
@@ -459,11 +478,25 @@ EntryResult run_entry(const EntryConfig& cfg, const EntryData& d, const Columns&
             a.x[i]     = d_x[i];
         }
     }
+    std::uint8_t* d_x8[3] = {};
+    if (!cfg.messages) { // the x outputs' A8 rows beside them
+        a.x8_stride = moe::kA8XRowBytes / 4;
+        for (int i = 0; i < 3; ++i) {
+            d_x8[i] = dalloc<std::uint8_t>(static_cast<std::size_t>(T) * moe::kA8XRowBytes);
+            a.x8[i] = reinterpret_cast<std::int32_t*>(d_x8[i]);
+        }
+    }
     ik::visit_entry(a, nullptr);
     cuda_check(cudaDeviceSynchronize(), "visit_entry");
     EntryResult r;
     r.tail_out = download(d_tail_out, static_cast<std::size_t>(T) * H);
     for (int i = 0; i < 3; ++i) { r.x[i] = download(d_x[i], static_cast<std::size_t>(T) * H); }
+    for (int i = 0; i < 3; ++i) {
+        if (d_x8[i] != nullptr) {
+            r.x8[i] = download(d_x8[i], static_cast<std::size_t>(T) * moe::kA8XRowBytes);
+            cudaFree(d_x8[i]);
+        }
+    }
     r.mixed      = download(d_mixed, std::size_t{3} * T * H);
     r.message    = download(d_message, std::size_t{3} * T * H);
     r.gate_input = download(d_gate, std::size_t{3} * T * 2 * H);
@@ -629,6 +662,16 @@ void entry_case(const EntryConfig& cfg, std::uint32_t seed) {
     }
     tally.report();
     if (cfg.messages) { ftally.report(); }
+    if (!cfg.messages) { // the A8 rows beside x: the codec of the kernel's own BF16 x, exactly
+        Tally a8t{"  x's A8 rows (exact encoder)"};
+        for (int i = 0; i < 3; ++i) {
+            for (int t = 0; t < T; ++t) {
+                const auto q = a8_host(got.x[i].data() + std::size_t(t) * H);
+                exact(a8t, got.x8[i].data() + std::size_t(t) * moe::kA8XRowBytes, q.data(), q.size());
+            }
+        }
+        a8t.report();
+    }
     cudaFree(d_ring);
 }
 
@@ -641,6 +684,7 @@ struct MlpConfig {
     bool messages;
     moe::ExpertFormat format;
     bool a16 = false; // the experts' rows as A16 limb rows and exponents
+    bool a8  = false; // the experts' rows as A8 rows
 };
 
 void mlp_case(const MlpConfig& cfg, std::uint32_t seed) {
@@ -657,7 +701,7 @@ void mlp_case(const MlpConfig& cfg, std::uint32_t seed) {
     const auto ms0 = rng.bf16(static_cast<std::size_t>(T) * H, 1.5F), ms1 = rng.bf16(static_cast<std::size_t>(T) * H, 1.5F);
     const HostRing ring0 = rng.bf16(static_cast<std::size_t>(kLanes) * R * H, 0.5F);
 
-    const int rb = cfg.a16 ? moe::kA16XRowBytes : moe::row_bytes(cfg.format, H);
+    const int rb = cfg.a16 ? moe::kA16XRowBytes : cfg.a8 ? moe::kA8XRowBytes : moe::row_bytes(cfg.format, H);
     auto* d_emax = dalloc<std::int32_t>(T);
     DeviceMap map(call);
     auto* d_o = upload(o);
@@ -701,7 +745,9 @@ void mlp_case(const MlpConfig& cfg, std::uint32_t seed) {
     } else {
         a.norm = d_norm;
         a.x    = d_x;
-        a.rows = cfg.a16 ? ik::ExpertRows{cfg.format, d_rows, nullptr, d_emax} : ik::ExpertRows{cfg.format, d_rows, d_amax};
+        a.rows = cfg.a16  ? ik::ExpertRows{cfg.format, d_rows, nullptr, d_emax}
+                 : cfg.a8 ? ik::ExpertRows{cfg.format, d_rows, nullptr, nullptr, true}
+                          : ik::ExpertRows{cfg.format, d_rows, d_amax};
     }
     ik::mlp_entry(a, nullptr);
     cuda_check(cudaDeviceSynchronize(), "mlp_entry");
@@ -772,6 +818,9 @@ void mlp_case(const MlpConfig& cfg, std::uint32_t seed) {
                 const auto q   = limbs_host(x.data() + std::size_t(t) * H, &e);
                 exact(qtally, rows.data() + std::size_t(t) * rb, q.data(), q.size());
                 exact(qtally, &emax[t], &e, 1);
+            } else if (cfg.a8) {
+                const auto q = a8_host(x.data() + std::size_t(t) * H);
+                exact(qtally, rows.data() + std::size_t(t) * rb, q.data(), q.size());
             } else {
                 float am = 0;
                 const auto q = quantize_host(x.data() + std::size_t(t) * H, cfg.format, &am);
@@ -813,7 +862,7 @@ void mlp_case(const MlpConfig& cfg, std::uint32_t seed) {
 }
 
 void gate_case(int kinds, bool shared_x, bool rows_too, moe::ExpertFormat format, const char* name, std::uint32_t seed,
-               bool a16 = false) {
+               bool a16 = false, bool a8x = false) {
     constexpr int T = 7;
     Rng rng(seed);
     const int planes = shared_x ? 1 : kinds;
@@ -822,7 +871,7 @@ void gate_case(int kinds, bool shared_x, bool rows_too, moe::ExpertFormat format
     const auto fg = rng.f32(static_cast<std::size_t>(kinds) * T * 2 * H, 1.2F);
     std::vector<std::uint16_t> norms[3];
     for (auto& n : norms) { n = rng.bf16(H, 0.2F, 1.0F); }
-    const int rb = a16 ? moe::kA16XRowBytes : moe::row_bytes(format, H);
+    const int rb = a16 ? moe::kA16XRowBytes : a8x ? moe::kA8XRowBytes : moe::row_bytes(format, H);
     auto* d_emax = dalloc<std::int32_t>(T);
     auto* d_mixed = upload(mixed);
     auto* d_message = upload(message);
@@ -840,15 +889,32 @@ void gate_case(int kinds, bool shared_x, bool rows_too, moe::ExpertFormat format
     a.message  = d_message;
     a.fg       = d_fg;
     for (int k = 0; k < kinds; ++k) { a.norms[k] = d_norms[k], a.x[k] = d_x[k]; }
-    if (rows_too) { a.rows = a16 ? ik::ExpertRows{format, d_rows, nullptr, d_emax} : ik::ExpertRows{format, d_rows, d_amax}; }
+    std::uint8_t* d_x8[3] = {};
+    a.x8_stride           = moe::kA8XRowBytes / 4;
+    for (int k = 0; k < kinds; ++k) { // each kind's x as A8 rows too (K2's 8-bit inputs)
+        d_x8[k] = dalloc<std::uint8_t>(static_cast<std::size_t>(T) * moe::kA8XRowBytes);
+        a.x8[k] = reinterpret_cast<std::int32_t*>(d_x8[k]);
+    }
+    if (rows_too) {
+        a.rows = a16   ? ik::ExpertRows{format, d_rows, nullptr, d_emax}
+                 : a8x ? ik::ExpertRows{format, d_rows, nullptr, nullptr, true}
+                       : ik::ExpertRows{format, d_rows, d_amax};
+    }
     ik::gate_exit(a, nullptr);
     cuda_check(cudaDeviceSynchronize(), "gate_exit");
     Tally tally{name}, qtally{a16 ? "  A16 limb rows and exponents (exact encoder)" : "  experts' rows (exact encoders)"};
     const auto rows = download(d_rows, static_cast<std::size_t>(T) * rb);
     const auto amax = download(d_amax, T);
     const auto emax = download(d_emax, T);
+    Tally a8t{"  x's A8 rows (exact encoder)"};
     for (int k = 0; k < kinds; ++k) {
         const auto x = download(d_x[k], static_cast<std::size_t>(T) * H);
+        const auto x8 = download(d_x8[k], static_cast<std::size_t>(T) * moe::kA8XRowBytes);
+        cudaFree(d_x8[k]);
+        for (int t = 0; t < T; ++t) {
+            const auto q8 = a8_host(x.data() + std::size_t(t) * H);
+            exact(a8t, x8.data() + std::size_t(t) * moe::kA8XRowBytes, q8.data(), q8.size());
+        }
         for (int t = 0; t < T; ++t) {
             const float* xv = mixed.data() + (std::size_t(shared_x ? 0 : k) * T + t) * H;
             const float* mv = message.data() + (std::size_t(k) * T + t) * H;
@@ -870,6 +936,9 @@ void gate_case(int kinds, bool shared_x, bool rows_too, moe::ExpertFormat format
                 const auto q   = limbs_host(x.data() + std::size_t(t) * H, &e);
                 exact(qtally, rows.data() + std::size_t(t) * rb, q.data(), q.size());
                 exact(qtally, &emax[t], &e, 1);
+            } else if (rows_too && k == 0 && a8x) {
+                const auto q = a8_host(x.data() + std::size_t(t) * H);
+                exact(qtally, rows.data() + std::size_t(t) * rb, q.data(), q.size());
             } else if (rows_too && k == 0) {
                 float am = 0;
                 const auto q = quantize_host(x.data() + std::size_t(t) * H, format, &am);
@@ -880,6 +949,7 @@ void gate_case(int kinds, bool shared_x, bool rows_too, moe::ExpertFormat format
     }
     tally.report();
     if (rows_too) { qtally.report(); }
+    a8t.report();
     std::vector<void*> frees = {d_mixed, d_message, d_fg, d_rows, d_amax, d_emax};
     for (int k = 0; k < 3; ++k) { frees.push_back(d_norms[k]), frees.push_back(d_x[k]); }
     for (void* p : frees) { cudaFree(p); }
@@ -927,6 +997,8 @@ INFERNIX_OP_TEST(inkling2_visit) {
     gate_case(1, false, true, moe::ExpertFormat::Mxfp8, "gate_exit mlp MXFP8", 44);
     mlp_case({"mlp_entry NVFP4 A16, 2 blocks", false, 2, false, moe::ExpertFormat::Nvfp4FourOverSix, true}, 34);
     gate_case(1, false, true, moe::ExpertFormat::Nvfp4FourOverSix, "gate_exit mlp NVFP4 A16", 45, true);
+    mlp_case({"mlp_entry NVFP4 A8, 2 blocks", false, 2, false, moe::ExpertFormat::Nvfp4FourOverSix, false, true}, 35);
+    gate_case(1, false, true, moe::ExpertFormat::Nvfp4FourOverSix, "gate_exit mlp NVFP4 A8", 46, false, true);
     softcap_case();
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

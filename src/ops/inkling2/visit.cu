@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_a8.h"
 #include "ops/inkling2/column.cuh"
 #include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
 #include "ops/inkling2/visit_math.h"
@@ -323,6 +324,31 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
     if (writes_ring(map, col)) { store8(ring_row(tail.ring, col.lane, col.pos) + c, x[0]); }
 }
 
+// ---------------------------------------------------------------------------- 8-bit rows (--a8-activations)
+
+// The thread's 8 values (elements 8g .. 8g + 7 of a K = kHidden row; 4 threads a 32-slice) as an A8 row: the codec of
+// ops/ggml/ggml_a8.h over their BF16 bits (the slice's largest magnitude's key, then the codes), the row's 2,304
+// codes then its 72 FP32 scales (a8_encode_columns' layout).
+__device__ __forceinline__ void a8_row8(const float (&v)[8], std::uint8_t* row) {
+    namespace a8 = ::infernix::ggml::a8;
+    const int g = static_cast<int>(threadIdx.x);
+    std::uint16_t bits[8];
+    unsigned key = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        bits[j] = canon::f32_to_bf16_rn(v[j]);
+        key     = max(key, static_cast<unsigned>(bits[j] & 0x7FFFU));
+    }
+    key = max(key, __shfl_xor_sync(kAll, key, 1));
+    key = max(key, __shfl_xor_sync(kAll, key, 2));
+    const a8::SliceScale sc = a8::slice_scale(key);
+    unsigned packed[2] = {0, 0};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { packed[j / 4] |= (static_cast<unsigned>(a8::code(bits[j], sc.inv)) & 0xFFU) << (8 * (j % 4)); }
+    *reinterpret_cast<uint2*>(row + 8 * g) = make_uint2(packed[0], packed[1]);
+    if ((g & 3) == 0) { reinterpret_cast<float*>(row + kHidden)[g / 4] = sc.d; }
+}
+
 // ---------------------------------------------------------------------------- the experts' activation rows
 
 // The column's MLP input (BF16 values, the thread's 8) as the experts' rows: four-over-six NVFP4 (codes, a scale word
@@ -330,6 +356,10 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
 __device__ __forceinline__ void quantize_row(const float (&v)[8], const ExpertRows& rows, int t,
                                              float (&scratch)[kWarpsH]) {
     const int g = static_cast<int>(threadIdx.x);
+    if (rows.a8) {
+        a8_row8(v, rows.rows + static_cast<std::size_t>(t) * moe::kA8XRowBytes);
+        return;
+    }
     if (rows.emax != nullptr) {
         // A16: the row's exponent from its largest BF16 magnitude bits (a NaN's bits exceed every finite one's), then a
         // block's two halves on a thread pair (store_a16_half: store_a16_block's bytes).
@@ -544,9 +574,15 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
 #pragma unroll
                 for (int k = 0; k < 3; ++k) {
                     if (a.x[k] != nullptr) { store8(a.x[k] + row, x); }
+                    if (a.x8[k] != nullptr) {
+                        a8_row8(x, reinterpret_cast<std::uint8_t*>(a.x8[k] + static_cast<std::size_t>(t) * a.x8_stride));
+                    }
                 }
             } else {
                 store8(a.x[i] + row, x);
+                if (a.x8[i] != nullptr) {
+                    a8_row8(x, reinterpret_cast<std::uint8_t*>(a.x8[i] + static_cast<std::size_t>(t) * a.x8_stride));
+                }
             }
         }
     } else {
@@ -713,6 +749,8 @@ __global__ void __launch_bounds__(kThreads) gate_exit_kernel(const GateExitArgs 
     for (int j = 0; j < 8; ++j) { x[j] = canon::mul_rn(nw[j], canon::mul_rn(x[j], r)); }
     round8(x);
     store8(xout + row, x);
+    std::int32_t* x8 = k == 0 ? a.x8[0] : (k == 1 ? a.x8[1] : a.x8[2]);
+    if (x8 != nullptr) { a8_row8(x, reinterpret_cast<std::uint8_t*>(x8 + static_cast<std::size_t>(t) * a.x8_stride)); }
     if (a.rows.rows != nullptr) { quantize_row(x, a.rows, t, s2); }
 }
 
@@ -764,11 +802,12 @@ void check_blocks(const Blocks& blocks, const char* op) {
     }
 }
 
-// The experts' rows: checkpoint rows (NVFP4 with its amax) or, with emax, NVFP4 A16 limb rows.
+// The experts' rows: checkpoint rows (NVFP4 with its amax) or, with emax, NVFP4 A16 limb rows, or NVFP4 A8 rows.
 void check_rows(const ExpertRows& rows, const char* op) {
     if (rows.rows == nullptr || reinterpret_cast<std::uintptr_t>(rows.rows) % 8 != 0 ||
-        (rows.format == moe::ExpertFormat::Nvfp4FourOverSix && rows.amax == nullptr && rows.emax == nullptr) ||
-        (rows.emax != nullptr && rows.format != moe::ExpertFormat::Nvfp4FourOverSix)) {
+        (rows.format == moe::ExpertFormat::Nvfp4FourOverSix && rows.amax == nullptr && rows.emax == nullptr && !rows.a8) ||
+        (rows.emax != nullptr && rows.format != moe::ExpertFormat::Nvfp4FourOverSix) ||
+        (rows.a8 && (rows.format != moe::ExpertFormat::Nvfp4FourOverSix || rows.emax != nullptr))) {
         throw std::invalid_argument(std::string(op) + ": the experts' rows (and NVFP4's amax, or A16's exponents) are needed");
     }
 }
@@ -803,10 +842,20 @@ void embed(const std::int32_t* tokens, std::int32_t columns, const std::uint16_t
     CUDA_CHECK(pdl::launch_consumer(columns_launch(columns, stream), embed_kernel, tokens, embedding, norm, out));
 }
 
+// --a8-activations' x8 rows: 16-byte aligned, at least a column's codes and scales apart.
+void check_x8(std::int32_t* const (&x8)[3], std::int32_t stride, const char* op) {
+    for (const std::int32_t* p : x8) {
+        if (p != nullptr && (reinterpret_cast<std::uintptr_t>(p) % 16 != 0 || stride * 4 < kHidden + kHidden / 8)) {
+            throw std::invalid_argument(std::string(op) + ": 8-bit rows need 16-byte alignment and a column's 2,592 bytes");
+        }
+    }
+}
+
 void visit_entry(const EntryArgs& a, cudaStream_t stream) {
     constexpr const char* op = "inkling2 visit_entry";
     check_columns(a.columns, op);
     check_map(a.map, a.columns, op);
+    check_x8(a.x8, a.x8_stride, op);
     const bool tail = a.tail.experts != nullptr;
     if (tail) {
         check_ring(a.tail.ring, kHidden, op);
@@ -868,6 +917,7 @@ void mlp_entry(const MlpEntryArgs& a, cudaStream_t stream) {
 void gate_exit(const GateExitArgs& a, cudaStream_t stream) {
     constexpr const char* op = "inkling2 gate_exit";
     check_columns(a.columns, op);
+    check_x8(a.x8, a.x8_stride, op);
     if (a.kinds != 1 && a.kinds != 3) { throw std::invalid_argument("inkling2 gate_exit: 1 or 3 kinds"); }
     if (a.mixed == nullptr || a.message == nullptr || a.fg == nullptr) {
         throw std::invalid_argument("inkling2 gate_exit: mixed, message and the projections are needed");

@@ -1273,13 +1273,14 @@ void router_case() {
 // moe_single against moe_route + moe_experts over the same workspace: routing and outputs byte for byte, for several
 // columns; eagerly and in a CUDA graph that interleaves the two paths (single, separate, single: each leaves the
 // workspace's state as the other needs it), replayed three times.
-void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core::Native) {
+void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core::Native, bool a8x = false) {
     const char* name   = a8                              ? "MXFP8"
                          : a16                           ? "NVFP4 A16"
+                         : a8x                           ? "NVFP4 A8"
                          : core == moe::Nvfp4Core::Exact ? "NVFP4 (exact core)"
                                                          : "NVFP4 (native core)";
     const auto format  = a8 ? moe::ExpertFormat::Mxfp8 : moe::ExpertFormat::Nvfp4FourOverSix;
-    const auto activation = a16 ? moe::ExpertActivation::A16 : moe::ExpertActivation::Checkpoint;
+    const auto activation = a16 ? moe::ExpertActivation::A16 : a8x ? moe::ExpertActivation::A8 : moe::ExpertActivation::Checkpoint;
     if (!moe::moe_single_supported(format, activation)) {
         std::printf("%s single-column launch: not supported on this device (the separate kernels run instead)\n", name);
         return;
@@ -1339,6 +1340,14 @@ void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core
             rows.activation = moe::ExpertActivation::A16;
             rows.emax       = d_emax;
         }
+        std::uint8_t* d_a8 = nullptr;
+        if (a8x) { // the column's A8 row by the production encoder
+            cuda_check(cudaMalloc(&d_a8, moe::kA8XRowBytes), "cudaMalloc");
+            moe::moe_encode_a8(d_x, 1, d_a8, nullptr);
+            rows.activation = moe::ExpertActivation::A8;
+            rows.rows       = d_a8;
+            rows.amax       = nullptr;
+        }
         const auto separate = [&](cudaStream_t s) {
             moe::moe_route(d_x, 1, d_w, d_bias, E, H, 8.0F, ws, s);
             moe::moe_experts(rows, moe::routed_routing(ws), bank, ws, d_ref, s);
@@ -1385,7 +1394,7 @@ void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core
         cuda_check(cudaGraphDestroy(graph), "destroy");
         cuda_check(cudaStreamDestroy(stream), "stream");
         for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rows), static_cast<void*>(d_amax),
-                        static_cast<void*>(d_emax)}) {
+                        static_cast<void*>(d_emax), static_cast<void*>(d_a8)}) {
             cuda_check(cudaFree(p), "cudaFree");
         }
     }
@@ -1555,6 +1564,7 @@ INFERNIX_OP_TEST(w4a4_sparse_moe) {
     single_case(false, false, moe::Nvfp4Core::Exact);
     single_case(true);
     single_case(false, true);
+    single_case(false, false, moe::Nvfp4Core::Native, true);
     bank_case(false);
     bank_case(false, moe::Nvfp4Core::Exact);
     bank_case(true);

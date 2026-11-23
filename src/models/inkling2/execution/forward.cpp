@@ -467,6 +467,13 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         e.x[0] = b_.x[0];
         if (op.full) { e.x[1] = b_.x[1], e.x[2] = b_.x[2]; }
     }
+    // a8: K2's 8-bit inputs written beside its BF16 inputs (by the entry, or the gates in a message visit).
+    const std::int32_t k2_words = ik::projection_a8_column_words(kH);
+    const auto k2_x8 = [&](int i) { return b_.x8 + static_cast<std::size_t>(i) * k2_words * T; };
+    if (a8_ && !messages) {
+        e.x8_stride = k2_words;
+        for (int i = 0; i < 3; ++i) { e.x8[i] = e.x[i] != nullptr ? k2_x8(i) : nullptr; }
+    }
     ik::visit_entry(e, stream);
     mark("visit_entry");
     if (b_.features != nullptr) { tap(v, h, stream); } // h: the partial block sum entering the visit
@@ -495,6 +502,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         g.message  = b_.message;
         g.fg       = b_.fg;
         for (int k = 0; k < 3; ++k) { g.norms[k] = op.norms[k], g.x[k] = b_.x[k]; }
+        if (a8_) {
+            g.x8_stride = k2_words;
+            for (int k = 0; k < 3; ++k) { g.x8[k] = k2_x8(k); }
+        }
         ik::gate_exit(g, stream);
         mark("message_gates");
     }
@@ -519,9 +530,9 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         add_segment(k2, a.key_taps, 1, b_.key_taps);
         add_segment(k2, a.value_taps, 2, b_.value_taps);
     }
-    if (a8_) { // the three inputs' codes (one input's, shared, when they alias)
-        const std::size_t words = static_cast<std::size_t>(ik::projection_a8_column_words(kH)) * T;
-        for (int i = 0; i < 3; ++i) { k2.x8[i] = b_.x8 + i * words; }
+    if (a8_) { // the inputs' codes, written by their producers (aliased inputs share the first one's)
+        for (int i = 0; i < 3; ++i) { k2.x8[i] = k2_x8(i); }
+        k2.x8_encoded = true;
     }
     project_fused(prompt_, k2, stream);
     mark("k2_projections");
@@ -565,6 +576,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     at.ws  = b_.attention_ws;
     at.out = b_.attention;
+    if (a8_ && !prompt_) { // the decode route's attention writes W_o's 8-bit inputs (over K2's, read by now)
+        at.out8        = b_.x8;
+        at.out8_stride = ik::projection_a8_column_words(kQ);
+    }
     // The decode route's prologue inside attention's launch, for one lane of at most 4 columns (2026-11-21, against the
     // prologue kernel: the decode round at 4K -0.44 % at one column, -0.17 % at two, -0.09 % at four, +0.25 % at eight;
     // infernix_bench C = 4 -0.8 %, C = 8 -1.3 %). Padding columns need the prologue's zeros, and a lane in two groups
@@ -584,15 +599,18 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     wo.k       = kQ;
     wo.x[0]    = b_.attention;
     add_segment(wo, a.output, 0, b_.o);
-    if (a8_) { wo.x8[0] = b_.x8; }
+    if (a8_) {
+        wo.x8[0]      = b_.x8;
+        wo.x8_encoded = !prompt_; // attention() wrote them; a prompt call encodes them here (the same bits)
+    }
     project_fused(prompt_, wo, stream);
     mark("w_o");
     // The experts' x: the checkpoint's rows, or under A16 an NVFP4 layer's limb rows and an MXFP8 layer's BF16 x alone,
-    // or under A8 an NVFP4 layer's A8 rows (encoded from the BF16 x after the entry; MXFP8 layers keep their rows).
+    // or under A8 an NVFP4 layer's A8 rows (written by the entry from the BF16 x; MXFP8 layers keep their rows).
     const bool a16   = activation_ == moe::ExpertActivation::A16;
     const bool nvfp4 = op.format == moe::ExpertFormat::Nvfp4FourOverSix;
     const bool a8x   = activation_ == moe::ExpertActivation::A8 && nvfp4;
-    const ik::ExpertRows rows = a8x  ? ik::ExpertRows{op.format, nullptr, nullptr, nullptr}
+    const ik::ExpertRows rows = a8x  ? ik::ExpertRows{op.format, b_.rows, nullptr, nullptr, true}
                               : !a16 ? ik::ExpertRows{op.format, b_.rows, b_.amax}
                               : nvfp4 ? ik::ExpertRows{op.format, b_.rows, nullptr, b_.emax}
                                       : ik::ExpertRows{op.format, nullptr, nullptr, nullptr};
@@ -657,10 +675,6 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         mark("message_gates");
     }
 
-    if (a8x) {
-        moe::moe_encode_a8(b_.xm, T, b_.rows, stream);
-        mark("experts_x");
-    }
     // K6-K8: route and the experts (their outputs combine in the next visit's entry). A prompt call: the router's logits
     // on tensor cores (FP32), the selection by column, the experts' grouped block-scaled GEMMs.
     if (prompt_) {

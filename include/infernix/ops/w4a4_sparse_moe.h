@@ -193,7 +193,7 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
 // router's rows on the first 16, every CTA then selecting the column itself, a job's 144 gate/up and down row groups on
 // 18 CTAs of 8 warps, each warp streaming both through one ring). x: the router's BF16 row; rows: the column's
 // quantized row. Needs moe_single_supported(bank.format): the device holds the grid resident (otherwise moe_route and
-// moe_experts); never for A8 (no single-launch kernel).
+// moe_experts). A8 (NVFP4 layers): rows is the column's A8 row; the separate kernels' A8 bits.
 [[nodiscard]] bool moe_single_supported(ExpertFormat format, ExpertActivation activation = ExpertActivation::Checkpoint);
 void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint16_t* router, const float* bias,
                 float route_scale, const Bank& bank, const Workspace& workspace, std::uint16_t* outputs,

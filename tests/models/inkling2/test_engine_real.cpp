@@ -21,7 +21,8 @@
 // 7. DSpark (--spec dspark, auto and 7 drafts, graphs and eager; INFERNIX_INKLING2_NO_DSPARK skips it): speculative
 //    tokens equal plain decoding's (the golden continuation, a 160-token greedy reply raw and parsed: the parsed one
 //    samples under its reasoning ban, the four sampled requests alone
-//    and C = 2; under --a16-activations the greedy reply equals that route's plain tokens); the acceptance is reported.
+//    and C = 2; under --a16-activations and under --a8-activations the greedy reply equals that route's plain tokens);
+//    the acceptance is reported.
 // 8. --kv-dtype (the full visits' pools quantized): each format as a variant of 6 (accepted with --reproducible),
 //    DSpark (auto, graphs) giving its plain tokens, and a 10,000-token prompt's greedy continuation the same in chunks
 //    of 4,096 and 1,000; bf16p (lossless) gives bf16's tokens throughout, the others' agreement with BF16's is reported.
@@ -345,6 +346,27 @@ int main() {
                 require_same("dspark (auto, graphs), a16: a 160-token greedy reply", a16_long, result.generated_token_ids);
                 const infernix::SpeculativeStats& s = result.speculative;
                 std::cout << "dspark (auto, graphs), a16: " << s.rounds << " rounds, " << s.drafted_tokens << " drafted, "
+                          << s.accepted_tokens << " accepted, " << s.fallback_steps << " plain steps\n";
+            }
+            {
+                // Under --a8-activations (--spec auto's drafter beside it): DSpark (auto, graphs) gives the A8 route's
+                // plain tokens (its verify calls run every 8-bit kernel at other widths than plain decoding).
+                infernix::EngineOptions plain = engine_options(artifact, 0, true, 1);
+                plain.a8_activations          = true;
+                Tokens a8_long;
+                {
+                    infernix::Engine engine(plain);
+                    a8_long = engine.generate(engine.prepare(chat(texts()[1])), long_greedy).generated_token_ids;
+                }
+                infernix::EngineOptions options       = plain;
+                options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                options.speculative.draft_tokens_auto = true;
+                options.speculative.draft_tokens      = 7;
+                infernix::Engine engine(options);
+                const auto result = engine.generate(engine.prepare(chat(texts()[1])), long_greedy);
+                require_same("dspark (auto, graphs), a8: a 160-token greedy reply", a8_long, result.generated_token_ids);
+                const infernix::SpeculativeStats& s = result.speculative;
+                std::cout << "dspark (auto, graphs), a8: " << s.rounds << " rounds, " << s.drafted_tokens << " drafted, "
                           << s.accepted_tokens << " accepted, " << s.fallback_steps << " plain steps\n";
             }
         }

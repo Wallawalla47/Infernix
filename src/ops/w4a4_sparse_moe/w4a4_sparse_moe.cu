@@ -809,13 +809,15 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a16_kernel
 
 // ---------------------------------------------------------------------------- NVFP4 A8 (--a8-activations)
 
-// The header's A8 contract on the narrow route (decode, verification, and for now the prompt route): a warp owns a row
-// group (16 rows: eight intermediates' interleaved gate and up rows, or 16 down rows) over the whole K, in passes of
+// The header's A8 contract on the narrow route (decode and verification calls of more than one column; moe_single
+// takes one column, the prompt route wide_expert_a8.cuh's grouped GEMM, both with these bits): a warp owns a row group
+// (16 rows: eight intermediates' interleaved gate and up rows, or 16 down rows) over the whole K, in passes of
 // kPass columns, one m16n8k16 s8 MMA per 144-byte unit (lane (g, t): rows g and g + 8 at K 4t .. 4t + 3 of the block,
 // the low and high nibbles of the unit's code word 32t + 4g; column g's codes at the same K), its int32 accumulators
 // started at 1.5 * 2^23 (ggml_a8_mma.cuh) so that P_b * S_b is one FFMA with {S_b, -1.5 * 2^23 * S_b} from a shared
 // table, and the term one more with the column's slice scale. One thread adds an output's terms in block order, so an
-// entry's bits depend on its own codes and its expert's record alone.
+// entry's bits depend on its own codes and its expert's record alone. A gate/up CTA's 32 intermediates are one slice of
+// h: it encodes each column's slice itself, and the down CTAs wait for every gate/up CTA's count.
 constexpr int kA8Warps   = 4; // row groups a CTA
 constexpr int kA8Threads = 32 * kA8Warps;
 constexpr int kA8Depth   = 4; // stages of a gate/up warp's ring
@@ -843,30 +845,24 @@ __device__ __forceinline__ void a8_unit_terms(const std::uint8_t* unit, unsigned
     c[3] = __fmaf_rn(ggml::a8::scaled_term(p[3], hi.x, hi.y), d1, c[3]);
 }
 
-// One 32-element BF16 slice (read through L2: written by other CTAs) encoded by ggml_a8.h's codec into `codes`; returns
-// its scale.
-__device__ __forceinline__ float a8_encode_slice(const std::uint16_t* v, std::int8_t* codes) {
-    uint4 raw[4];
+// One 32-element BF16 slice v (shared memory) encoded by ggml_a8.h's codec as slice s of an A8 row of K = k codes: its
+// codes at row + 32 s, its FP32 scale at row + k + 4 s (one thread; the h rows' encoder in every A8 kernel).
+__device__ __forceinline__ void a8_encode_slice(const std::uint16_t* v, std::uint8_t* row, int k, int s) {
+    unsigned key = 0;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) { raw[i] = __ldcg(reinterpret_cast<const uint4*>(v) + i); }
-    const auto* e = reinterpret_cast<const std::uint16_t*>(raw);
-    unsigned key  = 0;
-#pragma unroll
-    for (int j = 0; j < 32; ++j) { key = max(key, static_cast<unsigned>(e[j] & 0x7FFFU)); }
+    for (int j = 0; j < 32; ++j) { key = max(key, static_cast<unsigned>(v[j] & 0x7FFFU)); }
     const ggml::a8::SliceScale sc = ggml::a8::slice_scale(key);
-    unsigned words[8];
+    auto* words = reinterpret_cast<std::uint32_t*>(row + 32 * s);
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
-        unsigned packed = 0;
+        std::uint32_t packed = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            packed |= (static_cast<unsigned>(ggml::a8::code(e[4 * w + j], sc.inv)) & 0xFFU) << (8 * j);
+            packed |= (static_cast<std::uint32_t>(ggml::a8::code(v[4 * w + j], sc.inv)) & 0xFFU) << (8 * j);
         }
         words[w] = packed;
     }
-    reinterpret_cast<uint4*>(codes)[0] = make_uint4(words[0], words[1], words[2], words[3]);
-    reinterpret_cast<uint4*>(codes)[1] = make_uint4(words[4], words[5], words[6], words[7]);
-    return sc.d;
+    reinterpret_cast<float*>(row + k)[s] = sc.d;
 }
 
 template <class G>
@@ -875,7 +871,7 @@ struct GateUpA8iSmem {
     float2 scaled[256];
     alignas(16) std::uint8_t ring[kA8Warps][kA8Depth][kA8StageUnits * S::kUnit];
     alignas(16) std::uint8_t x[kPass][kA8XRowBytes];
-    int last;
+    std::uint16_t h[kPass][32]; // the pass's columns' BF16 h of this CTA's 32 intermediates (one slice)
 };
 
 template <class G>
@@ -940,7 +936,8 @@ __global__ void __launch_bounds__(kA8Threads) gate_up_a8i_kernel(Args a) {
             __syncwarp();
         }
         tile::cp_async_wait<0>();
-        // Rows g (even: gate) and g + 1 (up) of an intermediate pair through a shuffle; h = the softcapped SwiGLU.
+        // Rows g (even: gate) and g + 1 (up) of an intermediate pair through a shuffle; h = the softcapped SwiGLU, staged
+        // per column (the CTA's 32 intermediates are slice blockIdx.x of h), then each column's slice encoded here.
         std::uint16_t y[4], up[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) { y[i] = offloaded_moe::nvfp4_a8::row_output(c[i], m); }
@@ -952,31 +949,20 @@ __global__ void __launch_bounds__(kA8Threads) gate_up_a8i_kernel(Args a) {
                 const int col = 2 * t + (i & 1);
                 if (col < n) {
                     const int entry = a.ws.entries[v.first + base + col];
-                    a.ws.h[static_cast<std::size_t>(entry) * G::kInter + group * 8 + g / 2 + (i < 2 ? 0 : 4)] =
+                    sm.h[col][warp * 8 + g / 2 + (i < 2 ? 0 : 4)] =
                         swiglu(y[i], up[i], a.routing.gamma[entry], a.bank.gate_softcap, a.bank.up_softcap);
                 }
             }
         }
-        __syncthreads(); // the next pass reuses x and the rings
+        __syncthreads();
+        if (tid < n) { // a thread a column: its slice of h (the single launch's bits)
+            const int entry = a.ws.entries[v.first + base + tid];
+            a8_encode_slice(sm.h[tid], a.ws.h_a8 + static_cast<std::size_t>(entry) * kA8HRowBytes, G::kInter,
+                            static_cast<int>(blockIdx.x));
+        }
+        __syncthreads(); // the next pass reuses x, the rings and h
     }
-    // The job's last CTA encodes the job's h rows once, then counts again: the down CTAs wait for the CTAs + 1.
-    if (tid == 0) {
-        __threadfence();
-        sm.last = acq_rel_add(&a.ws.job_done[job]) == static_cast<std::uint32_t>(S::kGateUpRowGroups / kA8Warps - 1) ? 1 : 0;
-    }
-    __syncthreads();
-    if (sm.last == 0) { return; }
-    __threadfence();
-    constexpr int kSlices = G::kInter / 32;
-    for (int i = tid; i < v.count * kSlices; i += kA8Threads) {
-        const int c = i / kSlices, s = i % kSlices;
-        const int entry = a.ws.entries[v.first + c];
-        std::uint8_t* row = a.ws.h_a8 + static_cast<std::size_t>(entry) * kA8HRowBytes;
-        const float d = a8_encode_slice(a.ws.h + static_cast<std::size_t>(entry) * G::kInter + 32 * s,
-                                        reinterpret_cast<std::int8_t*>(row + 32 * s));
-        reinterpret_cast<float*>(row + G::kInter)[s] = d;
-    }
-    __syncthreads();
+    // The job's count: the down CTAs wait for every gate/up CTA's slices.
     if (tid == 0) {
         __threadfence();
         release_add(&a.ws.job_done[job]);
@@ -1011,7 +997,7 @@ __global__ void __launch_bounds__(kA8Threads) down_a8i_kernel(Args a) {
     fill_a8_scaled(sm.scaled, kA8Threads);
     __shared__ int stalled;
     if (tid == 0) {
-        stalled = wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpRowGroups / kA8Warps + 1), a.ws.error)
+        stalled = wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpRowGroups / kA8Warps), a.ws.error)
                       ? 0
                       : 1;
     }
@@ -1451,17 +1437,19 @@ struct SingleArgs {
     float route_scale = 0.0F;
 };
 
-// A16 (NVFP4 only): x and h as limb rows, with their exponents.
-template <class G, bool A8, bool A16 = false>
+// A16 (NVFP4 only): x and h as limb rows, with their exponents. I8 (NVFP4 only, ExpertActivation::A8): x and h as A8
+// rows.
+template <class G, bool A8, bool A16 = false, bool I8 = false>
 struct SingleSmem {
     using S = Shape<G, A8>;
-    static_assert(!(A8 && A16), "A16 limb rows are the NVFP4 layers'");
+    static_assert(!(A8 && A16) && !(A8 && I8) && !(A16 && I8), "A16 limb rows and A8 rows are the NVFP4 layers'");
     alignas(16) std::uint8_t ring[kSingleWarps][kSingleDepth][S::kStageBytes];
-    alignas(16) std::uint8_t x[A16 ? kA16XRowBytes : S::kXStride];
-    alignas(16) std::uint8_t h[A16 ? kA16HRowBytes : S::kHStride];
+    alignas(16) std::uint8_t x[A16 ? kA16XRowBytes : I8 ? kA8XRowBytes : S::kXStride];
+    alignas(16) std::uint8_t h[A16 ? kA16HRowBytes : I8 ? kA8HRowBytes : S::kHStride];
     int x_emax;
     int h_emax;
     std::int32_t scaled[256];
+    float2 a8_scaled[I8 ? 256 : 1]; // I8: {S, -1.5 * 2^23 * S} of every E4M3 scale word
     alignas(16) float keys[kSingleExperts];
     float sel[kTopK];
     std::int32_t routed[kTopK];
@@ -1474,13 +1462,15 @@ struct SingleSmem {
 
 // Native (NVFP4 A4): the native block-scaled core (a4_native_step) in gate_up_a4_kernel's and down_a4_kernel's chains:
 // gate/up two FP32 chains over the K halves added half 0 + half 1, down one chain in block order; x and h staged in
-// the core's slot order. Not Native (Nvfp4Core::Exact): the exact int64 core.
-template <class G, bool A8, bool A16 = false, bool Native = false>
+// the core's slot order. Not Native (Nvfp4Core::Exact): the exact int64 core. I8 (NVFP4 A8): gate_up_a8i_kernel's and
+// down_a8i_kernel's single chains (a8_unit_terms in block order); each CTA encodes its 64 intermediates (two slices)
+// and publishes them to the job's A8 h row, which every down CTA loads (as MXFP8's groups).
+template <class G, bool A8, bool A16 = false, bool Native = false, bool I8 = false>
 __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleArgs a) {
-    static_assert(!Native || (!A8 && !A16), "the native core is NVFP4 A4's");
+    static_assert(!Native || (!A8 && !A16 && !I8), "the native core is NVFP4 A4's");
     using S = Shape<G, A8>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto& sm      = *reinterpret_cast<SingleSmem<G, A8, A16>*>(smem_raw);
+    auto& sm      = *reinterpret_cast<SingleSmem<G, A8, A16, I8>*>(smem_raw);
     const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
     const int g = lane / 4, t = lane % 4;
     const int cta = static_cast<int>(blockIdx.x);
@@ -1496,7 +1486,11 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
             w[j] = *reinterpret_cast<const uint4*>(a.router + static_cast<std::size_t>(row) * G::kHidden + 8 * (lane + 32 * j));
         }
     }
-    if constexpr (!A8) { a4_mma_fill_scaled(sm.scaled, kSingleThreads); }
+    if constexpr (I8) {
+        fill_a8_scaled(sm.a8_scaled, kSingleThreads);
+    } else if constexpr (!A8) {
+        a4_mma_fill_scaled(sm.scaled, kSingleThreads);
+    }
     // Dependents launch once the gate/up stream is done (below): launched beside this grid they would pack onto the
     // SMs it leaves free and run there (pdl::enter's note).
     pdl::wait_for_dependencies();
@@ -1522,7 +1516,7 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         }
     }
     // The column's activation row (the gate/up's B operand) while the router finishes.
-    constexpr int kXBytes = A16 ? kA16XRowBytes : S::kXRowBytes;
+    constexpr int kXBytes = A16 ? kA16XRowBytes : I8 ? kA8XRowBytes : S::kXRowBytes;
     for (int i = tid; i < kXBytes / 8; i += kSingleThreads) {
         uint2 v = reinterpret_cast<const uint2*>(a.e.x.rows)[i];
         if constexpr (Native) {
@@ -1625,6 +1619,13 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
                     a4_native_step(stage + u * S::kUnit, b_row + 8 * b,
                                    *reinterpret_cast<const std::uint32_t*>(b_row + scales + b), g, t, acc);
                 }
+            } else if constexpr (I8) {
+                // The column's codes at K 16b + 4t .. + 3 for every lane (one column), its slice scale for both.
+                (void)scales;
+                const int k     = down ? G::kInter : G::kHidden;
+                const float d   = *reinterpret_cast<const float*>(b_row + k + 4 * (b / 2));
+                a8_unit_terms(stage + u * S::kUnit, *reinterpret_cast<const unsigned*>(b_row + 16 * b + 4 * t), d, d,
+                              sm.a8_scaled, g, t, acc);
             } else if constexpr (A8) {
                 a8_mma_unit(stage + u * S::kUnit, b_row + 32 * b, b_row[scales + b], lane, g, t, acc);
             } else if constexpr (A16) {
@@ -1642,10 +1643,18 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     // Gate/up: NVFP4 one exact sum s over both halves; MXFP8 c0 over half 0's blocks, c1 over half 1's.
     float c0[4] = {0.0F, 0.0F, 0.0F, 0.0F}, c1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
     long long s[4] = {0, 0, 0, 0};
-    for (int st = 0; st < kGu / 2; ++st) { step(st, c0, s); }
-    for (int st = kGu / 2; st < kGu; ++st) { step(st, c1, s); }
+    if constexpr (I8) { // one chain over all of K
+        for (int st = 0; st < kGu; ++st) { step(st, c0, s); }
+    } else {
+        for (int st = 0; st < kGu / 2; ++st) { step(st, c0, s); }
+        for (int st = kGu / 2; st < kGu; ++st) { step(st, c1, s); }
+    }
     std::uint16_t y[4], up[4];
-    if constexpr (A8) {
+    if constexpr (I8) {
+        const float m = a16_multiplier(a.e.bank.amax[2 * expert], a.e.bank.denominators[0]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { y[i] = offloaded_moe::nvfp4_a8::row_output(c0[i], m); }
+    } else if constexpr (A8) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) { y[i] = canon::f32_to_bf16_rn(canon::add_rn(c0[i], c1[i])); }
     } else if constexpr (Native) {
@@ -1669,7 +1678,23 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
     // Column 0's intermediates (t = 0): gate rows g (even) and g + 8, their up rows from lane + 4.
     std::uint16_t* h_row = a.e.ws.h + static_cast<std::size_t>(slot) * G::kInter;
-    if constexpr (A8) {
+    if constexpr (I8) {
+        // A8: the CTA's 64 intermediates are two whole slices: encoded here (the codec the separate kernels' last CTA
+        // applies, the same values) and published to the job's A8 h row, which every down CTA loads.
+        __shared__ std::uint16_t cta_h[2 * 32];
+        if (t == 0 && (g & 1) == 0) {
+            cta_h[warp * 8 + g / 2]     = swiglu(y[0], up[0], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+            cta_h[warp * 8 + g / 2 + 4] = swiglu(y[2], up[2], gamma, a.e.bank.gate_softcap, a.e.bank.up_softcap);
+        }
+        __syncthreads();
+        if (tid < 2) {
+            a8_encode_slice(cta_h + 32 * tid, a.e.ws.h_a8 + static_cast<std::size_t>(slot) * kA8HRowBytes, G::kInter,
+                            2 * (cta % kSingleCtasPerJob) + tid);
+            __threadfence();
+        }
+        __syncthreads();
+        if (tid == 0) { release_add(counters + 2 + job, kSingleWarps); } // the CTA's 8 row groups
+    } else if constexpr (A8) {
         // MXFP8: the CTA's 8 row groups are 64 consecutive intermediates, two whole groups: quantized here
         // (gate_up_a8_kernel's rule, the same values) and published to the job's h row (codes at 32 a group, the UE8M0
         // words after the 1,152 codes), so each down CTA loads them instead of forming all 36 groups itself.
@@ -1716,7 +1741,13 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
         tile::cp_async_wait<0>();
         return;
     }
-    if constexpr (A8) {
+    if constexpr (I8) {
+        // A8: the job's A8 h row as its 18 CTAs published it (codes, then the FP32 slice scales).
+        (void)h_row;
+        static_assert(kA8HRowBytes % 4 == 0, "the h row in words");
+        const auto* src = reinterpret_cast<const std::uint32_t*>(a.e.ws.h_a8 + static_cast<std::size_t>(slot) * kA8HRowBytes);
+        for (int i = tid; i < kA8HRowBytes / 4; i += kSingleThreads) { reinterpret_cast<std::uint32_t*>(sm.h)[i] = __ldcg(src + i); }
+    } else if constexpr (A8) {
         // MXFP8: the job's h row as its 18 CTAs published it (codes and UE8M0 words, in sm.h's layout).
         (void)h_row;
         static_assert(S::kHRowBytes % 4 == 0 && S::kHRowBytes <= S::kHStride, "the h row in words");
@@ -1815,7 +1846,11 @@ __global__ void __launch_bounds__(kSingleThreads, 1) single_kernel(const SingleA
     tile::cp_async_wait<0>();
     if (t == 0) {
         std::uint16_t lo, hi;
-        if constexpr (A8) {
+        if constexpr (I8) {
+            const float m = a16_multiplier(a.e.bank.amax[2 * expert + 1], a.e.bank.denominators[1]);
+            lo            = offloaded_moe::nvfp4_a8::row_output(cd[0], m);
+            hi            = offloaded_moe::nvfp4_a8::row_output(cd[2], m);
+        } else if constexpr (A8) {
             lo = canon::f32_to_bf16_rn(cd[0]);
             hi = canon::f32_to_bf16_rn(cd[2]);
         } else if constexpr (Native) {
@@ -1974,15 +2009,15 @@ void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t exp
 
 namespace {
 // Sets the instance's shared-memory attributes (every launch of it follows a check here) and whether its grid fits.
-template <bool A8, bool A16, bool Native = false>
+template <bool A8, bool A16, bool Native = false, bool I8 = false>
 bool single_fits() {
     using G = Inkling;
-    allow_shared(single_kernel<G, A8, A16, Native>, sizeof(SingleSmem<G, A8, A16>));
+    allow_shared(single_kernel<G, A8, A16, Native, I8>, sizeof(SingleSmem<G, A8, A16, I8>));
     int device = 0, sms = 0, blocks = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, single_kernel<G, A8, A16, Native>, kSingleThreads,
-                                                             sizeof(SingleSmem<G, A8, A16>)));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, single_kernel<G, A8, A16, Native, I8>, kSingleThreads,
+                                                             sizeof(SingleSmem<G, A8, A16, I8>)));
     return blocks >= 1 && static_cast<long long>(blocks) * sms >= kSingleCtas;
 }
 } // namespace
@@ -1991,8 +2026,9 @@ bool moe_single_supported(ExpertFormat format, ExpertActivation activation) {
     static const bool a4  = single_fits<false, false>() && single_fits<false, false, true>();
     static const bool a8  = single_fits<true, false>();
     static const bool a16 = single_fits<false, true>();
+    static const bool i8  = single_fits<false, false, false, true>();
     if (format == ExpertFormat::Mxfp8) { return activation == ExpertActivation::Checkpoint && a8; }
-    if (activation == ExpertActivation::A8) { return false; } // the NVFP4 A8 route has no single-launch kernel
+    if (activation == ExpertActivation::A8) { return i8; }
     return activation == ExpertActivation::A16 ? a16 : a4;
 }
 
@@ -2008,8 +2044,13 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
         throw std::invalid_argument("w4a4_sparse_moe single: the device cannot hold its grid resident");
     }
     const bool a16 = rows.activation == ExpertActivation::A16;
+    const bool i8  = rows.activation == ExpertActivation::A8;
     if (a16 && (rows.rows == nullptr || rows.emax == nullptr)) {
         throw std::invalid_argument("w4a4_sparse_moe single A16: the column's limb row and exponent");
+    }
+    if (i8 && (rows.rows == nullptr || bank.format != ExpertFormat::Nvfp4FourOverSix || workspace.h_a8 == nullptr)) {
+        throw std::invalid_argument("w4a4_sparse_moe single A8: an NVFP4 layer, the column's A8 row and a workspace carved "
+                                    "for A8");
     }
     SingleArgs args;
     args.e           = Args{rows, Routing{workspace.routed, workspace.gamma}, bank, workspace, outputs};
@@ -2017,7 +2058,12 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
     args.router      = router;
     args.bias        = bias;
     args.route_scale = route_scale;
-    if (bank.format == ExpertFormat::Nvfp4FourOverSix && a16) {
+    if (i8) {
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
+                                    {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, false, false, true>),
+                                     stream},
+                                    single_kernel<G, false, false, false, true>, args));
+    } else if (bank.format == ExpertFormat::Nvfp4FourOverSix && a16) {
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
                                     {dim3(kSingleCtas), dim3(kSingleThreads), sizeof(SingleSmem<G, false, true>), stream},
                                     single_kernel<G, false, true>, args));

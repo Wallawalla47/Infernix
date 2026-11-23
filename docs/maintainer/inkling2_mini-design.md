@@ -996,12 +996,21 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
     prompt route's grouped GEMM (`wide_expert_a8.cuh` with this model's epilogues) give an entry the same bits.
   - Unchanged, as Basalt: the MXFP8 experts (W8A8 already; Basalt requantizes them to Q8_0, a lossy weight change not
     taken here), the message gates and the router (16-bit activations; Basalt FP32), the attention arithmetic.
+  - The 8-bit inputs are written by the kernels that produce the BF16 ones, so a call launches no encoder for them:
+    K2's by visit_entry (EntryArgs::x8) or, in a message visit, gate_exit (GateExitArgs::x8); the experts' x by
+    mlp_entry / gate_exit (ExpertRows::a8); W_o's in a decode call by attention()'s combine (AttentionArgs::out8; a
+    prompt call's W_o encodes its input in the projection call). Every producer applies the same codec to the same BF16
+    values (the op tests compare their rows with the codec's host definition byte for byte), so where an input is
+    encoded changes no bit. A call that still encodes (the head, a prompt call's W_o) does its distinct inputs in one
+    launch. A decode call of one column runs the NVFP4 experts in one launch (moe_single's A8 instance: the separate
+    kernels' bits).
   Quality (2026-11-23, perplexity quick set, 291,842 tokens, bf16 KV, KL against the default route's logits): PPL
-  4.02607 against the default's 4.03144 and `--q8-weights`' 4.03419 (lower on wikitext, pg19, zhwiki and ninfer);
-  KL 8.43e-3, top-1 96.5 % (`--q8-weights` alone 1.06e-2, 96.0 %). The fake-quantized estimate of the dense
-  projections alone (8-bit inputs on the BF16-weight kernels, the experts W4A4) read KL 1.07e-2 and PPL 4.0318, per-token
-  scales 1.14e-2 (rejected): the 8-bit expert activations, not the dense route, bring the KL below this model's usual
-  ~1e-2 floor (a reading not tested further: the checkpoint's 4-bit activations amplify any upstream difference).
+  4.02607 against the default's 4.03144 and `--q8-weights`' 4.03419 (wikitext 5.9536 / 5.9671, pg19 6.2370 / 6.2518,
+  zhwiki 5.2716 / 5.2772 lower; ninfer 1.48938 / 1.48914 higher); KL 8.43e-3, top-1 96.5 % (`--q8-weights` alone
+  1.06e-2, 96.0 %). The fake-quantized estimate of the dense projections alone (8-bit inputs on the BF16-weight kernels,
+  the experts W4A4) read KL 1.07e-2 and PPL 4.0318, per-token scales 1.14e-2 (rejected). A reading, not isolated by
+  any arm: the 8-bit expert activations, not the dense route, bring the KL below this model's usual ~1e-2 floor (the
+  checkpoint's 4-bit activations may amplify any upstream difference).
 
 ---
 

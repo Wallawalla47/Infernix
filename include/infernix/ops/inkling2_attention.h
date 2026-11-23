@@ -209,6 +209,11 @@ struct AttentionArgs {
     KvView kv;
     AttentionWorkspace ws;
     std::uint16_t* out = nullptr;           // a [T][24 * 128] (padding columns: zero)
+    // attention() under --a8-activations: out's A8 rows too (W_o's 8-bit inputs, ops/ggml/ggml_a8.h's codec of the BF16
+    // out: a column's 3,072 codes then 96 FP32 scales, out8_stride words apart; padding columns all zero), so W_o's call
+    // encodes nothing. attention_prompt ignores them.
+    std::int32_t* out8      = nullptr;
+    std::int32_t out8_stride = 0;
     // attention(): the prologue inside the attention launch (a call without padding columns whose every lane is one
     // group: a lane's second group would read keys its first group's CTAs store): each CTA computes its
     // rows' q and r, and the CTA(s) reading a unit the call's new keys and values in it (stored as the prologue

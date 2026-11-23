@@ -109,6 +109,10 @@ struct EntryArgs {
     // one x to each non-null x[i]).
     const std::uint16_t* norms[3] = {};
     std::uint16_t* x[3]           = {};
+    // --a8-activations: the x outputs' A8 rows too (K2's 8-bit inputs: ops/ggml/ggml_a8.h's codec of the BF16 x, a
+    // column's 2,304 codes then 72 FP32 scales, x8_stride words apart), each non-null x8[i] beside x[i].
+    std::int32_t* x8[3]      = {};
+    std::int32_t x8_stride   = 0;
     // Loop passes 2-3: the message queries [4][H] (q, k, v, mlp; the first three used here) and the previous pass's
     // two message sources; the kernel then writes mixed (FP32 [nq][T][H]), message (FP32 [3][T][H]) and gate_input
     // (BF16 [3][T][2H]) instead of x.
@@ -128,6 +132,9 @@ struct ExpertRows {
     std::uint8_t* rows            = nullptr;
     float* amax                   = nullptr;
     std::int32_t* emax            = nullptr;
+    // --a8-activations (NVFP4 layers): rows as A8 rows [T][w4a4_moe::kA8XRowBytes] (ops/ggml/ggml_a8.h's codec of the
+    // BF16 MLP input, moe_encode_a8's bits).
+    bool a8                       = false;
 };
 
 struct MlpEntryArgs {
@@ -164,6 +171,9 @@ struct GateExitArgs {
     const float* fg      = nullptr;    // FP32 [kinds][T][2H]: the forget projection, then the gain projection
     const std::uint16_t* norms[3] = {}; // per kind (a sliding layer passes its one norm three times)
     std::uint16_t* x[3]           = {}; // per kind [T][H]
+    // --a8-activations: per kind x's A8 rows too (K2's 8-bit inputs, EntryArgs::x8's layout; null: none).
+    std::int32_t* x8[3]    = {};
+    std::int32_t x8_stride = 0;
     ExpertRows rows;                    // the mlp kind: the experts' rows of x[0] (rows.rows null: none)
 };
 void gate_exit(const GateExitArgs& args, cudaStream_t stream);
