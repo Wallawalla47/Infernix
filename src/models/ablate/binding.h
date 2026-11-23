@@ -24,6 +24,10 @@ struct AblateSidecarBinding {
     // The startup log's warning when the sidecar names another artifact than `loaded` as the one it was fitted on (it
     // loads, as the geometry matches, but was not measured there); empty when it names none or this one.
     [[nodiscard]] std::string artifact_mismatch(const artifact::ArtifactId& loaded) const;
+    // The device bytes the direction takes (prepare_ablate's copy): what a plan counts before anything is allocated.
+    [[nodiscard]] std::uint64_t device_bytes() const noexcept {
+        return static_cast<std::uint64_t>(sidecar.d_host.size()) * sizeof(float);
+    }
 };
 
 // Reads `path` against the model's geometry (artifact::AblateSidecar::load's checks).

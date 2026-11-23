@@ -130,6 +130,7 @@ struct State {
     bool experts = false;
     bool memory  = true; // --fake-no-memory: an older server without the memory breakdown
     bool lora    = false; // --lora: a rank-32 adapter's factors on the device
+    bool ablate  = false; // --ablate: a shared direction (a dense 27B's 20 KiB, Flash-Next's 10 KiB)
     std::uint64_t next_id        = 1;
     std::uint64_t completed      = 0;
     std::uint64_t prefill_tokens = 0;
@@ -227,6 +228,8 @@ Json memory_json() {
         device   = {part("weights", 6608125952ull), part("drafter", 775946240ull), experts(8729, 2763828),
                     filled("kv_cache", 170 * kMiB, held * 8192), part("state", 680 * kMiB), part("prefix_cache", 0),
                     part("workspace", 356 * kMiB), part("cuda_graphs", 136 * kMiB), part("staging", 210 * kMiB)};
+        // An ablation sidecar's direction beside the experts, as Qwen3.8-Flash-Next reports it.
+        if (g_state.ablate) { device.insert(device.begin() + 2, part("adapter", 10240)); }
         ram_others = 14 * kGiB;
         host       = {part("weights", 910 * kMiB), experts(23808, 2815313), filled("prefix_cache", 4 * kGiB, computed * 24576),
                       part("ngram", kGiB), part("staging", 288 * kMiB)};
@@ -234,12 +237,15 @@ Json memory_json() {
     } else {
         headroom = kGiB;
         others   = 1229 * kMiB;
+        // An MTP drafter's own KV pool beside the KV cache, as a Qwen3.5 model with --spec mtp reports it.
         device   = {part("weights", static_cast<std::uint64_t>(21.4 * static_cast<double>(kGiB))), part("drafter", 740 * kMiB),
-                    filled("kv_cache", 2 * kGiB, held * 32768), part("state", 680 * kMiB),
+                    filled("kv_cache", 2 * kGiB, held * 32768), part("mtp_kv", 48 * kMiB), part("state", 680 * kMiB),
                     filled("prefix_cache", 256 * kMiB, g_state.completed * 24 * kMiB), part("workspace", 1500000000ull),
                     part("cuda_graphs", 530000000ull), part("staging", 64 * kMiB)};
-        // A dense model's adapter, after the drafter (the server omits a part that holds nothing).
-        if (g_state.lora) { device.insert(device.begin() + 2, part("adapter", 304 * kMiB)); }
+        // A dense model's adapters (a LoRA adapter's factors, an ablation sidecar's direction) after the drafter: the
+        // server omits a part that holds nothing.
+        const std::uint64_t adapter = (g_state.lora ? 304 * kMiB : 0) + (g_state.ablate ? 20480 : 0);
+        if (adapter != 0) { device.insert(device.begin() + 2, part("adapter", adapter)); }
         ram_others = 18 * kGiB;
         host       = {part("weights", 910 * kMiB), filled("prefix_cache", 4 * kGiB, computed * 24576), part("staging", 288 * kMiB)};
     }
@@ -649,6 +655,7 @@ void print_help() {
         "  --expert-state FILE|off    expert cache state\n"
         "  --vision                   load the vision tower\n"
         "  --lora PATH                a LoRA adapter (its factors: 304 MiB of VRAM)\n"
+        "  --ablate FILE              an ablation sidecar (its direction: 20 KiB of VRAM)\n"
         "FAKE\n"
         "  --fake-load-ms N           loading time\n"
         "  --fake-fail-load TEXT      fail the load\n"
@@ -669,7 +676,7 @@ int write_plan(const std::string& file, std::uint64_t context) {
     const std::uint64_t max_context = (free_bytes - weights - headroom - 2030000000ull) / 33792ull / 4096 * 4096;
     if (context == 0) { context = max_context; }
     const std::uint64_t minimum    = 2030000000ull + context * 33792ull;
-    const std::uint64_t adapter    = g_state.lora ? 318767104ull : 0ull;
+    const std::uint64_t adapter    = (g_state.lora ? 318767104ull : 0ull) + (g_state.ablate ? 20480ull : 0ull);
     const std::uint64_t planned    = weights + adapter + minimum + headroom;
     const bool fits                = planned <= free_bytes;
     const Json plan = {
@@ -695,7 +702,7 @@ int write_plan(const std::string& file, std::uint64_t context) {
           {"expert_cache_bytes", nullptr},
           {"expert_frames", nullptr},
           {"draft_screen_bytes", nullptr},
-          {"adapter_bytes", g_state.lora ? Json(adapter) : Json(nullptr)},
+          {"adapter_bytes", adapter != 0 ? Json(adapter) : Json(nullptr)},
           {"headroom_bytes", headroom},
           {"planned_bytes", planned},
           {"left_bytes", fits ? free_bytes - planned : 0}}},
@@ -769,6 +776,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--lora") {
             (void)value();
             g_state.lora = true;
+        } else if (arg == "--ablate") {
+            (void)value();
+            g_state.ablate = true;
         } else if (arg == "--log-level") {
             const std::string level = value();
             g_info_logged = level == "trace" || level == "debug" || level == "info";

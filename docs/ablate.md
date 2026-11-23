@@ -101,7 +101,10 @@ degenerate row on a cut layer, and no `generation.source`.
 ## Memory and speed
 
 The direction takes `rows x hidden_size x 4` bytes of VRAM (Qwen3.8-Flash-Next: 10 KiB shared, 480 KiB as a per-layer
-stack), the memory summary's `adapter_bytes`.
+stack), the memory summary's `adapter_bytes`: `infernix-serve --plan` counts it in `vram.adapter_bytes` (and with
+offloaded experts, before the expert cache's frames), the server's memory telemetry in the device part `adapter`,
+and the launcher shows it as **Adapters** in **Will it fit?** (checked again when the sidecar changes) and in the
+dashboard's Memory panel. On Qwen3.5 a cut lane's copy of the residual is workspace, in `vram.workspace_bytes`.
 
 On Qwen3.8-Flash-Next a cut lane launches no extra kernel and takes no workspace: its inject is the cut inject in place
 of the plain one. Against the plain inject a cut inject costs about 0.4 us per call at one to 32 columns, and the fused

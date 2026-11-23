@@ -43,7 +43,8 @@ KV, no fast path, FP32 logits ([definition](maintainer/lossless-route.md)). Save
 `--save-top-tokens`, it is the reference that `--kl-reference` measures other runs against, and
 `report.json` records it as `lossless`. [Model-level numerical quality](maintainer/model-quality.md)
 has the method and the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
-`--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
+`--ngram-volume FILE` names it, as in `infernix` (and with offloaded experts, Flash-Next's or the 122B's,
+`--expert-stripe FILE` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final
 residual; the LM head then runs over them in tiles of 64 positions with FP32 logits. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `infernix` and

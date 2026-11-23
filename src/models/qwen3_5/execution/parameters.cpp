@@ -415,7 +415,7 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
         if (model.weights_resident()) {
             ablate = models::prepare_ablate(binding, config.num_hidden_layers, config.hidden_size);
         } else {
-            planned_ablate_bytes = binding->sidecar.d_host.size() * sizeof(float);
+            planned_ablate_bytes = binding->device_bytes();
         }
     }
     // The exact route decodes and verifies request-invariant on every artifact; a projection with

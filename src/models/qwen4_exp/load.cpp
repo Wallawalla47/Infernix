@@ -671,6 +671,8 @@ std::uint64_t LoadPlan::pinned_other_bytes() const {
 
 bool LoadPlan::has_output_head_screen() const { return impl_->weights.output_head_screen.valid(); }
 
+const AblateSidecarBinding* LoadPlan::ablate() const { return impl_->ablate ? &*impl_->ablate : nullptr; }
+
 std::uint64_t LoadPlan::device_bytes() const {
     return impl_->materialization.device_capacity_bytes + impl_->packed_bytes +
            (impl_->draft_materialization ? impl_->draft_materialization->device_capacity_bytes : 0);

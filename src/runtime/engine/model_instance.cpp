@@ -441,8 +441,12 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
         }
     }
     if (offload != nullptr) {
+        // Not yet on the device: the weights and what a start allocates beside them before its frames. On the 122B
+        // that is an --ablate sidecar's direction (12 KiB shared, 576 KiB per layer: under one frame); it takes no
+        // --lora, and its DFlash2 head (hidden size 3072) has no draft screen.
         const OffloadedFrames estimate =
-            estimate_offloaded_frames(*instance.model, sequence, reservation, vram.weights_bytes,
+            estimate_offloaded_frames(*instance.model, sequence, reservation,
+                                      vram.weights_bytes + planned_beside_weights_bytes(vram),
                                       open_vram_budget_source(device.device, options.vram_past_budget)->query(),
                                       *offload, device);
         vram.expert_frames      = estimate.frames;

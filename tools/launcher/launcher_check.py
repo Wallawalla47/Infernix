@@ -415,7 +415,7 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         parts = device.get("parts") or []
         keys = [part.get("key") for part in parts]
         check("/launcher/api/metrics carries the server's memory by part",
-              {"weights", "kv_cache", "workspace", "cuda_graphs"} <= set(keys) and device.get("total_bytes", 0) > 0
+              {"weights", "kv_cache", "mtp_kv", "workspace", "cuda_graphs"} <= set(keys) and device.get("total_bytes", 0) > 0
               and (device.get("process_bytes") or 0) >= sum(part.get("bytes", 0) for part in parts)
               and bool((held.get("host") or {}).get("parts")) and "ssd" in held and held["ssd"] is None, str(keys))
 
@@ -449,6 +449,23 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
               status == 200 and status_lora == 200 and "Adapters" in labels
               and (adapted.get("vram") or {}).get("planned", 0) - (plain.get("vram") or {}).get("planned", 0)
               == 318767104, str(labels))
+        # So is an ablation sidecar's direction (a dense 27B's 20 KiB), alone and beside a LoRA adapter's factors.
+        sidecar = Path(tempfile.mkdtemp(prefix="infernix-launcher-ablate-")) / "sidecar.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        status_cut, cut = call(port, "POST", f"{cfg}/plan",
+                               {"args": fast + ["--max-context", "65536", "--ablate", str(sidecar)]})
+        status_both, both = call(port, "POST", f"{cfg}/plan", {"args": fast + [
+            "--max-context", "65536", "--lora", str(adapter_dir), "--ablate", str(sidecar)]})
+
+        def adapters(plan: dict) -> int | None:
+            found = [part for part in (plan.get("vram") or {}).get("parts", []) if part.get("label") == "Adapters"]
+            return found[0].get("bytes") if found else None
+
+        planned = lambda plan: (plan.get("vram") or {}).get("planned", 0)  # noqa: E731
+        check("an ablation sidecar's direction is the plan's Adapters part and counts in what it plans",
+              status_cut == 200 and status_both == 200 and adapters(cut) == 20480 and adapters(both) == 318767104 + 20480
+              and planned(cut) - planned(plain) == 20480 and planned(both) - planned(adapted) == 20480,
+              f"{adapters(cut)} {adapters(both)} {planned(cut) - planned(plain)} {planned(both) - planned(adapted)}")
         status, plan = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "250000"]})
         suggestions = plan.get("suggestions", [])
         first = suggestions[0] if suggestions and isinstance(suggestions[0], dict) else {}

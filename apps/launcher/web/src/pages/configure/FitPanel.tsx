@@ -15,7 +15,7 @@ import { errorMessage } from "@/lib/api";
 import type { EnvVar, FitPlan, PlanBudget } from "@/lib/api-types";
 import { getFlagString, sameArgs, setFlag, type TakesValue } from "@/lib/args";
 import { cleanEnv, sameEnv, usePlan } from "@/lib/configs";
-import { formatContext, formatGiB, formatInt } from "@/lib/format";
+import { formatBytes, formatContext, formatGiB, formatInt } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
@@ -80,7 +80,10 @@ function BudgetBar({ label, icon: Icon, budget }: { label: string; icon: typeof 
               <span className="min-w-0 truncate text-muted-foreground" title={part.label}>
                 {part.label}
               </span>
-              <span className="shrink-0 tabular-nums">{formatGiB(part.bytes, 2)}</span>
+              {/* A part under 10 MiB (an ablation sidecar's direction is a few KiB) reads in its own unit, not 0.00 GiB. */}
+              <span className="shrink-0 tabular-nums">
+                {part.bytes < 10 * 1024 ** 2 ? formatBytes(part.bytes, { binary: true }) : formatGiB(part.bytes, 2)}
+              </span>
             </li>
           ))}
         </ul>
@@ -269,18 +272,28 @@ export function FitCard({
   // longer fits beside it), so turning it on checks at once and offers the context that fits.
   const hadVision = useRef(args.includes("--vision"));
   // A LoRA adapter's factors take VRAM beside the weights (304 MiB for a rank-32 adapter on a 27B's every
-  // projection), so setting or changing one checks at once too.
-  const loraOf = (list: string[]) => {
-    const at = list.indexOf("--lora");
+  // projection), and the plan reads an ablation sidecar against the model (refusing a malformed one) and counts its
+  // direction and a cut lane's copy of the residual, so setting or changing either checks at once too.
+  const valueOf = (list: string[], flag: string) => {
+    const at = list.indexOf(flag);
     return at >= 0 && at + 1 < list.length ? list[at + 1] : "";
   };
-  const hadLora = useRef(loraOf(args));
+  const hadLora = useRef(valueOf(args, "--lora"));
+  const hadAblate = useRef(valueOf(args, "--ablate"));
   useEffect(() => {
     const hasVision = args.includes("--vision");
-    const lora = loraOf(args);
-    if (((hasVision && !hadVision.current) || (lora !== "" && lora !== hadLora.current)) && !plan.isPending) run();
+    const lora = valueOf(args, "--lora");
+    const ablate = valueOf(args, "--ablate");
+    const changed = (now: string, before: string) => now !== "" && now !== before;
+    if (
+      ((hasVision && !hadVision.current) || changed(lora, hadLora.current) || changed(ablate, hadAblate.current)) &&
+      !plan.isPending
+    ) {
+      run();
+    }
     hadVision.current = hasVision;
     hadLora.current = lora;
+    hadAblate.current = ablate;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- runs on edits to the parameters only
   }, [args]);
 

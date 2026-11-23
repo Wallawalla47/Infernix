@@ -3558,6 +3558,7 @@ public:
         const std::uint64_t draft   = model.draft_device_bytes();
         out.device.weights          = model.device_weight_bytes() - draft;
         out.device.drafter          = draft + plan_.bytes.drafter;
+        out.device.adapter          = parameters_.ablate_bytes(); // --ablate's direction (0 without a sidecar)
         out.device.state            = plan_.bytes.state + plan_.bytes.io - plan_.bytes.drafter;
         out.device.workspace        = work_capacity_;
         out.device.staging          = plan_.bytes.staging + plan_.bytes.residency;

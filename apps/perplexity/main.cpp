@@ -53,7 +53,7 @@ struct Options {
     std::optional<std::filesystem::path> save_top_tokens;
     std::optional<std::filesystem::path> save_tokens;
     std::optional<std::filesystem::path> kl_reference;
-    std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
+    std::filesystem::path expert_stripe; // offloaded experts' record tails on a second drive
     std::filesystem::path lora;          // --lora: EngineOptions::lora_path
     std::filesystem::path ablate;        // --ablate: EngineOptions::ablate_sidecar_path
     float rope_yarn_factor              = 1.0F;
@@ -121,8 +121,9 @@ std::string usage_text() {
            "        evaluator that writes a --kl-reference of the same windows)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
            "        same corpus, context and stride, by context length)\n"
-           "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
-           "        drive, read beside the artifact by the SSD expert tier)\n"
+           "       [--expert-stripe <file>] (offloaded experts, Qwen3.8-Flash-Next and Qwen3.5-122B:\n"
+           "        the expert record tails on a second drive, read beside the artifact by the SSD\n"
+           "        expert tier)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 

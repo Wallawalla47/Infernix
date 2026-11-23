@@ -717,19 +717,20 @@ struct EngineOptions {
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
-    // Qwen3.8-Flash-Next ablation sidecar (docs/ablate.md): a sidecar.json naming a
-    // direction file and a per-layer alpha table. Empty (no --ablate): nothing loads, nothing
-    // hooks, behavior byte-identical to the standard engine.
+    // Ablation sidecar, every model (docs/ablate.md): a sidecar.json naming a direction file and
+    // per-layer alpha tables. Empty (no --ablate): nothing loads, nothing hooks, behavior
+    // byte-identical to the standard engine.
     std::filesystem::path ablate_sidecar_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
-    // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
-    // before the first request (warm start), written at stop and every 10 minutes between requests.
-    // Without a usable file (none given, a first start, another artifact's) the cache is seeded from the
-    // built-in calibrated expert order instead, and only a given file is saved.
+    // Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the saved expert-cache state, read at
+    // startup to fill the VRAM expert cache before the first request (warm start), written at stop and
+    // every 10 minutes between requests. Without a usable file (none given, a first start, another
+    // artifact's) the cache is seeded from the model's built-in calibrated expert order instead (half the
+    // frames on the 122B), and only a given file is saved.
     std::filesystem::path expert_state_path;
     // --expert-state off: no file and no seed, so the expert cache starts empty (cold benchmarks).
     bool expert_state_off = false;
-    // Qwen3.8-Flash-Next's expert stripe (tools/flash_next/expert_stripe.py): the tail of every routed
+    // Offloaded experts' stripe (tools/flash_next/expert_stripe.py): the tail of every routed
     // expert record on a second drive, read beside each record's head in the artifact when the SSD
     // expert tier serves the experts. Empty: whole records from the artifact.
     std::filesystem::path expert_stripe_path;
@@ -2099,7 +2100,8 @@ struct MemoryUsage {
     struct Device {
         std::uint64_t weights       = 0; // the model's device weights, the drafter's excepted
         std::uint64_t drafter       = 0; // a separate drafter's weights, and the drafters' columns, rings and pools
-        std::uint64_t adapter       = 0; // a LoRA adapter's factors (--lora; its per-call U is in `workspace`)
+        std::uint64_t adapter       = 0; // a LoRA adapter's factors (--lora; its per-call U is in `workspace`) and an
+                                         // ablation sidecar's direction (--ablate)
         std::uint64_t experts       = 0; // the VRAM expert cache's frames that hold experts
         std::uint32_t expert_frames = 0;
         std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
@@ -2209,8 +2211,9 @@ struct EnginePlanVram {
     // Offloaded experts: the VRAM expert cache's frames and bytes.
     std::optional<std::uint64_t> expert_cache_bytes;
     std::optional<std::uint32_t> expert_frames;
-    // Qwen3.5 family, beside the weights' arena: the DFlash2 drafter's proposal-head screen, and a LoRA adapter's
-    // factors (--lora; the adapter's per-call workspace is in workspace_bytes). Empty when the start has none.
+    // Beside the weights' arena: the DFlash2 drafter's proposal-head screen (Qwen3.5 family), and the adapters, a
+    // LoRA adapter's factors (--lora, Qwen3.5 dense) and an ablation sidecar's direction (--ablate, every model); their
+    // per-call workspace is in workspace_bytes. Empty when the start has none.
     std::optional<std::uint64_t> draft_screen_bytes;
     std::optional<std::uint64_t> adapter_bytes;
     // Left free for the display and other programs (--vram-headroom-mib or the automatic headroom).

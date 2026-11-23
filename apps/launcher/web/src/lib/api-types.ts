@@ -679,6 +679,7 @@ export type MemoryPartKey =
   | "adapter"
   | "experts"
   | "kv_cache"
+  | "mtp_kv"
   | "state"
   | "prefix_cache"
   | "workspace"

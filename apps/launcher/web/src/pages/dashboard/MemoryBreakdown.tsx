@@ -15,6 +15,7 @@ import { cn } from "@/lib/utils";
 
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
+const KiB = 1024;
 
 type Pool = "device" | "host" | "ssd";
 
@@ -30,13 +31,14 @@ interface KeySpec {
 
 // The bars' order: the contract's keys, but with the KV cache beside the prefix cache. The two trade
 // pages with every request (the prefix cache gives up what a growing KV cache takes), so beside each
-// other only their shared boundary moves and the other parts keep their places. Twelve keys share
+// other only their shared boundary moves and the other parts keep their places. Thirteen keys share
 // eight hues: the slots were chosen so that neighbours in realistic bars (with or without a drafter,
 // experts, device prefix slots, CUDA graphs) stay apart for normal and colour-blind vision in both
 // themes (model state and the KV cache swapped hues when they swapped places, so the bar's run of
 // colours is the validated one); staging, the n-gram table and the n-gram archive, the smallest and
 // rarest, reuse the hue of workspace, of the drafter and of CUDA graphs (a Device-only part, so it
-// never shares a bar with the archive), striped.
+// never shares a bar with the archive), striped, as the adapters reuse the experts' and the MTP KV
+// cache the KV cache's.
 const KEYS: Record<MemoryPartKey, KeySpec> = {
   weights: {
     label: "Model weights",
@@ -68,6 +70,14 @@ const KEYS: Record<MemoryPartKey, KeySpec> = {
     },
   },
   state: { label: "Model state", slot: 4, what: { device: "Recurrent (GDN) state, per-request rows and input/output buffers." } },
+  // The MTP drafter's own KV pool (Qwen3.5 with --spec mtp) takes the KV cache's hue, striped, on its far side from
+  // the prefix cache, so the KV cache and the prefix cache stay neighbours.
+  mtp_kv: {
+    label: "MTP KV cache",
+    slot: 6,
+    striped: true,
+    what: { device: "The MTP drafter's own KV page pool, beside the model's KV cache (Qwen3.5 with MTP drafting)." },
+  },
   kv_cache: {
     label: "KV cache",
     slot: 6,
@@ -123,6 +133,8 @@ interface Segment {
 /** Memory sizes: GiB from 1 GiB, MiB below. */
 function formatMemory(bytes: number): string {
   if (bytes >= GiB) return `${(bytes / GiB).toFixed(bytes >= 100 * GiB ? 0 : 1)} GiB`;
+  // An ablation sidecar's direction is a few KiB: it reads as such, not as 0 MiB.
+  if (bytes < MiB) return `${Math.max(1, Math.round(bytes / KiB))} KiB`;
   return `${Math.round(bytes / MiB)} MiB`;
 }
 
