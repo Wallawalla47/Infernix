@@ -829,10 +829,11 @@ width (a width threshold broke prefix restores on Flash-Next: L16).
 ### 9.4 Formats
 
 BF16 rings; the full pools in every profile of [§7.6](#76-kv-profiles), decoded into the decode and prompt kernels'
-tiles by `decode_unit` (`attention_common.cuh`) and encoded by the append. The lossless route (scored windows,
-`execution/lossless.cpp`) reads the window's own keys: exact scores (lossless_linear), the eager form's BF16 roundings
-with the bias, mask and sink and a correctly rounded softmax (`lossless_inkling2_attention_probs`), BF16 V
-([lossless route §3a](lossless-route.md#3a-the-route)).
+tiles by `decode_unit` (`attention_common.cuh`) and encoded by the append. The lossless route
+(`execution/lossless.cpp`) reads a scored window's own keys, or in generation the keys before the call from these rings
+and pages (holding BF16 V on that route) followed by the call's own: exact scores (lossless_linear), the eager form's
+BF16 roundings with the bias, mask and sink and a correctly rounded softmax (`lossless_inkling2_attention_probs`), BF16
+V ([lossless route §3a](lossless-route.md#3a-the-route)).
 
 ---
 

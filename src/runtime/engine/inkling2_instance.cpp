@@ -130,13 +130,13 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     refuse(options.reference && options.kv_cache != KvCacheStorage::BFloat16,
            "the design reference is built for --kv-dtype bf16 only (V stored as FP16); the coded formats are not yet");
     if (options.lossless) {
-        // The lossless route (docs/maintainer/lossless-route.md §2b): a scored window in one pass, text only.
-        refuse(options.purpose != EnginePurpose::CausalScoring,
-               "--lossless scores windows (causal scoring); lossless generation is not built for Inkling 2 yet");
-        refuse(options.enable_vision, "--lossless scores text windows (no --vision)");
+        // The lossless route (docs/maintainer/lossless-route.md §2b, §3a): a scored window in one pass, or generation
+        // in the cache form (eager calls, a lane at a time), text only.
+        refuse(options.enable_vision, "--lossless takes text (no --vision)");
         refuse(options.expert_a16_activations, "--lossless runs the experts' declared arithmetic (no --a16-activations)");
         refuse(options.q8_weights, "--lossless takes the artifact's exact weights (no --q8-weights)");
-        refuse(options.kv_cache != KvCacheStorage::BFloat16, "--lossless reads the window's own keys (--kv-dtype bf16)");
+        refuse(options.kv_cache != KvCacheStorage::BFloat16,
+               "--lossless keeps K and V exactly (--kv-dtype bf16; V stored as BF16 on this route)");
         refuse(options.fast_paths, "--lossless has no fast paths");
     }
     refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
@@ -255,6 +255,7 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     }
     if (spec.backend == SpeculativeBackend::DSpark) {
         refuse(options.purpose != EnginePurpose::Generation, "DSpark drafts for generation only");
+        refuse(options.lossless, "--lossless has no speculation (no --spec dspark)");
         refuse(spec.proposal_head != ProposalHead::Full, "--lm-head-draft is not available with DSpark yet");
         if (spec.draft_tokens_auto) {
             if (spec.draft_tokens == 0 || spec.draft_tokens > 7) { spec.draft_tokens = 7; } // the block less its anchor

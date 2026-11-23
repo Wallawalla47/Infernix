@@ -280,8 +280,10 @@ struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
     bool causal_scoring           = false;
-    // --lossless (causal scoring only): each window scored in one pass by LosslessForward (lossless.h); with
-    // `reference`, the design reference (--reference: V stored as the bf16 profile's FP16).
+    // --lossless (LosslessForward, lossless.h): causal scoring scores each window in one pass; generation runs every
+    // prefill chunk and decode call of a lane through the cache form (eager calls, one lane at a time; the K and V
+    // pages and rings hold BF16 values, V too). `reference` (causal scoring only): the design reference
+    // (--reference: V stored as the bf16 profile's FP16).
     bool lossless  = false;
     bool reference = false;
     // Columns a prefill call takes of one lane (1..kMaxPrefillChunk); the forward's call capacity follows it.

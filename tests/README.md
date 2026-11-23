@@ -542,6 +542,12 @@ reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it rep
 turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them. Each `--kv-dtype` format of
 the full pools runs as such a variant too (accepted with `--reproducible`), with DSpark equal to its plain tokens and a
 10,000-token prompt's continuation the same in chunks of 4,096 and 1,000; bf16p must give bf16's tokens throughout.
+`infernix_inkling2_lossless_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) checks the `--lossless` route's cache form
+(generation) against its window form (scoring), the exact oracle: a 1,226-token sequence's logits byte for byte over
+calls of mixed widths (one wider than a sliding visit's ring, single-column decode calls, calls across the ring's wrap
+and the 1,024-key window, a restored state) through a permuted block table; then Engine generation: greedy tokens are
+the lossless scoring Engine's top tokens, prompt readouts (resumed from the prefix cache too) its log-probabilities bit
+for bit, and sampled requests give the same tokens alone, two at once, at another chunk and resumed.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

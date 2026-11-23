@@ -11,10 +11,21 @@
 // expert into 64-column tiles), the exact gate/up products times amax_e outer / den (NVFP4) rounded to BF16, the
 // softcapped SwiGLU times gamma, h quantized the same way, the exact down products rounded to BF16, and the 8 slots
 // folded in slot order in binary32 and rounded to BF16 (the trained arithmetic; owner decision D4 pending).
+//
+// The cache form (lossless.h): each convolution runs over its input with the lane's last conv_kernel - 1 inputs before
+// the call prepended (lossless_inkling2_ring_load: the reproducible route's conv rings, zeros before position 0), its
+// outputs at the call's columns taken, and the call's inputs stored back (ring_store); attention's key planes hold the
+// keys the call's queries can see before the call (a sliding visit's last sliding_window - 1, a full visit's every one,
+// lossless_inkling2_keys_load from the window rings and the pages) followed by the call's own, its query positions
+// offset by the keys before, and the call's K and V are stored (keys_store) once computed. The score of a query and a
+// key, its probability and the value sums are the window form's operations on the same values: the planes' layout
+// changes nothing (the masked keys' probabilities are 0, the sums exact).
 
 #include "models/inkling2/execution/lossless.h"
 
 #include "core/device.h"
+#include "infernix/ops/inkling2_attention.h"
+#include "infernix/ops/inkling2_visit.h"
 #include "infernix/ops/lossless_inkling2.h"
 #include "infernix/ops/lossless_linear.h"
 #include "infernix/ops/lossless_quantize.h"
@@ -72,9 +83,13 @@ std::uint32_t float_bits(float f) {
 
 } // namespace
 
-// The scratch of one visit at window width T (bytes), with room for the projections' workspaces.
-std::size_t LosslessForward::device_bytes(const TextConfig& c, std::int32_t max_columns) {
+// The scratch of one visit at call width T (bytes), with room for the projections' workspaces.
+std::size_t LosslessForward::device_bytes(const TextConfig& c, std::int32_t max_columns, std::int32_t max_keys) {
     const std::size_t T = static_cast<std::size_t>(round_up(max_columns, kTile)), H = c.hidden_size;
+    // The key planes' columns (the cache form: the context) and the convolutions' history columns.
+    const auto keys = round_up(max_keys > 0 ? max_keys : max_columns, kTile);
+    const std::size_t Kc = static_cast<std::size_t>(keys);
+    const std::size_t Th = T + (max_keys > 0 ? c.conv_kernel - 1 : 0);
     const std::size_t Q = c.query_width(), K = c.key_width(), R = c.relative_width();
     const std::size_t I = c.intermediate, E = c.experts, k = c.top_k;
     std::size_t persistent = (9 + 3) * H * T * 2 + T * 8 + static_cast<std::size_t>(kHeadRows) * c.vocab_size * 4;
@@ -82,21 +97,35 @@ std::size_t LosslessForward::device_bytes(const TextConfig& c, std::int32_t max_
     visit += 3 * H * T * 4 + 4 * H * T * 4;        // the attention mixes, the messages
     visit += 2 * H * T * 2 + 64 * T * 2 + 2 * H * T * 4; // a message gate's scratch
     visit += 3 * H * T * 2;                         // x_q, x_k, x_v
-    visit += (2 * Q + R + c.heads + 4 * K + 2 * c.kv_heads * c.conv_kernel) * T * 2; // projections and convs
-    visit += (Q + 2 * K) * T * 2;                   // the head planes
-    visit += T * kQueryChunk * 2;                   // a head's scores
-    visit += (2 * Q + 2 * H) * T * 2;               // o, the gated o, W_o's output, the conv
+    visit += (2 * Q + R + c.heads) * T * 2 + (4 * K + 2 * c.kv_heads * c.conv_kernel) * Th * 2; // projections, convs
+    visit += Q * T * 2 + 2 * K * Kc * 2;            // the head planes
+    visit += Kc * kQueryChunk * 2;                  // a head's scores
+    visit += 2 * Q * T * 2 + 2 * H * Th * 2;        // o, the gated o, W_o's output, the conv
     visit += 3 * H * T * 4 + H * T * 2 + E * T * 4 + 2 * k * T * 4; // rho, the MLP mix, x, the router
     visit += H * (k * T + E * kTile) * 2;           // the experts' outputs by entry
     visit += (H + 3 * I) * kExpertChunk * 2 + 2 * kExpertChunk * 4 + (k * T / kTile + E + 1) * 64 * 16;
-    visit += 2 * H * T * 2;                         // the combine, the post-MLP conv
-    const std::size_t linear = 512ULL << 20;        // lossless_linear's workspaces (512 columns at a time)
+    visit += 2 * H * Th * 2;                        // the combine, the post-MLP conv
+    // lossless_linear's workspaces: the projections 512 columns at a time, the scores and value sums over the planes.
+    const auto D = static_cast<std::int32_t>(c.head_dim);
+    const std::size_t attention = std::max(ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, D, keys), keys, kQueryChunk),
+                                           ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, keys, D), D, kQueryChunk));
+    const std::size_t linear = std::max<std::size_t>(512ULL << 20, attention);
     return persistent + visit + linear + (64ULL << 20);
 }
 
-LosslessForward::LosslessForward(const Parameters& parameters, std::int32_t max_columns, bool reference)
-    : p_(parameters), c_(parameters.model.config().text), capacity_(round_up(max_columns, kTile)), reference_(reference) {
+LosslessForward::LosslessForward(const Parameters& parameters, std::int32_t max_columns, bool reference,
+                                 std::int32_t max_keys)
+    : p_(parameters), c_(parameters.model.config().text), capacity_(round_up(max_columns, kTile)),
+      keys_(round_up(max_keys > 0 ? max_keys : max_columns, kTile)), reference_(reference) {
     require(c_.heads % c_.kv_heads == 0 && c_.head_dim == 128 && c_.relative_dim <= 32, "the attention geometry");
+    if (max_keys > 0) {
+        // The cache form reads and writes the reproducible route's state layouts (forward.h, inkling2_attention.h).
+        require(!reference, "the design reference scores windows only");
+        require(c_.kv_heads == static_cast<std::uint32_t>(ops::inkling2::kKvHeads) &&
+                    c_.sliding_window == static_cast<std::uint32_t>(ops::inkling2::kWindow) &&
+                    c_.conv_kernel >= 1 && c_.conv_kernel - 1 <= static_cast<std::uint32_t>(ops::inkling2::kRingPositions),
+                "the state layouts' KV heads, window and conv rings");
+    }
     require(p_.layers.size() == c_.num_hidden_layers, "every layer's operands");
     for (const LayerOperands& l : p_.layers) {
         const AttentionOperands& a = l.attention;
@@ -128,7 +157,7 @@ LosslessForward::LosslessForward(const Parameters& parameters, std::int32_t max_
     require(ops::lossless_linear_supports(p_.head), "the output head's format");
     const std::size_t H = c_.hidden_size, T = static_cast<std::size_t>(capacity_);
     std::size_t persistent = (9 + 3) * H * T * 2 + T * 8 + static_cast<std::size_t>(kHeadRows) * c_.vocab_size * 4 + 4096;
-    const std::size_t total = device_bytes(c_, max_columns);
+    const std::size_t total = device_bytes(c_, max_columns, max_keys);
     memory_ = DeviceBuffer(total);
     auto* base = static_cast<std::uint8_t*>(memory_.p);
     std::size_t at = 0;
@@ -157,12 +186,96 @@ void LosslessForward::project(const Tensor& x, const Weight& w, std::int32_t row
     ops::lossless_linear(x, w, row_begin, rows, out, 0, *arena_, stream);
 }
 
-void LosslessForward::run(std::span<const std::int32_t> tokens, cudaStream_t stream) {
+void LosslessForward::run(std::span<const std::int32_t> tokens, cudaStream_t stream) { run_call(tokens, nullptr, stream); }
+
+void LosslessForward::run(std::span<const std::int32_t> tokens, const LosslessLaneState& lane, cudaStream_t stream) {
+    run_call(tokens, &lane, stream);
+}
+
+std::uint16_t* LosslessForward::ring(std::uint32_t visit, RingKind kind) const {
+    const VisitState& s = lane_->layout->visits[visit];
+    const std::int64_t at = kind == kKeyRing     ? s.key_ring
+                            : kind == kValueRing ? s.value_ring
+                            : kind == kAttentionRing ? s.attention_ring
+                                                     : s.mlp_ring;
+    return lane_->image + at;
+}
+
+ops::LosslessInkling2Keys LosslessForward::stored_keys(std::uint32_t visit) const {
+    const VisitState& s = lane_->layout->visits[visit];
+    ops::LosslessInkling2Keys out;
+    out.heads = static_cast<int>(c_.kv_heads);
+    out.dim   = static_cast<int>(c_.head_dim);
+    if (s.full_slot >= 0) {
+        out.k     = lane_->pool_k[static_cast<std::size_t>(s.full_slot)];
+        out.v     = lane_->pool_v[static_cast<std::size_t>(s.full_slot)];
+        out.table = lane_->table;
+    } else {
+        out.k          = lane_->image + s.window_k;
+        out.v          = lane_->image + s.window_v;
+        out.ring_pages = ops::inkling2::kWindowRingPages;
+    }
+    return out;
+}
+
+LosslessForward::ConvInput LosslessForward::conv_input(std::int32_t C, std::int32_t T) {
+    ConvInput in;
+    in.all  = arena_->alloc(DType::BF16, {C, history_ + T});
+    in.call = columns_of(in.all, history_, T);
+    return in;
+}
+
+void LosslessForward::load_history(const ConvInput& in, std::uint32_t visit, RingKind kind, cudaStream_t stream) const {
+    if (lane_ == nullptr) { return; }
+    Tensor before = columns_of(in.all, 0, history_);
+    ops::lossless_inkling2_ring_load(ring(visit, kind), ops::inkling2::kRingPositions, lane_->first - history_, history_,
+                                     before, stream);
+}
+
+void LosslessForward::store_history(const ConvInput& in, std::uint32_t visit, RingKind kind, cudaStream_t stream) const {
+    if (lane_ == nullptr) { return; }
+    ops::lossless_inkling2_ring_store(in.call, lane_->first, ring(visit, kind), ops::inkling2::kRingPositions, stream);
+}
+
+void LosslessForward::run_call(std::span<const std::int32_t> tokens, const LosslessLaneState* lane, cudaStream_t stream) {
     const auto T = static_cast<std::int32_t>(tokens.size());
-    require(T > 0 && T <= capacity_, "a window of 1 to " + std::to_string(capacity_) + " tokens");
+    require(T > 0 && T <= capacity_, "a call of 1 to " + std::to_string(capacity_) + " tokens");
+    if (lane != nullptr) {
+        require(lane->image != nullptr && lane->layout != nullptr && lane->table != nullptr && lane->first >= 0 &&
+                    static_cast<std::int64_t>(lane->first) + T <= keys_ &&
+                    lane->layout->visits.size() == c_.visits() &&
+                    lane->pool_k.size() == static_cast<std::size_t>(lane->layout->full_visits) &&
+                    lane->pool_v.size() == lane->pool_k.size(),
+                "a cache-form call within the context, with the lane's state");
+    }
     T_ = T;
+    // The call's lane and conv history, for this call only.
+    lane_    = lane;
+    history_ = lane != nullptr ? static_cast<std::int32_t>(c_.conv_kernel) - 1 : 0;
+    struct Reset {
+        LosslessForward& f;
+        ~Reset() {
+            f.lane_    = nullptr;
+            f.history_ = 0;
+        }
+    } reset{*this};
     const std::int32_t H = static_cast<std::int32_t>(c_.hidden_size);
     CUDA_CHECK(cudaMemcpyAsync(tokens_, tokens.data(), tokens.size() * 4, cudaMemcpyHostToDevice, stream));
+    // The columns' positions (the log scale's): the window's 0 .., a cache-form call's from its first.
+    std::vector<std::int32_t> positions;
+    const std::int32_t first = lane != nullptr ? lane->first : 0;
+    if (first != 0) {
+        positions.resize(static_cast<std::size_t>(T));
+        for (std::int32_t i = 0; i < T; ++i) { positions[static_cast<std::size_t>(i)] = first + i; }
+        identity_positions_ = false;
+    } else if (!identity_positions_) {
+        positions.resize(static_cast<std::size_t>(capacity_));
+        for (std::int32_t i = 0; i < capacity_; ++i) { positions[static_cast<std::size_t>(i)] = i; }
+        identity_positions_ = true;
+    }
+    if (!positions.empty()) {
+        CUDA_CHECK(cudaMemcpyAsync(positions_, positions.data(), positions.size() * 4, cudaMemcpyHostToDevice, stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     (void)ops::lossless_inkling2_take_undecided(); // a failed window's
     arena_->reset();
@@ -337,8 +450,9 @@ void LosslessForward::visit(std::uint32_t v, const Tensor& h, std::span<const Te
             }
         }
     }
-    Tensor c = arena_->alloc(DType::BF16, {H, T});
-    attention(l, xq, xk, xv, c, stream);
+    Tensor c_all = arena_->alloc(DType::BF16, {H, history_ + T});
+    attention(v, l, xq, xk, xv, c_all, stream);
+    Tensor c = columns_of(c_all, history_, T);
     // The residual: rho = fp32(c) at a block boundary, else fp32(h + c); the MLP mix over the blocks and rho.
     Tensor rho = arena_->alloc(DType::FP32, {H, T});
     Tensor x_mlp = arena_->alloc(DType::BF16, {H, T});
@@ -359,23 +473,33 @@ void LosslessForward::visit(std::uint32_t v, const Tensor& h, std::span<const Te
         Tensor w = matrix(l.mlp_norm, DType::BF16, H, 1);
         ops::lossless_inkling2_rmsnorm(mixed, &w, eps, x_mlp, stream);
     }
-    Tensor moe = arena_->alloc(DType::BF16, {H, T});
-    experts(l, layer, x_mlp, moe, stream);
-    Tensor d = arena_->alloc(DType::BF16, {H, T});
-    Tensor taps = matrix(l.mlp_conv, DType::BF16, H, static_cast<std::int32_t>(c_.conv_kernel));
-    ops::lossless_inkling2_conv(moe, taps, d, stream);
+    ConvInput moe = conv_input(H, T);
+    experts(l, layer, x_mlp, moe.call, stream);
+    load_history(moe, v, kMlpRing, stream);
+    Tensor d_all = arena_->alloc(DType::BF16, {H, history_ + T});
+    Tensor taps  = matrix(l.mlp_conv, DType::BF16, H, static_cast<std::int32_t>(c_.conv_kernel));
+    ops::lossless_inkling2_conv(moe.all, taps, d_all, stream);
+    store_history(moe, v, kMlpRing, stream);
     // h' = bf16(fp32(rho + d)).
+    Tensor d = columns_of(d_all, history_, T);
     ops::lossless_inkling2_add(rho, d, out, stream, true);
 }
 
-void LosslessForward::attention(const LayerOperands& l, const Tensor& xq, const Tensor& xk, const Tensor& xv, Tensor& c,
-                                cudaStream_t stream) {
+void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const Tensor& xq, const Tensor& xk,
+                                const Tensor& xv, Tensor& c, cudaStream_t stream) {
     const AttentionOperands& a = l.attention;
     const std::int32_t H = static_cast<std::int32_t>(c_.hidden_size), T = xq.ne[1];
     const std::int32_t heads = static_cast<std::int32_t>(c_.heads), kv = static_cast<std::int32_t>(c_.kv_heads);
     const std::int32_t D = static_cast<std::int32_t>(c_.head_dim), rel = static_cast<std::int32_t>(c_.relative_dim);
     const std::int32_t Q = heads * D, KW = kv * D, R = heads * rel, ck = static_cast<std::int32_t>(c_.conv_kernel);
-    const std::int32_t Tp = round_up(T, kTile);
+    const std::int32_t hc = history_;
+    const int window = l.full ? 0 : static_cast<int>(c_.sliding_window);
+    // The keys before the call its queries can see (the cache form: a sliding visit's last window - 1, a full visit's
+    // every one) and the planes' columns: those keys, then the call's.
+    const std::int32_t first  = lane_ != nullptr ? lane_->first : 0;
+    const std::int32_t from   = lane_ == nullptr || l.full ? 0 : std::max(0, first - (window - 1));
+    const std::int32_t before = first - from;
+    const std::int32_t Tp     = round_up(before + T, kTile);
     auto scope = arena_->scope();
     Tensor q = arena_->alloc(DType::BF16, {Q, T}), r = arena_->alloc(DType::BF16, {R, T});
     Tensor gate = arena_->alloc(DType::BF16, {Q, T}), sink = arena_->alloc(DType::BF16, {heads, T});
@@ -399,23 +523,34 @@ void LosslessForward::attention(const LayerOperands& l, const Tensor& xq, const 
     ops::lossless_inkling2_clip(q, &qs, heads, c_.qk_clip_threshold, log_scale, q, stream);
     ops::lossless_inkling2_clip(r, &rs, heads, c_.relative_clip_threshold, log_scale, r, stream);
     // k and v: the projection, its convolution (static; full layers dynamic), then k's clip and v's per-head norm.
-    Tensor k = arena_->alloc(DType::BF16, {KW, T}), vv = arena_->alloc(DType::BF16, {KW, T});
+    Tensor k_all = arena_->alloc(DType::BF16, {KW, hc + T}), v_all = arena_->alloc(DType::BF16, {KW, hc + T});
+    Tensor k = columns_of(k_all, hc, T), vv = columns_of(v_all, hc, T);
     {
         auto inner = arena_->scope();
-        Tensor kp = arena_->alloc(DType::BF16, {KW, T}), vp = arena_->alloc(DType::BF16, {KW, T});
-        project(xk, a.key, 0, KW, kp, stream);
-        project(xv, a.value, 0, KW, vp, stream);
+        ConvInput kp = conv_input(KW, T), vp = conv_input(KW, T);
+        project(xk, a.key, 0, KW, kp.call, stream);
+        project(xv, a.value, 0, KW, vp.call, stream);
+        load_history(kp, v, kKeyRing, stream);
+        load_history(vp, v, kValueRing, stream);
         Tensor kt = matrix(a.layer.key_conv, DType::BF16, KW, ck), vt = matrix(a.layer.value_conv, DType::BF16, KW, ck);
         if (l.full) {
-            Tensor kd = arena_->alloc(DType::BF16, {kv * ck, T}), vd = arena_->alloc(DType::BF16, {kv * ck, T});
-            project(xk, a.key_taps, 0, kv * ck, kd, stream);
-            project(xv, a.value_taps, 0, kv * ck, vd, stream);
-            ops::lossless_inkling2_dynamic_conv(kp, kd, kt, kv, k, stream);
-            ops::lossless_inkling2_dynamic_conv(vp, vd, vt, kv, vv, stream);
+            // The taps of a column are its own (a history column's outputs are not used: their taps are zeros).
+            Tensor kd = arena_->alloc(DType::BF16, {kv * ck, hc + T}), vd = arena_->alloc(DType::BF16, {kv * ck, hc + T});
+            if (hc > 0) {
+                CUDA_CHECK(cudaMemsetAsync(kd.data, 0, static_cast<std::size_t>(kv * ck) * hc * 2, stream));
+                CUDA_CHECK(cudaMemsetAsync(vd.data, 0, static_cast<std::size_t>(kv * ck) * hc * 2, stream));
+            }
+            Tensor kd_call = columns_of(kd, hc, T), vd_call = columns_of(vd, hc, T);
+            project(xk, a.key_taps, 0, kv * ck, kd_call, stream);
+            project(xv, a.value_taps, 0, kv * ck, vd_call, stream);
+            ops::lossless_inkling2_dynamic_conv(kp.all, kd, kt, kv, k_all, stream);
+            ops::lossless_inkling2_dynamic_conv(vp.all, vd, vt, kv, v_all, stream);
         } else {
-            ops::lossless_inkling2_conv(kp, kt, k, stream);
-            ops::lossless_inkling2_conv(vp, vt, vv, stream);
+            ops::lossless_inkling2_conv(kp.all, kt, k_all, stream);
+            ops::lossless_inkling2_conv(vp.all, vt, v_all, stream);
         }
+        store_history(kp, v, kKeyRing, stream);
+        store_history(vp, v, kValueRing, stream);
     }
     ops::lossless_inkling2_clip(k, nullptr, kv, c_.qk_clip_threshold, {}, k, stream);
     {
@@ -424,22 +559,31 @@ void LosslessForward::attention(const LayerOperands& l, const Tensor& xq, const 
         // The design reference: V as the bf16 profile stores it (FP16 words, sliding rings and full pools alike).
         if (reference_) { ops::lossless_round_fp16(rows, stream); }
     }
-    // Head planes: queries head-major [heads][T][D], keys head-major [kv][Tp][D] and values transposed [kv][D][Tp],
-    // zero beyond the window.
+    // Head planes: queries head-major [heads][T][D], keys head-major [kv][Tp][D] and values transposed [kv][D][Tp]
+    // (the keys before the call, then the call's), zero beyond them.
     Tensor qh = arena_->alloc(DType::BF16, {D, T, heads});
     Tensor kh = arena_->alloc(DType::BF16, {D, Tp, kv}), vt = arena_->alloc(DType::BF16, {Tp, D, kv});
     CUDA_CHECK(cudaMemsetAsync(kh.data, 0, kh.bytes(), stream));
     CUDA_CHECK(cudaMemsetAsync(vt.data, 0, vt.bytes(), stream));
     ops::lossless_inkling2_heads(q, heads, false, T, qh, stream);
-    ops::lossless_inkling2_heads(k, kv, false, Tp, kh, stream);
-    ops::lossless_inkling2_heads(vv, kv, true, Tp, vt, stream);
+    {
+        Tensor kh_call = kh, vt_call = vt;
+        kh_call.data = static_cast<std::uint16_t*>(kh.data) + static_cast<std::size_t>(before) * D;
+        vt_call.data = static_cast<std::uint16_t*>(vt.data) + before;
+        ops::lossless_inkling2_heads(k, kv, false, Tp, kh_call, stream);
+        ops::lossless_inkling2_heads(vv, kv, true, Tp, vt_call, stream);
+    }
+    if (lane_ != nullptr) {
+        const ops::LosslessInkling2Keys stored = stored_keys(v);
+        ops::lossless_inkling2_keys_load(stored, from, before, Tp, kh, vt, stream);
+        ops::lossless_inkling2_keys_store(k, vv, first, stored, stream);
+    }
     Tensor o = arena_->alloc(DType::BF16, {Q, T});
     Tensor table = matrix(a.layer.relative_table, DType::BF16, rel, static_cast<std::int32_t>(c_.relative_extent));
     const float scale = static_cast<float>(std::pow(static_cast<double>(D), -0.5));
-    const int window = l.full ? 0 : static_cast<int>(c_.sliding_window);
     for (std::int32_t t0 = 0; t0 < T; t0 += kQueryChunk) {
         const std::int32_t n = std::min(kQueryChunk, T - t0);
-        const std::int32_t keys = round_up(t0 + n, kTile); // the keys the chunk's queries can see
+        const std::int32_t keys = round_up(before + t0 + n, kTile); // the keys the chunk's queries can see
         auto inner = arena_->scope();
         Tensor s = arena_->alloc(DType::BF16, {Tp, n});
         Tensor o_chunk = columns_of(o, t0, n);
@@ -457,7 +601,7 @@ void LosslessForward::attention(const LayerOperands& l, const Tensor& xq, const 
             pa.scores      = &s;
             pa.ld          = Tp;
             pa.keys        = Tp;
-            pa.query_begin = t0;
+            pa.query_begin = before + t0; // plane column j is position from + j, the query at column t position first + t
             pa.head        = hq;
             pa.heads       = heads;
             pa.relative    = &rel_chunk;
@@ -476,10 +620,12 @@ void LosslessForward::attention(const LayerOperands& l, const Tensor& xq, const 
     // The gated output projection and the post-attention convolution.
     Tensor gated = arena_->alloc(DType::BF16, {Q, T});
     ops::lossless_inkling2_sigmoid_gate(o, gate, gated, stream);
-    Tensor y = arena_->alloc(DType::BF16, {H, T});
-    project(gated, a.output, 0, H, y, stream);
+    ConvInput y = conv_input(H, T);
+    project(gated, a.output, 0, H, y.call, stream);
+    load_history(y, v, kAttentionRing, stream);
     Tensor taps = matrix(l.attention_conv, DType::BF16, H, ck);
-    ops::lossless_inkling2_conv(y, taps, c, stream);
+    ops::lossless_inkling2_conv(y.all, taps, c, stream);
+    store_history(y, v, kAttentionRing, stream);
 }
 
 void LosslessForward::experts(const LayerOperands& l, std::uint32_t layer, const Tensor& x, Tensor& out,

@@ -101,9 +101,19 @@ std::uint64_t elapsed_ns(Clock::time_point start) {
 }
 
 // The forward's call capacity: the prefill chunk (no wider than the context: a call never holds more prompt
-// positions), and at least the decode and verify calls' width.
+// positions), and at least the decode and verify calls' width. The lossless route runs no call through it.
 std::int32_t forward_capacity(const ProgramOptions& o) {
+    if (o.lossless) { return kMaxForwardColumns; }
     return std::max(kMaxForwardColumns, static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context)));
+}
+
+// LosslessForward's calls: a scored window (the context), or a generation call of at most a prefill chunk whose keys
+// reach the context (the cache form).
+std::int32_t lossless_columns(const ProgramOptions& o) {
+    return static_cast<std::int32_t>(o.causal_scoring ? o.max_context : std::min(o.prefill_chunk, o.max_context));
+}
+std::int32_t lossless_keys(const ProgramOptions& o) {
+    return o.causal_scoring ? 0 : static_cast<std::int32_t>(o.max_context);
 }
 
 ops::w4a4_moe::ExpertActivation expert_activation(const ProgramOptions& o) {
@@ -117,10 +127,10 @@ std::size_t kv_planes_per_visit(ops::inkling2::KvCodec codec) { return codec == 
 
 // The full visits' page geometry (core/paged_kv_cache.h): per full visit its K and V planes, then a quantized form's
 // K and V side planes, each page-major [pages][kKvHeads][64][a row] (attention_common.cuh kv_row): a row of 128 BF16
-// (K) or FP16 (V) words, or a quantized form's codes and side record (inkling2_attention.h KvCodec); then, with DSpark,
-// the drafter's full layer's K and V (BF16, inkling2_dspark.h), so a page carries the drafter's context with the
-// target's.
-KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec codec, bool dspark) {
+// (K) or FP16 (V; BF16 on the lossless route, `lossless`) words, or a quantized form's codes and side record
+// (inkling2_attention.h KvCodec); then, with DSpark, the drafter's full layer's K and V (BF16, inkling2_dspark.h), so a
+// page carries the drafter's context with the target's.
+KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec codec, bool dspark, bool lossless) {
     const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
     const auto plane                  = [](DType dtype, std::int32_t row) {
         return KVPlaneGeometry{.dtype = dtype, .leading_extent = row, .head_extent = ops::inkling2::kKvHeads};
@@ -130,7 +140,7 @@ KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec
     for (std::int32_t s = 0; s < full_visits; ++s) {
         if (codec == ops::inkling2::KvCodec::Bf16) {
             g.planes.push_back(plane(DType::BF16, ops::inkling2::kHeadDim));
-            g.planes.push_back(plane(DType::FP16, ops::inkling2::kHeadDim));
+            g.planes.push_back(plane(lossless ? DType::BF16 : DType::FP16, ops::inkling2::kHeadDim));
         } else {
             g.planes.push_back(plane(DType::U8, b.key_code));
             g.planes.push_back(plane(DType::U8, b.value_code));
@@ -167,7 +177,8 @@ KvLayout kv_layout(const ProgramOptions& o, std::int32_t full_visits) {
     KvLayout out;
     LayoutBuilder builder;
     out.pool   = plan_device_kv_page_pool(builder, {.page_group_count = static_cast<std::uint32_t>(pages),
-                                                    .geometry = kv_page_geometry(full_visits, o.kv_codec, dspark_planes(o))});
+                                                    .geometry = kv_page_geometry(full_visits, o.kv_codec, dspark_planes(o),
+                                                                                 o.lossless)});
     out.tables = plan_kv_execution_tables(builder, {.logical_page_capacity = row,
                                                     .table_rows = static_cast<std::int32_t>(o.max_concurrency)});
     out.bytes  = builder.finish(256);
@@ -197,7 +208,7 @@ public:
         const StateLayout& layout = forward_.layout();
         const std::uint32_t pages = pages_per_lane(o_.max_context);
         if (o_.lossless) {
-            lossless_ = std::make_unique<LosslessForward>(p_, static_cast<std::int32_t>(o_.max_context), o_.reference);
+            lossless_ = std::make_unique<LosslessForward>(p_, lossless_columns(o_), o_.reference, lossless_keys(o_));
         }
         images_ = DeviceBuffer(static_cast<std::size_t>(layout.lane_words) * 2 * lanes_.size());
         // The full visits' page pool and the lanes' block-table rows (kv_layout), zeroed: a key beyond a lane's frontier
@@ -292,6 +303,14 @@ public:
             config.index.cost.chunk_seconds          = 30.0e-3;
             config.index.cost.token_seconds          = 1.0 / 21600.0;
             config.index.cost.attention_pair_seconds = 0.0;
+            if (o_.lossless) {
+                // The lossless route's calls (lossless-route.md §3a), fitted to its scoring runs (inkling2-mini, RTX
+                // 5090, infernix-perplexity --lossless, 2026-11-22: 11 windows of 2,048 tokens in 93.7 s, 2 of 9,216 in
+                // 133.5 s): about 3.3 ms a token and 0.86 us a (query, key) pair; calls are eager, so no call cost.
+                config.index.cost.chunk_seconds          = 0.0;
+                config.index.cost.token_seconds          = 3.3e-3;
+                config.index.cost.attention_pair_seconds = 0.86e-6;
+            }
             config.index.cost.h2d_bytes_per_second   = 22.0e9;
             config.ssd_bytes                         = o_.prefix_ssd_bytes;
             config.ssd_directory                     = o_.prefix_ssd_directory;
@@ -308,7 +327,7 @@ public:
             }
             prefix_ = std::make_unique<prefix::PrefixCache>(config, *pool_, images, o_.prefix_host_bytes, device_.stream);
         }
-        if (o_.use_cuda_graph && !o_.causal_scoring) { capture_decode_graphs(); }
+        if (o_.use_cuda_graph && !o_.causal_scoring && !o_.lossless) { capture_decode_graphs(); }
     }
 
     ~ProgramImpl() {
@@ -613,10 +632,14 @@ public:
             call.lane.push_back(static_cast<std::int32_t>(index));
             call.position.push_back(static_cast<std::int32_t>(lane.processed + i));
         }
-        upload(call);
-        run_forward(static_cast<std::int32_t>(chunk) - 1, last ? 1 : 0,
-                    [&] { overlay_images(lane.images, lane.processed, chunk); });
-        if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(chunk), device_.stream); } // the chunk's context rows
+        if (lossless_) {
+            run_lossless(index, call, last);
+        } else {
+            upload(call);
+            run_forward(static_cast<std::int32_t>(chunk) - 1, last ? 1 : 0,
+                        [&] { overlay_images(lane.images, lane.processed, chunk); });
+            if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(chunk), device_.stream); } // its context rows
+        }
         lane.processed += chunk;
         const std::size_t captured = lane.prefix.captures.size();
         publish_prefill(index);
@@ -654,6 +677,7 @@ public:
         // A row's round licenses at most its remaining generated tokens: a DSpark round needs two of them.
         const std::uint32_t remaining = budgets.empty() ? 0U : budgets[0].generated_tokens_remaining;
         if (remaining >= 2 && dspark_round(sequences, masks)) { return decode_dspark(sequences[0], remaining, masks, start); }
+        if (lossless_) { return decode_lossless(sequences, masks, start); }
         if (drafter_ && sequences.size() == 1) { ++lanes_[lane_of(sequences[0])].fallback; } // a plain round of a drafting row
         std::vector<std::uint32_t> rows;
         for (const SequenceHandle& s : sequences) { rows.push_back(lane_of(s)); }
@@ -1474,6 +1498,65 @@ private:
         }
     }
 
+    // The lossless route's call (lossless-route.md §3a): one lane's columns through LosslessForward's cache form, which
+    // continues the lane's state (its conv rings, window rings and pages) and leaves the call's in it; with `head`,
+    // the last column's logits (row 0 of lossless_->logits()).
+    void run_lossless(std::uint32_t index, const CallPlan& call, bool head) {
+        map_call_pages(call);
+        if (prefix_) { order_after_cache(call); }
+        LosslessLaneState state;
+        state.image  = static_cast<std::uint16_t*>(images_.p) + static_cast<std::size_t>(index) * forward_.layout().lane_words;
+        state.layout = &forward_.layout();
+        state.pool_k = view_.pool_k;
+        state.pool_v = view_.pool_v;
+        state.table  = view_.table + static_cast<std::size_t>(index) * view_.table_stride;
+        state.first  = call.position.front();
+        lossless_->run(call.tokens, state, device_.stream);
+        if (head) { lossless_->head(call.columns() - 1, 1, device_.stream); }
+    }
+
+    // A decode round on the lossless route: each row's lane runs its pending inputs (its last token and any forced
+    // ones) as one call, a lane at a time (the route's calls are eager), and the rows' logits are gathered in the
+    // Engine's order for one sample.
+    PendingBatch decode_lossless(std::span<const SequenceHandle> sequences, runtime::TokenMaskProvider* masks,
+                                 Clock::time_point start) {
+        if (gathered_.bytes == 0) { gathered_ = DeviceBuffer(static_cast<std::size_t>(vocab_) * 4 * kMaximumConcurrency); }
+        auto* gathered = static_cast<float*>(gathered_.p);
+        std::vector<std::uint32_t> rows;
+        std::vector<std::int32_t> identity;
+        for (const SequenceHandle& s : sequences) { rows.push_back(lane_of(s)); }
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            const std::uint32_t index = rows[r];
+            Lane& lane                = lanes_[index];
+            if (lane.processed >= lane.tokens.size()) { throw std::logic_error("Inkling 2: a decode row has no input"); }
+            CallPlan call;
+            call.first.assign(index + 1, 0);
+            for (std::uint32_t p = lane.processed; p < lane.tokens.size(); ++p) {
+                call.tokens.push_back(lane.tokens[p]);
+                call.lane.push_back(static_cast<std::int32_t>(index));
+                call.position.push_back(static_cast<std::int32_t>(p));
+            }
+            run_lossless(index, call, true);
+            CUDA_CHECK(cudaMemcpyAsync(gathered + r * static_cast<std::size_t>(vocab_), lossless_->logits(),
+                                       static_cast<std::size_t>(vocab_) * 4, cudaMemcpyDeviceToDevice, device_.stream));
+            identity.push_back(static_cast<std::int32_t>(r));
+        }
+        stage_sample(rows, identity, ops::kSamplePurposeDecode, masks);
+        launch_sample(rows.size(), identity, ops::kSamplePurposeDecode, gathered);
+        finish_sample(rows.size());
+        for (const std::uint32_t index : rows) { lanes_[index].processed = static_cast<std::uint32_t>(lanes_[index].tokens.size()); }
+        const std::uint64_t ns = elapsed_ns(start);
+        for (const std::uint32_t index : rows) {
+            lanes_[index].decode_ns += ns;
+            lanes_[index].decode_share_ns += ns / rows.size();
+        }
+        const std::uint64_t transaction = ++transaction_;
+        pending_      = transaction;
+        pending_kind_ = PendingKind::Decode;
+        return ContractAccess::batch(this, transaction, sequences, {sampled_tokens_.data(), sequences.size()},
+                                     timing_since(start), {failures_.data(), sequences.size()});
+    }
+
     // A decode or verify call: the Forward with the head over every column, then (DSpark) its columns' context rows
     // (a rejected verify column's rows are overwritten before anything reads them).
     void run_decode_call(std::int32_t columns) {
@@ -1732,6 +1815,8 @@ private:
             config.presence_penalty  = s.presence_penalty;
             config.frequency_penalty = s.frequency_penalty;
             config.seed              = s.seed;
+            // The lossless route draws by Gumbel-max (lossless-route.md §3a).
+            config.gumbel_max        = o_.lossless;
             config.token_counts      = lane.penalties ? lane_counts(lanes[row]) : nullptr;
             nonfinite_[row]          = 0;
             config.nonfinite         = &nonfinite_[row];
@@ -1758,11 +1843,17 @@ private:
         (void)logit_rows;
     }
 
-    // The sample of rows whose logits are rows `logit_rows` of the call's logits: one per row, gathered when
-    // the rows are not the call's leading rows in order.
-    void launch_sample(std::size_t rows, std::span<const std::int32_t> logit_rows, std::int32_t purpose) {
-        const float* logits = forward_.buffers().logits;
-        bool identity       = true;
+    // The last call's logits rows: the Forward's, or LosslessForward's on the lossless route.
+    [[nodiscard]] const float* call_logits() const noexcept {
+        return lossless_ ? lossless_->logits() : forward_.buffers().logits;
+    }
+
+    // The sample of rows whose logits are rows `logit_rows` of `logits` (null: the call's, call_logits()): one per row,
+    // gathered when the rows are not the leading rows in order.
+    void launch_sample(std::size_t rows, std::span<const std::int32_t> logit_rows, std::int32_t purpose,
+                       const float* logits = nullptr) {
+        if (logits == nullptr) { logits = call_logits(); }
+        bool identity = true;
         for (std::size_t i = 0; i < rows; ++i) { identity = identity && logit_rows[i] == static_cast<std::int32_t>(i); }
         if (!identity) {
             if (gathered_.bytes == 0) { gathered_ = DeviceBuffer(static_cast<std::size_t>(vocab_) * 4 * kMaximumConcurrency); }
@@ -1869,8 +1960,8 @@ private:
 
     PromptReadout readout(const Lane& lane, std::int32_t column) {
         std::vector<float> row(static_cast<std::size_t>(vocab_));
-        CUDA_CHECK(cudaMemcpy(row.data(), forward_.buffers().logits + static_cast<std::size_t>(column) * vocab_,
-                              row.size() * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(row.data(), call_logits() + static_cast<std::size_t>(column) * vocab_, row.size() * 4,
+                              cudaMemcpyDeviceToHost));
         double max = -std::numeric_limits<double>::infinity();
         std::int32_t top = 0;
         for (std::int32_t v = 0; v < vocab_; ++v) {
@@ -1895,7 +1986,7 @@ private:
     ProgramOptions o_;
     ProgramDevicePlan plan_;
     Forward forward_;
-    std::unique_ptr<LosslessForward> lossless_; // --lossless (causal scoring)
+    std::unique_ptr<LosslessForward> lossless_; // --lossless (scored windows; generation's cache form)
     std::unique_ptr<Drafter> drafter_; // --spec dspark
     std::unique_ptr<VisionTower> vision_; // --vision
     std::shared_ptr<const std::vector<PromptImage>> encoded_set_; // the prompt whose image the tower last encoded
@@ -2065,8 +2156,8 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
         out.workspace += VisionTower::device_bytes(*config.vision, options.vision_max_cells, options.vision_host);
     }
     if (options.lossless) {
-        if (!options.causal_scoring) { throw std::invalid_argument("Inkling 2: the lossless route scores windows only"); }
-        out.workspace += LosslessForward::device_bytes(config.text, static_cast<std::int32_t>(options.max_context));
+        out.workspace +=
+            LosslessForward::device_bytes(config.text, detail::lossless_columns(options), detail::lossless_keys(options));
     }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     return out;

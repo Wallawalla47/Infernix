@@ -48,6 +48,15 @@ infernix_add_test(infernix_inkling2_prefix_cache_real_test
 set_tests_properties(infernix_inkling2_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
   LABELS "gpu;real" TIMEOUT 1800)
 
+# The --lossless route on a real artifact: the cache form's logits equal the window form's byte for byte over mixed
+# call widths, and generation's greedy tokens, prompt readouts and sampled tokens are a function of the request alone;
+# skips without INFERNIX_INKLING2_ARTIFACT.
+infernix_add_test(infernix_inkling2_lossless_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_inkling2_lossless_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 3600)
+
 # The forward on a real artifact against the CPU reference's per-visit dump (teacher-forced stages, free-running
 # argmax, decode = verify): skips without INFERNIX_INKLING2_ARTIFACT and INFERNIX_INKLING2_REFERENCE.
 infernix_add_test(infernix_inkling2_forward_real_test

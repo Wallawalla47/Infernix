@@ -692,6 +692,70 @@ __global__ void heads_kernel(const std::uint16_t* x, int x_ld, int D, int heads,
     out[plane + (transposed ? static_cast<std::size_t>(d) * stride + t : static_cast<std::size_t>(t) * D + d)] = v;
 }
 
+// The cache form's state copies (exact).
+__global__ void ring_load_kernel(const std::uint16_t* ring, int rows, int C, int first, int count, std::uint16_t* out,
+                                 int out_ld) {
+    const std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(C) * count) { return; }
+    const int e = static_cast<int>(i % C), c = static_cast<int>(i / C);
+    const int p = first + c;
+    out[static_cast<std::size_t>(c) * out_ld + e] = p < 0 ? std::uint16_t{0} : ring[static_cast<std::size_t>(p % rows) * C + e];
+}
+
+__global__ void ring_store_kernel(const std::uint16_t* x, int x_ld, int C, int from, int count, int first, int rows,
+                                  std::uint16_t* ring) {
+    const std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(C) * count) { return; }
+    const int e = static_cast<int>(i % C), c = from + static_cast<int>(i / C);
+    ring[static_cast<std::size_t>((first + c) % rows) * C + e] = x[static_cast<std::size_t>(c) * x_ld + e];
+}
+
+constexpr int kKeyUnitRows = 64; // positions a KV unit (page) holds
+constexpr int kKeyDim      = 128;
+
+__device__ __forceinline__ std::size_t key_row(const LosslessInkling2Keys& s, int position, int head) {
+    const int unit = position / kKeyUnitRows, row = position % kKeyUnitRows;
+    if (s.table != nullptr) {
+        const auto page = static_cast<std::size_t>(s.table[unit]);
+        return ((page * s.heads + head) * kKeyUnitRows + row) * kKeyDim;
+    }
+    return ((static_cast<std::size_t>(head) * s.ring_pages + unit % s.ring_pages) * kKeyUnitRows + row) * kKeyDim;
+}
+
+// A block: 64 positions of one head. K rows go straight to the head-major plane; V rows through shared memory, so the
+// transposed plane's writes are rows of 64 consecutive positions.
+__global__ void __launch_bounds__(256) keys_load_kernel(LosslessInkling2Keys s, int first, int count, int stride,
+                                                       std::uint16_t* kh, std::uint16_t* vt) {
+    __shared__ std::uint16_t tile[kKeyUnitRows][kKeyDim + 2];
+    const int j0 = static_cast<int>(blockIdx.x) * kKeyUnitRows, h = static_cast<int>(blockIdx.y);
+    const std::size_t plane = static_cast<std::size_t>(h) * kKeyDim * stride;
+    for (int idx = static_cast<int>(threadIdx.x); idx < kKeyUnitRows * kKeyDim; idx += 256) {
+        const int jj = idx / kKeyDim, d = idx % kKeyDim;
+        if (j0 + jj >= count) { continue; }
+        const std::size_t r = key_row(s, first + j0 + jj, h);
+        kh[plane + static_cast<std::size_t>(j0 + jj) * kKeyDim + d] = s.k[r + d];
+        tile[jj][d] = s.v[r + d];
+    }
+    __syncthreads();
+    for (int idx = static_cast<int>(threadIdx.x); idx < kKeyUnitRows * kKeyDim; idx += 256) {
+        const int d = idx / kKeyUnitRows, jj = idx % kKeyUnitRows;
+        if (j0 + jj >= count) { continue; }
+        vt[plane + static_cast<std::size_t>(d) * stride + j0 + jj] = tile[jj][d];
+    }
+}
+
+__global__ void keys_store_kernel(const std::uint16_t* k, int k_ld, const std::uint16_t* v, int v_ld, int from, int count,
+                                  int first, LosslessInkling2Keys d) {
+    const std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const int row = d.heads * kKeyDim;
+    if (i >= static_cast<std::int64_t>(row) * count) { return; }
+    const int e = static_cast<int>(i % row), t = from + static_cast<int>(i / row);
+    const int h = e / kKeyDim, dd = e % kKeyDim;
+    const std::size_t r = key_row(d, first + t, h);
+    d.k[r + dd] = k[static_cast<std::size_t>(t) * k_ld + e];
+    d.v[r + dd] = v[static_cast<std::size_t>(t) * v_ld + e];
+}
+
 unsigned grid_for(std::int64_t count, int threads) {
     const std::int64_t blocks = (count + threads - 1) / threads;
     return static_cast<unsigned>(blocks < 1 ? 1 : blocks);
@@ -979,6 +1043,66 @@ void lossless_inkling2_heads(const Tensor& x, int heads, bool transposed, int st
     heads_kernel<<<grid_for(n, 256), 256, 0, stream>>>(static_cast<const std::uint16_t*>(x.data), column_stride(x), D,
                                                        heads, T, transposed, stride,
                                                        static_cast<std::uint16_t*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_inkling2_ring_load(const std::uint16_t* ring, int rows, int first, int count, Tensor& out,
+                                 cudaStream_t stream) {
+    require(ring != nullptr && rows > 0 && count >= 0 && is_matrix(out) && out.dtype == DType::BF16 && out.ne[1] >= count,
+            "ring_load: a ring of positive rows and out BF16 [C, >= count]");
+    if (count == 0) { return; }
+    const int C = static_cast<int>(out.ne[0]);
+    const std::int64_t n = static_cast<std::int64_t>(C) * count;
+    ring_load_kernel<<<grid_for(n, 256), 256, 0, stream>>>(ring, rows, C, first, count,
+                                                           static_cast<std::uint16_t*>(out.data), column_stride(out));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_inkling2_ring_store(const Tensor& x, int first, std::uint16_t* ring, int rows, cudaStream_t stream) {
+    require(ring != nullptr && rows > 0 && first >= 0 && is_matrix(x) && x.dtype == DType::BF16,
+            "ring_store: x BF16 [C, T] at a position >= 0 and a ring of positive rows");
+    const int C = static_cast<int>(x.ne[0]), T = static_cast<int>(x.ne[1]);
+    const int from = T > rows ? T - rows : 0, count = T - from;
+    if (count <= 0) { return; }
+    const std::int64_t n = static_cast<std::int64_t>(C) * count;
+    ring_store_kernel<<<grid_for(n, 256), 256, 0, stream>>>(static_cast<const std::uint16_t*>(x.data), column_stride(x), C,
+                                                            from, count, first, rows, ring);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_inkling2_keys_load(const LosslessInkling2Keys& source, int first, int count, int stride, Tensor& kh,
+                                 Tensor& vt, cudaStream_t stream) {
+    const std::int64_t plane_elements = static_cast<std::int64_t>(kKeyDim) * stride;
+    require(source.k != nullptr && source.v != nullptr && source.dim == kKeyDim && source.heads > 0 && first >= 0 &&
+                count >= 0 && stride >= count && (source.table != nullptr || source.ring_pages > 0),
+            "keys_load: 128-wide rows of a ring or a pool, positions >= 0, planes of >= count columns");
+    require(kh.dtype == DType::BF16 && vt.dtype == DType::BF16 && kh.numel() >= plane_elements * source.heads &&
+                vt.numel() >= plane_elements * source.heads,
+            "keys_load: BF16 planes of D x stride per head");
+    if (count == 0) { return; }
+    const dim3 grid(static_cast<unsigned>((count + kKeyUnitRows - 1) / kKeyUnitRows), static_cast<unsigned>(source.heads));
+    keys_load_kernel<<<grid, 256, 0, stream>>>(source, first, count, stride, static_cast<std::uint16_t*>(kh.data),
+                                               static_cast<std::uint16_t*>(vt.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_inkling2_keys_store(const Tensor& k, const Tensor& v, int first, const LosslessInkling2Keys& destination,
+                                  cudaStream_t stream) {
+    const LosslessInkling2Keys& d = destination;
+    require(d.k != nullptr && d.v != nullptr && d.dim == kKeyDim && d.heads > 0 && first >= 0 &&
+                (d.table != nullptr || d.ring_pages > 0),
+            "keys_store: 128-wide rows of a ring or a pool at a position >= 0");
+    require(is_matrix(k) && is_matrix(v) && k.dtype == DType::BF16 && v.dtype == DType::BF16 &&
+                k.ne[0] == static_cast<std::int64_t>(d.heads) * kKeyDim && v.ne[0] == k.ne[0] && v.ne[1] == k.ne[1],
+            "keys_store: k and v BF16 [dim heads, T]");
+    const int T = static_cast<int>(k.ne[1]);
+    const int ring_positions = d.table != nullptr ? T : d.ring_pages * kKeyUnitRows;
+    const int from = T > ring_positions ? T - ring_positions : 0, count = T - from;
+    if (count <= 0) { return; }
+    const std::int64_t n = static_cast<std::int64_t>(d.heads) * kKeyDim * count;
+    keys_store_kernel<<<grid_for(n, 256), 256, 0, stream>>>(static_cast<const std::uint16_t*>(k.data), column_stride(k),
+                                                            static_cast<const std::uint16_t*>(v.data), column_stride(v),
+                                                            from, count, first, d);
     CUDA_CHECK(cudaGetLastError());
 }
 

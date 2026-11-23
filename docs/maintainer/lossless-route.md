@@ -360,7 +360,21 @@ exact product with the transposed value plane. The routed experts group each lay
 tiles of their records (`lossless_linear_tiles`; NVFP4 with `den` as the activation divisor and each column's `outer`
 as its scale, MXFP8 through the `mxfp8_expert_rg16_v1` bank route). `--reference` with `--kv-dtype bf16` rounds each
 visit's V to FP16, as the bf16 profile stores it (`lossless_round_fp16`); the design reference of the coded KV formats
-and lossless generation are not built for Inkling 2 yet.
+is not built for Inkling 2 yet.
+
+Generation (`infernix --lossless`, `infernix-serve --lossless`; text requests, `--kv-dtype bf16`, no speculation)
+runs LosslessForward's cache form (`LosslessLaneState`): each prefill chunk and each decode call of a lane is one eager
+call (the router's selections go to the host), a lane at a time, continuing the lane's state in the reproducible
+route's layouts with the lossless values. Each convolution's input takes the lane's last three inputs before the call
+from its conv ring (`lossless_inkling2_ring_load`; zeros before position 0) and leaves the call's in it
+(`lossless_inkling2_ring_store`); attention's key planes hold the keys before the call that its queries see (a sliding
+visit's last 1,023 from its window ring, a full visit's every one through the block table:
+`lossless_inkling2_keys_load`), then the call's own, its queries' positions offset by those keys, and the call's K and
+V are stored bit for bit (`lossless_inkling2_keys_store`; V as its BF16 value, so the pool's V planes are BF16 on this
+route). Every operation is the window form's on the same values, so a position's logits do not depend on the prefill
+chunk, prefill or decode, the other requests or the prefix cache (whose snapshots are the lane's image and pages, exact
+copies; the file records the route); `infernix_inkling2_lossless_real_test` checks the cache form against the window
+form byte for byte. Sampling reads the FP32 logits; sampled requests draw by Gumbel-max.
 
 **Transcendental functions** (`src/ops/lossless/cr_math.cuh`): every one takes a binary32 argument, so
 its correct rounding is decidable: the double evaluation is accepted when both ends of its error

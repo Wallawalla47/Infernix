@@ -161,4 +161,43 @@ void lossless_inkling2_softcap(const Tensor& x, float cap, Tensor& out, cudaStre
  */
 void lossless_inkling2_heads(const Tensor& x, int heads, bool transposed, int stride, Tensor& out, cudaStream_t stream);
 
+// The cache form's state (generation, docs/maintainer/lossless-route.md §3a): exact copies between a call's tensors and
+// a lane's stored history, in the layouts the reproducible route keeps (models/inkling2/execution/forward.h StateLayout,
+// inkling2_attention.h), the lossless route's values bit for bit.
+
+/**
+ * A convolution's input ring: BF16 [rows][C], position p at row p % rows. ring_load writes positions first ..
+ * first + count - 1 into columns 0 .. count - 1 of out (BF16 [C, *], columns may be strided; +0 for a negative
+ * position: zeros before the sequence); ring_store writes x's columns (BF16 [C, T], column t position first + t,
+ * first >= 0) into the ring, only the last min(T, rows) (the ring then holds the call's last rows).
+ */
+void lossless_inkling2_ring_load(const std::uint16_t* ring, int rows, int first, int count, Tensor& out,
+                                 cudaStream_t stream);
+void lossless_inkling2_ring_store(const Tensor& x, int first, std::uint16_t* ring, int rows, cudaStream_t stream);
+
+/**
+ * Stored keys and values: a row of `dim` (128) BF16 per (position, KV head) in units of 64 positions; a sliding
+ * visit's ring [heads][ring_pages][64][dim] (position p in unit (p / 64) % ring_pages, row p % 64), or a full visit's
+ * page-major pool [pages][heads][64][dim] through a lane's block-table row (`table`, device I32: position p in page
+ * table[p / 64]).
+ */
+struct LosslessInkling2Keys {
+    std::uint16_t* k          = nullptr;
+    std::uint16_t* v          = nullptr;
+    const std::int32_t* table = nullptr; // a full visit's block-table row; null: a ring
+    int ring_pages            = 0;
+    int heads                 = 0;
+    int dim                   = 0;
+};
+/**
+ * Positions first .. first + count - 1 (first >= 0) into head planes laid out as lossless_inkling2_heads writes them,
+ * `stride` columns a plane: kh[h][j][d] (head-major) and vt[h][d][j] (transposed) for column j = position - first.
+ */
+void lossless_inkling2_keys_load(const LosslessInkling2Keys& source, int first, int count, int stride, Tensor& kh,
+                                 Tensor& vt, cudaStream_t stream);
+/** k and v (BF16 [dim heads, T], column t position first + t) into their rows (a ring: only the last min(T, its
+ * positions)). */
+void lossless_inkling2_keys_store(const Tensor& k, const Tensor& v, int first, const LosslessInkling2Keys& destination,
+                                  cudaStream_t stream);
+
 } // namespace infernix::ops
