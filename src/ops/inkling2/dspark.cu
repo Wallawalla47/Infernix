@@ -236,10 +236,30 @@ __global__ void __launch_bounds__(kAttnThreads, 1) attention_split_kernel(const 
     const int k0 = lo + split * kSplitKeys, k1 = min(hi, k0 + kSplitKeys);
     float* partial = a.scratch + (static_cast<std::size_t>(g) * a.splits + split) * kGroupRows * kPartialWords;
     if (k0 >= k1) { return; } // an inactive split (the merge reads only the active ones)
-    // The group's query rows: row q = block row i * 3 + head j (query head 3 g + j).
-    for (int i = tid; i < kGroupRows * kD; i += kAttnThreads) {
-        const int q = i / kD, d = i % kD, row = q / 3, head = 3 * g + q % 3;
-        sm.q[q][d] = bf(a.q[(static_cast<std::size_t>(row) * kDSparkHeads + head) * kD + d]);
+    // The group's query rows: row q = block row i * 3 + head j (query head 3 g + j), as 16-byte pieces all issued first.
+    {
+        constexpr int kQPieces = (kGroupRows * kD / 8 + kAttnThreads - 1) / kAttnThreads; // 2
+        uint4 qp[kQPieces];
+#pragma unroll
+        for (int j = 0; j < kQPieces; ++j) {
+            const int i = tid + j * kAttnThreads, q = i / (kD / 8), c = i % (kD / 8);
+            qp[j] = make_uint4(0U, 0U, 0U, 0U);
+            if (q < kGroupRows) {
+                const int row = q / 3, head = 3 * g + q % 3;
+                qp[j]         = *reinterpret_cast<const uint4*>(a.q + (static_cast<std::size_t>(row) * kDSparkHeads + head) * kD + 8 * c);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kQPieces; ++j) {
+            const int i = tid + j * kAttnThreads, q = i / (kD / 8), c = i % (kD / 8);
+            if (q >= kGroupRows) { continue; }
+            const std::uint32_t w[4] = {qp[j].x, qp[j].y, qp[j].z, qp[j].w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                sm.q[q][8 * c + 2 * e]     = bf(static_cast<std::uint16_t>(w[e] & 0xFFFFU));
+                sm.q[q][8 * c + 2 * e + 1] = bf(static_cast<std::uint16_t>(w[e] >> 16));
+            }
+        }
     }
     if (tid < kGroupRows) {
         sm.m[tid] = -INFINITY;
@@ -266,16 +286,34 @@ __global__ void __launch_bounds__(kAttnThreads, 1) attention_split_kernel(const 
         __syncthreads(); // the previous tile's readers are done
         if (tid < n) { sm.rows[tid] = row_of(t0 + tid); } // each key's row, looked up once a tile
         __syncthreads();
-        for (int i = tid; i < kTileKeys * kD; i += kAttnThreads) {
-            const int k = i / kD, d = i % kD;
-            float kv = 0.0F, vv = 0.0F;
-            if (k < n) {
-                const std::size_t at = static_cast<std::size_t>(sm.rows[k]) * kD + d;
-                kv                   = bf(a.cache_k[at]);
-                vv                   = bf(a.cache_v[at]);
+        {
+            // The tile's K and V rows as 16-byte pieces (8 values), every piece issued before any is stored, so the
+            // tile costs one round trip (element loads stored one at a time cost one each).
+            constexpr int kPieces = kTileKeys * kD / 8 / kAttnThreads; // 2 a thread
+            uint4 kp[kPieces], vp[kPieces];
+#pragma unroll
+            for (int j = 0; j < kPieces; ++j) {
+                const int i = tid + j * kAttnThreads, k = i / (kD / 8), c = i % (kD / 8);
+                kp[j] = vp[j] = make_uint4(0U, 0U, 0U, 0U);
+                if (k < n) {
+                    const std::size_t at = static_cast<std::size_t>(sm.rows[k]) * kD + 8 * c;
+                    kp[j]                = *reinterpret_cast<const uint4*>(a.cache_k + at);
+                    vp[j]                = *reinterpret_cast<const uint4*>(a.cache_v + at);
+                }
             }
-            sm.kt[d][k] = kv;
-            sm.v[k][d]  = vv;
+#pragma unroll
+            for (int j = 0; j < kPieces; ++j) {
+                const int i = tid + j * kAttnThreads, k = i / (kD / 8), c = i % (kD / 8);
+                const std::uint32_t kw[4] = {kp[j].x, kp[j].y, kp[j].z, kp[j].w};
+                const std::uint32_t vw[4] = {vp[j].x, vp[j].y, vp[j].z, vp[j].w};
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    sm.kt[8 * c + 2 * e][k]     = bf(static_cast<std::uint16_t>(kw[e] & 0xFFFFU));
+                    sm.kt[8 * c + 2 * e + 1][k] = bf(static_cast<std::uint16_t>(kw[e] >> 16));
+                    sm.v[k][8 * c + 2 * e]      = bf(static_cast<std::uint16_t>(vw[e] & 0xFFFFU));
+                    sm.v[k][8 * c + 2 * e + 1]  = bf(static_cast<std::uint16_t>(vw[e] >> 16));
+                }
+            }
         }
         __syncthreads();
         // Scores: thread t: key t % 32, rows 3 (t / 32) .. + 2.
@@ -750,6 +788,10 @@ void dspark_attention(const DSparkAttentionArgs& a, cudaStream_t stream) {
     if (a.q == nullptr || a.cache_k == nullptr || a.cache_v == nullptr || a.round == nullptr || a.scratch == nullptr ||
         a.out == nullptr || a.splits <= 0 || (a.ring <= 0 && (a.table == nullptr || a.table_stride <= 0))) {
         throw std::invalid_argument("inkling2 dspark_attention: queries, a cache, the round, scratch and splits");
+    }
+    if (reinterpret_cast<std::uintptr_t>(a.q) % 16 != 0 || reinterpret_cast<std::uintptr_t>(a.cache_k) % 16 != 0 ||
+        reinterpret_cast<std::uintptr_t>(a.cache_v) % 16 != 0) {
+        throw std::invalid_argument("inkling2 dspark_attention: 16-byte aligned queries and caches (16-byte row loads)");
     }
     static const bool configured = [] {
         check(cudaFuncSetAttribute(attention_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
