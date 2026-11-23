@@ -90,7 +90,25 @@ degenerate row on a cut layer, and no `generation.source`.
 
 The direction takes `rows x 2560 x 4` bytes of VRAM: 10 KiB shared, 480 KiB as a per-layer stack (the memory
 summary's `adapter_bytes`). A cut lane launches no extra kernel and takes no workspace: its inject is the cut inject in
-place of the plain one.
+place of the plain one. Against the plain inject a cut inject costs about 0.4 us per call at one to 32 columns, and the
+fused MoE combine with the cut about 1.5 us; at prefill widths both are faster than the plain kernels
+([Direction cut Op benchmark](../bench/README.md#direction-cut-op-benchmark)).
+
+Measured (2026-11-23, RTX 5090, Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8, `infernix_bench` on the default route, INT8
+KV, one lane, plain decode without a drafter, the n-gram table read from its volume; four fresh processes an arm in
+A B C C B A blocks, each the mean of three repetitions):
+
+| | pp1280 prefill | pp4096 prefill | tg256 decode |
+|---|---|---|---|
+| without `--ablate` | 940.7 tok/s | 2,410.5 tok/s | 149.97 tok/s |
+| the example sidecar | 939.5 (-0.1 %) | 2,402.5 (-0.3 %) | 144.97 (-3.3 %) |
+| the example's layers and lanes at alpha 1e-30 | 937.1 (-0.4 %) | 2,403.3 (-0.3 %) | 148.58 (-0.9 %) |
+
+The prefill differences are inside the runs' spread (1.9 to 3.6 %). The third row runs the example's kernels with the
+plain run's output, so -0.9 % of decode is the cut's own cost (its 40 fused MoE cuts a token). The rest of the
+example's -3.3 % follows from the text it changes: its 256 tokens routed more experts outside the VRAM cache (95.4 %
+hits against 96.5 %, 5,143 experts served by the CPU against 4,040). With a drafter the cut also changes the
+acceptance rate.
 
 ## Making a sidecar
 

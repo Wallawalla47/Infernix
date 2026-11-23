@@ -188,7 +188,7 @@ empty without an adapter), `lora_adapter` to `load` (the adapter the Engine appl
 and to `memory` `draft_screen_bytes` and `adapter_bytes` (the DFlash2 head screen and a LoRA adapter's factors,
 beside the weights' arena) and `cuda_graph_measured_bytes` (what CUDA Graph preparation took). Schema v28 adds `ablate`
 to `config` (`--ablate`, empty without a sidecar) and `ablate_sidecar` to `load` (the sidecar the Engine applied, as
-its startup log names it).
+its startup log names it); `memory.adapter_bytes` then counts the sidecar's direction.
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
@@ -663,6 +663,24 @@ cmake --build build -j --target infernix_rmsnorm_bench
   --cache warm --graph-calls 32 --csv-out /tmp/rmsnorm.csv
 ./build/bench/infernix_rmsnorm_bench --kind hidden27 --tokens 128 --profile
 ```
+
+## Direction cut Op benchmark
+
+`infernix_direction_cut_bench` times `--ablate`'s cut injects against the plain injects they replace on a cut lane, at
+Flash-Next's geometry (S = 4 streams of H = 2560, top-10; `--top-k` changes it): `hyper_connection_inject` against
+`hyper_connection_cut_inject` (an attention lane) and `moe_combine_inject` against `moe_combine_cut_inject` (an MLP
+lane). Each point is one CUDA graph of `--layers` back-to-back calls on the same buffers, reported per call.
+
+```bash
+cmake --build build -j --target infernix_direction_cut_bench
+./build/bench/infernix_direction_cut_bench --columns 1,2,8,32,512,4096 --layers 48 --repeat 50
+```
+
+On an RTX 5090 (2026-11-23, top-10, median per call) the attention lane's cut inject took 1.75 / 1.83 / 1.87 / 2.07 us
+at T = 1 / 2 / 8 / 32 against the plain inject's 1.37 / 1.39 / 1.41 / 1.45 us, and the combine's 2.82 / 2.90 / 2.91 /
+3.16 us against 1.36 / 1.41 / 1.61 / 1.69 us (one CTA a column takes its ten experts in two batches of loads); at
+T = 512 and 4096 the cut forms were faster (5.17 and 84.4 us against 6.44 and 104.2; 11.44 and 222.1 us against 13.40
+and 224.8).
 
 ## GDN control-projection Op benchmark
 
