@@ -22,23 +22,10 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import type { ModelArtifact } from "@/lib/api-types";
-
 import type { Control } from "./controls";
 
-const offloaded = (model: ModelArtifact) => model.offloaded_experts;
-const flashNext = (model: ModelArtifact) => model.needs_ngram_volume;
-const qwen35 = (model: ModelArtifact) => !model.needs_ngram_volume;
-const vision = (model: ModelArtifact) => model.has_vision;
-/** Qwen3.5 with dense MLPs (the 27B): the models --lora adapts. */
-const denseQwen35 = (model: ModelArtifact) => qwen35(model) && !model.num_experts;
-const fp4Local = (model: ModelArtifact) => /fp4[-_]?local/i.test(`${model.recipe ?? ""} ${model.name} ${model.file_name}`);
-/** Flash-Next conversions whose routed experts are NVIDIA's W4A4 NVFP4 (recipe A and Dense8). */
-const w4a4Experts = (model: ModelArtifact) =>
-  flashNext(model) &&
-  /nvfp4/i.test(`${model.recipe ?? ""} ${model.quantization ?? ""}`) &&
-  !fp4Local(model) &&
-  !/orcarouter|uncensored/i.test(`${model.recipe ?? ""} ${model.name}`);
+// Which of these a model shows is the server-side table's to say (src/launcher/option_support.cpp, sent as the model's
+// option_support): nothing here gates by model type.
 
 export const KV_OPTIONS = [
   { value: "int8", label: "INT8 (recommended)" },
@@ -58,7 +45,6 @@ export interface FormSection {
   icon: LucideIcon;
   /** Open until the user closes it (the others start closed unless one of their options is set). */
   startsOpen?: boolean;
-  when?: (model: ModelArtifact) => boolean;
   /** Options the page renders with a field of its own at the top of the section. */
   fields?: string[];
   controls: Control[];
@@ -145,7 +131,6 @@ const CONTEXT: FormSection = {
       flag: "--embedding-host",
       label: "Token embedding in RAM",
       help: "Keep the token embedding in pinned host memory so its VRAM (1.18 GiB on the 27B) goes to the KV and prefix caches. Same output.",
-      when: (model) => qwen35(model) && !model.offloaded_experts,
       more: true,
     },
     {
@@ -245,7 +230,6 @@ const PREFIX_CACHE: FormSection = {
       help: "After a reply that ends in a tool call, keep that conversation's cached prefix ahead of other cache entries this long, so the tool's result finds it (0 turns it off).",
       placeholder: "30 (default)",
       min: 0,
-      when: qwen35,
       more: true,
     },
     {
@@ -302,7 +286,6 @@ const PREFIX_CACHE: FormSection = {
       help: "State snapshot slots kept on the GPU (default: 1, their VRAM being KV cache; concurrency + 2 without a Host tier).",
       placeholder: "default",
       min: 0,
-      when: qwen35,
       more: true,
     },
     {
@@ -320,7 +303,6 @@ const EXPERTS: FormSection = {
   title: "Offloaded experts",
   description: "This model's routed experts live in RAM (or on the SSD) behind a VRAM cache",
   icon: HardDrive,
-  when: offloaded,
   controls: [
     {
       kind: "auto",
@@ -397,7 +379,6 @@ const SPECULATION: FormSection = {
       flag: "--lm-head-draft",
       label: "Optimized proposal head",
       help: "Load the artifact's proposal head for drafting.",
-      when: (model) => model.has_proposal,
     },
     {
       kind: "auto",
@@ -424,7 +405,6 @@ const SPECULATION: FormSection = {
       help: "DFlash2: verify a small tree of alternative drafts each round. auto measures while serving and uses a tree only where it is faster (seeded output can then vary between runs); a list fixes the tree size per number of active requests, e.g. 16,12,12,0.",
       placeholder: "off",
       mono: true,
-      when: qwen35,
       more: true,
     },
     {
@@ -436,7 +416,6 @@ const SPECULATION: FormSection = {
       min: 2,
       max: 8,
       step: 1,
-      when: qwen35,
       more: true,
     },
     {
@@ -495,7 +474,6 @@ const NGRAM: FormSection = {
   description: "Qwen3.8-Flash-Next's per-layer n-gram embeddings",
   icon: Layers,
   startsOpen: true,
-  when: flashNext,
   fields: ["--ngram-volume"],
   controls: [
     {
@@ -742,7 +720,6 @@ const VISION: FormSection = {
   id: "vision",
   title: "Vision",
   icon: ImageIcon,
-  when: vision,
   controls: [
     {
       kind: "switch",
@@ -828,17 +805,21 @@ const ROUTES: FormSection = {
     },
     {
       kind: "switch",
+      flag: "--q8-weights",
+      label: "8-bit weights (approximate)",
+      help: "Inkling 2: the attention input and output projections and the head as 8-bit weights, where they measured faster. Changes the output slightly; the reproducible and lossless routes refuse it.",
+    },
+    {
+      kind: "switch",
       flag: "--expert-a4-activations",
       label: "4-bit expert activations (approximate)",
       help: "NVIDIA FP4-Local only: W4A4 experts; faster, changes the output.",
-      when: fp4Local,
     },
     {
       kind: "switch",
       flag: "--a16-activations",
-      label: "16-bit expert activations",
-      help: "NVIDIA's W4A4 experts (the NVFP4, NVFP4 Dense8 and NVFP4-QAD conversions; on QAD the shared experts too): run them with 16-bit activations instead of the 4-bit ones the checkpoint specifies. Changes the output; the default follows NVIDIA and is recommended.",
-      when: w4a4Experts,
+      label: "16-bit activations",
+      help: "16-bit activations where the checkpoint specifies fewer bits: NVIDIA's W4A4 experts (Flash-Next's NVFP4, NVFP4 Dense8 and NVFP4-QAD conversions), the NVFP4 and FP8 layers of NVIDIA's NVFP4 27B, and Inkling 2's routed experts. Changes the output; the default follows the checkpoint and is recommended.",
     },
     {
       kind: "number",
@@ -847,7 +828,6 @@ const ROUTES: FormSection = {
       help: "Skip a routed expert missing from VRAM that every token of a round ranks at R or lower: faster decode, slightly worse output.",
       placeholder: "off",
       min: 1,
-      when: offloaded,
     },
     {
       kind: "select",
@@ -916,7 +896,6 @@ const LORA: FormSection = {
   title: "LoRA adapter",
   description: "A fine-tune applied on top of the model's weights at load",
   icon: Puzzle,
-  when: denseQwen35,
   // The page's own field: the library's adapters (Discover > LoRA adapters downloads them), or a path.
   fields: ["--lora"],
   controls: [],
@@ -1000,7 +979,6 @@ const LOGGING: FormSection = {
       placeholder: "off",
       mono: true,
       wide: true,
-      when: offloaded,
       more: true,
     },
   ],

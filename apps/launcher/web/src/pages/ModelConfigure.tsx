@@ -261,11 +261,11 @@ function ContextField({ model, form }: { model: ModelArtifact; form: FormContext
       label="Context length"
       flag="--max-context"
       help={`Tokens per request (prompt and output). Native ${formatInt(model.native_context)}; without the flag the server uses 8,192.${
-        model.offloaded_experts ? "" : " Auto sizes it at startup to the largest the KV cache holds beside the weights."
+        model.option_support.context_auto ? " Auto sizes it at startup to the largest the KV cache holds beside the weights." : ""
       }`}
     >
       <div className="flex flex-wrap items-center gap-1.5">
-        {model.offloaded_experts ? null : (
+        {!model.option_support.context_auto ? null : (
           <button
             type="button"
             onClick={() => set("auto")}
@@ -351,10 +351,17 @@ function ConcurrencyField({ form }: { form: FormContext }) {
 function SpecField({ model, form, specArg }: { model: ModelArtifact; form: FormContext; specArg: string | null | undefined }) {
   const current = getFlagString(form.args, "--spec", form.takesValue);
   const offIsExplicit = (specArg ?? "").split("|").includes("off");
-  const options: { value: string; label: string }[] = [{ value: "auto", label: "Auto (fastest measured drafter)" }];
-  if (model.has_mtp) options.push({ value: "mtp", label: "MTP" });
-  if (model.has_dflash) options.push({ value: "dflash", label: "DFlash" });
-  if (model.has_dflash2 || model.accepts_draft_model) options.push({ value: "dflash2", label: "DFlash2" });
+  const labels: Record<string, string> = {
+    auto: "Auto (fastest measured drafter)",
+    mtp: "MTP",
+    dflash: "DFlash",
+    dflash2: "DFlash2",
+    dspark: "DSpark",
+  };
+  // The drafters this model takes (option_support); `off` is the Off item below.
+  const options = model.option_support.spec_values
+    .filter((value) => value !== "off")
+    .map((value) => ({ value, label: labels[value] ?? value }));
   // UNSET is the Off item; without the flag the server's own default applies.
   const value = current === "off" ? UNSET : current.length > 0 ? current : offIsExplicit ? "auto" : UNSET;
   const choose = (next: string) =>
@@ -895,10 +902,11 @@ export function ModelConfigurePage() {
   const commandLine = preview.data?.command_line ?? argsToCommandLine(args);
 
   // The sections this model and this infernix-serve have options for, with how many each sets.
-  const formSections = FORM_SECTIONS.filter((section) => (section.when ? section.when(model) : true))
-    .map((section) => {
-      const controls = section.controls.filter((control) => (control.when ? control.when(model) : true) && available(control.flag));
-      const fields = (section.fields ?? []).filter(available);
+  // What this model takes is the launcher's table (option_support), the same one its launches apply.
+  const shown = (flag: string) => available(flag) && !model.option_support.unsupported.includes(flag);
+  const formSections = FORM_SECTIONS.map((section) => {
+      const controls = section.controls.filter((control) => shown(control.flag));
+      const fields = (section.fields ?? []).filter(shown);
       const flags = [...fields, ...controls.map((control) => control.flag)];
       return { section, controls, fields, setCount: flags.filter((flag) => hasFlag(args, flag, takesValue)).length };
     })

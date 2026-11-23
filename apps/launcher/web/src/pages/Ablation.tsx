@@ -83,7 +83,11 @@ function sidecarName(text: string): string {
 }
 
 function runnable(model: ModelArtifact): boolean {
-  return model.family !== "unknown" && model.missing_files.length === 0;
+  return (
+    model.family !== "unknown" &&
+    model.missing_files.length === 0 &&
+    !model.option_support.unsupported.includes("--ablate")
+  );
 }
 
 

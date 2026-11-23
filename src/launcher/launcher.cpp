@@ -6,6 +6,7 @@
 #include "serve/cors_headers.h"
 #include "launcher/load_advice.h"
 #include "launcher/model_defaults.h"
+#include "launcher/option_support.h"
 #include "launcher/process.h"
 #include "launcher/proxy.h"
 #include "launcher/route_support.h"
@@ -520,7 +521,12 @@ void Launcher::scan_loop() {
 
 Args Launcher::effective_args(const std::string& config_id, const ScannedModel& model, const LibraryScan& scan) const {
     const std::optional<StoredModelConfig> stored = store_.model_config(config_id);
-    if (stored && stored->args) { return *stored->args; }
+    if (stored && stored->args) {
+        // A saved value for an option this model no longer takes never reaches the command line.
+        Args args = *stored->args;
+        strip_unsupported_options(args, model);
+        return args;
+    }
     return model_default_args(model, scan);
 }
 
@@ -587,7 +593,7 @@ Json Launcher::model_config_json(const std::string& config_id, const ScannedMode
     const std::optional<StoredModelConfig> stored = store_.model_config(config_id);
     const bool named            = is_named_config(config_id);
     const Args defaults         = model_default_args(model, scan);
-    const Args args             = stored && stored->args ? *stored->args : defaults;
+    const Args args             = effective_args(config_id, model, scan); // without options this model does not take
     const std::string def_alias = config_default_alias(config_id, model, scan);
     const std::string alias     = stored && stored->alias && !stored->alias->empty() ? *stored->alias : def_alias;
     Json env                    = Json::array();

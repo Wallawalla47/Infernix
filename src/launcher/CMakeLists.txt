@@ -37,6 +37,7 @@ add_library(infernix_launcher STATIC
   log_buffer.cpp
   management_routes.cpp
   model_defaults.cpp
+  option_support.cpp
   process.cpp
   proxy.cpp
   public_api.cpp

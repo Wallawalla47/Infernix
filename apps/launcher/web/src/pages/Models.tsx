@@ -701,7 +701,7 @@ function Companions({ library, actions }: { library: Library; actions: Actions }
               LoRA adapters
             </CardTitle>
             <CardDescription>
-              Hugging Face PEFT adapters for the dense 27B models (--lora);{" "}
+              Hugging Face PEFT adapters for the dense 27B models and Inkling 2 (--lora);{" "}
               <Link to="/discover?tab=adapters" className="font-medium text-foreground underline-offset-4 hover:underline">
                 find more
               </Link>

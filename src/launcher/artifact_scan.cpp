@@ -1,5 +1,7 @@
 #include "launcher/artifact_scan.h"
 
+#include "launcher/option_support.h"
+
 #include "launcher/sha256.h"
 
 #include <algorithm>
@@ -101,6 +103,7 @@ std::string architecture_for(std::string_view model_type) {
     if (model_type == "qwen4_exp_text") { return "Qwen4ExpForCausalLM"; }
     if (model_type == "qwen3_5_moe_text") { return "Qwen3_5MoeForCausalLM"; }
     if (model_type == "qwen3_5_text") { return "Qwen3_5ForCausalLM"; }
+    if (model_type == "inkling2_loop_text") { return "Inkling2LoopForCausalLM"; }
     return std::string(model_type);
 }
 
@@ -138,6 +141,11 @@ void classify_family(ScannedModel& model) {
             model.family       = "qwen3.5";
             model.family_label = "Qwen3.5 family";
         }
+        return;
+    }
+    if (model.model_type == "inkling2_loop_text") {
+        model.family       = "inkling2-mini";
+        model.family_label = "Inkling 2 Mini";
         return;
     }
     model.family       = "unknown";
@@ -443,7 +451,12 @@ ParsedEntry parse_artifact_directory(const std::filesystem::path& path,
     model.has_mtp      = components.contains("mtp");
     model.has_dflash   = components.contains("dflash");
     model.has_dflash2  = components.contains("dflash2");
+    model.has_dspark   = components.contains("dspark");
     model.has_proposal = text_component.contains("proposal");
+    if (model.model_type == "inkling2_loop_text") { // its ranking is a parameter of the text component
+        const Json bindings = directory.value("bindings", Json::object());
+        model.has_proposal  = bindings.is_object() && bindings.contains("proposal/token_rank");
+    }
     model.native_context = json_or<std::uint64_t>(text, "max_position_embeddings", 0);
     model.hidden_size    = json_or<std::uint64_t>(text, "hidden_size", 0);
     model.num_layers     = json_or<std::uint64_t>(text, "num_hidden_layers", 0);
@@ -766,7 +779,9 @@ Json to_json(const LibraryScan& scan) {
             {"has_mtp", m.has_mtp},
             {"has_dflash", m.has_dflash},
             {"has_dflash2", m.has_dflash2},
+            {"has_dspark", m.has_dspark},
             {"has_proposal", m.has_proposal},
+            {"option_support", option_support_json(m)},
             {"offloaded_experts", m.offloaded_experts},
             {"needs_ngram_volume", m.needs_ngram_volume},
             {"accepts_draft_model", m.accepts_draft_model},

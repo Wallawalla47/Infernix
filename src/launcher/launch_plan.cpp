@@ -5,6 +5,7 @@
 
 #include "launcher/launch_script.h"
 #include "launcher/load_advice.h"
+#include "launcher/option_support.h"
 #include "launcher/process.h"
 #include "launcher/route_support.h"
 
@@ -85,6 +86,7 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
     Args argv              = {path_utf8(model.path)};
     Args own               = args;
     strip_managed_flags(own, takes);
+    strip_unsupported_options(own, model, takes); // the plan of what a load would run
     argv.insert(argv.end(), own.begin(), own.end());
     std::error_code ignored;
     std::filesystem::create_directories(options_.data_dir / "plans", ignored);
@@ -219,6 +221,12 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
         for (const std::string& flag : removed) { list += (list.empty() ? "" : ", ") + flag; }
         warnings.push_back("set by the launcher, so removed: " + list);
     }
+    const std::vector<std::string> unsupported = strip_unsupported_options(args, model, takes);
+    if (!unsupported.empty()) {
+        std::string list;
+        for (const std::string& flag : unsupported) { list += (list.empty() ? "" : ", ") + flag; }
+        warnings.push_back(model.family_label + " does not take these options, so they are left out: " + list);
+    }
     if (serve.found && !serve.options.empty()) {
         for (const std::string& arg : args) {
             if (!arg.starts_with("--")) { continue; }
@@ -273,12 +281,6 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
         warnings.push_back(model.family_label +
                            " needs an n-gram volume (--ngram-volume): none was found in the model folders; download one "
                            "in Discover");
-    }
-    if (has_flag(args, "--lora") && (model.needs_ngram_volume || model.num_experts.has_value())) {
-        warnings.push_back("--lora adapts dense Qwen3.5 models (the 27B) only; this model's MLPs are experts");
-    }
-    if (has_flag(args, "--draft-model") && !model.accepts_draft_model) {
-        warnings.push_back("--draft-model applies to Qwen3.8-Flash-Next only; this artifact bundles its drafters");
     }
     if (!model.missing_files.empty()) {
         warnings.push_back("missing or incomplete parts: " + std::to_string(model.missing_files.size()));

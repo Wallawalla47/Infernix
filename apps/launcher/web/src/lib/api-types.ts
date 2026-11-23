@@ -11,6 +11,7 @@ export type ModelFamily =
   | "qwen3.8-27b"
   | "qwen3.6-27b"
   | "qwen3.5"
+  | "inkling2-mini"
   | "unknown";
 
 // ---------------------------------------------------------------------------------------------
@@ -199,7 +200,18 @@ export interface ModelArtifact {
   has_mtp: boolean;
   has_dflash: boolean;
   has_dflash2: boolean;
+  /** Inkling 2's bundled DSpark drafter. */
+  has_dspark: boolean;
   has_proposal: boolean;
+  /** What this model takes (src/launcher/option_support.cpp, the one owner): the form shows nothing else. */
+  option_support: {
+    /** infernix-serve options this model does not take. */
+    unsupported: string[];
+    /** The --spec values it takes. */
+    spec_values: string[];
+    /** Whether it takes --max-context auto. */
+    context_auto: boolean;
+  };
   offloaded_experts: boolean;
   /** Qwen3.8-Flash-Next: needs an n-gram volume and takes --draft-model. */
   needs_ngram_volume: boolean;

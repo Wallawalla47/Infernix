@@ -160,7 +160,7 @@ folder levels deep, reading file headers only:
   serves only its own artifact).
 - **LoRA adapters** ([`--lora`](lora.md)): a folder holding a Hugging Face PEFT adapter's
   `adapter_config.json` and `adapter_model.safetensors`, named by the folder, with the base model,
-  rank and modules its config names. It is matched to the dense models of that base (an adapter of
+  rank and modules its config names. It is matched to the models of that base (an adapter of
   `Qwen/Qwen3.8-27B`, or of a repackaging such as `unsloth/Qwen3.8-27B-bnb-4bit`, to the Qwen3.8-27B
   artifacts); whether `infernix-serve` can apply it is the server's to say (below).
 - **Ablation sidecars** ([`--ablate`](ablate.md)): a folder's `sidecar.json` in the `ablate-direction-v2`
@@ -187,7 +187,15 @@ when nothing else is left in it; files a running server uses cannot be deleted.
 Each model's page edits its launch parameters, the `infernix-serve` options after the artifact
 path. The form and the **Launch parameters** text are two views of the same list: a control changes
 its option in the text, an edit to the text moves the controls, and options without a control are
-kept. The **DFlash2 drafter** and **N-gram volume** pickers (Qwen3.8-Flash-Next) list the compatible
+kept. The form shows only what the model takes: one table in the launcher (`src/launcher/option_support.cpp`) says
+which options each model type (Qwen3.5 dense, Qwen3.5-MoE with resident or offloaded experts, Qwen3.8-Flash-Next,
+Inkling 2) accepts, from what the engine accepts and reads for it, and which `--spec` values and whether
+`--max-context auto` apply. The same table builds the default arguments and filters every launch, preview and
+**Will it fit?** plan: a saved value for an option the model does not take is left out of the command line, and the
+preview names it. A model type the launcher does not know is not restricted. Inkling 2's defaults are
+`--max-context auto` and `--spec auto --draft-tokens auto` (DSpark when the artifact bundles it); `--lm-head-draft` is
+offered when the artifact holds its `proposal/token_rank` parameter; `--lora` and `--ablate` are not offered for it yet.
+The **DFlash2 drafter** and **N-gram volume** pickers (Qwen3.8-Flash-Next) list the compatible
 files found and write `--draft-model` and `--ngram-volume`; the **LoRA adapter** picker (the dense
 27Bs) lists the adapters found, those of the model's base first (another base's is marked, and
 picking it warns), or takes a folder or file elsewhere, and writes `--lora`. The full command line is previewed with
@@ -293,7 +301,7 @@ drafter and an n-gram volume (the recommended table preselected). Choose the des
 the folder browser; by default each repository gets its own subfolder. Any other repository can be
 entered by its `owner/name`.
 
-**Discover → LoRA adapters** asks Hugging Face for the PEFT LoRA adapters of a dense 27B base model
+**Discover → LoRA adapters** asks Hugging Face for the PEFT LoRA adapters of a base model
 (Qwen3.8-27B or Qwen3.6-27B) whose repository holds `adapter_config.json` and
 `adapter_model.safetensors` at its root, the files [`--lora`](lora.md) reads (GGUF exports and merged
 models are left out): [Harness Hub](https://huggingface.co/harness-hub)'s adapters for agent

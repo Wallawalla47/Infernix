@@ -1,5 +1,7 @@
 #include "launcher/model_defaults.h"
 
+#include "launcher/option_support.h"
+
 #include <algorithm>
 
 namespace infernix::launcher {
@@ -43,18 +45,22 @@ const ScannedNgramVolume* best_ngram_volume(const LibraryScan& scan, const Scann
 
 Args default_args(const LibraryScan& scan, const ScannedModel& model) {
     Args args;
+    // Only what this model takes (option_support.h).
     const auto add = [&](std::string_view flag, std::string_view value = {}) {
+        if (!supports_option(model, flag)) { return; }
         args.emplace_back(flag);
         if (!value.empty()) { args.emplace_back(value); }
     };
+    const bool inkling               = model_kind(model) == ModelKind::Inkling2;
     const bool has_drafter_component = model.has_mtp || model.has_dflash || model.has_dflash2;
 
     if (model.family == "qwen3.8-flash-next") {
         add("--max-context", "262144");
-    } else if (model.family == "qwen3.8-27b" || model.family == "qwen3.6-27b") {
+    } else if (model.family == "qwen3.8-27b" || model.family == "qwen3.6-27b" || inkling) {
         // Every KV page stays on the GPU: infernix-serve sizes the context at startup to the largest the KV
         // cache holds beside the weights and the headroom (2026-11-14, a headless 32 GB RTX 5090 with the 22 GB
-        // NVIDIA NVFP4 artifact, INT8 KV, two lanes, DFlash2: 256,896 tokens, the whole KV pool).
+        // NVIDIA NVFP4 artifact, INT8 KV, two lanes, DFlash2: 256,896 tokens, the whole KV pool). Inkling 2 reserves
+        // each lane's whole context, so a fixed default could exceed the card.
         add("--max-context", "auto");
     } else if (model.native_context != 0) {
         add("--max-context", std::to_string(std::min<std::uint64_t>(model.native_context, 262144)));
@@ -64,12 +70,13 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model) {
 
     // Speculative decoding: the Engine picks the drafter measured fastest for the artifact.
     const ScannedDrafter* drafter = model.accepts_draft_model ? best_drafter(scan, model) : nullptr;
-    if (has_drafter_component || drafter != nullptr) {
+    // Inkling 2: auto drafts with DSpark when the artifact bundles it and decodes plainly when not.
+    if (has_drafter_component || drafter != nullptr || inkling) {
         add("--spec", "auto");
         add("--draft-tokens", "auto");
         // The proposal head pays off with DFlash/DFlash2 and the small-model MTP drafters, not on the
-        // 122B whose MTP rounds measured no gain from it.
-        if (model.has_proposal && model.family != "qwen3.5-122b-a10b") { add("--lm-head-draft"); }
+        // 122B whose MTP rounds measured no gain from it. On Inkling 2 it is offered, not defaulted: unmeasured here.
+        if (model.has_proposal && model.family != "qwen3.5-122b-a10b" && !inkling) { add("--lm-head-draft"); }
     }
     if (drafter != nullptr) { add("--draft-model", path_utf8(drafter->path)); }
     if (model.family == "qwen3.8-27b" && model.has_dflash2) { add("--ngram-draft-tokens", "auto"); }

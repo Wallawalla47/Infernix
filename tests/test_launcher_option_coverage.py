@@ -50,7 +50,7 @@ def form_controls() -> dict[str, str]:
 
 def string_list(path: Path, name: str) -> set[str]:
     text = path.read_text(encoding="utf-8")
-    block = re.search(re.escape(name) + r"[^=]*=\s*(?:new Set\()?\[([^\]]*)\]", text)
+    block = re.search(re.escape(name) + r"[^=\n]*=\s*(?:new Set\()?\[([^\]]*)\]", text)
     assert block, f"{path.name}: {name} was not found"
     return set(re.findall(r'"(--[a-z0-9-]+)"', block.group(1)))
 
@@ -94,6 +94,17 @@ def test_switches_match_the_server() -> None:
         if kind == "switch" and flag not in known_switches:
             wrong.append(f"{flag}: a switch missing from KNOWN_SWITCHES in args.ts")
     assert not wrong, "; ".join(wrong)
+
+
+def test_the_support_table_names_only_server_options() -> None:
+    """src/launcher/option_support.cpp, the one owner of which model takes which option, and the form holds no gate."""
+    text = (ROOT / "src" / "launcher" / "option_support.cpp").read_text(encoding="utf-8")
+    named = set(re.findall(r'"(--[a-z0-9-]+)"', text))
+    assert len(named) > 40, "option_support.cpp: the option table was not found"
+    stale = sorted(named - set(serve_options()))
+    assert not stale, f"the support table names options infernix-serve does not have: {stale}"
+    form = FORM_OPTIONS.read_text(encoding="utf-8")
+    assert not re.search(r"^\s*when:", form, re.M), "options.ts gates a control by model: use option_support.cpp"
 
 
 if __name__ == "__main__":

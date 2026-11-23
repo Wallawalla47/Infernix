@@ -45,7 +45,8 @@ struct ScannedModel {
     bool has_mtp             = false;
     bool has_dflash          = false;
     bool has_dflash2         = false;
-    bool has_proposal        = false;
+    bool has_dspark          = false; // Inkling 2's bundled drafter
+    bool has_proposal        = false; // a proposal head (--lm-head-draft); on Inkling 2 its proposal/token_rank parameter
     bool offloaded_experts   = false;
     bool needs_ngram_volume  = false;
     bool accepts_draft_model = false;
@@ -196,8 +197,8 @@ struct ParsedEntry {
 [[nodiscard]] AdapterConfigFacts parse_adapter_config(const Json& config);
 [[nodiscard]] Json to_json(const AdapterConfigFacts& facts);
 
-// Whether an adapter was trained on this model's base: a dense Qwen3.5-architecture model (the --lora models) whose
-// family (Qwen3.8-27B, Qwen3.6-27B) the adapter's base_model_name_or_path names.
+// Whether an adapter was trained on this model's base: a dense Qwen3.5-architecture model whose family (Qwen3.8-27B,
+// Qwen3.6-27B) the adapter's base_model_name_or_path names, or Inkling 2 Mini, which it names as such (the --lora models).
 [[nodiscard]] bool adapter_matches(const ScannedModel& model, const ScannedAdapter& adapter);
 
 // A sidecar.json's facts (exposed for tests): nothing when it is not an ablate-direction-v2 sidecar or cuts no layer;

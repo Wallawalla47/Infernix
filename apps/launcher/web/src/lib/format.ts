@@ -158,6 +158,7 @@ export const FAMILY_LABELS: Record<ModelFamily, string> = {
   "qwen3.8-27b": "Qwen3.8-27B",
   "qwen3.6-27b": "Qwen3.6-27B",
   "qwen3.5": "Qwen3.5 family",
+  "inkling2-mini": "Inkling 2 Mini",
   unknown: "Other",
 };
 
@@ -168,6 +169,7 @@ export const FAMILY_ORDER: ModelFamily[] = [
   "qwen3.6-35b-a3b",
   "qwen3.6-27b",
   "qwen3.5",
+  "inkling2-mini",
   "unknown",
 ];
 

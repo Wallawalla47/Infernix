@@ -10,7 +10,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Hint } from "@/components/ui/tooltip";
 import { getFlag, getFlagValues, setFlag, setFlagValues, type TakesValue } from "@/lib/args";
-import type { ModelArtifact } from "@/lib/api-types";
 import { cn } from "@/lib/utils";
 
 export const UNSET = "__unset__";
@@ -19,8 +18,6 @@ interface Base {
   flag: string;
   label: string;
   help: string;
-  /** Shown only for models this returns true for. */
-  when?: (model: ModelArtifact) => boolean;
   /** A less common option: listed under the section's "More options" (open while one is set). */
   more?: boolean;
 }
