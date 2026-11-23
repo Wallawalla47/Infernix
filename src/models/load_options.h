@@ -48,6 +48,8 @@ struct LoadOptions {
     std::filesystem::path draft_model;
     // Qwen3.5: the LoRA adapter applied at runtime (EngineOptions::lora_path), empty for none.
     std::filesystem::path lora;
+    // Qwen4Exp: the ablation sidecar applied at runtime (EngineOptions::ablate_sidecar_path), empty for none.
+    std::filesystem::path ablate;
     // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
     // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp
     // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected; the Qwen4Exp
@@ -140,6 +142,7 @@ struct LoadOptions {
             .expert_csf               = options.expert_csf,
             .draft_model              = options.speculative.draft_model,
             .lora                     = options.lora_path,
+            .ablate                   = options.ablate_sidecar_path,
             // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
             .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&
                                     options.purpose == EnginePurpose::Generation &&

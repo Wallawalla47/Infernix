@@ -117,6 +117,17 @@ host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT 
 rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module binding (the Gated DeltaNet modules
 included), ranks to 128 and its refusals (a rank above 128 by its wording).
 
+`--ablate` ([Ablation sidecars](../docs/ablate.md)): `infernix_direction_cut_test` checks the cut injects (the plain
+lane form and the fused MoE combine) against an FP64 oracle at Flash-Next's shapes, a column's bits whatever the call's
+width or the column's position, graph replay, that an inactive cut is the plain inject bit for bit and that the fused
+combine equals `moe_combine` followed by the cut inject. On the host, `infernix_artifact_ablate_sidecar_test` covers the
+sidecar reader and every refusal. `infernix_qwen4_exp_ablate_real_test` (Flash-Next, the reproducible route) checks
+that a negligible cut keeps the plain run's bits on every cut path, that cuts of the last layer's lanes and of layer
+0's move the first-token readouts, that a strong cut's decode agrees with its own prefill, and that a cut prompt reads
+the same bits at two prefill chunks of one grid. `infernix_http_scoring_routes_test` covers a `--causal-scoring`
+server's routes over loopback HTTP (generation refused, `/v1/score` answered) and `infernix_score_schema_test` the
+`/v1/score` request and response.
+
 `infernix_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and
 `--non-causal-only` runs only the packed and context sections. CTest registers the latter as

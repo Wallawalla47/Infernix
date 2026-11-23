@@ -3,54 +3,25 @@
 #include "artifact/ablate_sidecar.h"
 #include "models/qwen4_exp/config.h"
 
-#include <cstddef>
-#include <cstdint>
 #include <filesystem>
 #include <string>
 
 namespace infernix::models::qwen4_exp {
 
-// An ablation sidecar (`--ablate`, docs/ablate.md) bound to a Qwen3.8-Flash-Next text configuration: the sidecar read
-// against the model's layer count and hidden width, and its direction's device copy. The forward asks it per layer
-// and lane; an unbound (default) binding cuts nothing, and the forward hooks nothing.
-class AblateBinding {
-public:
-    using Lane = artifact::AblateSidecar::Lane;
-
-    bool enabled = false;
-    std::filesystem::path path;
+// An ablation sidecar (`--ablate`, docs/ablate.md) read at load against a Qwen3.8-Flash-Next text configuration: Model
+// data, as a LoRA adapter's binding is a Qwen3.5 Model's (bind_lora). It holds the host direction and the alpha
+// tables; the direction's device copy and the per-layer cuts the forward reads are the Parameters'
+// (execution/ablate_parameters.h). A Model loaded without --ablate holds none, and nothing downstream changes.
+struct AblateSidecarBinding {
+    std::filesystem::path path; // sidecar.json
     artifact::AblateSidecar sidecar;
 
-    [[nodiscard]] float alpha_for(const std::uint32_t layer, const Lane lane) const noexcept {
-        return enabled ? sidecar.alpha_for(layer, lane) : 0.0F;
-    }
-    [[nodiscard]] bool layer_cut(const std::uint32_t layer) const noexcept {
-        return enabled && sidecar.layer_cut(layer);
-    }
-    // The direction this layer cuts along on the device (nullptr before upload()).
-    [[nodiscard]] const float* device_d(const std::uint32_t layer = 0) const noexcept {
-        return d_device_ == nullptr ? nullptr : d_device_ + sidecar.d_row_offset(layer);
-    }
-
-    void upload(); // cudaMalloc + copy of the direction; throws on failure
-    void release() noexcept;
-
-    // A one-line description for the startup log.
+    // The startup log's description, after the path: "one shared direction, attn lane 26 layers (22-47), mlp lane
+    // 40 layers (8-47); source=...".
     [[nodiscard]] std::string describe() const;
-
-    AblateBinding() = default;
-    AblateBinding(const AblateBinding&)            = delete;
-    AblateBinding& operator=(const AblateBinding&) = delete;
-    AblateBinding(AblateBinding&& other) noexcept;
-    AblateBinding& operator=(AblateBinding&& other) noexcept;
-    ~AblateBinding() { release(); }
-
-private:
-    float* d_device_ = nullptr; // device FP32, rows() x hidden_size; owned
 };
 
-// Reads `path` against `text`'s geometry (artifact::AblateSidecar::load's checks). Nothing on the device until
-// upload(): the Program's planner binds the same sidecar to plan with and runs no kernels.
-[[nodiscard]] AblateBinding bind_ablate(const std::filesystem::path& path, const TextConfig& text);
+// Reads `path` against `text`'s layer count and hidden width (artifact::AblateSidecar::load's checks).
+[[nodiscard]] AblateSidecarBinding bind_ablate(const std::filesystem::path& path, const TextConfig& text);
 
 } // namespace infernix::models::qwen4_exp

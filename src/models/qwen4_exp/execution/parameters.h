@@ -7,6 +7,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen4_exp/execution/ablate_parameters.h"
 #include "models/qwen4_exp/model.h"
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
@@ -161,6 +162,15 @@ public:
     DraftHeadParameters draft_head;
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
     std::uint32_t hc_q8_repacked = 0; // matrices the hc_q8 repack rewrote
+    // --ablate (docs/ablate.md): the direction's device copy and each layer's cuts; nullopt without a sidecar.
+    std::optional<AblateParameters> ablate;
+
+    // A lane's cut at `layer`: inactive without --ablate or where the sidecar leaves the lane uncut.
+    [[nodiscard]] ops::DirectionCut ablate_cut(std::uint32_t layer, AblateParameters::Lane lane) const noexcept {
+        return ablate ? ablate->cut(layer, lane) : ops::DirectionCut{};
+    }
+    // The device bytes beside the weights' arena the sidecar's direction takes (MemorySummary::adapter_bytes).
+    [[nodiscard]] std::uint64_t ablate_bytes() const noexcept { return ablate ? ablate->direction.bytes : 0; }
 
 private:
     // Device copy of every layer's ExpertScales, [layers][E], and the lossless route's.

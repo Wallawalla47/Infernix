@@ -1,6 +1,6 @@
 // The ablation sidecar reader (artifact::AblateSidecar, docs/ablate.md), host only: the format, the two lane
 // tables, the per-layer direction stack, the provenance requirement, and every way a sidecar can be wrong.
-// A model's device copy (qwen4_exp::AblateBinding::upload) is not exercised here; the engine boot covers it.
+// A model's device copy (qwen4_exp's binding at load) is not exercised here; the engine boot covers it.
 // Every case prints a verdict line.
 
 #include "artifact/ablate_sidecar.h"
@@ -80,24 +80,36 @@ struct Scratch {
 int main() {
     AblateSidecar s;
 
-    // --- v1 still means what it meant ----------------------------------------------------------
-    std::printf("v1 compatibility\n");
+    // --- one table for both lanes --------------------------------------------------------------
+    std::printf("alpha_per_layer\n");
     {
-        Scratch t("v1");
+        Scratch t("both");
         const std::string d = write_direction(t.dir, "d.f32.bin", 1);
-        write_json(t.dir, R"({"format":"ablate-direction-v1","direction_file":")" + d +
+        write_json(t.dir, R"({"format":"ablate-direction-v2","direction_file":")" + d +
                             R"(","direction_dtype":"float32","direction_dim":8,"default_alpha":0,
+                               "generation":{"source":"test","notes":"one table"},
                                "alpha_per_layer":{"1":1.955,"2":1.955}})");
         const std::string err = try_load(t.dir, s);
-        check(err.empty(), "v1 flat table loads" + (err.empty() ? "" : "  [got: " + err + "]"));
-        check(s.format_version == 1, "v1 reports version 1");
-        check(!s.per_layer_direction, "v1 direction is shared");
-        check(s.alpha_for(1, AblateSidecar::Lane::Attn) == 1.955F, "v1 cuts the attention lane");
-        check(s.alpha_for(1, AblateSidecar::Lane::Mlp) == 1.955F, "v1 names BOTH lanes with its one alpha");
+        check(err.empty(), "a single table loads" + (err.empty() ? "" : "  [got: " + err + "]"));
+        check(!s.per_layer_direction, "the direction is shared by default");
+        check(s.alpha_for(1, AblateSidecar::Lane::Attn) == 1.955F, "it cuts the attention lane");
+        check(s.alpha_for(1, AblateSidecar::Lane::Mlp) == 1.955F, "and the MLP lane with the same alpha");
         check(s.alpha_for(0, AblateSidecar::Lane::Attn) == 0.0F, "an unlisted layer stays cut-free");
+        check(s.artifact_id.empty(), "a sidecar naming no artifact has an empty artifact_id");
+        check(s.generation == "source=test, one table", "the provenance line names source and notes");
         double norm = 0.0;
         for (const float v : s.d_host) { norm += static_cast<double>(v) * v; }
         check(std::fabs(norm - 1.0) < 1e-6, "the direction is normalized on load");
+    }
+    {
+        Scratch t("artifact");
+        const std::string d = write_direction(t.dir, "d.f32.bin", 1);
+        write_json(t.dir, R"({"format":"ablate-direction-v2","direction_file":")" + d +
+                            R"(","direction_dtype":"float32","direction_dim":8,"artifact_id":"abc123",
+                               "generation":{"source":"test"},"alpha_mlp_per_layer":{"3":1.0}})");
+        const std::string err = try_load(t.dir, s);
+        check(err.empty() && s.artifact_id == "abc123",
+              "artifact_id names the artifact the direction was fitted on" + (err.empty() ? "" : "  [got: " + err + "]"));
     }
 
     // --- v2: the two lanes decide independently -----------------------------------------------
@@ -198,7 +210,7 @@ int main() {
         write_json(t.dir, R"({"format":"ablate-direction-v2","direction_file":")" + d +
                             R"(","direction_dtype":"float32","direction_dim":8,"default_alpha":0,
                                "alpha_attn_per_layer":{"1":1.0}})");
-        threw(try_load(t.dir, s), "generation", "a v2 sidecar with no provenance is refused");
+        threw(try_load(t.dir, s), "generation", "a sidecar with no provenance is refused");
     }
     {
         Scratch t("empty-source");
@@ -218,20 +230,37 @@ int main() {
                                "alpha_attn_per_layer":{"1":3.0}})");
         threw(try_load(t.dir, s), "name a layer once", "a layer named in two tables is refused, not merged");
     }
-    {
-        Scratch t("v1-stack");
-        const std::string d = write_direction(t.dir, "stack.f32.bin", kLayers);
-        write_json(t.dir, R"({"format":"ablate-direction-v1","direction_file":")" + d +
-                            R"(","direction_dtype":"float32","direction_dim":8,"default_alpha":0,
-                               "direction_layout":"per_layer","alpha_per_layer":{"1":1.0}})");
-        threw(try_load(t.dir, s), "per_layer", "v1 cannot claim a stack");
-    }
-    {
+    for (const char* format : {"ablate-direction-v1", "ablate-direction-v3"}) {
         Scratch t("format");
         const std::string d = write_direction(t.dir, "d.f32.bin", 1);
-        write_json(t.dir, R"({"format":"ablate-direction-v3","direction_file":")" + d +
-                            R"(","direction_dtype":"float32","direction_dim":8,"alpha_per_layer":{"1":1.0}})");
-        threw(try_load(t.dir, s), "unsupported format", "an unknown format is refused, never guessed at");
+        write_json(t.dir, std::string(R"({"format":")") + format + R"(","direction_file":")" + d +
+                            R"(","direction_dtype":"float32","direction_dim":8,"generation":{"source":"test"},
+                               "alpha_per_layer":{"1":1.0}})");
+        threw(try_load(t.dir, s), "unsupported format",
+              std::string("another format (") + format + ") is refused, never guessed at");
+    }
+    {
+        // A misspelt lane table would otherwise load as a sidecar that leaves that lane uncut.
+        Scratch t("unknown-key");
+        const std::string d = write_direction(t.dir, "d.f32.bin", 1);
+        write_json(t.dir, R"({"format":"ablate-direction-v2","direction_file":")" + d +
+                            R"(","direction_dtype":"float32","direction_dim":8,"generation":{"source":"test"},
+                               "alpha_attn_per_layer":{"1":1.0},"alpha_mpl_per_layer":{"1":1.0}})");
+        threw(try_load(t.dir, s), "unknown key 'alpha_mpl_per_layer'", "an unknown key is refused by name");
+    }
+    {
+        Scratch t("no-file");
+        write_json(t.dir, R"({"format":"ablate-direction-v2","direction_dtype":"float32","direction_dim":8,
+                              "generation":{"source":"test"},"alpha_attn_per_layer":{"1":1.0}})");
+        threw(try_load(t.dir, s), "direction_file must be", "a sidecar naming no direction file is refused by name");
+    }
+    {
+        Scratch t("notes-type");
+        const std::string d = write_direction(t.dir, "d.f32.bin", 1);
+        write_json(t.dir, R"({"format":"ablate-direction-v2","direction_file":")" + d +
+                            R"(","direction_dtype":"float32","direction_dim":8,
+                               "generation":{"source":"test","notes":7},"alpha_attn_per_layer":{"1":1.0}})");
+        threw(try_load(t.dir, s), "generation.notes", "provenance notes that are not text are refused");
     }
     {
         Scratch t("default-alpha");
@@ -272,6 +301,14 @@ int main() {
                             R"(","direction_dtype":"float32","direction_dim":16,"default_alpha":0,
                                "generation":{"source":"test"},"alpha_attn_per_layer":{"1":1.0}})");
         threw(try_load(t.dir, s), "direction_dim", "a direction for another model's width is refused");
+    }
+    {
+        Scratch t("dim-fraction");
+        const std::string d = write_direction(t.dir, "d.f32.bin", 1);
+        write_json(t.dir, R"({"format":"ablate-direction-v2","direction_file":")" + d +
+                            R"(","direction_dtype":"float32","direction_dim":8.5,
+                               "generation":{"source":"test"},"alpha_attn_per_layer":{"1":1.0}})");
+        threw(try_load(t.dir, s), "direction_dim", "a fractional direction_dim is refused");
     }
     {
         Scratch t("size");

@@ -2670,7 +2670,8 @@ When Vision is enabled, `vision_workspace` reports the aggregate prompt and maxi
 bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
 be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
 `draft_screen_bytes` and `adapter_bytes` are the Device memory beside the weights' arena: the DFlash2
-drafter's proposal-head screen and a LoRA adapter's factors (`--lora`; `0` without one), and
+drafter's proposal-head screen and a LoRA adapter's factors (`--lora`) or an ablation sidecar's direction
+(`--ablate`; `0` without either), and
 `server_start.artifact.lora_adapter` names the adapter as the startup log does (`null` without one), and
 `server_start.artifact.ablate_sidecar` the ablation sidecar (`--ablate`; `null` without one).
 `cuda_graph_allowance_bytes` is the CUDA Graph memory

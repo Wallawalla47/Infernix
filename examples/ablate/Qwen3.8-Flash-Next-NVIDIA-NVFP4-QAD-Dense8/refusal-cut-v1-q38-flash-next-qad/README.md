@@ -2,7 +2,8 @@
 
 **For `Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix` only.** It was fitted on that artifact's activations and
 measured only there. Another conversion of Qwen3.8-Flash-Next has the same geometry, so the sidecar will load on it, but
-nothing here was measured on one.
+nothing here was measured on one: `sidecar.json` names this artifact (`artifact_id` 044ad3ee0d384c0bb24db0b490d852cb), so
+a start on another logs a warning.
 
 ```
 infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix-00001-of-00003.infernix \
@@ -52,8 +53,8 @@ scored once, after the fit. Nine of its harmful prompts are HarmBench behaviors 
 direction prompts and two among the 40 held out. The one HarmBench refusal and the one JBB refusal are different
 prompts.
 
-**JBB-Behaviors on this repository's build** (the PR's, with #74's `/v1/score` merged in for the KL measure; RTX
-5090, 2026-11-21), graded the same way: with the sidecar 2 of the 100 harmful prompts are refused (stock: 96) and 0
+**JBB-Behaviors on PR #75's build** (with #74's `/v1/score` merged in for the KL measure; RTX 5090, 2026-11-21; the
+merged engine computes the cut inside the inject, unrounded, so its bits differ slightly), graded the same way: with the sidecar 2 of the 100 harmful prompts are refused (stock: 96) and 0
 of the 100 benign ones (stock: 38). The stock model's 200 answers are identical to the older build's; with the
 sidecar, 5 answers differ and one verdict changes, a Sexual/Adult content prompt now refused. This build applies the
 last layer's MLP cut on the column that picks the first generated token, which the older build skipped.
@@ -75,9 +76,10 @@ off. The noise band is twice the standard error.
 
 Not measured: GPQA, MuSR, BBH, MMLU-Pro.
 
-**On this repository's build** (the PR's, RTX 5090, 2026-11-21), `infernix-perplexity --ablate` against a
-`--save-top-tokens` run without it, on 24 KB of `docs/serving.md` (context 1,024, stride 512, 6,287 positions):
-perplexity 8.7064 without the sidecar and 8.7076 with it (mean NLL +0.00014 per token); KL from the stock model
-0.082 on average (over its top 64 tokens plus one bucket for the rest, a lower bound); the top token agrees on 86.2 %
-of positions. Every position of technical prose is scored here, where many next tokens are near ties, so this is not
-the first-token measure above. The same run with every alpha set to 0 gives KL 0 and the stock perplexity exactly.
+**On this repository's build** (RTX 5090, 2026-11-23), `infernix-perplexity --ablate` against a `--save-top-tokens`
+run without it, on the first 24 KB (whole lines) of `docs/serving.md` (context 1,024, stride 512, FP8 KV, 6,341
+positions): perplexity 9.4550 without the sidecar and 9.4745 with it (mean NLL +0.0021 per token); KL from the stock
+model 0.081 on average (over its top 64 tokens plus one bucket for the rest, a lower bound); the top token agrees on
+86.1 % of positions. Every position of technical prose is scored here, where many next tokens are near ties, so this
+is not the first-token measure above. (On PR #75's build, 2026-11-21, a 24 KB slice of the file as it was then gave
+8.7064 and 8.7076, KL 0.082 and 86.2 %; the text differs, so only the KL and the agreement compare.)

@@ -2,20 +2,36 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace infernix::artifact {
 namespace {
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("ablate-sidecar: " + what); }
 
-constexpr double kAlphaMax = 4.0;      // beyond this the cut is a projection removal, not an ablation
-constexpr double kMinNorm   = 0.5;     // a direction this far from unit is a broken file, not a weak cut
+constexpr std::string_view kFormat = "ablate-direction-v2";
+constexpr double kAlphaMax         = 4.0; // beyond this the cut is a projection removal, not an ablation
+constexpr double kMinNorm          = 0.5; // a direction this far from unit is a broken file, not a weak cut
+
+constexpr std::array<std::string_view, 11> kKeys{
+    "format",          "direction_dtype",      "direction_dim",       "direction_layout",
+    "direction_file",  "default_alpha",        "alpha_per_layer",     "alpha_attn_per_layer",
+    "alpha_mlp_per_layer", "generation",       "artifact_id"};
+
+const std::string& required_string(const nlohmann::json& cfg, const char* key) {
+    if (!cfg.contains(key) || !cfg.at(key).is_string() || cfg.at(key).get_ref<const std::string&>().empty()) {
+        fail(std::string(key) + " must be a non-empty string");
+    }
+    return cfg.at(key).get_ref<const std::string&>();
+}
 
 // One alpha table: {"3": 1.9, "4": 0.0} into a dense per-layer vector. Keys must be bare integers
 // inside the layer range, values finite inside [0, kAlphaMax]; anything else fails the boot.
@@ -43,13 +59,11 @@ void read_table(const nlohmann::json& table, const std::string& what, const std:
 }
 
 // Reads the direction bytes and normalizes them row by row. A shared direction is one row; a
-// per-layer stack is n_layers rows of hidden_size floats each. `required[r]` says whether layer r is
-// cut: a required row that is non-finite or far from unit fails the boot; an unrequired one is
+// per-layer stack is n_layers rows of hidden_size floats each. `required[r]` says whether row r is
+// read by a cut: a required row that is non-finite or far from unit fails the boot; an unrequired one is
 // zeroed and carried, so a short stack still loads for the layers that do use it.
-void read_direction(const std::filesystem::path& json_path, const std::string& file_name,
-                    const std::uint32_t rows, const std::uint32_t hidden_size,
-                    const std::vector<float>& required, std::vector<float>& d) {
-    const auto path = json_path.parent_path() / file_name;
+void read_direction(const std::filesystem::path& path, const std::uint32_t rows, const std::uint32_t hidden_size,
+                    const std::vector<bool>& required, std::vector<float>& d) {
     std::ifstream bin(path, std::ios::binary);
     if (!bin) { fail("direction file not found: " + path.string()); }
     std::vector<char> bytes((std::istreambuf_iterator<char>(bin)), std::istreambuf_iterator<char>());
@@ -63,12 +77,15 @@ void read_direction(const std::filesystem::path& json_path, const std::string& f
     std::memcpy(d.data(), bytes.data(), bytes.size());
 
     for (std::uint32_t row = 0; row < rows; ++row) {
-        const bool required_row = row < static_cast<std::uint32_t>(required.size()) && required[row] != 0.0F;
-        float*        v    = d.data() + static_cast<std::size_t>(row) * hidden_size;
-        double        norm = 0.0;
-        bool          finite = true;
+        const bool required_row = row < required.size() && required[row];
+        float* v                = d.data() + static_cast<std::size_t>(row) * hidden_size;
+        double norm             = 0.0;
+        bool finite             = true;
         for (std::uint32_t h = 0; h < hidden_size; ++h) {
-            if (!std::isfinite(v[h])) { finite = false; break; }
+            if (!std::isfinite(v[h])) {
+                finite = false;
+                break;
+            }
             norm += static_cast<double>(v[h]) * v[h];
         }
         norm = std::sqrt(norm);
@@ -93,10 +110,10 @@ void read_direction(const std::filesystem::path& json_path, const std::string& f
     }
 }
 
-}  // namespace
+} // namespace
 
 AblateSidecar AblateSidecar::load(const std::filesystem::path& json_path, const std::uint32_t n_layers,
-                                 const std::uint32_t hidden_size) {
+                                  const std::uint32_t hidden_size) {
     std::ifstream in(json_path);
     if (!in) { fail("sidecar not found: " + json_path.string()); }
     nlohmann::json cfg;
@@ -105,115 +122,95 @@ AblateSidecar AblateSidecar::load(const std::filesystem::path& json_path, const 
     } catch (const std::exception& error) {
         fail("bad JSON in " + json_path.string() + ": " + error.what());
     }
-
-    const std::string format = cfg.value("format", std::string());
-    int version              = 0;
-    if (format == "ablate-direction-v1") { version = 1; }
-    else if (format == "ablate-direction-v2") { version = 2; }
-    else {
-        fail("unsupported format '" + (format.empty() ? std::string("<missing>") : format) +
-             "': expected ablate-direction-v1 or ablate-direction-v2");
+    if (!cfg.is_object()) { fail(json_path.string() + " must hold a JSON object"); }
+    for (const auto& entry : cfg.items()) {
+        if (std::find(kKeys.begin(), kKeys.end(), entry.key()) == kKeys.end()) {
+            fail("unknown key '" + entry.key() + "' in " + json_path.string());
+        }
     }
 
-    if (cfg.value("direction_dtype", std::string()) != "float32") { fail("direction_dtype must be float32"); }
-    if (cfg.value("direction_dim", 0.0) != static_cast<double>(hidden_size)) {
-        fail("direction_dim " + std::to_string(cfg.value("direction_dim", 0.0)) +
-             " != model write width " + std::to_string(hidden_size));
+    const std::string format = cfg.contains("format") && cfg.at("format").is_string()
+                                   ? cfg.at("format").get<std::string>()
+                                   : std::string();
+    if (format != kFormat) {
+        fail("unsupported format '" + (format.empty() ? std::string("<missing>") : format) + "': expected " +
+             std::string(kFormat));
+    }
+    if (required_string(cfg, "direction_dtype") != "float32") { fail("direction_dtype must be float32"); }
+    if (!cfg.contains("direction_dim") || !cfg.at("direction_dim").is_number_integer() ||
+        cfg.at("direction_dim").get<std::int64_t>() != static_cast<std::int64_t>(hidden_size)) {
+        fail("direction_dim must be the model's write width " + std::to_string(hidden_size));
     }
     // Layers outside every table stay cut-free. A sidecar that cuts everything by default would turn
     // a typo in the table into a model-wide edit, and the fit could not tell the two apart.
-    if (cfg.value("default_alpha", 0.0) != 0.0) {
-        fail("format v" + std::to_string(version) + " requires default_alpha 0");
+    if (cfg.contains("default_alpha") &&
+        (!cfg.at("default_alpha").is_number() || cfg.at("default_alpha").get<double>() != 0.0)) {
+        fail("default_alpha must be 0");
     }
 
     AblateSidecar sidecar;
-    sidecar.format_version = version;
-    sidecar.n_layers       = n_layers;
-    sidecar.hidden_size    = hidden_size;
+    sidecar.n_layers    = n_layers;
+    sidecar.hidden_size = hidden_size;
     for (auto& table : sidecar.alpha) { table.assign(n_layers, 0.0F); }
 
-    // --- direction: one shared vector, or a per-layer stack (v2 only) ---------------------------
-    const std::string layout = cfg.value("direction_layout", std::string("shared"));
-    if (version == 1 && !layout.empty() && layout != "shared") {
-        fail("v1 has no per-layer direction stack (use v2 for direction_layout per_layer)");
-    }
+    // --- direction: one shared vector, or a per-layer stack -------------------------------------
+    std::string layout = "shared";
+    if (cfg.contains("direction_layout")) { layout = required_string(cfg, "direction_layout"); }
     if (layout != "shared" && layout != "per_layer") {
         fail("direction_layout must be 'shared' or 'per_layer', got '" + layout + "'");
     }
     sidecar.per_layer_direction = (layout == "per_layer");
-    const std::uint32_t rows     = sidecar.per_layer_direction ? n_layers : 1U;
+    const std::uint32_t rows    = sidecar.per_layer_direction ? n_layers : 1U;
 
     // --- alphas --------------------------------------------------------------------------------
     const bool has_shared = cfg.contains("alpha_per_layer");
     const bool has_attn   = cfg.contains("alpha_attn_per_layer");
     const bool has_mlp    = cfg.contains("alpha_mlp_per_layer");
-    if (version == 1) {
-        if (has_attn || has_mlp) { fail("v1 does not carry per-lane alpha tables (use v2)"); }
-        if (has_shared) {
-            // v1 named one alpha for the layer, and the hook applied it at both lanes. Preserved
-            // exactly: a v1 sidecar must score the same on a v2 engine as it did on the one it fit on.
-            read_table(cfg.at("alpha_per_layer"), "alpha_per_layer", n_layers,
-                       sidecar.alpha[static_cast<std::size_t>(Lane::Attn)]);
-            sidecar.alpha[static_cast<std::size_t>(Lane::Mlp)] =
-                sidecar.alpha[static_cast<std::size_t>(Lane::Attn)];
-        }
-    } else {
-        if (has_shared && (has_attn || has_mlp)) {
-            fail("v2 must name a layer once: give alpha_per_layer alone, or the per-lane tables");
-        }
-        if (has_shared) {
-            read_table(cfg.at("alpha_per_layer"), "alpha_per_layer", n_layers,
-                       sidecar.alpha[static_cast<std::size_t>(Lane::Attn)]);
-            sidecar.alpha[static_cast<std::size_t>(Lane::Mlp)] =
-                sidecar.alpha[static_cast<std::size_t>(Lane::Attn)];
-        }
-        if (has_attn) {
-            read_table(cfg.at("alpha_attn_per_layer"), "alpha_attn_per_layer", n_layers,
-                       sidecar.alpha[static_cast<std::size_t>(Lane::Attn)]);
-        }
-        if (has_mlp) {
-            read_table(cfg.at("alpha_mlp_per_layer"), "alpha_mlp_per_layer", n_layers,
-                       sidecar.alpha[static_cast<std::size_t>(Lane::Mlp)]);
-        }
+    if (has_shared && (has_attn || has_mlp)) {
+        fail("name a layer once: give alpha_per_layer alone, or the per-lane tables");
+    }
+    if (has_shared) {
+        read_table(cfg.at("alpha_per_layer"), "alpha_per_layer", n_layers,
+                   sidecar.alpha[static_cast<std::size_t>(Lane::Attn)]);
+        sidecar.alpha[static_cast<std::size_t>(Lane::Mlp)] = sidecar.alpha[static_cast<std::size_t>(Lane::Attn)];
+    }
+    if (has_attn) {
+        read_table(cfg.at("alpha_attn_per_layer"), "alpha_attn_per_layer", n_layers,
+                   sidecar.alpha[static_cast<std::size_t>(Lane::Attn)]);
+    }
+    if (has_mlp) {
+        read_table(cfg.at("alpha_mlp_per_layer"), "alpha_mlp_per_layer", n_layers,
+                   sidecar.alpha[static_cast<std::size_t>(Lane::Mlp)]);
     }
 
-    // --- provenance (v2): the engine ignores this, and still requires it ------------------------
-    if (version >= 2) {
-        if (!cfg.contains("generation") || !cfg.at("generation").is_object()) {
-            fail("v2 requires a generation block naming where the direction came from "
-                 "(generation.source)");
-        }
-        const auto& gen  = cfg.at("generation");
-        const auto  src  = gen.value("source", std::string());
-        if (src.empty()) {
-            fail("v2 generation.source must say what produced the direction (e.g. the seed corpus "
-                 "and the extraction that cut it)");
-        }
-        std::string line = "source=" + src;
-        if (gen.contains("seed") && gen.at("seed").is_string()) { line += ", seed=" + gen.at("seed").get<std::string>(); }
-        if (gen.contains("notes") && gen.at("notes").is_string()) { line += ", " + gen.at("notes").get<std::string>(); }
-        sidecar.generation = std::move(line);
+    // --- provenance: the engine logs it and does not interpret it, and still requires it ---------
+    if (!cfg.contains("generation") || !cfg.at("generation").is_object()) {
+        fail("a generation block must name where the direction came from (generation.source)");
     }
+    const nlohmann::json& gen = cfg.at("generation");
+    if (!gen.contains("source") || !gen.at("source").is_string() ||
+        gen.at("source").get_ref<const std::string&>().empty()) {
+        fail("generation.source must say what produced the direction (e.g. the seed corpus and the extraction "
+             "that cut it)");
+    }
+    for (const char* key : {"seed", "notes"}) {
+        if (gen.contains(key) && !gen.at(key).is_string()) { fail(std::string("generation.") + key + " must be a string"); }
+    }
+    std::string line = "source=" + gen.at("source").get<std::string>();
+    if (gen.contains("seed")) { line += ", seed=" + gen.at("seed").get<std::string>(); }
+    if (gen.contains("notes")) { line += ", " + gen.at("notes").get<std::string>(); }
+    sidecar.generation = std::move(line);
+    if (cfg.contains("artifact_id")) { sidecar.artifact_id = required_string(cfg, "artifact_id"); }
 
     // A row a cut actually reads must be a real direction; a row on an uncut layer is a placeholder
-    // the fitter may leave empty. That is the difference between a half-filled stack and a sidecar
-    // that silently stops ablating on the layers it was fitted for.
-    std::vector<float> require(n_layers, 0.0F);
-    bool any_cut = false;
+    // the fitter may leave empty. One shared row serves every layer, so it is required whenever any
+    // layer is cut: checking it against layer 0 alone would let a broken file zero out and serve uncut.
+    std::vector<bool> required(rows, false);
     for (std::uint32_t l = 0; l < n_layers; ++l) {
-        require[l] = sidecar.layer_cut(l) ? 1.0F : 0.0F;
-        any_cut    = any_cut || require[l] != 0.0F;
+        if (sidecar.layer_cut(l)) { required[sidecar.per_layer_direction ? l : 0U] = true; }
     }
-    if (!sidecar.per_layer_direction) {
-        // One shared row serves every layer, so "this row's layer" is "any layer": a degenerate shared
-        // direction must fail even when layer 0 happens to be uncut. Checking row 0 against layer 0
-        // would let a broken file zero out and serve uncut, which is the silent no-op this whole
-        // loader exists to refuse.
-        require.assign(1, any_cut ? 1.0F : 0.0F);
-    }
-    read_direction(json_path, cfg.at("direction_file").get<std::string>(), rows, hidden_size, require,
+    read_direction(json_path.parent_path() / required_string(cfg, "direction_file"), rows, hidden_size, required,
                    sidecar.d_host);
-
     return sidecar;
 }
 

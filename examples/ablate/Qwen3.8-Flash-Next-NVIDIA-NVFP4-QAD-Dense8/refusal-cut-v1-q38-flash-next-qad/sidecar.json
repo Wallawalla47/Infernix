@@ -5,6 +5,7 @@
  "direction_layout": "shared",
  "direction_file": "d.f32.bin",
  "default_alpha": 0.0,
+ "artifact_id": "044ad3ee0d384c0bb24db0b490d852cb",
  "alpha_attn_per_layer": {
   "22": 1.0920167700576688,
   "23": 1.1089169505858683,

@@ -63,6 +63,30 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
     report_engine(options, level, text);
 }
 
+std::string artifact_hex(const artifact::ArtifactId& id) {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    for (const std::byte byte : id) {
+        out += kHex[std::to_integer<unsigned>(byte) >> 4U];
+        out += kHex[std::to_integer<unsigned>(byte) & 15U];
+    }
+    return out;
+}
+
+// --ablate (docs/ablate.md): the startup log names the cut applied, and warns when the sidecar names another artifact
+// as the one its direction was fitted on (the geometry matches, so it loads, but it was not measured here).
+void report_ablate(const EngineOptions& options, const models::qwen4_exp::Model& model) {
+    const models::qwen4_exp::AblateSidecarBinding* ablate = model.ablate();
+    if (ablate == nullptr) { return; }
+    report(options, DiagnosticLevel::Info, "ablation sidecar " + ablate->path.string() + ": " + ablate->describe());
+    const std::string& fitted = ablate->sidecar.artifact_id;
+    if (const std::string here = artifact_hex(model.info().artifact_id); !fitted.empty() && fitted != here) {
+        report(options, DiagnosticLevel::Warning,
+               "the ablation sidecar was fitted on artifact " + fitted + ", not this one (" + here +
+                   "): it loads, as the geometry matches, but its cut was not measured on this artifact");
+    }
+}
+
 // The fast paths and --a8-activations' routes are chosen from the stored formats the load plan records
 // (TextConfig::dense_format, expert_format, ggml_projections) before any weight is read; the bound
 // Parameters must agree, or a route chosen for one format would run on another.
@@ -348,7 +372,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefill_cpu_split = false;
     }
     program_options.kv_cache        = options.kv_cache;
-    program_options.ablate_sidecar_path = options.ablate_sidecar_path;
     program_options.diagnostics     = options.diagnostic_observer;
     program_options.kv_capacity_tokens =
         options.kv_capacity.mode == KvCapacityMode::Explicit ? options.kv_capacity.explicit_tokens : 0U;
@@ -729,6 +752,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
     frontend.complete();
     check_selection_formats(instance->parameters, instance->model->config());
+    report_ablate(options, *instance->model);
 
     // The fast paths selected before the load.
     program_options.fast_paths        = fast.forward();
@@ -921,9 +945,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary summary;
     summary.architecture         = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
     summary.model_name           = instance->model->info().name;
-    if (!options.ablate_sidecar_path.empty()) {
-        summary.ablate_sidecar = options.ablate_sidecar_path.string() + ": " +
-                                 models::qwen4_exp::bind_ablate(options.ablate_sidecar_path, text).describe();
+    if (const auto* ablate = instance->model->ablate()) {
+        summary.ablate_sidecar = ablate->path.string() + ": " + ablate->describe();
     }
     summary.load_seconds         = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;

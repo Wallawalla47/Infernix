@@ -467,6 +467,12 @@ infernix_add_family_op_test(infernix_hyper_connection_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
+# The direction cut and inject (--ablate) against the FP64 cut, inject and combine, its column invariance and graph
+# replay, and an inactive cut as the plain inject.
+infernix_add_family_op_test(infernix_direction_cut_test FAMILY elementwise
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_direction_cut.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_direction_cut_test PROPERTIES SKIP_RETURN_CODE 77)
 # hyper_connection_stream_mean (DFlash2's target features) against the FP64 stream mean.
 infernix_add_family_op_test(infernix_hyper_connection_stream_mean_test FAMILY elementwise
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection_stream_mean.cpp"

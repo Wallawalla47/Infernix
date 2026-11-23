@@ -14,7 +14,7 @@ infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix-00001-of-0000
 The startup log names the cut and where its direction came from:
 
 ```
-INFO  engine | ablation sidecar .../refusal-cut-v1-q38-flash-next-qad/sidecar.json: v2, one shared direction, attn lane 26 layers (22-47), mlp lane 40 layers (8-47); source=HarmBench standard behaviors (MIT): 160 of the 200, ...
+INFO  engine | ablation sidecar .../refusal-cut-v1-q38-flash-next-qad/sidecar.json: one shared direction, attn lane 26 layers (22-47), mlp lane 40 layers (8-47); source=HarmBench standard behaviors (MIT): 160 of the 200, ...
 ```
 
 ## What it computes
@@ -32,8 +32,19 @@ with `d` a unit direction (one shared vector, or one per layer). Two lanes are c
 | `attn` | the layer's attention or Gated DeltaNet output, before it is added to the residual streams |
 | `mlp` | the MoE output (routed and shared experts combined), before it is added to the residual streams |
 
-`alpha` 1 removes the component along `d` entirely; values above 1 reverse part of it. The dot product is summed in
-FP32 in a fixed order (one CUDA block per column), so a cut run is as deterministic as the run without it.
+`alpha` 1 removes the component along `d` entirely; values above 1 reverse part of it. The cut runs inside the
+lane's inject into the residual streams (`ops::hyper_connection_cut_inject`, and `ops::moe_combine_cut_inject` where
+the MoE combine injects its output directly): the dot product is summed in FP32 in a fixed order, one CUDA block per
+column, and the cut value goes into the inject unrounded, so each residual element keeps the inject's one BF16
+rounding. A column's result depends only on that column, so a cut run is as deterministic and request-invariant as
+the run without it. A layer or lane the sidecar leaves uncut runs the plain inject, and without `--ablate` nothing
+loads and every kernel is the one that runs without the flag.
+
+Cutting a direction out of a projection's output is a rank-1 low-rank term in principle, but `--lora`'s kernels do not
+serve it: its term is fused into Qwen3.5's adapted projections, which Qwen3.8-Flash-Next does not run, and the MoE
+output is a sum over experts rather than one projection. `--ablate` follows `--lora`'s layout instead: the sidecar
+is read at load as Model data (`models/qwen4_exp/load/ablate`), its direction is the Parameters' device copy
+(`execution/ablate_parameters`, reported as `adapter_bytes`), and the saved prefix cache's fingerprint stamps it.
 
 ## The sidecar's files
 
@@ -42,20 +53,22 @@ row). Every field is checked at load; anything malformed fails the start, naming
 
 | Field | Meaning |
 |---|---|
-| `format` | `ablate-direction-v2` (or `ablate-direction-v1`: one table for both lanes, no per-layer stack) |
+| `format` | `ablate-direction-v2` |
 | `direction_dtype` | `float32` |
-| `direction_dim` | the model's hidden size (2560 on Qwen3.8-Flash-Next) |
-| `direction_layout` | `shared` (one row for every layer) or `per_layer` (`num_hidden_layers` rows) |
+| `direction_dim` | the model's hidden size, an integer (2560 on Qwen3.8-Flash-Next) |
+| `direction_layout` | optional: `shared` (one row for every layer, the default) or `per_layer` (`num_hidden_layers` rows) |
 | `direction_file` | the direction file's name, beside `sidecar.json` |
-| `default_alpha` | must be 0: a layer missing from a table is not cut |
+| `default_alpha` | optional; must be 0: a layer missing from a table is not cut |
 | `alpha_attn_per_layer`, `alpha_mlp_per_layer` | layer index (a string) to alpha, each in [0, 4] |
-| `alpha_per_layer` | one table for both lanes (v1, or instead of the two in v2) |
-| `generation` | v2 requires `generation.source`, saying what produced the direction; `notes` is optional. The engine logs it and does not interpret it |
+| `alpha_per_layer` | one table for both lanes, instead of the two |
+| `generation` | required: `generation.source` says what produced the direction; `seed` and `notes` are optional strings. The engine logs them and does not interpret them |
+| `artifact_id` | optional: the 32-hex-digit id of the artifact the direction was fitted on. A start on another artifact logs a warning (the sidecar loads, as the geometry matches, but was not measured there) |
 
-Rows a cut layer reads must be finite with a norm above 0.5 (they are normalized at load); rows of uncut layers may be
-zero. Refused, naming the cause: a missing or unreadable file, an unknown format, a wrong dtype or dimension, a non-zero
-`default_alpha`, a layer key outside the model, a non-finite or out-of-range alpha, a direction file of the wrong size,
-a degenerate row on a cut layer, and a v2 sidecar without `generation.source`.
+Any other key is refused, so a misspelt table cannot load as a lane left uncut. Rows a cut layer reads must be finite
+with a norm above 0.5 (they are normalized at load); rows of uncut layers may be zero. Refused, naming the cause: a
+missing or unreadable file, an unknown key or format, a wrong dtype or dimension, a non-zero `default_alpha`, a layer
+key outside the model, a non-finite or out-of-range alpha, no `direction_file`, a direction file of the wrong size, a
+degenerate row on a cut layer, and no `generation.source`.
 
 ## Where it applies
 
@@ -75,21 +88,9 @@ a degenerate row on a cut layer, and a v2 sidecar without `generation.source`.
 
 ## Memory and speed
 
-The direction takes `rows x 2560 x 4` bytes of VRAM: 10 KiB shared, 480 KiB as a per-layer stack. Each cut lane adds
-one kernel per layer. A layer whose MLP lane is cut also forms the MoE output before adding it, as its own kernel
-instead of the fused add, which takes one BF16 hidden-width buffer per call column (budgeted in the forward's
-workspace when `--ablate` is given).
-
-Measured cost, against the same build without `--ablate` (RTX 5090, a production argv: DFlash2, `--max-concurrency 2`,
-`--max-context 262144`, INT8 KV; two fresh prompts of 11,431 and 11,413 tokens, 600 tokens out, one run per arm, the example sidecar):
-
-| | Prefill, first / second prompt | Decode, first / second prompt | DFlash2 acceptance |
-|---|---|---|---|
-| without | 4.65k / 6.32k tok/s | 99.4 / 166.7 tok/s | 58.6 % / 62.7 % |
-| with the example | 5.15k / 6.28k tok/s | 136.4 / 172.2 tok/s | 59.3 % / 66.0 % |
-
-The first prompt after a start runs cold and varies most; on the second the cost is -0.6 % of prefill, inside a
-run-to-run spread measured at about 5 %. Decode follows DFlash2's acceptance, which changes with the output.
+The direction takes `rows x 2560 x 4` bytes of VRAM: 10 KiB shared, 480 KiB as a per-layer stack (the memory
+summary's `adapter_bytes`). A cut lane launches no extra kernel and takes no workspace: its inject is the cut inject in
+place of the plain one.
 
 ## Making a sidecar
 

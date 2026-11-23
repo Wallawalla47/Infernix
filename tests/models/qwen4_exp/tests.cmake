@@ -209,6 +209,14 @@ infernix_add_test(infernix_qwen4_exp_prefill_width_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_prefill_width_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# --ablate (docs/ablate.md) on the reproducible route: a negligible cut keeps the plain run's bits on every cut path, a
+# cut of the last layer's lanes or layer 0's moves the first-token readouts, a strong cut's decode agrees with its
+# prefill, and a cut prompt reads the same bits at two prefill chunks of one grid.
+infernix_add_test(infernix_qwen4_exp_ablate_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ablate_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_ablate_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # Startup capture (candidates §23 NU-04; tests turn it off through testing::set_startup_capture): the graph set captured at startup against
 # capture at first use, plain, MTP and DFlash2 (INFERNIX_QWEN4_DFLASH2): reproducible-route ids equal, and no graph
 # captured after startup on either route.

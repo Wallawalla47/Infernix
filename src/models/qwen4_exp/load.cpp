@@ -640,6 +640,8 @@ struct LoadPlan::Impl {
     // device memory, and into pinned host memory (the token embedding: packable_embedding), a pin after the block's.
     std::vector<artifact::ObjectHandle> packed_objects, packed_host_objects;
     std::uint64_t packed_bytes = 0, packed_host_bytes = 0;
+    // LoadOptions::ablate: the sidecar, read at planning so a broken one fails before the weights load.
+    std::optional<AblateSidecarBinding> ablate;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -711,6 +713,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    if (!options.ablate.empty()) { out->ablate = bind_ablate(options.ablate, out->config.text); }
     if (options.dflash2() && options.purpose == EnginePurpose::Generation) {
         out->draft_reader   = std::make_unique<artifact::Reader>(options.draft_model);
         out->config.dflash2 = parse_dflash2_config(out->draft_reader->directory(), out->config.text);
@@ -1169,13 +1172,15 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                                .ladder_bytes = 0,
                                                .layout       = std::move(*data->vision_overlay)};
     }
-    return std::unique_ptr<Model>(new Model(std::move(data->config), data->options,
-                                            std::move(data->weights), std::move(bound),
-                                            std::move(banks), std::move(data->resources),
-                                            std::move(data->info), std::move(overlay), std::move(backing),
-                                            std::move(store), std::move(draft_backing), std::move(packed),
-                                            std::move(csf_tables), std::move(shared_banks),
-                                            std::move(shared_multipliers)));
+    auto model = std::unique_ptr<Model>(new Model(std::move(data->config), data->options,
+                                                  std::move(data->weights), std::move(bound),
+                                                  std::move(banks), std::move(data->resources),
+                                                  std::move(data->info), std::move(overlay), std::move(backing),
+                                                  std::move(store), std::move(draft_backing), std::move(packed),
+                                                  std::move(csf_tables), std::move(shared_banks),
+                                                  std::move(shared_multipliers)));
+    model->ablate_ = std::move(data->ablate);
+    return model;
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

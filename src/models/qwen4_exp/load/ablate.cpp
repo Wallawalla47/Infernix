@@ -1,16 +1,9 @@
 #include "models/qwen4_exp/load/ablate.h"
 
-#include <cuda_runtime.h>
-
-#include <cstdio>
-#include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace infernix::models::qwen4_exp {
 namespace {
-
-[[noreturn]] void fail(const std::string& what) { throw std::runtime_error("ablate-sidecar: " + what); }
 
 // "8-47" for a contiguous run of cut layers, "8-20, 30" otherwise; "none" when the lane is uncut.
 std::string layer_ranges(const artifact::AblateSidecar& sidecar, const artifact::AblateSidecar::Lane lane) {
@@ -32,64 +25,21 @@ std::string layer_ranges(const artifact::AblateSidecar& sidecar, const artifact:
 
 } // namespace
 
-AblateBinding bind_ablate(const std::filesystem::path& path, const TextConfig& text) {
-    AblateBinding binding;
-    binding.sidecar = artifact::AblateSidecar::load(path, text.num_hidden_layers, text.hidden_size);
-    binding.path    = path;
-    binding.enabled = true;
-    return binding;
+AblateSidecarBinding bind_ablate(const std::filesystem::path& path, const TextConfig& text) {
+    return AblateSidecarBinding{.path    = path,
+                                .sidecar = artifact::AblateSidecar::load(path, text.num_hidden_layers,
+                                                                         text.hidden_size)};
 }
 
-void AblateBinding::upload() {
-    if (!enabled) { return; }
-    const std::size_t floats = static_cast<std::size_t>(sidecar.rows()) * sidecar.hidden_size;
-    if (sidecar.d_host.size() != floats) { fail("internal: direction size does not match the geometry"); }
-    if (d_device_ == nullptr) {
-        if (cudaMalloc(reinterpret_cast<void**>(&d_device_), floats * sizeof(float)) != cudaSuccess) {
-            d_device_ = nullptr;
-            fail("cudaMalloc for the ablation direction");
-        }
-    }
-    if (cudaMemcpy(d_device_, sidecar.d_host.data(), floats * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
-        release();
-        fail("cudaMemcpy for the ablation direction");
-    }
-}
-
-void AblateBinding::release() noexcept {
-    if (d_device_ != nullptr) {
-        cudaFree(d_device_);
-        d_device_ = nullptr;
-    }
-}
-
-std::string AblateBinding::describe() const {
-    using artifact::AblateSidecar;
-    char text[256];
-    std::snprintf(text, sizeof(text), "%s, %s direction, attn lane %u layers (%s), mlp lane %u layers (%s)",
-                  sidecar.format_name(), sidecar.per_layer_direction ? "per-layer" : "one shared",
-                  sidecar.layers_cut(AblateSidecar::Lane::Attn), layer_ranges(sidecar, AblateSidecar::Lane::Attn).c_str(),
-                  sidecar.layers_cut(AblateSidecar::Lane::Mlp), layer_ranges(sidecar, AblateSidecar::Lane::Mlp).c_str());
-    std::string line = text;
+std::string AblateSidecarBinding::describe() const {
+    using Lane = artifact::AblateSidecar::Lane;
+    std::string line = std::string(sidecar.per_layer_direction ? "a per-layer direction" : "one shared direction") +
+                       ", attn lane " + std::to_string(sidecar.layers_cut(Lane::Attn)) + " layers (" +
+                       layer_ranges(sidecar, Lane::Attn) + "), mlp lane " +
+                       std::to_string(sidecar.layers_cut(Lane::Mlp)) + " layers (" + layer_ranges(sidecar, Lane::Mlp) +
+                       ")";
     if (!sidecar.generation.empty()) { line += "; " + sidecar.generation; }
     return line;
-}
-
-AblateBinding::AblateBinding(AblateBinding&& other) noexcept
-    : enabled(other.enabled), path(std::move(other.path)), sidecar(std::move(other.sidecar)),
-      d_device_(std::exchange(other.d_device_, nullptr)) {
-    other.enabled = false;
-}
-
-AblateBinding& AblateBinding::operator=(AblateBinding&& other) noexcept {
-    if (this != &other) {
-        release();
-        enabled       = std::exchange(other.enabled, false);
-        path          = std::move(other.path);
-        sidecar       = std::move(other.sidecar);
-        d_device_     = std::exchange(other.d_device_, nullptr);
-    }
-    return *this;
 }
 
 } // namespace infernix::models::qwen4_exp

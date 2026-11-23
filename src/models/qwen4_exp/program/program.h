@@ -360,9 +360,6 @@ struct ProgramOptions {
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
-    // Ablation sidecar (docs/ablate.md): sidecar.json path; empty = off.
-    // EngineOptions::ablate_sidecar_path, filled by qwen4_exp_instance.
-    std::filesystem::path ablate_sidecar_path;
     // The fast paths the Forward runs (fast_paths.h); all off on the exact route.
     execution::ForwardFastPaths fast_paths;
     std::filesystem::path ngram_volume;

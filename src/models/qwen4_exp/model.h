@@ -7,6 +7,7 @@
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/expert_offload.h"
+#include "models/qwen4_exp/load/ablate.h"
 #include "models/qwen4_exp/weights.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -116,6 +117,8 @@ public:
     [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {
         return overlay_vision_;
     }
+    // LoadOptions::ablate (--ablate, docs/ablate.md): the sidecar read at load; null without one.
+    [[nodiscard]] const AblateSidecarBinding* ablate() const noexcept { return ablate_ ? &*ablate_ : nullptr; }
 
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
@@ -143,6 +146,7 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<qwen3_5::VisionOverlayAssets> overlay_vision_;
+    std::optional<AblateSidecarBinding> ablate_;
 };
 
 } // namespace infernix::models::qwen4_exp

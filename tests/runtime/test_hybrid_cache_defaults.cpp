@@ -544,6 +544,15 @@ int main() {
             failures += check(rejected == (architecture != infernix::models::Architecture::Qwen4Exp),
                               "--ablate was misjudged for its architecture");
         }
+        // The lossless route is refused before anything loads, not when the forward is built.
+        options.lossless = true;
+        bool rejected    = false;
+        try {
+            infernix::runtime::validate_engine_options(options, infernix::models::Architecture::Qwen4Exp, true);
+        } catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("--lossless") != std::string::npos;
+        }
+        failures += check(rejected, "--ablate with --lossless was not refused at validation");
     }
     // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts: MTP keeps its drafter (its gated
     // drafts beat plain decode there), DFlash2 decodes without one (no policy beat plain decode); a fixed

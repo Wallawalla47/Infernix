@@ -79,6 +79,11 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument("--ablate cuts Qwen3.8-Flash-Next only (docs/ablate.md); this artifact is " +
                                     std::string(models::architecture_name(architecture)));
     }
+    // The lossless route computes the model's own forward correctly rounded; a cut is not part of it. Refused here,
+    // before anything loads.
+    if (!options.ablate_sidecar_path.empty() && options.lossless) {
+        throw std::invalid_argument("--ablate does not combine with --lossless (docs/ablate.md)");
+    }
     // An automatic context takes all the VRAM the KV pool may have: offloaded experts size their cache from what
     // the fixed allocations leave, so it would starve the expert cache.
     if (options.max_context_auto) {
