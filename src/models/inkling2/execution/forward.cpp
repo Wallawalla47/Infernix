@@ -848,7 +848,8 @@ void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) 
     mark("head");
 }
 
-void Forward::project_head(const std::uint16_t* x, std::int32_t count, float* out, cudaStream_t stream) const {
+void Forward::project_head(const std::uint16_t* x, std::int32_t count, float* out, cudaStream_t stream,
+                           std::int32_t* x8) const {
     if (count <= 0 || count > kMaxForwardColumns) { throw std::invalid_argument("inkling2 forward: 1-128 head rows"); }
     if (q8(p_.head)) {
         ik::ProjectionArgs h{};
@@ -857,7 +858,12 @@ void Forward::project_head(const std::uint16_t* x, std::int32_t count, float* ou
         h.x[0]     = x;
         h.fp32_out = true;
         add_segment(h, p_.head, 0, out);
-        ik::projections(h, stream);
+        if (x8 != nullptr) {
+            h.x8[0] = x8; // encoded here
+            ik::projections_mma(h, stream);
+        } else {
+            ik::projections(h, stream);
+        }
     } else {
         project(x, p_.head, out, true, stream, 0, count);
     }

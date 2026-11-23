@@ -1184,6 +1184,15 @@ text. Measured: a round's draft 2.16 → 1.24 ms (7 drafts, `--q8-weights` and `
 fixtures (conv / struct / prose, auto, -r 2) `--q8-weights` 272.9 / 557.1 / 218.9 → 294.5 / 608.2 / 234.2 tok/s,
 `--a8-activations` 276.1 / 610.3 / 212.7 → 296.5 / 665.1 / 227.6.
 
+A Q8 head (`--q8-weights`, `--a8-activations`) then runs the drafter's 7 rows on 8-bit inputs (`Forward::project_head`
+with the drafter's own 8-bit input rows: `projections_mma`'s tensor cores instead of the skinny route's FMA chains;
+the only Q8 route that takes the head's unaligned FP32 rows). Drafts only, as above. Measured (2026-11-23, Basalt's
+fixtures, auto, -r 2, against the skinny route on the same build): `--q8-weights` struct 621.4 → 626.8 tok/s, conv
+302.8 → 304.9 and prose 242.6 → 242.4 within their ±; `--a8-activations` struct 670.7 → 674.2, prose 234.8 → 235.5,
+conv 304.9 → 305.5 (within ±10). The policy's cost constants (0.12 a verify column, 0.18 a proposal) were re-tuned
+against the same fixtures (0.17 / 0.29 measured, 0.145 / 0.235, 0.22 / 0.29, and a concave 0.14 / 0.30 + 0.15 for the
+first column): none beat them on both routes once the 8-bit head was in, so they stand.
+
 ---
 
 ## 14. Prefill

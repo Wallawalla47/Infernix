@@ -113,6 +113,7 @@ private:
     std::int32_t* tokens_ = nullptr;
     float* probabilities_ = nullptr;
     float* inv_freq_ = nullptr; // the RoPE table [64]
+    std::int32_t* head_x8_ = nullptr; // [8] 8-bit head input rows (Forward::project_head)
     ops::inkling2::DSparkRound* host_round_ = nullptr;
     std::int32_t* host_tokens_ = nullptr;
     float* host_probabilities_ = nullptr;

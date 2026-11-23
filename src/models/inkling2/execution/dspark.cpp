@@ -36,8 +36,9 @@ struct Layout {
     std::uint16_t *qr = nullptr, *attention = nullptr, *a = nullptr, *y = nullptr, *gate = nullptr, *up = nullptr;
     std::uint16_t *h = nullptr, *final_rows = nullptr;
     float *base = nullptr, *attention_scratch = nullptr, *markov_scratch = nullptr, *probabilities = nullptr;
-    std::int32_t* tokens = nullptr;
-    float* inv_freq      = nullptr;
+    std::int32_t* tokens  = nullptr;
+    float* inv_freq       = nullptr;
+    std::int32_t* head_x8 = nullptr; // the block's final rows as 8-bit head inputs (Forward::project_head)
 };
 
 template <class Add>
@@ -66,6 +67,7 @@ void walk(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity, 
     add(b.attention_scratch, ik::dspark_attention_scratch_bytes(std::max(full_splits(max_context), kSlidingSplits)));
     add(b.markov_scratch, ik::dspark_markov_scratch_bytes(static_cast<std::int32_t>(vocab)));
     add(b.tokens, kB * 4), add(b.probabilities, kB * 4), add(b.inv_freq, ik::kDSparkHeadDim / 2 * 4);
+    add(b.head_x8, static_cast<std::size_t>(kB) * ik::projection_a8_column_words(kH) * 4);
 }
 
 // A BF16 or 8-bit (Q8_G32_FP16 RowSplit, converted at load: plan_load's drafter_q8_objects) matrix as one segment of
@@ -147,7 +149,7 @@ Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int3
     q_ = b.q, k_ = b.k, v_ = b.v, qr_ = b.qr, attention_ = b.attention, a_ = b.a, y_ = b.y;
     gate_ = b.gate, up_ = b.up, h_ = b.h, final_ = b.final_rows, base_ = b.base;
     attention_scratch_ = b.attention_scratch, markov_scratch_ = b.markov_scratch;
-    tokens_ = b.tokens, probabilities_ = b.probabilities, inv_freq_ = b.inv_freq;
+    tokens_ = b.tokens, probabilities_ = b.probabilities, inv_freq_ = b.inv_freq, head_x8_ = b.head_x8;
     {
         float table[ik::kDSparkHeadDim / 2];
         ik::dspark_inv_freq(static_cast<double>(parameters.model.config().dspark->rope_theta), table);
@@ -331,8 +333,8 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
     fin.normed   = final_;
     fin.rows     = kB;
     ik::dspark_add_norm(fin, stream);
-    // The target head over the block's rows 1 .. steps (the anchor's row predicts nothing).
-    forward_.project_head(final_ + kH, steps, base_, stream);
+    // The target head over the block's rows 1 .. steps (the anchor's row predicts nothing); a Q8 head on 8-bit inputs.
+    forward_.project_head(final_ + kH, steps, base_, stream, head_x8_);
     ik::DSparkMarkovArgs mk;
     mk.projection    = bf16_words(d_.markov_projection);
     mk.bias          = d_.markov_projection_bias;
