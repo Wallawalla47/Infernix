@@ -473,6 +473,7 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
             (["--request-log-max-mib", "8"], "--request-log-max-mib needs --request-log-jsonl"),
             (["--request-log-keep", "2"], "--request-log-keep needs --request-log-max-mib"),
             (["--vision-offload", "on"], "--vision-offload on needs --vision"),
+            (["--causal-scoring", "--max-context", "auto"], "--causal-scoring needs --max-context N"),
         ]
         unnamed = [want for extra, want in alone if not any(w.startswith(want) for w in warned(extra))]
         check("the preview names each", not unnamed, "; ".join(unnamed))
@@ -480,7 +481,8 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
                            "--prefix-cache-file", str(data / "prefix.cache"), "--prefix-cache-save-mins", "30",
                            "--ngram-archive-mib", "64", "--ngram-native-sessions",
                            "--request-log-jsonl", str(data / "requests.jsonl"), "--request-log-max-mib", "8",
-                           "--request-log-keep", "2", "--vision", "--vision-offload", "on"])
+                           "--request-log-keep", "2", "--vision", "--vision-offload", "on",
+                           "--causal-scoring", "--max-context", "8192"])
         check("...and none of them when both are given", not any(" needs " in w for w in together), "; ".join(together))
         absent = warned(["--ssd-context-gib", "64", "--ssd-context-dir", str(data / "no-such-folder")])
         check("...and an SSD prefix cache folder that does not exist",

@@ -265,6 +265,10 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
     if (flag_value(args, "--vision-offload").value_or("") == "on" && !has_flag(args, "--vision")) {
         warnings.push_back("--vision-offload on needs --vision");
     }
+    // The dense 27Bs' default context is auto, which sizes a generation server; a scoring server refuses it.
+    if (has_flag(args, "--causal-scoring") && flag_value(args, "--max-context").value_or("") == "auto") {
+        warnings.push_back("--causal-scoring needs --max-context N: auto sizes a generation server's KV cache");
+    }
     if (model.needs_ngram_volume && !model.own_ngram_volume && !has_flag(args, "--ngram-volume")) {
         warnings.push_back(model.family_label +
                            " needs an n-gram volume (--ngram-volume): none was found in the model folders; download one "

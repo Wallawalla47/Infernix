@@ -717,7 +717,7 @@ const CLIENTS: FormSection = {
       kind: "switch",
       flag: "--causal-scoring",
       label: "Scoring server",
-      help: "Start for teacher-forced scoring only: POST /v1/score returns per-token log-probabilities and top_k for a given continuation, one request at a time. Nothing generates: chat and coding tools are refused (generation_not_enabled). docs/serving.md",
+      help: "Start for teacher-forced scoring only: POST /v1/score returns per-token log-probabilities and top_k for a given continuation, one request at a time. Nothing generates: chat and coding tools are refused (generation_not_enabled). Needs a fixed Max context (not auto). docs/serving.md",
       more: true,
     },
   ],

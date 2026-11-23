@@ -1990,7 +1990,9 @@ needs a server started with `--causal-scoring`; a generation server answers `501
 `/v1/responses`, `/v1/messages` and `/v1/decide` answer `501` with `code: "generation_not_enabled"`
 before anything runs (token counting still answers). It scores one request at a time without
 speculation, vision or the prefix cache, and its startup log names the settings of a generation
-configuration (`--max-concurrency`, a drafter, `--prefix-cache-file`) that this leaves unused.
+configuration (`--max-concurrency`, a drafter, `--prefix-cache-file`) that this leaves unused. It
+takes a fixed `--max-context N` (the longest prompt plus continuation it scores): `--max-context auto`
+sizes a generation server and is refused, and the launcher's preview says so when the switch is on.
 
 Requests wait for their turn in arrival order. At most `--max-pending-requests` wait beside the one
 being scored (more are refused as the generation queue refuses them), and a request still waiting
