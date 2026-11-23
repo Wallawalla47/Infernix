@@ -12704,6 +12704,34 @@ cannot coalesce while the span runs (a running span's inner positions are not re
 walk) fails on FP4-Local with and without this change and on main c2afefb2 alike (leader 0, follower 0 reused
 tokens; not investigated here).
 
+**Bounded by the CPU split (2026-11-23, issue #77; same bits).** The walk streams every expert a layer lacks, while a
+single call within the prefill CPU split's width (`split_columns()`, 4,096 columns on the reference link) copies only
+what its gated stream routes and serves the rest on the CPU. An agent turn that does not echo its reply has exactly
+this shape: a few thousand new tokens and the generation opener's short last call. It walked, so a 2K-token turn moved
+17,000 experts (43.8 GiB, 18 GiB of them read from the SSD where the experts do not fit in RAM) where the same turn as
+one call moved 5,700 and read none. One call and a narrow last call now walk only past the split's width. Spans of two
+or more streamed calls keep walking: holding them chunk-major too measured the same.
+
+Measured (Dense8 and FP4-Local, INT8 KV, a conversation from 30K to 120K tokens, median prefill of six turns per width,
+rule off/on/on/off; prefill time against the walk):
+
+| new tokens | Dense8, 32 GiB of experts in RAM | Dense8, all in RAM | FP4-Local, all in RAM |
+|---|---|---|---|
+| 300 | 0.77x | 1.01x | 1.00x |
+| 600 | 0.40x | 0.40x | 0.43x |
+| 1,000 | 0.44x | 0.46x | 0.47x |
+| 1,500 | 0.58x | 0.53x | 0.56x |
+| 2,000 | 0.63x | 0.58x | 0.61x |
+| 3,000 | 0.93x | 0.70x | 0.68x |
+| 4,000 and more | 0.97-1.00x | 1.00x | 1.00x |
+
+The 300-token row is below the stream boundary, where the rule does not act, so its 0.77x on the first setup is a
+knock-on of the turns around it or unexplained. Cold prompts of 4,096 tokens plus a 6-250-token last call, where the
+rule acts on the call grid: 1.69 s -> 1.20-1.54 s on Dense8, and on the reproducible route all 12 replies were identical
+with the rule on and off. That disagrees with 2026-10-27's pp4125 ABBA, which measured the walk level with chunk-major
+(Dense8 1.000x, IQ3_S 0.999x); the two are not reconciled, and IQ3_S was not measured here. A 16K-token call and its
+narrow last call still walk, so §19.3.42's pp16413 gain is untouched.
+
 ### 19.3.43 NVFP4 W4A16 banks split decode misses by the share form (2026-10-30; placement only; default)
 
 **What.** Flash-Next's Program kept a decode call's host-memory misses on the link by the divisor rule, M / d with
