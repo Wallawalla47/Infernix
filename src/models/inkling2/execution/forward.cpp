@@ -600,7 +600,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
             moe::moe_prefetch_l2(b_.guess_ids + static_cast<std::size_t>(v) * 16, guesses, op.bank, guess_bytes,
                                  side_->prefetch);
         } else {
-            moe::moe_prefetch_l2(b_.expert_record + static_cast<std::size_t>(v) * moe::kTopK, moe::kTopK, op.bank,
+            moe::moe_prefetch_l2(b_.expert_record + static_cast<std::size_t>(v) * moe::kTopK, kReadAheadExperts, op.bank,
                                  gate_up_bytes, side_->prefetch);
         }
         side_->forked_prefetch = true;

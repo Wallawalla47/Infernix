@@ -930,7 +930,8 @@ stream once, at the end of `finish()`, so nothing on the visit's chain waits for
   likeliest experts' whole records (gate/up and down) are the guess, at two each column's 4 likeliest experts' gate/up
   bytes (16 guesses at 2 columns cost more bus than they saved);
 - a call of 3-8 columns of one lane (verification): the router records each visit's last column's experts
-  (`moe_route`'s `record`, relaxed stores) for the next such call; a decode round of 3-8 lanes prefetches nothing
+  (`moe_route`'s `record`, relaxed stores, in descending key) for the next such call, which prefetches the 4 likeliest
+  of them; a decode round of 3-8 lanes prefetches nothing
   (its last lane's experts for every lane: 8 lanes 649.6 → 646.4 tok/s in all, 4 lanes 463.1 → 463.6);
 - after each visit's K2 the prefetch stream issues `moe_prefetch_l2` (12 CTAs of `cp.async.bulk.prefetch.L2`, 16 KB
   pieces) over the guess's bytes or the record's gate/up bytes.
@@ -943,6 +944,13 @@ default), 6 gate/up 4.2327 / 4.2287 / 4.8919, 5 4.2426 / 4.2004 / 4.8914, 4 4.27
 guesses were +0.07 % on `--q8-weights` and -1.24 % on `--a8-activations`, 8 whole records +1.32 / +2.83 %, 6 whole
 +1.14 / +1.16 %, so two columns keep 8 gate/up guesses. Why fewer, whole guesses win at one column is not established
 (a guess's bus time competes with W_o and attention beside it; a kept guess also saves its down pass).
+
+The read-ahead's size was measured on Basalt's DSpark fixtures (conv / struct / prose, auto draft length, -r 2; the
+texts are the same whatever is prefetched), against the record's 8 gate/up parts: its first 4 gate/up parts were faster
+in two slots on `--a8-activations` (struct 667.7 → 669.6 and 667.6 → 670.5 / 667.2 → 669.3 tok/s, prose 231.9 → 234.4
+and 231.9 → 234.3 / 232.1 → 234.9, beyond ±0.6-1.5; conv within its ±10) and about even on `--q8-weights` (prose 240.5 →
+241.6 and 240.4 → 241.6 beyond ±1.1, 241.0 → 241.0; struct 620.8 → 620.0 and 620.7 → 620.9 within ±1.3, 620.4 → 619.6
+beyond ±0.7; conv within its ±17); 4 whole records and 8 whole records were not faster (8 whole the slowest).
 
 No output depends on it (only L2's contents; emitted token ids checked equal with and without it, DSpark and plain,
 2026-11-23). Measured (RTX 5090, 2026-11-23, against the same build without it; ranges over two or three slots where

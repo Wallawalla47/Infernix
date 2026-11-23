@@ -238,13 +238,14 @@ public:
     // this visit's MLP input (kept a visit each: ForwardBuffers::guess_x) on one side stream, and after each visit's K2
     // prefetches that guess into L2 on another: at one column its kGuessExperts1 likeliest experts' whole records, at
     // two each column's kGuessExperts / 2 likeliest experts' gate/up bytes. A call of kGuessColumns + 1 to
-    // kReadAheadColumns columns (verification) prefetches instead the experts its visit's last column took in the
-    // previous such call (the router's record). The side streams join the call's stream once, at the end of finish().
-    // No output depends on it (only what L2 holds).
+    // kReadAheadColumns columns (verification) prefetches instead the gate/up bytes of the kReadAheadExperts likeliest
+    // experts its visit's last column took in the previous such call (the router's record). The side streams join the
+    // call's stream once, at the end of finish(). No output depends on it (only what L2 holds).
     static constexpr std::int32_t kGuessColumns     = 2;
     static constexpr std::int32_t kGuessExperts1    = 4;
     static constexpr std::int32_t kGuessExperts     = 8;
     static constexpr std::int32_t kReadAheadColumns = 8;
+    static constexpr std::int32_t kReadAheadExperts = 4;
 
 private:
     // The prefetch's two side streams and the events that fork and join them (created with the forward).
