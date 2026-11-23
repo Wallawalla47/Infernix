@@ -71,7 +71,8 @@ float bits_float(std::uint32_t b) {
 
 const char* kNames[] = {"rmsnorm", "mix",   "message_gate", "clip",         "conv",   "dynamic_conv",
                         "sigmoid_gate", "add", "probs",     "router",       "four_over_six", "mxfp8",
-                        "swiglu",  "combine", "softcap", "sqrt_magnitude"};
+                        "swiglu",  "combine", "softcap", "sqrt_magnitude", "ring_load", "ring_store", "keys_load",
+                        "keys_store"};
 
 // wide.cuh's sqrt_magnitude over ProductSum-sized magnitudes (the clips' norms): case i's 20 words, then its unit.
 __global__ void sqrt_cases(const std::uint32_t* words, int n, std::uint32_t* out) {
@@ -319,6 +320,64 @@ INFERNIX_OP_TEST(lossless_inkling2) {
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
             got = download32(out, n);
+            break;
+        }
+        case 16: { // ring_load: rows, C, first, count, columns, ld (the whole destination compared)
+            const int rows = I(0), C = I(1), columns = I(4), ld = I(5);
+            DeviceBuffer ring = upload16(inputs[0]), out = upload16(inputs[1]);
+            Tensor to = strided(out.p, DType::BF16, C, columns, ld);
+            ops::lossless_inkling2_ring_load(static_cast<const std::uint16_t*>(ring.p), rows, I(2), I(3), to, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(ld) * columns);
+            break;
+        }
+        case 17: { // ring_store: rows, C, first, T, ld
+            const int rows = I(0), C = I(1), T = I(3), ld = I(4);
+            DeviceBuffer x = upload16(inputs[0]), ring = upload16(inputs[1]);
+            const Tensor tx = strided(x.p, DType::BF16, C, T, ld);
+            ops::lossless_inkling2_ring_store(tx, I(2), static_cast<std::uint16_t*>(ring.p), rows, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(ring, static_cast<std::size_t>(rows) * C);
+            break;
+        }
+        case 18: { // keys_load: heads, ring pages (0: a pool), pages, first, count, stride
+            const int heads = I(0), ring_pages = I(1), stride = I(5);
+            DeviceBuffer k = upload16(inputs[0]), v = upload16(inputs[1]), table = upload32(inputs[2]);
+            DeviceBuffer kh = upload16(inputs[3]), vt = upload16(inputs[4]);
+            ops::LosslessInkling2Keys s;
+            s.k          = static_cast<std::uint16_t*>(k.p);
+            s.v          = static_cast<std::uint16_t*>(v.p);
+            s.table      = ring_pages != 0 ? nullptr : static_cast<const std::int32_t*>(table.p);
+            s.ring_pages = ring_pages;
+            s.heads      = heads;
+            s.dim        = 128;
+            Tensor tk(kh.p, DType::BF16, {128, stride, heads}), tv(vt.p, DType::BF16, {stride, 128, heads});
+            ops::lossless_inkling2_keys_load(s, I(3), I(4), stride, tk, tv, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const std::size_t n = static_cast<std::size_t>(heads) * 128 * stride;
+            got = download16(kh, n);
+            const auto values = download16(vt, n);
+            got.insert(got.end(), values.begin(), values.end());
+            break;
+        }
+        case 19: { // keys_store: heads, ring pages (0: a pool), pages, first, T, ld
+            const int heads = I(0), ring_pages = I(1), pages = I(2), T = I(4), ld = I(5);
+            DeviceBuffer xk = upload16(inputs[0]), xv = upload16(inputs[1]), table = upload32(inputs[2]);
+            DeviceBuffer k = upload16(inputs[3]), v = upload16(inputs[4]);
+            ops::LosslessInkling2Keys s;
+            s.k          = static_cast<std::uint16_t*>(k.p);
+            s.v          = static_cast<std::uint16_t*>(v.p);
+            s.table      = ring_pages != 0 ? nullptr : static_cast<const std::int32_t*>(table.p);
+            s.ring_pages = ring_pages;
+            s.heads      = heads;
+            s.dim        = 128;
+            const Tensor tk = strided(xk.p, DType::BF16, heads * 128, T, ld), tv = strided(xv.p, DType::BF16, heads * 128, T, ld);
+            ops::lossless_inkling2_keys_store(tk, tv, I(3), s, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const std::size_t n = static_cast<std::size_t>(ring_pages != 0 ? ring_pages : pages) * heads * 64 * 128;
+            got = download16(k, n);
+            const auto values = download16(v, n);
+            got.insert(got.end(), values.begin(), values.end());
             break;
         }
         default: std::cerr << "FAIL unknown op " << op << "\n"; return 1;

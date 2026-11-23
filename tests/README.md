@@ -547,7 +547,8 @@ the full pools runs as such a variant too (accepted with `--reproducible`), with
 calls of mixed widths (one wider than a sliding visit's ring, single-column decode calls, calls across the ring's wrap
 and the 1,024-key window, a restored state) through a permuted block table; then Engine generation: greedy tokens are
 the lossless scoring Engine's top tokens, prompt readouts (resumed from the prefix cache too) its log-probabilities bit
-for bit, and sampled requests give the same tokens alone, two at once, at another chunk and resumed.
+for bit, and sampled requests give the same tokens alone, two at once, at another chunk, resumed, read back from the
+SSD tier and restored from a prefix cache file.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

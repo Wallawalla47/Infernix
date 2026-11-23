@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lossless_cr_oracle as cr  # noqa: E402
 
 (RMSNORM, MIX, MESSAGE_GATE, CLIP, CONV, DYNAMIC_CONV, SIGMOID_GATE, ADD, PROBS, ROUTER, FOUR_OVER_SIX, MXFP8,
- SWIGLU, COMBINE, SOFTCAP, SQRT) = range(16)
+ SWIGLU, COMBINE, SOFTCAP, SQRT, RING_LOAD, RING_STORE, KEYS_LOAD, KEYS_STORE) = range(20)
 
 F32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 
@@ -571,10 +571,90 @@ def sqrt_cases(rng):
     yield SQRT, [len(expected)], [words], expected
 
 
+# The cache form's state copies: exact, so their inputs are arbitrary 16-bit words (NaN patterns and -0 included), every
+# destination starts as random words and the whole of it is compared (what a copy must leave alone stays).
+def words16(rng, n: int) -> list[int]:
+    return [rng.getrandbits(16) for _ in range(n)]
+
+
+def ring_load_cases(rng):
+    # Real rings (32 positions, 1024 and 2304 wide), positions before the sequence, the ring's wrap, strided columns.
+    for rows, C, first, count, columns, ld in ((32, 1024, -3, 3, 4, 1024), (32, 2304, -1, 3, 5, 2310), (32, 64, 30, 3, 4, 70),
+                                               (32, 64, 64, 3, 3, 64), (8, 16, -20, 30, 32, 19)):
+        ring, out = words16(rng, rows * C), words16(rng, ld * columns)
+        expected = list(out)
+        for c in range(count):
+            p = first + c
+            for e in range(C):
+                expected[c * ld + e] = 0 if p < 0 else ring[(p % rows) * C + e]
+        yield RING_LOAD, [rows, C, first & 0xFFFFFFFF, count, columns, ld], [ring, out], expected
+
+
+def ring_store_cases(rng):
+    # One column, the wrap, exactly the ring's rows, more than them (only the last rows), strided columns.
+    for rows, C, first, T, ld in ((32, 1024, 7, 1, 1024), (32, 2304, 29, 6, 2304), (32, 64, 100, 32, 70), (32, 64, 5, 40, 64),
+                                  (8, 16, 0, 8, 19)):
+        x, ring = words16(rng, ld * T), words16(rng, rows * C)
+        expected = list(ring)
+        for t in range(max(0, T - rows), T):
+            slot = (first + t) % rows
+            for e in range(C):
+                expected[slot * C + e] = x[t * ld + e]
+        yield RING_STORE, [rows, C, first, T, ld], [x, ring], expected
+
+
+def key_row(table: list[int], ring_pages: int, heads: int, position: int, head: int) -> int:
+    unit, row = position // 64, position % 64
+    if table:
+        return ((table[unit] * heads + head) * 64 + row) * 128
+    return ((head * ring_pages + unit % ring_pages) * 64 + row) * 128
+
+
+def keys_load_cases(rng):
+    # A real sliding visit's ring and window (17 pages, 8 heads, 1,023 keys across its wrap), a small ring's wrap, one
+    # key, and pools through a permuted block table with an unaligned start and a partial last tile.
+    for heads, ring_pages, pages, first, count, stride in ((8, 17, 0, 2000, 1023, 1088), (2, 3, 0, 100, 130, 192),
+                                                           (2, 3, 0, 0, 1, 64), (8, 0, 7, 0, 1, 64), (2, 0, 7, 30, 200, 256),
+                                                           (2, 0, 7, 64, 64, 128)):
+        n = (ring_pages or pages) * heads * 64 * 128
+        k, v = words16(rng, n), words16(rng, n)
+        table = rng.sample(range(pages), pages) if pages else []
+        kh, vt = words16(rng, heads * 128 * stride), words16(rng, heads * 128 * stride)
+        out_k, out_v = list(kh), list(vt)
+        for h in range(heads):
+            plane = h * 128 * stride
+            for j in range(count):
+                r = key_row(table, ring_pages, heads, first + j, h)
+                for d in range(128):
+                    out_k[plane + j * 128 + d] = k[r + d]
+                    out_v[plane + d * stride + j] = v[r + d]
+        yield KEYS_LOAD, [heads, ring_pages, pages, first, count, stride], [k, v, table or [0], kh, vt], out_k + out_v
+
+
+def keys_store_cases(rng):
+    # A real ring's one column, more columns than a ring's positions (only the last), the wrap, and pools across a page.
+    for heads, ring_pages, pages, first, T, ld in ((8, 17, 0, 2047, 1, 1024), (2, 2, 0, 10, 150, 256), (2, 2, 0, 120, 20, 260),
+                                                   (8, 0, 7, 63, 2, 1024), (2, 0, 7, 60, 130, 256)):
+        n = (ring_pages or pages) * heads * 64 * 128
+        x_k, x_v = words16(rng, ld * T), words16(rng, ld * T)
+        table = rng.sample(range(pages), pages) if pages else []
+        k, v = words16(rng, n), words16(rng, n)
+        out_k, out_v = list(k), list(v)
+        start = max(0, T - ring_pages * 64) if ring_pages else 0
+        for t in range(start, T):
+            for h in range(heads):
+                r = key_row(table, ring_pages, heads, first + t, h)
+                for d in range(128):
+                    out_k[r + d] = x_k[t * ld + h * 128 + d]
+                    out_v[r + d] = x_v[t * ld + h * 128 + d]
+        yield KEYS_STORE, [heads, ring_pages, pages, first, T, ld], [x_k, x_v, table or [0], k, v], out_k + out_v
+
+
 def cases(rng):
     for generator in (rmsnorm_cases, mix_cases, message_gate_cases, clip_cases, conv_cases, dynamic_conv_cases,
                       sigmoid_gate_cases, add_cases, probs_cases, router_cases, quantize_cases, swiglu_cases,
-                      combine_cases, softcap_cases, sqrt_cases):
+                      combine_cases, softcap_cases, sqrt_cases, ring_load_cases, ring_store_cases, keys_load_cases,
+                      keys_store_cases):
         yield from generator(rng)
 
 

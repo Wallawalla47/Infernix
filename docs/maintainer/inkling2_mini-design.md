@@ -631,8 +631,9 @@ form Qwen3.8-Flash-Next's binding takes:
   the captures and block writes in flight (write-back takes a snapshot only once it and its path are on the Host),
   then starts and waits for the write-backs, so the last request's snapshot is written rather than displaced. A
   promotion lands them the same way before it asks for Host room. The source choice weighs the read: at the cost
-  model's 2 GB/s a default-route prompt under about 2,800 tokens is re-prefilled instead; the lossless route's model
-  (about 3.3 ms a token and 0.86 us a query-key pair, fitted to its scoring runs) reads nearly every snapshot back.
+  model's 2 GB/s (a modelled break-even, not timed) a default-route prompt under about 2,800 tokens is re-prefilled
+  instead; the lossless route's model (about 0.27 s a call, 3.1 ms a token and 0.89 us a query-key pair) prefers the
+  read at any length.
 - **Not built yet**: next-turn prefill, tool-call holds, queue holds and prefetching for waiting requests.
 
 Sizes: an image is 190 MiB (BF16 rings) plus 9 MiB of drafter rings; restoring one takes ~8 ms over the PCIe link,

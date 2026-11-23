@@ -304,12 +304,13 @@ public:
             config.index.cost.token_seconds          = 1.0 / 21600.0;
             config.index.cost.attention_pair_seconds = 0.0;
             if (o_.lossless) {
-                // The lossless route's calls (lossless-route.md §3a), fitted to its scoring runs (inkling2-mini, RTX
-                // 5090, infernix-perplexity --lossless, 2026-11-22: 11 windows of 2,048 tokens in 93.7 s, 2 of 9,216 in
-                // 133.5 s): about 3.3 ms a token and 0.86 us a (query, key) pair; calls are eager, so no call cost.
-                config.index.cost.chunk_seconds          = 0.0;
-                config.index.cost.token_seconds          = 3.3e-3;
-                config.index.cost.attention_pair_seconds = 0.86e-6;
+                // The lossless route's calls (lossless-route.md §3a; inkling2-mini, RTX 5090, 2026-11-23): about 0.27 s a
+                // call (infernix --lossless, one-column decode calls at a 20-token context, 3.6 tok/s), then 3.1 ms a
+                // token and 0.89 us a (query, key) pair, fitted to its scoring runs (infernix-perplexity: 11 windows of
+                // 2,048 tokens in 93.7 s, 2 of 9,216 in 133.5 s).
+                config.index.cost.chunk_seconds          = 0.27;
+                config.index.cost.token_seconds          = 3.1e-3;
+                config.index.cost.attention_pair_seconds = 0.89e-6;
             }
             config.index.cost.h2d_bytes_per_second   = 22.0e9;
             config.ssd_bytes                         = o_.prefix_ssd_bytes;

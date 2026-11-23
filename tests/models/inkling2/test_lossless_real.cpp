@@ -11,6 +11,8 @@
 //    greedy request's, and the prompt continued by 1, 12 and 23 of its tokens, resumed from the prefix cache) equal
 //    the scoring Engine's log-probabilities byte for byte; sampled requests (temperature 1: Gumbel-max) give the same
 //    tokens alone, two at once in reverse order, with chunks of 512 and resumed from the prefix cache.
+// 3. The prefix cache's lower tiers on this route: a snapshot pushed out to the SSD tier and read back, and one saved
+//    by --prefix-cache-file and restored by a new Engine, each resume giving the same sampled tokens.
 //
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (skips without it)
 
@@ -30,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -267,6 +270,52 @@ void require_same(const std::string& label, const std::vector<TokenId>& a, const
 
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
 
+// 3. `solo`: the prompt's sampled tokens (seed 200) from a cold run.
+void lower_tiers(const char* artifact, const std::vector<TokenId>& prompt, const std::vector<TokenId>& solo) {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix_inkling2_lossless_tiers";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    std::filesystem::create_directories(dir);
+    {
+        // A Host tier of one snapshot (a 190 MiB image and the prompt's 18 blocks): another prompt pushes it to the SSD.
+        EngineOptions options                          = generation_options(artifact, 512, 1);
+        options.context_cache.host_capacity_bytes      = std::size_t{260} << 20U;
+        options.context_cache.ssd_capacity_bytes       = std::uint64_t{2} << 30U;
+        options.context_cache.ssd_write_bytes_per_hour = ContextCacheOptions::kSsdWritesUnlimited;
+        options.context_cache.ssd_directory            = dir;
+        Engine engine(options);
+        (void)engine.generate(engine.prepare_tokens(prompt), request(false, 7, true, 1));
+        const std::vector<TokenId> other(prompt.rbegin(), prompt.rend());
+        (void)engine.generate(engine.prepare_tokens(other), request(false, 7, true, 1));
+        const RuntimeStats before = engine.runtime_stats();
+        const GenerationResult warm = engine.generate(engine.prepare_tokens(prompt), request(false, 200, true));
+        const RuntimeStats after  = engine.runtime_stats();
+        require(after.hybrid_ssd_promotions > before.hybrid_ssd_promotions, "ssd tier: the source was not read back");
+        require(after.hybrid_ssd_failures == 0, "ssd tier: an SSD transfer failed");
+        require(warm.reused_prompt_tokens >= 1152, "ssd tier: the resume reused too little");
+        require_same("ssd tier (" + std::to_string(warm.reused_prompt_tokens) + " tokens reused, " +
+                         std::to_string(after.hybrid_ssd_read_bytes / 1000000) + " MB read)",
+                     solo, warm.generated_token_ids);
+    }
+    {
+        EngineOptions options                            = generation_options(artifact, 512, 1);
+        options.context_cache.hybrid.persistent_file     = dir / "lossless.cache";
+        options.context_cache.hybrid.persistent_identity = "infernix_inkling2_lossless_real_test";
+        {
+            Engine engine(options);
+            (void)engine.generate(engine.prepare_tokens(prompt), request(false, 7, true, 1));
+            engine.stop(); // the orderly stop saves the Host tier
+        }
+        require(std::filesystem::exists(options.context_cache.hybrid.persistent_file), "file: nothing was saved at shutdown");
+        Engine engine(options);
+        const GenerationResult warm = engine.generate(engine.prepare_tokens(prompt), request(false, 200, true));
+        require(warm.reused_prompt_tokens >= 1152, "file: the restarted Engine reused too little");
+        require_same("prefix cache file (" + std::to_string(warm.reused_prompt_tokens) + " tokens reused)", solo,
+                     warm.generated_token_ids);
+    }
+    std::filesystem::remove_all(dir, ignored);
+}
+
 void generation(const char* artifact) {
     std::vector<std::vector<TokenId>> prompts;
     std::vector<TokenId> greedy;
@@ -357,6 +406,7 @@ void generation(const char* artifact) {
                       << " equals the scoring route's bit for bit\n";
         }
     }
+    lower_tiers(artifact, prompts[0], solo[0]);
 }
 
 } // namespace
