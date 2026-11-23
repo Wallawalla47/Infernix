@@ -820,7 +820,8 @@ void profile_prefill(const m::Parameters& p, int width) {
 
 // 5. Three lanes in one call with different token sequences and a padding column, in two calls of mixed widths:
 //    each lane's logits equal its own run alone (as the only lane of a one-lane forward) bit for bit.
-bool lanes_alone(const m::Parameters& p, m::Forward& solo, State& solo_state, const Reference& ref) {
+// a8: the solo forward's --a8-activations route, which the 3-lane forward takes too.
+bool lanes_alone(const m::Parameters& p, m::Forward& solo, State& solo_state, const Reference& ref, bool a8) {
     const auto& c = p.model.config().text;
     const std::int32_t* ids = ref.get<std::int32_t>("ids");
     std::vector<std::vector<std::int32_t>> tokens(3);
@@ -831,7 +832,8 @@ bool lanes_alone(const m::Parameters& p, m::Forward& solo, State& solo_state, co
     }
     // Per call, each lane's first position and width (lane 0 0-7 then 8-15, lane 1 0-4 then 5-20, lane 2 0-11 then 12).
     const int widths[2][3] = {{8, 5, 12}, {8, 16, 1}};
-    m::Forward multi(p, 3);
+    m::Forward multi(p, 3, m::kMaxForwardColumns,
+                     a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
     State multi_state(multi.layout(), 3);
     std::vector<std::vector<float>> together(3), alone(3);
     int at[3] = {0, 0, 0};
@@ -1146,7 +1148,7 @@ int main() {
                         prompt_differ, kPositions, kLastPrompt, vs_ref, vs_decode);
         }
         ok = graph_replay(parameters, forward, state, ref) && ok;
-        ok = lanes_alone(parameters, forward, state, ref) && ok;
+        ok = lanes_alone(parameters, forward, state, ref, a8) && ok;
         std::printf(ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& error) {
