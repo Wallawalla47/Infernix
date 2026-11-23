@@ -1,12 +1,14 @@
 #pragma once
 
 #include "infernix/types.h"
+#include "product/config/config_file.h"
 #include "product/logging/logging.h"
 #include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -229,6 +231,9 @@ const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
+// Every option the command line and --config accept after the artifact path: its name, whether it takes a value and
+// whether it repeats. serve_usage_text lists each of them (the launcher and tools/ablate read the arity from it).
+std::span<const product::ConfigOption> serve_option_arities() noexcept;
 // Whether a --host value accepts connections from this machine only (127.0.0.0/8, ::1, localhost).
 bool is_loopback_host(std::string_view host) noexcept;
 

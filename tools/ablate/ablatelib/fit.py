@@ -37,7 +37,9 @@ def load_sets(run) -> dict:
 
 
 def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: float = 1.0, startup: int = 60,
-        markers: tuple[str, ...] = M.MARKERS, max_failures: int = 3, log=print) -> dict:
+        markers: tuple[str, ...] = M.MARKERS, max_failures: int = 3, log=print, progress=None) -> dict:
+    """Adds `trials` trials to the study. `progress`, when given, is called with {'control_refusals', 'n_harmful'} once
+    the control is measured and with each finished trial's record."""
     import optuna
 
     base = run.dir / "direction" / "sidecar.json"
@@ -76,6 +78,8 @@ def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: 
         raise SystemExit(f"the control's refusal grading had {control['errors']} error(s); see {run_dir}")
     log(f"CONTROL (no cut): refusals {control['refusals']}/{len(harm)} (truncated {control['truncated']})")
     write_json(run_dir / "control.json", {"refusals": control, "kl_prompts": len(good), "shape": shape})
+    if progress is not None:
+        progress({"control_refusals": control["refusals"], "n_harmful": len(harm)})
 
     def run_trial(trial) -> float:
         started = time.time()
@@ -112,6 +116,8 @@ def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: 
         write_json(tdir / "trial.json", record)
         log(f"trial {trial.number:>4}  refusals {graded['refusals']:>2}/{len(harm)} (control {control['refusals']})  "
             f"KL {kl:.4f}{'  OVER TARGET' if kl >= kl_target else ''}  {what}  {time.time() - started:.0f}s")
+        if progress is not None:
+            progress({"trial": trial.number, **{k: v for k, v in record.items() if k != "kl_per_prompt"}})
         return score
 
     def objective(trial) -> float:
@@ -151,6 +157,24 @@ def front(study) -> list[dict]:
     return [{"trial": t.number, "refusals": t.user_attrs.get("refusals"), "n": t.user_attrs.get("n_harmful"),
              "kl": round(float(t.user_attrs.get("kl", float("nan"))), 4), "what": t.user_attrs.get("what"),
              "sidecar": t.user_attrs.get("sidecar")} for t in ranked]
+
+
+def best_trial(study, kl_target: float, control_refusals: int) -> tuple[int | None, str]:
+    """(trial number, why) of the cut to keep: the fewest held-out refusals among completed trials whose first-token
+    KL is below the target, then the lowest KL. None, with the reason, when the stock model refuses none of the
+    held-out prompts, no trial is below the target, or none refuses fewer than the stock model."""
+    if control_refusals == 0:
+        return None, "the stock model refused none of the held-out harmful prompts: there is no refusal to remove"
+    done = [t for t in study.trials if t.state.name == "COMPLETE" and t.user_attrs.get("kl", 9.9) < kl_target]
+    if not done:
+        return None, f"no trial kept the first-token KL below the target ({kl_target:g}): try more trials"
+    best = min(done, key=lambda t: (t.user_attrs.get("refusals", 99), t.user_attrs.get("kl", 9.9), t.number))
+    refusals = best.user_attrs.get("refusals", 99)
+    if refusals >= control_refusals:
+        return None, (f"no trial below the KL target refused fewer held-out prompts than the stock model "
+                      f"({control_refusals}): try more trials")
+    return best.number, (f"trial {best.number}: {refusals}/{best.user_attrs.get('n_harmful')} held-out harmful prompts "
+                         f"refused (stock {control_refusals}), first-token KL {best.user_attrs.get('kl', 0.0):.3f}")
 
 
 def open_study(run, study_name: str):

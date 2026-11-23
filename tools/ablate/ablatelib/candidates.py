@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -166,8 +167,9 @@ def chat(run, candidate: str | None, context: int | None, thinking: bool = True)
             print(f"\nmodel: {content}\n")
 
 
-def export(run, candidate: str, name: str, source: str | None = None) -> Path:
-    """A shareable copy: no local paths, plain-words provenance, and what it was fitted under."""
+def export(run, candidate: str, name: str, source: str | None = None, out: Path | None = None) -> Path:
+    """A shareable copy in out/name (default: the run's export/ folder): no local paths, plain-words provenance, and
+    what it was fitted under."""
     sc = candidate_sidecar(run, candidate)
     cfg = SC.read(sc)
     sets = json.loads((run.dir / "prompts" / "sets.json").read_text(encoding="utf-8"))
@@ -195,7 +197,8 @@ def export(run, candidate: str, name: str, source: str | None = None) -> Path:
         "chat_template": ({"file": Path(template).name, "sha256": hashlib.sha256(template_text.encode()).hexdigest()}
                           if template_text else "the artifact's own"),
         "numerics_options": [f if v is None else f"{f} {v}" for f, v in numerics],
-        "thinking": "off (refusals and KL)", "tool": "tools/ablate " + _git_head()}
+        "thinking": "off (refusals and KL)", "tool": "tools/ablate " + tool_version(),
+        "engine": f"{run.serve_binary.name} sha256:{sha256_file(run.serve_binary)[:16]}"}
     lora = prod.value("--lora")
     if lora:
         # The adapter the model was served with: its folder (or file) name and its weights' sha256.
@@ -204,7 +207,7 @@ def export(run, candidate: str, name: str, source: str | None = None) -> Path:
     cfg["generation"] = {"source": src, "notes": notes, "fitted_under": fitted_under}
     # The engine warns when the sidecar starts on another artifact.
     cfg["artifact_id"] = artifact_id(prod.artifact)
-    dest = run.dir / "export" / name
+    dest = (Path(out) if out else run.dir / "export") / name
     if dest.exists():
         raise SystemExit(f"{dest} exists; pick another name")
     dest.mkdir(parents=True)
@@ -217,8 +220,15 @@ def export(run, candidate: str, name: str, source: str | None = None) -> Path:
     return dest
 
 
-def _git_head() -> str:
-    """The tool's commit, '-dirty' when tools/ablate has uncommitted changes; '(unknown)' outside a git checkout."""
+def tool_version() -> str:
+    """The tool's version: what the launcher that installed it says (INFERNIX_ABLATE_TOOL_VERSION), else its checkout's
+    commit ('-dirty' when tools/ablate has uncommitted changes), else '(unknown)'."""
+    given = os.environ.get("INFERNIX_ABLATE_TOOL_VERSION", "").strip()
+    if given:
+        return given
+    if not (REPO_ROOT / ".git").exists():
+        return "(unknown)"
+
     def git(*args: str) -> str:
         return subprocess.run(["git", "-C", str(REPO_ROOT), *args], capture_output=True, text=True,
                               timeout=10).stdout.strip()

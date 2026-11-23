@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import platform_util as PU
 from . import serve_flags as SF
+from .run import write_json
 
 MODEL_ID = "ablate"
 
@@ -83,6 +84,12 @@ class Engine:
         self.seed_expert_state()
         self.port = PU.free_port()
         self.proc = PU.start(self.argv(), self.log_path)
+        # The engine is in a process group of its own, so a program that has to end this tool at once (the launcher,
+        # when an orderly stop timed out) does not reach it: run/engines/<pid>.json names it until it is stopped.
+        # The resolved path: what the process runs as (Linux's /proc/<pid>/exe), whatever link the command line names.
+        write_json(self.run.sub("engines") / f"{self.proc.pid}.json",
+                   {"pid": self.proc.pid, "executable": str(Path(self.run.serve_binary).resolve()),
+                    "purpose": self.purpose})
         deadline = time.monotonic() + self.boot_timeout_s
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
@@ -96,7 +103,9 @@ class Engine:
         raise EngineError(f"infernix-serve did not answer /health within {self.boot_timeout_s:.0f} s; see {self.log_path}")
 
     def stop(self) -> None:
-        PU.stop(self.proc)
+        if self.proc is not None:
+            PU.stop(self.proc)
+            (self.run.dir / "engines" / f"{self.proc.pid}.json").unlink(missing_ok=True)
         self.proc = None
 
     def tail(self, n: int = 15) -> str:

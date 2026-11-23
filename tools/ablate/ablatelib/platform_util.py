@@ -44,21 +44,40 @@ def free_disk_bytes(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
-def card_processes(device: int = 0) -> list[tuple[int, int]]:
-    """(pid, MiB) of every compute process on the card, from nvidia-smi (on PATH on Linux and Windows)."""
-    exe = shutil.which("nvidia-smi")
-    if exe is None:
-        raise RuntimeError("nvidia-smi is not on PATH; it ships with the NVIDIA driver")
-    uuid = subprocess.run([exe, "-i", str(device), "--query-gpu=uuid", "--format=csv,noheader"],
-                          capture_output=True, text=True, timeout=30, check=True).stdout.strip()
-    out = subprocess.run([exe, "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"],
-                         capture_output=True, text=True, timeout=30, check=True).stdout
-    procs = []
-    for line in out.splitlines():
+# Another program holds the card when one of its compute processes holds this much of it, or (Windows' WDDM driver
+# reports no memory per process) when this much of the card is in use: a desktop's shell, compositor and browsers are
+# listed as compute processes there while holding a few hundred MiB.
+BUSY_PROCESS_MIB = 1024
+BUSY_CARD_MIB = 4096
+
+
+def card_busy(device: int = 0, run=subprocess.run) -> str | None:
+    """Why another program holds the card the tool's engines need whole (production still serving, say), or None.
+    From nvidia-smi (on PATH on Linux and Windows); the engines' own --plan checks whether they fit what is free."""
+    exe = shutil.which("nvidia-smi") or "nvidia-smi"
+
+    def query(*args: str) -> str:
+        try:
+            return run([exe, *args], capture_output=True, text=True, timeout=30, check=True).stdout
+        except FileNotFoundError:
+            raise RuntimeError("nvidia-smi is not on PATH; it ships with the NVIDIA driver") from None
+
+    card = [p.strip() for p in query("-i", str(device), "--query-gpu=uuid,memory.used",
+                                     "--format=csv,noheader,nounits").strip().split(",")]
+    uuid, used = card[0], int(card[1]) if len(card) > 1 and card[1].isdigit() else 0
+    procs = []   # (pid, program, MiB or None where the driver does not say)
+    for line in query("--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+                      "--format=csv,noheader,nounits").splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) == 3 and parts[0] == uuid:
-            procs.append((int(parts[1]), int(parts[2]) if parts[2].isdigit() else 0))
-    return procs
+        if len(parts) >= 4 and parts[0] == uuid:
+            procs.append((int(parts[1]), Path(",".join(parts[2:-1])).name, int(parts[-1]) if parts[-1].isdigit() else None))
+    holders = [p for p in procs if p[2] is not None and p[2] >= BUSY_PROCESS_MIB]
+    if holders:
+        return "held by " + ", ".join(f"{name} (process {pid}, {mib} MiB)" for pid, name, mib in holders)
+    if used >= BUSY_CARD_MIB and not any(p[2] is not None for p in procs):
+        names = ", ".join(f"{name} ({pid})" for pid, name, _ in procs) or "no process listed"
+        return f"{used} MiB of the card in use (compute processes: {names})"
+    return None
 
 
 def free_port() -> int:

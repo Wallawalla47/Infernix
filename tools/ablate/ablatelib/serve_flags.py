@@ -9,12 +9,14 @@ files (the prefix-cache file, the SSD tier, the expert-cache state, log files).
 
 An option this table does not know is refused by name, never passed through: a new flag could change the model or
 write a file, and silently forwarding it would make the measurement mean something nobody chose.
-tests/test_ablate_tools.py fails when infernix-serve gains an option this table does not classify.
+tests/test_ablate_tools.py fails when infernix-serve gains an option this table does not classify. A run reads which
+options take a value from its own infernix-serve's --help (arities_of), so the tool needs no source checkout.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,16 +172,48 @@ RULES: dict[str, Rule] = {
 }
 
 
-def arities(repo_root: Path) -> dict[str, str]:
-    """Flag -> 'switch' | 'value' | 'repeatable', from infernix-serve's own ServeOptionArity table (the parse the
-    launcher's coverage test uses). The table is the server's definition of its command line."""
-    text = (repo_root / "src" / "serve" / "serve_options.cpp").read_text(encoding="utf-8")
-    table: dict[str, str] = {}
-    for match in re.finditer(r'ServeOptionArity\{"(--[a-z0-9-]+)"(?:,\s*(true|false))?(?:,\s*(true|false))?\}', text):
-        flag, takes_value, repeatable = match.groups()
-        table[flag] = "switch" if takes_value == "false" else "repeatable" if repeatable == "true" else "value"
-    if len(table) < 100:
-        raise RuntimeError(f"{repo_root / 'src/serve/serve_options.cpp'}: the ServeOptionArity table was not found")
+def arities_from_help(text: str) -> dict[str, str]:
+    """Flag -> 'switch' | 'value' | 'repeatable' from infernix-serve's --help, read as the launcher reads it
+    (src/launcher/serve_help.cpp): "  --flag[, -x] [ARG]   description" at an indent of 2 to 4, continued by lines
+    indented further; the first listing of a flag counts (the NOTES section names options again); a flag takes a value
+    when ARG is given and repeats when its description says "(...; repeatable)". tests/test_serve_options.cpp checks
+    that the help lists every option the server accepts this way."""
+    listed: dict[str, list] = {}
+    current = None
+    for raw in text.splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip():
+            current = None
+            continue
+        lead = len(line) - len(line.lstrip(" "))
+        rest = line[lead:]
+        if 2 <= lead <= 4 and rest.startswith("--"):
+            head, _, description = rest.partition("  ")
+            flag, _, arg = head.partition(" ")
+            flag = flag.rstrip(",")
+            if flag in listed:
+                current = None
+                continue
+            arg = "" if arg.strip().startswith("-") else arg.strip()
+            listed[flag] = [bool(arg), description.strip()]
+            current = flag
+        elif current is not None and lead > 4:
+            listed[current][1] += " " + line.strip()
+    return {flag: ("switch" if not takes_value else
+                   "repeatable" if re.search(r"[(;]\s*repeatable\)", description) else "value")
+            for flag, (takes_value, description) in listed.items()}
+
+
+def arities_of(serve_binary: Path) -> dict[str, str]:
+    """The arity table of the infernix-serve a run uses, from its own --help: the command line it accepts."""
+    try:
+        out = subprocess.run([str(serve_binary), "--help"], capture_output=True, text=True, timeout=120,
+                             encoding="utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SystemExit(f"{serve_binary} --help did not run ({e}): is this an infernix-serve?") from e
+    table = arities_from_help(out.stdout + out.stderr)
+    if len(table) < 50:
+        raise SystemExit(f"{serve_binary} --help listed {len(table)} options: is this an infernix-serve?")
     return table
 
 

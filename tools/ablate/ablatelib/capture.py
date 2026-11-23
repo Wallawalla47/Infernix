@@ -22,7 +22,7 @@ import numpy as np
 
 from . import serve_flags as SF
 from .engine import Engine
-from .run import artifact_id, sha256_file, write_json
+from .run import artifact_id, replace_file, sha256_file, write_json
 
 
 def identity(run) -> dict:
@@ -76,7 +76,7 @@ def run_capture(run, kinds: dict[str, list[str]], log=print) -> dict:
             target = out / f"{entry['fingerprint']}.f32"
             tmp = target.with_suffix(".f32.tmp")
             rows.astype("<f4").tofile(tmp)
-            tmp.replace(target)
+            replace_file(tmp, target)
             entry["prompt_tokens"] = prompt_tokens
             if n % 40 == 0 or n == len(todo):
                 log(f"  recorded {n}/{len(todo)} ({time.monotonic() - started:.0f} s with the engine's start)")

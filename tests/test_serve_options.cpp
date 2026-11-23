@@ -10,7 +10,10 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <regex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -39,6 +42,54 @@ std::string parse_error(std::vector<std::string> arguments) {
         (void)parse(std::move(arguments));
     } catch (const std::exception& error) { return error.what(); }
     return {};
+}
+
+// The help's options as the launcher (launcher/serve_help.cpp) and tools/ablate (serve_flags.arities_from_help) read
+// them: "  --flag[, -x] [ARG]   description" at an indent of 2 to 4, continued by lines indented further, the first
+// listing of a flag counting; a flag takes a value when ARG is given and repeats when its description says
+// "(...; repeatable)".
+struct HelpOption {
+    bool takes_value = false;
+    std::string description;
+};
+std::map<std::string, HelpOption> help_options(const std::string& help) {
+    std::map<std::string, HelpOption> options;
+    std::string* current = nullptr;
+    std::istringstream lines(help);
+    for (std::string line; std::getline(lines, line);) {
+        const std::size_t lead = line.find_first_not_of(' ');
+        if (lead == std::string::npos) {
+            current = nullptr;
+            continue;
+        }
+        if (lead >= 2 && lead <= 4 && line.compare(lead, 2, "--") == 0) {
+            const std::string rest = line.substr(lead);
+            const std::size_t gap  = rest.find("  ");
+            const std::string head = rest.substr(0, gap);
+            const std::size_t space = head.find(' ');
+            std::string flag        = head.substr(0, space);
+            if (!flag.empty() && flag.back() == ',') { flag.pop_back(); }
+            std::string arg = space == std::string::npos ? std::string{} : head.substr(space + 1);
+            if (arg.starts_with("-")) { arg.clear(); }
+            // The NOTES section names options again ("  --greedy forces temperature 0"): the first listing counts.
+            if (options.contains(flag)) {
+                current = nullptr;
+                continue;
+            }
+            HelpOption& option = options[flag];
+            option.takes_value = !arg.empty();
+            option.description = gap == std::string::npos ? std::string{} : rest.substr(gap);
+            current            = &option.description;
+            continue;
+        }
+        if (current != nullptr && lead > 4) { *current += " " + line.substr(lead); }
+    }
+    return options;
+}
+
+bool says_repeatable(const std::string& description) {
+    static const std::regex pattern(R"([(;]\s*repeatable\))");
+    return std::regex_search(description, pattern);
 }
 
 // Replaces the scratch --config file's contents and returns its path.
@@ -85,6 +136,36 @@ int main() {
     failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
     failures += check(serve_usage_text("infernix-serve").find("--rope-yarn-factor") != std::string::npos,
                       "serving help omits YaRN");
+    // The help lists exactly the options the parser accepts, each with its arity: the launcher and tools/ablate read
+    // a server's command line through its --help.
+    {
+        const std::map<std::string, HelpOption> listed = help_options(serve_usage_text("infernix-serve"));
+        std::set<std::string> table;
+        for (const infernix::product::ConfigOption& option : serve_option_arities()) {
+            table.insert(std::string(option.name));
+            const auto it = listed.find(std::string(option.name));
+            if (it == listed.end()) {
+                std::cerr << "serve help omits " << option.name << '\n';
+                ++failures;
+                continue;
+            }
+            if (it->second.takes_value != option.takes_value) {
+                std::cerr << "serve help gives " << option.name << " the wrong arity\n";
+                ++failures;
+            }
+            if (says_repeatable(it->second.description) != option.repeatable) {
+                std::cerr << "serve help " << (option.repeatable ? "omits" : "claims") << " that " << option.name
+                          << " repeats\n";
+                ++failures;
+            }
+        }
+        for (const auto& [flag, option] : listed) {
+            if (flag != "--help" && flag != "--config" && !table.contains(flag)) {
+                std::cerr << "serve help lists " << flag << ", which the parser refuses\n";
+                ++failures;
+            }
+        }
+    }
     // Integer options past int's range are refused, not saturated (Windows' long is int's size), and the pending
     // queue (one HTTP worker each) is bounded (candidates QA-13).
     for (const auto* option : {"--max-http-clients", "--pending-timeout-ms", "--max-pending-requests"}) {

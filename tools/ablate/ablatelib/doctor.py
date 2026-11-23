@@ -70,9 +70,8 @@ def check(run, log=print) -> int:
                          + {0: ", fits)", 3: ", does not fit)", 1: ", no plan)"}.get(rc, ")"))
 
     try:
-        busy = PU.card_processes(int(prod.value("--device") or 0))
-        say(not busy, "the card is free" if not busy else
-            f"the card is busy ({len(busy)} process(es), {sum(m for _, m in busy)} MiB): stop production first")
+        busy = PU.card_busy(int(prod.value("--device") or 0))
+        say(busy is None, "the card is free" if busy is None else f"the card is busy ({busy}): stop production first")
     except RuntimeError as e:
         say(False, str(e))
     free = PU.free_disk_bytes(run.dir)

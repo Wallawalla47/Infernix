@@ -10,6 +10,7 @@ so the tool resolves them once, here, and stores absolute paths.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -79,14 +80,20 @@ def _resolve(value: str, launch_dir: Path) -> str:
     return str(p if p.is_absolute() else (launch_dir / p).resolve())
 
 
+def named_serve_binary(tokens: list[str], launch_dir: Path) -> Path | None:
+    """The infernix-serve a command line starts with, when its first word names one."""
+    if tokens and Path(tokens[0]).name.lower().startswith("infernix-serve"):
+        return Path(_resolve(tokens[0], launch_dir))
+    return None
+
+
 def parse_tokens(tokens: list[str], arity: dict[str, str], launch_dir: Path, source: str) -> Production:
     """Tokens of an infernix-serve command line -> Production. A --config FILE among them is read here, with the
     command line overriding the file (infernix-serve's rule) and repeatable values accumulating."""
     if not tokens:
         raise ValueError(f"{source}: the production command line is empty")
-    serve_binary = None
-    if Path(tokens[0]).name.lower().startswith("infernix-serve"):
-        serve_binary = Path(_resolve(tokens[0], launch_dir))
+    serve_binary = named_serve_binary(tokens, launch_dir)
+    if serve_binary is not None:
         tokens = tokens[1:]
     artifact: str | None = None
     cli: list[tuple[str, str | None]] = []
@@ -110,8 +117,8 @@ def parse_tokens(tokens: list[str], arity: dict[str, str], launch_dir: Path, sou
             i += 1 if eq else 2
             continue
         if name not in arity:
-            raise ValueError(f"{source}: {name} is not an infernix-serve option in this checkout "
-                             "(is the production binary from a different Infernix version?)")
+            raise ValueError(f"{source}: {name} is not an option of this infernix-serve "
+                             "(does the command line name the binary production runs?)")
         if arity[name] == "switch":
             cli.append((name, None))
             i += 1
@@ -174,9 +181,21 @@ def read_config(path: Path, arity: dict[str, str]) -> tuple[str | None, list[tup
     return model, options
 
 
+def read_command_line(path: Path) -> list[str]:
+    """The words of a command line saved in a file (continuations and comments as _split_command_line takes them)."""
+    return _split_command_line(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def read_argv(path: Path) -> list[str]:
+    """The words of a command line saved as a JSON list of strings (no quoting or comment rules to get wrong)."""
+    words = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(words, list) or not words or not all(isinstance(w, str) for w in words):
+        raise SystemExit(f"{path}: expected a JSON list of strings (the infernix-serve command line, word by word)")
+    return words
+
+
 def from_text_file(path: Path, arity: dict[str, str], launch_dir: Path | None = None) -> Production:
-    return parse_tokens(_split_command_line(path.read_text(encoding="utf-8-sig")), arity,
-                        (launch_dir or Path.cwd()).resolve(), source=str(path))
+    return parse_tokens(read_command_line(path), arity, (launch_dir or Path.cwd()).resolve(), source=str(path))
 
 
 def from_config_file(path: Path, arity: dict[str, str], launch_dir: Path | None = None,
@@ -188,9 +207,9 @@ def from_config_file(path: Path, arity: dict[str, str], launch_dir: Path | None 
                         source="--config")
 
 
-def from_running(arity: dict[str, str]) -> Production:
-    """The running infernix-serve's command line (Linux only: /proc). On other systems, save the production command
-    line to a file and pass it with --production instead."""
+def running_command_line() -> tuple[list[str], Path, str]:
+    """(argv, launch directory, source) of the running infernix-serve (Linux only: /proc). On other systems, save the
+    production command line to a file and pass it with --production instead."""
     if not sys.platform.startswith("linux"):
         raise ValueError("--from-running reads /proc, which only Linux has; save your production command line to "
                          "a text file and pass --production FILE")
@@ -208,4 +227,4 @@ def from_running(arity: dict[str, str]) -> Production:
         raise ValueError(f"--from-running found {len(found)} running infernix-serve processes; it needs exactly one "
                          "(or save the production command line to a file and pass --production FILE)")
     pid, argv, cwd = found[0]
-    return parse_tokens(argv, arity, cwd, source=f"running infernix-serve pid {pid}")
+    return argv, cwd, f"running infernix-serve pid {pid}"

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -44,7 +45,7 @@ class Run:
                 "serve_binary": str(self.serve_binary), "context": self.context, "production": self.production.to_json(), "notes": self.notes}
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
-        tmp.replace(self.path)
+        replace_file(tmp, self.path)
 
     @classmethod
     def load(cls, run_dir: Path) -> Run:
@@ -77,26 +78,39 @@ def sha256_file(path: Path, limit: int | None = None) -> str:
     return f"head{limit}+size:{h.hexdigest()[:16]}"
 
 
+# A v3 entry file's header (tools/artifact/framing.py): magic, directory JSON length, artifact id.
+ENTRY_HEADER = struct.Struct("<8sQ16s")
+ENTRY_MAGIC = b"NINFER\x00\x03"
+
+
 def artifact_id(artifact: Path) -> str:
     """The artifact's id as the engine prints it (32 lowercase hex digits), from its entry file's header: what a
     sidecar's artifact_id names, so a start on another artifact warns."""
-    import sys
-    tools = str(REPO_ROOT / "tools")
-    if tools not in sys.path:
-        sys.path.insert(0, tools)
-    from artifact.framing import HEADER, MAGIC   # noqa: E402  (Infernix's own v3 framing, tools/artifact)
     with Path(artifact).open("rb") as fh:
-        raw = fh.read(HEADER.size)
-    if len(raw) != HEADER.size or HEADER.unpack(raw)[0] != MAGIC:
+        raw = fh.read(ENTRY_HEADER.size)
+    if len(raw) != ENTRY_HEADER.size or ENTRY_HEADER.unpack(raw)[0] != ENTRY_MAGIC:
         raise SystemExit(f"{artifact}: not an Infernix v3 artifact (its entry header does not read)")
-    return HEADER.unpack(raw)[2].hex()
+    return ENTRY_HEADER.unpack(raw)[2].hex()
+
+
+def replace_file(tmp: Path, path: Path) -> None:
+    """tmp.replace(path), tried again for a few seconds while Windows refuses it: a rename over a file another program
+    has open fails there (the launcher reads progress.json every second; a virus scanner opens new files)."""
+    for attempt in range(60):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 59:
+                raise
+            time.sleep(0.05)
 
 
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    replace_file(tmp, path)
 
 
 def as_dict(obj) -> dict:

@@ -8,8 +8,12 @@
     python tools/ablate/ablate.py grade RUN --harmful T --benign B mine
     python tools/ablate/ablate.py eval RUN mine                        # capability: the stock model vs the candidate
     python tools/ablate/ablate.py export RUN mine --name my-cut
+    python tools/ablate/ablate.py datasets list                        # public prompt sets and their licences
+    python tools/ablate/ablate.py datasets fetch advbench-alpaca --out prompts
+    python tools/ablate/ablate.py auto RUN --harmful H --harmless G --out sidecars --name my-cut
 
-`all` is doctor, prompts, capture, direction and fit in order; each also runs on its own. docs/ablate-fitting.md is
+`all` is doctor, prompts, capture, direction and fit in order; each also runs on its own. `auto` runs them, picks the
+cut, grades and exports it in one resumable command (the launcher's Ablation page runs it). docs/ablate-fitting.md is
 the guide (what to install, where to get prompt sets, how long each step takes, how to read the results).
 """
 
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -25,23 +30,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ablatelib import platform_util as PU  # noqa: E402
 from ablatelib import production as P  # noqa: E402
 from ablatelib import serve_flags as SF  # noqa: E402
-from ablatelib.run import REPO_ROOT, Run, sha256_file, write_json  # noqa: E402
+from ablatelib.run import Run, write_json  # noqa: E402
 
 
 def cmd_init(a) -> int:
-    arity = SF.arities(REPO_ROOT)
     launch = Path(a.launch_dir).resolve() if a.launch_dir else Path.cwd()
-    if sum(x is not None and x is not False for x in (a.production, a.production_config, a.from_running or None)) != 1:
-        raise SystemExit("give exactly one of --production FILE, --production-config TOML, --from-running")
-    if a.production:
-        prod = P.from_text_file(Path(a.production), arity, launch)
+    given = (a.production, a.production_argv, a.production_config, a.from_running or None)
+    if sum(x is not None and x is not False for x in given) != 1:
+        raise SystemExit("give exactly one of --production FILE, --production-argv JSON, --production-config TOML, "
+                         "--from-running")
+    # The infernix-serve first: its --help says which of the command line's options take a value.
+    named = None
+    if a.production or a.production_argv:
+        tokens = P.read_command_line(Path(a.production)) if a.production else P.read_argv(Path(a.production_argv))
+        named = P.named_serve_binary(tokens, launch)
+    elif a.from_running:
+        tokens, launch, running = P.running_command_line()
+        named = P.named_serve_binary(tokens, launch)
+    serve = Path(a.serve_binary).resolve() if a.serve_binary else named
+    if serve is None:
+        raise SystemExit("which infernix-serve? pass --serve-binary (the production command line did not name one)")
+    arity = SF.arities_of(serve)
+    if a.production or a.production_argv:
+        prod = P.parse_tokens(tokens, arity, launch, source=str(a.production or a.production_argv))
     elif a.production_config:
         prod = P.from_config_file(Path(a.production_config), arity, launch, extra=a.extra)
     else:
-        prod = P.from_running(arity)
-    serve = Path(a.serve_binary).resolve() if a.serve_binary else prod.serve_binary
-    if serve is None:
-        raise SystemExit("which infernix-serve? pass --serve-binary (the production command line did not name one)")
+        prod = P.parse_tokens(tokens, arity, launch, source=running)
     refused = prod.refused()
     if refused:
         raise SystemExit("this setup cannot be fitted as it stands:\n  " + "\n  ".join(refused))
@@ -59,26 +74,16 @@ def cmd_doctor(a) -> int:
 
 
 def need_free_card(run) -> None:
-    busy = PU.card_processes(int(run.production.value("--device") or 0))
+    busy = PU.card_busy(int(run.production.value("--device") or 0))
     if busy:
-        raise SystemExit(f"the card is busy ({len(busy)} process(es)): every step starts its own engine on the whole "
-                         "card, so stop your production server first")
+        raise SystemExit(f"the card is busy ({busy}): every step starts its own engine on the whole card, so stop "
+                         "your production server first")
 
 
 def cmd_prompts(a) -> int:
     from ablatelib import prompts as PR
     run = Run.load(Path(a.run))
-    harmful, hcat = PR.read_prompts(Path(a.harmful), a.field)
-    harmless, gcat = PR.read_prompts(Path(a.harmless), a.field)
-    issues = PR.problems(harmful, harmless, a.held_out, a.paired)
-    if issues:
-        raise SystemExit("prompt sets refused:\n  " + "\n  ".join(issues))
-    sets = PR.split(harmful, harmless, a.held_out)
-    sets["source"] = {k: {"name": Path(f).name, "sha256": sha256_file(Path(f)), "n": n}
-                      for k, f, n in (("harmful", a.harmful, len(harmful)), ("harmless", a.harmless, len(harmless)))}
-    sets["categories"] = {"harmful": hcat, "harmless": gcat}
-    sets["paired"] = a.paired
-    write_json(run.sub("prompts") / "sets.json", sets)
+    sets = PR.prepare(run, Path(a.harmful), Path(a.harmless), a.held_out, a.paired, a.field)
     d, h = sets["direction"], sets["held_out"]
     print(f"direction: {len(d['harmful'])} harmful / {len(d['harmless'])} harmless;  held out (graded every trial): "
           f"{len(h['harmful'])} / {len(h['harmless'])}  eval id {PR.eval_id(h['harmful'], h['harmless'])}")
@@ -157,8 +162,38 @@ def cmd_chat(a) -> int:
 
 def cmd_export(a) -> int:
     from ablatelib import candidates as CD
-    print(f"exported {CD.export(Run.load(Path(a.run)), a.candidate, a.name, a.source)}")
+    print(f"exported {CD.export(Run.load(Path(a.run)), a.candidate, a.name, a.source, Path(a.out) if a.out else None)}")
     return 0
+
+
+def cmd_datasets(a) -> int:
+    from ablatelib import datasets as DS
+    if a.action == "list":
+        if a.json:
+            print(json.dumps(DS.catalogue(), indent=1))
+            return 0
+        for preset in DS.catalogue():
+            print(f"{preset['name']}: {preset['title']}\n  {preset['description']}")
+            for source in preset["sources"]:
+                print(f"    {source['title']}: {source['licence']} ({source['licence_note']}) {source['home']}")
+        return 0
+    if not a.preset or not a.out:
+        raise SystemExit("datasets fetch PRESET --out DIR")
+    DS.fetch_preset(a.preset, Path(a.out))
+    return 0
+
+
+def cmd_auto(a) -> int:
+    from ablatelib import auto as AU
+    run = Run.load(Path(a.run))
+    if a.test_benign and not a.test_harmful:
+        raise SystemExit("--test-benign goes with --test-harmful")
+    rc = AU.run_auto(run, harmful=Path(a.harmful), harmless=Path(a.harmless), paired=a.paired, field=a.field,
+                     held_out=a.held_out, study=a.study, trials=a.trials, kl_target=a.kl_target, startup=a.startup,
+                     markers=markers_of(a), test_harmful=Path(a.test_harmful) if a.test_harmful else None,
+                     test_benign=Path(a.test_benign) if a.test_benign else None, out=Path(a.out), name=a.name,
+                     source=a.source)
+    return rc
 
 
 def cmd_eval(a) -> int:
@@ -214,6 +249,7 @@ def main() -> int:
 
     p = command("init", cmd_init, "record your production setup in a new run directory")
     p.add_argument("--production", help="a text file holding your infernix-serve command line")
+    p.add_argument("--production-argv", help="a JSON file holding it as a list of words (what the launcher writes)")
     p.add_argument("--production-config", help="your --config TOML (options after `--` are added on top)")
     p.add_argument("--from-running", action="store_true", help="Linux: read the running infernix-serve's command line")
     p.add_argument("--launch-dir", help="the directory production is started from (relative paths; default: here)")
@@ -258,10 +294,39 @@ def main() -> int:
     p.add_argument("candidate")
     p.add_argument("--name", required=True)
     p.add_argument("--source", help="describe the prompt sets in plain words (default: from the run)")
+    p.add_argument("--out", help="the folder to write it in (default: the run's export/ folder)")
+    p = command("auto", cmd_auto, "prompts to an exported sidecar in one resumable command (progress in RUN/progress.json)")
+    prompt_args(p)
+    p.add_argument("--study", default="auto", help="the study name (auto)")
+    p.add_argument("--trials", type=int, default=300, help="trials the study holds when the fit ends (300)")
+    p.add_argument("--kl-target", type=float, default=0.4, help="the pick keeps first-token KL below this (0.4)")
+    p.add_argument("--startup", type=int, default=60, help="random trials before TPE starts modelling (60)")
+    p.add_argument("--refusal-markers", help="extra refusal phrases, one per line")
+    p.add_argument("--test-harmful", help="harmful prompts the fit never saw, to grade the pick")
+    p.add_argument("--test-benign", help="benign prompts the fit never saw (over-refusals and KL)")
+    p.add_argument("--out", required=True, help="the folder the sidecar is exported to")
+    p.add_argument("--name", required=True, help="the exported sidecar's folder name")
+    p.add_argument("--source", help="describe the prompt sets in plain words (default: from the run)")
+    p = sub.add_parser("datasets", help="public prompt sets: list them, or download and convert one",
+                       description="public prompt sets: list them (with their licences), or download and convert one")
+    p.add_argument("action", choices=("list", "fetch"))
+    p.add_argument("preset", nargs="?", help="the preset to fetch (see `datasets list`)")
+    p.add_argument("--out", help="fetch: the folder the preset's folder is written in")
+    p.add_argument("--json", action="store_true", help="list: as JSON")
+    p.set_defaults(fn=cmd_datasets)
+    parsers["datasets"] = p
     p = command("all", cmd_all, "doctor, prompts, capture, direction and fit in order")
     prompt_args(p)
     fit_args(p)
     p.add_argument("--no-orthogonalize", action="store_true")
+    # A stop request (the launcher's Ctrl+Break on Windows, SIGTERM elsewhere) unwinds like Ctrl+C, so every engine the
+    # tool started is stopped on the way out instead of keeping the GPU (Python ends on SIGBREAK without unwinding).
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), interrupt)
     # Each command parses with parse_intermixed_args, so names after options (grade RUN --harmful H mine theirs) land
     # in the positional list; plain parse_args binds an nargs='*' list, empty, together with RUN.
     argv = sys.argv[1:]

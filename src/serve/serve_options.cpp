@@ -146,6 +146,12 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--plan"},
 };
 
+} // namespace
+
+std::span<const product::ConfigOption> serve_option_arities() noexcept { return kServeOptionArities; }
+
+namespace {
+
 const ServeOptionArity* find_option(std::string_view name) noexcept {
     const auto found =
         std::find_if(kServeOptionArities.begin(), kServeOptionArities.end(),

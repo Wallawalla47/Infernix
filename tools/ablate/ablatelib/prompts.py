@@ -3,8 +3,8 @@
 A run has one harmful list and one harmless list. The first part of each builds the direction; the held-out tail
 grades every trial (refusals on the harmful half, KL on the harmless half), so no trial is graded on a prompt the
 direction was built from. A test pair (for example JBB-Behaviors' harmful and benign halves) is scored once, at the
-end, by `grade`: that is the out-of-sample number. The tool ships no prompts; docs/ablate-fitting.md says where to get
-them and how to build matched harmless counterparts.
+end, by `grade`: that is the out-of-sample number. The tool ships no prompts: `datasets` downloads and converts public
+sets, and docs/ablate-fitting.md says where to get others and how to build matched harmless counterparts.
 """
 
 from __future__ import annotations
@@ -79,6 +79,23 @@ def split(harmful: list[str], harmless: list[str], held_out: int) -> dict:
     h, g = len(harmful) - held_out, len(harmless) - held_out
     return {"direction": {"harmful": harmful[:h], "harmless": harmless[:g]},
             "held_out": {"harmful": harmful[h:], "harmless": harmless[g:]}}
+
+
+def prepare(run, harmful_file: Path, harmless_file: Path, held_out: int, paired: bool, field: str | None) -> dict:
+    """Reads, checks and splits the two lists into run/prompts/sets.json; returns the sets."""
+    from .run import sha256_file, write_json
+    harmful, hcat = read_prompts(Path(harmful_file), field)
+    harmless, gcat = read_prompts(Path(harmless_file), field)
+    issues = problems(harmful, harmless, held_out, paired)
+    if issues:
+        raise SystemExit("prompt sets refused:\n  " + "\n  ".join(issues))
+    sets = split(harmful, harmless, held_out)
+    sets["source"] = {k: {"name": Path(f).name, "sha256": sha256_file(Path(f)), "n": n}
+                      for k, f, n in (("harmful", harmful_file, len(harmful)), ("harmless", harmless_file, len(harmless)))}
+    sets["categories"] = {"harmful": hcat, "harmless": gcat}
+    sets["paired"] = paired
+    write_json(run.sub("prompts") / "sets.json", sets)
+    return sets
 
 
 def eval_id(harmful: list[str], harmless: list[str]) -> str:

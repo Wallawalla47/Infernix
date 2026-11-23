@@ -4,8 +4,9 @@
 KV type, chat template and memory placement), then evaluates it against the stock model. The method is
 [heretic](https://github.com/p-e-w/heretic) 1.4's: projected abliteration for the direction, and an Optuna search over
 heretic's per-lane band of alphas that minimizes refusals on held-out prompts while bounding the first-token KL
-divergence from the original model. The repository ships no prompts: [Prompt sets](#prompt-sets) says where to get
-them and how to build the harmless half.
+divergence from the original model. The repository ships no prompts: `ablate.py datasets` downloads and converts
+public sets ([Prompt sets](#prompt-sets)), which also says where to get others and how to build the harmless half.
+The launcher's Ablation page runs all of it from the browser ([In the launcher](#in-the-launcher)).
 
 It runs on every model `--ablate` does (the Qwen3.5 family and Qwen3.8-Flash-Next): every step drives
 `infernix-serve` with your production options, and the capture reads each prompt's hidden states from a scoring
@@ -14,7 +15,9 @@ engine (`POST /v1/score` with `hidden_states`).
 ## Contents
 
 - [What you need](#what-you-need)
+- [In the launcher](#in-the-launcher)
 - [Quick start](#quick-start)
+- [One command: auto](#one-command-auto)
 - [The steps](#the-steps)
 - [Your production setup](#your-production-setup)
 - [Prompt sets](#prompt-sets)
@@ -33,13 +36,24 @@ engine (`POST /v1/score` with `hidden_states`).
 |---|---|
 | Model | an Infernix artifact of the Qwen3.5 family (the 27Bs, the 35B-A3B, the 122B-A10B) or Qwen3.8-Flash-Next ([Model coverage](#model-coverage)) |
 | Infernix | the `infernix-serve` you serve with |
-| Python | 3.11 or newer, then `pip install -r tools/ablate/requirements.txt` (numpy, optuna). `eval` also needs `pip install -r tools/ablate/requirements-eval.txt` (lm-eval) |
-| GPU | the whole card. Every step starts its own engine, so stop your production server first; each step refuses while the card has other compute processes |
+| Python | 3.11 or newer, then `pip install -r tools/ablate/requirements.txt` (numpy, optuna; the launcher's Ablation page installs them into its own folder). `eval` also needs `pip install -r tools/ablate/requirements-eval.txt` (lm-eval) |
+| GPU | the whole card. Every step starts its own engine, so stop your production server first; each step refuses while another program holds the card (a compute process with 1 GiB or more, or, where Windows reports no memory per process, 4 GiB of the card in use: the desktop's own small share does not count) |
 | Host RAM | the engines use your production memory options (below), the capture's included |
 | Disk | a recording is one prompt's hidden states, layers x hidden size x 4 bytes (Qwen3.8-Flash-Next 480 KiB, a 27B 1.25 MiB): up to 0.4 GiB for 320 prompts. A 300-trial fit takes about 120 MB |
 | Time | about 7 hours for a first fit, plus about 6 hours per candidate for a full evaluation ([How long it takes](#how-long-it-takes)) |
 
 `ablate.py doctor RUN` checks all of it without loading the model.
+
+## In the launcher
+
+The launcher's **Ablation** page ([guide](launcher.md#ablation)) runs this tool for one of its models: it finds a
+Python (or downloads a portable one), installs the packages, downloads a prompt set (`datasets fetch`), then runs
+`init` with the model's configuration (`--production-argv`) and [`auto`](#one-command-auto) with the page's settings:
+150, 300 or 600 trials, the KL target 0.4, 40 held-out prompts, the set's JBB-Behaviors test pair for `grade`. It
+unloads the launcher's model first and loads none until the run ends, shows the progress, stops the run in order (the
+tool's engines stop and its finished work is kept) and continues it when started again. The sidecar goes to the launcher's
+`ablation/sidecars/<name>`, which becomes a model folder. Everything below applies to those runs too: their folders
+are `ablation/runs/<name>-<hash>` in the launcher's folder, and the commands here read them.
 
 ## Quick start
 
@@ -74,7 +88,33 @@ python tools/ablate/ablate.py export runs/mine mine --name my-refusal-cut
 
 Every command prints `--help`. All state lives in the run directory: `run.json` (the setup), `prompts/`, `capture/`,
 `direction/`, `fit/<study>/` (the study ledger and one directory per trial), `candidates/`, `grade/`, `eval/`,
-`export/`, `logs/` and `expert.state`.
+`export/`, `logs/`, `expert.state`, `engines/` (one file per engine running) and, from `auto`, `progress.json`.
+
+## One command: auto
+
+`auto` goes from the two lists to an exported sidecar: doctor, prompts, capture, direction, the fit until the study
+holds `--trials` completed trials, the pick, `grade` on a test pair (with `--test-harmful`, and `--test-benign`) and
+`export`.
+
+```bash
+python tools/ablate/ablate.py datasets fetch advbench-alpaca --out prompts
+python tools/ablate/ablate.py auto runs/mine --harmful prompts/advbench-alpaca/harmful.txt \
+  --harmless prompts/advbench-alpaca/harmless.txt --test-harmful prompts/advbench-alpaca/test-harmful.txt \
+  --test-benign prompts/advbench-alpaca/test-benign.txt --trials 300 --out sidecars --name my-refusal-cut
+```
+
+The pick is the trial with the fewest held-out refusals among those whose first-token KL is below `--kl-target`
+(0.4), then the lowest KL. Nothing is exported when the stock model refuses none of the held-out harmful prompts, no
+trial is below the target, or none refuses fewer than the stock model; the run ends with state `no_sidecar` and says
+why. Running the same command again continues: recordings are kept, the study only gains the completed trials it
+lacks (a trial a stop interrupted is recorded as failed and replaced), a pick already graded is not graded again, and
+an export already made is not made again.
+
+`RUN/progress.json` says where it is, for a program watching it (the launcher reads it): `state` (`running`, `done`,
+`no_sidecar`, `stopped`, `failed`), `phase` and `phases_done`, `message`, `trials` (`done`, `target`, and `seconds`,
+the recent trials' mean time), `control` (the stock model's held-out refusals), `best` (the best trial so far by the
+pick's rule), `grade`, `export`, `started` and `updated`. Ctrl+C, Ctrl+Break or SIGTERM stops it in order (the engines
+stop and save their expert-cache state) with exit status 130.
 
 ## The steps
 
@@ -105,10 +145,11 @@ settings, the fit's settings and the trials never need a new capture.
 ## Your production setup
 
 A sidecar is fitted to what the model computes on your setup, so the tool reads your setup instead of asking for
-settings. `init` accepts it three ways: `--production FILE` (the command line as you type it; `\`, `^` and backtick
-continuations, `#` comments and cmd's `REM` and `::` lines are fine), `--production-config serve.toml` (Infernix's
-`--config` file, with any options you add on top after the TOML path), or `--from-running` (Linux: the running
-server's own command line).
+settings. `init` accepts it four ways: `--production FILE` (the command line as you type it; `\`, `^` and backtick
+continuations, `#` comments and cmd's `REM` and `::` lines are fine), `--production-argv FILE` (a JSON list of its
+words, what the launcher writes: no quoting rules between), `--production-config serve.toml` (Infernix's `--config`
+file, with any options you add on top after the TOML path), or `--from-running` (Linux: the running server's own
+command line).
 Relative paths resolve against `--launch-dir` (default: the current directory), as `infernix-serve` resolves them.
 
 Every `infernix-serve` option has a rule in `tools/ablate/ablatelib/serve_flags.py`, and a test fails if Infernix
@@ -152,6 +193,21 @@ The held-out tail is scored on every trial, so the search tunes against it: it i
 result. The out-of-sample numbers come from `grade` on lists the fit never saw. Order your files (or pre-split them)
 to choose what is held out, and cover the range of categories in each part. `--paired` declares that line *i* of the
 harmless list is the counterpart of line *i* of the harmful one (the tool checks the lengths match).
+
+### Download a public set
+
+`ablate.py datasets list` shows the presets with their sources and licences; `datasets fetch PRESET --out DIR`
+downloads each source from a pinned revision, checks its SHA-256 and writes `DIR/PRESET/harmful.txt`, `harmless.txt`,
+`test-harmful.txt`, `test-benign.txt` and `sets.json` (the sources, licences and counts). Test prompts that are also
+fit prompts are dropped from the test pair.
+
+| Preset | Fit lists | Test pair | Licences |
+|---|---|---|---|
+| `advbench-alpaca` (heretic's defaults, from their sources) | the first 400 AdvBench behaviors; the first 400 Alpaca instructions without an input | JBB-Behaviors harmful (89 after dropping AdvBench's) and benign (100) | AdvBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0, and its README limits it to research use |
+| `harmbench-alpaca` | HarmBench's 200 `standard` behaviors (refusal-cut-v1's harmful prompts); 200 Alpaca instructions | JBB-Behaviors harmful and benign | HarmBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 |
+
+The harmless lists are not matched counterparts (no `--paired`). A sidecar records the sets and their licences in
+its `generation.source`; the licences are the publishers', and checking they fit your use is yours.
 
 ### Where to get them
 
