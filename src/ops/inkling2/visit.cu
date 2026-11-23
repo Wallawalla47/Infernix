@@ -99,28 +99,59 @@ __device__ __forceinline__ float fold8(const float (&a)[8], const float (&b)[8])
 
 // ---------------------------------------------------------------------------- CTA reductions
 
-// N H-vector sums at once: each thread's partials in v, the totals back in v (every thread holds them).
+// One round of a transposing xor butterfly over M values (offset o): the lane with bit o clear keeps the even values of
+// each pair, its partner the odd ones, and each adds the value its partner sent; (M + 1) / 2 values remain. Values past
+// M are zero (a pair's missing odd member), so a lane's padding slots stay zero.
+template <int M>
+__device__ __forceinline__ void transpose_round(const float (&x)[M], float (&y)[(M + 1) / 2], int lane, int o) {
+    const bool upper = (lane & o) != 0;
+#pragma unroll
+    for (int i = 0; i < (M + 1) / 2; ++i) {
+        const float even = x[2 * i];
+        const float odd  = 2 * i + 1 < M ? x[2 * i + 1] : 0.0F;
+        const float keep = upper ? odd : even;
+        const float send = upper ? even : odd;
+        y[i]             = canon::add_rn(keep, __shfl_xor_sync(kAll, send, o));
+    }
+}
+
+// N H-vector sums at once: each thread's partials in v, the totals back in v (every thread holds them). The pinned
+// order (visit_math.h): a warp's 32 partials by the xor butterfly (offsets 16, 8, 4, 2, 1), the 9 warps folded from
+// +0.0. N >= 2 runs the butterfly transposed (the same pairs and order, FP32 addition being commutative): after the five
+// rounds value n is held by the lane whose 5 bits are n's reversed, which stores the warp's sum; then lane n of every
+// warp folds value n's 9 warp sums and the warp broadcasts the totals.
 template <int N>
 __device__ __forceinline__ void cta_sum(float (&v)[N], float (&scratch)[N][kWarpsH]) {
+    static_assert(N >= 1 && N <= 32, "cta_sum: 1-32 sums");
     const int lane = static_cast<int>(threadIdx.x & 31U), warp = static_cast<int>(threadIdx.x >> 5);
+    if constexpr (N == 1) {
 #pragma unroll
-    for (int n = 0; n < N; ++n) {
-#pragma unroll
-        for (int offset = 16; offset >= 1; offset >>= 1) {
-            v[n] = canon::add_rn(v[n], __shfl_xor_sync(kAll, v[n], offset));
-        }
-    }
-    if (lane == 0) {
-#pragma unroll
-        for (int n = 0; n < N; ++n) { scratch[n][warp] = v[n]; }
-    }
-    __syncthreads();
-#pragma unroll
-    for (int n = 0; n < N; ++n) {
+        for (int offset = 16; offset >= 1; offset >>= 1) { v[0] = canon::add_rn(v[0], __shfl_xor_sync(kAll, v[0], offset)); }
+        if (lane == 0) { scratch[0][warp] = v[0]; }
+        __syncthreads();
         float total = 0.0F;
 #pragma unroll
-        for (int w = 0; w < kWarpsH; ++w) { total = canon::add_rn(total, scratch[n][w]); }
-        v[n] = total;
+        for (int w = 0; w < kWarpsH; ++w) { total = canon::add_rn(total, scratch[0][w]); }
+        v[0] = total;
+    } else {
+        constexpr int M1 = (N + 1) / 2, M2 = (M1 + 1) / 2, M3 = (M2 + 1) / 2, M4 = (M3 + 1) / 2;
+        static_assert((M4 + 1) / 2 == 1, "cta_sum: five rounds leave one value a lane");
+        float y1[M1], y2[M2], y3[M3], y4[M4], y5[1];
+        transpose_round<N>(v, y1, lane, 16);
+        transpose_round<M1>(y1, y2, lane, 8);
+        transpose_round<M2>(y2, y3, lane, 4);
+        transpose_round<M3>(y3, y4, lane, 2);
+        transpose_round<M4>(y4, y5, lane, 1);
+        const int held = static_cast<int>(__brev(static_cast<unsigned>(lane)) >> 27);
+        if (held < N) { scratch[held][warp] = y5[0]; }
+        __syncthreads();
+        float total = 0.0F;
+        if (lane < N) {
+#pragma unroll
+            for (int w = 0; w < kWarpsH; ++w) { total = canon::add_rn(total, scratch[lane][w]); }
+        }
+#pragma unroll
+        for (int n = 0; n < N; ++n) { v[n] = __shfl_sync(kAll, total, n); }
     }
 }
 
