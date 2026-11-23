@@ -219,6 +219,11 @@ struct AttentionArgs {
     // rows' q and r, and the CTA(s) reading a unit the call's new keys and values in it (stored as the prologue
     // stores them), the same bits (the first split's CTAs also write ws.q and ws.r). attention_prompt ignores it.
     bool fused = false;
+    // attention(): the kernel triggers its programmatic dependents at entry, so the next kernel's CTAs launch beside it
+    // (its grid, the splits x KV heads x groups, exceeds half the SMs, where pdl::enter would leave the trigger to its
+    // exit). For a dependent that loads its weights before its own wait (the decode route's W_o in Q8 storage).
+    // attention_prompt ignores it.
+    bool trigger_at_entry = false;
 };
 void attention(const AttentionArgs& args, cudaStream_t stream);
 

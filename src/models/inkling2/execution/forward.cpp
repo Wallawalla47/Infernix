@@ -654,6 +654,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     // infernix_bench C = 4 -0.8 %, C = 8 -1.3 %). Padding columns need the prologue's zeros, and a lane in two groups
     // its keys before the second group reads them.
     at.fused = !padding_ && one_group_lanes_ && call_lanes_.size() == 1 && T <= 4;
+    // W_o in Q8 storage loads all its weights before its PDL wait: attention lets its CTAs launch at once, beside it
+    // (2026-11-23, rounds at context 512 / 4096: --q8-weights -0.3 to -1.6 %, --a8-activations -0.03 to -1.4 % at one to
+    // eight columns; a BF16 W_o (the default route) was +0.07 / +0.25 % slower at one column, so it waits as before).
+    at.trigger_at_entry = q8(a.output);
     prompt_ ? ik::attention_prompt(at, stream) : ik::attention(at, stream);
     mark("attention");
     if (staged) {

@@ -484,6 +484,9 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
             for (int i = warp; i < 2 * count; i += kWarps) { kv_prefetch(a, column_of(a.map, c0 + (i >> 1)), kv, i & 1, wl); }
         }
     }
+    // A grid wider than half the SMs does not trigger in pdl::enter; trigger_at_entry lets the next kernel's CTAs launch
+    // (and load what they may before their own wait) beside this one's (AttentionArgs).
+    if (a.trigger_at_entry) { pdl::trigger_dependents(); }
     pdl::enter();
     // The rows' q and r: from the prologue's workspace, or (fused) computed here in its arithmetic, a warp a row.
     if (a.fused) {
