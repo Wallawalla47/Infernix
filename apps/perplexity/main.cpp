@@ -92,7 +92,7 @@ std::string usage_text() {
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
            "       [--lora PATH] (Qwen3.5 dense: a LoRA adapter applied at runtime, a Hugging Face PEFT\n"
            "        adapter directory or its adapter_model.safetensors with adapter_config.json beside it)\n"
-           "       [--ablate FILE] (Qwen3.8-Flash-Next: an ablation sidecar applied at runtime, its\n"
+           "       [--ablate FILE] (an ablation sidecar applied at runtime, every model: its\n"
            "        sidecar.json with the direction file beside it)\n"
            "       [--lossless] (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next: the quality reference's\n"
            "        route, every operation of the model correctly rounded; no fast path, one\n"

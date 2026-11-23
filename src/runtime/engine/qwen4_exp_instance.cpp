@@ -11,7 +11,7 @@
 #include "models/load_options.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
-#include "models/qwen4_exp/load/ablate.h"
+#include "models/ablate/binding.h"
 #include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 #include "runtime/expert_offload/memory_plan.h"
@@ -63,27 +63,14 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
     report_engine(options, level, text);
 }
 
-std::string artifact_hex(const artifact::ArtifactId& id) {
-    constexpr char kHex[] = "0123456789abcdef";
-    std::string out;
-    for (const std::byte byte : id) {
-        out += kHex[std::to_integer<unsigned>(byte) >> 4U];
-        out += kHex[std::to_integer<unsigned>(byte) & 15U];
-    }
-    return out;
-}
-
 // --ablate (docs/ablate.md): the startup log names the cut applied, and warns when the sidecar names another artifact
 // as the one its direction was fitted on (the geometry matches, so it loads, but it was not measured here).
 void report_ablate(const EngineOptions& options, const models::qwen4_exp::Model& model) {
-    const models::qwen4_exp::AblateSidecarBinding* ablate = model.ablate();
+    const models::AblateSidecarBinding* ablate = model.ablate();
     if (ablate == nullptr) { return; }
     report(options, DiagnosticLevel::Info, "ablation sidecar " + ablate->path.string() + ": " + ablate->describe());
-    const std::string& fitted = ablate->sidecar.artifact_id;
-    if (const std::string here = artifact_hex(model.info().artifact_id); !fitted.empty() && fitted != here) {
-        report(options, DiagnosticLevel::Warning,
-               "the ablation sidecar was fitted on artifact " + fitted + ", not this one (" + here +
-                   "): it loads, as the geometry matches, but its cut was not measured on this artifact");
+    if (const std::string warning = ablate->artifact_mismatch(model.info().artifact_id); !warning.empty()) {
+        report(options, DiagnosticLevel::Warning, warning);
     }
 }
 

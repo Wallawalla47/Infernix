@@ -7,7 +7,7 @@
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/expert_offload.h"
-#include "models/qwen4_exp/load/ablate.h"
+#include "models/ablate/binding.h"
 #include "models/qwen4_exp/weights.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"

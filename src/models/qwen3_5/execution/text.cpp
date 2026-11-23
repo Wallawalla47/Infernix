@@ -16,6 +16,7 @@
 #include "infernix/ops/top_logprobs.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/causal_conv1d_silu.h"
+#include "infernix/ops/direction_cut.h"
 #include "infernix/ops/embedding.h"
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/gated_rmsnorm.h"
@@ -1019,7 +1020,7 @@ std::int32_t TextContext::trimmed_attention_columns(std::int32_t T) const noexce
     return active_sequence_batch_ == 0 && output_columns_ > 0 && output_columns_ < T ? output_columns_ : 0;
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph, std::size_t layer) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1138,8 +1139,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         Tensor columns       = x.slice(1, skipped, kept);
         const Tensor gated   = tail.view({dimension(config_.attention->query_width()), kept});
         const auto lora      = attention_output_lora(p, gated, work_, s);
-        ops::linear_add(gated, p.output.weight, columns, residual_projection_policy(p.output, false), work_, s,
-                        ops::LinearRoutes::Exact, lora ? &*lora : nullptr);
+        add_output_projection(gated, p.output.weight, columns, residual_projection_policy(p.output, false),
+                              ops::LinearRoutes::Exact, lora ? &*lora : nullptr, layer);
         return;
     } else {
         ops::causal_softmax_attention(
@@ -1159,21 +1160,41 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         Tensor columns     = x.slice(1, T - output_columns_, output_columns_);
         const Tensor gated = mixed.slice(1, T - output_columns_, output_columns_);
         const auto lora    = attention_output_lora(p, gated, work_, s);
-        ops::linear_add(gated, p.output.weight, columns, residual_projection_policy(p.output, false), work_, s,
-                        ops::LinearRoutes::Exact, lora ? &*lora : nullptr);
+        add_output_projection(gated, p.output.weight, columns, residual_projection_policy(p.output, false),
+                              ops::LinearRoutes::Exact, lora ? &*lora : nullptr, layer);
         return;
     }
     const auto lora = attention_output_lora(p, mixed, work_, s);
-    ops::linear_add(mixed, p.output.weight, x,
-                    residual_projection_policy(
-                        p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
-                    work_, s,
-                    ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
-                                        : ops::LinearRoutes::Exact,
-                    lora ? &*lora : nullptr);
+    add_output_projection(mixed, p.output.weight, x,
+                          residual_projection_policy(
+                              p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
+                          ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
+                                              : ops::LinearRoutes::Exact,
+                          lora ? &*lora : nullptr, layer);
 }
 
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::add_output_projection(const Tensor& input, const Weight& weight, Tensor& residual,
+                                        ops::LinearPolicy policy, ops::LinearRoutes routes, const ops::LoraAddend* lora,
+                                        std::size_t layer) {
+    const cudaStream_t s = ctx_.stream;
+    const ops::DirectionCut cut = parameters_.ablate_cut(layer, models::AblateParameters::Lane::Attn);
+    if (!cut.active()) {
+        ops::linear_add(input, weight, residual, policy, work_, s, routes, lora);
+        return;
+    }
+    // A cut lane writes as an uncut one, then loses the direction's component of what it added.
+    const Tensor before = snapshot_residual(residual);
+    ops::linear_add(input, weight, residual, policy, work_, s, routes, lora);
+    ops::residual_delta_cut(before, cut, residual, s);
+}
+
+Tensor TextContext::snapshot_residual(const Tensor& residual) {
+    Tensor before = work_.alloc(DType::BF16, {residual.ne[0], residual.ne[1]});
+    CUDA_CHECK(cudaMemcpyAsync(before.data, residual.data, before.bytes(), cudaMemcpyDeviceToDevice, ctx_.stream));
+    return before;
+}
+
+void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph, std::size_t layer) {
     const auto& p  = std::get<GdnParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1356,19 +1377,18 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor columns     = x.slice(1, T - output_columns_, output_columns_);
         const Tensor input = on.view({dimension(config_.gdn->value_width()), T}).slice(1, T - output_columns_, output_columns_);
         const auto out_lora = gdn_output_lora(p, input, work_, s);
-        ops::linear_add(input, p.output.weight, columns, residual_projection_policy(p.output, false), work_, s,
-                        ops::LinearRoutes::Exact, out_lora ? &*out_lora : nullptr);
+        add_output_projection(input, p.output.weight, columns, residual_projection_policy(p.output, false),
+                              ops::LinearRoutes::Exact, out_lora ? &*out_lora : nullptr, layer);
         return;
     }
     const Tensor input  = on.view({dimension(config_.gdn->value_width()), T});
     const auto out_lora = gdn_output_lora(p, input, work_, s);
-    ops::linear_add(input, p.output.weight, x,
-                    residual_projection_policy(
-                        p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
-                    work_, s,
-                    ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
-                                        : ops::LinearRoutes::Exact,
-                    out_lora ? &*out_lora : nullptr);
+    add_output_projection(input, p.output.weight, x,
+                          residual_projection_policy(
+                              p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
+                          ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
+                                              : ops::LinearRoutes::Exact,
+                          out_lora ? &*out_lora : nullptr, layer);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1379,6 +1399,19 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints, std::size_t layer) {
+    // --ablate: a cut MLP lane writes as an uncut one, then loses the direction's component of what it added.
+    const ops::DirectionCut cut = parameters_.ablate_cut(layer, models::AblateParameters::Lane::Mlp);
+    if (!cut.active()) {
+        mlp_write(weights, x, ph, hints, layer);
+        return;
+    }
+    const Tensor before = snapshot_residual(x);
+    mlp_write(weights, x, ph, hints, layer);
+    ops::residual_delta_cut(before, cut, x, ctx_.stream);
+}
+
+void TextContext::mlp_write(const BlockParameters& weights, Tensor& x, Phase ph, const ops::SparseMoeHints& hints,
+                            std::size_t layer) {
     const std::int32_t width = row_width(x.ne[1]);
     // The NVFP4 MLP's A4 residual rounds: the norm and both projections in three launches, the same bits.
     if (fused_dense_mlp(x, weights.post_attention_norm, config_.rms_norm_eps, weights.ffn, work_, ctx_.stream,
@@ -1447,9 +1480,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, ph);
+                    attn_mix(block, x, compact, ph, layer);
                 } else {
-                    gdn_mix(block, x, compact, ph);
+                    gdn_mix(block, x, compact, ph, layer);
                 }
                 output_columns_ = 0;
             }

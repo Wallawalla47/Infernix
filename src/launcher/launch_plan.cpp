@@ -124,7 +124,7 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
                        {"planned", bytes(vram, "planned_bytes")},
                        {"parts", parts(vram, {{"weights_bytes", "Weights"},
                                               {"draft_screen_bytes", "Draft screen"},
-                                              {"adapter_bytes", "LoRA adapter"},
+                                              {"adapter_bytes", "Adapters"},
                                               {"kv_bytes", "KV cache"},
                                               {"workspace_bytes", "Workspace"},
                                               {"graph_allowance_bytes", "CUDA graphs"},
@@ -272,9 +272,6 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
     }
     if (has_flag(args, "--lora") && (model.needs_ngram_volume || model.num_experts.has_value())) {
         warnings.push_back("--lora adapts dense Qwen3.5 models (the 27B) only; this model's MLPs are experts");
-    }
-    if (has_flag(args, "--ablate") && model.family != "qwen3.8-flash-next") {
-        warnings.push_back("--ablate cuts Qwen3.8-Flash-Next only; this model refuses it");
     }
     if (has_flag(args, "--draft-model") && !model.accepts_draft_model) {
         warnings.push_back("--draft-model applies to Qwen3.8-Flash-Next only; this artifact bundles its drafters");

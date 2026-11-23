@@ -53,4 +53,32 @@ void hyper_connection_cut_inject(const Tensor& y, const DirectionCut& cut, const
 void moe_combine_cut_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
                             const DirectionCut& cut, const Tensor& inject, Tensor& residual, cudaStream_t stream);
 
+/**
+ * Op: residual delta cut (the single-stream residual of Qwen3.5 and Qwen3.5-MoE; docs/ablate.md)
+ *
+ * The lane has already written its output into x by its own kernels; `before` is x as it was before that write. The
+ * cut removes the direction's component of what the write added.
+ *
+ * Math / indexing:
+ *   For each column t, with delta[h, t] = x[h, t] - before[h, t] and c[t] = sum_h dir[h] * delta[h, t]:
+ *     x[h, t] = bf16(x[h, t] - alpha * c[t] * dir[h])
+ *
+ * Logical shapes: before and x BF16 [H, T]; dir FP32 [H]. T >= 1.
+ *
+ * Supported domain: H a multiple of 8, at most 8192; alpha finite in (0, 4]. An inactive cut leaves x unchanged.
+ *
+ * Numeric:
+ *   delta, c and the cut value are FP32 (delta exact unless the two BF16 values are 2^16 apart in magnitude; c in a
+ *   fixed order per column); x is rounded
+ *   to BF16 once more (round to nearest even), so a cut too small to move a residual element keeps its bits. Against
+ *   the ideal x0 + y - alpha (dir . y) dir of a lane output y written as bf16(x0 + y) with rounding error r, the
+ *   result is x0 + y + (r - alpha (dir . r) dir) plus that last rounding: the lane write's own error, its component
+ *   along dir scaled by 1 - alpha. A column's bits depend only on that column.
+ *
+ * Effects: x is updated in place; before and dir are only read; x must not overlap them.
+ *
+ * Workspace: none. Execution: stream-ordered; graph-capturable.
+ */
+void residual_delta_cut(const Tensor& before, const DirectionCut& cut, Tensor& x, cudaStream_t stream);
+
 } // namespace infernix::ops

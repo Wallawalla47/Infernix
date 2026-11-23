@@ -4,13 +4,11 @@
 target_sources(infernix_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/load/ablate.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/ngram_hash.cpp"
 )
 
 target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/execution/ablate_parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/activation_scan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward_lossless.cpp"

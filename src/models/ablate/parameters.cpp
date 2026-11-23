@@ -1,17 +1,16 @@
-#include "models/qwen4_exp/execution/ablate_parameters.h"
+#include "models/ablate/parameters.h"
 
 #include <stdexcept>
 
-namespace infernix::models::qwen4_exp::execution {
+namespace infernix::models {
 
-std::optional<AblateParameters> prepare_ablate(const Model& model) {
-    const AblateSidecarBinding* binding = model.ablate();
+std::optional<AblateParameters> prepare_ablate(const AblateSidecarBinding* binding, std::uint32_t layers,
+                                               std::uint32_t hidden_size) {
     if (binding == nullptr) { return std::nullopt; }
     const artifact::AblateSidecar& sidecar = binding->sidecar;
-    const auto& text                       = model.config().text;
-    if (sidecar.n_layers != text.num_hidden_layers || sidecar.hidden_size != text.hidden_size ||
+    if (sidecar.n_layers != layers || sidecar.hidden_size != hidden_size ||
         sidecar.d_host.size() != static_cast<std::size_t>(sidecar.rows()) * sidecar.hidden_size) {
-        throw std::logic_error("Qwen4Exp --ablate: the sidecar does not match the model it was bound to");
+        throw std::logic_error("--ablate: the sidecar does not match the model it was bound to");
     }
     AblateParameters out;
     out.direction = DeviceBuffer(sidecar.d_host.size() * sizeof(float));
@@ -30,4 +29,4 @@ std::optional<AblateParameters> prepare_ablate(const Model& model) {
     return out;
 }
 
-} // namespace infernix::models::qwen4_exp::execution
+} // namespace infernix::models

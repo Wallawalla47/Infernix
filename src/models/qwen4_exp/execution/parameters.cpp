@@ -482,7 +482,7 @@ Parameters::Parameters(const Model& source, bool hc_q8) : model(source) {
             }
         }
     }
-    ablate = prepare_ablate(source); // nullopt without --ablate
+    ablate = prepare_ablate(source.ablate(), c.num_hidden_layers, c.hidden_size); // nullopt without --ablate
 }
 
 Parameters::~Parameters() = default;

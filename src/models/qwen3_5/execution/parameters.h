@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "models/ablate/parameters.h"
 #include "models/qwen3_5/model.h"
 #include "infernix/ops/lora.h"
 #include "infernix/ops/rope.h"
@@ -319,6 +320,23 @@ public:
         return draft_screen.bytes + planned_draft_screen_bytes;
     }
     [[nodiscard]] std::uint64_t lora_bytes() const noexcept { return lora_factors.bytes + planned_lora_bytes; }
+    // --ablate (docs/ablate.md): the sidecar's direction on the device and each layer's two cuts; nullopt without one
+    // (and on a plan-only model, which counts the direction's bytes in planned_ablate_bytes).
+    std::optional<models::AblateParameters> ablate;
+    std::uint64_t planned_ablate_bytes = 0;
+    [[nodiscard]] std::uint64_t ablate_bytes() const noexcept {
+        return (ablate ? ablate->direction.bytes : 0) + planned_ablate_bytes;
+    }
+    // The adapters' device bytes beside the weights' arena (MemorySummary::adapter_bytes): a LoRA adapter's factors and
+    // an ablation sidecar's direction, allocated or planned; allocated_adapter_bytes counts the allocated ones only.
+    [[nodiscard]] std::uint64_t adapter_bytes() const noexcept { return lora_bytes() + ablate_bytes(); }
+    [[nodiscard]] std::uint64_t allocated_adapter_bytes() const noexcept {
+        return lora_factors.bytes + (ablate ? ablate->direction.bytes : 0);
+    }
+    // A layer's lane cut: inactive without --ablate or where the sidecar leaves the lane uncut.
+    [[nodiscard]] ops::DirectionCut ablate_cut(std::size_t layer, models::AblateParameters::Lane lane) const noexcept {
+        return ablate ? ablate->cut(static_cast<std::uint32_t>(layer), lane) : ops::DirectionCut{};
+    }
     std::optional<ProposalParameters> proposal;
     // `mtp` and the proposal head under LinearPolicy::A16ColumnInvariant, which the exact route's
     // batched draft calls run with (TextContext::mtp_forward_decode_batch, mtp_propose_batch).

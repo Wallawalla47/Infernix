@@ -48,7 +48,7 @@ struct LoadOptions {
     std::filesystem::path draft_model;
     // Qwen3.5: the LoRA adapter applied at runtime (EngineOptions::lora_path), empty for none.
     std::filesystem::path lora;
-    // Qwen4Exp: the ablation sidecar applied at runtime (EngineOptions::ablate_sidecar_path), empty for none.
+    // Every model: the ablation sidecar applied at runtime (EngineOptions::ablate_sidecar_path), empty for none.
     std::filesystem::path ablate;
     // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
     // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp

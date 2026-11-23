@@ -929,7 +929,6 @@ const ABLATE: FormSection = {
   title: "Ablation sidecar",
   description: "A direction cut out of the model's residual writes at load (refusal removal)",
   icon: Scissors,
-  when: flashNext,
   controls: [
     {
       kind: "text",

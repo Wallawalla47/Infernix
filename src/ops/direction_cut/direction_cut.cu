@@ -207,6 +207,40 @@ __global__ void __launch_bounds__(kMaxThreads)
     }
 }
 
+// The single-stream residual (Qwen3.5), after the lane's own write: x[h, t] = bf16(x - alpha * c * dir) with c the
+// direction's component of x - before. A plain stream-ordered launch; a thread holds a few registers only, so 1024
+// threads (H up to 8192) cost no spill.
+constexpr int kMaxSingleThreads = 1024;
+__global__ void __launch_bounds__(kMaxSingleThreads)
+    residual_delta_cut_kernel(const bf16* before, const float* direction, float alpha, int hidden, int columns, bf16* x) {
+    __shared__ float scratch[kMaxSingleThreads / 32];
+    const int h0    = static_cast<int>(threadIdx.x) * kVector;
+    const bool owns = h0 < hidden;
+    float d[kVector] = {};
+    if (owns) {
+        const float4* dv = reinterpret_cast<const float4*>(direction + h0);
+        const float4 a = dv[0], b = dv[1];
+        d[0] = a.x, d[1] = a.y, d[2] = a.z, d[3] = a.w, d[4] = b.x, d[5] = b.y, d[6] = b.z, d[7] = b.w;
+    }
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        Bf16x8 bv{}, xv{};
+        if (owns) {
+            bv = load_bf16x8(before + static_cast<std::size_t>(t) * hidden + h0);
+            xv = load_bf16x8(x + static_cast<std::size_t>(t) * hidden + h0);
+        }
+        float delta[kVector];
+#pragma unroll
+        for (int i = 0; i < kVector; ++i) { delta[i] = xv.v[i] - bv.v[i]; } // exact within 2^16 of magnitude
+        const float g = alpha * column_dot(delta, d, owns, scratch);
+        if (owns) {
+            float out[kVector];
+#pragma unroll
+            for (int i = 0; i < kVector; ++i) { out[i] = __fmaf_rn(-g, d[i], xv.v[i]); }
+            *reinterpret_cast<uint4*>(x + static_cast<std::size_t>(t) * hidden + h0) = pack_bf16x8(out);
+        }
+    }
+}
+
 int threads_for(int hidden) { return (hidden / kVector + 31) / 32 * 32; }
 
 void require_cut(const DirectionCut& cut, const Tensor& inject, const Tensor& residual, int hidden, int columns) {
@@ -267,6 +301,22 @@ void moe_combine_cut_inject(const Tensor& outputs, const MoeRouting& routing, co
                                       static_cast<const float*>(inject.data), hidden, top_k,
                                       static_cast<int>(inject.ne[0]), columns, static_cast<bf16*>(residual.data)),
                  "combine cut inject");
+}
+
+void residual_delta_cut(const Tensor& before, const DirectionCut& cut, Tensor& x, cudaStream_t stream) {
+    if (!cut.active()) { return; }
+    require(contiguous_2d(before, DType::BF16) && contiguous_2d(x, DType::BF16) && aligned16(before) && aligned16(x),
+            "residual delta cut requires contiguous, 16-byte aligned BF16 before and x");
+    const int hidden = x.ne[0], columns = x.ne[1];
+    require(before.ne[0] == hidden && before.ne[1] == columns && columns > 0, "residual delta cut shapes disagree");
+    require(hidden > 0 && hidden % kVector == 0 && hidden / kVector <= kMaxSingleThreads,
+            "the hidden width must be a positive multiple of 8, at most 8192");
+    require(cut.direction != nullptr && reinterpret_cast<std::uintptr_t>(cut.direction) % 16 == 0,
+            "the direction must be a 16-byte aligned device vector");
+    require(cut.alpha > 0.0F && cut.alpha <= 4.0F, "alpha must be in (0, 4]");
+    residual_delta_cut_kernel<<<dim3(1, grid_rows(columns)), dim3(threads_for(hidden)), 0, stream>>>(
+        static_cast<const bf16*>(before.data), cut.direction, cut.alpha, hidden, columns, static_cast<bf16*>(x.data));
+    check_launch(cudaSuccess, "residual delta cut");
 }
 
 } // namespace infernix::ops

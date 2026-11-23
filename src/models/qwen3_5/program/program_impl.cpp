@@ -788,7 +788,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};
     out.draft_screen_bytes = parameters.draft_screen.bytes;
-    out.adapter_bytes      = parameters.lora_factors.bytes;
+    out.adapter_bytes      = parameters.allocated_adapter_bytes();
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     std::size_t active_handoff_bytes = 0;
@@ -845,8 +845,9 @@ MemoryUsage ProgramImpl::memory_usage() const noexcept {
     out.device.weights  = storage.device_capacity_bytes - std::min<std::uint64_t>(storage.device_capacity_bytes, drafter_weight_bytes);
     // With the drafter's proposal-head screen (DFlash2, Parameters::draft_screen: 357.6 MB at 248,320 rows).
     out.device.drafter  = drafter_weight_bytes + persistent_drafter_bytes + parameters.draft_screen.bytes;
-    // --lora: the adapter's factors (Parameters::lora_factors; its per-call U is in the workspace).
-    out.device.adapter  = parameters.lora_factors.bytes;
+    // --lora: the adapter's factors (Parameters::lora_factors; its per-call U is in the workspace); --ablate: the
+    // sidecar's direction (Parameters::ablate).
+    out.device.adapter  = parameters.allocated_adapter_bytes();
     // The KV: the decoder's pages and tables (and an elastic pool's mapped pages), less the pages only the prefix
     // cache holds (each page's share of the KV), which are its part.
     out.device.kv = persistent_kv_bytes + (kv_vmm ? kv_vmm->mapped_bytes() : 0);

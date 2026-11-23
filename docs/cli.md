@@ -318,7 +318,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--expert-stripe FILE` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive; each record not in RAM is then read in two parts, its head from the artifact and its tail from the stripe, at the same time. The stripe must belong to the artifact. Unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--lora PATH` | apply a LoRA adapter at runtime: a Hugging Face PEFT adapter's folder, or its `adapter_model.safetensors` with `adapter_config.json` beside it. Qwen3.5 dense models (the 27Bs); `--lossless` computes it as PEFT does ([LoRA adapters](lora.md)) | none |
-| `--ablate FILE` | apply an ablation sidecar at runtime: its `sidecar.json`, with the direction file it names beside it. Qwen3.8-Flash-Next only; refused with `--lossless` ([Ablation sidecars](ablate.md)) | none |
+| `--ablate FILE` | apply an ablation sidecar at runtime: its `sidecar.json`, with the direction file it names beside it. Every model; refused with `--lossless` ([Ablation sidecars](ablate.md)) | none |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
 | `--reasoning-loop off\|stop\|conclude` | end the reply or close the thinking when it keeps repeating whole passages, or one line with only its numbers changing | `off` |

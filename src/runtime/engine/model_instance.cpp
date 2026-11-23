@@ -74,11 +74,6 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
                                         "models (the 27B) only");
         }
     }
-    // --ablate is wired into Qwen3.8-Flash-Next's forward only; any other model would load nothing and serve uncut.
-    if (!options.ablate_sidecar_path.empty() && architecture != models::Architecture::Qwen4Exp) {
-        throw std::invalid_argument("--ablate cuts Qwen3.8-Flash-Next only (docs/ablate.md); this artifact is " +
-                                    std::string(models::architecture_name(architecture)));
-    }
     // The lossless route computes the model's own forward correctly rounded; a cut is not part of it. Refused here,
     // before anything loads.
     if (!options.ablate_sidecar_path.empty() && options.lossless) {
@@ -1269,14 +1264,26 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                            lora->adapter->weights_path().parent_path().string().c_str(), lora->describe().c_str(),
                            static_cast<unsigned long long>((instance->parameters.lora_bytes() + (1U << 20) - 1) >> 20));
     }
+    // --ablate: the cut applied, and a warning when the sidecar was fitted on another artifact.
+    if (const auto* ablate = instance->model->ablate()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "ablation sidecar %s: %s",
+                           ablate->path.string().c_str(), ablate->describe().c_str());
+        if (const std::string warning = ablate->artifact_mismatch(instance->model->info().artifact_id); !warning.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s", warning.c_str());
+        }
+    }
     if (spill) {
         const std::uint64_t screen = instance->parameters.draft_screen.bytes;
-        const std::uint64_t lora   = instance->parameters.lora_factors.bytes;
+        const std::uint64_t lora   = instance->parameters.allocated_adapter_bytes();
         const std::uint64_t beside = screen + lora;
         if (const std::uint64_t spilled = beside != 0 ? spill->end(beside, 0) : 0; spilled != 0) {
-            const char* what = screen != 0 && lora != 0 ? "the DFlash2 draft screen and the LoRA adapter's factors"
-                               : screen != 0           ? "the DFlash2 draft screen"
-                                                       : "the LoRA adapter's factors";
+            // --ablate's direction counts beside a LoRA adapter's factors (Parameters::allocated_adapter_bytes).
+            const char* adapter = instance->parameters.lora_factors.bytes != 0 ? "the LoRA adapter's factors"
+                                                                               : "the ablation sidecar's direction";
+            const std::string named = screen != 0 && lora != 0 ? std::string("the DFlash2 draft screen and ") + adapter
+                                      : screen != 0            ? std::string("the DFlash2 draft screen")
+                                                               : std::string(adapter);
+            const char* what = named.c_str();
             throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of " + what + " (" +
                                      std::to_string(beside >> 20) +
                                      " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
@@ -1288,7 +1295,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (const std::uint64_t screen = instance->parameters.draft_screen_bytes(); screen != 0) {
             planned->vram.draft_screen_bytes = screen;
         }
-        if (const std::uint64_t adapter = instance->parameters.lora_bytes(); adapter != 0) {
+        if (const std::uint64_t adapter = instance->parameters.adapter_bytes(); adapter != 0) {
             planned->vram.adapter_bytes = adapter;
         }
     }
@@ -1372,7 +1379,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         std::size_t free_bytes =
             plan_only ? planned_free_after_weights(sizing_now, planned_weights,
                                                    planned_beside_weights + instance->parameters.draft_screen_bytes() +
-                                                       instance->parameters.lora_bytes())
+                                                       instance->parameters.adapter_bytes())
                       : sizing_now;
         // Other processes' VRAM by NVML, which counts every process (the OS budget does not): its device-wide use
         // less this process's; 0 without NVML. On the RTX 5090 it read ~200 MiB on a quiet card (the desktop
@@ -1672,6 +1679,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     summary.model_name   = instance->model->info().name;
     if (const auto* lora = instance->model->lora()) {
         summary.lora_adapter = lora->adapter->weights_path().parent_path().string() + ": " + lora->describe();
+    }
+    if (const auto* ablate = instance->model->ablate()) {
+        summary.ablate_sidecar = ablate->path.string() + ": " + ablate->describe();
     }
     summary.prefill_signature = signature;
     std::set<std::string> formats;

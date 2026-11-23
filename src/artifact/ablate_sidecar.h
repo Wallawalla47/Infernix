@@ -8,7 +8,7 @@
 // the MLP output before it is added.
 //
 // This is the format reader and its validation, host only. A model binds a sidecar to its own geometry and owns the
-// device copy (Qwen3.8-Flash-Next: models/qwen4_exp/load/ablate.h).
+// device copy (models/ablate/binding.h and parameters.h).
 //
 // FORMAT "ablate-direction-v2": a shared unit direction or a per-layer stack, alpha_attn_per_layer /
 // alpha_mlp_per_layer (or alpha_per_layer for both lanes), a REQUIRED "generation" block saying where the direction

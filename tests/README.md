@@ -118,13 +118,20 @@ rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module bindi
 included), ranks to 128 and its refusals (a rank above 128 by its wording).
 
 `--ablate` ([Ablation sidecars](../docs/ablate.md)): `infernix_direction_cut_test` checks the cut injects (the plain
-lane form and the fused MoE combine) against an FP64 oracle at Flash-Next's shapes, a column's bits whatever the call's
-width or the column's position, graph replay, that an inactive cut is the plain inject bit for bit and that the fused
-combine equals `moe_combine` followed by the cut inject. On the host, `infernix_artifact_ablate_sidecar_test` covers the
-sidecar reader and every refusal. `infernix_qwen4_exp_ablate_real_test` (Flash-Next, the reproducible route) checks
-that a negligible cut keeps the plain run's bits on every cut path, that cuts of the last layer's lanes and of layer
-0's move the first-token readouts, that a strong cut's decode agrees with its own prefill, and that a cut prompt reads
-the same bits at two prefill chunks of one grid. `infernix_http_scoring_routes_test` covers a `--causal-scoring`
+lane form and the fused MoE combine) at Flash-Next's shapes and the single-stream cut after a lane's write
+(`residual_delta_cut`) at the Qwen3.5 family's against an FP64 oracle (the latter also against the lane's ideal
+mathematics, with residual elements in the thousands), a column's bits whatever the call's width or the column's
+position, graph replay, that an inactive cut is the plain kernel bit for bit (a negligible one too, for the cut after
+the write) and that the fused combine equals `moe_combine` followed by the cut inject. On the host, `infernix_artifact_ablate_sidecar_test` covers the sidecar reader and every refusal.
+`infernix_qwen4_exp_ablate_real_test` (Flash-Next, the reproducible route) checks that a negligible cut keeps the
+plain run's bits on every cut path, that cuts of the last layer's lanes and of layer 0's move the first-token
+readouts, that a strong cut's decode agrees with its own prefill, and that a cut prompt reads the same bits at two
+prefill chunks of one grid. `infernix_qwen3_5_ablate_real_test` (with its `_moe_` and `_offloaded_` entries: the 27B,
+the 35B-A3B and the 122B-A10B, the reproducible route) checks the sidecar's layer range, that a negligible cut on
+every lane keeps the plain run's bits (readouts and greedy tokens), that single-lane cuts of the last and first layers
+move the readouts, the decode path's cut, that a strong cut keeps its bits across repeats, on two lanes and under each
+drafter (with drafts accepted), CausalScoring with a sidecar, and (with `INFERNIX_TEST_LORA` on the 27B) that a
+negligible cut keeps an adapter run's bits. `infernix_http_scoring_routes_test` covers a `--causal-scoring`
 server's routes over loopback HTTP (generation refused, `/v1/score` answered) and `infernix_score_schema_test` the
 `/v1/score` request and response.
 

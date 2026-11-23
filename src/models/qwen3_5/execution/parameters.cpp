@@ -409,6 +409,15 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
     }
     // --lora: the adapter's factors beside the text layers' projections, before the copies below take them.
     planned_lora_bytes = prepare_lora(model, text, lora_factors);
+    // --ablate: the sidecar's direction and each layer's cuts (a plan-only model allocates nothing and counts them).
+    if (const models::AblateSidecarBinding* binding = model.ablate()) {
+        const auto& config = model.config().text;
+        if (model.weights_resident()) {
+            ablate = models::prepare_ablate(binding, config.num_hidden_layers, config.hidden_size);
+        } else {
+            planned_ablate_bytes = binding->sidecar.d_host.size() * sizeof(float);
+        }
+    }
     // The exact route decodes and verifies request-invariant on every artifact; a projection with
     // no dedicated column-invariant route runs its exact route once per column.
     invariant_text = column_invariant_text(text);

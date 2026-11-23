@@ -46,6 +46,7 @@ struct LoadPlan::Impl {
     std::uint64_t embedding_bytes = 0; // offloaded experts: the token embedding's stored bytes (pinned)
     std::uint64_t mtp_expert_pinned = 0; // the MTP drafter's routed experts' stored bytes, pinned behind the drafter pool
     std::optional<LoraBinding> lora;     // LoadOptions::lora
+    std::optional<AblateSidecarBinding> ablate; // LoadOptions::ablate, read at planning so a broken one fails early
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -245,6 +246,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         }
         out->lora = bind_lora(options.lora, out->config.text);
     }
+    if (!options.ablate.empty()) {
+        out->ablate = bind_ablate(options.ablate, static_cast<std::uint32_t>(out->config.text.num_hidden_layers),
+                                  static_cast<std::uint32_t>(out->config.text.hidden_size));
+    }
     out->info.name = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
     out->info.metadata_json   = reader.directory().metadata.dump();
@@ -348,11 +353,13 @@ std::unique_ptr<Model> plan_model(LoadPlan&& plan) {
     auto backing = artifact::materialize_geometry(reader, std::move(data->materialization));
     BoundModel parts =
         bind_model(data->config, data->options, data->weights, std::move(data->pending), backing, reader);
-    return std::unique_ptr<Model>(new Model(
+    auto model = std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::nullopt, std::move(backing), std::move(parts.banks),
         std::move(parts.shared_banks), std::move(parts.shared_multipliers), std::move(parts.store),
         runtime::expert_offload::CsfTables{}, std::move(data->lora)));
+    model->ablate_ = std::move(data->ablate);
+    return model;
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
@@ -420,11 +427,13 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     runtime::expert_offload::CsfTables csf_tables = data->options.expert_csf
                                                         ? runtime::expert_offload::compress_banks(parts.banks)
                                                         : runtime::expert_offload::CsfTables{};
-    return std::unique_ptr<Model>(new Model(
+    auto model = std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::move(overlay),
         std::move(backing), std::move(parts.banks), std::move(parts.shared_banks),
         std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables), std::move(data->lora)));
+    model->ablate_ = std::move(data->ablate);
+    return model;
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

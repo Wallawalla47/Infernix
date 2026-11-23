@@ -1,8 +1,9 @@
-#include "models/qwen4_exp/load/ablate.h"
+#include "models/ablate/binding.h"
 
+#include <cstddef>
 #include <string>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::models {
 namespace {
 
 // "8-47" for a contiguous run of cut layers, "8-20, 30" otherwise; "none" when the lane is uncut.
@@ -25,10 +26,8 @@ std::string layer_ranges(const artifact::AblateSidecar& sidecar, const artifact:
 
 } // namespace
 
-AblateSidecarBinding bind_ablate(const std::filesystem::path& path, const TextConfig& text) {
-    return AblateSidecarBinding{.path    = path,
-                                .sidecar = artifact::AblateSidecar::load(path, text.num_hidden_layers,
-                                                                         text.hidden_size)};
+AblateSidecarBinding bind_ablate(const std::filesystem::path& path, std::uint32_t layers, std::uint32_t hidden_size) {
+    return AblateSidecarBinding{.path = path, .sidecar = artifact::AblateSidecar::load(path, layers, hidden_size)};
 }
 
 std::string AblateSidecarBinding::describe() const {
@@ -42,4 +41,16 @@ std::string AblateSidecarBinding::describe() const {
     return line;
 }
 
-} // namespace infernix::models::qwen4_exp
+std::string AblateSidecarBinding::artifact_mismatch(const artifact::ArtifactId& loaded) const {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string here;
+    for (const std::byte byte : loaded) {
+        here += kHex[std::to_integer<unsigned>(byte) >> 4U];
+        here += kHex[std::to_integer<unsigned>(byte) & 15U];
+    }
+    if (sidecar.artifact_id.empty() || sidecar.artifact_id == here) { return {}; }
+    return "the ablation sidecar was fitted on artifact " + sidecar.artifact_id + ", not this one (" + here +
+           "): it loads, as the geometry matches, but its cut was not measured on this artifact";
+}
+
+} // namespace infernix::models

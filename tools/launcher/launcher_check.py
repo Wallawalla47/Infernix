@@ -446,7 +446,7 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
                                     {"args": fast + ["--max-context", "65536", "--lora", str(adapter_dir)]})
         labels = [part.get("label") for part in (adapted.get("vram") or {}).get("parts", [])]
         check("a LoRA adapter's VRAM is a part of the plan and of what it plans",
-              status == 200 and status_lora == 200 and "LoRA adapter" in labels
+              status == 200 and status_lora == 200 and "Adapters" in labels
               and (adapted.get("vram") or {}).get("planned", 0) - (plain.get("vram") or {}).get("planned", 0)
               == 318767104, str(labels))
         status, plan = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "250000"]})

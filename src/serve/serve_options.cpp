@@ -442,7 +442,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             beside its head in the artifact\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
-           "  --ablate FILE              Qwen3.8-Flash-Next runtime ablation sidecar\n"
+           "  --ablate FILE              runtime ablation sidecar, every model\n"
            "                             (docs/ablate.md): a sidecar.json\n"
            "                             naming a direction file and per-layer alpha tables;\n"
            "                             each cut layer removes the direction's component from\n"

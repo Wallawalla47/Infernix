@@ -380,7 +380,7 @@ std::string usage_text(const char* argv0) {
            "                           adapter_config.json beside it); Qwen3.5 dense models\n"
            "                           (the 27Bs); --lossless computes it as PEFT does (docs/lora.md)\n"
            "  --ablate FILE            apply an ablation sidecar at runtime: its sidecar.json,\n"
-           "                           the direction file beside it; Qwen3.8-Flash-Next\n"
+           "                           the direction file beside it; every model\n"
            "                           (docs/ablate.md)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"

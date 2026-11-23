@@ -713,7 +713,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
-    if (!options.ablate.empty()) { out->ablate = bind_ablate(options.ablate, out->config.text); }
+    if (!options.ablate.empty()) {
+        out->ablate = bind_ablate(options.ablate, out->config.text.num_hidden_layers, out->config.text.hidden_size);
+    }
     if (options.dflash2() && options.purpose == EnginePurpose::Generation) {
         out->draft_reader   = std::make_unique<artifact::Reader>(options.draft_model);
         out->config.dflash2 = parse_dflash2_config(out->draft_reader->directory(), out->config.text);

@@ -14,7 +14,8 @@
 // y bit for bit (the same FMA chain); a column's bits do not depend on T or its position; a captured graph replays
 // the eager bits; inputs and the residual's guards are untouched; out-of-domain calls are refused. Geometry: Flash-Next
 // (S = 4, H = 2560, top-8) at T = 1, 2, 31, 32, 33 and 257, top-1 and top-16, H = 200 (a partial warp), and a call
-// wider than a grid's 65,535 rows (S = 2, H = 16, T = 70,001).
+// wider than a grid's 65,535 rows (S = 2, H = 16, T = 70,001). residual_delta_cut (Qwen3.5's single-stream residual,
+// after the lane's own write) at H = 5120, 3072 and 2048 (the 27B, the 122B, the 35B): see single_case below.
 
 #include "ops/op_family.h"
 #include "infernix/ops/direction_cut.h"
@@ -328,7 +329,162 @@ void combine_matches_composition(const Case& c, const std::string& label) {
           label + ": the combine form differs from moe_combine followed by the cut inject");
 }
 
+// residual_delta_cut (Qwen3.5's single-stream residual), after a lane wrote after = bf16(x0 + y) over before = x0:
+// - the op's contract, pointwise against FP64: out = after - alpha c dir, c = dir . (after - before), with the same
+//   bound as the cut inject at inject 1 (delta = after - before is exact);
+// - the lane's ideal x0 + y - alpha (dir . y) dir, per column in L2: the error is the write's own rounding r with its
+//   component along dir scaled by 1 - alpha, plus the last rounding, so
+//     |out - ideal| <= max(1, |1 - alpha|) |2^-8 after| + |2^-8 out| + the FP32 dot's error,
+//   at realistic ratios (|x0| well above |y|, and a few residual elements in the thousands, as Qwen3.5's residual
+//   has); the largest error against the write's own rounding bound is printed;
+// - a cut too small to move an element keeps its bits (alpha 1e-30: out = after), an inactive cut leaves x
+//   unchanged, a column's bits whatever T or its position, a graph replay and a repeat give the eager bits, before and
+//   the guards are untouched.
+struct SingleCase {
+    int hidden = 5120, columns = 1;
+    float alpha = 1.0F;
+    std::vector<float> dir;
+    std::vector<double> y;                    // the lane's output (FP64), for the ideal
+    std::vector<std::uint16_t> before, after; // BF16 x0 and bf16(x0 + y)
+};
+
+SingleCase make_single(int hidden, int columns, float alpha, std::uint32_t seed) {
+    SingleCase c{.hidden = hidden, .columns = columns, .alpha = alpha};
+    Rng rng{seed};
+    const std::size_t H = static_cast<std::size_t>(hidden), n = H * columns;
+    c.y.resize(n);
+    c.before.resize(n);
+    c.after.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        // A residual element up to 16, four per column in the thousands; a lane output a few times smaller.
+        const bool outlier = i % H < 4;
+        const double x0    = outlier ? std::ldexp(1.0 + 0.5 * rng.unit(), 10 + rng.below(2)) * (rng.unit() < 0 ? -1 : 1)
+                                     : std::ldexp(rng.unit(), rng.below(9) - 4);
+        c.before[i]        = t::f32_to_bf16(static_cast<float>(x0));
+        double y           = std::ldexp(rng.unit(), rng.below(9) - 6);
+        double sum         = t::bf16_to_f32(c.before[i]) + y;
+        if (sum == 0.0) { // no exact zero: a cut moves a zero element however small it is
+            y += 0.5;
+            sum = t::bf16_to_f32(c.before[i]) + y;
+        }
+        c.after[i] = t::f32_to_bf16(static_cast<float>(sum));
+        c.y[i]     = y;
+    }
+    c.dir = make_direction(hidden, rng, nullptr);
+    return c;
+}
+
+std::vector<std::uint16_t> run_single(const SingleCase& c, bool graph, const std::string& label) {
+    infernix::DeviceBuffer d_dir = t::to_device(c.dir), d_before = t::to_device(c.before);
+    t::GuardedDeviceBuffer x(c.after.size() * sizeof(std::uint16_t));
+    x.copy_from_host(c.after.data(), x.bytes());
+    const Tensor before(d_before.p, DType::BF16, {c.hidden, c.columns});
+    Tensor out(x.data(), DType::BF16, {c.hidden, c.columns});
+    const DirectionCut cut{.direction = c.alpha != 0.0F ? static_cast<const float*>(d_dir.p) : nullptr, .alpha = c.alpha};
+    const auto launch = [&](cudaStream_t stream) { infernix::ops::residual_delta_cut(before, cut, out, stream); };
+    if (graph) {
+        cudaStream_t stream = nullptr;
+        t::cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
+        {
+            infernix::DecodeGraphDefinition definition;
+            infernix::DecodeGraphExecutable executable;
+            definition.capture(stream, [&] { launch(stream); });
+            executable.instantiate(definition);
+            executable.launch(stream);
+            t::cuda_check(cudaStreamSynchronize(stream), "graph synchronize");
+        }
+        t::cuda_check(cudaStreamDestroy(stream), "destroy stream");
+    } else {
+        launch(nullptr);
+        t::cuda_synchronize();
+    }
+    failures += x.verify_guards(label + " guards");
+    check(t::from_device<std::uint16_t>(d_before, c.before.size()) == c.before, label + ": before modified");
+    return t::from_device<std::uint16_t>(x.data(), c.after.size());
+}
+
+double worst_single_ratio = 0.0; // the largest |out - ideal| against the write's own rounding bound, over every case
+
+void verify_single(const SingleCase& c, const std::vector<std::uint16_t>& got, const std::string& label) {
+    const std::size_t H = static_cast<std::size_t>(c.hidden);
+    const double a      = c.alpha;
+    for (int col = 0; col < c.columns; ++col) {
+        double dot = 0.0, magnitude = 0.0, ideal_dot = 0.0;
+        for (std::size_t h = 0; h < H; ++h) {
+            const std::size_t at = col * H + h;
+            const double delta   = static_cast<double>(t::bf16_to_f32(c.after[at])) - t::bf16_to_f32(c.before[at]);
+            dot += static_cast<double>(c.dir[h]) * delta;
+            magnitude += std::abs(static_cast<double>(c.dir[h]) * delta);
+            ideal_dot += static_cast<double>(c.dir[h]) * c.y[at];
+        }
+        double error2 = 0.0, write2 = 0.0, out2 = 0.0;
+        for (std::size_t h = 0; h < H; ++h) {
+            const std::size_t at = col * H + h;
+            const double after = t::bf16_to_f32(c.after[at]), d = c.dir[h];
+            const double ref   = after - a * dot * d;
+            const double cut_d = a * std::abs(d);
+            const double e     = std::ldexp(std::abs(after) + cut_d * std::abs(dot), -20) + cut_d * std::ldexp(magnitude, -17);
+            const double value = t::bf16_to_f32(got[at]);
+            if (!std::isfinite(value) || !(std::abs(value - ref) <= std::ldexp(std::abs(ref), -8) + e)) {
+                check(false, label + ": column " + std::to_string(col) + " row " + std::to_string(h) + " is " +
+                                 std::to_string(value) + ", expected " + std::to_string(ref));
+                return;
+            }
+            const double ideal = t::bf16_to_f32(c.before[at]) + c.y[at] - a * ideal_dot * d;
+            error2 += (value - ideal) * (value - ideal);
+            write2 += std::ldexp(after, -8) * std::ldexp(after, -8);
+            out2 += std::ldexp(value, -8) * std::ldexp(value, -8);
+        }
+        // after was rounded through FP32 first (2^-24 more), hence the slop on the write's bound.
+        const double write = std::sqrt(write2) * (1.0 + std::ldexp(1.0, -10));
+        const double bound = std::max(1.0, std::abs(1.0 - a)) * write + std::sqrt(out2) + a * std::ldexp(magnitude, -17);
+        worst_single_ratio = std::max(worst_single_ratio, std::sqrt(error2) / write);
+        if (!(std::sqrt(error2) <= bound)) {
+            check(false, label + ": column " + std::to_string(col) + " is " + std::to_string(std::sqrt(error2)) +
+                             " from the ideal in L2, past " + std::to_string(bound));
+            return;
+        }
+    }
+}
+
+void single_case(int hidden, int columns, float alpha, std::uint32_t seed, bool invariance) {
+    const SingleCase c   = make_single(hidden, columns, alpha, seed);
+    const std::string label = "residual delta cut H=" + std::to_string(hidden) + " T=" + std::to_string(columns) +
+                              " alpha " + std::to_string(alpha);
+    const std::vector<std::uint16_t> eager = run_single(c, false, label);
+    verify_single(c, eager, label);
+    check(run_single(c, false, label + " repeat") == eager, label + ": a repeated call differs");
+    check(run_single(c, true, label + " graph") == eager, label + ": the graph replay differs");
+    if (invariance && columns > 1) {
+        const std::size_t H = static_cast<std::size_t>(hidden);
+        for (const int col : {0, columns / 2, columns - 1}) {
+            SingleCase one = c;
+            one.columns = 1;
+            const auto from = static_cast<std::ptrdiff_t>(col * H), to = static_cast<std::ptrdiff_t>((col + 1) * H);
+            one.y.assign(c.y.begin() + from, c.y.begin() + to);
+            one.before.assign(c.before.begin() + from, c.before.begin() + to);
+            one.after.assign(c.after.begin() + from, c.after.begin() + to);
+            check(run_single(one, false, label + " alone") ==
+                      std::vector<std::uint16_t>(eager.begin() + from, eager.begin() + to),
+                  label + ": column " + std::to_string(col) + " differs from its T = 1 call");
+        }
+    }
+    SingleCase off = c;
+    off.alpha = 0.0F;
+    check(run_single(off, false, label + " inactive") == c.after, label + ": an inactive cut changed x");
+    SingleCase tiny = c;
+    tiny.alpha = 1e-30F;
+    check(run_single(tiny, false, label + " alpha 1e-30") == c.after, label + ": a negligible cut changed x");
+}
+
 void refusals() {
+    for (const int hidden : {5116, 8200}) {
+        SingleCase bad = make_single(hidden, 2, 1.0F, 7U);
+        try {
+            (void)run_single(bad, false, "refused");
+            check(false, "residual delta cut at H=" + std::to_string(hidden) + " was not refused");
+        } catch (const std::invalid_argument&) {}
+    }
     Case c = make_case(4, 2560, 2, 8, 1.0F, false, false, 9U);
     const auto refused = [&](const std::string& what, const auto& mutate) {
         Case bad = c;
@@ -380,6 +536,17 @@ INFERNIX_OP_TEST(direction_cut) {
         inactive_is_plain(make_case(4, 2560, 9, 8, 1.0F, false, false, ++seed), "inject");
         inactive_is_plain(make_case(4, 2560, 9, 8, 1.0F, true, false, ++seed), "combine");
         combine_matches_composition(make_case(4, 2560, 33, 8, 1.0F, true, false, ++seed), "combine T=33");
+        // Qwen3.5's widths: the 27B (5120), the 122B (3072), the 35B (2048); a partial warp (200) and a wide call.
+        for (const int hidden : {5120, 3072, 2048}) {
+            for (const int columns : {1, 2, 33, 257}) { single_case(hidden, columns, 1.0F, ++seed, columns == 33); }
+            single_case(hidden, 5, 2.0F, ++seed, false);
+            single_case(hidden, 5, 4.0F, ++seed, false);
+        }
+        single_case(200, 5, 1.0F, ++seed, true);
+        single_case(16, 70001, 1.0F, ++seed, false);
+        std::printf("residual delta cut: the largest error against the lane's ideal is %.3g of the write's own rounding "
+                    "bound (L2 per column)\n",
+                    worst_single_ratio);
         refusals();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

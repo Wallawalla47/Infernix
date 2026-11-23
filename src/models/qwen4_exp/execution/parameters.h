@@ -7,7 +7,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/execution/parameters.h"
-#include "models/qwen4_exp/execution/ablate_parameters.h"
+#include "models/ablate/parameters.h"
 #include "models/qwen4_exp/model.h"
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"

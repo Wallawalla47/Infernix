@@ -567,7 +567,7 @@ std::string usage_text(std::string_view program) {
         << "                             qualified, else the model's fastest fixed length)\n"
         << "  --draft-model <path>       Qwen3.8-Flash-Next DFlash2: the drafter's companion artifact\n"
         << "  --lora <path>              Qwen3.5 dense: a LoRA adapter applied at runtime (PEFT directory)\n"
-        << "  --ablate <path>            Qwen3.8-Flash-Next: an ablation sidecar applied at runtime (sidecar.json)\n"
+        << "  --ablate <path>            an ablation sidecar applied at runtime, every model (sidecar.json)\n"
         << "  --spec-min-p <p>           MTP (Flash-Next: fixed --draft-tokens only), Flash-Next DFlash2\n"
         << "                             draft-confidence gate 0..1 (default 0: every draft)\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"

@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "models/ablate/binding.h"
 #include "models/qwen3_5/load/lora.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen3_5/weights.h"
@@ -82,6 +83,9 @@ public:
     // The LoRA adapter (LoadOptions::lora) bound to the text layers, or null. Its factors are read from the adapter's
     // file by execution::Parameters, which owns their device form.
     [[nodiscard]] const LoraBinding* lora() const noexcept { return lora_ ? &*lora_ : nullptr; }
+    // LoadOptions::ablate (--ablate, docs/ablate.md): the sidecar read at load; null without one. Its direction's device
+    // copy and the per-layer cuts are execution::Parameters'.
+    [[nodiscard]] const AblateSidecarBinding* ablate() const noexcept { return ablate_ ? &*ablate_ : nullptr; }
     // With LoadOptions::stream_experts: where each routed record lies in the artifact (the SSD tier
     // reads them in place); null otherwise.
     [[nodiscard]] const runtime::expert_offload::ExpertStore* expert_store() const noexcept {
@@ -119,6 +123,7 @@ private:
     std::optional<runtime::expert_offload::ExpertStore> expert_store_;
     runtime::expert_offload::CsfTables csf_tables_; // expert_banks_' CSF tables
     std::optional<LoraBinding> lora_;
+    std::optional<AblateSidecarBinding> ablate_;
 };
 
 } // namespace infernix::models::qwen3_5

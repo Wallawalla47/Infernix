@@ -161,6 +161,18 @@ infernix_add_test(infernix_qwen3_5_memory_exhausted_real_test
 set_tests_properties(infernix_qwen3_5_memory_exhausted_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
 
+# --ablate on each Qwen3.5-family artifact (docs/ablate.md): the dense 27B, the 35B-A3B and the 122B-A10B with the
+# drafters each holds; INFERNIX_TEST_LORA adds the dense entry's --lora check.
+infernix_add_test(infernix_qwen3_5_ablate_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_ablate_real.cpp"
+  LIBRARIES infernix_engine
+  ARGS dense mtp dflash2)
+add_test(NAME infernix_qwen3_5_ablate_moe_real_test COMMAND infernix_qwen3_5_ablate_real_test moe mtp dflash)
+add_test(NAME infernix_qwen3_5_ablate_offloaded_real_test COMMAND infernix_qwen3_5_ablate_real_test offloaded mtp dflash2)
+set_tests_properties(infernix_qwen3_5_ablate_real_test infernix_qwen3_5_ablate_moe_real_test
+  infernix_qwen3_5_ablate_offloaded_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 infernix_add_test(infernix_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES infernix_engine)

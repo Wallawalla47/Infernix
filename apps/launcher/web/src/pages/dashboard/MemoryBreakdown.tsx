@@ -47,12 +47,16 @@ const KEYS: Record<MemoryPartKey, KeySpec> = {
     },
   },
   drafter: { label: "Drafter", slot: 3, what: { device: "The speculative drafter's weights and buffers (MTP, DFlash or DFlash2)." } },
-  // A dense model's adapter takes the experts' place and hue: --lora refuses mixture-of-experts models, so the two
-  // never share a bar.
+  // The adapters take the experts' place and hue, striped: --lora refuses mixture-of-experts models, but an ablation
+  // sidecar's direction (a few KiB, --ablate) can share a bar with a MoE model's experts.
   adapter: {
-    label: "LoRA adapter",
+    label: "Adapters",
     slot: 5,
-    what: { device: "The LoRA adapter's factors (--lora), applied to the model's projections at runtime." },
+    striped: true,
+    what: {
+      device:
+        "A LoRA adapter's factors (--lora) and an ablation sidecar's direction (--ablate), applied to the model at runtime.",
+    },
   },
   experts: {
     label: "Experts",

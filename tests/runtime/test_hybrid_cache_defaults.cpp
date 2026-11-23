@@ -527,7 +527,7 @@ int main() {
         failures += check(cut.find("d.f32.bin") != std::string::npos, "the fingerprint does not name the direction file");
         std::filesystem::remove_all(dir);
     }
-    // --ablate: only Qwen3.8-Flash-Next wires the cut in; every other architecture refuses it rather than serve uncut.
+    // --ablate: every architecture takes it (Qwen3.5, Qwen3.5-MoE, Qwen3.8-Flash-Next).
     {
         EngineOptions options;
         options.artifact_path       = "model.infernix";
@@ -541,8 +541,7 @@ int main() {
             } catch (const std::invalid_argument& error) {
                 rejected = std::string(error.what()).find("--ablate") != std::string::npos;
             }
-            failures += check(rejected == (architecture != infernix::models::Architecture::Qwen4Exp),
-                              "--ablate was misjudged for its architecture");
+            failures += check(!rejected, "--ablate was refused for an architecture that takes it");
         }
         // The lossless route is refused before anything loads, not when the forward is built.
         options.lossless = true;
