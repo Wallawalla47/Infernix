@@ -480,8 +480,12 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     const bool guessing = !prompt_ && T <= kGuessColumns;
     const bool reading  = !prompt_ && T > kGuessColumns && T <= kReadAheadColumns && call_lanes_.size() == 1;
     auto* xm            = const_cast<std::uint16_t*>(mlp_input(v)); // b_'s own memory
+    // The guess's size (2026-11-23, rounds at context 512): one column 4 whole records (8 gate/up parts were 2.0-3.4 %
+    // slower a round); two columns 8 gate/up parts (6, or whole records, were not faster on every route).
+    const std::int32_t guesses = T == 1 ? kGuessExperts1 : kGuessExperts;
     const std::uint64_t gate_up_bytes =
         moe::gate_up_record_bytes(op.bank.format, kH, static_cast<std::int32_t>(c_.intermediate));
+    const std::uint64_t guess_bytes = T == 1 ? op.bank.record_stride : gate_up_bytes;
     if (v == 0 && wide_conv_) { // before the call's first ring write
         snapshot_history(s, stream);
         mark("conv_history");
@@ -593,8 +597,8 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         CUDA_CHECK(cudaStreamWaitEvent(side_->prefetch, side_->k2, 0));
         if (guessing) {
             CUDA_CHECK(cudaStreamWaitEvent(side_->prefetch, side_->guessed, 0));
-            moe::moe_prefetch_l2(b_.guess_ids + static_cast<std::size_t>(v) * 16, (kGuessExperts / T) * T, op.bank,
-                                 gate_up_bytes, side_->prefetch);
+            moe::moe_prefetch_l2(b_.guess_ids + static_cast<std::size_t>(v) * 16, guesses, op.bank, guess_bytes,
+                                 side_->prefetch);
         } else {
             moe::moe_prefetch_l2(b_.expert_record + static_cast<std::size_t>(v) * moe::kTopK, moe::kTopK, op.bank,
                                  gate_up_bytes, side_->prefetch);
@@ -744,8 +748,8 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         CUDA_CHECK(cudaEventRecord(side_->x, stream));
         CUDA_CHECK(cudaStreamWaitEvent(side_->guess, side_->x, 0));
         moe::moe_route(xm, T, next.router, next.router_bias, next.bank.experts, kH, c_.route_scale, b_.guess, side_->guess);
-        // kGuessExperts in all: each column's first kGuessExperts / T slots (descending key: its likeliest experts).
-        const std::size_t take = static_cast<std::size_t>(kGuessExperts / T) * 4;
+        // Each column's first guesses / T slots (descending key: its likeliest experts).
+        const std::size_t take = static_cast<std::size_t>(guesses / T) * 4;
         CUDA_CHECK(cudaMemcpy2DAsync(b_.guess_ids + static_cast<std::size_t>(v + 1) * 16, take, b_.guess.routed,
                                      static_cast<std::size_t>(moe::kTopK) * 4, take, static_cast<std::size_t>(T),
                                      cudaMemcpyDeviceToDevice, side_->guess));

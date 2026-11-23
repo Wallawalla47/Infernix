@@ -926,13 +926,23 @@ stream once, at the end of `finish()`, so nothing on the visit's chain waits for
 2026-11-22 in-chain prefetch from mlp_entry's CTA held ~25 us on the critical path and was rejected):
 
 - a call of 1-2 columns: after each visit's MLP input is formed (kept a visit each, `ForwardBuffers::guess_x`), the
-  NEXT visit's router runs on it on the guess stream (`moe_route` over a 2-column workspace); each column's likeliest
-  8 / T experts, 8 in all, are the guess (Basalt's count: 16 guesses at 2 columns cost more bus than they saved);
+  NEXT visit's router runs on it on the guess stream (`moe_route` over a 2-column workspace); at one column its 4
+  likeliest experts' whole records (gate/up and down) are the guess, at two each column's 4 likeliest experts' gate/up
+  bytes (16 guesses at 2 columns cost more bus than they saved);
 - a call of 3-8 columns of one lane (verification): the router records each visit's last column's experts
   (`moe_route`'s `record`, relaxed stores) for the next such call; a decode round of 3-8 lanes prefetches nothing
   (its last lane's experts for every lane: 8 lanes 649.6 → 646.4 tok/s in all, 4 lanes 463.1 → 463.6);
 - after each visit's K2 the prefetch stream issues `moe_prefetch_l2` (12 CTAs of `cp.async.bulk.prefetch.L2`, 16 KB
-  pieces) over the guess's or the record's gate/up bytes.
+  pieces) over the guess's bytes or the record's gate/up bytes.
+
+The guess's size was measured (2026-11-23, context 512 rounds, median of 3, after the visit kernels' 11-23 latency
+work): at one column, against 8 gate/up guesses (4.2838 / 4.3428 / 4.9523 ms on `--q8-weights` / `--a8-activations` /
+default), 6 gate/up 4.2327 / 4.2287 / 4.8919, 5 4.2426 / 4.2004 / 4.8914, 4 4.2779 / 4.2271 / 4.9237, 8 whole records
+4.1985 / 4.3889 / 4.9039, 6 whole 4.2280 / 4.3037 / 4.9071, 4 whole 4.1864 / 4.1931 / 4.8512 (spreads <= 0.011):
+4 whole records, tg128 230.0 → 235.7 and 225.2 → 234.2 tok/s. At two columns (against 8 gate/up guesses) 6 gate/up
+guesses were +0.07 % on `--q8-weights` and -1.24 % on `--a8-activations`, 8 whole records +1.32 / +2.83 %, 6 whole
++1.14 / +1.16 %, so two columns keep 8 gate/up guesses. Why fewer, whole guesses win at one column is not established
+(a guess's bus time competes with W_o and attention beside it; a kept guess also saves its down pass).
 
 No output depends on it (only L2's contents; emitted token ids checked equal with and without it, DSpark and plain,
 2026-11-23). Measured (RTX 5090, 2026-11-23, against the same build without it; ranges over two or three slots where
