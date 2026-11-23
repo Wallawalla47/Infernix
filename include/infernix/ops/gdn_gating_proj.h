@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -94,6 +95,18 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, LinearPolicy policy, WorkspaceArena& ws,
                           Tensor& h, Tensor& g, Tensor& beta, DeviceExecutionView execution);
+
+/**
+ * The Qwen3.8-27B control (48 heads, 5120 inputs) with a LoRA term (include/infernix/ops/lora.h): with x the
+ * normalized BF16 input h, a and b each become fl32(p + fl32(c * s)) before the gates (the canonical addend; the term's
+ * rows a's 48, then b's 48, U over x's columns). One schedule at every T, so a column's g and beta are functions of that
+ * column alone (the request invariance A16ColumnInvariant asks for, under every policy). No workspace. The contiguous
+ * parent (A rows [0,48), B rows [48,96)) and the two-weight form.
+ */
+void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
+                     const LoraAddend& lora, Tensor& g, Tensor& beta, cudaStream_t stream);
+void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                     const Tensor& dt_bias, const LoraAddend& lora, Tensor& g, Tensor& beta, cudaStream_t stream);
 
 /** The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,

@@ -111,6 +111,14 @@ struct GdnParameters {
     ops::ProjectionWeights control;
     Tensor a_log, dt_bias, convolution, norm;
     LinearParameters output;
+    // --lora: one shrink of h stacked over in_proj_qkv, in_proj_z, in_proj_a and in_proj_b (lora_input.a); the
+    // projection's term (lora_input.addend, B in the single parent's q/k/value/z row order; absent when neither
+    // in_proj_qkv nor in_proj_z is adapted) and the control's (lora_control: a rows, then b rows) over its U;
+    // out_proj over the output. On the lossless route the lossless_ forms instead (the input site's segments: the
+    // q/k/value channels, z, a, b).
+    std::optional<LoraSiteParameters> lora_input, lora_output;
+    ops::LoraAddend lora_control;
+    std::optional<LosslessLoraSite> lossless_lora_input, lossless_lora_output;
 };
 
 struct BlockParameters {

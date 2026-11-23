@@ -292,6 +292,10 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
         const Quantized hc = quantize(a, control_step, h, *a_w, s);
         shared(a, hc.x, {{a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}}, s, hc.scale);
     }
+    // --lora: in_proj_qkv (the q/k/value channels), in_proj_z, in_proj_a and in_proj_b read h (unquantized).
+    if (p.lossless_lora_input) {
+        lora_terms(a, *p.lossless_lora_input, h, {{&mixed, 0}, {&z, 0}, {&av, 0}, {&bv, 0}}, s);
+    }
     tap("gdn_mixed", mixed);
     tap("gdn_z", z);
     tap("gdn_a", av);
@@ -323,6 +327,7 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
     Tensor y = alloc(a, DType::BF16, {H, T});
     const Quantized oq = quantize(a, design_step(design, p.output), on, p.output.weight, s);
     linear(a, oq.x, p.output.weight, 0, H, y, 0, s, oq.scale);
+    if (p.lossless_lora_output) { lora_terms(a, *p.lossless_lora_output, on, {{&y, 0}}, s); }
     tap("gdn_y", y);
     if constexpr (kRuns<A>) { ops::lossless_add(x, y, x, s); }
 }

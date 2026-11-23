@@ -50,26 +50,27 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 }
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                              LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+                              LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream,
+                              const LoraAddend* lora) {
     const Nvfp4GdnInputRoute route = resolve_route(policy, x.ne[1]);
     if (route == Nvfp4GdnInputRoute::ColumnInvariantA16) {
-        nvfp4_gdn_input_invariant_launch(x, weight, qkv, z, stream);
+        nvfp4_gdn_input_invariant_launch(x, weight, qkv, z, stream, lora);
         return;
     }
     if (route == Nvfp4GdnInputRoute::A16) {
-        nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream);
+        nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream, lora);
         return;
     }
     if (workspace == nullptr) {
         throw std::invalid_argument("nvfp4 A4 and A8 gdn_input_proj require caller workspace");
     }
     if (route == Nvfp4GdnInputRoute::A8) {
-        nvfp4_gdn_input_a8_launch(x, weight, qkv, z, *workspace, stream);
+        nvfp4_gdn_input_a8_launch(x, weight, qkv, z, *workspace, stream, lora);
         return;
     }
     auto scope                     = workspace->scope();
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
-    nvfp4_gdn_input_a4_launch(x, weight, qkv, z, scratch, stream);
+    nvfp4_gdn_input_a4_launch(x, weight, qkv, z, scratch, stream, lora);
 }
 
 } // namespace infernix::ops::detail

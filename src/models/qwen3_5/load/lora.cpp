@@ -41,9 +41,10 @@ LoraBinding bind_lora(const std::filesystem::path& path, const TextConfig& text)
         std::smatch match;
         if (!std::regex_match(m.module, match, kModule)) {
             refuse(*adapter, "it adapts module '" + m.module +
-                                 "', which is not a text layer's attention or MLP projection. Infernix adapts the text "
-                                 "layers' q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj and down_proj, not the "
-                                 "vision tower, MTP, the embeddings or the head");
+                                 "', which is not a text layer's attention, linear-attention or MLP projection. Infernix "
+                                 "adapts the text layers' q_proj, k_proj, v_proj, o_proj, linear_attn's in_proj_qkv, "
+                                 "in_proj_z, in_proj_a, in_proj_b and out_proj, and gate_proj, up_proj and down_proj, not "
+                                 "the vision tower, MTP, the embeddings or the head");
         }
         const std::uint64_t layer = std::stoull(match[2].str());
         const std::string block = match[3].str(), leaf = match[4].str();
@@ -66,11 +67,32 @@ LoraBinding bind_lora(const std::filesystem::path& path, const TextConfig& text)
             slot = index;
         };
         if (block == "linear_attn") {
-            refuse(*adapter, "it adapts module '" + m.module +
-                                 "', a linear-attention (Gated DeltaNet) projection. Infernix adapts the full-attention "
-                                 "layers' q/k/v/o projections and the MLPs, not the Gated DeltaNet layers");
-        }
-        if (block == "self_attn") {
+            if (text.layer_types.at(layer) != MixerKind::LinearAttention || !text.gdn) {
+                refuse(*adapter, "it adapts linear-attention module '" + m.module +
+                                     "', but that layer is a full-attention layer in this model: the adapter was trained "
+                                     "for another base model" + base_named(*adapter));
+            }
+            const GdnConfig& g = *text.gdn;
+            if (leaf == "in_proj_qkv") {
+                expect(text.hidden_size, 2 * g.key_width() + g.value_width()); // query, key, then value channels
+                place(target.gdn_qkv);
+            } else if (leaf == "in_proj_z") {
+                expect(text.hidden_size, g.value_width());
+                place(target.gdn_z);
+            } else if (leaf == "in_proj_a") {
+                expect(text.hidden_size, g.linear_num_value_heads);
+                place(target.gdn_a);
+            } else if (leaf == "in_proj_b") {
+                expect(text.hidden_size, g.linear_num_value_heads);
+                place(target.gdn_b);
+            } else if (leaf == "out_proj") {
+                expect(g.value_width(), text.hidden_size);
+                place(target.gdn_output);
+            } else {
+                refuse(*adapter, "it adapts linear-attention module '" + m.module +
+                                     "'; Infernix adapts in_proj_qkv, in_proj_z, in_proj_a, in_proj_b and out_proj");
+            }
+        } else if (block == "self_attn") {
             if (text.layer_types.at(layer) != MixerKind::FullAttention || !text.attention) {
                 refuse(*adapter, "it adapts attention module '" + m.module +
                                      "', but that layer is a linear-attention (Gated DeltaNet) layer in this model: the "
@@ -134,15 +156,18 @@ LoraBinding bind_lora(const std::filesystem::path& path, const TextConfig& text)
     };
     shrinkable(text.hidden_size, "the hidden");
     if (text.attention) { shrinkable(text.attention->query_width(), "the attention output"); }
+    if (text.gdn) { shrinkable(text.gdn->value_width(), "the linear-attention output"); }
     if (dense != nullptr) { shrinkable(dense->intermediate_size, "the MLP intermediate"); }
     binding.adapter = std::move(adapter);
     return binding;
 }
 
 std::string LoraBinding::describe() const {
-    std::size_t attention = 0, mlp = 0, layers_adapted = 0;
+    std::size_t attention = 0, linear = 0, mlp = 0, layers_adapted = 0;
     for (const LoraLayer& layer : layers) {
         attention += (layer.query ? 1 : 0) + (layer.key ? 1 : 0) + (layer.value ? 1 : 0) + (layer.output ? 1 : 0);
+        linear += (layer.gdn_qkv ? 1 : 0) + (layer.gdn_z ? 1 : 0) + (layer.gdn_a ? 1 : 0) + (layer.gdn_b ? 1 : 0) +
+                  (layer.gdn_output ? 1 : 0);
         mlp += (layer.gate ? 1 : 0) + (layer.up ? 1 : 0) + (layer.down ? 1 : 0);
         layers_adapted += layer.any() ? 1 : 0;
     }
@@ -157,9 +182,12 @@ std::string LoraBinding::describe() const {
         first     = false;
     }
     char text[512];
+    const std::string kinds = linear > 0 ? std::to_string(attention) + " attention, " + std::to_string(linear) +
+                                               " linear-attention and " + std::to_string(mlp) + " MLP"
+                                         : std::to_string(attention) + " attention and " + std::to_string(mlp) + " MLP";
     std::snprintf(text, sizeof(text),
-                  "%zu attention and %zu MLP projections in %zu layers, rank %u%s, scale %g%s, %s factors, base %s",
-                  attention, mlp, layers_adapted, max_rank,
+                  "%s projections in %zu layers, rank %u%s, scale %g%s, %s factors, base %s", kinds.c_str(),
+                  layers_adapted, max_rank,
                   min_rank != max_rank ? (" (from " + std::to_string(min_rank) + ")").c_str() : "",
                   static_cast<double>(max_scale), min_scale != max_scale ? " (varies)" : "",
                   adapter->dtype().c_str(), adapter->base_model().empty() ? "unnamed" : adapter->base_model().c_str());

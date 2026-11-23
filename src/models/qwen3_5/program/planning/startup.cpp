@@ -281,6 +281,11 @@ std::uint64_t lora_sites(const execution::Parameters& parameters) {
         if (const auto* attention = std::get_if<execution::AttentionParameters>(&block.mixer)) {
             sites += (attention->lora_input || attention->lossless_lora_input ? 1U : 0U) +
                      (attention->lora_output || attention->lossless_lora_output ? 1U : 0U);
+        } else if (const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer)) {
+            // An adapted control is a site of its own (the norm, the shrink and its control kernel).
+            sites += (gdn->lora_input || gdn->lossless_lora_input ? 1U : 0U) +
+                     (gdn->lora_control.present() ? 1U : 0U) +
+                     (gdn->lora_output || gdn->lossless_lora_output ? 1U : 0U);
         }
         if (const auto* dense = std::get_if<execution::DenseParameters>(&block.ffn)) {
             sites += (dense->lora_gate_up || dense->lossless_lora_gate_up ? 1U : 0U) +
@@ -628,6 +633,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     const auto* control = std::get_if<execution::LinearParameters>(&gdn.control);
                     (void)workspace::gdn_control(layout, config, last);
+                    // --lora: the adapted inputs' U (text.cpp gdn_mix), held through the projection.
+                    if (gdn.lora_input) { (void)layout.alloc(DType::BF16, {gdn.lora_input->a.rows, last}); }
                     scratch(layout, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
                                         dimension(config.gdn->linear_num_value_heads),
                                         dimension(config.hidden_size),
@@ -655,6 +662,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     dimension(config.gdn->linear_num_value_heads), first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
+                    // --lora: out_proj's U (gdn_output_lora), held under the output projection's scratch.
+                    if (gdn.lora_output) { (void)layout.alloc(DType::BF16, {gdn.lora_output->a.rows, last}); }
                     add_scratch(layout, gdn.output, first, last, wide_verification);
                 }
             }

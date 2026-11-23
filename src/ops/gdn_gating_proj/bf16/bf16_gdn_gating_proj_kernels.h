@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/tensor.h"
+#include "infernix/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -9,6 +10,12 @@
 #include <cstdint>
 
 namespace infernix::ops::detail {
+
+// The 27B's control [96,5120] over the normalized input with a LoRA term (bf16_gdn_gating_lora.cu): one schedule at
+// every T (column-invariant).
+void bf16_gdn_gating_lora_launch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
+                                 const LoraAddend& lora, const Tensor& A_log, const Tensor& dt_bias, Tensor& g,
+                                 Tensor& beta, cudaStream_t stream);
 
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,

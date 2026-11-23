@@ -582,6 +582,13 @@ infernix_add_family_op_test(infernix_lora_test FAMILY lora
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora.cpp"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_lora_test PROPERTIES TIMEOUT 3600 RESOURCE_LOCK gpu_memory)
+# The Gated DeltaNet input projection's term (NVFP4, row-scaled FP8 and the Q4/Q5 pair at the 27B shapes): against the
+# no-term call plus the FP64 term at every route and policy, zero-B identity, A16ColumnInvariant column bits, and the
+# snapshot and record forms bit for bit against the projection with the term and the convolution over it.
+infernix_add_family_op_test(infernix_lora_gdn_test FAMILY lora
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_gdn.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_lora_gdn_test PROPERTIES TIMEOUT 3600 RESOURCE_LOCK gpu_memory)
 
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

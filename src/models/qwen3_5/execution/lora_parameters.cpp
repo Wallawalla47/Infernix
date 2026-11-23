@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/lora_parameters.h"
 
 #include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
 #include "infernix/ops/lossless_lora.h"
@@ -108,9 +109,14 @@ std::uint64_t prepare_lossless_lora(const Model& model, TextParameters& text, De
         std::int32_t a_rows = 0, k = 0;
     };
     struct LayerLayout {
-        Site input, output, gate_up, down;
+        Site input, output, gate_up, down, gdn_input, gdn_output;
         std::int32_t q = -1, k = -1, v = -1, gate = -1, up = -1;
+        std::int32_t gqkv = -1, gz = -1, ga = -1, gb = -1;
     };
+    // The Gated DeltaNet input site's B rows: the q/k/value channels (C), z (VW), a (Hv), b (Hv).
+    const std::int32_t gdn_c  = config.gdn ? static_cast<std::int32_t>(2 * config.gdn->key_width() + config.gdn->value_width()) : 0;
+    const std::int32_t gdn_vw = config.gdn ? static_cast<std::int32_t>(config.gdn->value_width()) : 0;
+    const std::int32_t gdn_hv = config.gdn ? static_cast<std::int32_t>(config.gdn->linear_num_value_heads) : 0;
     std::uint64_t size   = 0;
     const auto reserve   = [&](std::uint64_t bytes) {
         const std::uint64_t at = size;
@@ -153,6 +159,15 @@ std::uint64_t prepare_lossless_lora(const Model& model, TextParameters& text, De
             }
             if (layer.down) { l.down = make_site(r, inter, static_cast<std::uint64_t>(h)); }
         }
+        if (layer.gdn_input()) {
+            std::int32_t rows = 0;
+            if (layer.gdn_qkv) { l.gqkv = rows; rows += r; }
+            if (layer.gdn_z) { l.gz = rows; rows += r; }
+            if (layer.gdn_a) { l.ga = rows; rows += r; }
+            if (layer.gdn_b) { l.gb = rows; rows += r; }
+            l.gdn_input = make_site(rows, h, static_cast<std::uint64_t>(gdn_c + gdn_vw + 2 * gdn_hv));
+        }
+        if (layer.gdn_output) { l.gdn_output = make_site(r, gdn_vw, static_cast<std::uint64_t>(h)); }
     }
     const bool resident = model.weights_resident();
     // One site at a time (as prepare_lora): each site's span is staged in RAM and uploaded.
@@ -243,6 +258,34 @@ std::uint64_t prepare_lossless_lora(const Model& model, TextParameters& text, De
                 put_b(*layer.down, [](std::uint64_t row) { return row; });
             });
         }
+        if (layer.gdn_input()) {
+            const auto c = static_cast<std::uint64_t>(gdn_c), vw = static_cast<std::uint64_t>(gdn_vw),
+                       hv = static_cast<std::uint64_t>(gdn_hv);
+            upload(l.gdn_input, [&] {
+                if (layer.gdn_qkv) {
+                    put_a(l.gqkv, *layer.gdn_qkv);
+                    put_b(*layer.gdn_qkv, [](std::uint64_t row) { return row; });
+                }
+                if (layer.gdn_z) {
+                    put_a(l.gz, *layer.gdn_z);
+                    put_b(*layer.gdn_z, [&](std::uint64_t row) { return c + row; });
+                }
+                if (layer.gdn_a) {
+                    put_a(l.ga, *layer.gdn_a);
+                    put_b(*layer.gdn_a, [&](std::uint64_t row) { return c + vw + row; });
+                }
+                if (layer.gdn_b) {
+                    put_a(l.gb, *layer.gdn_b);
+                    put_b(*layer.gdn_b, [&](std::uint64_t row) { return c + vw + hv + row; });
+                }
+            });
+        }
+        if (layer.gdn_output) {
+            upload(l.gdn_output, [&] {
+                put_a(0, *layer.gdn_output);
+                put_b(*layer.gdn_output, [](std::uint64_t row) { return row; });
+            });
+        }
     }
     stage = {};
     const auto scale = [&](const std::optional<std::size_t>& m) { return m ? binding.module(*m).scale : 0.0F; };
@@ -282,6 +325,20 @@ std::uint64_t prepare_lossless_lora(const Model& model, TextParameters& text, De
             }
             if (layer.down) { dense->lossless_lora_down = site_of(l.down, {segment(h, 0, scale(layer.down))}); }
         }
+        if (layer.gdn_input() || layer.gdn_output) {
+            auto* gdn = std::get_if<GdnParameters>(&block.mixer);
+            if (gdn == nullptr) { throw std::logic_error("--lora: linear-attention modules on a non-linear-attention layer"); }
+            if (layer.gdn_input()) {
+                gdn->lossless_lora_input =
+                    site_of(l.gdn_input, {segment(gdn_c, l.gqkv, scale(layer.gdn_qkv)),
+                                          segment(gdn_c + gdn_vw, l.gz, scale(layer.gdn_z)),
+                                          segment(gdn_c + gdn_vw + gdn_hv, l.ga, scale(layer.gdn_a)),
+                                          segment(gdn_c + gdn_vw + 2 * gdn_hv, l.gb, scale(layer.gdn_b))});
+            }
+            if (layer.gdn_output) {
+                gdn->lossless_lora_output = site_of(l.gdn_output, {segment(h, 0, scale(layer.gdn_output))});
+            }
+        }
     }
     return resident ? 0 : size;
 }
@@ -299,13 +356,36 @@ std::uint64_t prepare_lora(const Model& model, TextParameters& text, DeviceBuffe
 
     // Pass 1: the layout (offsets only), so the device buffer is one allocation.
     struct LayerLayout {
-        SiteLayout input, output, gate_up, down;
+        SiteLayout input, output, gate_up, down, gdn_input, gdn_output;
         std::int32_t q = -1, k = -1, v = -1, gate = -1, up = -1; // U offsets of the stacked blocks
+        std::int32_t gqkv = -1, gz = -1, ga = -1, gb = -1;
     };
+    // The Gated DeltaNet input site's B: the projection parent's rows (q/k/value channels C, then z VW), then the
+    // control's (a's Hv, then b's Hv).
+    const std::int64_t gdn_c  = config.gdn ? static_cast<std::int64_t>(2 * config.gdn->key_width() + config.gdn->value_width()) : 0;
+    const std::int64_t gdn_vw = config.gdn ? static_cast<std::int64_t>(config.gdn->value_width()) : 0;
+    const std::int64_t gdn_hv = config.gdn ? static_cast<std::int64_t>(config.gdn->linear_num_value_heads) : 0;
     std::vector<LayerLayout> layout(binding->layers.size());
     for (std::size_t i = 0; i < binding->layers.size(); ++i) {
         const LoraLayer& layer = binding->layers[i];
         LayerLayout& l         = layout[i];
+        if (layer.gdn_input()) {
+            std::int32_t rows = 0;
+            if (layer.gdn_qkv) { l.gqkv = rows; rows += r; }
+            if (layer.gdn_z) { l.gz = rows; rows += r; }
+            if (layer.gdn_a) { l.ga = rows; rows += r; }
+            if (layer.gdn_b) { l.gb = rows; rows += r; }
+            l.gdn_input.a_rows = rows;
+            l.gdn_input.a      = packer.reserve(static_cast<std::uint64_t>(rows) * h);
+            l.gdn_input.b      = packer.reserve(static_cast<std::uint64_t>(gdn_c + gdn_vw + 2 * gdn_hv) * r);
+            l.gdn_input.end    = packer.size();
+        }
+        if (layer.gdn_output) {
+            l.gdn_output.a_rows = r;
+            l.gdn_output.a      = packer.reserve(static_cast<std::uint64_t>(r) * gdn_vw);
+            l.gdn_output.b      = packer.reserve(static_cast<std::uint64_t>(h) * r);
+            l.gdn_output.end    = packer.size();
+        }
         if (layer.attention_input()) {
             const auto& a = *config.attention;
             std::int32_t rows = 0;
@@ -414,6 +494,37 @@ std::uint64_t prepare_lora(const Model& model, TextParameters& text, DeviceBuffe
                 packer.put_b(region(l.down.b), *layer.down, [](std::uint64_t row) { return row; });
             });
         }
+        if (layer.gdn_input()) {
+            // in_proj_qkv's rows are the projection parent's q/k/value channels in order, in_proj_z's its z rows;
+            // in_proj_a's and in_proj_b's the control's a and b rows.
+            const auto c = static_cast<std::uint64_t>(gdn_c), vw = static_cast<std::uint64_t>(gdn_vw),
+                       hv = static_cast<std::uint64_t>(gdn_hv);
+            upload(l.gdn_input, [&](const auto& region) {
+                if (layer.gdn_qkv) {
+                    packer.put_a(region(l.gdn_input.a), l.gqkv, *layer.gdn_qkv);
+                    packer.put_b(region(l.gdn_input.b), *layer.gdn_qkv, [](std::uint64_t row) { return row; });
+                }
+                if (layer.gdn_z) {
+                    packer.put_a(region(l.gdn_input.a), l.gz, *layer.gdn_z);
+                    packer.put_b(region(l.gdn_input.b), *layer.gdn_z, [&](std::uint64_t row) { return c + row; });
+                }
+                if (layer.gdn_a) {
+                    packer.put_a(region(l.gdn_input.a), l.ga, *layer.gdn_a);
+                    packer.put_b(region(l.gdn_input.b), *layer.gdn_a, [&](std::uint64_t row) { return c + vw + row; });
+                }
+                if (layer.gdn_b) {
+                    packer.put_a(region(l.gdn_input.a), l.gb, *layer.gdn_b);
+                    packer.put_b(region(l.gdn_input.b), *layer.gdn_b,
+                                 [&](std::uint64_t row) { return c + vw + hv + row; });
+                }
+            });
+        }
+        if (layer.gdn_output) {
+            upload(l.gdn_output, [&](const auto& region) {
+                packer.put_a(region(l.gdn_output.a), 0, *layer.gdn_output);
+                packer.put_b(region(l.gdn_output.b), *layer.gdn_output, [](std::uint64_t row) { return row; });
+            });
+        }
     }
     stage = {};
     const auto at = [&](std::uint64_t offset) -> const void* { return base == nullptr ? nullptr : base + offset; };
@@ -502,6 +613,66 @@ std::uint64_t prepare_lora(const Model& model, TextParameters& text, DeviceBuffe
                 site.addend.segments = 1;
                 site.addend.segment  = {segment(h, 0, scale(layer.down)), {}, {}, {}};
                 dense->lora_down = site;
+            }
+        }
+        if (layer.gdn_input() || layer.gdn_output) {
+            auto* gdn = std::get_if<GdnParameters>(&block.mixer);
+            if (gdn == nullptr) { throw std::logic_error("--lora: linear-attention modules on a non-linear-attention layer"); }
+            const auto c = static_cast<std::int32_t>(gdn_c), vw = static_cast<std::int32_t>(gdn_vw),
+                       hv = static_cast<std::int32_t>(gdn_hv);
+            if (layer.gdn_input()) {
+                if (layer.gdn_projection()) {
+                    if (const auto* single = std::get_if<LinearParameters>(&gdn->projection)) {
+                        if (!ops::gdn_input_proj_lora_supported(single->weight.qtype, single->weight.n,
+                                                                single->weight.k)) {
+                            refuse(i, "linear-attention input projection", single->weight);
+                        }
+                    }
+                }
+                if (layer.gdn_control()) {
+                    // gdn_gating_proj's LoRA form: the BF16 control of 48 heads over 5120 inputs.
+                    const auto* single = std::get_if<LinearParameters>(&gdn->control);
+                    const Weight& w    = single != nullptr ? single->weight
+                                                           : std::get<ops::PairedProjectionWeights>(gdn->control).first;
+                    if (w.qtype != QType::BF16 || w.k != 5120 || hv != 48 || w.n != (single != nullptr ? 2 * hv : hv)) {
+                        refuse(i, "linear-attention control projection", w);
+                    }
+                }
+                LoraSiteParameters site;
+                site.a = {at(l.gdn_input.a), l.gdn_input.a_rows, h};
+                if (layer.gdn_projection()) {
+                    site.addend.b        = at(l.gdn_input.b);
+                    site.addend.rank     = r;
+                    site.addend.u_rows   = l.gdn_input.a_rows;
+                    site.addend.segments = 2;
+                    site.addend.segment  = {segment(c, l.gqkv, scale(layer.gdn_qkv)),
+                                            segment(c + vw, l.gz, scale(layer.gdn_z)), {}, {}};
+                }
+                gdn->lora_input = site;
+                if (layer.gdn_control()) {
+                    ops::LoraAddend control;
+                    control.b        = at(l.gdn_input.b + static_cast<std::uint64_t>(c + vw) * r);
+                    control.rank     = r;
+                    control.u_rows   = l.gdn_input.a_rows;
+                    control.segments = 2;
+                    control.segment  = {segment(hv, l.ga, scale(layer.gdn_a)), segment(2 * hv, l.gb, scale(layer.gdn_b)),
+                                        {}, {}};
+                    gdn->lora_control = control;
+                }
+            }
+            if (layer.gdn_output) {
+                if (!ops::linear_add_lora_supported(gdn->output.weight.qtype, gdn->output.weight.n,
+                                                    gdn->output.weight.k)) {
+                    refuse(i, "linear-attention output projection", gdn->output.weight);
+                }
+                LoraSiteParameters site;
+                site.a               = {at(l.gdn_output.a), r, vw};
+                site.addend.b        = at(l.gdn_output.b);
+                site.addend.rank     = r;
+                site.addend.u_rows   = r;
+                site.addend.segments = 1;
+                site.addend.segment  = {segment(h, 0, scale(layer.gdn_output)), {}, {}, {}};
+                gdn->lora_output = site;
             }
         }
     }

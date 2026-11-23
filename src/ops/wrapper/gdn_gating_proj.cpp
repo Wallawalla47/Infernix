@@ -153,6 +153,34 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, execution);
 }
 
+void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                     const Tensor& dt_bias, const LoraAddend& lora, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    constexpr const char* op  = "gdn_gating_proj";
+    const std::int32_t tokens = x.ne[1];
+    if (a_weight.n != 48 || a_weight.k != 5120) {
+        throw std::invalid_argument("gdn_gating_proj: a LoRA term is registered for the 27B control (48 heads, 5120 inputs)");
+    }
+    require_bf16_weight(a_weight, 48, 5120, "a_weight");
+    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
+    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
+    validate_lora_addend(lora, 96, tokens);
+    detail::bf16_gdn_gating_lora_launch(x, a_weight, b_weight, lora, A_log, dt_bias, g, beta, stream);
+}
+
+void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
+                     const LoraAddend& lora, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    const GdnControlParentGeometry geometry = require_bf16_parent(ab_weight);
+    if (geometry.heads != 48 || geometry.input_rows != 5120) {
+        throw std::invalid_argument("gdn_gating_proj: a LoRA term is registered for the 27B control (48 heads, 5120 inputs)");
+    }
+    gdn_gating_proj(x, bf16_row_view(ab_weight, 0, 48), bf16_row_view(ab_weight, 48, 48), A_log, dt_bias, lora, g,
+                    beta, stream);
+}
+
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, LinearPolicy policy, WorkspaceArena& ws,

@@ -21,7 +21,10 @@ namespace infernix::ops {
  *    value, to the value the kernel hands its epilogue where that value is exactly rounded (an accumulator, an
  *    explicitly rounded product), or to the epilogue's FP32 result (after the residual's add) where the kernel hands it
  *    a product the add may fuse into one FMA. The kernel's own arithmetic is then the no-adapter kernel's: B = 0 gives
- *    its bits. The kernels of one column-invariant route take the term in the same place.
+ *    its bits. The kernels of one column-invariant route take the term in the same place. Two sites run other routes
+ *    when adapted, so B = 0 gives those routes' bits rather than the unadapted model's: a Gated DeltaNet projection's
+ *    decode and verification (the materialized projection, then the convolution) and an adapted Gated DeltaNet control
+ *    (the input norm alone, then gdn_gating_proj's LoRA form over the BF16 h).
  *
  * Canonical arithmetic (every kernel and route computes exactly this, so the adapted model keeps the request
  * invariance of the routes that promise it):
