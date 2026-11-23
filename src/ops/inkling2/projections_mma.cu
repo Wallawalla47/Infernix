@@ -647,13 +647,17 @@ void launch_a8(MmaParams q, const ProjectionArgs& a, cudaStream_t stream) {
     CUDA_CHECK(pdl::launch_consumer(config, kernel, q));
 }
 
-// A8 tile shapes (the same bits in each): calls of up to 16 columns 32 x 16 (two warps of 16 x 16, three stages, four
+// A8 tile shapes (the same bits in each): calls of up to 16 columns 32 x 16 (two warps of 16 x 16, five stages, three
 // CTAs an SM: the weights' stream), up to 128 columns or few-row matrices 64 x 64 (four warps of 32 x 32, two CTAs an
 // SM), wider calls 128 x 128 (eight warps of 64 x 32, two stages).
 template <class Out>
 void launch_a8_shape(const MmaParams& p, const ProjectionArgs& a, bool small, cudaStream_t stream) {
     if (a.columns <= 16) {
-        launch_a8<A8Schedule<32, 16, 16, 16, 3, 4>, Out>(p, a, stream);
+        // 2026-11-23 (decode rounds at context 512, --a8-activations, one / two / three / eight columns): five stages,
+        // three CTAs an SM, so more of K2's, W_o's and the head's weights load before the PDL wait: 4.1129 -> 4.0950 ms,
+        // -0.44 / -0.56 / -0.21 % wider; six stages and two CTAs -0.37 / -0.54 / -0.74 / -0.10 %; 16-row tiles (six or
+        // eight stages, four CTAs) +3 to +9 %.
+        launch_a8<A8Schedule<32, 16, 16, 16, 5, 3>, Out>(p, a, stream);
     } else if (small || a.columns <= 128) {
         launch_a8<A8Schedule<64, 64, 32, 32, 2, 2>, Out>(p, a, stream);
     } else {
@@ -809,9 +813,12 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
     }
 }
 
-// Blocks in flight a warp: kDmmaAhead of BF16 storage, twice as many of Q8 (half the bytes a block); a BF16 launch of at
-// most kDmmaDeepWarps warps (a few tiles: the loop's message-gate downs, 12 tiles of 16 runs) kDmmaDeep, so most of
-// its weights load before the PDL wait, beside the kernel before it, on the few SMs it occupies.
+// Blocks in flight a warp: kDmmaAhead of BF16 storage, kDmmaQ8Ahead of Q8 (half the bytes a block; 12 against 8:
+// 2026-11-23, --q8-weights decode rounds at context 512 -0.79 / -0.37 / -0.59 / -0.28 % at one / two / three / eight
+// columns, 16 +0.09 to +0.46 %); a BF16 launch of at most kDmmaDeepWarps warps (a few tiles: the loop's message-gate
+// downs, 12 tiles of 16 runs) kDmmaDeep, so most of its weights load before the PDL wait, beside the kernel before it,
+// on the few SMs it occupies.
+constexpr int kDmmaQ8Ahead   = 12;
 constexpr int kDmmaDeep      = 8;
 constexpr int kDmmaDeepWarps = 512;
 
@@ -819,7 +826,7 @@ template <int Splits, int NT, class Out>
 void launch_dmma(const MmaParams& p, std::int32_t tiles, cudaStream_t stream) {
     const pdl::LaunchConfig config{dim3(static_cast<unsigned>(tiles)), dim3(Splits * 32), 0, stream};
     if (p.seg[0].codes != nullptr) {
-        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, true, 2 * kDmmaAhead>, p));
+        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, true, kDmmaQ8Ahead>, p));
     } else if (tiles * Splits <= kDmmaDeepWarps) {
         CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, false, kDmmaDeep>, p));
     } else {
