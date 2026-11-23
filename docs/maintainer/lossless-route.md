@@ -352,11 +352,12 @@ or the design reference (3b), one scoring pass per window (`infernix-certify ref
 On Inkling 2 (`Inkling2LoopForCausalLM`; `src/models/inkling2/execution/lossless.cpp`, ProgramOptions::lossless)
 causal scoring takes `--lossless` for text windows with `--kv-dtype bf16` and no fast path: each window runs once
 through LosslessForward, §2b's operations over the window's own columns (`include/infernix/ops/lossless_inkling2.h`),
-from zero conv state, writing nothing to the KV pool or the lanes' images. Attention runs a query head at a time over
-256-column query chunks: the scores are lossless_linear's exact products against the KV head's keys as BF16 weight
-rows, `lossless_inkling2_attention_probs` applies the eager form's roundings, bias, mask and sink in place (each
-probability its quotient's correct rounding, decided in binary64 or else double-double), and the values are their
-exact product with the transposed value plane. The routed experts group each layer's entries by expert into 64-column
+from zero conv state, writing nothing to the KV pool or the lanes' images. Attention runs passes of up to 256 query
+columns (fewer once every head's scores would pass 256 MiB): the three query heads of a KV head are one product's
+columns, their scores lossless_linear's exact products against the KV head's keys as BF16 weight rows;
+`lossless_inkling2_attention_probs` applies the eager form's roundings, bias, mask and sink in place, every head in one
+launch and a block per (head, query column) (each probability its quotient's correct rounding, decided in binary64 or
+else double-double), and the values are their exact product with the KV head's transposed value plane. The routed experts group each layer's entries by expert into 64-column
 tiles of their records (`lossless_linear_tiles`; NVFP4 with `den` as the activation divisor and each column's `outer`
 as its scale, MXFP8 through the `mxfp8_expert_rg16_v1` bank route). `--reference` with `--kv-dtype bf16` rounds each
 visit's V to FP16, as the bf16 profile stores it (`lossless_round_fp16`); the design reference of the coded KV formats

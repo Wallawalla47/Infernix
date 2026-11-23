@@ -1,11 +1,11 @@
 // Inkling 2's --lossless route (lossless.h; docs/maintainer/lossless-route.md §2b): one window, every operation of
 // modeling_inkling2_loop.py on its exact operands, each rounded once to its dtype.
 //
-// Layouts: activations [width, T] with column t the window's position t. Attention runs a query head at a time over
-// chunks of query columns: the scores S (BF16 [keys, chunk]) are lossless_linear's exact products of the head's
-// queries against its KV head's keys (the keys as BF16 weight rows), lossless_inkling2_attention_probs turns them into
-// the eager form's BF16 probabilities in place, and the head's output is their exact product with the values (the
-// transposed value plane as BF16 weight rows), into its rows of o.
+// Layouts: activations [width, T] with column t the window's position t. Attention runs passes of query columns: the
+// scores S (BF16 [keys, heads n], column h n + t) are lossless_linear's exact products of each KV head's three query
+// heads against its keys (the keys as BF16 weight rows), lossless_inkling2_attention_probs turns every head's into the
+// eager form's BF16 probabilities in place, and the outputs are their exact products with each KV head's values (the
+// transposed value plane as BF16 weight rows), into o.
 //
 // Experts: x quantized four-over-six (or MXFP8) per product column (a column per routed entry, the entries grouped by
 // expert into 64-column tiles), the exact gate/up products times amax_e outer / den (NVFP4) rounded to BF16, the
@@ -40,7 +40,8 @@
 namespace infernix::models::inkling2 {
 namespace {
 
-constexpr std::int32_t kQueryChunk  = 256;  // attention's query columns a pass
+constexpr std::int32_t kQueryChunk  = 256;  // attention's query columns a pass, at most
+constexpr std::size_t kScoreBytes   = std::size_t{256} << 20U; // a pass's scores of every head, at most
 constexpr std::int32_t kExpertChunk = 1024; // the experts' product columns a pass (whole tiles)
 constexpr int kTile                 = 64;
 
@@ -75,6 +76,12 @@ Weight bf16_rows(const void* data, std::int32_t k, std::int32_t n) {
     return w;
 }
 
+// The query columns of one attention pass over key planes of `keys` columns: every head's scores in kScoreBytes.
+std::int32_t query_chunk(std::int32_t keys, std::int32_t heads) {
+    const std::size_t most = kScoreBytes / (static_cast<std::size_t>(keys) * heads * 2);
+    return static_cast<std::int32_t>(std::clamp<std::size_t>(most, 1, kQueryChunk));
+}
+
 std::uint32_t float_bits(float f) {
     std::uint32_t u;
     std::memcpy(&u, &f, 4);
@@ -98,17 +105,24 @@ std::size_t LosslessForward::device_bytes(const TextConfig& c, std::int32_t max_
     visit += 2 * H * T * 2 + 64 * T * 2 + 2 * H * T * 4; // a message gate's scratch
     visit += 3 * H * T * 2;                         // x_q, x_k, x_v
     visit += (2 * Q + R + c.heads) * T * 2 + (4 * K + 2 * c.kv_heads * c.conv_kernel) * Th * 2; // projections, convs
-    visit += Q * T * 2 + 2 * K * Kc * 2;            // the head planes
-    visit += Kc * kQueryChunk * 2;                  // a head's scores
-    visit += 2 * Q * T * 2 + 2 * H * Th * 2;        // o, the gated o, W_o's output, the conv
+    visit += Q * T * 2 + 2 * K * Kc * 2;            // a pass's queries by head, the key and value planes
+    visit += std::min(kScoreBytes, Kc * c.heads * kQueryChunk * 2); // a pass's scores of every head
+    visit += 3 * Q * T * 2 + 2 * H * Th * 2;        // o, by head and gated, W_o's output, the conv
     visit += 3 * H * T * 4 + H * T * 2 + E * T * 4 + 2 * k * T * 4; // rho, the MLP mix, x, the router
     visit += H * (k * T + E * kTile) * 2;           // the experts' outputs by entry
     visit += (H + 3 * I) * kExpertChunk * 2 + 2 * kExpertChunk * 4 + (k * T / kTile + E + 1) * 64 * 16;
     visit += 2 * H * Th * 2;                        // the combine, the post-MLP conv
     // lossless_linear's workspaces: the projections 512 columns at a time, the scores and value sums over the planes.
-    const auto D = static_cast<std::int32_t>(c.head_dim);
-    const std::size_t attention = std::max(ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, D, keys), keys, kQueryChunk),
-                                           ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, keys, D), D, kQueryChunk));
+    // A KV head's three query heads share a call: its columns peak where the pass stops being cut by kScoreBytes.
+    const auto D = static_cast<std::int32_t>(c.head_dim), heads = static_cast<std::int32_t>(c.heads);
+    const std::int32_t group = heads / static_cast<std::int32_t>(c.kv_heads);
+    const auto widest = round_up(static_cast<std::int32_t>(kScoreBytes / (static_cast<std::size_t>(heads) * 2 * kQueryChunk)), kTile);
+    std::size_t attention = 0;
+    for (const std::int32_t planes : {keys, std::min(keys, widest)}) {
+        const std::int32_t columns = group * query_chunk(planes, heads);
+        attention = std::max({attention, ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, D, planes), planes, columns),
+                              ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, planes, D), D, columns)});
+    }
     const std::size_t linear = std::max<std::size_t>(512ULL << 20, attention);
     return persistent + visit + linear + (64ULL << 20);
 }
@@ -559,13 +573,11 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
         // The design reference: V as the bf16 profile stores it (FP16 words, sliding rings and full pools alike).
         if (reference_) { ops::lossless_round_fp16(rows, stream); }
     }
-    // Head planes: queries head-major [heads][T][D], keys head-major [kv][Tp][D] and values transposed [kv][D][Tp]
-    // (the keys before the call, then the call's), zero beyond them.
-    Tensor qh = arena_->alloc(DType::BF16, {D, T, heads});
+    // Head planes: keys head-major [kv][Tp][D] and values transposed [kv][D][Tp] (the keys before the call, then the
+    // call's), zero beyond them.
     Tensor kh = arena_->alloc(DType::BF16, {D, Tp, kv}), vt = arena_->alloc(DType::BF16, {Tp, D, kv});
     CUDA_CHECK(cudaMemsetAsync(kh.data, 0, kh.bytes(), stream));
     CUDA_CHECK(cudaMemsetAsync(vt.data, 0, vt.bytes(), stream));
-    ops::lossless_inkling2_heads(q, heads, false, T, qh, stream);
     {
         Tensor kh_call = kh, vt_call = vt;
         kh_call.data = static_cast<std::uint16_t*>(kh.data) + static_cast<std::size_t>(before) * D;
@@ -581,40 +593,56 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
     Tensor o = arena_->alloc(DType::BF16, {Q, T});
     Tensor table = matrix(a.layer.relative_table, DType::BF16, rel, static_cast<std::int32_t>(c_.relative_extent));
     const float scale = static_cast<float>(std::pow(static_cast<double>(D), -0.5));
-    for (std::int32_t t0 = 0; t0 < T; t0 += kQueryChunk) {
-        const std::int32_t n = std::min(kQueryChunk, T - t0);
+    // A pass of query columns: the query heads of one KV head (`group` of them, consecutive) are one product's columns
+    // against its keys and one against its values, and every head's probabilities one launch.
+    const std::int32_t group = heads / kv, chunk = query_chunk(Tp, heads);
+    for (std::int32_t t0 = 0; t0 < T; t0 += chunk) {
+        const std::int32_t n = std::min(chunk, T - t0);
         const std::int32_t keys = round_up(before + t0 + n, kTile); // the keys the chunk's queries can see
         auto inner = arena_->scope();
-        Tensor s = arena_->alloc(DType::BF16, {Tp, n});
+        // The pass's queries head-major ([heads][n][D]) and its scores ([heads n][Tp], column h n + t).
+        Tensor qc = arena_->alloc(DType::BF16, {D, n, heads});
+        {
+            const Tensor q_chunk = columns_of(q, t0, n);
+            ops::lossless_inkling2_heads(q_chunk, heads, false, n, qc, stream);
+        }
+        Tensor s = arena_->alloc(DType::BF16, {Tp, heads * n});
         Tensor o_chunk = columns_of(o, t0, n);
         Tensor rel_chunk = columns_of(r, t0, n), sink_chunk = columns_of(sink, t0, n);
-        for (std::int32_t hq = 0; hq < heads; ++hq) {
-            const std::int32_t g = hq / (heads / kv);
-            Tensor x = matrix(static_cast<std::uint16_t*>(qh.data) + (static_cast<std::size_t>(hq) * T + t0) * D,
-                              DType::BF16, D, n);
+        for (std::int32_t g = 0; g < kv; ++g) {
+            Tensor x = matrix(static_cast<std::uint16_t*>(qc.data) + static_cast<std::size_t>(g) * group * n * D, DType::BF16, D,
+                              group * n);
             const Weight kw = bf16_rows(static_cast<std::uint16_t*>(kh.data) + static_cast<std::size_t>(g) * Tp * D, D, keys);
-            {
-                auto ws = arena_->scope();
-                ops::lossless_linear(x, kw, 0, keys, s, 0, *arena_, stream);
-            }
-            ops::LosslessInkling2Probs pa;
-            pa.scores      = &s;
-            pa.ld          = Tp;
-            pa.keys        = Tp;
-            pa.query_begin = before + t0; // plane column j is position from + j, the query at column t position first + t
-            pa.head        = hq;
-            pa.heads       = heads;
-            pa.relative    = &rel_chunk;
-            pa.table       = &table;
-            pa.sinks       = &sink_chunk;
-            pa.window      = window;
-            pa.scale       = scale;
-            ops::lossless_inkling2_attention_probs(pa, stream);
+            Tensor s_g = columns_of(s, g * group * n, group * n);
+            auto ws    = arena_->scope();
+            ops::lossless_linear(x, kw, 0, keys, s_g, 0, *arena_, stream);
+        }
+        ops::LosslessInkling2Probs pa;
+        pa.scores      = &s;
+        pa.ld          = Tp;
+        pa.keys        = Tp;
+        pa.query_begin = before + t0; // plane column j is position from + j, the query at column t position first + t
+        pa.head        = 0;
+        pa.head_count  = heads;
+        pa.heads       = heads;
+        pa.relative    = &rel_chunk;
+        pa.table       = &table;
+        pa.sinks       = &sink_chunk;
+        pa.window      = window;
+        pa.scale       = scale;
+        ops::lossless_inkling2_attention_probs(pa, stream);
+        // The value products head-major ([heads n][D]); one query column's are o's own rows.
+        Tensor oh = n == 1 ? matrix(o_chunk.data, DType::BF16, D, heads) : arena_->alloc(DType::BF16, {D, heads * n});
+        for (std::int32_t g = 0; g < kv; ++g) {
+            Tensor s_g = columns_of(s, g * group * n, group * n), o_g = columns_of(oh, g * group * n, group * n);
             const Weight vw = bf16_rows(static_cast<std::uint16_t*>(vt.data) + static_cast<std::size_t>(g) * D * Tp, Tp, D);
-            {
-                auto ws = arena_->scope();
-                ops::lossless_linear(s, vw, 0, D, o_chunk, hq * D, *arena_, stream);
-            }
+            auto ws         = arena_->scope();
+            ops::lossless_linear(s_g, vw, 0, D, o_g, 0, *arena_, stream);
+        }
+        if (n > 1) {
+            // [heads][n][D] to o's [n][heads][D]: the same copy with the two indices' roles exchanged.
+            const Tensor by_head = matrix(oh.data, DType::BF16, D * n, heads);
+            ops::lossless_inkling2_heads(by_head, n, false, heads, o_chunk, stream);
         }
     }
     // The gated output projection and the post-attention convolution.

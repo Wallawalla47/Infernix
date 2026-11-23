@@ -318,33 +318,42 @@ def add_cases(rng):
 
 
 def probs_cases(rng):
-    rel, heads, extent = 16, 3, 40
-    for keys, ld, T, begin, window, head in ((70, 128, 5, 60, 0, 1), (70, 128, 4, 30, 16, 2), (256, 256, 3, 250, 0, 0)):
-        scores = [random_bf16(rng, 2) for _ in range(ld * T)]
+    rel = 16
+    # keys, ld, query columns T, first query position, window, first head, heads in the call, heads, extent: the small
+    # shapes, then the real geometry (24 heads, extent 1,024; a sliding visit's 1,024-key window and a full visit's keys,
+    # one and eight query columns), 256 query columns, visible keys past one block with a partial last warp, lo > 0.
+    for keys, ld, T, begin, window, head, count, heads, extent in (
+            (70, 128, 5, 60, 0, 1, 1, 3, 40), (70, 128, 4, 30, 16, 2, 1, 3, 40), (256, 256, 3, 250, 0, 0, 1, 3, 40),
+            (2048, 2048, 1, 2047, 1024, 0, 24, 24, 1024), (2048, 2048, 1, 1500, 0, 5, 3, 24, 1024),
+            (1088, 1088, 8, 1000, 1024, 0, 3, 24, 1024), (320, 320, 256, 40, 0, 2, 1, 3, 40),
+            (1000, 1100, 2, 700, 300, 1, 2, 3, 40), (513, 600, 1, 512, 0, 0, 1, 3, 40), (257, 300, 1, 256, 0, 0, 3, 3, 40)):
+        columns = T * count
+        scores = [random_bf16(rng, 2) for _ in range(ld * columns)]
         r = [random_bf16(rng, 1) for _ in range(rel * heads * T)]
         table = [random_bf16(rng, 1) for _ in range(rel * extent)]
         sinks = [random_bf16(rng, 1) for _ in range(heads * T)]
         scale = f32(128 ** -0.5)
         out = []
-        for t in range(T):
+        for column in range(columns):
+            t, head_c = column % T, head + column // T
             P = begin + t
             lo = max(0, P - window + 1) if window > 0 else 0
             hi = min(P, keys - 1)
             logits = []
             for j in range(lo, hi + 1):
-                a = bf(Fraction(scores[t * ld + j]) * Fraction(scale))
+                a = bf(Fraction(scores[column * ld + j]) * Fraction(scale))
                 d = P - j
                 if d < extent:
-                    rr = r[(t * heads + head) * rel:(t * heads + head + 1) * rel]
+                    rr = r[(t * heads + head_c) * rel:(t * heads + head_c + 1) * rel]
                     b = bf(sum((Fraction(f32(rc * table[c * extent + d])) for c, rc in enumerate(rr)), Fraction(0)))
                     a = bf(Fraction(a) + Fraction(b))
                 logits.append(a)
-            p = softmax_f32(logits + [sinks[t * heads + head]])[:-1]
+            p = softmax_f32(logits + [sinks[t * heads + head_c]])[:-1]
             row = [0.0] * ld
             for j, pj in zip(range(lo, hi + 1), p):
                 row[j] = bf(pj)
-            out += row[:keys] + scores[t * ld + keys:(t + 1) * ld]
-        yield (PROBS, [keys, ld, T, begin, window, head, heads, rel, extent, f32_bits(scale)],
+            out += row[:keys] + scores[column * ld + keys:(column + 1) * ld]
+        yield (PROBS, [keys, ld, T, begin, window, head, heads, rel, extent, f32_bits(scale), count],
                [u16(scores), u16(r), u16(table), u16(sinks)], u16(out))
 
 

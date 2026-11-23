@@ -415,11 +415,13 @@ __global__ void softcap_kernel(const float* x, float cap, float* out, std::int64
 
 // ---------------------------------------------------------------------------------------------- attention probs
 
-constexpr int kMaxRelative = 32;
+constexpr int kMaxRelative  = 32;
+constexpr int kProbsThreads = 256;
+constexpr int kProbsWarps   = kProbsThreads / 32;
 
 struct ProbsArgs {
     std::uint16_t* scores;
-    int ld, keys, query_begin, head, heads, columns;
+    int ld, keys, query_begin, head, heads, columns, query_columns; // columns: head_count * query_columns
     const std::uint16_t* relative; // [rel][heads][T]: column t's head h at (t heads + h) rel
     int rel, rel_ld;
     const std::uint16_t* table; // [rel][extent]
@@ -444,23 +446,64 @@ __device__ __forceinline__ float relative_bias(const float (&r)[kMaxRelative], i
     return bf16_bits_float(static_cast<std::uint16_t>(round_magnitude(mag, -150, negative, true)));
 }
 
-// One warp a query column.
-__global__ void probs_kernel(ProbsArgs a) {
-    const int t    = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    if (t >= a.columns) { return; }
-    std::uint16_t* row = a.scores + static_cast<std::size_t>(t) * a.ld;
+// The block's OR, largest value and double-double sum of per-thread values (every thread calls them; `scratch` holds
+// one entry a warp). The warps' partial sums are added in warp order: a sum of positive terms in double-double keeps a
+// relative error below 2^-103 an addition whatever its tree.
+__device__ __forceinline__ bool block_any(bool v, int* scratch) {
+    v = __any_sync(0xFFFFFFFFU, v);
+    if ((threadIdx.x & 31) == 0) { scratch[threadIdx.x >> 5] = v ? 1 : 0; }
+    __syncthreads();
+    bool out = false;
+    for (int w = 0; w < kProbsWarps; ++w) { out = out || scratch[w] != 0; }
+    __syncthreads();
+    return out;
+}
+
+__device__ __forceinline__ float block_max(float m, float* scratch) {
+    for (int o = 16; o > 0; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFU, m, o)); }
+    if ((threadIdx.x & 31) == 0) { scratch[threadIdx.x >> 5] = m; }
+    __syncthreads();
+    for (int w = 0; w < kProbsWarps; ++w) { m = fmaxf(m, scratch[w]); }
+    __syncthreads();
+    return m;
+}
+
+__device__ __forceinline__ DD block_dd_sum(DD s, double* scratch_hi, double* scratch_lo) {
+    for (int o = 16; o > 0; o >>= 1) {
+        const DD other = {__shfl_xor_sync(0xFFFFFFFFU, s.hi, o), __shfl_xor_sync(0xFFFFFFFFU, s.lo, o)};
+        s              = lossless::dd_add(s, other);
+    }
+    if ((threadIdx.x & 31) == 0) {
+        scratch_hi[threadIdx.x >> 5] = s.hi;
+        scratch_lo[threadIdx.x >> 5] = s.lo;
+    }
+    __syncthreads();
+    DD out = {scratch_hi[0], scratch_lo[0]};
+    for (int w = 1; w < kProbsWarps; ++w) { out = lossless::dd_add(out, DD{scratch_hi[w], scratch_lo[w]}); }
+    __syncthreads();
+    return out;
+}
+
+// One CTA per (head, query column), its visible keys across the block's threads.
+__global__ void __launch_bounds__(kProbsThreads) probs_kernel(ProbsArgs a) {
+    __shared__ int shared_flag[kProbsWarps];
+    __shared__ float shared_max[kProbsWarps];
+    __shared__ double shared_hi[kProbsWarps], shared_lo[kProbsWarps];
+    const int c      = static_cast<int>(blockIdx.x);
+    const int t      = c % a.query_columns, head = a.head + c / a.query_columns;
+    const int lane   = static_cast<int>(threadIdx.x);
+    std::uint16_t* row = a.scores + static_cast<std::size_t>(c) * a.ld;
     const int P = a.query_begin + t;
     const int lo = a.window > 0 ? max(0, P - a.window + 1) : 0, hi = min(P, a.keys - 1); // visible keys [lo, hi]
     float r[kMaxRelative];
-    for (int c = 0; c < a.rel; ++c) {
-        r[c] = bf16_bits_float(a.relative[static_cast<std::size_t>(t) * a.rel_ld + static_cast<std::size_t>(a.head) * a.rel + c]);
+    for (int i = 0; i < a.rel; ++i) {
+        r[i] = bf16_bits_float(a.relative[static_cast<std::size_t>(t) * a.rel_ld + static_cast<std::size_t>(head) * a.rel + i]);
     }
     // Pass 1: the scaled, biased logits in place; their maximum.
-    float m      = bf16_bits_float(a.sinks[static_cast<std::size_t>(t) * a.sink_ld + a.head]);
+    float m      = bf16_bits_float(a.sinks[static_cast<std::size_t>(t) * a.sink_ld + head]);
     const float sink = m;
     bool nan     = isnan(m);
-    for (int j = lo + lane; j <= hi; j += 32) {
+    for (int j = lo + lane; j <= hi; j += kProbsThreads) {
         const double prod = static_cast<double>(bf16_bits_float(row[j])) * static_cast<double>(a.scale); // exact
         float v           = bf16_bits_float(lossless::bf16_rne_of_double(prod));
         const int d       = P - j;
@@ -472,51 +515,46 @@ __global__ void probs_kernel(ProbsArgs a) {
         nan    = nan || isnan(v);
         m      = fmaxf(m, v);
     }
-    nan = __any_sync(0xFFFFFFFFU, nan);
-    for (int o = 16; o > 0; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFU, m, o)); }
+    nan = block_any(nan, shared_flag);
+    m   = block_max(m, shared_max);
     const bool invalid = nan || isinf(m);
     // Pass 2: the sum of exponentials in double-double (each term within an ulp of binary64).
     DD s = {0.0, 0.0};
     if (!invalid) {
-        for (int j = lo + lane; j <= hi; j += 32) {
+        for (int j = lo + lane; j <= hi; j += kProbsThreads) {
             const double d = static_cast<double>(bf16_bits_float(row[j])) - static_cast<double>(m);
             s              = lossless::dd_add(s, {d < -745.0 ? 0.0 : exp(d), 0.0});
         }
-        for (int o = 16; o > 0; o >>= 1) {
-            const DD other = {__shfl_xor_sync(0xFFFFFFFFU, s.hi, o), __shfl_xor_sync(0xFFFFFFFFU, s.lo, o)};
-            s              = lossless::dd_add(s, other);
-        }
+        s = block_dd_sum(s, shared_hi, shared_lo);
         const double ds = static_cast<double>(sink) - static_cast<double>(m);
         s               = lossless::dd_add(s, {ds < -745.0 ? 0.0 : exp(ds), 0.0});
     }
     // Pass 3: each probability decided in binary64 (relative error below 2^-50: an ulp of the term, an ulp of the
-    // sum, the quotient's rounding); a row with an undecided one has all its quotients redone in double-double.
+    // sum, the quotient's rounding; the double-double sum's own error, at most 2^20 additions of 2^-103, is far below
+    // them); a row with an undecided one has all its quotients redone in double-double.
     const double S = s.hi + s.lo;
     bool undecided = false;
     if (!invalid) {
-        for (int j = lo + lane; j <= hi; j += 32) {
+        for (int j = lo + lane; j <= hi; j += kProbsThreads) {
             const double d = static_cast<double>(bf16_bits_float(row[j])) - static_cast<double>(m);
             const double q = (d < -745.0 ? 0.0 : exp(d)) / S;
             float p;
             undecided = undecided || !lossless::certain_f32(q, q * 0x1p-50, p);
         }
     }
-    undecided = __any_sync(0xFFFFFFFFU, undecided) || g_force_fallback;
+    undecided = block_any(undecided, shared_flag) || g_force_fallback;
     DD sd     = {0.0, 0.0};
     if (undecided && !invalid) {
-        for (int j = lo + lane; j <= hi; j += 32) {
+        for (int j = lo + lane; j <= hi; j += kProbsThreads) {
             const double d = static_cast<double>(bf16_bits_float(row[j])) - static_cast<double>(m);
             sd             = lossless::dd_add(sd, d < -700.0 ? DD{0.0, 0.0} : lossless::dd_exp(d));
         }
-        for (int o = 16; o > 0; o >>= 1) {
-            const DD other = {__shfl_xor_sync(0xFFFFFFFFU, sd.hi, o), __shfl_xor_sync(0xFFFFFFFFU, sd.lo, o)};
-            sd             = lossless::dd_add(sd, other);
-        }
+        sd = block_dd_sum(sd, shared_hi, shared_lo);
         const double ds = static_cast<double>(sink) - static_cast<double>(m);
         sd              = lossless::dd_add(sd, ds < -700.0 ? DD{0.0, 0.0} : lossless::dd_exp(ds));
     }
     // Pass 4: the probabilities (BF16 of the binary32 rounding), zeros off the visible keys.
-    for (int j = lane; j < a.keys; j += 32) {
+    for (int j = lane; j < a.keys; j += kProbsThreads) {
         if (j < lo || j > hi) {
             row[j] = 0;
             continue;
@@ -935,7 +973,9 @@ void lossless_inkling2_attention_probs(const LosslessInkling2Probs& a, cudaStrea
     const int rel = static_cast<int>(a.table->ne[0]);
     require(rel <= kMaxRelative && a.relative->ne[0] == static_cast<std::int64_t>(rel) * a.heads,
             "attention probs: relative states [rel heads, T] with rel <= 32");
-    require(a.head >= 0 && a.head < a.heads && a.sinks->ne[0] == a.heads && a.keys <= a.ld, "attention probs: shapes");
+    require(a.head >= 0 && a.head_count > 0 && a.head + a.head_count <= a.heads && a.sinks->ne[0] == a.heads &&
+                a.keys <= a.ld && a.scores->ne[1] % a.head_count == 0,
+            "attention probs: shapes");
     ProbsArgs p{};
     p.scores      = static_cast<std::uint16_t*>(a.scores->data);
     p.ld          = a.ld;
@@ -944,6 +984,7 @@ void lossless_inkling2_attention_probs(const LosslessInkling2Probs& a, cudaStrea
     p.head        = a.head;
     p.heads       = a.heads;
     p.columns     = static_cast<int>(a.scores->ne[1]);
+    p.query_columns = p.columns / a.head_count;
     p.relative    = static_cast<const std::uint16_t*>(a.relative->data);
     p.rel         = rel;
     p.rel_ld      = column_stride(*a.relative);
@@ -953,9 +994,10 @@ void lossless_inkling2_attention_probs(const LosslessInkling2Probs& a, cudaStrea
     p.sink_ld     = column_stride(*a.sinks);
     p.window      = a.window;
     p.scale       = a.scale;
-    require(a.relative->ne[1] >= p.columns && a.sinks->ne[1] >= p.columns, "attention probs: a relative row and sink a column");
+    require(a.relative->ne[1] >= p.query_columns && a.sinks->ne[1] >= p.query_columns,
+            "attention probs: a relative row and sink a query column");
     if (p.columns == 0) { return; }
-    probs_kernel<<<(p.columns + 7) / 8, 256, 0, stream>>>(p);
+    probs_kernel<<<p.columns, kProbsThreads, 0, stream>>>(p);
     CUDA_CHECK(cudaGetLastError());
 }
 

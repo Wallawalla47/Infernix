@@ -233,11 +233,11 @@ INFERNIX_OP_TEST(lossless_inkling2) {
             got = o32 ? download32(out, n) : download16(out, n);
             break;
         }
-        case 8: { // probs: keys, ld, T, begin, window, head, heads, rel, extent, scale
-            const int keys = I(0), ld = I(1), T = I(2), heads = I(6), rel = I(7), extent = I(8);
+        case 8: { // probs: keys, ld, T, begin, window, head, heads, rel, extent, scale, heads in the call
+            const int keys = I(0), ld = I(1), T = I(2), heads = I(6), rel = I(7), extent = I(8), count = I(10);
             DeviceBuffer s = upload16(inputs[0]), r = upload16(inputs[1]), tab = upload16(inputs[2]), sk = upload16(inputs[3]);
-            Tensor ts(s.p, DType::BF16, {ld, T}), tr(r.p, DType::BF16, {rel * heads, T}), tt(tab.p, DType::BF16, {rel, extent}),
-                tk(sk.p, DType::BF16, {heads, T});
+            Tensor ts(s.p, DType::BF16, {ld, T * count}), tr(r.p, DType::BF16, {rel * heads, T}),
+                tt(tab.p, DType::BF16, {rel, extent}), tk(sk.p, DType::BF16, {heads, T});
             ops::LosslessInkling2Probs a;
             a.scores      = &ts;
             a.ld          = ld;
@@ -245,6 +245,7 @@ INFERNIX_OP_TEST(lossless_inkling2) {
             a.query_begin = I(3);
             a.window      = I(4);
             a.head        = I(5);
+            a.head_count  = count;
             a.heads       = heads;
             a.relative    = &tr;
             a.table       = &tt;
@@ -252,7 +253,7 @@ INFERNIX_OP_TEST(lossless_inkling2) {
             a.scale       = bits_float(d[9]);
             ops::lossless_inkling2_attention_probs(a, nullptr);
             CUDA_CHECK(cudaDeviceSynchronize());
-            got = download16(s, static_cast<std::size_t>(ld) * T);
+            got = download16(s, static_cast<std::size_t>(ld) * T * count);
             break;
         }
         case 9: { // router: E, k, T, scaling

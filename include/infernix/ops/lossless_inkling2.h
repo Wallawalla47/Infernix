@@ -83,13 +83,14 @@ void lossless_inkling2_add(const Tensor& a, const Tensor& b, Tensor& out, cudaSt
 void lossless_inkling2_convert(const Tensor& x, Tensor& out, cudaStream_t stream);
 
 /**
- * One head's attention probabilities in the eager form (eager_attention_forward with position_bias and sinks), in
- * place: scores (BF16, column t of query position P_t = query_begin + t, row j the key at position j, j < keys; its
- * columns `ld` apart) holds a_j = bf16(q . k_j) and receives p_j (0 off the visible keys): a = bf16(fp32 a s)
- * (s = fp32(scale)), a = bf16(a + B(d)) for d = P_t - j < extent with B(d) = bf16(sum_c r_c table[c, d]) (r BF16
- * [rel, heads, T] the head's relative states at column t, table BF16 [rel, extent]; the sum exact), then softmax over
- * the visible keys (j <= P_t, and P_t - j < window when window > 0) and the sink (sinks BF16 [heads, T]):
- * p_j = bf16(fp32(softmax_j)), each the correctly rounded quotient.
+ * The attention probabilities of `head_count` consecutive heads from `head` in the eager form
+ * (eager_attention_forward with position_bias and sinks), in place: scores (BF16, its columns `ld` apart) holds the
+ * heads' query columns head-major, column (h - head) T + t that of head h and query position P_t = query_begin + t,
+ * row j the key at position j, j < keys; it holds a_j = bf16(q . k_j) and receives p_j (0 off the visible keys):
+ * a = bf16(fp32 a s) (s = fp32(scale)), a = bf16(a + B(d)) for d = P_t - j < extent with B(d) = bf16(sum_c r_c
+ * table[c, d]) (r BF16 [rel, heads, T] the head's relative states at column t, table BF16 [rel, extent]; the sum exact),
+ * then softmax over the visible keys (j <= P_t, and P_t - j < window when window > 0) and the sink (sinks BF16
+ * [heads, T]): p_j = bf16(fp32(softmax_j)), each the correctly rounded quotient.
  */
 struct LosslessInkling2Probs {
     Tensor* scores        = nullptr;
@@ -97,6 +98,7 @@ struct LosslessInkling2Probs {
     int keys              = 0;
     int query_begin       = 0;
     int head              = 0;
+    int head_count        = 1;
     int heads             = 0;
     const Tensor* relative = nullptr;
     const Tensor* table   = nullptr;
