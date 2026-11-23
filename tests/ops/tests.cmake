@@ -612,6 +612,7 @@ infernix_add_family_op_test(infernix_inkling2_canon_test FAMILY inkling2
 
 # Inkling 2's routed experts at [128, 2304, 1152] in both arithmetics: NVFP4 equals the exact pinned arithmetic bit for
 # bit, both within 2^-6 of an FP64 chain, column invariance (T = 1 against T = 32), and no state across calls.
+# A16 and A8 (--a8-activations: NVFP4 x int8) bit for bit their orders, the A8 prompt route the narrow route's bits.
 infernix_add_family_op_test(infernix_w4a4_sparse_moe_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_w4a4_sparse_moe.cu"
   LIBRARIES infernix_ops)
@@ -624,6 +625,7 @@ infernix_add_family_op_test(infernix_inkling2_visit_test FAMILY inkling2
   LIBRARIES infernix_ops)
 
 # Inkling 2's fused projections bit for bit ops::linear's BF16 route on one visit's real shapes, widths 1-40.
+# Q8 storage within FP64 bounds; 8-bit inputs (x8) bit for bit their order, every width and tile shape.
 infernix_add_family_op_test(infernix_inkling2_projections_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_projections.cu"
   LIBRARIES infernix_ops)

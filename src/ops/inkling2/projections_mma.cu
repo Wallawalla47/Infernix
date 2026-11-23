@@ -12,12 +12,16 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "core/tensor.h"
 #include "ops/common/dynamic_shared.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/ggml/ggml_a8_mma.cuh"
+#include "ops/ggml/ggml_linear_a8.h"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -41,6 +45,8 @@ struct MmaSegment {
     const std::uint8_t* codes   = nullptr;
     const std::uint16_t* scales = nullptr;
     std::int32_t stride         = 0;
+    // A8 (with Q8 storage): the input's encoded columns (a8_encode_columns), MmaParams::x8_stride words apart.
+    const std::int32_t* x8 = nullptr;
 };
 
 // A Q8 stage's weights: codes [BM][kQ8Row] (64 a row used; the padding spreads the fragment rows over the banks) and
@@ -53,6 +59,7 @@ struct MmaParams {
     std::int32_t count;
     std::int32_t k;
     std::int32_t columns;
+    std::int32_t x8_stride = 0; // A8: words between encoded columns
 };
 
 template <int BM, int BN, int WM, int WN, int S, int MinBlocks>
@@ -60,10 +67,14 @@ using Schedule = d::Bf16A16MmaSchedule<BM, BN, 64, WM, WN, S, MinBlocks, Cache::
                                        d::Bf16MmaFragmentPipeline::PingPong, d::Bf16MmaRaster::TokenFast,
                                        d::Bf16MmaSwizzle::Xor64>;
 
-// The output tile staged as FP32 [BN][BM + 4] (the padding spreads a fragment's 8 rows over the banks).
+// The output tile staged as FP32 [BN][BM + 4] (the padding spreads a fragment's 8 rows over the banks), in one pass or,
+// a tile wider than kStagingLimit allows, two passes of half its columns.
+constexpr int kStagingLimit = 96 * 1024;
+template <class Sched>
+inline constexpr int kStorePasses = Sched::kBlockTokens * (Sched::kBlockRows + 4) * 4 <= kStagingLimit ? 1 : 2;
 template <class Sched>
 constexpr int staging_bytes() {
-    return Sched::kBlockTokens * (Sched::kBlockRows + 4) * 4;
+    return Sched::kBlockTokens / kStorePasses<Sched> * (Sched::kBlockRows + 4) * 4;
 }
 template <class Sched>
 constexpr int shared_bytes() {
@@ -132,6 +143,77 @@ __device__ __forceinline__ void q8_compute_stage(const std::uint8_t* codes, cons
                 accum[mi][ni][1] = fmaf(tmp[mi][ni][1], s0, accum[mi][ni][1]);
                 accum[mi][ni][2] = fmaf(tmp[mi][ni][2], s1, accum[mi][ni][2]);
                 accum[mi][ni][3] = fmaf(tmp[mi][ni][3], s1, accum[mi][ni][3]);
+            }
+        }
+    }
+}
+
+// The tile through shared memory (every copy landed and every thread past its reads): FP32 [BN][BM + 4], then 16-byte
+// rows of the [T][rows] output. Accumulator (mi, ni, q) of warp (wm, wn): row wm WM + 16 mi + g + 8 (q >> 1), column
+// wn WN + 8 ni + 2t + (q & 1).
+template <class Sched, class Out>
+__device__ __forceinline__ void store_tile(unsigned char* shared_raw,
+                                           const float (&accum)[Sched::kMmaRows][Sched::kMmaTokens][4],
+                                           const MmaSegment& seg, int m0, int n0, int T) {
+    constexpr int BM = Sched::kBlockRows, BN = Sched::kBlockTokens, THREADS = Sched::kThreads, LD = BM + 4;
+    constexpr int kPasses = kStorePasses<Sched>, CW = BN / kPasses; // columns a pass stages
+    static_assert(Sched::kWarpsTokens % kPasses == 0, "a pass stages whole warps' columns");
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int M      = seg.rows;
+    float* tile_out  = reinterpret_cast<float*>(shared_raw);
+    const int wm = warp / Sched::kWarpsTokens, wn = warp % Sched::kWarpsTokens;
+    const int g = lane >> 2, t = lane & 3;
+    constexpr int kPer = std::is_same_v<Out, float> ? 4 : 8; // values a 16-byte store
+    constexpr int kChunks = BM / kPer;
+    Out* out = static_cast<Out*>(seg.out);
+#pragma unroll 1
+    for (int pass = 0; pass < kPasses; ++pass) {
+        if (pass > 0) { __syncthreads(); } // the previous pass's stores have read the staging
+        if (wn * Sched::kWarpTokens / CW == pass) {
+#pragma unroll
+            for (int mi = 0; mi < Sched::kMmaRows; ++mi) {
+#pragma unroll
+                for (int ni = 0; ni < Sched::kMmaTokens; ++ni) {
+                    const int r = wm * Sched::kWarpRows + mi * 16 + g;
+                    const int c = wn * Sched::kWarpTokens + ni * 8 + 2 * t - pass * CW;
+                    tile_out[c * LD + r]           = accum[mi][ni][0];
+                    tile_out[(c + 1) * LD + r]     = accum[mi][ni][1];
+                    tile_out[c * LD + r + 8]       = accum[mi][ni][2];
+                    tile_out[(c + 1) * LD + r + 8] = accum[mi][ni][3];
+                }
+            }
+        }
+        __syncthreads();
+        const int c0 = n0 + pass * CW;
+        // Output rows of a 16-byte multiple from a 16-byte aligned start take 16-byte stores; others (the head's FP32
+        // logits rows) one value a store.
+        const bool vector = (static_cast<std::size_t>(M) * sizeof(Out)) % 16 == 0 &&
+                            reinterpret_cast<std::uintptr_t>(seg.out) % 16 == 0;
+#pragma unroll 1
+        for (int item = tid; item < CW * kChunks; item += THREADS) {
+            const int c = item / kChunks, r = (item - c * kChunks) * kPer;
+            if (c0 + c >= T || m0 + r >= M) { continue; }
+            const float* v = tile_out + c * LD + r;
+            Out* dst       = out + static_cast<std::size_t>(c0 + c) * M + m0 + r;
+            if (!vector) {
+                for (int i = 0; i < kPer && m0 + r + i < M; ++i) {
+                    if constexpr (std::is_same_v<Out, float>) {
+                        dst[i] = v[i];
+                    } else {
+                        dst[i] = __float2bfloat16_rn(v[i]);
+                    }
+                }
+            } else if constexpr (std::is_same_v<Out, float>) {
+                *reinterpret_cast<float4*>(dst) = make_float4(v[0], v[1], v[2], v[3]);
+            } else {
+                uint4 packed;
+                unsigned* words = reinterpret_cast<unsigned*>(&packed);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const __nv_bfloat162 pair = __floats2bfloat162_rn(v[2 * i], v[2 * i + 1]);
+                    words[i]                  = *reinterpret_cast<const unsigned*>(&pair);
+                }
+                *reinterpret_cast<uint4*>(dst) = packed;
             }
         }
     }
@@ -245,46 +327,7 @@ __global__ void __launch_bounds__(Sched::kThreads, Sched::kMinBlocksPerSm) proje
     ops::cp_wait<0>();
     __syncthreads();
     pdl::trigger_dependents();
-
-    // The tile through shared memory: FP32 [BN][BM + 4], then 16-byte rows of the output.
-    constexpr int LD = BM + 4;
-    float* tile_out  = reinterpret_cast<float*>(shared_raw);
-    const int wm = warp / Sched::kWarpsTokens, wn = warp % Sched::kWarpsTokens;
-    const int g = lane >> 2, t = lane & 3;
-#pragma unroll
-    for (int mi = 0; mi < Sched::kMmaRows; ++mi) {
-#pragma unroll
-        for (int ni = 0; ni < Sched::kMmaTokens; ++ni) {
-            const int r = wm * Sched::kWarpRows + mi * 16 + g, c = wn * Sched::kWarpTokens + ni * 8 + 2 * t;
-            tile_out[c * LD + r]           = accum[mi][ni][0];
-            tile_out[(c + 1) * LD + r]     = accum[mi][ni][1];
-            tile_out[c * LD + r + 8]       = accum[mi][ni][2];
-            tile_out[(c + 1) * LD + r + 8] = accum[mi][ni][3];
-        }
-    }
-    __syncthreads();
-    constexpr int kPer = std::is_same_v<Out, float> ? 4 : 8; // values a 16-byte store
-    constexpr int kChunks = BM / kPer;
-    Out* out = static_cast<Out*>(seg.out);
-#pragma unroll 1
-    for (int item = tid; item < BN * kChunks; item += THREADS) {
-        const int c = item / kChunks, r = (item - c * kChunks) * kPer;
-        if (n0 + c >= T || m0 + r >= M) { continue; }
-        const float* v = tile_out + c * LD + r;
-        Out* dst       = out + static_cast<std::size_t>(n0 + c) * M + m0 + r;
-        if constexpr (std::is_same_v<Out, float>) {
-            *reinterpret_cast<float4*>(dst) = make_float4(v[0], v[1], v[2], v[3]);
-        } else {
-            uint4 packed;
-            unsigned* words = reinterpret_cast<unsigned*>(&packed);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const __nv_bfloat162 pair = __floats2bfloat162_rn(v[2 * i], v[2 * i + 1]);
-                words[i]                  = *reinterpret_cast<const unsigned*>(&pair);
-            }
-            *reinterpret_cast<uint4*>(dst) = packed;
-        }
-    }
+    store_tile<Sched, Out>(shared_raw, accum, seg, m0, n0, T);
 }
 
 template <class Sched, class Out, bool Q8 = false>
@@ -331,6 +374,231 @@ void launch_shape(const MmaParams& p, bool small, cudaStream_t stream, std::int3
         using Sched = std::conditional_t<Q8, Schedule<128, 128, 32, 32, 3, 1>, Schedule<128, 128, 64, 32, 3, 1>>;
         tiles_out   = tiles_for(Sched::kBlockRows, q);
         launch<Sched, Out, Q8>(q, tiles_out, stream);
+    }
+}
+
+// ---------------------------------------------------------------------------- 8-bit activations (A8)
+
+// projections_mma over Q8 segments with 8-bit inputs (ProjectionArgs::x8, `--a8-activations`: LOSSY, opt-in): the wide
+// 8-bit route's arithmetic (ops/ggml/ggml_a8_tile.cuh) over Q8_G32_FP16 rows read in place. Per 32-slice s of K, P_s is
+// the exact int32 dot of the row's codes with the column's (a8_encode_columns: ops/ggml/ggml_a8.h's codec), w_s the
+// row's FP16 group scale and d_s the column's slice scale: acc = +0, then for s = 0 .. K / 32 - 1 in order
+// acc = fma(fl32(P_s w_s), d_s, acc), with fl32(P_s w_s) from an MMA started at M = 1.5 2^23 (ggml_a8_mma.cuh: exact,
+// since an FP16 scale has at most 11 significant bits, and no conversion instruction); the output is acc rounded once.
+// One thread adds an output's terms, so its bits depend only on its row, its column and K: not on the call's width,
+// other columns or segments, nor on the tile shape.
+//
+// A CTA computes BM rows x BN columns with warps of WM x WN, over a cp.async ring of S stages of BK = 128 elements of K
+// (four slices; K a multiple of 64, a last stage of two slices zero-filling the other two). A stage holds the rows' codes [BM][128] and the columns' [BN][128], each row's or column's 128 bytes
+// one line of global memory (one L2 request: 2026-11-23, ncu, K2 at 4,096 columns, a 64-element stage split into
+// slice-major halves and 4-byte scale copies issued ~1 sector a request and held L2's tags at 80 % while its data path
+// ran at 21 %), 16-byte chunks XOR-swizzled by (row & 3) << 1 so that the 8 bytes a lane reads of 8 rows cover the banks
+// once; then the rows' four FP16 scales [BM][4] and the columns' four FP32 scales [BN][4] (one 8- and one 16-byte copy).
+// The MMA takes the ggml tiles' permuted K labelling: lane (g, t) holds bytes 8t .. 8t + 7 of a slice of rows g and
+// g + 8 (A: row g's word 2t, row g + 8's, row g's word 2t + 1, row g + 8's) and of column g (B), one 8-byte load each.
+template <int BM_, int BN_, int WM_, int WN_, int S_, int MinBlocks_>
+struct A8Schedule {
+    static constexpr int kBlockRows = BM_, kBlockTokens = BN_, kWarpRows = WM_, kWarpTokens = WN_, kStages = S_;
+    static constexpr int kMinBlocksPerSm = MinBlocks_;
+    static constexpr int kWarpsTokens    = BN_ / WN_;
+    static constexpr int kThreads        = 32 * (BM_ / WM_) * kWarpsTokens;
+    static constexpr int kMmaRows = WM_ / 16, kMmaTokens = WN_ / 8;
+    static constexpr int kBlockK = 128, kSlices = kBlockK / 32;
+    static constexpr int kRowCodes = 0, kColumnCodes = BM_ * kBlockK, kRowScales = kColumnCodes + BN_ * kBlockK;
+    static constexpr int kColumnScales = kRowScales + BM_ * 2 * kSlices, kStageBytes = kColumnScales + BN_ * 4 * kSlices;
+    static_assert(BM_ % WM_ == 0 && BN_ % WN_ == 0 && WM_ % 16 == 0 && WN_ % 8 == 0 && kStageBytes % 16 == 0);
+};
+
+// Byte offset of 16-byte chunk c of row r in a stage's [rows][128] codes.
+__device__ __forceinline__ int a8_chunk(int r, int c) { return r * 128 + ((c ^ ((r & 3) << 1)) << 4); }
+
+template <class Sched>
+constexpr int a8_shared_bytes() {
+    return std::max(Sched::kStages * Sched::kStageBytes, staging_bytes<Sched>());
+}
+
+template <class Sched, class Out>
+__global__ void __launch_bounds__(Sched::kThreads, Sched::kMinBlocksPerSm) projections_a8_kernel(const MmaParams p) {
+    namespace a8 = ::infernix::ggml::a8;
+    constexpr int BM = Sched::kBlockRows, BN = Sched::kBlockTokens, S = Sched::kStages, THREADS = Sched::kThreads;
+    constexpr int WM = Sched::kWarpRows, WN = Sched::kWarpTokens, MT = Sched::kMmaRows, NT = Sched::kMmaTokens;
+    constexpr int BK = Sched::kBlockK, SL = Sched::kSlices, CH = BK / 16; // chunks a row
+    extern __shared__ __align__(16) unsigned char shared_raw[];
+
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int tile = static_cast<int>(blockIdx.x);
+    int s          = 0;
+    while (s + 1 < p.count && tile >= p.tile_begin[s + 1]) { ++s; }
+    const MmaSegment seg = p.seg[s];
+    const int K = p.k, M = seg.rows, T = p.columns;
+    const int m0 = (tile - p.tile_begin[s]) * BM;
+    const int n0 = static_cast<int>(blockIdx.y) * BN;
+    const int kTiles = (K + BK - 1) / BK; // K a multiple of 64: the last stage may hold two slices
+    const std::size_t column_bytes = static_cast<std::size_t>(p.x8_stride) * 4;
+    const auto* x8                 = reinterpret_cast<const std::uint8_t*>(seg.x8);
+
+    // Weights first (immutable: before the PDL wait), then the inputs of the same stages. Rows past the matrix, columns
+    // past the call and slices past K read zeros (codes and scales: their terms are +0, which leave acc's bits).
+    const auto stage_weights = [&](int stage, int k_tile) {
+        unsigned char* base = shared_raw + stage * Sched::kStageBytes;
+        const int k0 = k_tile * BK, kv = min(BK, K - k0);
+#pragma unroll 1
+        for (int item = tid; item < BM * CH; item += THREADS) { // chunk item % CH of row item / CH
+            const int row = item / CH, c = item % CH;
+            const bool valid    = m0 + row < M;
+            const std::size_t r = valid ? static_cast<std::size_t>(m0 + row) : 0;
+            ops::cp_async_zfill<16, Cache::cg>(base + Sched::kRowCodes + a8_chunk(row, c),
+                                              seg.codes + r * seg.stride + k0 + 16 * c, valid && 16 * c < kv ? 16 : 0);
+        }
+        for (int row = tid; row < BM; row += THREADS) {
+            const bool valid    = m0 + row < M;
+            const std::size_t r = valid ? static_cast<std::size_t>(m0 + row) : 0;
+            ops::cp_async_zfill<2 * SL>(base + Sched::kRowScales + row * 2 * SL,
+                                        seg.scales + r * (seg.stride / 32) + k0 / 32, valid ? kv / 16 : 0);
+        }
+    };
+    const auto stage_inputs = [&](int stage, int k_tile) {
+        unsigned char* base = shared_raw + stage * Sched::kStageBytes;
+        const int k0 = k_tile * BK, kv = min(BK, K - k0);
+#pragma unroll 1
+        for (int item = tid; item < BN * CH; item += THREADS) {
+            const int col = item / CH, c = item % CH;
+            const bool valid           = n0 + col < T;
+            const std::uint8_t* column = x8 + (valid ? static_cast<std::size_t>(n0 + col) : 0) * column_bytes;
+            ops::cp_async_zfill<16, Cache::cg>(base + Sched::kColumnCodes + a8_chunk(col, c), column + k0 + 16 * c,
+                                              valid && 16 * c < kv ? 16 : 0);
+        }
+        for (int col = tid; col < BN; col += THREADS) { // the stage's slice scales (after the column's K codes)
+            const bool valid           = n0 + col < T;
+            const std::uint8_t* column = x8 + (valid ? static_cast<std::size_t>(n0 + col) : 0) * column_bytes;
+            ops::cp_async_zfill<4 * SL>(base + Sched::kColumnScales + col * 4 * SL, column + K + k0 / 8,
+                                        valid ? kv / 8 : 0);
+        }
+    };
+
+    // The ring as projections_mma_kernel's: S groups of weights, then (after the PDL wait) one group of the first
+    // stages' inputs; a step's refill is committed S steps before its stage is read.
+#pragma unroll
+    for (int stage = 0; stage < S; ++stage) {
+        if (stage < kTiles) { stage_weights(stage, stage); }
+        ops::cp_commit();
+    }
+    pdl::enter_streaming();
+#pragma unroll
+    for (int stage = 0; stage < S; ++stage) {
+        if (stage < kTiles) { stage_inputs(stage, stage); }
+    }
+    ops::cp_commit();
+
+    const int wm = warp / Sched::kWarpsTokens, wn = warp % Sched::kWarpsTokens;
+    const int g = lane >> 2, t = lane & 3;
+    float accum[MT][NT][4] = {};
+#pragma unroll 1
+    for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
+        const int stage = k_tile % S;
+        if (k_tile == 0) {
+            ops::cp_wait<0>();
+        } else {
+            ops::cp_wait<S - 1>();
+        }
+        __syncthreads();
+        const unsigned char* base = shared_raw + stage * Sched::kStageBytes;
+        // The scales of the stage: rows g and g + 8 of each m16 tile (four FP16 each), columns 2t and 2t + 1 of each n8
+        // tile (four FP32 each).
+        uint2 ws[MT][2];
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            const int r = wm * WM + 16 * mi + g;
+            ws[mi][0]   = *reinterpret_cast<const uint2*>(base + Sched::kRowScales + r * 2 * SL);
+            ws[mi][1]   = *reinterpret_cast<const uint2*>(base + Sched::kRowScales + (r + 8) * 2 * SL);
+        }
+        float4 xs[NT][2];
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni) {
+            const int c = wn * WN + 8 * ni + 2 * t;
+            xs[ni][0]   = *reinterpret_cast<const float4*>(base + Sched::kColumnScales + c * 4 * SL);
+            xs[ni][1]   = *reinterpret_cast<const float4*>(base + Sched::kColumnScales + (c + 1) * 4 * SL);
+        }
+        const auto lane_bytes = [&](int region, int row, int j) { // bytes 8t .. 8t + 7 of slice j of a row
+            return *reinterpret_cast<const int2*>(base + region + a8_chunk(row, 2 * j + (t >> 1)) + 8 * (t & 1));
+        };
+        const auto half_of = [](const uint2& w, int j) { // the FP16 scale of slice j
+            const unsigned word = j < 2 ? w.x : w.y;
+            return __half2float(__ushort_as_half(static_cast<unsigned short>((j & 1) == 0 ? word & 0xFFFFU : word >> 16)));
+        };
+        const auto lane_scale = [](const float4& v, int j) { return j == 0 ? v.x : j == 1 ? v.y : j == 2 ? v.z : v.w; };
+#pragma unroll
+        for (int j = 0; j < SL; ++j) {
+            int2 b[NT];
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) { b[ni] = lane_bytes(Sched::kColumnCodes, wn * WN + 8 * ni + g, j); }
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                const int r     = wm * WM + 16 * mi + g;
+                const int2 lo   = lane_bytes(Sched::kRowCodes, r, j);
+                const int2 hi   = lane_bytes(Sched::kRowCodes, r + 8, j);
+                const float w0  = half_of(ws[mi][0], j), w1 = half_of(ws[mi][1], j);
+                const float mw0 = __fmul_rn(a8::kMinusMagic, w0), mw1 = __fmul_rn(a8::kMinusMagic, w1);
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    int q[4];
+                    a8::mma_k32_magic(q, lo.x, hi.x, lo.y, hi.y, b[ni].x, b[ni].y);
+                    const float x0 = lane_scale(xs[ni][0], j), x1 = lane_scale(xs[ni][1], j);
+                    accum[mi][ni][0] = __fmaf_rn(a8::scaled_term(q[0], w0, mw0), x0, accum[mi][ni][0]);
+                    accum[mi][ni][1] = __fmaf_rn(a8::scaled_term(q[1], w0, mw0), x1, accum[mi][ni][1]);
+                    accum[mi][ni][2] = __fmaf_rn(a8::scaled_term(q[2], w1, mw1), x0, accum[mi][ni][2]);
+                    accum[mi][ni][3] = __fmaf_rn(a8::scaled_term(q[3], w1, mw1), x1, accum[mi][ni][3]);
+                }
+            }
+        }
+        __syncthreads();
+        const int next = k_tile + S;
+        if (next < kTiles) {
+            stage_weights(stage, next);
+            stage_inputs(stage, next);
+        }
+        ops::cp_commit();
+    }
+    ops::cp_wait<0>();
+    __syncthreads();
+    pdl::trigger_dependents();
+    store_tile<Sched, Out>(shared_raw, accum, seg, m0, n0, T);
+}
+// Each segment's first row tile of BM rows (grid x) into q; returns the call's tiles.
+std::int32_t segment_tiles(MmaParams& q, const ProjectionArgs& a, int bm) {
+    std::int32_t tiles = 0;
+    for (int s = 0; s < a.count; ++s) {
+        q.tile_begin[s] = tiles;
+        tiles += (a.segments[s].rows + bm - 1) / bm;
+    }
+    q.tile_begin[a.count] = tiles;
+    return tiles;
+}
+
+template <class Sched, class Out>
+void launch_a8(MmaParams q, const ProjectionArgs& a, cudaStream_t stream) {
+    constexpr auto kernel = projections_a8_kernel<Sched, Out>;
+    const int dynamic     = d::prepare_dynamic_shared<a8_shared_bytes<Sched>(), kernel, true>();
+    const std::int32_t tiles = segment_tiles(q, a, Sched::kBlockRows);
+    const dim3 grid(static_cast<unsigned>(tiles),
+                    static_cast<unsigned>((q.columns + Sched::kBlockTokens - 1) / Sched::kBlockTokens));
+    const pdl::LaunchConfig config{grid, dim3(Sched::kThreads), static_cast<std::size_t>(dynamic), stream};
+    CUDA_CHECK(pdl::launch_consumer(config, kernel, q));
+}
+
+// A8 tile shapes (the same bits in each): calls of up to 16 columns 32 x 16 (two warps of 16 x 16, three stages, four
+// CTAs an SM: the weights' stream), up to 128 columns or few-row matrices 64 x 64 (four warps of 32 x 32, two CTAs an
+// SM), wider calls 128 x 128 (eight warps of 64 x 32, two stages).
+template <class Out>
+void launch_a8_shape(const MmaParams& p, const ProjectionArgs& a, bool small, cudaStream_t stream) {
+    if (a.columns <= 16) {
+        launch_a8<A8Schedule<32, 16, 16, 16, 3, 4>, Out>(p, a, stream);
+    } else if (small || a.columns <= 128) {
+        launch_a8<A8Schedule<64, 64, 32, 32, 2, 2>, Out>(p, a, stream);
+    } else {
+        // 2026-11-23 (forward test prefill profile, 4,096 columns; K2 / W_o ms): this 24.35 / 10.24; 16 warps of 32 x 32
+        // 26.9 / 11.3; 128 x 64 and 64 x 128 in three stages 27.6 / 10.6 and 28.0 / 10.8.
+        launch_a8<A8Schedule<128, 128, 64, 32, 2, 1>, Out>(p, a, stream);
     }
 }
 
@@ -579,6 +847,8 @@ void projections_dmma(const ProjectionArgs& a, cudaStream_t stream) {
     }
 }
 
+std::int32_t projection_a8_column_words(std::int32_t k) { return a8_linear_column_words(k, false); }
+
 void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
     if (a.columns <= 0 || a.k <= 0 || a.k % 64 != 0 || a.count <= 0 || a.count > kMaxProjectionSegments) {
         throw std::invalid_argument("inkling2 projections_mma: 1-8 segments, positive columns, K a multiple of 64");
@@ -588,8 +858,10 @@ void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
     p.k       = a.k;
     p.columns = a.columns;
     std::int32_t widest = 0;
-    // One storage for the call: BF16, or Q8 (codes and scales, stride a multiple of 128).
+    // One storage for the call: BF16, or Q8 (codes and scales, stride a multiple of 128). 8-bit inputs take output rows
+    // of any length (the head's FP32 logits rows).
     const bool q8 = a.segments[0].q8_scales != nullptr;
+    const bool a8 = a.x8[0] != nullptr || a.x8[1] != nullptr || a.x8[2] != nullptr;
     for (int s = 0; s < a.count; ++s) {
         const ProjectionSegment& g = a.segments[s];
         const auto* x              = (g.input >= 0 && g.input <= 2) ? a.x[g.input] : nullptr;
@@ -600,10 +872,11 @@ void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
                                    reinterpret_cast<std::uintptr_t>(g.q8_scales) % 4 == 0)
                                 : (g.weight != nullptr && g.codes == nullptr &&
                                    reinterpret_cast<std::uintptr_t>(g.weight) % 16 == 0);
+        const bool out_aligned = reinterpret_cast<std::uintptr_t>(g.out) % 16 == 0 && (g.rows * word) % 16 == 0;
         if (!storage || g.rows <= 0 || x == nullptr || g.out == nullptr || reinterpret_cast<std::uintptr_t>(x) % 16 != 0 ||
-            reinterpret_cast<std::uintptr_t>(g.out) % 16 != 0 || (g.rows * word) % 16 != 0) {
+            reinterpret_cast<std::uintptr_t>(g.out) % word != 0 || (!a8 && !out_aligned)) {
             throw std::invalid_argument("inkling2 projections_mma: BF16 or Q8 segments (one storage a call), with 16-byte "
-                                        "aligned weights, inputs, outputs and output rows");
+                                        "aligned weights and inputs, and (16-bit inputs) 16-byte aligned outputs and rows");
         }
         p.seg[s] = {reinterpret_cast<const __nv_bfloat16*>(g.weight), reinterpret_cast<const __nv_bfloat16*>(x), g.out,
                     g.rows};
@@ -616,6 +889,33 @@ void projections_mma(const ProjectionArgs& a, cudaStream_t stream) {
     }
     std::int32_t tiles = 0;
     const bool small   = widest <= 256;
+    if (a8) {
+        // 8-bit inputs: each input a segment reads encoded once (an input equal to an earlier one shares its codes).
+        if (!q8) { throw std::invalid_argument("inkling2 projections_mma: 8-bit inputs (x8) take Q8 segments"); }
+        const std::int32_t words = projection_a8_column_words(a.k);
+        const std::int32_t* encoded[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            bool used = false;
+            for (int s = 0; s < a.count; ++s) { used = used || a.segments[s].input == i; }
+            if (!used) { continue; }
+            for (int j = 0; j < i && encoded[i] == nullptr; ++j) {
+                if (a.x[j] == a.x[i] && encoded[j] != nullptr) { encoded[i] = encoded[j]; }
+            }
+            if (encoded[i] != nullptr) { continue; }
+            if (a.x8[i] == nullptr || reinterpret_cast<std::uintptr_t>(a.x8[i]) % 16 != 0) {
+                throw std::invalid_argument("inkling2 projections_mma: every input of an 8-bit call needs 16-byte aligned "
+                                            "x8 workspace");
+            }
+            const Tensor x(const_cast<std::uint16_t*>(a.x[i]), DType::BF16, {a.k, a.columns});
+            Tensor codes(a.x8[i], DType::I32, {words, a.columns});
+            a8_encode_columns(x, codes, stream);
+            encoded[i] = a.x8[i];
+        }
+        p.x8_stride = words;
+        for (int s = 0; s < a.count; ++s) { p.seg[s].x8 = encoded[a.segments[s].input]; }
+        a.fp32_out ? launch_a8_shape<float>(p, a, small, stream) : launch_a8_shape<__nv_bfloat16>(p, a, small, stream);
+        return;
+    }
     if (q8) {
         a.fp32_out ? launch_shape<float, true>(p, small, stream, tiles, a)
                    : launch_shape<__nv_bfloat16, true>(p, small, stream, tiles, a);

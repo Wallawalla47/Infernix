@@ -48,7 +48,15 @@ struct ProjectionArgs {
     bool fp32_out        = false;
     ProjectionSegment segments[kMaxProjectionSegments];
     std::int32_t count   = 0;
+    // projections_mma's 8-bit inputs (Q8 segments, `--a8-activations`): 16-byte aligned workspace for input i's encoded
+    // columns (projection_a8_column_words(K) words each, T of them), where the call encodes it (an input equal to an
+    // earlier one shares that one's). Null everywhere for the 16-bit route.
+    std::int32_t* x8[3] = {};
 };
+
+// The words of one 8-bit input column of K = k (ops/ggml/ggml_a8.h's codec: K int8 codes, then K / 32 FP32 slice
+// scales, rounded up to 16 bytes).
+[[nodiscard]] std::int32_t projection_a8_column_words(std::int32_t k);
 
 void projections(const ProjectionArgs& args, cudaStream_t stream);
 
@@ -59,6 +67,10 @@ void projections(const ProjectionArgs& args, cudaStream_t stream);
 // group's sum by two chained MMAs from zero over its codes (as BF16, exact) and the BF16 inputs, then
 // acc = fma(sum, the row's group scale, acc). A column's bits depend only on its row and its own input: not on the call's
 // width, its other columns or matrices, nor on the tile shape the launch picks. Other bits than projections()'s fold.
+// With x8 (Q8 segments, 8-bit inputs; LOSSY): each input column quantized per 32 values of K to int8 codes with an FP32
+// scale d_s (ops/ggml/ggml_a8.h's codec, as the other `--a8-activations` routes), then per 32-group s in ascending order
+// from +0, acc = fma(fl32(P_s w_s), d_s, acc): P_s the exact int32 dot of the codes on int8 tensor cores, w_s the row's
+// group scale (the GGUF wide 8-bit route's arithmetic); the same invariance.
 void projections_mma(const ProjectionArgs& args, cudaStream_t stream);
 
 // The decode route's projections on tensor cores (BF16 or Q8 storage, one a call; K a multiple of 32; a call of any

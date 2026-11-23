@@ -55,6 +55,7 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
             .draft_tokens      = options.speculative.draft_tokens == 0 ? 7U : options.speculative.draft_tokens,
             .draft_tokens_auto = options.speculative.draft_tokens_auto,
             .expert_a16        = options.expert_a16_activations,
+            .a8                = options.a8_activations,
             .vision            = options.enable_vision,
             .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
             .kv_codec          = models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
@@ -139,7 +140,19 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
         refuse(options.fast_paths, "--lossless has no fast paths");
     }
     refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
-    refuse(options.a8_activations, "--a8-activations is not built for Inkling 2 yet");
+    if (options.a8_activations) {
+        // The 8-bit route (Forward's a8): the --q8-weights matrices, whose attention input and output projections take
+        // 8-bit activations in prompt calls.
+        refuse(!options.fast_paths, "--a8-activations is approximate; the reproducible route (--reproducible) refuses it");
+        refuse(options.expert_a16_activations,
+               "--a16-activations runs with 16-bit activations: it excludes --a8-activations");
+        options.q8_weights = true;
+        report(options, "Inkling 2: --a8-activations: 8-bit activations (int8 codes with an FP32 scale per 32 values, as "
+                        "llama.cpp's Q8_1) in every call: the attention input and output projections and the head (on "
+                        "8-bit weights, --q8-weights) and the NVFP4 layers' routed experts (instead of the checkpoint's "
+                        "4-bit activations); the MXFP8 experts keep their 8-bit arithmetic, the message gates and the "
+                        "router 16-bit activations, as Basalt runs them (approximate: changes the output)");
+    }
     if (options.expert_a16_activations) {
         report(options, "Inkling 2: --a16-activations: the routed experts take 16-bit activations instead of the "
                         "checkpoint's four-over-six NVFP4 and MXFP8 ones (changes the output; the default follows the "
@@ -148,7 +161,7 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     if (options.q8_weights && !options.fast_paths) {
         throw std::invalid_argument("--q8-weights is approximate; the reproducible route (--reproducible) refuses it");
     }
-    if (options.q8_weights) {
+    if (options.q8_weights && !options.a8_activations) {
         report(options, "Inkling 2: --q8-weights: the attention input and output projections and the head run as 8-bit "
                         "weights (approximate: the output differs from the artifact's BF16 weights)");
     }

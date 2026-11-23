@@ -14,7 +14,8 @@
 // 5. Scoring: a CausalScoring Engine's logits of the 32 golden ids (positions 0-30) equal the forward test's
 //    prompt-route logits (INFERNIX_INKLING2_PROMPT_LOGITS_GUARD: scoring runs the prompt route) byte for byte.
 // 6. --q8-weights (approximate 8-bit weights; refused with --reproducible) and --a16-activations (16-bit expert
-//    activations; accepted with --reproducible, giving the same tokens), and both together: under each, an eager Engine at chunks of 16
+//    activations; accepted with --reproducible, giving the same tokens), both together, and --a8-activations (8-bit
+//    activations in every call; refused with --reproducible): under each, an eager Engine at chunks of 16
 //    serving one request at a time is the reference, and graphs (alone and C = 4 in reverse order), chunks of 7, and
 //    the long prompt in one 4,096-column call give its tokens.
 // 7. DSpark (--spec dspark, auto and 7 drafts, graphs and eager; INFERNIX_INKLING2_NO_DSPARK skips it): speculative
@@ -481,6 +482,9 @@ int main() {
                 o.q8_weights             = true;
                 o.expert_a16_activations = true;
             });
+            // --a8-activations (8-bit activations in every call: the dense projections, the head and the NVFP4 experts;
+            // implies --q8-weights): request-invariant like the others, refused with --reproducible.
+            variant("a8", "--a8-activations", false, [](infernix::EngineOptions& o) { o.a8_activations = true; });
 
             // 8. --kv-dtype: the full visits' pools in a quantized format (the sliding windows stay BF16 K / FP16 V),
             // deterministic and request-invariant, so accepted with --reproducible: the variant's checks above; DSpark

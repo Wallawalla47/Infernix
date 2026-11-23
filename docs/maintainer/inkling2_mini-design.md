@@ -975,18 +975,33 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
   multiples of 16, so the head kernel handles the tail rather than padding with zero rows, which would score 0 and need
   a mask), softcap 30 in the epilogue, FP32 logits; the checkpoint's padded rows (non-zero, unreachable) are never
   stored; one read for all T columns; evict-first loads (read once per step).
-- **`--a8-activations` (planned, 2026-11-22; not built).** The opt-in Basalt-style route: the dense BF16 matrices
-  (K2's fused input projections, W_o, the message gates' W_down, the head) become Q8 at load as under `--q8-weights`
-  (the 8-bit floor: no lower-bit copy), and their inputs are quantized per token in groups of 32 (INT8 codes, an FP32
-  scale `amax / 127` a group, as Basalt's q8_1), fused into the producers (the norms and gates that write them). Decode
-  and verify widths run INT8 x INT8 dot products (IMMA m16n8k32: one MMA k-step is one group, its INT32 sum scaled by
-  both groups' scales into an FP32 accumulator); prompt calls an IMMA GEMM, which on the RTX 5090 runs at four times the
-  BF16-with-FP32-accumulation rate. The experts keep their checkpoint arithmetic (NVFP4 W4A4 and MXFP8 W8A8 already),
-  the router stays BF16 with FP32 logits (expert selection), the attention arithmetic is unchanged. Expected: prompt
-  calls gain where the dense projections dominate (their BF16 MMAs are an estimated 20-30 % of a 4,096-column call);
-  decode gains little over `--q8-weights` (the matrices read the same bytes; Basalt's decode lead measured as overlap
-  and L2 reuse, not kernel work, SLOT B2b). Each route registers only where measured faster (the a8 rule); the output
-  changes (approximate, like `--q8-weights`).
+- **`--a8-activations` (approximate, opt-in; 2026-11-23).** 8-bit activations in every call, as Basalt runs this model
+  (owner, 2026-11-23: "8-bit activations everywhere (including in place of the existing NVFP4 activations) ... I sort
+  of want it to run like Basalt's implementation"). One codec throughout, the engine's other `--a8-activations` routes'
+  (`ops/ggml/ggml_a8.h`, llama.cpp's Q8_1 with an FP32 scale): each 32 values of a column as int8 codes
+  `rne(v * fl32(127 / m))` with the scale `d = fl32(m / 127)`, `m` the slice's largest magnitude.
+  - The dense matrices of `--q8-weights` (K2's fused input projections, W_o, the head: Q8_G32_FP16 at load, the flag
+    implies it) take 8-bit inputs at every width, prompt and decode: `projections_mma` with `ProjectionArgs::x8`
+    (`projections_a8_kernel`, the GGUF wide 8-bit route's arithmetic: per 32-slice in ascending order from +0,
+    `acc = fma(fl32(P_s w_s), d_s, acc)`, `P_s` the exact int32 dot on int8 tensor cores, started at 1.5 * 2^23 so
+    `fl32(P_s w_s)` is one FFMA); one thread sums an output, so a column's bits depend on its row and its input alone,
+    the same at every width and tile shape. The call encodes each distinct input once (`a8_encode_columns`; K2's
+    aliased inputs once). Tile: 128 x 128, eight warps of 64 x 32, two stages of 128 elements of K whose rows are one
+    line each (ncu, K2 at 4,096 columns: 64-element stages split slice-major issued ~1 sector an L2 request and held
+    L2's tags at 80 % with its data path at 21 %; 128-element contiguous stages: 22.6M requests instead of 55.3M, L2
+    43 %, the int8 pipe 41 %, issue 47 % with two warps a scheduler).
+  - The NVFP4 layers' routed experts: W4A8 instead of the checkpoint's four-over-six W4A4 (`ExpertActivation::A8`,
+    the `w4a4_sparse_moe.h` contract): per 16-block in order `acc = fma(P_b S_b, d_s, acc)`, then
+    `bf16(fl32(fl32(acc 2^-10) m))`, `m = amax_w / denominator`; the narrow kernels (decode, verification) and the
+    prompt route's grouped GEMM (`wide_expert_a8.cuh` with this model's epilogues) give an entry the same bits.
+  - Unchanged, as Basalt: the MXFP8 experts (W8A8 already; Basalt requantizes them to Q8_0, a lossy weight change not
+    taken here), the message gates and the router (16-bit activations; Basalt FP32), the attention arithmetic.
+  Quality (2026-11-23, perplexity quick set, 291,842 tokens, bf16 KV, KL against the default route's logits): PPL
+  4.02607 against the default's 4.03144 and `--q8-weights`' 4.03419 (lower on wikitext, pg19, zhwiki and ninfer);
+  KL 8.43e-3, top-1 96.5 % (`--q8-weights` alone 1.06e-2, 96.0 %). The fake-quantized estimate of the dense
+  projections alone (8-bit inputs on the BF16-weight kernels, the experts W4A4) read KL 1.07e-2 and PPL 4.0318, per-token
+  scales 1.14e-2 (rejected): the 8-bit expert activations, not the dense route, bring the KL below this model's usual
+  ~1e-2 floor (a reading not tested further: the checkpoint's 4-bit activations amplify any upstream difference).
 
 ---
 

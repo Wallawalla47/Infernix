@@ -69,7 +69,16 @@ struct Bank {
 //     m = fl32(amax_w[e] / denominator) (the weights' c * s * amax / denominator). Exact, so a column's bits depend
 //     on its own inputs alone.
 //   MXFP8 layers: W8A16, x and h BF16 (no rows).
-enum class ExpertActivation : std::uint8_t { Checkpoint, A16 };
+// or, with --a8-activations (EngineOptions::a8_activations; LOSSY), A8 on the NVFP4 layers (the MXFP8 layers keep
+// their checkpoint W8A8): x (K = H) and h (K = I) each quantized per 32-element slice s to int8 codes q with an FP32
+// scale d_s (ops/ggml/ggml_a8.h's codec, the dense projections' too), P_b = sum_j c2(w) q_j the exact int32 product
+// of 16-element block b (|P_b| <= 12 * 16 * 127), and per output
+//   acc = +0; for b = 0 .. K/16 - 1 in order: acc = fma(P_b * S_b, d_s(b), acc)   (P_b * S_b exact)
+//   y   = bf16(fl32(fl32(acc * 2^-10) * m))                                         (nvfp4_a8::row_output)
+// with S_b = canon::e4m3_scaled of the block's scale word and m = fl32(amax_w[e] / denominator), A16's multiplier:
+// the wide 8-bit route's arithmetic (ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh), so every route that takes it
+// gives an entry the same bits. h = the BF16 softcapped SwiGLU times gamma, as on every route, then its slices.
+enum class ExpertActivation : std::uint8_t { Checkpoint, A16, A8 };
 
 // The NVFP4 checkpoint arithmetic's core in the decode and verify kernels (the header's NVFP4 contract; no effect on
 // A16, MXFP8 or the prompt route).
@@ -78,9 +87,13 @@ enum class Nvfp4Core : std::uint8_t { Native, Exact };
 // An A16 limb row (a16_limbs.cuh's planes: per 64-element tile 64 H1, 64 L1, 64 H0 | L0 << 4 bytes).
 inline constexpr std::int32_t kA16XRowBytes = 2304 / 64 * 192; // 6,912
 inline constexpr std::int32_t kA16HRowBytes = 1152 / 64 * 192; // 3,456
+// An A8 row (a8_encode_columns' column: K int8 codes, then K / 32 FP32 slice scales).
+inline constexpr std::int32_t kA8XRowBytes = 2304 + 2304 / 8; // 2,592
+inline constexpr std::int32_t kA8HRowBytes = 1152 + 1152 / 8; // 1,296
 
 // The columns' x (the MoE mixer's output). Checkpoint: rows [T][row_bytes(H)], and for NVFP4 each row's amax [T].
 // A16: x16, the BF16 rows [T][H]; NVFP4 layers also rows as limb rows [T][kA16XRowBytes] and emax [T] their exponents.
+// A8 (NVFP4 layers): rows as A8 rows [T][kA8XRowBytes].
 struct Activations {
     const std::uint8_t* rows    = nullptr;
     const float* amax           = nullptr;
@@ -119,6 +132,8 @@ struct Workspace {
     // A16 NVFP4 (a workspace carved for A16): h as limb rows [capacity * kTopK][kA16HRowBytes], their exponent a16_emax
     // of h_amax's BF16 bits.
     std::uint8_t* h_limbs     = nullptr;
+    // A8 NVFP4 (a workspace carved for A8): h as A8 rows [capacity * kTopK][kA8HRowBytes].
+    std::uint8_t* h_a8        = nullptr;
     // [1]: kErrorDownStalled once a down CTA's wait for its job made no progress for 2 s (zero: no error).
     std::uint32_t* error      = nullptr;
     // [10]: moe_single's counters (router CTAs, finished CTAs, each job's gate/up row groups), reset by its last CTA.
@@ -166,7 +181,10 @@ void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t
 void moe_dispatch(const Routing& routing, std::int32_t columns, std::int32_t experts, const Workspace& workspace,
                   cudaStream_t stream);
 
-// The routed experts of the dispatched entries: outputs BF16 [columns * kTopK][H].
+// A8: the columns' x (BF16 [T][H]) as A8 rows [T][kA8XRowBytes] (Activations::rows).
+void moe_encode_a8(const std::uint16_t* x, std::int32_t columns, std::uint8_t* rows, cudaStream_t stream);
+
+// The routed experts of the dispatched entries: outputs BF16 [columns * kTopK][H]. A8 (NVFP4 layers) at any width.
 void moe_experts(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,
                  std::uint16_t* outputs, cudaStream_t stream);
 
@@ -175,7 +193,7 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
 // router's rows on the first 16, every CTA then selecting the column itself, a job's 144 gate/up and down row groups on
 // 18 CTAs of 8 warps, each warp streaming both through one ring). x: the router's BF16 row; rows: the column's
 // quantized row. Needs moe_single_supported(bank.format): the device holds the grid resident (otherwise moe_route and
-// moe_experts).
+// moe_experts); never for A8 (no single-launch kernel).
 [[nodiscard]] bool moe_single_supported(ExpertFormat format, ExpertActivation activation = ExpertActivation::Checkpoint);
 void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint16_t* router, const float* bias,
                 float route_scale, const Bank& bank, const Workspace& workspace, std::uint16_t* outputs,
@@ -195,8 +213,9 @@ void moe_select(const float* logits, std::int32_t columns, const float* bias, st
 // products in its own fixed K order (the exact sum up to the accumulation's rounding) and rs the narrow route's row
 // scale; h and its four-over-six rows as the narrow route forms them. MXFP8 layers: a
 // grouped GEMM on block-scaled FP8 tensor cores (mma mxf8f6f4, UE8M0 per 32), each output the FP32 sum over K's
-// 32-blocks in ascending order, g, u = bf16(acc), h's MXFP8 groups as the narrow route's, y = bf16(acc). Outputs as
-// moe_experts'.
+// 32-blocks in ascending order, g, u = bf16(acc), h's MXFP8 groups as the narrow route's, y = bf16(acc). A8 (NVFP4
+// layers): the A8 order above on int8 tensor cores (ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh's grouped GEMM),
+// so its outputs are moe_experts' A8 bits. A16 takes moe_experts. Outputs as moe_experts'.
 void moe_experts_prompt(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,
                         std::uint16_t* outputs, cudaStream_t stream);
 

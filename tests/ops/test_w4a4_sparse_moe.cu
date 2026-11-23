@@ -32,6 +32,8 @@
 #include "infernix/ops/w4a4_sparse_moe.h"
 #include "ops/common/a4_native.cuh"
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_a8.h"
+#include "ops/offloaded_sparse_moe/nvfp4_a8.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
 
@@ -402,14 +404,19 @@ LimbRow encode_a16(const std::vector<float>& v) {
 }
 
 Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* workspace,
-           int capacity = moe::kMaxColumns, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core::Native) {
+           int capacity = moe::kMaxColumns, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core::Native,
+           bool a8x = false) {
     std::vector<std::uint8_t> rows;
     std::vector<float> amax;
     std::vector<std::int32_t> emax;
     std::vector<std::uint16_t> x16;
     for (const auto& x : call.x) {
         for (const float v : x) { x16.push_back(canon::f32_to_bf16_rn(v)); }
-        if (a16 && b.a8) { // MXFP8 A16: the BF16 rows alone
+        if ((a16 && b.a8) || a8x) { // MXFP8 A16: the BF16 rows alone; NVFP4 A8: rows encoded on the device below
+            amax.push_back(0.0F);
+            continue;
+        }
+        if (a16 && b.a8) {
             amax.push_back(0.0F);
             continue;
         }
@@ -438,13 +445,22 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
         act.emax       = b.a8 ? nullptr : d_emax;
         act.x16        = d_x16;
     }
+    std::uint8_t* d_a8 = nullptr;
+    if (a8x) { // the production encoder: the oracle encodes from the codec's definition
+        cuda_check(cudaMalloc(&d_a8, std::size_t(call.columns) * moe::kA8XRowBytes), "cudaMalloc");
+        moe::moe_encode_a8(d_x16, call.columns, d_a8, nullptr);
+        act.activation = moe::ExpertActivation::A8;
+        act.rows       = d_a8;
+    }
     std::int32_t* d_exp  = upload(call.experts);
     float* d_gamma       = upload(call.gamma);
     std::uint16_t* d_out = nullptr;
     const std::size_t entries = std::size_t(call.columns) * K;
     cuda_check(cudaMalloc(&d_out, entries * H * 2), "cudaMalloc");
     const moe::Workspace ws = moe::carve_workspace(workspace, E, I, capacity,
-                                                   a16 ? moe::ExpertActivation::A16 : moe::ExpertActivation::Checkpoint);
+                                                   a8x   ? moe::ExpertActivation::A8
+                                                   : a16 ? moe::ExpertActivation::A16
+                                                         : moe::ExpertActivation::Checkpoint);
     const moe::Routing routing{d_exp, d_gamma};
     moe::Bank bank;
     bank.records       = db.records;
@@ -488,10 +504,186 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
     r.h_amax = download(ws.h_amax, entries);
     for (void* p : {static_cast<void*>(d_rows), static_cast<void*>(d_amax), static_cast<void*>(d_exp),
                     static_cast<void*>(d_gamma), static_cast<void*>(d_out), static_cast<void*>(d_emax),
-                    static_cast<void*>(d_x16)}) {
+                    static_cast<void*>(d_x16), static_cast<void*>(d_a8)}) {
         cuda_check(cudaFree(p), "cudaFree");
     }
     return r;
+}
+
+// ---------------------------------------------------------------------------- A8 (--a8-activations), NVFP4
+
+// A vector's A8 slices by the codec's definition (ops/ggml/ggml_a8.h): codes q and scales d (a non-finite slice: d NaN).
+struct A8Row {
+    std::vector<std::int32_t> q;
+    std::vector<float> d;
+};
+A8Row encode_a8(const std::vector<float>& v) {
+    namespace a8 = infernix::ggml::a8;
+    A8Row r;
+    r.q.resize(v.size());
+    for (std::size_t s = 0; s < v.size() / 32; ++s) {
+        std::uint16_t bits[32];
+        unsigned key = 0;
+        for (int j = 0; j < 32; ++j) {
+            bits[j] = canon::f32_to_bf16_rn(v[32 * s + j]);
+            key     = std::max(key, static_cast<unsigned>(bits[j] & 0x7FFFU));
+        }
+        const a8::SliceScale sc = a8::slice_scale(key);
+        r.d.push_back(sc.d);
+        for (int j = 0; j < 32; ++j) { r.q[32 * s + j] = a8::code(bits[j], sc.inv); }
+    }
+    return r;
+}
+
+// The A8 outputs of entry (x, e, gamma) by the header's order: per row acc = +0, then per block in order
+// acc = fma(P_b * S_b, d_s, acc) (P_b * S_b exact), y = bf16(fl32(fl32(acc * 2^-10) * m)); h = swiglu * gamma, its
+// slices encoded again, the down rows likewise.
+std::vector<std::uint16_t> oracle_a8(const HostBank& b, const Matrix& gu, const Matrix& dn, int e, const A8Row& x,
+                                     float gamma) {
+    const float m1 = canon::div_rn(b.amax[2 * e], b.den[0]), m2 = canon::div_rn(b.amax[2 * e + 1], b.den[1]);
+    const auto row = [](const Matrix& w, int r, const A8Row& a, float m) {
+        float acc = 0.0F;
+        for (int blk = 0; blk < w.k / 16; ++blk) {
+            int p = 0;
+            for (int j = 0; j < 16; ++j) {
+                const int k = 16 * blk + j;
+                p += canon::e2m1_x2(w.code[std::size_t(r) * w.k + k]) * a.q[k];
+            }
+            const float ps = static_cast<float>(p) * static_cast<float>(canon::e4m3_scaled(w.scale[std::size_t(r) * (w.k / 16) + blk]));
+            acc = canon::fma_rn(ps, a.d[blk / 2], acc);
+        }
+        return infernix::ops::offloaded_moe::nvfp4_a8::row_output(acc, m);
+    };
+    std::vector<std::uint16_t> y(2 * I);
+    for (int r = 0; r < 2 * I; ++r) { y[r] = row(gu, r, x, m1); }
+    std::vector<float> h(I);
+    for (int i = 0; i < I; ++i) { h[i] = canon::bf16_to_f32(swiglu(y[2 * i], y[2 * i + 1], gamma)); }
+    const A8Row ha = encode_a8(h);
+    std::vector<std::uint16_t> out(H);
+    for (int r = 0; r < H; ++r) { out[r] = row(dn, r, ha, m2); }
+    return out;
+}
+
+// Criteria (fixed before the first run): every output equals the order's bits at widths 1, 5, 32, 128 and 300 (graph
+// replays included, in run()), a non-finite column gives the canonical NaN in all its outputs, and a column alone gives
+// the bits it gets in a wider call. (The order's accuracy: one FP32 chain of exact block terms, K / 16 roundings.)
+void a8_case() {
+    const HostBank b = make_bank(false, 43U);
+    DeviceBank db{upload(b.records), upload(b.amax), upload(std::vector<float>{b.den[0], b.den[1]})};
+    constexpr int kCapacity = 300;
+    const std::size_t bytes = moe::workspace_bytes(E, I, kCapacity, moe::ExpertActivation::A8);
+    void* workspace = nullptr;
+    cuda_check(cudaMalloc(&workspace, bytes), "cudaMalloc");
+    cuda_check(cudaMemset(workspace, 0, bytes), "cudaMemset");
+    std::vector<Matrix> cache_gu(E), cache_dn(E);
+    std::vector<bool> decoded(E, false);
+    int differ = 0, checked = 0;
+    Result wide;
+    Call wide_call;
+    for (const int columns : {1, 5, 32, 128, kCapacity}) {
+        Call call = make_call(columns, 950U + static_cast<std::uint32_t>(columns), columns == 32 ? 16.0F : 1.0F);
+        if (columns == 32) { call.x[3][100] = INFINITY; } // a non-finite column
+        const Result got = run(b, db, call, workspace, kCapacity, false, moe::Nvfp4Core::Native, true);
+        const int entries = columns * K, step = columns >= 128 ? 16 : 1;
+        for (int entry = 0; entry < entries; entry += step) {
+            const int t = entry / K, e = call.experts[entry];
+            if (!decoded[e]) {
+                cache_gu[e] = decode(b, e, false);
+                cache_dn[e] = decode(b, e, true);
+                decoded[e]  = true;
+            }
+            const std::vector<std::uint16_t> want =
+                oracle_a8(b, cache_gu[e], cache_dn[e], e, encode_a8(call.x[t]), call.gamma[entry]);
+            for (int i = 0; i < H; ++i) {
+                const std::uint16_t g = got.out[std::size_t(entry) * H + i];
+                const bool nan = (want[i] & 0x7FFFU) > 0x7F80U;
+                differ += (nan ? g != 0x7FC0U : g != want[i]) ? 1 : 0;
+            }
+            checked += H;
+            if (columns == 32 && t == 3) {
+                bool all_nan = true;
+                for (int i = 0; i < H; ++i) { all_nan = all_nan && got.out[std::size_t(entry) * H + i] == 0x7FC0U; }
+                check(all_nan, "A8: a non-finite column's outputs are not the canonical NaN");
+            }
+        }
+        if (columns == kCapacity) {
+            wide      = got;
+            wide_call = call;
+        }
+    }
+    int alone_differ = 0;
+    for (const int t : {0, 9, 150, 299}) {
+        Call one;
+        one.columns = 1;
+        one.x       = {wide_call.x[t]};
+        one.experts.assign(wide_call.experts.begin() + t * K, wide_call.experts.begin() + (t + 1) * K);
+        one.gamma.assign(wide_call.gamma.begin() + t * K, wide_call.gamma.begin() + (t + 1) * K);
+        const Result alone = run(b, db, one, workspace, kCapacity, false, moe::Nvfp4Core::Native, true);
+        for (int i = 0; i < K * H; ++i) { alone_differ += alone.out[i] != wide.out[std::size_t(t) * K * H + i] ? 1 : 0; }
+    }
+    std::printf("NVFP4 A8: %d of %d outputs differ from the order's bits; %d outputs of 4 columns alone differ from the "
+                "300-column call\n",
+                differ, checked, alone_differ);
+    check(differ == 0, "A8 outputs differ from the order's bits");
+    check(alone_differ == 0, "an A8 column alone differs from the column in a wider call");
+    // The prompt route (moe_experts_prompt: the grouped 8-bit GEMM) on the 300-column call and on one column: the
+    // narrow route's bits, every output (the same order and terms), and a repeated call the same.
+    const auto run_prompt = [&](const Call& call) {
+        std::vector<std::uint16_t> x16;
+        for (const auto& x : call.x) {
+            for (const float v : x) { x16.push_back(canon::f32_to_bf16_rn(v)); }
+        }
+        std::uint16_t* d_x16 = upload(x16);
+        std::uint8_t* d_a8   = nullptr;
+        cuda_check(cudaMalloc(&d_a8, std::size_t(call.columns) * moe::kA8XRowBytes), "cudaMalloc");
+        moe::moe_encode_a8(d_x16, call.columns, d_a8, nullptr);
+        std::int32_t* d_exp = upload(call.experts);
+        float* d_gamma      = upload(call.gamma);
+        const std::size_t entries = std::size_t(call.columns) * K;
+        std::uint16_t* d_out      = nullptr;
+        cuda_check(cudaMalloc(&d_out, entries * H * 2), "cudaMalloc");
+        const moe::Workspace ws = moe::carve_workspace(workspace, E, I, kCapacity, moe::ExpertActivation::A8);
+        moe::Bank bank;
+        bank.records       = db.records;
+        bank.record_stride = b.stride;
+        bank.format        = moe::ExpertFormat::Nvfp4FourOverSix;
+        bank.amax          = db.amax;
+        bank.denominators  = db.den;
+        bank.experts       = E;
+        bank.hidden        = H;
+        bank.intermediate  = I;
+        const moe::Routing routing{d_exp, d_gamma};
+        moe::Activations act{d_a8, nullptr, call.columns};
+        act.activation = moe::ExpertActivation::A8;
+        moe::moe_dispatch(routing, call.columns, E, ws, nullptr);
+        moe::moe_experts_prompt(act, routing, bank, ws, d_out, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "A8 prompt call");
+        std::vector<std::uint16_t> out = download(d_out, entries * H);
+        for (void* p : {static_cast<void*>(d_x16), static_cast<void*>(d_a8), static_cast<void*>(d_exp),
+                        static_cast<void*>(d_gamma), static_cast<void*>(d_out)}) {
+            cuda_check(cudaFree(p), "cudaFree");
+        }
+        return out;
+    };
+    const std::vector<std::uint16_t> prompt = run_prompt(wide_call), prompt_again = run_prompt(wide_call);
+    int prompt_differ = 0;
+    for (std::size_t i = 0; i < prompt.size(); ++i) { prompt_differ += prompt[i] != wide.out[i] ? 1 : 0; }
+    Call one;
+    one.columns = 1;
+    one.x       = {wide_call.x[150]};
+    one.experts.assign(wide_call.experts.begin() + 150 * K, wide_call.experts.begin() + 151 * K);
+    one.gamma.assign(wide_call.gamma.begin() + 150 * K, wide_call.gamma.begin() + 151 * K);
+    const std::vector<std::uint16_t> prompt_one = run_prompt(one);
+    int one_differ = 0;
+    for (int i = 0; i < K * H; ++i) { one_differ += prompt_one[i] != wide.out[std::size_t(150) * K * H + i] ? 1 : 0; }
+    std::printf("NVFP4 A8 prompt route: %d of %zu outputs of the 300-column call differ from the narrow route, %d of %d "
+                "of a 1-column call; a repeated call %s\n",
+                prompt_differ, prompt.size(), one_differ, K * H, prompt == prompt_again ? "the same" : "DIFFERS");
+    check(prompt_differ == 0 && one_differ == 0, "the A8 prompt route differs from the narrow route");
+    check(prompt == prompt_again, "a repeated A8 prompt call differs");
+    for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den), workspace}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
 }
 
 // ---------------------------------------------------------------------------- A16 (--a16-activations), NVFP4
@@ -1367,6 +1559,7 @@ INFERNIX_OP_TEST(w4a4_sparse_moe) {
     bank_case(false, moe::Nvfp4Core::Exact);
     bank_case(true);
     a16_case();
+    a8_case();
     mx_a16_case();
     prompt_case(false);
     prompt_case(true);

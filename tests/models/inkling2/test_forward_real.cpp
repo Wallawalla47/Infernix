@@ -754,7 +754,11 @@ void q8_census(const m::Model& model) {
 // in stream order, so an Op's time is the gap since the previous boundary (PDL overlap moves a little between them).
 void profile_prefill(const m::Parameters& p, int width) {
     const auto& c = p.model.config().text;
-    m::Forward fw(p, 1, std::max(width, m::kMaxForwardColumns));
+    // INFERNIX_INKLING2_A8: --a8-activations (with the 8-bit weights it implies): the projections' and the NVFP4
+    // experts' 8-bit activations.
+    const bool a8 = std::getenv("INFERNIX_INKLING2_A8") != nullptr;
+    m::Forward fw(p, 1, std::max(width, m::kMaxForwardColumns),
+                  a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
     State state(fw.layout(), 1, width / ik::kKeyUnit + 2);
     m::CallPlan plan;
     std::uint64_t lcg = 12345;
@@ -896,7 +900,7 @@ int main() {
         // timing, the invariance checks and the census).
         models::LoadOptions load_options;
         load_options.pack_bf16  = std::getenv("INFERNIX_INKLING2_PACK") != nullptr;
-        load_options.q8_weights = std::getenv("INFERNIX_INKLING2_Q8") != nullptr;
+        load_options.q8_weights = std::getenv("INFERNIX_INKLING2_Q8") != nullptr || std::getenv("INFERNIX_INKLING2_A8") != nullptr;
         auto model = m::materialize_model(m::plan_load(reader, load_options), device);
         if (model->packed().source_bytes != 0) {
             std::printf("packed %zu matrices at load: %.2f GB of BF16 -> %.2f GB, %llu escapes, %.0f ms\n",
@@ -922,7 +926,10 @@ int main() {
             }
         }
         const m::Parameters parameters(*model);
-        m::Forward forward(parameters, 1);
+        // INFERNIX_INKLING2_A8 (profiles only: the reference criteria are the default route's).
+        const bool a8 = std::getenv("INFERNIX_INKLING2_A8") != nullptr;
+        m::Forward forward(parameters, 1, m::kMaxForwardColumns,
+                           a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
         State state(forward.layout());
         const auto& c = model->config().text;
         if (const char* width = std::getenv("INFERNIX_INKLING2_PROFILE"); width != nullptr) {

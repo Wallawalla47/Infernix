@@ -294,6 +294,9 @@ struct ProgramOptions {
     bool draft_tokens_auto      = true;
     // --a16-activations: the routed experts on 16-bit activations (w4a4_sparse_moe.h's ExpertActivation::A16).
     bool expert_a16             = false;
+    // --a8-activations (with the 8-bit weights it implies): 8-bit activations in the attention projections, the head
+    // and the NVFP4 layers' routed experts, in every call (Forward's a8; the experts' ExpertActivation::A8).
+    bool a8                     = false;
     // --vision (the tower bound in the Parameters): the tower's buffers for images of up to vision_max_cells cells.
     bool vision                    = false;
     std::uint32_t vision_max_cells = 0;

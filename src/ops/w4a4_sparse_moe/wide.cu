@@ -18,8 +18,12 @@
 #include "infernix/ops/w4a4_sparse_moe.h"
 
 #include "core/device.h"
+#include "core/tensor.h"
 #include "core/tma_descriptor_staging.cuh"
+#include "ops/ggml/ggml_linear_a8.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.cuh"
+#include "ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh"
+#include "ops/offloaded_sparse_moe/nvfp4_a8.h"
 #include "ops/w4a4_sparse_moe/expert_math.cuh"
 
 #include <cuda_runtime.h>
@@ -193,6 +197,88 @@ struct DownEpilogue {
                     const std::uint32_t y0 = canon::f32_to_bf16_rn(canon::mul_rn(acc[m][r][2 * half], rs));
                     const std::uint32_t y1 = canon::f32_to_bf16_rn(canon::mul_rn(acc[m][r][2 * half + 1], rs));
                     *reinterpret_cast<std::uint32_t*>(out + wide::tile_row(ctx.warp_n, r, ctx.tig)) = y0 | (y1 << 16);
+                }
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------- A8 (--a8-activations), NVFP4 layers
+
+// wide_expert_a8.cuh's grouped 8-bit GEMM over Inkling's matrices (the header's A8 order, so a column's bits are the
+// narrow route's): x as the columns' A8 rows (Activations::rows, by token), h as A8 rows in dispatch order (the
+// workspace's h_a8, encoded from the BF16 h plane in dispatch order).
+template <wide::Matrix M>
+struct A8Shape {
+    static constexpr int kRowGroups      = M == wide::Matrix::GateUp ? G::kGateUpRowGroups : G::kDownRowGroups;
+    static constexpr int kBlocks         = M == wide::Matrix::GateUp ? G::kGateUpBlocks : G::kDownBlocks;
+    static constexpr std::size_t kOffset = M == wide::Matrix::GateUp ? 0 : G::kGateUpBytes;
+    static constexpr int kK              = M == wide::Matrix::GateUp ? kHidden : kInter;
+    static constexpr int kRowBytes       = M == wide::Matrix::GateUp ? kA8XRowBytes : kA8HRowBytes;
+    static constexpr bool kTokenRows     = M == wide::Matrix::GateUp;
+    static constexpr bool kSharedJobs    = false;
+    static_assert(kRowGroups % wide::ScheduleA8::kRowGroups == 0 && kBlocks % wide::ScheduleA8::kUnitsPerKTile == 0,
+                  "whole 128-row blocks and 128-element stages");
+    static_assert(kRowBytes == kK + kK / 8, "a row holds its codes, then its slice scales");
+};
+
+// g, u = nvfp4_a8::row_output(acc, m) with m = fl32(amax_w / denominator), h = the softcapped SwiGLU times gamma into
+// the BF16 h plane row of the tile column's dispatch position.
+struct GateUpA8Epilogue {
+    const std::int32_t* entries;
+    const float* gamma;
+    const float* w_amax;
+    const float* denominators;
+    float gate_cap, up_cap;
+    std::uint16_t* h;
+
+    __device__ __forceinline__ void operator()(wide::AccumulatorsA8& acc, const wide::TileContext& ctx) const {
+        using S       = wide::ScheduleA8;
+        const float m = canon::div_rn(w_amax[2 * ctx.expert], denominators[0]);
+#pragma unroll
+        for (int mt = 0; mt < S::kMmaTokens; ++mt) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int column = wide::a8_tile_column(ctx, mt, half);
+                if (column >= ctx.columns) { continue; }
+                const int p      = ctx.first + column;
+                const float gm   = gamma[entries[p]];
+                std::uint16_t* hp = h + static_cast<std::size_t>(p) * kInter;
+#pragma unroll
+                for (int r = 0; r < S::kMmaRows; ++r) {
+                    const std::uint16_t gate = offloaded_moe::nvfp4_a8::row_output(acc[mt][r][2 * half], m);
+                    const std::uint16_t up   = offloaded_moe::nvfp4_a8::row_output(acc[mt][r][2 * half + 1], m);
+                    hp[(ctx.row_block * S::kBlockRows + 16 * ctx.warp_n + 8 * r + 2 * ctx.tig) / 2] =
+                        detail::swiglu(gate, up, gm, gate_cap, up_cap);
+                }
+            }
+        }
+    }
+};
+
+// y = nvfp4_a8::row_output(acc, m_down) into the entry's output row.
+struct DownA8Epilogue {
+    const std::int32_t* entries;
+    const float* w_amax;
+    const float* denominators;
+    std::uint16_t* outputs;
+
+    __device__ __forceinline__ void operator()(wide::AccumulatorsA8& acc, const wide::TileContext& ctx) const {
+        using S       = wide::ScheduleA8;
+        const float m = canon::div_rn(w_amax[2 * ctx.expert + 1], denominators[1]);
+#pragma unroll
+        for (int mt = 0; mt < S::kMmaTokens; ++mt) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int column = wide::a8_tile_column(ctx, mt, half);
+                if (column >= ctx.columns) { continue; }
+                std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * kHidden +
+                                     ctx.row_block * S::kBlockRows + 16 * ctx.warp_n;
+#pragma unroll
+                for (int r = 0; r < S::kMmaRows; ++r) {
+                    const std::uint32_t y0 = offloaded_moe::nvfp4_a8::row_output(acc[mt][r][2 * half], m);
+                    const std::uint32_t y1 = offloaded_moe::nvfp4_a8::row_output(acc[mt][r][2 * half + 1], m);
+                    *reinterpret_cast<std::uint32_t*>(out + 8 * r + 2 * ctx.tig) = y0 | (y1 << 16);
                 }
             }
         }
@@ -453,9 +539,43 @@ void moe_experts_prompt(const Activations& x, const Routing& routing, const Bank
         x.columns <= 0 || x.columns > ws.capacity) {
         throw std::invalid_argument("w4a4_sparse_moe prompt: Inkling 2's [E, 2304, 1152] banks, 1..capacity columns");
     }
+    const bool a8 = x.activation == ExpertActivation::A8;
+    if (x.activation == ExpertActivation::A16 ||
+        (a8 && (bank.format != ExpertFormat::Nvfp4FourOverSix || x.rows == nullptr || ws.h_a8 == nullptr))) {
+        throw std::invalid_argument("w4a4_sparse_moe prompt: the checkpoint's activations, or A8 on an NVFP4 layer with the "
+                                    "columns' A8 rows and a workspace carved for A8 (A16 takes moe_experts)");
+    }
     const int entries = x.columns * kTopK;
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(ws, bank.records, bank.record_stride, bank.experts);
     check_launch("plan");
+    if (a8) {
+        wide::Call call{};
+        call.dispatch.counts    = ws.counts;
+        call.dispatch.offsets   = ws.offsets;
+        call.dispatch.entries   = ws.entries;
+        call.dispatch.jobs      = ws.jobs;
+        call.dispatch.job_count = ws.job_count;
+        call.job_records        = ws.job_records;
+        call.tiles              = ws.tiles;
+        call.pass_tiles         = ws.pass_tiles;
+        call.passes             = 1;
+        call.top_k              = kTopK;
+        call.a8                 = true;
+        call.x_limbs            = x.rows;
+        call.h_rows             = ws.h_a8;
+        const GateUpA8Epilogue gate_up{ws.entries,       routing.gamma,  bank.amax, bank.denominators,
+                                       bank.gate_softcap, bank.up_softcap, ws.h};
+        wide::launch_a8<A8Shape<wide::Matrix::GateUp>>(call, 0, gate_up, stream);
+        check_launch("A8 gate/up");
+        // h's BF16 plane (dispatch order) as A8 rows, by the codec the x rows took.
+        const Tensor h(ws.h, DType::BF16, {kInter, entries});
+        Tensor h8(ws.h_a8, DType::I32, {kA8HRowBytes / 4, entries});
+        ops::a8_encode_columns(h, h8, stream);
+        const DownA8Epilogue down{ws.entries, bank.amax, bank.denominators, outputs};
+        wide::launch_a8<A8Shape<wide::Matrix::Down>>(call, 0, down, stream);
+        check_launch("A8 down");
+        return;
+    }
     if (bank.format == ExpertFormat::Mxfp8) {
         const A8Call call{ws, bank.records, bank.record_stride, x.rows, routing.gamma, bank.gate_softcap, bank.up_softcap,
                           outputs};

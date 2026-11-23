@@ -6,7 +6,9 @@
 // runs the wide kernel, the weights held across passes). linear() runs 8 columns a call (its column-invariant skinny
 // route), so the oracle is linear's arithmetic itself; its accuracy is the Linear Op's qualification.
 // Q8 storage (the lossy 8-bit weights) against an FP64 oracle on the stored codes and scales decoded on the host, within
-// the FP32 fold's error bound, and every column equal to the same column projected alone (run_q8).
+// the FP32 fold's error bound, and every column equal to the same column projected alone (run_q8). 8-bit inputs
+// (projections_mma's x8, --a8-activations): bit for bit the contract's order emulated on the host from the codec's
+// definition, within FP64's bound, every column equal to the column alone (run_a8).
 
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -16,6 +18,7 @@
 #include "infernix/ops/linear.h"
 #include "infernix/ops/q8_g32.h"
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_a8.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
 
@@ -346,6 +349,191 @@ void run_mma(const Case& c, int columns, std::uint32_t seed, ProjectionsFn fn = 
     for (auto* p : alone) { cudaFree(p); }
 }
 
+// A matrix of Q8 storage on the device (quantize_bf16_q8_g32 of random BF16 rows with zeros, outliers and a zero
+// group) and its stored codes and scales on the host.
+struct Q8Matrix {
+    void* block = nullptr;
+    Weight q;
+    int stride = 0;
+    std::vector<std::int8_t> codes;
+    std::vector<std::uint16_t> scales;
+};
+Q8Matrix make_q8(int rows, int k, std::mt19937& gen) {
+    auto* w   = dalloc<std::uint16_t>(static_cast<std::size_t>(rows) * k);
+    auto host = random_bf16(static_cast<std::size_t>(rows) * k, 0.03F, gen);
+    for (std::size_t i = 0; i < host.size(); i += 997) { host[i] = (i / 997) % 2 == 0 ? std::uint16_t{0} : canon::f32_to_bf16_rn(3.0F); }
+    std::fill(host.begin(), host.begin() + 32, std::uint16_t{0});
+    cuda_check(cudaMemcpy(w, host.data(), host.size() * 2, cudaMemcpyHostToDevice), "upload");
+    Q8Matrix m;
+    m.block = dalloc<std::uint8_t>(infernix::ops::q8_g32_bytes(rows, k));
+    auto* scale_plane = static_cast<std::uint8_t*>(m.block) + static_cast<std::size_t>(rows) * infernix::ops::q8_g32_padded_columns(k);
+    m.q = infernix::ops::quantize_bf16_q8_g32(bf16_weight(w, rows, k), m.block, scale_plane, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "quantize");
+    cudaFree(w);
+    m.stride = static_cast<int>(m.q.padded_shape[1]);
+    m.codes.resize(static_cast<std::size_t>(rows) * m.stride);
+    m.scales.resize(static_cast<std::size_t>(rows) * (m.stride / 32));
+    cuda_check(cudaMemcpy(m.codes.data(), m.q.qdata, m.codes.size(), cudaMemcpyDeviceToHost), "download");
+    cuda_check(cudaMemcpy(m.scales.data(), m.q.scales, m.scales.size() * 2, cudaMemcpyDeviceToHost), "download");
+    return m;
+}
+
+// 8-bit inputs (projections_mma with x8 over Q8 storage; LOSSY). Oracle: the inputs encoded on the host by the codec's
+// definition (ops/ggml/ggml_a8.h: slice scale d = fl32(m / 127), codes rne(fl32(v fl32(127 / m))) clamped to +-127),
+// then (1) the contract's arithmetic in binary32 on the host (acc = +0; per slice in order acc = fma(fl32(P w), d, acc),
+// P the exact integer dot): every output bit for bit; (2) FP64 sum_s P_s w_s d_s within the order's bound
+// (K / 32 + 1) 2^-24 sum_s |P_s w_s d_s| plus BF16 rounding (2^-8 |y|): the arithmetic's accuracy; (3) every checked
+// column equal to the same column projected alone (a 1-column call: another tile shape). Inputs: N(0, 1) with, at 4 or
+// more columns, a zero slice (d = 0) in column 1, a slice below 2^-120 (d = 0) in column 2 and a NaN in the last
+// column (that column's every output NaN). `alias`: the three inputs one buffer (a visit without messages: encoded once).
+void run_a8(const Case& c, int columns, std::uint32_t seed, bool alias) {
+    namespace a8 = infernix::ggml::a8;
+    std::mt19937 gen(seed);
+    const int word = c.fp32 ? 4 : 2, slices = c.k / 32;
+    std::uint16_t* x[3];
+    std::vector<std::uint16_t> xh[3];
+    for (int i = 0; i < 3; ++i) {
+        if (alias && i > 0) {
+            x[i]  = x[0];
+            xh[i] = xh[0];
+            continue;
+        }
+        x[i]  = dalloc<std::uint16_t>(static_cast<std::size_t>(columns) * c.k);
+        xh[i] = random_bf16(static_cast<std::size_t>(columns) * c.k, 1.0F, gen);
+        if (columns >= 4) {
+            auto* v = xh[i].data();
+            std::fill(v + c.k, v + c.k + 32, std::uint16_t{0});
+            for (int j = 0; j < 32; ++j) { v[2 * static_cast<std::size_t>(c.k) + 32 + j] = canon::f32_to_bf16_rn(1.0e-38F * (j % 3)); }
+            v[static_cast<std::size_t>(columns - 1) * c.k + 40] = 0x7FC0U;
+        }
+        cuda_check(cudaMemcpy(x[i], xh[i].data(), xh[i].size() * 2, cudaMemcpyHostToDevice), "upload");
+    }
+    // The host's codes and slice scales of every input column.
+    std::vector<std::int8_t> qx[3];
+    std::vector<float> dx[3];
+    for (int i = 0; i < 3; ++i) {
+        qx[i].resize(xh[i].size());
+        dx[i].resize(static_cast<std::size_t>(columns) * slices);
+        for (int t = 0; t < columns; ++t) {
+            for (int s = 0; s < slices; ++s) {
+                const std::uint16_t* v = xh[i].data() + static_cast<std::size_t>(t) * c.k + 32 * s;
+                unsigned key           = 0;
+                for (int j = 0; j < 32; ++j) { key = std::max(key, static_cast<unsigned>(v[j] & 0x7FFFU)); }
+                const a8::SliceScale sc = a8::slice_scale(key);
+                dx[i][static_cast<std::size_t>(t) * slices + s] = sc.d;
+                for (int j = 0; j < 32; ++j) {
+                    const bool finite = (v[j] & 0x7F80U) != 0x7F80U;
+                    qx[i][static_cast<std::size_t>(t) * c.k + 32 * s + j] = static_cast<std::int8_t>(finite ? a8::code(v[j], sc.inv) : 0);
+                }
+            }
+        }
+    }
+    const std::int32_t words = ik::projection_a8_column_words(c.k);
+    std::int32_t* x8[3];
+    for (auto& p : x8) { p = dalloc<std::int32_t>(static_cast<std::size_t>(columns) * words); }
+    ik::ProjectionArgs args;
+    args.columns  = columns;
+    args.k        = c.k;
+    args.fp32_out = c.fp32;
+    for (int i = 0; i < 3; ++i) { args.x[i] = x[i], args.x8[i] = x8[i]; }
+    std::vector<Q8Matrix> mats;
+    for (const auto& [rows, input] : c.segments) {
+        mats.push_back(make_q8(rows, c.k, gen));
+        ik::ProjectionSegment seg;
+        seg.rows      = rows;
+        seg.input     = input;
+        seg.out       = dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * rows * word);
+        seg.codes     = mats.back().q.qdata;
+        seg.q8_scales = static_cast<const std::uint16_t*>(mats.back().q.scales);
+        seg.q8_stride = mats.back().stride;
+        args.segments[args.count++] = seg;
+    }
+    ik::projections_mma(args, nullptr);
+    std::vector<int> checked;
+    if (columns <= 40) {
+        for (int t = 0; t < columns; ++t) { checked.push_back(t); }
+    } else {
+        checked = {0, 1, 2, 3, columns / 7, columns / 3, columns / 2, (2 * columns) / 3, columns - 9, columns - 2, columns - 1};
+    }
+    std::vector<void*> alone;
+    for (int s = 0; s < args.count; ++s) {
+        alone.push_back(dalloc<std::uint8_t>(static_cast<std::size_t>(columns) * args.segments[s].rows * word));
+    }
+    for (const int t : checked) {
+        ik::ProjectionArgs one = args;
+        one.columns            = 1;
+        for (int i = 0; i < 3; ++i) { one.x[i] = x[i] + static_cast<std::size_t>(t) * c.k; }
+        for (int s = 0; s < args.count; ++s) {
+            one.segments[s].out = static_cast<std::uint8_t*>(alone[s]) + static_cast<std::size_t>(t) * args.segments[s].rows * word;
+        }
+        ik::projections_mma(one, nullptr);
+    }
+    cuda_check(cudaDeviceSynchronize(), "projections_mma (a8)");
+    long outside = 0, wrong = 0, differ = 0, total = 0;
+    double worst = 0;
+    for (int s = 0; s < args.count; ++s) {
+        const Q8Matrix& m = mats[s];
+        const int rows = args.segments[s].rows, input = c.segments[s].second;
+        const std::size_t n = static_cast<std::size_t>(columns) * rows;
+        std::vector<std::uint8_t> got(n * word), solo(n * word);
+        cuda_check(cudaMemcpy(got.data(), args.segments[s].out, got.size(), cudaMemcpyDeviceToHost), "download");
+        cuda_check(cudaMemcpy(solo.data(), alone[s], solo.size(), cudaMemcpyDeviceToHost), "download");
+        for (const int t : checked) {
+            for (int r = 0; r < rows; ++r) {
+                float acc = 0.0F;
+                double y = 0, a = 0;
+                for (int sl = 0; sl < slices; ++sl) {
+                    long long dot = 0;
+                    for (int j = 0; j < 32; ++j) {
+                        dot += static_cast<long long>(m.codes[static_cast<std::size_t>(r) * m.stride + 32 * sl + j]) *
+                               qx[input][static_cast<std::size_t>(t) * c.k + 32 * sl + j];
+                    }
+                    const float w = a8::f16_to_f32(m.scales[static_cast<std::size_t>(r) * (m.stride / 32) + sl]);
+                    const float d = dx[input][static_cast<std::size_t>(t) * slices + sl];
+                    acc           = canon::fma_rn(canon::mul_rn(static_cast<float>(dot), w), d, acc);
+                    const double term = static_cast<double>(dot) * w * d;
+                    y += term, a += std::fabs(term);
+                }
+                const std::size_t i = static_cast<std::size_t>(t) * rows + r;
+                double g = 0;
+                bool same = false;
+                if (c.fp32) {
+                    float f = 0;
+                    std::memcpy(&f, &got[i * 4], 4);
+                    g    = f;
+                    same = std::isnan(acc) ? std::isnan(f) : std::memcmp(&f, &acc, 4) == 0;
+                } else {
+                    std::uint16_t b = 0;
+                    std::memcpy(&b, &got[i * 2], 2);
+                    g = canon::bf16_to_f32(b);
+                    const std::uint16_t want = canon::f32_to_bf16_rn(acc);
+                    same = std::isnan(acc) ? std::isnan(g) : b == want;
+                }
+                wrong += same ? 0 : 1;
+                if (!std::isnan(y)) {
+                    const double tol = (slices + 1) * 0x1p-24 * a + (c.fp32 ? 0.0 : 0x1p-8 * std::fabs(y)) + 1e-30;
+                    const double err = std::fabs(g - y);
+                    outside += err > tol ? 1 : 0;
+                    worst = std::max(worst, err / tol);
+                }
+                differ += std::memcmp(&got[i * word], &solo[i * word], word) != 0 ? 1 : 0;
+                ++total;
+            }
+        }
+    }
+    std::printf("%-44s A8%s T = %4d: %ld of %ld differ from the order's bits, %ld outside the bound (worst %.3f of "
+                "it), %ld differ from the column alone\n",
+                c.name, alias ? " (one input)" : "", columns, wrong, total, outside, worst, differ);
+    if (wrong != 0 || outside != 0 || differ != 0) { ++g_failures; }
+    for (int i = 0; i < 3; ++i) {
+        if (!(alias && i > 0)) { cudaFree(x[i]); }
+        cudaFree(x8[i]);
+    }
+    for (auto& m : mats) { cudaFree(m.block); }
+    for (int s = 0; s < args.count; ++s) { cudaFree(args.segments[s].out); }
+    for (auto* p : alone) { cudaFree(p); }
+}
+
 void run_case(const Case& c, int columns, std::uint32_t seed, bool packed) {
     std::mt19937 gen(seed);
     const int word = c.fp32 ? 4 : 2;
@@ -446,6 +634,17 @@ INFERNIX_OP_TEST(inkling2_projections) {
         for (const int columns : {1, 2, 3, 8, 9, 16, 17, 40}) {
             run_q8(c, columns, seed++, ik::projections_dmma, true, "Q8DMMA");
         }
+        // 8-bit inputs on the prompt route (every tile shape: <= 16 columns, <= 128 or few rows, wide).
+        for (const int columns : {1, 4, 16, 17, 100, 300, 2048}) { run_a8(c, columns, seed++, false); }
+    }
+    run_a8(cases[0], 40, seed++, true);
+    run_a8(cases[0], 300, seed++, true);
+    // The message gates' forget and gain (K = 64: one half stage) and the router's shape, on 8-bit inputs.
+    for (const int columns : {1, 4, 17, 300}) { run_a8(cases[2], columns, seed++, false); }
+    for (const int columns : {1, 17, 300}) { run_a8({"router [128, 2304], FP32 out", 2304, true, {{128, 0}}}, columns, seed++, false); }
+    // Output rows of no 16-byte multiple (the head's FP32 logits rows: V = 200,002 is 8 bytes off).
+    for (const int columns : {1, 3, 17, 130}) {
+        run_a8({"head rows [4098, 2304], FP32 out, unaligned rows", 2304, true, {{4098, 0}}}, columns, seed++, false);
     }
     // The tensor-core projections at the same shapes, the router's [128, 2304] FP32 and the head's arithmetic, at
     // narrow and wide widths (tile shapes: <= 16 columns, few rows, wide).

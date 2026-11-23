@@ -92,6 +92,9 @@ struct ForwardBuffers {
     std::uint16_t* experts = nullptr; // [columns * kTopK][H]
     float *mixed = nullptr, *message = nullptr, *fg = nullptr; // [3][columns][H], [3][columns][H], [3][columns][2H]
     std::uint16_t *gate_input = nullptr, *z = nullptr;          // [3][columns][2H], [3][columns][rank]
+    // a8: a call's 8-bit inputs (projections_mma's x8): K2's three ([3][columns][projection_a8_column_words(H)]
+    // words), then W_o's and the head's over the same memory; null without a8.
+    std::int32_t* x8 = nullptr;
     std::uint16_t* final_hidden = nullptr;
     // DSpark's context features (--spec dspark): each column's partial block sums entering the drafter's target visits
     // (5, 23, 41) and its final-normed state, BF16 [columns][4][H]; null without the drafter.
@@ -121,9 +124,12 @@ class Forward {
 public:
     // A forward of `max_lanes` lanes and calls of up to `capacity` columns (prefill's chunk; at least
     // kMaxForwardColumns, the decode and verify calls' width, whose logits rows the head takes).
-    // `activation`: the routed experts' (--a16-activations: ExpertActivation::A16).
+    // `activation`: the routed experts' (--a16-activations: ExpertActivation::A16; A8 with `a8`). `a8`
+    // (--a8-activations, LOSSY): the attention input and output projections (K2, W_o) and the head, whose 8-bit
+    // weights it needs, take 8-bit activations (projections_mma's x8) in every call, prompt or decode; the message
+    // gates and the router keep 16-bit ones (as Basalt runs them).
     Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity = kMaxForwardColumns,
-            ops::w4a4_moe::ExpertActivation activation = ops::w4a4_moe::ExpertActivation::Checkpoint);
+            ops::w4a4_moe::ExpertActivation activation = ops::w4a4_moe::ExpertActivation::Checkpoint, bool a8 = false);
 
     // Uploads the call's tokens and column map (synchronous copies) and fixes the call's width.
     void prepare(const CallPlan& call);
@@ -138,7 +144,8 @@ public:
     [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity,
                                                   bool features = false,
                                                   ops::w4a4_moe::ExpertActivation activation =
-                                                      ops::w4a4_moe::ExpertActivation::Checkpoint);
+                                                      ops::w4a4_moe::ExpertActivation::Checkpoint,
+                                                  bool a8 = false);
     void embed(cudaStream_t stream);
     void visit(std::uint32_t visit, const StateView& state, const VisitInputs& in, cudaStream_t stream);
     void visit(std::uint32_t v, const StateView& state, cudaStream_t stream) { visit(v, state, inputs(v), stream); }
@@ -194,6 +201,7 @@ private:
     std::int32_t max_lanes_ = 0;
     std::int32_t capacity_  = 0;
     ops::w4a4_moe::ExpertActivation activation_ = ops::w4a4_moe::ExpertActivation::Checkpoint;
+    bool a8_                 = false;
     std::int32_t max_groups_ = 0;
     std::int32_t staging_pages_ = 0;
     std::int32_t columns_   = 0;

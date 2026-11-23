@@ -22,11 +22,16 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "core/tensor.h"
 #include "ops/common/a4_mma.cuh"
 #include "ops/common/a4_native.cuh"
 #include "ops/common/canonical_math.h"
 #include "ops/common/mma.cuh"
+#include "ops/ggml/ggml_a8.h"
+#include "ops/ggml/ggml_a8_mma.cuh"
+#include "ops/ggml/ggml_linear_a8.h"
 #include "ops/ggml/ggml_tile.cuh"
+#include "ops/offloaded_sparse_moe/nvfp4_a8.h"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/offloaded_sparse_moe/cuda/a16_limbs.cuh"
 #include "ops/w4a4_sparse_moe/expert_math.cuh"
@@ -799,6 +804,252 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a16_kernel
                     canon::a16_row_output(s[i], a16_h_emax(__ldcg(a.ws.h_amax + entry)), m);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------- NVFP4 A8 (--a8-activations)
+
+// The header's A8 contract on the narrow route (decode, verification, and for now the prompt route): a warp owns a row
+// group (16 rows: eight intermediates' interleaved gate and up rows, or 16 down rows) over the whole K, in passes of
+// kPass columns, one m16n8k16 s8 MMA per 144-byte unit (lane (g, t): rows g and g + 8 at K 4t .. 4t + 3 of the block,
+// the low and high nibbles of the unit's code word 32t + 4g; column g's codes at the same K), its int32 accumulators
+// started at 1.5 * 2^23 (ggml_a8_mma.cuh) so that P_b * S_b is one FFMA with {S_b, -1.5 * 2^23 * S_b} from a shared
+// table, and the term one more with the column's slice scale. One thread adds an output's terms in block order, so an
+// entry's bits depend on its own codes and its expert's record alone.
+constexpr int kA8Warps   = 4; // row groups a CTA
+constexpr int kA8Threads = 32 * kA8Warps;
+constexpr int kA8Depth   = 4; // stages of a gate/up warp's ring
+constexpr int kA8StageUnits = 8;
+
+__device__ __forceinline__ void fill_a8_scaled(float2* scaled, int threads) {
+    for (int i = static_cast<int>(threadIdx.x); i < 256; i += threads) {
+        const float s = static_cast<float>(canon::e4m3_scaled(static_cast<unsigned>(i)));
+        scaled[i]     = make_float2(s, __fmul_rn(ggml::a8::kMinusMagic, s));
+    }
+}
+
+// One unit's terms for rows g and g + 8 and columns 2t, 2t + 1 (c[i]: row g + 8 (i >> 1), column 2t + (i & 1)); b0:
+// column g's four codes, d0 / d1: the slice scales of columns 2t and 2t + 1.
+__device__ __forceinline__ void a8_unit_terms(const std::uint8_t* unit, unsigned b0, float d0, float d1, const float2* scaled,
+                                              int g, int t, float (&c)[4]) {
+    const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * t + 4 * g);
+    const unsigned a0 = canon::e2m1_x2_quad(word & 0x0F0F0F0FU), a1 = canon::e2m1_x2_quad((word >> 4) & 0x0F0F0F0FU);
+    int p[4];
+    ggml::a8::mma_k16_magic(p, a0, a1, b0);
+    const float2 lo = scaled[unit[128 + g]], hi = scaled[unit[136 + g]];
+    c[0] = __fmaf_rn(ggml::a8::scaled_term(p[0], lo.x, lo.y), d0, c[0]);
+    c[1] = __fmaf_rn(ggml::a8::scaled_term(p[1], lo.x, lo.y), d1, c[1]);
+    c[2] = __fmaf_rn(ggml::a8::scaled_term(p[2], hi.x, hi.y), d0, c[2]);
+    c[3] = __fmaf_rn(ggml::a8::scaled_term(p[3], hi.x, hi.y), d1, c[3]);
+}
+
+// One 32-element BF16 slice (read through L2: written by other CTAs) encoded by ggml_a8.h's codec into `codes`; returns
+// its scale.
+__device__ __forceinline__ float a8_encode_slice(const std::uint16_t* v, std::int8_t* codes) {
+    uint4 raw[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { raw[i] = __ldcg(reinterpret_cast<const uint4*>(v) + i); }
+    const auto* e = reinterpret_cast<const std::uint16_t*>(raw);
+    unsigned key  = 0;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) { key = max(key, static_cast<unsigned>(e[j] & 0x7FFFU)); }
+    const ggml::a8::SliceScale sc = ggml::a8::slice_scale(key);
+    unsigned words[8];
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        unsigned packed = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            packed |= (static_cast<unsigned>(ggml::a8::code(e[4 * w + j], sc.inv)) & 0xFFU) << (8 * j);
+        }
+        words[w] = packed;
+    }
+    reinterpret_cast<uint4*>(codes)[0] = make_uint4(words[0], words[1], words[2], words[3]);
+    reinterpret_cast<uint4*>(codes)[1] = make_uint4(words[4], words[5], words[6], words[7]);
+    return sc.d;
+}
+
+template <class G>
+struct GateUpA8iSmem {
+    using S = Shape<G, false>;
+    float2 scaled[256];
+    alignas(16) std::uint8_t ring[kA8Warps][kA8Depth][kA8StageUnits * S::kUnit];
+    alignas(16) std::uint8_t x[kPass][kA8XRowBytes];
+    int last;
+};
+
+template <class G>
+__global__ void __launch_bounds__(kA8Threads) gate_up_a8i_kernel(Args a) {
+    using S = Shape<G, false>;
+    static_assert(G::kHidden + G::kHidden / 8 == kA8XRowBytes && G::kInter + G::kInter / 8 == kA8HRowBytes, "A8 rows");
+    constexpr int kStages = S::kGateUpBlocks / kA8StageUnits; // 18
+    constexpr int kStageBytes = kA8StageUnits * S::kUnit;
+    static_assert(S::kGateUpBlocks % kA8StageUnits == 0 && kStages >= kA8Depth && S::kGateUpRowGroups % kA8Warps == 0);
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm = *reinterpret_cast<GateUpA8iSmem<G>*>(smem_raw);
+    pdl::trigger_dependents(); // the down pass may launch and copy its weights; it reads h after its job's count
+    const int job = static_cast<int>(blockIdx.y);
+    JobView v;
+    if (!job_view(a, job, v)) { return; }
+    const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
+    const int g = lane / 4, t = lane % 4;
+    const int group = static_cast<int>(blockIdx.x) * kA8Warps + warp;
+    const std::uint8_t* units = v.record + static_cast<std::size_t>(group) * S::kGateUpBlocks * S::kUnit;
+    auto& ring       = sm.ring[warp];
+    const auto issue = [&](int stage) {
+        const std::uint8_t* src = units + static_cast<std::size_t>(stage) * kStageBytes;
+        for (int i = lane; i < kStageBytes / 16; i += 32) { tile::cp_async16(ring[stage % kA8Depth] + 16 * i, src + 16 * i, 16); }
+    };
+    fill_a8_scaled(sm.scaled, kA8Threads);
+    const float m = a16_multiplier(a.bank.amax[2 * v.expert], a.bank.denominators[0]);
+    const auto column_of_entry = [&](int c) { return a.ws.entries[v.first + c] / kTopK; };
+    for (int base = 0; base < v.count; base += kPass) {
+        const int n = min(kPass, v.count - base);
+        // The pass's columns' A8 rows (a missing column repeats the last: its outputs are not stored), then the ring.
+        for (int i = tid; i < kPass * (kA8XRowBytes / 16); i += kA8Threads) {
+            const int c = i / (kA8XRowBytes / 16), k = i % (kA8XRowBytes / 16);
+            const std::uint8_t* row = a.x.rows + static_cast<std::size_t>(column_of_entry(base + min(c, n - 1))) * kA8XRowBytes;
+            tile::cp_async16(sm.x[c] + 16 * k, row + 16 * k, 16);
+        }
+        tile::cp_async_commit();
+#pragma unroll
+        for (int k = 0; k < kA8Depth - 1; ++k) {
+            issue(k);
+            tile::cp_async_commit();
+        }
+        const std::uint8_t* xg = sm.x[g];
+        const float* d0s = reinterpret_cast<const float*>(sm.x[2 * t] + G::kHidden);
+        const float* d1s = reinterpret_cast<const float*>(sm.x[2 * t + 1] + G::kHidden);
+        float c[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        for (int st = 0; st < kStages; ++st) {
+            tile::cp_async_wait<kA8Depth - 2>();
+            if (st == 0) {
+                __syncthreads(); // every thread's x copies and the scale table
+            } else {
+                __syncwarp();
+            }
+            if (st + kA8Depth - 1 < kStages) { issue(st + kA8Depth - 1); }
+            tile::cp_async_commit();
+            const std::uint8_t* stage = ring[st % kA8Depth];
+#pragma unroll
+            for (int u = 0; u < kA8StageUnits; ++u) {
+                const int b = st * kA8StageUnits + u;
+                a8_unit_terms(stage + u * S::kUnit, *reinterpret_cast<const unsigned*>(xg + 16 * b + 4 * t), d0s[b / 2],
+                              d1s[b / 2], sm.scaled, g, t, c);
+            }
+            __syncwarp();
+        }
+        tile::cp_async_wait<0>();
+        // Rows g (even: gate) and g + 1 (up) of an intermediate pair through a shuffle; h = the softcapped SwiGLU.
+        std::uint16_t y[4], up[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { y[i] = offloaded_moe::nvfp4_a8::row_output(c[i], m); }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { up[i] = static_cast<std::uint16_t>(__shfl_down_sync(0xFFFFFFFFU, y[i], 4)); }
+        if ((g & 1) == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = 2 * t + (i & 1);
+                if (col < n) {
+                    const int entry = a.ws.entries[v.first + base + col];
+                    a.ws.h[static_cast<std::size_t>(entry) * G::kInter + group * 8 + g / 2 + (i < 2 ? 0 : 4)] =
+                        swiglu(y[i], up[i], a.routing.gamma[entry], a.bank.gate_softcap, a.bank.up_softcap);
+                }
+            }
+        }
+        __syncthreads(); // the next pass reuses x and the rings
+    }
+    // The job's last CTA encodes the job's h rows once, then counts again: the down CTAs wait for the CTAs + 1.
+    if (tid == 0) {
+        __threadfence();
+        sm.last = acq_rel_add(&a.ws.job_done[job]) == static_cast<std::uint32_t>(S::kGateUpRowGroups / kA8Warps - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (sm.last == 0) { return; }
+    __threadfence();
+    constexpr int kSlices = G::kInter / 32;
+    for (int i = tid; i < v.count * kSlices; i += kA8Threads) {
+        const int c = i / kSlices, s = i % kSlices;
+        const int entry = a.ws.entries[v.first + c];
+        std::uint8_t* row = a.ws.h_a8 + static_cast<std::size_t>(entry) * kA8HRowBytes;
+        const float d = a8_encode_slice(a.ws.h + static_cast<std::size_t>(entry) * G::kInter + 32 * s,
+                                        reinterpret_cast<std::int8_t*>(row + 32 * s));
+        reinterpret_cast<float*>(row + G::kInter)[s] = d;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        release_add(&a.ws.job_done[job]);
+    }
+}
+
+template <class G>
+struct DownA8iSmem {
+    using S = Shape<G, false>;
+    float2 scaled[256];
+    alignas(16) std::uint8_t units[kA8Warps][S::kDownBytes];
+    alignas(16) std::uint8_t h[kPass][kA8HRowBytes];
+};
+
+template <class G>
+__global__ void __launch_bounds__(kA8Threads) down_a8i_kernel(Args a) {
+    using S = Shape<G, false>;
+    static_assert(S::kDownRowGroups % kA8Warps == 0, "whole row groups a CTA");
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm = *reinterpret_cast<DownA8iSmem<G>*>(smem_raw);
+    pdl::trigger_dependents();
+    const int job = static_cast<int>(blockIdx.y);
+    JobView v;
+    if (!job_view(a, job, v)) { return; }
+    const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
+    const int g = lane / 4, t = lane % 4;
+    const int group = static_cast<int>(blockIdx.x) * kA8Warps + warp;
+    // The weights do not depend on h: their copies start before the wait.
+    const std::uint8_t* src = v.record + S::kGateUpBytes + static_cast<std::size_t>(group) * S::kDownBytes;
+    for (int i = lane; i < S::kDownBytes / 16; i += 32) { tile::cp_async16(sm.units[warp] + 16 * i, src + 16 * i, 16); }
+    tile::cp_async_commit();
+    fill_a8_scaled(sm.scaled, kA8Threads);
+    __shared__ int stalled;
+    if (tid == 0) {
+        stalled = wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpRowGroups / kA8Warps + 1), a.ws.error)
+                      ? 0
+                      : 1;
+    }
+    tile::cp_async_wait<0>();
+    __syncthreads();
+    if (stalled != 0) { return; }
+    const float m = a16_multiplier(a.bank.amax[2 * v.expert + 1], a.bank.denominators[1]);
+    const std::uint8_t* units = sm.units[warp];
+    for (int base = 0; base < v.count; base += kPass) {
+        const int n = min(kPass, v.count - base);
+        for (int i = tid; i < kPass * (kA8HRowBytes / 16); i += kA8Threads) {
+            const int c = i / (kA8HRowBytes / 16), k = i % (kA8HRowBytes / 16);
+            const std::uint8_t* row =
+                a.ws.h_a8 + static_cast<std::size_t>(a.ws.entries[v.first + base + min(c, n - 1)]) * kA8HRowBytes;
+            tile::cp_async16(sm.h[c] + 16 * k, row + 16 * k, 16);
+        }
+        tile::cp_async_commit();
+        tile::cp_async_wait<0>();
+        __syncthreads();
+        const std::uint8_t* hg = sm.h[g];
+        const float* d0s = reinterpret_cast<const float*>(sm.h[2 * t] + G::kInter);
+        const float* d1s = reinterpret_cast<const float*>(sm.h[2 * t + 1] + G::kInter);
+        float c[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll 8
+        for (int b = 0; b < S::kDownBlocks; ++b) {
+            a8_unit_terms(units + b * S::kUnit, *reinterpret_cast<const unsigned*>(hg + 16 * b + 4 * t), d0s[b / 2],
+                          d1s[b / 2], sm.scaled, g, t, c);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int col = 2 * t + (i & 1);
+            if (col < n) {
+                const int entry = a.ws.entries[v.first + base + col];
+                const int row   = group * 16 + g + (i < 2 ? 0 : 8);
+                a.outputs[static_cast<std::size_t>(entry) * G::kHidden + row] = offloaded_moe::nvfp4_a8::row_output(c[i], m);
+            }
+        }
+        __syncthreads(); // the next pass's h rows
     }
 }
 
@@ -1638,6 +1889,7 @@ Workspace layout(std::int32_t experts, std::int32_t intermediate, std::int32_t c
     w.h_amax     = reinterpret_cast<std::uint32_t*>(take(m * 4));
     w.h_rows     = reinterpret_cast<std::uint8_t*>(take(m * h_row));
     if (activation == ExpertActivation::A16) { w.h_limbs = reinterpret_cast<std::uint8_t*>(take(m * (i / 64 * 192))); }
+    if (activation == ExpertActivation::A8) { w.h_a8 = reinterpret_cast<std::uint8_t*>(take(m * (i + i / 8))); }
     w.error      = reinterpret_cast<std::uint32_t*>(take(4));
     w.single     = reinterpret_cast<std::uint32_t*>(take(kSingleCounters * 4));
     w.x_plane    = reinterpret_cast<std::uint8_t*>(take(m * kPromptXRowBytes));
@@ -1740,6 +1992,7 @@ bool moe_single_supported(ExpertFormat format, ExpertActivation activation) {
     static const bool a8  = single_fits<true, false>();
     static const bool a16 = single_fits<false, true>();
     if (format == ExpertFormat::Mxfp8) { return activation == ExpertActivation::Checkpoint && a8; }
+    if (activation == ExpertActivation::A8) { return false; } // the NVFP4 A8 route has no single-launch kernel
     return activation == ExpertActivation::A16 ? a16 : a4;
 }
 
@@ -1782,6 +2035,16 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
     check_launch("single");
 }
 
+void moe_encode_a8(const std::uint16_t* x, std::int32_t columns, std::uint8_t* rows, cudaStream_t stream) {
+    if (x == nullptr || rows == nullptr || columns <= 0 || reinterpret_cast<std::uintptr_t>(rows) % 16 != 0 ||
+        ops::a8_linear_column_words(Inkling::kHidden, false) * 4 != kA8XRowBytes) {
+        throw std::invalid_argument("w4a4_sparse_moe A8 encode: BF16 [T][2304] into 16-byte aligned A8 rows");
+    }
+    const Tensor in(const_cast<std::uint16_t*>(x), DType::BF16, {Inkling::kHidden, columns});
+    Tensor out(rows, DType::I32, {kA8XRowBytes / 4, columns});
+    ops::a8_encode_columns(in, out, stream);
+}
+
 void moe_experts(const Activations& x, const Routing& routing, const Bank& bank, const Workspace& workspace,
                  std::uint16_t* outputs, cudaStream_t stream) {
     using G = Inkling;
@@ -1794,6 +2057,30 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
     const Args args{x, routing, bank, workspace, outputs};
     // A job per expert with entries: at most min(E, columns * top_k) jobs; CTAs past the job count exit.
     const int jobs = std::min(bank.experts, x.columns * kTopK);
+    if (x.activation == ExpertActivation::A8) {
+        if (bank.format != ExpertFormat::Nvfp4FourOverSix || x.rows == nullptr || workspace.h_a8 == nullptr) {
+            throw std::invalid_argument("w4a4_sparse_moe A8: NVFP4 layers (MXFP8 keep their 8-bit arithmetic), the "
+                                        "columns' A8 rows and a workspace carved for A8");
+        }
+        using S = Shape<G, false>;
+        static const bool configured = [] {
+            allow_shared(gate_up_a8i_kernel<G>, sizeof(GateUpA8iSmem<G>));
+            allow_shared(down_a8i_kernel<G>, sizeof(DownA8iSmem<G>));
+            return true;
+        }();
+        (void)configured;
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+                                    {dim3(S::kGateUpRowGroups / kA8Warps, jobs), dim3(kA8Threads), sizeof(GateUpA8iSmem<G>),
+                                     stream},
+                                    gate_up_a8i_kernel<G>, args));
+        check_launch("NVFP4 A8 gate/up");
+        CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
+                                    {dim3(S::kDownRowGroups / kA8Warps, jobs), dim3(kA8Threads), sizeof(DownA8iSmem<G>),
+                                     stream},
+                                    down_a8i_kernel<G>, args));
+        check_launch("NVFP4 A8 down");
+        return;
+    }
     if (x.activation == ExpertActivation::A16 && bank.format == ExpertFormat::Mxfp8) {
         if (x.x16 == nullptr) { throw std::invalid_argument("w4a4_sparse_moe MXFP8 A16: the columns' BF16 rows"); }
         using S = Shape<G, true>;

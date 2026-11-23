@@ -90,7 +90,9 @@ bool use_dmma(bool prompt, const ik::ProjectionArgs& a) {
     return !prompt && (a.segments[0].weight != nullptr || a.segments[0].q8_scales != nullptr) && a.k % 32 == 0;
 }
 void project_fused(bool prompt, const ik::ProjectionArgs& a, cudaStream_t stream) {
-    if (use_mma(prompt, a)) {
+    if (a.x8[0] != nullptr) { // 8-bit inputs: projections_mma at every width (one arithmetic, width-invariant)
+        ik::projections_mma(a, stream);
+    } else if (use_mma(prompt, a)) {
         ik::projections_mma(a, stream);
     } else if (use_dmma(prompt, a)) {
         ik::projections_dmma(a, stream);
@@ -105,9 +107,15 @@ std::int32_t max_groups(std::int32_t lanes, std::int32_t capacity) {
 
 // The forward's device buffers in order, each through add(pointer, bytes) (the constructor places them; device_bytes
 // counts them).
+// a8: the words of a prompt call's 8-bit inputs, a column: K2's three inputs, where W_o's one also fits.
+std::size_t a8_column_words() {
+    const std::size_t k2 = 3 * static_cast<std::size_t>(ik::projection_a8_column_words(kH));
+    return std::max(k2, static_cast<std::size_t>(ik::projection_a8_column_words(kQ)));
+}
+
 template <class Add>
 void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, bool features,
-                  moe::ExpertActivation activation, ForwardBuffers& b, std::uint8_t*& moe_base,
+                  moe::ExpertActivation activation, bool a8, ForwardBuffers& b, std::uint8_t*& moe_base,
                   std::uint8_t*& attention_base, Add&& add) {
     const std::size_t T = static_cast<std::size_t>(capacity);
     const std::size_t V = c.vocab_size, rank = c.loop.message_rank, lanes = static_cast<std::size_t>(max_lanes);
@@ -129,11 +137,14 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
     add(b.v, T * kKv * 2), add(b.sink, T * ik::kHeads * 2), add(b.key_taps, T * kTaps * 2);
     add(b.value_taps, T * kTaps * 2), add(b.attention, T * kQ * 2), add(b.o, row16), add(b.xm, row16);
     const bool a16 = activation == moe::ExpertActivation::A16;
+    const bool a8x = activation == moe::ExpertActivation::A8;
     add(b.rows, T * std::max({moe::row_bytes(moe::ExpertFormat::Nvfp4FourOverSix, kH),
-                              moe::row_bytes(moe::ExpertFormat::Mxfp8, kH), a16 ? moe::kA16XRowBytes : 0}));
+                              moe::row_bytes(moe::ExpertFormat::Mxfp8, kH), a16 ? moe::kA16XRowBytes : 0,
+                              a8x ? moe::kA8XRowBytes : 0}));
     add(b.amax, T * 4), add(b.emax, T * 4), add(b.experts, T * moe::kTopK * kH * 2);
     add(b.mixed, 3 * T * kH * 4), add(b.message, 3 * T * kH * 4), add(b.fg, 3 * T * 2 * kH * 4);
     add(b.gate_input, 3 * T * 2 * kH * 2), add(b.z, 3 * T * rank * 2);
+    if (a8) { add(b.x8, T * a8_column_words() * 4); }
     add(b.final_hidden, row16), add(b.logits, std::size_t{kMaxForwardColumns} * V * 4);
     if (features) { add(b.features, 4 * row16); }
     add(moe_base, moe::workspace_bytes(static_cast<std::int32_t>(c.experts), static_cast<std::int32_t>(c.intermediate),
@@ -144,11 +155,11 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
 } // namespace
 
 std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity, bool features,
-                                  moe::ExpertActivation activation) {
+                                  moe::ExpertActivation activation, bool a8) {
     ForwardBuffers b;
     std::uint8_t *moe_base = nullptr, *attention_base = nullptr;
     std::size_t at = 0;
-    walk_buffers(config, max_lanes, capacity, features, activation, b, moe_base, attention_base,
+    walk_buffers(config, max_lanes, capacity, features, activation, a8, b, moe_base, attention_base,
                  [&](auto*&, std::size_t bytes) { at = align(at + bytes); });
     return at;
 }
@@ -176,9 +187,9 @@ StateLayout state_layout(const TextConfig& c) {
 }
 
 Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity,
-                 moe::ExpertActivation activation)
+                 moe::ExpertActivation activation, bool a8)
     : p_(parameters), c_(parameters.model.config().text), layout_(state_layout(c_)), max_lanes_(max_lanes),
-      capacity_(capacity), activation_(activation), max_groups_(max_groups(max_lanes, capacity)),
+      capacity_(capacity), activation_(activation), a8_(a8), max_groups_(max_groups(max_lanes, capacity)),
       staging_pages_(ik::staging_ring_pages(capacity)) {
     if (max_lanes <= 0 || max_lanes > ik::kMaxAttentionLanes) {
         throw std::invalid_argument("inkling2 forward: 1-8 lanes");
@@ -191,7 +202,7 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     std::vector<std::pair<void**, std::size_t>> slots;
     std::uint8_t* moe_base       = nullptr;
     std::uint8_t* attention_base = nullptr;
-    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, b_, moe_base, attention_base,
+    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, a8, b_, moe_base, attention_base,
                  [&](auto*& pointer, std::size_t bytes) {
         slots.emplace_back(reinterpret_cast<void**>(&pointer), at);
         at = align(at + bytes);
@@ -508,6 +519,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         add_segment(k2, a.key_taps, 1, b_.key_taps);
         add_segment(k2, a.value_taps, 2, b_.value_taps);
     }
+    if (a8_) { // the three inputs' codes (one input's, shared, when they alias)
+        const std::size_t words = static_cast<std::size_t>(ik::projection_a8_column_words(kH)) * T;
+        for (int i = 0; i < 3; ++i) { k2.x8[i] = b_.x8 + i * words; }
+    }
     project_fused(prompt_, k2, stream);
     mark("k2_projections");
 
@@ -569,20 +584,28 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     wo.k       = kQ;
     wo.x[0]    = b_.attention;
     add_segment(wo, a.output, 0, b_.o);
+    if (a8_) { wo.x8[0] = b_.x8; }
     project_fused(prompt_, wo, stream);
     mark("w_o");
-    // The experts' x: the checkpoint's rows, or under A16 an NVFP4 layer's limb rows and an MXFP8 layer's BF16 x alone.
-    const bool a16 = activation_ == moe::ExpertActivation::A16;
+    // The experts' x: the checkpoint's rows, or under A16 an NVFP4 layer's limb rows and an MXFP8 layer's BF16 x alone,
+    // or under A8 an NVFP4 layer's A8 rows (encoded from the BF16 x after the entry; MXFP8 layers keep their rows).
+    const bool a16   = activation_ == moe::ExpertActivation::A16;
     const bool nvfp4 = op.format == moe::ExpertFormat::Nvfp4FourOverSix;
-    const ik::ExpertRows rows = !a16 ? ik::ExpertRows{op.format, b_.rows, b_.amax}
-                                : nvfp4 ? ik::ExpertRows{op.format, b_.rows, nullptr, b_.emax}
-                                        : ik::ExpertRows{op.format, nullptr, nullptr, nullptr};
+    const bool a8x   = activation_ == moe::ExpertActivation::A8 && nvfp4;
+    const ik::ExpertRows rows = a8x  ? ik::ExpertRows{op.format, nullptr, nullptr, nullptr}
+                              : !a16 ? ik::ExpertRows{op.format, b_.rows, b_.amax}
+                              : nvfp4 ? ik::ExpertRows{op.format, b_.rows, nullptr, b_.emax}
+                                      : ik::ExpertRows{op.format, nullptr, nullptr, nullptr};
     moe::Activations experts_x{b_.rows, b_.amax, T};
     if (a16) {
         experts_x.activation = moe::ExpertActivation::A16;
         experts_x.rows       = nvfp4 ? b_.rows : nullptr;
         experts_x.emax       = nvfp4 ? b_.emax : nullptr;
         experts_x.x16        = b_.xm;
+    }
+    if (a8x) {
+        experts_x.activation = moe::ExpertActivation::A8;
+        experts_x.amax       = nullptr;
     }
     ik::MlpEntryArgs m;
     m.columns  = T;
@@ -634,6 +657,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         mark("message_gates");
     }
 
+    if (a8x) {
+        moe::moe_encode_a8(b_.xm, T, b_.rows, stream);
+        mark("experts_x");
+    }
     // K6-K8: route and the experts (their outputs combine in the next visit's entry). A prompt call: the router's logits
     // on tensor cores (FP32), the selection by column, the experts' grouped block-scaled GEMMs.
     if (prompt_) {
@@ -650,7 +677,8 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         ik::projections_mma(router, stream);
         moe::moe_select(b_.moe.logits, T, op.router_bias, op.bank.experts, c_.route_scale, b_.moe, stream);
         mark("router");
-        // A16: the narrow kernels at the prompt's width too (their exact or column-invariant sums; no A16 grouped GEMM).
+        // A16: the narrow kernels at the prompt's width too (exact sums; no A16 grouped GEMM). A8: the grouped 8-bit
+        // GEMM, the narrow route's bits.
         a16 ? moe::moe_experts(experts_x, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream)
             : moe::moe_experts_prompt(experts_x, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
     } else if (T == 1 && moe::moe_single_supported(op.bank.format, experts_x.activation)) {
@@ -699,7 +727,12 @@ void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) 
         h.x[0]     = x;
         h.fp32_out = true;
         add_segment(h, p_.head, 0, b_.logits);
-        ik::projections(h, stream);
+        if (a8_) { // 8-bit inputs (the head's rows are Q8 under a8)
+            h.x8[0] = b_.x8;
+            ik::projections_mma(h, stream);
+        } else {
+            ik::projections(h, stream);
+        }
     } else {
         project(x, p_.head, b_.logits, true, stream, 0, count);
     }
