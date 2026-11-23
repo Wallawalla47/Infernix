@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <exception>
 #include <iterator>
 #include <mutex>
@@ -43,6 +45,16 @@ struct RequestLifetime {
     std::shared_ptr<RequestCapacity> capacity;
     std::chrono::steady_clock::time_point started;
     std::chrono::steady_clock::time_point deadline;
+};
+
+// POST /v1/score's turn (GenerationService::score): the scoring Engine runs one call at a time, so requests wait here
+// in arrival order, where one whose client disconnects or that outlives --pending-timeout-ms still gives up. A score
+// that has started runs to its end.
+struct ScoreQueue {
+    std::mutex mutex;
+    std::condition_variable turn;
+    std::deque<std::uint64_t> waiting; // tickets in arrival order; the front one scores
+    std::uint64_t next = 0;
 };
 
 std::string vision_overflow_note(const infernix::ContextLengthDetails& details) {
@@ -458,7 +470,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
-    pdf_cache_ = std::make_shared<PdfCache>(kPdfCacheBytes);
+    score_queue_ = std::make_shared<ScoreQueue>();
+    pdf_cache_   = std::make_shared<PdfCache>(kPdfCacheBytes);
 }
 
 std::shared_ptr<RequestLifetime>
@@ -810,17 +823,21 @@ void GenerationService::schedule_next_turn(PreparedRequest& prepared,
     engine_->prefill_next_turn(std::move(conversation));
 }
 
-ScoreOutcome GenerationBackend::score(const ScoreRequest&) {
+ScoreOutcome GenerationBackend::score(const ScoreRequest&, std::function<bool()>) {
     throw ApiException(ApiError{.status  = 501,
                                 .type    = "not_supported",
                                 .message = "this server does not score: start infernix-serve with --causal-scoring",
                                 .code    = "scoring_not_enabled"});
 }
 
-ScoreOutcome GenerationService::score(const ScoreRequest& request) {
+ScoreOutcome GenerationService::score(const ScoreRequest& request, std::function<bool()> is_cancelled) {
     if (engine_->options().purpose != infernix::EnginePurpose::CausalScoring) {
-        return GenerationBackend::score(request);
+        return GenerationBackend::score(request, std::move(is_cancelled));
     }
+    // Admission as a generation's: at most --max-pending-requests wait beside the one scoring, each until
+    // --pending-timeout-ms.
+    const std::shared_ptr<RequestLifetime> lifetime =
+        acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout, false);
     ScoreOutcome outcome;
     outcome.chat_template_applied = request.apply_chat_template;
     outcome.top_k                 = request.top_k;
@@ -860,10 +877,48 @@ ScoreOutcome GenerationService::score(const ScoreRequest& request) {
     infernix::ScoreOptions score_options;
     score_options.top_k = request.top_k;
     infernix::ScoreResult result;
-    try {
-        result = engine_->score_tokens(std::move(tokens), outcome.prompt_tokens, score_options);
-    } catch (const std::invalid_argument& exception) {
-        bad_request(exception.what(), {}, "invalid_score_request");
+    {
+        // The scoring Engine's turn, in arrival order (ScoreQueue): a request whose client disconnects, or that is
+        // still waiting at its deadline, leaves the queue; one that has started scoring runs to its end.
+        ScoreQueue& queue = *score_queue_;
+        std::unique_lock lock(queue.mutex);
+        const std::uint64_t ticket = queue.next++;
+        queue.waiting.push_back(ticket);
+        while (queue.waiting.front() != ticket) {
+            queue.turn.wait_for(lock, std::chrono::milliseconds(10));
+            if (queue.waiting.front() == ticket) { break; }
+            lock.unlock();
+            const bool cancelled = is_cancelled && is_cancelled();
+            const bool expired   = Clock::now() >= lifetime->deadline;
+            lock.lock();
+            if ((cancelled || expired) && queue.waiting.front() != ticket) {
+                queue.waiting.erase(std::find(queue.waiting.begin(), queue.waiting.end(), ticket));
+                lock.unlock();
+                if (cancelled) {
+                    throw ApiException(ApiError{.status  = 499,
+                                                .type    = "request_cancelled",
+                                                .message = "client disconnected while the score waited for its turn",
+                                                .code    = "client_disconnected"});
+                }
+                throw_request_error(infernix::RequestError(RequestErrorKind::QueueTimeout,
+                                                           "the score waited past --pending-timeout-ms for its turn"),
+                                    "structured_outputs.grammar", {}, queue_retry_after_seconds());
+            }
+        }
+        lock.unlock();
+        struct Turn {
+            ScoreQueue& queue;
+            ~Turn() {
+                std::lock_guard done(queue.mutex);
+                queue.waiting.pop_front();
+                queue.turn.notify_all();
+            }
+        } turn{queue};
+        try {
+            result = engine_->score_tokens(std::move(tokens), outcome.prompt_tokens, score_options);
+        } catch (const std::invalid_argument& exception) {
+            bad_request(exception.what(), {}, "invalid_score_request");
+        }
     }
     const auto text = [this](infernix::TokenId id) {
         return engine_->detokenize_bytes(std::span<const infernix::TokenId>(&id, 1));

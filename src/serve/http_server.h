@@ -118,6 +118,10 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
 
     void register_routes();
+    // A --causal-scoring server generates nothing: its generation routes (chat completions, Responses, Messages,
+    // decide) refuse with 501 generation_not_enabled before anything runs, as /v1/score refuses on a generation
+    // server with scoring_not_enabled.
+    void require_generation() const;
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);

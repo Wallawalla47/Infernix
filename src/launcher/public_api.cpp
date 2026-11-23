@@ -40,7 +40,8 @@ std::string rfc3339(std::int64_t ms) {
 
 // Whether a public route's answer can be an event stream (the generation routes), not JSON only.
 bool route_streams(std::string_view path) {
-    for (const std::string_view json_only : {"/count_tokens", "/input_tokens", "/compact", "/decide", "/systemone"}) {
+    for (const std::string_view json_only :
+         {"/count_tokens", "/input_tokens", "/compact", "/decide", "/systemone", "/score"}) {
         if (path.ends_with(json_only)) { return false; }
     }
     return true;
@@ -415,7 +416,7 @@ void Launcher::handle_generation(const Request& request, Response& response, Api
     }
     bool stream = false, parsed = false;
     const std::string name = json_body_model(request.body, stream, parsed);
-    // Only the generation routes stream: count_tokens, input_tokens, compact and decide answer JSON whatever
+    // Only the generation routes stream: count_tokens, input_tokens, compact, decide and score answer JSON whatever
     // `stream` says, so they wait for a load and relay that JSON instead of starting an event stream for it.
     stream      = stream && route_streams(request.path);
     call.stream = stream;
@@ -661,7 +662,7 @@ void Launcher::register_public_routes() {
     server_.Get(R"((?:/v1){0,2}/models)", logged(&Launcher::handle_models));
     server_.Get(R"((?:/v1){0,2}/models/(.+))", logged(&Launcher::handle_models));
     server_.Post(
-        R"((?:/v1)?/v1/(chat/completions|completions|responses|responses/input_tokens|responses/compact|messages|messages/count_tokens|decide|systemone))",
+        R"((?:/v1)?/v1/(chat/completions|completions|responses|responses/input_tokens|responses/compact|messages|messages/count_tokens|decide|systemone|score))",
         logged(&Launcher::handle_generation));
     // Stored Responses live in the loaded server.
     server_.Get(R"((?:/v1)?/v1/responses/([^/]+)(/input_items)?)", logged(&Launcher::handle_stateful));

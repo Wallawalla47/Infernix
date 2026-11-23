@@ -67,6 +67,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
     DecideRequest request;
     std::vector<std::optional<DecideSchedule>> schedules;
     try {
+        require_generation();
         request = parse_decide_request(parse_json_body(req), decide_labels_.size());
         if (!request.model.empty()) {
             request.model = resolve_openai_model(request.model, public_model_id_, options_.any_model_name);

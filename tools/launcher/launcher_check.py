@@ -294,6 +294,15 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
               status == 200 and "application/json" in (response.getheader("Content-Type") or "")
               and isinstance(counted, dict) and counted.get("input_tokens") == 56,
               f"{status} {response.getheader('Content-Type')} {str(counted)[:120]}")
+        # /v1/score (a --causal-scoring server) is proxied as a JSON-only route too.
+        status, scored, response = call(port, "POST", "/v1/score",
+                                        {"model": default_alias, "stream": True, "apply_chat_template": False,
+                                         "prompt": "The capital of France is", "continuation": " Paris"},
+                                        full=True)
+        check("/v1/score is proxied and answers its JSON",
+              status == 200 and "application/json" in (response.getheader("Content-Type") or "")
+              and isinstance(scored, dict) and scored.get("object") == "score",
+              f"{status} {response.getheader('Content-Type')} {str(scored)[:120]}")
         call(port, "POST", "/launcher/api/unload", {})
         wait_for(lambda: instance(port)["state"] == "idle", 30)
 

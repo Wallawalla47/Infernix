@@ -161,6 +161,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     std::shared_ptr<AnthropicResponseState> state;
     try {
+        require_generation();
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         limits.claude_code_prompt = options_.claude_code_prompt;

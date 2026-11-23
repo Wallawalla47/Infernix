@@ -609,7 +609,26 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
-    case EnginePurpose::CausalScoring:
+    case EnginePurpose::CausalScoring: {
+        // Scoring runs one teacher-forced call at a time, without speculation, vision, CUDA Graphs or the prefix
+        // cache. A server started for scoring with a generation configuration (the launcher's defaults name lanes
+        // and a drafter) says which of its settings that leaves unused rather than refusing them.
+        std::string ignored;
+        const auto ignore = [&ignored](const std::string& what) { ignored += (ignored.empty() ? "" : ", ") + what; };
+        if (options.max_concurrency > 1) { ignore("--max-concurrency " + std::to_string(options.max_concurrency)); }
+        const SpeculativeOptions& spec = options.speculative;
+        if (spec.backend != SpeculativeBackend::None || spec.backend_auto || !spec.draft_model.empty() ||
+            spec.ngram_draft_tokens != 0 || spec.ngram_draft_tokens_auto) {
+            ignore("speculative decoding (--spec, --draft-model, --ngram-draft-tokens)");
+        }
+        if (options.enable_vision) { ignore("vision"); }
+        if (!options.context_cache.hybrid.persistent_file.empty()) { ignore("--prefix-cache-file"); }
+        if (!ignored.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "causal scoring runs one request at a time without speculation, vision or the prefix "
+                               "cache: %s unused",
+                               ignored.c_str());
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.kv_capacity         = KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -618,6 +637,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{.enabled = false};
         break;
+    }
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }

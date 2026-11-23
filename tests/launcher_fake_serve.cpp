@@ -847,6 +847,12 @@ int main(int argc, char** argv) {
     server.Post(R"((?:/v1)?/v1/messages/count_tokens)", [](const httplib::Request&, httplib::Response& response) {
         response.set_content(R"({"input_tokens":56})", "application/json");
     });
+    // A --causal-scoring server's answer (docs/serving.md, Teacher-forced scoring), JSON whatever `stream` says.
+    server.Post(R"((?:/v1)?/v1/score)", [](const httplib::Request&, httplib::Response& response) {
+        response.set_content(R"({"object":"score","positions":[{"token_id":11,"logprob":-0.25,"top_logprobs":[]}],)"
+                             R"("usage":{"prompt_tokens":7,"continuation_tokens":1}})",
+                             "application/json");
+    });
     // As infernix-serve (docs/serving.md, Resource behavior): compaction is refused, and this
     // stand-in stores no Response, so every id is unknown to cancel.
     server.Post(R"((?:/v1)?/v1/responses/compact)", [](const httplib::Request&, httplib::Response& response) {

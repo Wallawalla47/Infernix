@@ -26,6 +26,7 @@ namespace infernix::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+struct ScoreQueue;
 class CitationRegistry;
 class PdfCache;
 
@@ -208,8 +209,9 @@ public:
                        std::chrono::steady_clock::time_point until) const = 0;
 
     // POST /v1/score (serve/score.h): teacher-forced scoring on a causal-scoring Engine. Not pure,
-    // so a backend that does not score refuses with scoring_not_enabled.
-    [[nodiscard]] virtual ScoreOutcome score(const ScoreRequest& request);
+    // so a backend that does not score refuses with scoring_not_enabled. `is_cancelled` (the client
+    // disconnected) ends a score still waiting for its turn; one that has started runs to its end.
+    [[nodiscard]] virtual ScoreOutcome score(const ScoreRequest& request, std::function<bool()> is_cancelled);
 
     // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
     virtual void stop() noexcept = 0;
@@ -295,7 +297,7 @@ public:
     bool admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
                std::chrono::steady_clock::time_point until) const override;
 
-    [[nodiscard]] ScoreOutcome score(const ScoreRequest& request) override;
+    [[nodiscard]] ScoreOutcome score(const ScoreRequest& request, std::function<bool()> is_cancelled) override;
 
     // Generates, so a causal-scoring Engine (ServeOptions::causal_scoring) skips it.
     void warmup();
@@ -341,6 +343,8 @@ private:
     // Token counting runs the whole preparation path on handler threads, so it has its own bound:
     // a flood of counts is rejected before it can occupy the threads generation prepares on.
     std::shared_ptr<RequestCapacity> count_capacity_;
+    // POST /v1/score's turn on a causal-scoring Engine, in arrival order (ScoreQueue).
+    std::shared_ptr<ScoreQueue> score_queue_;
     // Recently read PDF documents (documents.h).
     std::shared_ptr<PdfCache> pdf_cache_;
 };

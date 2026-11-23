@@ -331,7 +331,7 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
   snippet sets both, and Codex's sets `model_context_window` (Codex otherwise assumes 272K).
 - Generation routes are forwarded unchanged, streaming included: `POST /v1/chat/completions`,
   `/v1/responses`, `/v1/responses/input_tokens`, `/v1/responses/compact`, `/v1/messages`,
-  `/v1/messages/count_tokens` and `/v1/decide`; `GET`/`DELETE /v1/responses/{id}`,
+  `/v1/messages/count_tokens`, `/v1/decide` and `/v1/score`; `GET`/`DELETE /v1/responses/{id}`,
   `GET /v1/responses/{id}/input_items` and `POST /v1/responses/{id}/cancel` go to the loaded model.
   `infernix-serve` refuses compaction (`compaction_not_supported`) and cancellation (it has no
   background Responses), and clients get those answers. The doubled `/v1/v1/...` prefix is accepted
@@ -371,7 +371,7 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
   an HTTP error status, as does a whole-body success answer the stream cannot carry
   (`upstream_not_a_stream`). A non-streaming request receives no bytes until its model is ready, and
   so does a request to a route that never streams (`count_tokens`, `input_tokens`, `compact`, `decide`,
-  `systemone`), whatever its `stream` says: it gets the server's own JSON answer and status.
+  `systemone`, `score`), whatever its `stream` says: it gets the server's own JSON answer and status.
 - **Pooled connections** stay open 6 minutes after a response (advertised as `Keep-Alive:
   timeout=360`, closed 10 s after that), as `infernix-serve`'s `--keep-alive-timeout-sec` default
   ([serving](serving.md)): longer than Bun's 5-minute `fetch` idle timeout, so opencode, whose

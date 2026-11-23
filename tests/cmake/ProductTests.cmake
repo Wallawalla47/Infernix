@@ -154,6 +154,12 @@ infernix_add_test(infernix_http_reasoning_restore_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_reasoning_restore.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 
+# A --causal-scoring server's routes over loopback HTTP: generation refused (generation_not_enabled), /v1/score
+# answered; a generation server refusing /v1/score (scoring_not_enabled).
+infernix_add_test(infernix_http_scoring_routes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_scoring_routes.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
 # Streaming requests refused before their stream starts (queue answers, a context overflow), over
 # loopback HTTP against a refusing generation backend.
 infernix_add_test(infernix_http_stream_refusals_test

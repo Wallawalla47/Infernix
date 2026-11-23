@@ -18,7 +18,7 @@ void HttpServer::handle_score(const httplib::Request& req, httplib::Response& re
         if (!request.model.empty()) {
             request.model = resolve_openai_model(request.model, public_model_id_, options_.any_model_name);
         }
-        const ScoreOutcome outcome = service_->score(request);
+        const ScoreOutcome outcome = service_->score(request, [&req] { return client_disconnected(req); });
         res.set_content(make_score_response(public_model_id_, outcome)
                             .dump(-1, ' ', false, RequestJson::error_handler_t::replace),
                         "application/json");

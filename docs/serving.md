@@ -1986,7 +1986,16 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
 prompt, and the engine's own top-k next-token distribution at each of those positions. Nothing is
 generated: the whole sequence is scored in one teacher-forced pass by `Engine::score_tokens`. It
 needs a server started with `--causal-scoring`; a generation server answers `501` with
-`code: "scoring_not_enabled"`.
+`code: "scoring_not_enabled"`. A scoring server generates nothing: `/v1/chat/completions`,
+`/v1/responses`, `/v1/messages` and `/v1/decide` answer `501` with `code: "generation_not_enabled"`
+before anything runs (token counting still answers). It scores one request at a time without
+speculation, vision or the prefix cache, and its startup log names the settings of a generation
+configuration (`--max-concurrency`, a drafter, `--prefix-cache-file`) that this leaves unused.
+
+Requests wait for their turn in arrival order. At most `--max-pending-requests` wait beside the one
+being scored (more are refused as the generation queue refuses them), and a request still waiting
+when its client disconnects (`499`) or when `--pending-timeout-ms` passes (`503`
+`request_queue_timeout`) leaves the queue. A score that has started runs to its end.
 
 Uses: KL divergence between two models or settings over the same prompts (each response carries
 the distribution at every position, not only the target token's probability), and the
@@ -2000,7 +2009,7 @@ log-likelihood requests of evaluation harnesses such as lm-evaluation-harness.
 | `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Template options, parsed as on `/v1/chat/completions`. Refused when `apply_chat_template` is false (`template_option_without_template`). |
 | `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. |
 | `top_k` | `0` to `256`: the most probable tokens returned per position, in descending order. Above `256` is refused (`top_k_out_of_range`), never narrowed. |
-| `model` | Optional string, echoed back. |
+| `model` | Optional. Resolved as on `/v1/chat/completions`: another name than the server's answers `404` `model_not_found` (unless `--any-model-name`). The response's `model` is the server's public model ID. |
 
 An unknown field is refused with `400` and `code: "unknown_field"`. Prompt plus continuation must fit
 the server's `--max-context` (`context_length_exceeded`).

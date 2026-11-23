@@ -690,6 +690,16 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) { handle_score(req, res); });
 }
 
+void HttpServer::require_generation() const {
+    if (service_->engine_options().purpose == infernix::EnginePurpose::CausalScoring) {
+        throw ApiException(ApiError{.status  = 501,
+                                    .type    = "not_supported",
+                                    .message = "this server only scores (--causal-scoring) and generates nothing: "
+                                               "use POST /v1/score",
+                                    .code    = "generation_not_enabled"});
+    }
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), service_->engine_options().max_context,
                                      model_metadata_, chat_template_caps_),

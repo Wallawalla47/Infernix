@@ -369,6 +369,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     OpenAIResponsesResolvedPrompt resolved;
     const std::string id = new_openai_response_id();
     try {
+        require_generation();
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         const auto body           = parse_json_body(req);
