@@ -79,6 +79,11 @@ struct Projection {
     Route route;
 };
 
+// A BF16 product narrow enough to split K over CTAs (linear_impl.cuh split_parts).
+bool splits(const Call& c, Route route, std::int32_t columns) {
+    return route == Route::Bf16 && (c.plane_columns > 0 || columns <= kTileTokens);
+}
+
 // The columns the encode holds when they are fewer than the product's (the planes form).
 std::int32_t encoded_columns(const Call& c) { return c.plane_columns > 0 ? c.x->ne[1] : 0; }
 
@@ -86,12 +91,17 @@ std::int32_t encoded_columns(const Call& c) { return c.plane_columns > 0 ? c.x->
 // widest projection (shared, the projections run in turn), then each BF16 weight's block data.
 std::size_t projections_bytes(std::int32_t k, std::span<const Projection> ps, std::int32_t columns) {
     std::int32_t rows = 0;
-    std::size_t meta  = 0;
+    std::size_t meta  = 0, split = 0;
     for (const Projection& p : ps) {
         rows = std::max(rows, p.call.rows);
         if (p.route == Route::Bf16) { meta += bf16_meta_bytes(k, scanned_rows(p.call)); }
+        // A plan for wider calls also covers the narrow calls it may run (at most 64 columns).
+        if (p.route == Route::Bf16) {
+            const std::int32_t narrow = p.call.plane_columns > 0 ? columns : std::min(columns, kTileTokens);
+            split = std::max(split, split_bytes(p.call.rows, narrow, k));
+        }
     }
-    return layout_of(k, rows, columns, false, encoded_columns(ps[0].call)).total + meta;
+    return layout_of(k, rows, columns, false, encoded_columns(ps[0].call)).total + meta + split;
 }
 
 // Projections of one input (the same x, columns and column maps): each chunk's activation columns are encoded
@@ -112,6 +122,10 @@ void run(std::span<Projection> ps, WorkspaceArena& workspace, cudaStream_t strea
         if (p.route != Route::Bf16) { continue; }
         scan_bf16(p.call, meta, stream);
         meta += bf16_meta_bytes(k, scanned_rows(p.call));
+    }
+    // The projections run in turn: their split products share one region, after the scans'.
+    for (Projection& p : ps) {
+        if (splits(p.call, p.route, columns) && split_parts(p.call.rows, columns, k) > 1) { p.call.split = meta; }
     }
     for (int first = 0; first < columns; first += kChunkColumns) {
         const int count = std::min(kChunkColumns, columns - first);
@@ -163,7 +177,9 @@ bool lossless_linear_supports(const Weight& weight) noexcept { return route_of(w
 
 std::size_t lossless_linear_workspace_bytes(const Weight& weight, std::int32_t rows, std::int32_t columns) {
     require(weight.k > 0 && weight.k % kBlockK == 0 && rows > 0 && columns > 0, "K must be a positive multiple of 64");
-    return layout_of(weight.k, rows, columns, route_of(weight) == Route::Bf16).total;
+    const bool bf16 = route_of(weight) == Route::Bf16;
+    return layout_of(weight.k, rows, columns, bf16).total +
+           (bf16 ? split_bytes(rows, std::min(columns, kTileTokens), weight.k) : 0);
 }
 
 std::size_t lossless_linear_shared_workspace_bytes(std::span<const LosslessProjection> projections, std::int32_t columns) {
@@ -230,7 +246,7 @@ std::size_t lossless_linear_planes_workspace_bytes(const Weight& weight, std::in
     require(route_of(weight) == Route::Bf16 && planes > 0 && plane_columns > 0 && rows > 0 && weight.k % kBlockK == 0,
             "the planes form takes a BF16 weight, positive planes, columns and rows");
     return layout_of(weight.k, rows, planes * kTileTokens, false, planes * plane_columns).total +
-           bf16_meta_bytes(weight.k, (planes - 1) * plane_stride + rows);
+           bf16_meta_bytes(weight.k, (planes - 1) * plane_stride + rows) + split_bytes(rows, planes * kTileTokens, weight.k);
 }
 
 void lossless_linear_planes(const Tensor& x, const Weight& weight, const Tensor& tile_planes, std::int32_t plane_stride,

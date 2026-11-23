@@ -261,7 +261,10 @@ its columns through an input map and written through an output map. The planes f
 few columns a plane against consecutive planes of one BF16 weight in one launch (Inkling 2's KV heads). A narrow call
 (at most 64 columns, the planes form, or expert tiles that are mostly padding; BF16 and the expert-record formats) runs
 its own instantiation of the product kernel, whose warps with no live column skip their products; the wide kernel
-carries none of that logic.
+carries none of that logic. A narrow BF16 call also splits K over the CTAs it leaves idle (up to 256 in all, a part at
+least one K block): each CTA stores its range's exact int128 partial sums (or a mark that a term was dropped), and a
+finish kernel adds the parts, then flags the element for the exact fallback or rounds it. The sums are exact, so the
+split is invisible in the output.
 
 **Offloaded experts** (`offloaded_moe::WideA16::kLossless`, `ops/offloaded_sparse_moe/cuda/lossless_expert.cuh`):
 the call reads each job's column count back once (the route is eager), and each staging pass of jobs is
