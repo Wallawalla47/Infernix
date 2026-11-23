@@ -42,6 +42,27 @@ struct NullTap {
     [[nodiscard]] static constexpr bool reads_layer(int) noexcept { return false; }
 };
 
+// Causal scoring's hidden-state capture (ScoreOptions::prompt_hidden_states): every layer's output residual (the
+// residual after layer L) at one absolute prompt position, into column L of `out` (BF16 [H, layers]); rows[L] counts
+// the writes. The prefill tells it each window's first position and width (begin_window).
+struct HiddenStateSink {
+    static constexpr bool enabled = true;
+    Tensor out;
+    std::int64_t position           = -1;
+    std::vector<std::uint8_t>* rows = nullptr;
+    std::int64_t window_first       = 0;
+    std::int32_t window_columns     = 0;
+
+    // Every layer is read, so the last layer's tail runs over every column (YC-01 trims none).
+    [[nodiscard]] static constexpr bool reads_layer(int) noexcept { return true; }
+    void begin(const Tensor&) noexcept {}
+    void begin_window(std::int64_t first, std::int32_t columns) noexcept {
+        window_first   = first;
+        window_columns = columns;
+    }
+    void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
+};
+
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
@@ -208,6 +229,10 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   bool finalize_at_end, HiddenStateSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);

@@ -354,7 +354,10 @@ execution::ForwardBatch ProgramImpl::walk_batch(std::size_t c) {
     fb.stream         = true;
     fb.release_stream = c + 1 == walk_.widths.size();
     fb.stream_whole   = tier_losses() == tier_losses_at_span_;
-    if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); } // a scored prompt's (causal_score)
+    if (scoring_) { // a scored prompt's (causal_score)
+        fb.residual_out = score_residuals(walk_.begins[c], w);
+        set_hidden_capture(fb, walk_.begins[c], w);
+    }
     return fb;
 }
 

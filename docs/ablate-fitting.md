@@ -7,8 +7,9 @@ heretic's per-lane band of alphas that minimizes refusals on held-out prompts wh
 divergence from the original model. The repository ships no prompts: [Prompt sets](#prompt-sets) says where to get
 them and how to build the harmless half.
 
-The sidecar in [examples/ablate](../examples/ablate) was fitted this way. Run on the same inputs, the tool reproduces
-its capture byte for byte and its direction file exactly.
+It runs on every model `--ablate` does (the Qwen3.5 family and Qwen3.8-Flash-Next): every step drives
+`infernix-serve` with your production options, and the capture reads each prompt's hidden states from a scoring
+engine (`POST /v1/score` with `hidden_states`).
 
 ## Contents
 
@@ -30,12 +31,12 @@ its capture byte for byte and its direction file exactly.
 
 | | |
 |---|---|
-| Model | a Qwen3.8-Flash-Next (`qwen4_exp`) artifact. `--ablate` refuses every other architecture ([Model coverage](#model-coverage)) |
-| Infernix | built with `-DBUILD_TESTING=ON`. Capture runs the model's forward-pass test, `build/tests/infernix_qwen4_exp_forward_real_test` (`.exe` on Windows), which only test builds have. It is a test, not a stable interface: after updating Infernix, capture a few prompts again and compare |
-| Python | 3.11 or newer, then `pip install -r tools/ablate/requirements.txt` (numpy, optuna, jinja2, tokenizers). `eval` also needs `pip install -r tools/ablate/requirements-eval.txt` (lm-eval) |
+| Model | an Infernix artifact of the Qwen3.5 family (the 27Bs, the 35B-A3B, the 122B-A10B) or Qwen3.8-Flash-Next ([Model coverage](#model-coverage)) |
+| Infernix | the `infernix-serve` you serve with |
+| Python | 3.11 or newer, then `pip install -r tools/ablate/requirements.txt` (numpy, optuna). `eval` also needs `pip install -r tools/ablate/requirements-eval.txt` (lm-eval) |
 | GPU | the whole card. Every step starts its own engine, so stop your production server first; each step refuses while the card has other compute processes |
-| Host RAM | the engines use your production memory options (below). Capture does not take them: its default mode pins every expert in host RAM (about 66 GiB for QAD Dense8), and the tool uses it only when free RAM covers the artifact plus 8 GiB; otherwise it reads experts from disk per prompt (about 4.3 GiB, much slower). Both write identical recordings |
-| Disk | recordings take 0.94 MiB per prompt token (48 layers x 4 taps x 2560 x BF16): 8.4 GiB for 320 prompts of about 27 tokens. A 300-trial fit takes about 120 MB |
+| Host RAM | the engines use your production memory options (below), the capture's included |
+| Disk | a recording is one prompt's hidden states, layers x hidden size x 4 bytes (Qwen3.8-Flash-Next 480 KiB, a 27B 1.25 MiB): up to 0.4 GiB for 320 prompts. A 300-trial fit takes about 120 MB |
 | Time | about 7 hours for a first fit, plus about 6 hours per candidate for a full evaluation ([How long it takes](#how-long-it-takes)) |
 
 `ablate.py doctor RUN` checks all of it without loading the model.
@@ -53,8 +54,7 @@ build/apps/infernix-serve /models/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Inf
 EOF
 
 # 2. A run directory for this setup; then check it
-python tools/ablate/ablate.py init runs/mine --production production.txt \
-    --capture-binary build/tests/infernix_qwen4_exp_forward_real_test
+python tools/ablate/ablate.py init runs/mine --production production.txt
 python tools/ablate/ablate.py doctor runs/mine
 
 # 3. Stop production, then: prompts -> capture -> direction -> fit (resumable: rerun the same command to continue)
@@ -83,7 +83,7 @@ Every command prints `--help`. All state lives in the run directory: `run.json` 
 | `init` | reads your production setup and records it | nothing | once per setup |
 | `doctor` | checks Python, packages, binaries, files, the card, RAM and disk; sizes both engines with `infernix-serve --plan` | `infernix-serve --plan` (loads nothing) | before long steps |
 | `prompts` | reads and checks the two lists, splits each into a direction part and a held-out tail | nothing | when the lists change |
-| `capture` | runs each direction prompt through the model once, recording every layer's lane inputs and outputs; then checks that the engine counts the same tokens for a few prompts | the forward-pass test (one load per 40 prompts), then one scoring engine | when the [inputs](#when-to-capture-again) change |
+| `capture` | scores each direction prompt once, recording every layer's hidden state at its last token | one scoring engine | when the [inputs](#when-to-capture-again) change |
 | `direction` | computes the refusal direction at every layer from the recordings | nothing (CPU) | after capture |
 | `fit` | each trial writes a sidecar, counts refusals on the held-out harmful prompts and measures KL on the held-out harmless ones | two `infernix-serve` boots per trial: one generating, one scoring | the trials you ask for |
 | `list` / `pin` | shows the trials ranked by (refusals, KL) / keeps one as a named candidate | nothing | |
@@ -95,11 +95,12 @@ Every command prints `--help`. All state lives in the run directory: `run.json` 
 
 ### When to capture again
 
-A recording depends only on its prompt's token ids and what decides the model's numerics, so capture is per prompt
-and incremental: each recording is named by a fingerprint of the token ids, the artifact, the KV type, the activation
-options and the n-gram volume, and only missing ones are recorded. Capture again (it records only what changed) after
-changing the prompts, the artifact, the chat template, the KV type, the n-gram volume or an activation option, and
-after updating Infernix. The direction's settings, the fit's settings and the trials never need a new capture.
+A recording depends only on its prompt and on what decides the model's numbers, so capture is per prompt and
+incremental: each recording is named by a fingerprint of the prompt, the artifact's id, the chat template, every
+option carried from production and the `infernix-serve` binary, and only missing ones are recorded. Rerun `capture`
+after changing any of them (prompts, artifact, template, KV type, n-gram volume, an activation option, a LoRA
+adapter, an Infernix update): it records again exactly the prompts whose fingerprint changed. The direction's
+settings, the fit's settings and the trials never need a new capture.
 
 ## Your production setup
 
@@ -115,19 +116,17 @@ gains an option without one. An option the tool does not know stops `init` by na
 
 | Rule | Options (examples) | Why |
 |---|---|---|
-| carried to every engine | `--kv-dtype`, `--chat-template`, `--ngram-volume`, `--expert-stripe`, `--device`, `--prefill-chunk`, `--expert-ram-mib`, `--ngram-residency`, `--host-context-mib`, `--ram-free-mib`, the activation and numerics options | what the model computes, and where it lives: your values are known to fit your machine |
+| carried to every engine | `--kv-dtype`, `--chat-template`, `--lora`, `--ngram-volume`, `--expert-stripe`, `--device`, `--prefill-chunk`, `--expert-ram-mib`, `--ngram-residency`, `--host-context-mib`, `--ram-free-mib`, the activation and numerics options | what the model computes, and where it lives: your values are known to fit your machine. A LoRA adapter is part of the model you serve, so the direction and the fit are measured with it (`--ablate` cuts each lane's write with the adapter's term in it) |
 | set by the tool | `--host 127.0.0.1 --port <free> --model-id ablate --max-context 16384 --max-concurrency 1 --spec off`, `--expert-state <run>/expert.state`, `--causal-scoring` for the scoring engine, `--ablate <trial>` | one request at a time, 16K of context (change with `init --context`), no drafter (drafts are verified by the cut model, so the output is the cut model's either way, as in [ablate.md](ablate.md#where-it-applies); a drafter only adds load time and memory); the run keeps its own expert-cache state, seeded from production's, so production's file is never written |
 | left out | the drafter (`--draft-model`, `--draft-tokens`, ...), sampling and thinking defaults (every request sets its own), request logs, authentication, prefix-cache files, vision | production traffic only, or would write production's files |
-| refused | `--lora`, `--lossless` | a LoRA changes the model being measured and does not combine with `--ablate`; `infernix-serve` refuses `--ablate` with the lossless route |
+| refused | `--lossless` | `infernix-serve` refuses `--ablate` with the lossless route |
 
 The fit measures with thinking off and greedy decoding ([The fit](#the-fit)); `chat` and `eval` use your template
 with thinking on, as you serve.
 
-Capture runs the forward-pass test, which takes `--kv` but none of the serve options. It renders each prompt with
-your `--chat-template` (or the artifact's own) and records with your KV type; options it cannot reproduce are listed
-in `capture/index.json` (`not_reproduced`) and printed. After recording, it boots one scoring engine and checks
-that the engine counts the same tokens as the capture for a few prompts, so a rendering difference stops here rather
-than producing a direction measured on other tokens.
+Capture uses a scoring engine like the fit's KL measurement: your carried options, your template (or the artifact's
+own), one user turn with thinking off. The direction is measured on what production computes, rendered as
+production renders it.
 
 ## Prompt sets
 
@@ -201,7 +200,8 @@ borderline topics.
 
 Each trial samples heretic's parameters (every one, every trial; multivariate TPE): the direction scope (one direction
 interpolated between two neighbouring layers' rows, applied at every layer, or each layer's own row) and, per lane
-(attention/DeltaNet output and MoE output), a band: a peak layer, a peak weight, a reach and an edge weight. It
+(the attention or Gated DeltaNet output, and the MLP or MoE output), a band: a peak layer, a peak weight, a reach and
+an edge weight. It
 writes the sidecar, boots a generating engine and counts refusals on the held-out harmful prompts, then boots a
 scoring engine and measures KL on the held-out harmless ones.
 
@@ -240,8 +240,9 @@ score hides it. Read KL as what it does to the first answer token:
 
 A mean hides spread, so look at `kl_per_prompt` in `trial.json` too. On prompts the stock model itself refuses, a
 large KL is the cut working ("I can't" became an answer), so `grade` reports KL over all benign prompts, over the ones
-the stock model answered (collateral drift) and over the ones it refused. For refusal-cut-v1 on JBB-Behaviors'
-benign half (100 prompts, measured with this tool on a build with `--ablate`): KL 1.58 over all of them, 0.44 (median
+the stock model answered (collateral drift) and over the ones it refused. For refusal-cut-v1 (the example sidecar,
+graded with `grade` on a build with `--ablate`; its direction came from the earlier capture, see
+[Model coverage](#model-coverage)) on JBB-Behaviors' benign half (100 prompts): KL 1.58 over all of them, 0.44 (median
 0.16) on the 62 the stock model answered, 3.45 on the 38 it refused; it refused 2 of the 100 harmful prompts and 0 of
 the benign ones, against the stock model's 96 and 38. Its in-fit numbers were 1 of 40 held-out harmful prompts
 refused, KL 0.235 on the held-out counterparts. Refusal counts hold for what the lists cover: a category the
@@ -271,22 +272,23 @@ the chat template only (there is no `/v1/completions`), and the evaluation conte
 
 `export` writes a copy with no local paths. Its `generation.source` and `notes` describe the prompt sets, the
 direction recipe and the trial's numbers in words (`--source` replaces the prompt description), and
-`generation.fitted_under` records the artifact, KV type, chat template (file name and sha256), numerics options,
-thinking mode and the tool's commit. The engine logs `generation` and does not interpret it. Serve with your
+`generation.fitted_under` records the artifact, KV type, chat template (file name and sha256), numerics options, the
+LoRA adapter (folder name and its weights' sha256) when you serve one, thinking mode and the tool's commit. The
+engine logs `generation` and does not interpret it. `artifact_id` names the artifact it was fitted on, so a start on
+another artifact logs a warning ([the sidecar's files](ablate.md#the-sidecars-files)). Serve with your
 production command line plus `--ablate <export>/sidecar.json`. A sidecar is fitted to one artifact's activations
 under those conditions; elsewhere it may load but has not been measured.
 
 ## How long it takes
 
-Measured on an RTX 5090 with Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8 and the example's 200 + 200 prompts. Engine
-boots take about 13 s each.
+Measured on an RTX 5090 with Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8 and the example's 200 + 200 prompts, except
+where a row says otherwise. Engine boots take about 13 s each.
 
 | Step | Time |
 |---|---|
 | `doctor` | seconds |
-| `capture`, default mode | 28 s per 40 prompts: 3.7 min for 320 |
-| `capture`, `--capture-mode stream` | about 12 s per prompt at 5.4 GiB/s disk reads: about 64 min for 320 |
-| `direction` | 7 s for 320 prompts |
+| `capture` | one engine start, then a fraction of a second per prompt: 48 short prompts took 28 s on Qwen3.8-Flash-Next, 8 s on the 35B-A3B, 10 s on a 27B with a LoRA adapter and 32 s on the 122B-A10B, start included (2026-11-23) |
+| `direction` | about a second (48 prompts, 2026-11-23) |
 | `fit` | 74 to 78 s per trial (two boots, 40 refusal probes, 40 scores): 300 trials took 6.7 hours |
 | `grade`, 100 + 100 prompts | about 4 to 5 minutes per arm |
 | `eval`, all tasks, one arm | 5 h 50 min: kl 1 min, humaneval 35 min, gsm8k 65 min, ifeval 84 min, truthfulqa 166 min (timed with the harness this command was ported from; same tasks and settings). The first `eval` runs the stock arm too, so about twice that |
@@ -296,11 +298,17 @@ log with an earlier one.
 
 ## Model coverage
 
-- **Qwen3.8-Flash-Next only.** `--ablate` is implemented in the `qwen4_exp` forward, and every other architecture
-  refuses it at startup. The tool's capture uses the same model's forward-pass test and shape (48 layers, hidden size
-  2560).
-- Measured on the NVIDIA NVFP4 QAD Dense8 artifact. Other conversions of the same model share its geometry and
-  should work; they have not been measured.
+- **Every model `--ablate` runs on**: the Qwen3.5 family (the 27Bs, the 35B-A3B, the 122B-A10B with offloaded
+  experts) and Qwen3.8-Flash-Next. The direction is measured from the hidden state each layer hands on: on the
+  Qwen3.5 family the residual after the layer; on Qwen3.8-Flash-Next, whose residual is four hyper-connection
+  streams, the next layer's mixer input (and the last layer's MoE input) ([Teacher-forced
+  scoring](serving.md#teacher-forced-scoring)).
+- The method's full fit, grading and evaluation were measured on Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8
+  (refusal-cut-v1, the example), through an earlier capture whose reader took the forward-pass test's recordings
+  layer by layer where the test writes them position by position: the example's direction is not the last-token
+  direction this page describes, although its graded results below are measured. The capture as it is now has run
+  short smoke fits on every family (two benign topic lists, two trials); no fit graded on refusals has been run with
+  it yet.
 
 ## For an AI assistant running this
 
@@ -326,8 +334,7 @@ command checks its own preconditions; trust its messages over assumptions.
 | `the card is busy` | another process holds the GPU | stop production (or the other process) |
 | `production uses --x, which this tool does not know` | an option newer than this tool | classify it in `serve_flags.py` (and send the change upstream) |
 | `--x is not an infernix-serve option in this checkout` | production runs a different Infernix version than this checkout | run the tool from the checkout production was built from |
-| `capture failed (rc ...)` | the forward-pass test stopped; its log is named | out of host RAM: `--capture-mode stream`; then rerun `capture` (recorded prompts are kept) |
-| `the capture's token ids do not match what the engine renders` | the template renders differently in Jinja2 than in Infernix | try the artifact's own template, or report the template |
-| `prompt(s) render to more than 512 tokens` | capture records one 512-token chunk per prompt | shorten or drop those prompts |
+| `infernix-serve exited during start` (capture, fit, grade) | the engine could not start with these options; the last lines of its log follow | read `logs/` or the trial's `engine.*.log`; `doctor` sizes both engines with `--plan` |
+| `the engine returned ... hidden states, the capture holds ...` | the recordings in `capture/` come from another model | start a new run directory for another model |
 | `study ... was fitted as ...` | a different KL target, direction or graded prompts | use a new `--study` name |
 | `FIT STOPPED: 3 trials in a row failed` | engines failing | read the last trial's `engine.*.log` |

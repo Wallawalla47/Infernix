@@ -69,6 +69,11 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
     std::optional<PendingBatch> pending;
     try {
         scoring_ = true;
+        // ScoreOptions::prompt_hidden_states: the call holding the last prompt position captures it (set_hidden_capture).
+        if (options.prompt_hidden_states) {
+            score_hidden_position_ = static_cast<std::int64_t>(first_target) - 1;
+            score_hidden_rows_.assign(c_.num_hidden_layers, 0);
+        }
         for (;;) {
             PrefillProgress progress = advance_prefill(sequence, nullptr);
             if (progress.complete) {
@@ -76,8 +81,24 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
                 break;
             }
         }
-        scoring_ = false;
+        scoring_               = false;
+        score_hidden_position_ = -1;
         check_device_error();
+        if (options.prompt_hidden_states) {
+            if (std::any_of(score_hidden_rows_.begin(), score_hidden_rows_.end(), [](std::uint8_t n) { return n != 1; })) {
+                throw std::logic_error("Qwen4Exp: the scored prompt's hidden states were not captured once per layer");
+            }
+            const std::size_t values = static_cast<std::size_t>(c_.hidden_size) * c_.num_hidden_layers;
+            std::vector<std::uint16_t> raw(values);
+            CUDA_CHECK(cudaMemcpyAsync(raw.data(), score_hidden_.p, 2 * values, cudaMemcpyDeviceToHost, device_.stream));
+            device_.synchronize();
+            output.hidden_states.resize(values);
+            output.hidden_state_layers = c_.num_hidden_layers;
+            for (std::size_t i = 0; i < values; ++i) {
+                const std::uint32_t bits = std::uint32_t{raw[i]} << 16U;
+                std::memcpy(&output.hidden_states[i], &bits, sizeof(bits));
+            }
+        }
 
         // Position p's logits (p in [first_target - 1, n - 2]) predict token p + 1.
         const cudaStream_t s = device_.stream;
@@ -159,7 +180,8 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
                                              floats + candidate_logprobs_at + static_cast<std::size_t>(columns) * per_position);
         }
     } catch (...) {
-        scoring_ = false;
+        scoring_               = false;
+        score_hidden_position_ = -1;
         if (pending) {
             (void)discard(std::move(*pending));
         } else {

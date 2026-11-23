@@ -17,9 +17,9 @@ using Json = RequestJson;
 // Template options that only mean something when the template renders the prompt.
 constexpr std::array<std::string_view, 4> kTemplateFields{"enable_thinking", "preserve_thinking",
                                                           "chat_template_kwargs", "reasoning_effort"};
-constexpr std::array<std::string_view, 6> kScoreFields{"model",        "prompt", "messages",
+constexpr std::array<std::string_view, 7> kScoreFields{"model",        "prompt", "messages",
                                                        "apply_chat_template", "continuation",
-                                                       "top_k"};
+                                                       "top_k", "hidden_states"};
 
 bool known_field(std::string_view key) {
     for (const std::string_view field : kScoreFields) {
@@ -118,6 +118,12 @@ ScoreRequest parse_score_request(const Json& body) {
     }
     request.continuation = body.at("continuation").get<std::string>();
     request.top_k        = parse_top_k(body);
+    if (present(body, "hidden_states")) {
+        if (!body.at("hidden_states").is_boolean()) {
+            bad_request("hidden_states must be true or false", "hidden_states", "invalid_hidden_states");
+        }
+        request.hidden_states = body.at("hidden_states").get<bool>();
+    }
     return request;
 }
 
@@ -143,6 +149,16 @@ RequestJson make_score_response(const std::string& model, const ScoreOutcome& ou
     body["top_k"]           = outcome.top_k;
     body["max_top_k"]       = infernix::kMaximumScoreTopTokens;
     body["positions"]       = std::move(positions);
+    if (outcome.hidden_state_layers != 0) {
+        // One row per layer (hidden_size values each), as Engine::score_tokens returns them.
+        const std::size_t width = outcome.hidden_states.size() / outcome.hidden_state_layers;
+        Json rows               = Json::array();
+        for (std::size_t layer = 0; layer < outcome.hidden_state_layers; ++layer) {
+            const auto first = outcome.hidden_states.begin() + static_cast<std::ptrdiff_t>(layer * width);
+            rows.push_back(Json(std::vector<float>(first, first + static_cast<std::ptrdiff_t>(width))));
+        }
+        body["hidden_states"] = std::move(rows);
+    }
     body["usage"]["prompt_tokens"]       = outcome.prompt_tokens;
     body["usage"]["continuation_tokens"] = outcome.positions.size();
     return body;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit a refusal-ablation sidecar (--ablate) for Qwen3.8-Flash-Next on your own setup, and evaluate it.
+"""Fit a refusal-ablation sidecar (--ablate) for your model on your own setup, and evaluate it.
 
     python tools/ablate/ablate.py init RUN --production prod.txt      # your infernix-serve command line, once
     python tools/ablate/ablate.py all RUN --harmful H --harmless G --study s1
@@ -42,19 +42,14 @@ def cmd_init(a) -> int:
     serve = Path(a.serve_binary).resolve() if a.serve_binary else prod.serve_binary
     if serve is None:
         raise SystemExit("which infernix-serve? pass --serve-binary (the production command line did not name one)")
-    capture = Path(a.capture_binary).resolve() if a.capture_binary else None
-    if capture is None:
-        guess = serve.parent.parent / "tests" / ("infernix_qwen4_exp_forward_real_test" + (".exe" if sys.platform == "win32" else ""))
-        capture = guess if guess.is_file() else None
     refused = prod.refused()
     if refused:
         raise SystemExit("this setup cannot be fitted as it stands:\n  " + "\n  ".join(refused))
-    run = Run(dir=Path(a.run).resolve(), production=prod, serve_binary=serve, capture_binary=capture, context=a.context)
+    run = Run(dir=Path(a.run).resolve(), production=prod, serve_binary=serve, context=a.context)
     if run.path.exists() and not a.force:
         raise SystemExit(f"{run.path} exists (pass --force to replace the setup; prompts and results are kept)")
     run.save()
-    print(f"run {run.dir}\n  model {prod.artifact}\n  serve {serve}\n  capture {capture or '(none yet)'}\n"
-          f"  from {prod.source}\nnext: ablate.py doctor {a.run}")
+    print(f"run {run.dir}\n  model {prod.artifact}\n  serve {serve}\n  from {prod.source}\nnext: ablate.py doctor {a.run}")
     return 0
 
 
@@ -96,9 +91,7 @@ def cmd_capture(a) -> int:
     run = Run.load(Path(a.run))
     need_free_card(run)
     d = load_sets(run)["direction"]
-    kinds = {"harmful": d["harmful"], "harmless": d["harmless"]}
-    C.run_capture(run, kinds, mode_request=a.capture_mode)
-    C.check_against_engine(run, kinds)
+    C.run_capture(run, {"harmful": d["harmful"], "harmless": d["harmless"]})
     print(f"recordings: {run.dir / 'capture'}")
     return 0
 
@@ -107,8 +100,7 @@ def cmd_direction(a) -> int:
     from ablatelib import direction as D
     run = Run.load(Path(a.run))
     index = json.loads((run.dir / "capture" / "index.json").read_text(encoding="utf-8"))
-    path, report = D.build(run, index, run.dir / "direction", measure_at=a.measure_at, token=a.token,
-                           orthogonalize=not a.no_orthogonalize)
+    path, report = D.build(run, index, run.dir / "direction", orthogonalize=not a.no_orthogonalize)
     write_json(run.dir / "direction" / "report.json", report)
     print(f"base sidecar {path}  d_sha256 {report['d_sha256'][:16]}  ({report['recipe']})")
     return 0
@@ -226,18 +218,13 @@ def main() -> int:
     p.add_argument("--from-running", action="store_true", help="Linux: read the running infernix-serve's command line")
     p.add_argument("--launch-dir", help="the directory production is started from (relative paths; default: here)")
     p.add_argument("--serve-binary", help="the infernix-serve to run (default: the one the command line names)")
-    p.add_argument("--capture-binary", help="infernix_qwen4_exp_forward_real_test (a -DBUILD_TESTING=ON build)")
     p.add_argument("--context", type=int, default=16384, help="context of the tool's engines (16384)")
     p.add_argument("--force", action="store_true")
     p.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     command("doctor", cmd_doctor, "check everything a run needs, without loading the model")
     prompt_args(command("prompts", cmd_prompts, "read, check and split the prompt sets"))
-    p = command("capture", cmd_capture, "record the direction prompts (needs the card)")
-    p.add_argument("--capture-mode", choices=("auto", "default", "stream"), default="auto",
-                   help="default pins every expert in RAM; stream reads them from disk per prompt (auto: by free RAM)")
+    command("capture", cmd_capture, "record the direction prompts' hidden states (needs the card)")
     p = command("direction", cmd_direction, "compute the refusal direction from the recordings")
-    p.add_argument("--measure-at", choices=("next_layer_input", "lane_output"), default="next_layer_input")
-    p.add_argument("--token", choices=("last", "mean"), default="last")
     p.add_argument("--no-orthogonalize", action="store_true")
     fit_args(command("fit", cmd_fit, "search for the cut (needs the card; resumable)"))
     p = command("list", cmd_list, "show a study's front by (refusals, KL)")
@@ -274,9 +261,6 @@ def main() -> int:
     p = command("all", cmd_all, "doctor, prompts, capture, direction and fit in order")
     prompt_args(p)
     fit_args(p)
-    p.add_argument("--capture-mode", choices=("auto", "default", "stream"), default="auto")
-    p.add_argument("--measure-at", choices=("next_layer_input", "lane_output"), default="next_layer_input")
-    p.add_argument("--token", choices=("last", "mean"), default="last")
     p.add_argument("--no-orthogonalize", action="store_true")
     # Each command parses with parse_intermixed_args, so names after options (grade RUN --harmful H mine theirs) land
     # in the positional list; plain parse_args binds an nargs='*' list, empty, together with RUN.

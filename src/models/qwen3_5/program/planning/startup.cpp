@@ -513,6 +513,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             add_tensor(builder, DType::BF16,
                        {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
                        "causal score hidden staging");
+        out.score_layer_hidden =
+            add_tensor(builder, DType::BF16,
+                       {dimension(config.hidden_size), dimension(config.num_hidden_layers)},
+                       "causal score layer hidden states");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {

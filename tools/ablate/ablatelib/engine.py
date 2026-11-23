@@ -124,19 +124,39 @@ class Engine:
                                                    "enable_thinking": enable_thinking}, timeout)
         return reply["choices"][0]
 
-    def score(self, prompt: str, continuation: str, *, top_k: int, enable_thinking: bool) -> list[dict[str, float]]:
+    def score(self, prompt: str, continuation: str, *, top_k: int, enable_thinking: bool) -> list[dict[int, float]]:
         """POST /v1/score (a --causal-scoring engine): the top-k next-token distribution at each continuation position,
-        with the chat template applied. Refuses anything that would quietly change what KL means."""
+        keyed by token id (two tokens may decode to the same text), with the chat template applied. Refuses anything
+        that would quietly change what KL means."""
         out = self.post("/v1/score", {"model": MODEL_ID, "apply_chat_template": True,
                                       "messages": [{"role": "user", "content": prompt}],
                                       "enable_thinking": enable_thinking, "continuation": continuation, "top_k": top_k})
+        self._check_rendering(out, enable_thinking)
+        positions = out.get("positions") or []
+        if not positions or len(positions[0].get("top_logprobs") or []) != top_k:
+            raise EngineError(f"/v1/score returned {len(positions)} position(s) / a top_logprobs width other than {top_k}")
+        return [{int(t["token_id"]): float(t["logprob"]) for t in p["top_logprobs"]} for p in positions]
+
+    def hidden_states(self, prompt: str):
+        """POST /v1/score with hidden_states (a --causal-scoring engine): every layer's hidden state at the last token
+        of one user turn rendered with the chat template, thinking off (heretic's rendering). Returns (FP32
+        [layers, hidden], the prompt's token count). Row L is the hidden state layer L hands on (docs/serving.md,
+        "Teacher-forced scoring")."""
+        import numpy as np
+        out = self.post("/v1/score", {"model": MODEL_ID, "apply_chat_template": True, "enable_thinking": False,
+                                      "messages": [{"role": "user", "content": prompt}], "continuation": " x",
+                                      "hidden_states": True})
+        self._check_rendering(out, False)
+        rows = out.get("hidden_states")
+        if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+            raise EngineError("/v1/score returned no hidden states, or rows of unequal width")
+        return np.asarray(rows, dtype=np.float32), int(out["usage"]["prompt_tokens"])
+
+    @staticmethod
+    def _check_rendering(out: dict, enable_thinking: bool) -> None:
         if out.get("object") != "score":
             raise EngineError(f"/v1/score returned object={out.get('object')!r}")
         if out.get("chat_template_applied") is not True:
             raise EngineError("/v1/score did not apply the chat template")
         if out.get("enable_thinking") is not enable_thinking:
             raise EngineError(f"/v1/score rendered enable_thinking={out.get('enable_thinking')!r}, asked {enable_thinking}")
-        positions = out.get("positions") or []
-        if not positions or len(positions[0].get("top_logprobs") or []) != top_k:
-            raise EngineError(f"/v1/score returned {len(positions)} position(s) / a top_logprobs width other than {top_k}")
-        return [{t["token"]: float(t["logprob"]) for t in p["top_logprobs"]} for p in positions]

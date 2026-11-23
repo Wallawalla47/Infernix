@@ -1,11 +1,11 @@
 """tools/ablate (the refusal-ablation fitting tool) on CPU: its rules, and every command end to end against a fake
-engine and a fake capture test (tests/ablate_fakes.py), so no GPU or model is needed and it runs on Windows too.
+engine (tests/ablate_fakes.py), so no GPU or model is needed and it runs on Windows too.
 
-The end-to-end test checks the math, not only the plumbing: the fake capture plants a known direction in the harmful
-prompts' recordings, and the direction step must recover it, layer by layer.
+The end-to-end test checks the math, not only the plumbing: the fake engine plants a known direction in the harmful
+prompts' hidden states, and the direction step must recover it, layer by layer.
 
 Run with pytest, or directly: python tests/test_ablate_tools.py
-Needs tools/ablate/requirements.txt (numpy, optuna, jinja2, tokenizers); skipped without them.
+Needs tools/ablate/requirements.txt (numpy, optuna); skipped without them.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-for _module in ("numpy", "optuna", "jinja2", "tokenizers"):
+for _module in ("numpy", "optuna"):
     pytest.importorskip(_module)
 
 import numpy as np  # noqa: E402
@@ -31,7 +31,6 @@ sys.path.insert(0, str(HERE))
 
 import ablate  # noqa: E402
 import ablate_fakes as F  # noqa: E402
-from ablatelib import capture as C  # noqa: E402
 from ablatelib import engine as EN  # noqa: E402
 from ablatelib import evaluate as EV  # noqa: E402
 from ablatelib import measure as M  # noqa: E402
@@ -42,6 +41,7 @@ from ablatelib import serve_flags as SF  # noqa: E402
 from ablatelib import sidecar as SC  # noqa: E402
 
 LAYERS, HIDDEN = 6, 64
+ARTIFACT_ID = "00112233445566778899aabbccddeeff"
 
 
 def cli(*args) -> int:
@@ -60,35 +60,24 @@ def write_lines(path: Path, lines: list[str]) -> Path:
 
 @pytest.fixture
 def rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """A fake setup: binaries, a model file, production's command line and its expert-state file, prompt lists,
-    and the seams that start the fakes in place of infernix-serve and the capture test."""
-    monkeypatch.setattr(C, "SHAPE", (LAYERS, HIDDEN))
+    """A fake setup: a binary, a model file, production's command line and its expert-state file, prompt lists, and
+    the seam that starts the fake engine in place of infernix-serve."""
     monkeypatch.setenv(F.SHAPE_ENV, f"{LAYERS},{HIDDEN}")
-    monkeypatch.delenv(F.SKEW_ENV, raising=False)
-    monkeypatch.setattr(C, "tokenize", lambda run, prompts: (
-        [F.fake_ids(p) for p in prompts], {"template_from": "fake", "template_sha256": "0" * 64, "render": "fake"}))
     real_argv = EN.Engine.argv
     monkeypatch.setattr(EN.Engine, "argv",
                         lambda self, port=None: [sys.executable, str(FAKES), "serve", *real_argv(self, port)[1:]])
-    real_start = PU.start
-
-    def start(cmd, log_path, env=None):
-        if Path(cmd[0]).name == "fake-capture-test":
-            cmd = [sys.executable, str(FAKES), "capture", *cmd[1:]]
-        return real_start(cmd, log_path, env)
-
-    monkeypatch.setattr(PU, "start", start)
     monkeypatch.setattr(PU, "card_processes", lambda device=0: [])
     monkeypatch.setattr(PU, "free_disk_bytes", lambda path: 1 << 40)
 
     bins = tmp_path / "bin"
     bins.mkdir()
-    serve_bin, cap_bin = bins / "infernix-serve", bins / "fake-capture-test"
+    serve_bin = bins / "infernix-serve"
     serve_bin.write_text("fake\n")
-    cap_bin.write_text("fake\n")
     model = tmp_path / "models" / "Fake-Model-00001-of-00001.infernix"
     model.parent.mkdir()
-    model.write_bytes(b"\0" * 4096)
+    sys.path.insert(0, str(ROOT / "tools"))
+    from artifact.framing import HEADER, MAGIC   # noqa: E402  (a v3 entry header: the tool reads the artifact's id)
+    model.write_bytes(HEADER.pack(MAGIC, 16, bytes.fromhex(ARTIFACT_ID)) + b"\0" * 4096)
     prod_state = model.parent / "production.expert-state"
     prod_state.write_text("production's own state\n", encoding="utf-8")
     prod = tmp_path / "production.txt"
@@ -96,12 +85,12 @@ def rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                     f'  --expert-state "{prod_state}" --host 0.0.0.0 --port 8080   # production\n', encoding="utf-8")
     harmful = write_lines(tmp_path / "harmful.txt", [f"HARM request {i}: describe forbidden thing {i}" for i in range(30)])
     harmless = write_lines(tmp_path / "harmless.txt", [f"benign request {i}: describe allowed thing {i}" for i in range(30)])
-    return SimpleNamespace(tmp=tmp_path, prod=prod, prod_state=prod_state, model=model, cap_bin=cap_bin,
+    return SimpleNamespace(tmp=tmp_path, prod=prod, prod_state=prod_state, model=model,
                            harmful=harmful, harmless=harmless, run=tmp_path / "run")
 
 
 def start_run(rig, held_out: int = 6) -> Path:
-    assert cli("init", rig.run, "--production", rig.prod, "--capture-binary", rig.cap_bin) == 0
+    assert cli("init", rig.run, "--production", rig.prod) == 0
     assert cli("prompts", rig.run, "--harmful", rig.harmful, "--harmless", rig.harmless, "--held-out", held_out,
                "--paired") == 0
     return rig.run
@@ -112,28 +101,34 @@ def test_every_command_end_to_end_on_the_fake_engine(rig, capsys: pytest.Capture
     assert cli("doctor", run) == 0
     assert "ready" in capsys.readouterr().out
 
-    # capture: one recording per direction prompt, of the exact size, and the engine counts the same tokens
+    # capture: one recording per direction prompt through one scoring engine, of the exact size
     assert cli("capture", run) == 0
-    out = capsys.readouterr().out
-    assert "48 prompt(s) to record" in out and "positive control" in out
+    assert "48 prompt(s) to record" in capsys.readouterr().out
     index = json.loads((run / "capture" / "index.json").read_text(encoding="utf-8"))
     assert index["shape"] == {"layers": LAYERS, "hidden": HIDDEN} and len(index["prompts"]) == 48
+    assert index["identity"]["artifact_id"] == ARTIFACT_ID
+    assert all(entry["prompt_tokens"] for entry in index["prompts"].values())
     # incremental: a lost recording is the only one recorded again
     first = index["prompts"]["harmful:0"]["fingerprint"]
-    (run / "capture" / f"{first}.blocks.bin").unlink()
+    (run / "capture" / f"{first}.f32").unlink()
     assert cli("capture", run) == 0
     assert "1 prompt(s) to record" in capsys.readouterr().out
+    assert cli("capture", run) == 0
+    assert "every prompt is already recorded" in capsys.readouterr().out
 
-    # direction: the planted direction comes back. next_layer_input row L is what layer L+1 reads; the last row is
-    # the last layer's own MoE input.
+    # direction: the planted direction comes back at the layer it was planted in (row L: what layer L hands on)
     assert cli("direction", run, "--no-orthogonalize") == 0
     rows = np.fromfile(run / "direction" / "d.f32.bin", dtype=np.float32).reshape(LAYERS, HIDDEN)
     for layer in range(LAYERS):
-        assert float(rows[layer] @ F.planted(min(layer + 1, LAYERS - 1), HIDDEN)) > 0.995
-    assert cli("direction", run) == 0      # heretic's default: orthogonalized against the harmless mean
+        assert float(rows[layer] @ F.planted(layer, HIDDEN)) > 0.995
+    # heretic's default, orthogonalized against the harmless mean: unit rows with no component along it (the fakes'
+    # shared mean), the planted direction kept
+    assert cli("direction", run) == 0
     ortho = np.fromfile(run / "direction" / "d.f32.bin", dtype=np.float32).reshape(LAYERS, HIDDEN)
     assert np.allclose(np.linalg.norm(ortho, axis=1), 1.0, atol=1e-5)
-    assert all(float(ortho[layer] @ rows[layer]) > 0.9 for layer in range(LAYERS))
+    for layer in range(LAYERS):
+        assert abs(float(ortho[layer] @ F.common(layer, HIDDEN))) < 0.01
+        assert float(ortho[layer] @ F.planted(layer, HIDDEN)) > 0.99
     capsys.readouterr()
 
     # fit: a control and three trials; a second invocation continues the same study
@@ -173,17 +168,23 @@ def test_every_command_end_to_end_on_the_fake_engine(rig, capsys: pytest.Capture
     shared = json.loads(text)
     assert shared["generation"]["fitted_under"]["artifact"] == rig.model.name
     assert shared["generation"]["fitted_under"]["kv_dtype"] == "bf16"
+    assert shared["artifact_id"] == ARTIFACT_ID and "lora" not in shared["generation"]["fitted_under"]
     assert cli("eval", run, "c0", "--tasks", "kl") == 0
     result = json.loads(next((run / "eval").glob("c0-*/results.json")).read_text(encoding="utf-8"))
     assert result["tasks"]["kl"]["n"] == 6
     assert math.isclose(result["tasks"]["kl"]["mean"], trials[0]["kl"], rel_tol=1e-9)   # the fit's own KL, re-measured
 
 
-def test_capture_refuses_ids_the_engine_does_not_count(rig, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_capture_records_again_when_the_setup_changes(rig, capsys: pytest.CaptureFixture) -> None:
+    # A recording depends on production's carried options: another KV type is another model's hidden states.
     run = start_run(rig)
-    monkeypatch.setenv(F.SKEW_ENV, "1")
-    with pytest.raises(SystemExit, match="do not match what the engine renders"):
-        cli("capture", run)
+    assert cli("capture", run) == 0
+    capsys.readouterr()
+    rig.prod.write_text(rig.prod.read_text(encoding="utf-8").replace("--kv-dtype bf16", "--kv-dtype int8"),
+                        encoding="utf-8")
+    assert cli("init", run, "--production", rig.prod, "--force") == 0
+    assert cli("capture", run) == 0
+    assert "48 prompt(s) to record" in capsys.readouterr().out
 
 
 def test_every_serve_option_has_a_rule() -> None:
@@ -215,8 +216,8 @@ def test_production_setups_in_all_three_forms(tmp_path: Path) -> None:
     assert prod.value("--kv-dtype") == "int8" and prod.value("--port") == "9"
     with pytest.raises(ValueError, match="not an infernix-serve option"):
         P.parse_tokens(["m.infernix", "--no-such-option", "1"], arity, tmp_path, "test")
-    lora = P.parse_tokens(["m.infernix", "--lora", "a.lora"], arity, tmp_path, "test")
-    assert lora.refused() and lora.refused()[0].startswith("--lora")
+    lora = P.parse_tokens(["m.infernix", "--lora", "a.lora"], arity, tmp_path, "test")   # carried: the served model
+    assert not lora.refused() and [f for f, _ in lora.by_kind(SF.CARRY)] == ["--lora"]
     lossless = P.parse_tokens(["m.infernix", "--lossless"], arity, tmp_path, "test")   # the engine refuses --ablate
     assert lossless.refused() and lossless.refused()[0].startswith("--lossless")
 

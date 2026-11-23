@@ -160,4 +160,3 @@ def open_study(run, study_name: str):
         raise SystemExit(f"no study {study_name!r} in {run.dir / 'fit'}")
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     return optuna.load_study(study_name=study_name, storage=f"sqlite:///{path.as_posix()}")
-

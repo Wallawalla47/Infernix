@@ -14,6 +14,16 @@
 //
 // TOKENS holds ids separated by commas or whitespace; REFERENCE is the dump of the same ids (int32
 // vocabulary, int32 rows, then one FP32 row per position). INFERNIX_EXPERT_RAM_MIB selects the SSD tier.
+// The dump runs none of the default fast paths: --no-fast-paths runs the Engine on the same kernels. On the default
+// route NVIDIA NVFP4 QAD Dense8's fast paths move the scores beyond these criteria (2026-11-23, 300 tokens at chunk
+// 256: mean |dlogp| 0.067, top-1 96 %; with --no-fast-paths 0.00028, 100 %, and the hidden states bit-identical).
+//
+// With --blocks BLOCKS.bin (the forward test's --blocks of the same ids and --chunk: BF16 [position][layer][mixer in,
+// mixer out, MoE in, MoE out][H]), the prompt's hidden states (ScoreOptions::prompt_hidden_states, the window's last
+// token as the continuation) are checked too: against the Forward's mixer inputs of layers 1.. and the last layer's
+// MoE input at the last prompt position (per layer relative L2 within 1e-2: the Program's kernels round differently,
+// a wrong column or layer is off by order one); the scores identical with and without them; and the same hidden
+// states, within that bound, when the continuation token changes (the capture reads the prompt's column).
 
 #include "infernix/engine.h"
 
@@ -22,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iterator>
@@ -46,6 +57,89 @@ std::vector<infernix::TokenId> read_ids(const std::string& arg) {
     return ids;
 }
 
+float bf16_value(std::uint16_t bits) {
+    const std::uint32_t word = std::uint32_t{bits} << 16U;
+    float value              = 0;
+    std::memcpy(&value, &word, sizeof(value));
+    return value;
+}
+
+// The worst layer's relative L2 difference of two [layers][H] hidden-state blocks.
+double worst_relative(const std::vector<float>& a, const std::vector<float>& b, std::size_t layers) {
+    if (a.size() != b.size() || layers == 0 || a.size() % layers != 0) { return INFINITY; }
+    const std::size_t width = a.size() / layers;
+    double worst            = 0;
+    for (std::size_t layer = 0; layer < layers; ++layer) {
+        double diff = 0, norm = 0;
+        for (std::size_t i = layer * width; i < (layer + 1) * width; ++i) {
+            const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            diff += d * d;
+            norm += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        worst = std::max(worst, std::sqrt(diff / std::max(norm, 1e-30)));
+    }
+    return worst;
+}
+
+// --blocks: the prompt's hidden states (all ids but the last; the last is the continuation) against the Forward's taps.
+bool check_hidden_states(infernix::Engine& engine, const std::vector<infernix::TokenId>& ids, const std::string& path) {
+    const auto first_target = static_cast<std::uint32_t>(ids.size() - 1);
+    const infernix::ScoreResult plain  = engine.score_tokens(ids, first_target);
+    const infernix::ScoreResult hidden = engine.score_tokens(ids, first_target, {.prompt_hidden_states = true});
+    const std::size_t layers           = hidden.hidden_state_layers;
+    if (layers == 0 || hidden.hidden_states.empty() || hidden.hidden_states.size() % layers != 0) {
+        std::printf("FAIL: no hidden states\n");
+        return false;
+    }
+    const std::size_t H = hidden.hidden_states.size() / layers, T = ids.size(), position = T - 2;
+    std::ifstream file(path, std::ios::binary);
+    std::vector<std::uint16_t> taps(T * layers * 4 * H);
+    file.read(reinterpret_cast<char*>(taps.data()), static_cast<std::streamsize>(taps.size() * 2));
+    if (!file || file.peek() != std::char_traits<char>::eof()) {
+        std::printf("FAIL: %s is not BF16 [%zu positions][%zu layers][4][%zu]\n", path.c_str(), T, layers, H);
+        return false;
+    }
+    // Row L: layer L + 1's mixer input (tap 0), and the last layer's MoE input (tap 2). Position-major, as the forward
+    // test writes; the layer-major reading [layer][tap][position][H] is printed beside it for comparison.
+    std::vector<float> forward(layers * H), layer_major(layers * H);
+    for (std::size_t row = 0; row < layers; ++row) {
+        const std::size_t layer = row + 1 < layers ? row + 1 : row, tap = row + 1 < layers ? 0 : 2;
+        for (std::size_t h = 0; h < H; ++h) {
+            forward[row * H + h]     = bf16_value(taps[((position * layers + layer) * 4 + tap) * H + h]);
+            layer_major[row * H + h] = bf16_value(taps[((layer * 4 + tap) * T + position) * H + h]);
+        }
+    }
+    const double against_forward = worst_relative(hidden.hidden_states, forward, layers);
+    const double against_misread = worst_relative(hidden.hidden_states, layer_major, layers);
+    std::printf("per layer (relative L2, cosine) against the Forward:");
+    for (std::size_t row = 0; row < layers; ++row) {
+        double diff = 0, norm = 0, dot = 0, own = 0;
+        for (std::size_t h = 0; h < H; ++h) {
+            const double a = hidden.hidden_states[row * H + h], b = forward[row * H + h];
+            diff += (a - b) * (a - b);
+            norm += b * b;
+            dot += a * b;
+            own += a * a;
+        }
+        std::printf(" %zu:%.3g/%.4f", row, std::sqrt(diff / std::max(norm, 1e-30)), dot / std::sqrt(std::max(norm * own, 1e-30)));
+    }
+    std::printf("\n");
+    std::vector<infernix::TokenId> other = ids;
+    other.back()                         = ids.back() == ids[0] ? ids[1] : ids[0];
+    const infernix::ScoreResult changed  = engine.score_tokens(other, first_target, {.prompt_hidden_states = true});
+    const double against_changed         = worst_relative(changed.hidden_states, hidden.hidden_states, layers);
+    const bool same_scores               = plain.logprobs == hidden.logprobs && plain.hidden_states.empty();
+    std::printf("hidden states (%zu layers x %zu) at position %zu: worst layer relative L2 against the Forward %.3g "
+                "(the layer-major reading of the same file: %.3g); with another continuation token %.3g (%s); scores "
+                "%s with and without them\n",
+                layers, H, position, against_forward, against_misread, against_changed,
+                changed.hidden_states == hidden.hidden_states ? "bit-identical" : "not bit-identical",
+                same_scores ? "identical" : "DIFFERENT");
+    const bool ok = against_forward <= 1e-2 && against_changed <= 1e-2 && same_scores;
+    std::printf("%s\n", ok ? "OK hidden states" : "FAIL: the hidden states differ from the Forward's");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -56,10 +150,19 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::uint32_t chunk = 256, top_k = 8;
-    for (int i = 3; i + 1 < argc; i += 2) {
+    std::string blocks_path;
+    bool fast_paths = true;
+    for (int i = 3; i < argc; ++i) {
         const std::string option = argv[i];
+        if (option == "--no-fast-paths") { // the Forward's kernels: the dump runs none of the default fast paths
+            fast_paths = false;
+            continue;
+        }
+        if (i + 1 >= argc) { break; }
         if (option == "--chunk") { chunk = static_cast<std::uint32_t>(std::stoul(argv[i + 1])); }
         if (option == "--top-k") { top_k = static_cast<std::uint32_t>(std::stoul(argv[i + 1])); }
+        if (option == "--blocks") { blocks_path = argv[i + 1]; }
+        ++i;
     }
     try {
         const auto ids = read_ids(argv[1]);
@@ -81,6 +184,7 @@ int main(int argc, char** argv) {
         options.max_context   = static_cast<std::uint32_t>(ids.size());
         options.prefill_chunk = chunk;
         options.kv_cache      = infernix::KvCacheStorage::Int8Group64;
+        options.fast_paths    = fast_paths;
         infernix::Engine engine(options);
         infernix::ScoreOptions score;
         score.top_k = top_k;
@@ -127,7 +231,9 @@ int main(int argc, char** argv) {
         const bool ok = result.logprobs.size() == positions && result.top_ids.size() == positions * top_k &&
                         mean_abs < 0.02 && 100 * top1 >= 98 * positions && topk_equal == topk_checked;
         std::printf("%s\n", ok ? "OK" : "FAIL: the Engine's scores differ from the Forward's");
-        return ok ? 0 : 1;
+        bool hidden_ok = true;
+        if (!blocks_path.empty()) { hidden_ok = check_hidden_states(engine, ids, blocks_path); }
+        return ok && hidden_ok ? 0 : 1;
     } catch (const std::exception& error) {
         std::printf("FAIL: %s\n", error.what());
         return 1;

@@ -15,7 +15,7 @@ from . import sidecar as SC
 from .engine import MODEL_ID, Engine
 from .fit import front, open_study
 from .prompts import read_prompts
-from .run import REPO_ROOT, write_json
+from .run import REPO_ROOT, artifact_id, sha256_file, write_json
 
 
 def list_front(run, study_name: str, n: int = 15) -> list[dict]:
@@ -190,12 +190,20 @@ def export(run, candidate: str, name: str, source: str | None = None) -> Path:
                  f"this candidate: {trial['refusals']}/{trial['n_harmful']} held-out harmful prompts refused "
                  f"(stock: {trial['control_refusals']}), first-token KL {trial['kl']:.3f} on the held-out harmless "
                  f"prompts; {trial['what']}")
-    cfg["generation"] = {"source": src, "notes": notes, "fitted_under": {
+    fitted_under = {
         "artifact": prod.artifact.name, "kv_dtype": prod.value("--kv-dtype") or "bf16 (default)",
         "chat_template": ({"file": Path(template).name, "sha256": hashlib.sha256(template_text.encode()).hexdigest()}
                           if template_text else "the artifact's own"),
         "numerics_options": [f if v is None else f"{f} {v}" for f, v in numerics],
-        "thinking": "off (refusals and KL)", "tool": "tools/ablate " + _git_head()}}
+        "thinking": "off (refusals and KL)", "tool": "tools/ablate " + _git_head()}
+    lora = prod.value("--lora")
+    if lora:
+        # The adapter the model was served with: its folder (or file) name and its weights' sha256.
+        weights = Path(lora) / "adapter_model.safetensors" if Path(lora).is_dir() else Path(lora)
+        fitted_under["lora"] = {"adapter": Path(lora).name, "sha256": sha256_file(weights)}
+    cfg["generation"] = {"source": src, "notes": notes, "fitted_under": fitted_under}
+    # The engine warns when the sidecar starts on another artifact.
+    cfg["artifact_id"] = artifact_id(prod.artifact)
     dest = run.dir / "export" / name
     if dest.exists():
         raise SystemExit(f"{dest} exists; pick another name")

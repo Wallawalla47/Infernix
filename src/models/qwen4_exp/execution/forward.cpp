@@ -638,11 +638,17 @@ void Forward::layer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, c
         Tensor inject = a.alloc(DType::FP32, {dim(config_.hc.streams), T});
         Tensor xa_a8;
         Tensor xa     = mix_mixer_input_impl(a, block, residual, inject, xa_a8);
+        if constexpr (kRuns<A>) {
+            if (layer > 0) { capture_hidden(*batch, layer - 1, xa); }
+        }
         Tensor y      = mixer_impl(a, layer, batch, shape, xa, xa_a8.data != nullptr ? &xa_a8 : nullptr);
         // The attention half's inject, then the MLP half's mix. One fused Op folding the inject into the
         // mixer's reads (candidates §7.3 D6) measured flat (removed 2026-10-28).
         if constexpr (kRuns<A>) { inject_lane(y, layer, AblateParameters::Lane::Attn, inject, residual, s); }
         Tensor xm = mix_impl(a, block.mlp_hc, residual, &inject);
+        if constexpr (kRuns<A>) {
+            if (layer + 1 == config_.num_hidden_layers) { capture_hidden(*batch, layer, xm); }
+        }
         // YC-01: the last layer's MoE over the trailing columns whose final residuals are read (their logits). The
         // mix stays whole: a layer walk mixes each chunk whole too, and its MoE then takes the same columns.
         const std::int32_t kept =
@@ -698,6 +704,23 @@ void Forward::layer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, c
     } else {
         (void)s;
     }
+}
+
+void Forward::capture_hidden(const ForwardBatch& batch, std::uint32_t row, const Tensor& x) {
+    if (batch.hidden_column < 0) { return; }
+    const std::int32_t H = dim(config_.hidden_size);
+    if (batch.hidden_out.dtype != DType::BF16 || batch.hidden_out.ne[0] != H ||
+        batch.hidden_out.ne[1] != static_cast<std::int32_t>(config_.num_hidden_layers) || x.dtype != DType::BF16 ||
+        x.ne[0] != H || batch.hidden_column >= x.ne[1] || batch.hidden_rows == nullptr ||
+        batch.hidden_rows->size() != config_.num_hidden_layers) {
+        throw std::invalid_argument("Qwen4Exp forward: the hidden-state capture does not match the call");
+    }
+    const std::size_t column_bytes = 2ULL * static_cast<std::size_t>(H);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(batch.hidden_out.data) + row * column_bytes,
+                               static_cast<const std::byte*>(x.data) +
+                                   static_cast<std::size_t>(batch.hidden_column) * column_bytes,
+                               column_bytes, cudaMemcpyDeviceToDevice, device_.stream));
+    ++(*batch.hidden_rows)[row];
 }
 
 void Forward::capture_draft_features(std::uint32_t layer, const Tensor& residual, const Tensor& features) {
@@ -812,11 +835,17 @@ void Forward::layer_mixer_impl(A& a, std::uint32_t layer, const ForwardBatch* ba
         auto scope = a.scope();
         if (block.ple) { ple_impl(a, *block.ple, residual, batch, shape); }
         Tensor xa = mix_impl(a, block.attn_hc, residual, &inject);
+        if constexpr (kRuns<A>) {
+            if (layer > 0) { capture_hidden(*batch, layer - 1, xa); }
+        }
         Tensor y  = mixer_impl(a, layer, batch, shape, xa, nullptr);
         if constexpr (kRuns<A>) {
             inject_lane(y, layer, AblateParameters::Lane::Attn, inject, residual, device_.stream);
         }
         (void)mix_impl(a, block.mlp_hc, residual, &inject, &xm);
+        if constexpr (kRuns<A>) {
+            if (layer + 1 == config_.num_hidden_layers) { capture_hidden(*batch, layer, xm); }
+        }
     } catch (const std::exception&) {
         runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");
     }

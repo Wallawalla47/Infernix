@@ -122,6 +122,12 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     card.set_offloaded_experts(state.execution.io.offloaded_experts, state.offloaded_call);
     const std::span<const int> prompt(ids.data(), ids.size());
+    if (state.hidden_states != nullptr) {
+        // Causal scoring only, which runs no drafter.
+        if (state.dflash != nullptr) { throw std::logic_error("a hidden-state capture takes no DFlash features"); }
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                  *state.hidden_states);
+    }
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,

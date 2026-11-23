@@ -2056,6 +2056,10 @@ struct ScoreOptions {
     // kMaximumScoreLogitPositions) whose whole logits vector ScoreResult::logits returns, for exact
     // comparisons (IQS-2 reference conformance).
     std::vector<std::uint32_t> logits_positions;
+    // Every layer's hidden state at the last prompt token (the position before first_target, whose next-token
+    // distribution is scored position 0): ScoreResult::hidden_states (tools/ablate's capture). Not on the lossless
+    // route.
+    bool prompt_hidden_states = false;
 };
 
 inline constexpr std::uint32_t kMaximumScoreLogitPositions = 256;
@@ -2072,6 +2076,12 @@ struct ScoreResult {
     // One vocabulary-sized row per ScoreOptions::logits_positions entry, in that order: the FP32 logits
     // as scoring computed them.
     std::vector<float> logits;
+    // ScoreOptions::prompt_hidden_states: [layers][hidden_size], layer-major, the BF16 values widened exactly. Row L
+    // is the hidden state layer L hands on at the last prompt token: on Qwen3.5 the residual after layer L; on
+    // Qwen3.8-Flash-Next (four hyper-connection streams) layer L + 1's mixer input, and for the last layer its MoE
+    // input. Empty otherwise.
+    std::vector<float> hidden_states;
+    std::uint32_t hidden_state_layers = 0; // hidden_states' rows (0 when empty)
 };
 
 // Offloaded routed experts (Qwen3.5-122B-A10B): the VRAM expert cache's frames now and at startup,

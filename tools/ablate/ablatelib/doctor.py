@@ -10,10 +10,10 @@ from pathlib import Path
 
 from . import platform_util as PU
 from . import serve_flags as SF
-from .capture import choose_mode, shard_bytes
 from .engine import Engine
+from .run import artifact_id
 
-REQUIRED = {"numpy": "numpy", "optuna": "optuna", "jinja2": "jinja2", "tokenizers": "tokenizers"}
+REQUIRED = {"numpy": "numpy", "optuna": "optuna"}
 OPTIONAL_EVAL = {"lm_eval": "lm-eval (only for `eval`)"}
 
 
@@ -39,17 +39,14 @@ def check(run, log=print) -> int:
 
     prod = run.production
     say(run.serve_binary.is_file(), f"infernix-serve: {run.serve_binary}")
-    say(run.capture_binary is not None and Path(run.capture_binary).is_file(),
-        f"capture test: {run.capture_binary or '(not set: build with -DBUILD_TESTING=ON and pass --capture-binary)'}")
     try:
-        size = shard_bytes(prod.artifact)
-        say(True, f"model: {prod.artifact.name} ({size / PU.GIB:.1f} GiB over its shards)")
-    except OSError as e:
+        say(True, f"model: {prod.artifact.name} (artifact {artifact_id(prod.artifact)})")
+    except (OSError, SystemExit) as e:
         say(False, f"model: {e}")
-    for flag in ("--ngram-volume", "--chat-template", "--expert-stripe"):
+    for flag in ("--ngram-volume", "--chat-template", "--expert-stripe", "--lora"):
         v = prod.value(flag)
         if v:
-            say(Path(v).is_file(), f"{flag}: {v}")
+            say(Path(v).exists(), f"{flag}: {v}")
     for r in prod.refused():
         say(False, f"production uses {r}")
     carried = [f for f, _ in prod.by_kind(SF.CARRY)]
@@ -78,9 +75,8 @@ def check(run, log=print) -> int:
             f"the card is busy ({len(busy)} process(es), {sum(m for _, m in busy)} MiB): stop production first")
     except RuntimeError as e:
         say(False, str(e))
-    mode, why = choose_mode(run, "auto")
-    say(None, f"capture would run in {mode} mode: {why}")
     free = PU.free_disk_bytes(run.dir)
-    say(free >= 25 * PU.GIB, f"{free / PU.GIB:.0f} GiB free disk at {run.dir} (a capture of 400 prompts writes ~20 GiB)")
+    say(free >= 2 * PU.GIB, f"{free / PU.GIB:.0f} GiB free disk at {run.dir} (a capture of 400 prompts writes up to "
+                            "0.5 GiB, a 300-trial fit about 120 MB)")
     log("ready" if not problems else f"{problems} problem(s) to fix first")
     return problems

@@ -875,7 +875,8 @@ ScoreOutcome GenerationService::score(const ScoreRequest& request, std::function
                     "continuation", "context_length_exceeded");
     }
     infernix::ScoreOptions score_options;
-    score_options.top_k = request.top_k;
+    score_options.top_k                = request.top_k;
+    score_options.prompt_hidden_states = request.hidden_states;
     infernix::ScoreResult result;
     {
         // The scoring Engine's turn, in arrival order (ScoreQueue): a request whose client disconnects, or that is
@@ -934,6 +935,8 @@ ScoreOutcome GenerationService::score(const ScoreRequest& request, std::function
         }
         outcome.positions.push_back(std::move(position));
     }
+    outcome.hidden_states       = std::move(result.hidden_states);
+    outcome.hidden_state_layers = result.hidden_state_layers;
     return outcome;
 }
 

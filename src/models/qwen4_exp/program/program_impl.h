@@ -388,8 +388,9 @@ struct DeviceLayout {
     DFlash2Io dflash_io;
     std::optional<DFlash2Config> dflash2_config;
     // Causal scoring: the window's final residuals (BF16 [S*H, max_context]), one tile's FP32 logits
-    // and its targets, log-probabilities and distributions (ProgramImpl::causal_score).
-    std::size_t score_residuals = 0, score_logits = 0, score_logits16 = 0, score_io = 0;
+    // and its targets, log-probabilities and distributions, and the last prompt token's hidden states
+    // (BF16 [H, layers], ScoreOptions::prompt_hidden_states) (ProgramImpl::causal_score).
+    std::size_t score_residuals = 0, score_logits = 0, score_logits16 = 0, score_io = 0, score_hidden = 0;
     ProgramDevicePlan bytes;
 };
 
@@ -745,6 +746,7 @@ public:
             d.score_logits    = bf16_head ? 0 : align(sizeof(float) * c.vocab_size * kScoreTileColumns);
             d.score_logits16  = o.bf16_logits ? align(2ULL * c.vocab_size * kScoreTileColumns) : 0;
             d.score_io        = align(4ULL * kScoreIoWords);
+            d.score_hidden    = align(2ULL * c.hidden_size * c.num_hidden_layers);
         }
 
         // The workspace arena (the forward pass, sampling, draft acceptance and the drafter) covers
@@ -934,7 +936,7 @@ public:
                (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) +
                (o.ngram_table && o.ngram_table->nvfp4_scale ? sizeof(std::uint32_t) : 0) + constraint_bytes(lanes, W) +
                grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_logits16 +
-               d.score_io;
+               d.score_io + d.score_hidden;
         b.residency            = ExpertResidency::table_bytes(expert_layout(c), d.columns);
         b.expert_record_stride = d.record_stride;
         b.expert_tier_list_slots =
@@ -1251,6 +1253,7 @@ public:
             allocate(score_logits_, plan_.score_logits, allocated);
             allocate(score_logits16_, plan_.score_logits16, allocated);
             allocate(score_io_, plan_.score_io, allocated);
+            allocate(score_hidden_, plan_.score_hidden, allocated);
             score_host_ = PinnedHostBuffer(plan_.score_io);
         }
         constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
@@ -6011,7 +6014,10 @@ private:
             fb.draft_features      = dflash_feature_columns(column, n);
         }
         // A scored prompt's calls keep their final residuals for the LM head (causal_score).
-        if (scoring_) { fb.residual_out = score_residuals(score_column_, cols); }
+        if (scoring_) {
+            fb.residual_out = score_residuals(score_column_, cols);
+            set_hidden_capture(fb, score_column_, cols);
+        }
         // YC-01: a prefill chunk's or forced tokens' final residuals are read only at the logit column (the last) when
         // no MTP cells or residual export take them, so the last layer's MoE runs over its trailing columns alone.
         fb.trim_last_layer = trims_last_layer() && verify == nullptr && !decode_round && batch == 1 &&
@@ -7702,14 +7708,29 @@ private:
     // ---- causal scoring (score.cpp) ----
     // While a scored prompt prefills, each call's final residuals land in score_residuals_ at its
     // first position (score_column_: forward_call's; a layer walk's chunks carry their own).
-    DeviceBuffer score_residuals_, score_logits_, score_logits16_, score_io_;
+    DeviceBuffer score_residuals_, score_logits_, score_logits16_, score_io_, score_hidden_;
     PinnedHostBuffer score_host_{1};
     bool scoring_                = false;
     std::int32_t score_column_   = 0;
+    // ScoreOptions::prompt_hidden_states: the scored prompt's last position (-1: none) and how often each layer's row
+    // of score_hidden_ was written (once each).
+    std::int64_t score_hidden_position_ = -1;
+    std::vector<std::uint8_t> score_hidden_rows_;
     // Columns [begin, begin + columns) of score_residuals_.
     [[nodiscard]] Tensor score_residuals(std::int32_t begin, std::int32_t columns) const {
         return Tensor(static_cast<std::byte*>(score_residuals_.p) + 2ULL * width_ * static_cast<std::size_t>(begin),
                       DType::BF16, {width_, columns});
+    }
+    // A scored prompt's call over positions [begin, begin + columns): the one holding score_hidden_position_ captures
+    // its hidden states (ForwardBatch::hidden_out).
+    void set_hidden_capture(execution::ForwardBatch& fb, std::int32_t begin, std::int32_t columns) {
+        if (score_hidden_position_ < begin || score_hidden_position_ >= static_cast<std::int64_t>(begin) + columns) {
+            return;
+        }
+        fb.hidden_out    = Tensor(score_hidden_.p, DType::BF16,
+                                  {static_cast<std::int32_t>(c_.hidden_size), static_cast<std::int32_t>(c_.num_hidden_layers)});
+        fb.hidden_column = static_cast<std::int32_t>(score_hidden_position_ - begin);
+        fb.hidden_rows   = &score_hidden_rows_;
     }
 
 public:

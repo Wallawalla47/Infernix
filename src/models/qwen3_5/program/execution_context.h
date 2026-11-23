@@ -83,6 +83,9 @@ struct PrefillContext {
     // physical state image slot it fills (ProgramImpl::hybrid_reserve_pair); -1: none.
     std::int64_t pair_tap_frontier = -1;
     std::int32_t pair_tap_slot     = -1;
+    // Causal scoring with ScoreOptions::prompt_hidden_states: the text pass records each layer's output at the sink's
+    // position (prefill_text_chunk); null otherwise.
+    HiddenStateSink* hidden_states = nullptr;
 };
 
 struct OrdinaryBatchContext {

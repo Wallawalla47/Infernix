@@ -69,6 +69,11 @@ void test_parse() {
     check(parse_score_request(d).top_k == 0, "top_k defaults to 0");
     d["top_k"] = infernix::kMaximumScoreTopTokens;
     check(parse_score_request(d).top_k == infernix::kMaximumScoreTopTokens, "top_k at the bound");
+
+    Json e = templated();
+    check(!parse_score_request(e).hidden_states, "hidden_states defaults to off");
+    e["hidden_states"] = true;
+    check(parse_score_request(e).hidden_states, "hidden_states asked for");
 }
 
 void test_refusals() {
@@ -119,6 +124,11 @@ void test_refusals() {
     check(api_code(body) == "unknown_field", "an unknown field is refused, not ignored");
     check(api_param(body) == "logprobs", "the unknown field is named");
 
+    body                  = templated();
+    body["hidden_states"] = "last";
+    check(api_code(body) == "invalid_hidden_states" && api_param(body) == "hidden_states",
+          "hidden_states takes a boolean");
+
     body             = templated();
     body["messages"] = Json::array({Json{
         {"role", "user"},
@@ -151,6 +161,19 @@ void test_response() {
           "top_logprobs descend");
     check(position["top_logprobs"][1]["token"] == " Lyon", "alternatives are detokenized");
     check(body["usage"]["prompt_tokens"] == 7 && body["usage"]["continuation_tokens"] == 1, "usage");
+    check(!body.contains("hidden_states"), "no hidden states unless asked for");
+
+    // Two layers of three values, layer-major as Engine::score_tokens returns them: one row per layer, each value as
+    // the engine widened it from BF16.
+    outcome.hidden_states       = {0.5F, -1.25F, 0.0078125F, 3.0F, -0.375F, 1024.0F};
+    outcome.hidden_state_layers = 2;
+    const Json hidden           = make_score_response("qwen", outcome)["hidden_states"];
+    check(hidden.size() == 2 && hidden[0].size() == 3 && hidden[1].size() == 3, "one row per layer");
+    check(hidden[0][2].get<double>() == 0.0078125 && hidden[1][0].get<double>() == 3.0 &&
+              hidden[1][2].get<double>() == 1024.0,
+          "rows in order, values exact");
+    outcome.hidden_states.clear();
+    outcome.hidden_state_layers = 0;
 
     outcome.chat_template_applied = true;
     outcome.enable_thinking       = false;

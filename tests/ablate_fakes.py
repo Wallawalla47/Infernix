@@ -1,13 +1,12 @@
-"""Stand-ins for infernix-serve and the capture test, for tests/test_ablate_tools.py: no GPU, no model, any OS.
+"""A stand-in for infernix-serve, for tests/test_ablate_tools.py: no GPU, no model, any OS.
 
-    python tests/ablate_fakes.py serve   <infernix-serve's argv after the binary>
-    python tests/ablate_fakes.py capture <infernix_qwen4_exp_forward_real_test's argv>
+    python tests/ablate_fakes.py serve <infernix-serve's argv after the binary>
 
 The fake engine answers like the real one where the tool depends on it (/health, /v1/chat/completions,
-/v1/score in src/serve/score.cpp's shape, --plan, --expert-state written at stop). A sidecar's strength is the sum of
-its alphas: refusals of prompts containing HARM fall, and the first-token distribution moves, as it grows, so a fit
-has a real front to find. The fake capture writes recordings of the exact size the tool expects and plants a known
-refusal direction at the last token of harmful prompts (layer L: PLANTED(L)), so a test can check the math.
+/v1/score in src/serve/score.cpp's shape with its hidden states, --plan, --expert-state written at stop). A sidecar's
+strength is the sum of its alphas: refusals of prompts containing HARM fall, and the first-token distribution moves,
+as it grows, so a fit has a real front to find. Its hidden states plant a known refusal direction in harmful prompts
+(layer L: planted(L)), so a test can check the math.
 """
 
 from __future__ import annotations
@@ -25,19 +24,41 @@ import numpy as np
 
 HARM = "HARM"                  # the tests' harmful prompts contain this word
 EDGE = "EDGE"                  # a benign prompt the stock model refuses anyway (an over-refusal)
-SKEW_ENV = "ABLATE_FAKE_TOKEN_SKEW"   # added to /v1/score's prompt_tokens (the positive control's negative test)
-SHAPE_ENV = "ABLATE_FAKE_SHAPE"       # "layers,hidden" of the fake recordings
+SHAPE_ENV = "ABLATE_FAKE_SHAPE"       # "layers,hidden" of the fake model's hidden states
 PLANT = 3.0
+MEAN = 5.0
 NOISE = 0.05
 
 
 def fake_ids(prompt: str) -> list[int]:
-    """The fake tokenizer: the tests' capture and the fake engine agree on it."""
+    """The fake tokenizer."""
     return [1 if HARM in prompt else 2] + [10 + ord(c) % 200 for c in prompt[:20]]
+
+
+def hidden_states(prompt: str) -> list[list[float]]:
+    """The fake model's [layers, hidden] hidden states at a prompt's last token: noise and the shared mean common(L),
+    plus planted(L) at every layer of a harmful prompt, BF16-rounded as the engine's are."""
+    layers, hidden = (int(x) for x in os.environ[SHAPE_ENV].split(","))
+    ids = fake_ids(prompt)
+    x = np.random.default_rng(sum(ids) * 7919 + len(ids)).normal(scale=NOISE, size=(layers, hidden)).astype(np.float32)
+    for layer in range(layers):
+        x[layer] += MEAN * common(layer, hidden)
+        if HARM in prompt:
+            x[layer] += PLANT * planted(layer, hidden)
+    return ((x.view(np.uint32) >> 16) << 16).view(np.float32).tolist()
 
 
 def planted(layer: int, hidden: int) -> np.ndarray:
     v = np.random.default_rng(1000 + layer).normal(size=hidden)
+    return (v / np.linalg.norm(v)).astype(np.float32)
+
+
+def common(layer: int, hidden: int) -> np.ndarray:
+    """Every prompt's shared mean (real hidden states have a large one), orthogonal to planted(layer): what heretic's
+    orthogonalization projects out of the direction."""
+    v = np.random.default_rng(2000 + layer).normal(size=hidden)
+    p = planted(layer, hidden).astype(np.float64)
+    v = v - (v @ p) * p
     return (v / np.linalg.norm(v)).astype(np.float32)
 
 
@@ -61,7 +82,6 @@ def serve(argv: list[str]) -> int:
         Path(_arg(argv, "--plan") or "plan.json").write_text("{}\n", encoding="utf-8")
         return 0
     port, s, scoring = int(_arg(argv, "--port") or 0), strength(_arg(argv, "--ablate")), "--causal-scoring" in argv
-    skew = int(os.environ.get(SKEW_ENV, "0"))
     state = _arg(argv, "--expert-state")
 
     def stop(*_):
@@ -103,46 +123,26 @@ def serve(argv: list[str]) -> int:
             if self.path == "/v1/score":
                 if not scoring:
                     return self.reply(400, {"error": {"code": "scoring_not_enabled"}})
-                k, words = int(body["top_k"]), max(1, len(body["continuation"].split()))
+                k, words = int(body.get("top_k") or 0), max(1, len(body["continuation"].split()))
                 phase = _seed(prompt) % 1000 / 100.0
-                logits = [-0.3 * i + 0.05 * s * math.sin(1.7 * i + phase) for i in range(k)]
+                logits = [-0.3 * i + 0.05 * s * math.sin(1.7 * i + phase) for i in range(max(k, 1))]
                 top = max(logits)
                 norm = top + math.log(sum(math.exp(x - top) for x in logits))
                 alts = [{"token_id": i, "token": f"t{i}", "logprob": x - norm} for i, x in enumerate(logits)]
                 alts.sort(key=lambda a: -a["logprob"])
                 positions = [{"token_id": alts[0]["token_id"], "token": alts[0]["token"],
-                              "logprob": alts[0]["logprob"], "top_logprobs": alts} for _ in range(words)]
-                return self.reply(200, {"object": "score", "model": "ablate", "chat_template_applied": True,
-                                        "enable_thinking": body.get("enable_thinking"), "positions": positions,
-                                        "usage": {"prompt_tokens": len(fake_ids(prompt)) + skew,
-                                                  "continuation_tokens": words}})
+                              "logprob": alts[0]["logprob"], "top_logprobs": alts[:k]} for _ in range(words)]
+                reply = {"object": "score", "model": "ablate", "chat_template_applied": True,
+                         "enable_thinking": body.get("enable_thinking"), "positions": positions,
+                         "usage": {"prompt_tokens": len(fake_ids(prompt)), "continuation_tokens": words}}
+                if body.get("hidden_states"):
+                    reply["hidden_states"] = hidden_states(prompt)
+                return self.reply(200, reply)
             return self.reply(404, {})
 
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     return 0
 
 
-def capture(argv: list[str]) -> int:
-    layers, hidden = (int(x) for x in os.environ[SHAPE_ENV].split(","))
-    jobs, job = [], None
-    for i, tok in enumerate(argv):
-        if tok.startswith("@"):
-            job = {"ids": Path(tok[1:])}
-            jobs.append(job)
-        elif job is not None and tok in ("--dump-logits", "--blocks"):
-            job[tok] = Path(argv[i + 1])
-    for job in jobs:
-        ids = [int(x) for x in job["ids"].read_text(encoding="ascii").strip().split(",")]
-        rng = np.random.default_rng(sum(ids) * 7919 + len(ids))
-        x = rng.normal(scale=NOISE, size=(layers, 4, len(ids), hidden)).astype(np.float32)
-        if ids[0] == 1:                       # a harmful prompt: plant the direction at its last token
-            for layer in range(layers):
-                x[layer, :, -1, :] += PLANT * planted(layer, hidden)
-        (x.view(np.uint32) >> 16).astype("<u2").tofile(job["--blocks"])   # float32 -> bf16, truncated
-        job["--dump-logits"].write_bytes(b"\0" * 8)
-        print(f"recorded {job['ids'].name}: {len(ids)} tokens")
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit({"serve": serve, "capture": capture}[sys.argv[1]](sys.argv[2:]))
+    sys.exit({"serve": serve}[sys.argv[1]](sys.argv[2:]))

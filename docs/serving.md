@@ -2011,6 +2011,7 @@ log-likelihood requests of evaluation harnesses such as lm-evaluation-harness.
 | `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Template options, parsed as on `/v1/chat/completions`. Refused when `apply_chat_template` is false (`template_option_without_template`). |
 | `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. |
 | `top_k` | `0` to `256`: the most probable tokens returned per position, in descending order. Above `256` is refused (`top_k_out_of_range`), never narrowed. |
+| `hidden_states` | Optional, `true` or `false` (default). `true` also returns every layer's hidden state at the prompt's last token, the position whose distribution is position 0 (below). Not on `--lossless` (`invalid_score_request`). |
 | `model` | Optional. Resolved as on `/v1/chat/completions`: another name than the server's answers `404` `model_not_found` (unless `--any-model-name`). The response's `model` is the server's public model ID. |
 
 An unknown field is refused with `400` and `code: "unknown_field"`. Prompt plus continuation must fit
@@ -2051,6 +2052,13 @@ write the continuation as the text that follows the prompt, boundary spacing inc
 
 `enable_thinking` is the template's thinking switch as rendered (`null` without a template).
 Repeating a request returns byte-identical output.
+
+With `"hidden_states": true` the response also carries `hidden_states`: one row per layer, `hidden_size` numbers
+each (the BF16 values exactly), at the prompt's last token. Row `L` is the hidden state layer `L` hands on: on the
+Qwen3.5 family the residual after layer `L`; on Qwen3.8-Flash-Next, whose residual is four hyper-connection streams,
+layer `L + 1`'s mixer input, and for the last layer its MoE input. It is what
+[fitting an ablation sidecar](ablate-fitting.md) measures directions from; the scores are the same with and without
+it. A 27B's rows are 64 x 5,120 numbers, so the response grows by a few MB.
 
 ## Authentication and CORS
 

@@ -9,7 +9,7 @@ files (the prefix-cache file, the SSD tier, the expert-cache state, log files).
 
 An option this table does not know is refused by name, never passed through: a new flag could change the model or
 write a file, and silently forwarding it would make the measurement mean something nobody chose.
-tests/test_serve_flags.py fails when infernix-serve gains an option this table does not classify.
+tests/test_ablate_tools.py fails when infernix-serve gains an option this table does not classify.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ RULES: dict[str, Rule] = {
     "--use-original-nvfp4-prefill-kernel": Rule(CARRY, _NUMERICS),
     "--prefill-split-workspace-mib": Rule(CARRY, _MEMORY),
     "--reproducible": Rule(CARRY, _NUMERICS),
-    "--lossless": Rule(REFUSE, "infernix-serve refuses --ablate with the lossless route (qwen4_exp forward.cpp)"),
+    "--lossless": Rule(REFUSE, "infernix-serve refuses --ablate on the lossless route"),
     "--fast-path": Rule(CARRY, _NUMERICS),
     "--no-fast-path": Rule(CARRY, _NUMERICS),
     "--expert-a4-activations": Rule(CARRY, _NUMERICS, capture="--expert-a4-activations"),
@@ -64,7 +64,9 @@ RULES: dict[str, Rule] = {
     "--model-id": Rule(OWNED, "the tool names its own engine"),
     "--any-model-name": Rule(DROP, _TRAFFIC),
     "--chat-template": Rule(CARRY, "the template the model is served with renders every prompt the fit measures"),
-    "--lora": Rule(REFUSE, "a LoRA changes the model being measured, and --ablate does not combine with it"),
+    # Qwen3.5 dense: the adapted model is the one production serves, so the direction and every trial are measured on
+    # its activations (--ablate cuts each lane's write with the adapter's term in it).
+    "--lora": Rule(CARRY, "the adapter is part of the model production serves"),
     "--claude-code-prompt": Rule(DROP, _TRAFFIC),
     "--ngram-volume": Rule(CARRY, "the model's n-gram embedding volume"),
     "--ngram-residency": Rule(CARRY, _MEMORY),

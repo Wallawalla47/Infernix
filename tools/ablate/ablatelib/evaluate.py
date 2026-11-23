@@ -33,7 +33,7 @@ from pathlib import Path
 from . import measure as M
 from .engine import MODEL_ID, Engine, EngineError
 from .prompts import read_prompts
-from .run import write_json
+from .run import sha256_file, write_json
 
 LM_TASKS = {"gsm8k": {"tasks": ["gsm8k"], "num_fewshot": 0, "max_gen_toks": 7168},
             "ifeval": {"tasks": ["leaderboard_ifeval"], "num_fewshot": None, "max_gen_toks": 4096},
@@ -313,7 +313,10 @@ def evaluate(run, candidate: str, tasks: str, context: int | None, limit: int | 
         raise SystemExit(f"unknown task(s) {unknown}")
     label = Path(candidate).parent.name if candidate.endswith(".json") else candidate
     out = run.sub("eval", f"{label}-{time.strftime('%Y%m%dT%H%M%S')}")
-    setup = hashlib.sha256(json.dumps([Engine(run, "generate", context=context).argv(port=1), limit]).encode()).hexdigest()[:16]
+    # The stock results are reused while the engine's command line and binary are the same (an Infernix update is
+    # another stock model).
+    setup = hashlib.sha256(json.dumps([Engine(run, "generate", context=context).argv(port=1), limit,
+                                       sha256_file(run.serve_binary)]).encode()).hexdigest()[:16]
     stock_dir = run.sub("eval", "stock", setup)
     results: dict = {"candidate": str(sc), "context": context, "limit": limit, "stock_cache": str(stock_dir), "tasks": {}}
     for task in wanted:

@@ -194,6 +194,9 @@ struct PersistentLayout {
     qwen3_5::RoundStateLayout round;
     TensorLayout prefill_hidden;
     std::optional<TensorLayout> score_hidden;
+    // Causal scoring: the last prompt token's hidden state at every layer (BF16 [H, layers],
+    // ScoreOptions::prompt_hidden_states).
+    std::optional<TensorLayout> score_layer_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
     std::optional<TensorLayout> grammar_masks;

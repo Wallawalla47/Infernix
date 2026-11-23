@@ -32,6 +32,8 @@ struct ScoreRequest {
     std::string continuation;
     // The top_k most probable next tokens per scored position, in [0,kMaximumScoreTopTokens].
     std::uint32_t top_k = 0;
+    // Every layer's hidden state at the prompt's last token (ScoreOptions::prompt_hidden_states).
+    bool hidden_states = false;
 };
 
 struct ScoredAlternative {
@@ -54,6 +56,9 @@ struct ScoreOutcome {
     std::uint32_t top_k            = 0;
     std::uint32_t prompt_tokens    = 0;
     std::vector<ScoredPosition> positions;
+    // ScoreRequest::hidden_states: [layers][hidden_size] layer-major (ScoreResult::hidden_states); empty otherwise.
+    std::vector<float> hidden_states;
+    std::uint32_t hidden_state_layers = 0;
 };
 
 // Validates the whole body before anything runs: an unknown field, a missing choice or an

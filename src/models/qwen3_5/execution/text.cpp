@@ -174,6 +174,21 @@ void DFlashFeatureSink::begin(const Tensor& value) {
     }
 }
 
+void HiddenStateSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
+    if (position < window_first || position >= window_first + window_columns) { return; }
+    const std::int64_t column = position - window_first;
+    if (rows == nullptr || out.dtype != DType::BF16 || value.dtype != DType::BF16 || value.ne[0] != out.ne[0] ||
+        layer < 0 || layer >= out.ne[1] || rows->size() != static_cast<std::size_t>(out.ne[1]) ||
+        column >= value.ne[1]) {
+        throw std::logic_error("the hidden-state capture does not match the prefill window");
+    }
+    const std::size_t column_bytes = 2ULL * static_cast<std::size_t>(out.ne[0]);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(out.data) + static_cast<std::size_t>(layer) * column_bytes,
+                               static_cast<const std::byte*>(value.data) + static_cast<std::size_t>(column) * column_bytes,
+                               column_bytes, cudaMemcpyDeviceToDevice, stream));
+    ++(*rows)[static_cast<std::size_t>(layer)];
+}
+
 void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
     const auto it = std::find(layers.begin(), layers.end(), layer);
     if (it == layers.end()) { return; }
@@ -1843,6 +1858,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 if (kept > 0 && pair_rel > 0) { kept = std::max<std::int32_t>(kept, len - pair_rel + 1); }
                 const bool trim_last       = kept > 0 && len > kept;
                 if constexpr (Tap::enabled) { tap.begin(x); }
+                if constexpr (requires { tap.begin_window(std::int64_t{}, 0); }) { tap.begin_window(base64 + t0, len); }
                 trim_last_columns_ = trim_last ? kept : 0;
                 pair_column_       = pair_rel;
                 try {
@@ -2056,6 +2072,18 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                               std::uint32_t nominal_length, bool finalize_at_end,
                                               DFlashFeatureSink& sink) {
+    if (begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - begin) {
+        throw std::invalid_argument("text prefill chunk is outside the prompt");
+    }
+    const TextPrefill text_prefill{full_ids, begin};
+    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
+                        finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                              std::uint32_t nominal_length, bool finalize_at_end,
+                                              HiddenStateSink& sink) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");

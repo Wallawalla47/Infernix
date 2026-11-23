@@ -113,6 +113,66 @@ int main() {
         std::cerr << "invalid distribution outputs were accepted\n";
         return 1;
     }
+
+    // Every layer's hidden state at the last prompt token (ScoreOptions::prompt_hidden_states): the scores unchanged,
+    // one row per layer. The rows are read at the prompt's last column, in the first prefill chunk and in the second:
+    // another token after it (the first target, or a shorter window's narrower chunk) leaves them alone within 1e-2
+    // relative L2 per layer (kernels may round a column by its neighbours; a later column is off by order one), and
+    // another token at it moves them by order one (an earlier column would not move: the scored prefix is causal).
+    const auto worst_relative = [](const infernix::ScoreResult& a, const infernix::ScoreResult& b) -> double {
+        const std::size_t layers = a.hidden_state_layers;
+        if (layers == 0 || layers != b.hidden_state_layers || a.hidden_states.size() != b.hidden_states.size()) {
+            return INFINITY;
+        }
+        const std::size_t width = a.hidden_states.size() / layers;
+        double worst            = 0;
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            double diff = 0, norm = 0;
+            for (std::size_t i = layer * width; i < (layer + 1) * width; ++i) {
+                const double d = static_cast<double>(a.hidden_states[i]) - static_cast<double>(b.hidden_states[i]);
+                diff += d * d;
+                norm += static_cast<double>(b.hidden_states[i]) * static_cast<double>(b.hidden_states[i]);
+            }
+            worst = std::max(worst, std::sqrt(diff / std::max(norm, 1e-30)));
+        }
+        return worst;
+    };
+    const infernix::ScoreOptions hidden_options{.prompt_hidden_states = true};
+    const infernix::ScoreResult hidden = engine.score_tokens(tokens, 513, hidden_options);
+    const std::size_t layers           = hidden.hidden_state_layers;
+    if (hidden.logprobs != suffix || layers == 0 || hidden.hidden_states.size() % layers != 0 ||
+        !std::all_of(hidden.hidden_states.begin(), hidden.hidden_states.end(), [](float v) { return std::isfinite(v); }) ||
+        !top.hidden_states.empty()) {
+        std::cerr << "the prompt's hidden states changed the scores or have an invalid shape\n";
+        return 1;
+    }
+    std::vector<infernix::TokenId> other = tokens;
+    other[513]                           = tokens[513] == tokens[0] ? tokens[1] : tokens[0];
+    const infernix::ScoreResult changed  = engine.score_tokens(other, 513, hidden_options);
+    // Position 1499, in the second 1,024-token chunk: the 1,537-token window against a 1,501-token one.
+    const infernix::ScoreResult wide = engine.score_tokens(tokens, 1500, hidden_options);
+    const infernix::ScoreResult narrow =
+        engine.score_tokens(std::vector<infernix::TokenId>(tokens.begin(), tokens.begin() + 1501), 1500, hidden_options);
+    const auto moved_at = [&](std::uint32_t first_target) {
+        std::vector<infernix::TokenId> moved = tokens;
+        const std::size_t at                 = first_target - 1U;
+        moved[at]                            = tokens[at] == tokens[0] ? tokens[1] : tokens[0];
+        return worst_relative(engine.score_tokens(moved, first_target, hidden_options),
+                              engine.score_tokens(tokens, first_target, hidden_options));
+    };
+    const double changed_worst = worst_relative(changed, hidden), chunk_worst = worst_relative(narrow, wide);
+    const double moved_first = moved_at(513), moved_second = moved_at(1500);
+    std::cout << "hidden states: " << layers << " layers x " << hidden.hidden_states.size() / layers
+              << "; another first target token: worst layer relative L2 " << changed_worst
+              << (changed.hidden_states == hidden.hidden_states ? " (bit-identical)" : "")
+              << "; position 1499 in a narrower second chunk: " << chunk_worst
+              << (narrow.hidden_states == wide.hidden_states ? " (bit-identical)" : "")
+              << "; another token at the captured position: " << moved_first << " (position 512), " << moved_second
+              << " (position 1499)\n";
+    if (changed_worst > 1e-2 || chunk_worst > 1e-2 || moved_first < 0.1 || moved_second < 0.1) {
+        std::cerr << "the hidden states are not the prompt position's\n";
+        return 1;
+    }
     std::cout << "OK causal_score_real\n";
     return 0;
 }

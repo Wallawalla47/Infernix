@@ -2,7 +2,7 @@
 
     <run>/run.json          the setup (written by `init`, read by every command)
     <run>/prompts/          the prompt sets as the fit uses them (sets.json)
-    <run>/capture/          recordings, one per prompt, named by fingerprint
+    <run>/capture/          each direction prompt's hidden states, one recording per prompt, named by fingerprint
     <run>/direction/        the base sidecar (per-layer refusal directions, no cut)
     <run>/fit/<study>/      the study ledger (sqlite), one directory per trial
     <run>/candidates/<name> pinned trials
@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .production import Production
 
-SCHEMA = "infernix-ablate-run-1"
+SCHEMA = "infernix-ablate-run-2"
 TOOL_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = TOOL_DIR.parent.parent
 
@@ -30,7 +30,6 @@ class Run:
     dir: Path
     production: Production
     serve_binary: Path
-    capture_binary: Path | None
     context: int = 16384
     created: str = ""
     notes: dict = field(default_factory=dict)
@@ -42,9 +41,7 @@ class Run:
     def save(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         data = {"schema": SCHEMA, "created": self.created or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "serve_binary": str(self.serve_binary),
-                "capture_binary": str(self.capture_binary) if self.capture_binary else None,
-                "context": self.context, "production": self.production.to_json(), "notes": self.notes}
+                "serve_binary": str(self.serve_binary), "context": self.context, "production": self.production.to_json(), "notes": self.notes}
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
         tmp.replace(self.path)
@@ -58,9 +55,7 @@ class Run:
         if data.get("schema") != SCHEMA:
             raise SystemExit(f"{path}: schema {data.get('schema')!r}, this tool reads {SCHEMA}")
         return cls(dir=Path(run_dir).resolve(), production=Production.from_json(data["production"]),
-                   serve_binary=Path(data["serve_binary"]),
-                   capture_binary=Path(data["capture_binary"]) if data.get("capture_binary") else None,
-                   context=int(data.get("context", 16384)), created=data.get("created", ""),
+                   serve_binary=Path(data["serve_binary"]), context=int(data.get("context", 16384)), created=data.get("created", ""),
                    notes=data.get("notes") or {})
 
     def sub(self, *parts: str) -> Path:
@@ -80,6 +75,21 @@ def sha256_file(path: Path, limit: int | None = None) -> str:
         h.update(fh.read(limit))
     h.update(str(Path(path).stat().st_size).encode())
     return f"head{limit}+size:{h.hexdigest()[:16]}"
+
+
+def artifact_id(artifact: Path) -> str:
+    """The artifact's id as the engine prints it (32 lowercase hex digits), from its entry file's header: what a
+    sidecar's artifact_id names, so a start on another artifact warns."""
+    import sys
+    tools = str(REPO_ROOT / "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from artifact.framing import HEADER, MAGIC   # noqa: E402  (Infernix's own v3 framing, tools/artifact)
+    with Path(artifact).open("rb") as fh:
+        raw = fh.read(HEADER.size)
+    if len(raw) != HEADER.size or HEADER.unpack(raw)[0] != MAGIC:
+        raise SystemExit(f"{artifact}: not an Infernix v3 artifact (its entry header does not read)")
+    return HEADER.unpack(raw)[2].hex()
 
 
 def write_json(path: Path, data) -> None:

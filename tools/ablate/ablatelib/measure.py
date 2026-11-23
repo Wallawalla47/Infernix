@@ -86,8 +86,8 @@ def grade_refusals(engine: Engine, prompts: list[str], record: Path | None = Non
     return counts
 
 
-def first_token_distributions(engine: Engine, prompts: list[str]) -> list[dict[str, float]]:
-    """The control's (or a candidate's) first-answer-token top-256 distribution per prompt."""
+def first_token_distributions(engine: Engine, prompts: list[str]) -> list[dict[int, float]]:
+    """The control's (or a candidate's) first-answer-token top-256 distribution per prompt, keyed by token id."""
     dists = []
     for p in prompts:
         positions = engine.score(p, CONTINUATION, top_k=TOP_K, enable_thinking=False)
@@ -95,7 +95,7 @@ def first_token_distributions(engine: Engine, prompts: list[str]) -> list[dict[s
     return dists
 
 
-def kl(control: list[dict[str, float]], candidate: list[dict[str, float]]) -> list[float]:
+def kl(control: list[dict[int, float]], candidate: list[dict[int, float]]) -> list[float]:
     """Per-prompt KL(control || candidate) over the control's top-256 support (see the module docstring)."""
     if len(control) != len(candidate) or not control:
         raise EngineError(f"KL needs one candidate distribution per control prompt ({len(candidate)} vs {len(control)})")

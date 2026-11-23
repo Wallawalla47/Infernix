@@ -670,6 +670,10 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
         throw std::invalid_argument("score_tokens logits_positions must be strictly ascending scored positions, at "
                                     "most kMaximumScoreLogitPositions");
     }
+    if (options.prompt_hidden_states && impl_->options.lossless) {
+        throw std::invalid_argument("score_tokens prompt_hidden_states is not offered on the lossless route");
+    }
+    const bool hidden_states           = options.prompt_hidden_states;
     const std::size_t logit_rows       = options.logits_positions.size();
     const std::size_t top_values       = positions * options.top_k;
     const std::size_t candidate_values = options.candidates.size();
@@ -688,7 +692,9 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
         result.top_logprobs.size() != top_values ||
         result.candidate_logprobs.size() != candidate_values ||
-        (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0)) {
+        (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0) ||
+        result.hidden_states.empty() == hidden_states ||
+        (hidden_states && (result.hidden_state_layers == 0 || result.hidden_states.size() % result.hidden_state_layers != 0))) {
         throw std::logic_error("target Program returned an invalid causal score count");
     }
     return result;
