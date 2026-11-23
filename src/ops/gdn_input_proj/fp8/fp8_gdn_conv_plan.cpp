@@ -98,24 +98,31 @@ std::size_t record_capacity(const Fp8GdnConvShape& shape, Fp8GdnConvPlan plan,
 
 void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected, Tensor& z,
                        Fp8GdnConvScheduleId schedule, WorkspaceArena& workspace,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, const LoraAddend* lora) {
     if (schedule == Fp8GdnConvScheduleId::MaterializedA16) {
-        fp8_gdn_input_a16_dispatch(x, weight, projected, z, stream);
+        fp8_gdn_input_a16_dispatch(x, weight, projected, z, stream, lora);
         return;
     }
     if (schedule == Fp8GdnConvScheduleId::MaterializedInvariantA16) {
-        fp8_gdn_input_invariant_launch(x, weight, projected, z, stream);
+        fp8_gdn_input_invariant_launch(x, weight, projected, z, stream, lora);
         return;
     }
     if (schedule == Fp8GdnConvScheduleId::MaterializedA8) {
-        fp8_gdn_input_a8_dispatch(x, weight, projected, z, workspace, stream);
+        fp8_gdn_input_a8_dispatch(x, weight, projected, z, workspace, stream, lora);
         return;
     }
     if (schedule == Fp8GdnConvScheduleId::MaterializedA8Residual) {
-        fp8_gdn_input_a8_residual_dispatch(x, weight, projected, z, workspace, stream);
+        fp8_gdn_input_a8_residual_dispatch(x, weight, projected, z, workspace, stream, lora);
         return;
     }
     throw std::logic_error("fp8 GDN materialized projection received a fused plan");
+}
+
+// A LoRA term has no fused form: its widths take the materialized A16 projection (the same A16 route), then the
+// convolution over it.
+Fp8GdnConvPlan materialize_for_term(Fp8GdnConvPlan plan, bool lora) {
+    if (lora && plan.schedule == Fp8GdnConvScheduleId::FusedA16) { plan.schedule = Fp8GdnConvScheduleId::MaterializedA16; }
+    return plan;
 }
 
 // Record and snapshot choose the same arithmetic for the same physical block.
@@ -164,16 +171,17 @@ Fp8GdnConvPlan fp8_gdn_record_resolve_plan(const Fp8GdnConvShape& shape, LinearP
 std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(QType qtype, LinearPolicy policy, std::int32_t input_rows,
                                                       std::int32_t batch_size,
                                                       std::int32_t min_width,
-                                                      std::int32_t max_width) {
+                                                      std::int32_t max_width, bool lora) {
     if (min_width <= 0 || max_width < min_width) {
         throw std::invalid_argument("fp8 GDN snapshot workspace: invalid width interval");
     }
     const Fp8GdnConvShape shape = conv_shape(qtype, input_rows);
     (void)fp8_gdn_snapshot_resolve_plan(shape, policy, min_width, batch_size);
-    const Fp8GdnConvPlan maximum =
-        fp8_gdn_snapshot_resolve_plan(shape, policy, max_width, batch_size);
-    // A8Only materializes at every width (fp8_gdn_conv_resolve_plan).
-    const bool fused_minimum = shape.fused && !column_invariant(policy) && !a8_only(policy) && batch_size == 1;
+    const Fp8GdnConvPlan maximum = materialize_for_term(
+        fp8_gdn_snapshot_resolve_plan(shape, policy, max_width, batch_size), lora);
+    // A8Only materializes at every width (fp8_gdn_conv_resolve_plan), and so does a LoRA term.
+    const bool fused_minimum =
+        shape.fused && !lora && !column_invariant(policy) && !a8_only(policy) && batch_size == 1;
     const std::int32_t largest_materialized_width =
         !fused_minimum || max_width > 3 ? max_width : 0;
     return snapshot_capacity(shape, maximum, batch_size * largest_materialized_width,
@@ -183,14 +191,15 @@ std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(QType qtype, LinearPolicy 
 std::size_t fp8_gdn_record_workspace_capacity_bytes(QType qtype, LinearPolicy policy, std::int32_t input_rows,
                                                     std::int32_t batch_size,
                                                     std::int32_t min_width,
-                                                    std::int32_t max_width) {
+                                                    std::int32_t max_width, bool lora) {
     if (min_width < 2 || max_width < min_width) {
         throw std::invalid_argument("fp8 GDN record workspace: invalid width interval");
     }
     const Fp8GdnConvShape shape = conv_shape(qtype, input_rows);
     (void)fp8_gdn_record_resolve_plan(shape, policy, min_width, batch_size);
-    const Fp8GdnConvPlan maximum =
-        fp8_gdn_record_resolve_plan(shape, policy, max_width, batch_size);
+    // A term's materialized A16 widths write the caller's record, as the fused route does: no storage either way.
+    const Fp8GdnConvPlan maximum = materialize_for_term(
+        fp8_gdn_record_resolve_plan(shape, policy, max_width, batch_size), lora);
     return record_capacity(shape, maximum, batch_size * max_width);
 }
 
@@ -201,7 +210,8 @@ void launch_snapshot_plan(const Tensor& x, const Weight& weight, const Tensor& c
                           const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                           Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                           const Fp8GdnConvShape& shape, Fp8GdnConvPlan plan,
-                          WorkspaceArena& workspace, cudaStream_t stream) {
+                          WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
+    plan = materialize_for_term(plan, lora != nullptr);
     if (plan.schedule == Fp8GdnConvScheduleId::FusedA16) {
         fp8_gdn_snapshot_fused_launch(x, weight, conv_weight, conv_states, valid_columns,
                                       initial_slot, snapshot_base_slot, query, key, value, z,
@@ -216,7 +226,7 @@ void launch_snapshot_plan(const Tensor& x, const Weight& weight, const Tensor& c
     Fp8GdnProjectedWorkspace scratch     = allocate_projected(workspace, shape, aggregate_columns);
     Tensor x_flat(x.data, DType::BF16, {shape.hidden, aggregate_columns});
     Tensor z_flat(z.data, DType::BF16, {shape.z_rows, aggregate_columns});
-    launch_projection(x_flat, weight, scratch.projected, z_flat, plan.schedule, workspace, stream);
+    launch_projection(x_flat, weight, scratch.projected, z_flat, plan.schedule, workspace, stream, lora);
 
     Tensor projected(scratch.projected.data, DType::BF16, {shape.channels, width, batch});
     gdn_projected_conv_snapshot_launch(projected, conv_weight, conv_states, valid_columns,
@@ -228,11 +238,9 @@ void launch_record_plan(const Tensor* tree_rows, const Tensor& x, const Weight& 
                         const Tensor& valid_columns, const Tensor& initial_slot,
                         Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                         const Fp8GdnConvShape& shape, Fp8GdnConvPlan plan,
-                        WorkspaceArena& workspace, cudaStream_t stream) {
-    // A tree convolves over ancestors, which the fused epilogue cannot address.
-    if (tree_rows != nullptr && plan.schedule == Fp8GdnConvScheduleId::FusedA16) {
-        plan.schedule = Fp8GdnConvScheduleId::MaterializedA16;
-    }
+                        WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
+    // A tree convolves over ancestors, which the fused epilogue cannot address; a term has no fused form.
+    plan = materialize_for_term(plan, tree_rows != nullptr || lora != nullptr);
     if (plan.schedule == Fp8GdnConvScheduleId::FusedA16) {
         fp8_gdn_record_fused_launch(x, weight, conv_weight, conv_states, valid_columns,
                                     initial_slot, conv_record, query, key, value, z, stream);
@@ -246,7 +254,7 @@ void launch_record_plan(const Tensor* tree_rows, const Tensor& x, const Weight& 
     Tensor x_flat(x.data, DType::BF16, {shape.hidden, aggregate_columns});
     Tensor record_flat(conv_record.data, DType::BF16, {shape.channels, aggregate_columns});
     Tensor z_flat(z.data, DType::BF16, {shape.z_rows, aggregate_columns});
-    launch_projection(x_flat, weight, record_flat, z_flat, plan.schedule, workspace, stream);
+    launch_projection(x_flat, weight, record_flat, z_flat, plan.schedule, workspace, stream, lora);
     if (tree_rows != nullptr) {
         gdn_projected_conv_record_tree_launch(conv_record, conv_weight, conv_states, valid_columns,
                                               initial_slot, *tree_rows, query, key, value, stream);
@@ -263,12 +271,12 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
                                const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                LinearPolicy policy, WorkspaceArena& workspace,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, const LoraAddend* lora) {
     const Fp8GdnConvShape shape = conv_shape(weight.qtype, weight.k);
     launch_snapshot_plan(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                          snapshot_base_slot, query, key, value, z, shape,
                          fp8_gdn_snapshot_resolve_plan(shape, policy, x.ne[1], x.ne[2]),
-                         workspace, stream);
+                         workspace, stream, lora);
 }
 
 void fp8_gdn_record_dispatch(const Tensor* tree_rows, const Tensor& x, const Weight& weight,
@@ -276,12 +284,12 @@ void fp8_gdn_record_dispatch(const Tensor* tree_rows, const Tensor& x, const Wei
                              const Tensor& valid_columns, const Tensor& initial_slot,
                              Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                              Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, const LoraAddend* lora) {
     const Fp8GdnConvShape shape = conv_shape(weight.qtype, weight.k);
     launch_record_plan(tree_rows, x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                        conv_record, query, key, value, z, shape,
                        fp8_gdn_record_resolve_plan(shape, policy, x.ne[1], x.ne[2]), workspace,
-                       stream);
+                       stream, lora);
 }
 
 } // namespace infernix::ops::detail

@@ -78,16 +78,29 @@ void rowsplit_ring_linear_kernel(const __nv_bfloat16* __restrict__ x, typename F
         // --lora: the term on each consumer warp's fragments (canonical chains), before any epilogue form below.
         const int warp = static_cast<int>(threadIdx.x) >> 5;
         const int wm = warp / Tile::WARPS_N, wn = warp % Tile::WARPS_N;
-        lora_add_rows_tile<MT, NT>(
-            epilogue.lora, acc,
-            [&](int mm, int i) {
-                const int r = row0 + wm * Tile::WM + mm * 16 + i;
-                return r < rows ? r : rows - 1;
-            },
-            [&](int mn, int j) {
-                const int t = col0 + wn * Tile::WN + mn * 8 + j;
-                return t < cols ? token_begin + t : -1;
-            });
+        if constexpr (kLoraStageRank<Epilogue> > kLoraNarrowRank &&
+                      (BM + BN) * (2 * kLoraStageRank<Epilogue> + 16) <= Ring::kBarrierOffset) {
+            // A wide instance: B's rows and U's columns staged in the free ring (every consumer warp busy each pass).
+            // A narrow one reads them from L2: staged, the groupwise 27B's instances took 0.6 % longer at rank 32
+            // (2,048-token prefill, RTX 5090, 2026-11-22).
+            lora_add_rows_tile_staged<BM, BN, Ring::kBarrierOffset>(
+                epilogue.lora, acc, [&](int mm, int i) { return wm * Tile::WM + mm * 16 + i; },
+                [&](int mn, int j) { return wn * Tile::WN + mn * 8 + j; },
+                [&](int i) { return row0 + i < rows ? row0 + i : rows - 1; }, token_begin + col0, token_begin + cols,
+                Ring::storage(), static_cast<int>(threadIdx.x), Tile::THREADS,
+                [] { asm volatile("bar.sync 1, %0;" ::"r"(Tile::THREADS) : "memory"); });
+        } else {
+            lora_add_rows_tile<MT, NT>(
+                epilogue.lora, acc,
+                [&](int mm, int i) {
+                    const int r = row0 + wm * Tile::WM + mm * 16 + i;
+                    return r < rows ? r : rows - 1;
+                },
+                [&](int mn, int j) {
+                    const int t = col0 + wn * Tile::WN + mn * 8 + j;
+                    return t < cols ? token_begin + t : -1;
+                });
+        }
     }
 
     using Schedule = RowSplitRingSchedule<Ring, Tile>;

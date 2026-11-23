@@ -47,6 +47,13 @@ void require_residual_profile(std::int32_t input_rows) {
     }
 }
 
+// The [20480,3072] parent has no adapter form.
+void require_lora_profile(std::int32_t input_rows, const LoraAddend* lora) {
+    if (lora != nullptr && n20480(input_rows)) {
+        throw std::invalid_argument("fp8 gdn_input_proj: the [20480,3072] parent takes no LoRA term");
+    }
+}
+
 } // namespace
 
 std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t input_rows,
@@ -81,40 +88,43 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(QType qtype, LinearPolicy pol
 }
 
 void fp8_gdn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, const LoraAddend* lora) {
+    require_lora_profile(weight.k, lora);
     if (n20480(weight.k)) {
         fp8_gdn_input_n20480_invariant_launch(x, weight, qkv, z, stream);
     } else {
-        fp8_gdn_input_n16384_invariant_launch(x, weight, qkv, z, stream);
+        fp8_gdn_input_n16384_invariant_launch(x, weight, qkv, z, stream, lora);
     }
 }
 
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const LoraAddend* lora) {
+    require_lora_profile(weight.k, lora);
     if (n20480(weight.k)) {
         fp8_gdn_input_n20480_a16_launch(x, weight, qkv, z, stream);
     } else if (x.ne[1] == 1) {
-        fp8_gdn_input_decode_launch(x, weight, qkv, z, stream);
+        fp8_gdn_input_decode_launch(x, weight, qkv, z, stream, lora);
     } else {
-        fp8_gdn_input_matrix_launch(x, weight, qkv, z, stream);
+        fp8_gdn_input_matrix_launch(x, weight, qkv, z, stream, lora);
     }
 }
 
 void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                               WorkspaceArena& workspace, cudaStream_t stream) {
+                               WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
+    require_lora_profile(weight.k, lora);
     auto scope                   = workspace.scope();
     const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_gdn_input_partial_capacity_bytes(weight.k, x.ne[1]));
     if (n20480(weight.k)) {
         fp8_gdn_input_n20480_a8_launch(x, weight, qkv, z, scratch, stream);
     } else {
-        fp8_gdn_input_a8_launch(x, weight, qkv, z, scratch, stream);
+        fp8_gdn_input_a8_launch(x, weight, qkv, z, scratch, stream, lora);
     }
 }
 
 void fp8_gdn_input_a8_residual_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv,
                                         Tensor& z, WorkspaceArena& workspace,
-                                        cudaStream_t stream) {
+                                        cudaStream_t stream, const LoraAddend* lora) {
     require_residual_profile(weight.k);
     if (weight.qtype == QType::FP8_E4M3FN_ROW_F32) {
         throw std::invalid_argument("fp8 gdn_input_proj: a static input scale has no A8 residual route");
@@ -122,28 +132,29 @@ void fp8_gdn_input_a8_residual_dispatch(const Tensor& x, const Weight& weight, T
     auto scope = workspace.scope();
     fp8_gdn_input_a8_residual_launch(
         x, weight, qkv, z, allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k, 0, true),
-        stream);
+        stream, lora);
 }
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                            LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+                            LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream,
+                            const LoraAddend* lora) {
     const Fp8GdnInputRoute route = resolve_route(policy, x.ne[1]);
     if (route == Fp8GdnInputRoute::ColumnInvariantA16) {
-        fp8_gdn_input_invariant_launch(x, weight, qkv, z, stream);
+        fp8_gdn_input_invariant_launch(x, weight, qkv, z, stream, lora);
         return;
     }
     if (route == Fp8GdnInputRoute::A16) {
-        fp8_gdn_input_a16_dispatch(x, weight, qkv, z, stream);
+        fp8_gdn_input_a16_dispatch(x, weight, qkv, z, stream, lora);
         return;
     }
     if (workspace == nullptr) {
         throw std::invalid_argument("fp8 A8 gdn_input_proj requires caller workspace");
     }
     if (route == Fp8GdnInputRoute::A8Residual) {
-        fp8_gdn_input_a8_residual_dispatch(x, weight, qkv, z, *workspace, stream);
+        fp8_gdn_input_a8_residual_dispatch(x, weight, qkv, z, *workspace, stream, lora);
         return;
     }
-    fp8_gdn_input_a8_dispatch(x, weight, qkv, z, *workspace, stream);
+    fp8_gdn_input_a8_dispatch(x, weight, qkv, z, *workspace, stream, lora);
 }
 
 } // namespace infernix::ops::detail

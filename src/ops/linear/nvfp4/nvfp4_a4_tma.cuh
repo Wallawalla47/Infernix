@@ -157,6 +157,16 @@ union alignas(128) Nvfp4A4TmaScratch {
     }();
     unsigned char epilogue_scratch[kEpilogueBytes];
     __nv_bfloat16 output[Schedule::kBlockTokens * (Schedule::kBlockRows + 8)];
+    // A wide adapter instance's term operands: B's rows and one segment's U columns over the whole tile in unpadded
+    // rows (lora_add_tokens_tile_staged_swizzled); one byte for every other instance, whose size is unchanged.
+    static constexpr int kLoraBytes = [] {
+        if constexpr (kLoraEpilogue<Epilogue>) {
+            if constexpr (kLoraStageRank<Epilogue> > kLoraNarrowRank)
+                return (Schedule::kBlockRows + Schedule::kBlockTokens) * 2 * kLoraStageRank<Epilogue>;
+        }
+        return 1;
+    }();
+    unsigned char lora_scratch[kLoraBytes];
 };
 
 template <class Schedule, class Rows, class Epilogue>

@@ -1,7 +1,8 @@
 // Performance bench for lora_shrink (U = A x, include/infernix/ops/lora.h) at Qwen3.8-27B's adapter sites: the
-// stacked q/k/v A (3 r rows over K 5120), gate/up (2 r over 5120), o_proj (r over 6144) and down_proj (r over
-// 17408), r the padded rank. The GB/s it prints is informational (A + x read, U written).
-//   ./infernix_lora_shrink_bench [--rank 32] [--tokens 1,16,1024,4096]
+// stacked q/k/v A (3 r rows over K 5120), the Gated DeltaNet input's in_proj_qkv / z / a / b (4 r over 5120), gate/up
+// (2 r over 5120), o_proj and out_proj (r over 6144) and down_proj (r over 17408), r the padded rank. The GB/s it
+// prints is informational (A + x read, U written). The call takes the schedule lora_shrink picks for its shape.
+//   ./infernix_lora_shrink_bench [--rank 32] [--tokens 1,16,1024,4096] [--site q/k/v|gdn-in|gate/up|o_proj|down]
 #include "infernix/ops/lora.h"
 #include "infernix_bench_common.h"
 
@@ -58,13 +59,19 @@ int main(int argc, char** argv) {
     }
     int rank                = 32;
     std::vector<int> tokens = {1, 2, 8, 16, 64, 256, 1024, 2048, 3072, 4096, 6144, 8192};
+    std::string only; // --site: one site (a profiler's target)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--rank") && i + 1 < argc) {
             rank = std::atoi(argv[++i]);
         } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
             tokens = parse_list(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--site") && i + 1 < argc) {
+            only = argv[++i];
         } else {
-            std::fprintf(stderr, "usage: %s [--rank R (padded, multiple of 16)] [--tokens T[,T...]]\n", argv[0]);
+            std::fprintf(stderr,
+                         "usage: %s [--rank R (padded, multiple of 16)] [--tokens T[,T...]] "
+                         "[--site q/k/v|gdn-in|gate/up|o_proj|down]\n",
+                         argv[0]);
             return 2;
         }
     }
@@ -73,11 +80,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
+        const auto site = [&](const char* name, int rows, int k, int t) {
+            if (only.empty() || only == name) { run(name, rows, k, t); }
+        };
         for (const int t : tokens) {
-            run("q/k/v", 3 * rank, 5120, t);
-            run("gate/up", 2 * rank, 5120, t);
-            run("o_proj", rank, 6144, t);
-            run("down", rank, 17408, t);
+            site("q/k/v", 3 * rank, 5120, t);
+            site("gdn-in", 4 * rank, 5120, t); // in_proj_qkv / z / a / b stacked
+            site("gate/up", 2 * rank, 5120, t);
+            site("o_proj", rank, 6144, t);
+            site("down", rank, 17408, t);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "lora_shrink bench: %s\n", error.what());

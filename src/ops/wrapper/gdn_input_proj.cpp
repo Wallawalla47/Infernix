@@ -336,12 +336,29 @@ void validate_policy(LinearPolicy policy, QType qtype) {
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");
 }
 
+// The single parent's LoRA term (gdn_input_proj_lora_supported) over `columns` columns (W * B for the convolution
+// forms); refused before any launch.
+void require_single_parent_lora(const LoraAddend* lora, const Weight& weight, std::int32_t columns,
+                                const char* operation) {
+    if (lora == nullptr) { return; }
+    if (!gdn_input_proj_lora_supported(weight.qtype, weight.n, weight.k)) {
+        throw std::invalid_argument(std::string(operation) + ": this parent takes no LoRA term");
+    }
+    validate_lora_addend(*lora, weight.n, columns);
+}
+
+// The two-parent Q4/Q5 form's term: the single parent's [16384] rows (q/k, then value/z).
+void require_two_parent_lora(const LoraAddend* lora, std::int32_t columns) {
+    if (lora != nullptr) { validate_lora_addend(*lora, 16384, columns); }
+}
+
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, LinearRoutes routes, WorkspaceArena* workspace,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const LoraAddend* lora = nullptr) {
     validate_policy(policy, weight.qtype);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+    require_single_parent_lora(lora, weight, cols, "gdn_input_proj");
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden  = 5120;
@@ -356,7 +373,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
         }
-        detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
+        detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream, lora);
         return;
     }
 
@@ -374,7 +391,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         if (weight.n != rows || weight.k != hidden) {
             throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
         }
-        detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
+        detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream, lora);
         return;
     }
 
@@ -510,8 +527,10 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      const Tensor& valid_columns, const Tensor& initial_state_slots,
                                      const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                      Tensor& value, Tensor& z, LinearPolicy policy,
-                                     WorkspaceArena& workspace, cudaStream_t stream) {
+                                     WorkspaceArena& workspace, cudaStream_t stream,
+                                     const LoraAddend* lora = nullptr) {
     validate_policy(policy, weight.qtype);
+    require_single_parent_lora(lora, weight, x.ne[1] * x.ne[2], "gdn_input_proj_conv_snapshot");
     // Every format's snapshot: no operand aliases another, the live workspace or the parent weight (the record forms
     // check the same).
     const std::array<const Tensor*, 10> operands{&x,     &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
@@ -555,13 +574,14 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      kQueryRows, kKeyRows, kValueRows, geometry, workspace, stream,
                                      [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
                                          gdn_input_proj(x_flat, weight, projected, z_flat, policy,
-                                                        workspace, stream);
+                                                        workspace, stream, LinearRoutes::Exact, lora);
                                      });
             return;
         }
+        // One row: a term takes the Materialized schedule at every width (nvfp4_gdn_snapshot_dispatch).
         detail::nvfp4_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                             initial_state_slots, snapshot_base_slots, query, key,
-                                            value, z, policy, workspace, stream);
+                                            value, z, policy, workspace, stream, lora);
         return;
     }
 
@@ -592,7 +612,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                             "gdn_input_proj_conv_snapshot", "z");
         detail::fp8_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                           initial_state_slots, snapshot_base_slots, query, key,
-                                          value, z, policy, workspace, stream);
+                                          value, z, policy, workspace, stream, lora);
         return;
     }
 
@@ -653,8 +673,10 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    const Tensor& initial_state_slots, Tensor& conv_record,
                                    Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                    LinearPolicy policy, WorkspaceArena& workspace,
-                                   cudaStream_t stream, const Tensor* tree_rows = nullptr) {
+                                   cudaStream_t stream, const Tensor* tree_rows = nullptr,
+                                   const LoraAddend* lora = nullptr) {
     validate_policy(policy, weight.qtype);
+    require_single_parent_lora(lora, weight, x.ne[1] * x.ne[2], "gdn_input_proj_conv_record");
     if (tree_rows != nullptr) {
         if (x.ne[1] < 2 || x.ne[1] > kSpeculativeTreeMaxNodes) {
             throw std::invalid_argument(
@@ -699,7 +721,8 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
             Tensor x_flat      = flatten_columns(x, x.ne[0], geometry);
             Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
             Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
-            gdn_input_proj(x_flat, weight, record_flat, z_flat, policy, workspace, stream);
+            gdn_input_proj(x_flat, weight, record_flat, z_flat, policy, workspace, stream, LinearRoutes::Exact,
+                           lora);
             detail::gdn_projected_conv_record_tree_launch(conv_record, conv_weight, conv_states,
                                                           valid_columns, initial_state_slots,
                                                           *tree_rows, query, key, value, stream);
@@ -713,11 +736,12 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                            conv_record, query, key, value, z, geometry, workspace, stream,
                            [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                                gdn_input_proj(x_flat, weight, record_flat, z_flat, policy,
-                                              workspace, stream);
+                                              workspace, stream, LinearRoutes::Exact, lora);
                            });
             return;
         }
-        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
+        // A term has no fused form: one row materializes at every width (as the snapshot does).
+        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16 && lora == nullptr) {
             detail::nvfp4_gdn_record_small_t_launch(x, weight, conv_weight, conv_states,
                                                     valid_columns, initial_state_slots, conv_record,
                                                     query, key, value, z, stream);
@@ -725,7 +749,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         }
 
         auto scope = workspace.scope();
-        gdn_input_proj(x, weight, conv_record, z, policy, workspace, stream);
+        gdn_input_proj(x, weight, conv_record, z, policy, workspace, stream, LinearRoutes::Exact, lora);
         detail::nvfp4_gdn_record_post_launch(conv_record, conv_weight, conv_states, valid_columns,
                                              initial_state_slots, query, key, value, stream);
         return;
@@ -765,7 +789,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         require_parent_nonoverlap(weight, tensors, workspace, "fp8 gdn_input_proj_conv_record");
         detail::fp8_gdn_record_dispatch(tree_rows, x, weight, conv_weight, conv_states,
                                         valid_columns, initial_state_slots, conv_record, query, key,
-                                        value, z, policy, workspace, stream);
+                                        value, z, policy, workspace, stream, lora);
         return;
     }
 
@@ -831,7 +855,7 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, LinearPolicy policy, cudaStream_t stream) {
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, cudaStream_t stream, const LoraAddend* lora) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("gdn_input_proj: invalid compute policy");
     }
@@ -848,9 +872,14 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_matrix(z, kZRows, cols, "z");
     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    require_two_parent_lora(lora, cols);
 
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream,
-                                     column_invariant(policy));
+                                     column_invariant(policy), lora);
+}
+
+bool gdn_input_proj_lora_supported(QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows) noexcept {
+    return parent_rows == 16384 && input_rows == 5120 && (parent_qtype == QType::NVFP4 || is_fp8_row(parent_qtype));
 }
 
 bool gdn_input_proj_column_invariant_route(QType parent_qtype, std::int32_t parent_rows,
@@ -903,11 +932,12 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
+                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes,
+                    const LoraAddend* lora) {
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("gdn_input_proj: unsupported route set");
     }
-    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, policy, routes, &workspace, stream);
+    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, policy, routes, &workspace, stream, lora);
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
@@ -928,7 +958,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: invalid compute policy");
     }
@@ -936,6 +966,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     const bool q8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !q8) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: unregistered shape");
+    }
+    if (lora && !q4_q5) {
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: the Q8 parent takes no LoRA term");
     }
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const std::int32_t channels = query_rows + key_rows + value_rows;
@@ -965,7 +998,8 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, 1);
         (void)resolve_q4_q5_conv_plan(max_width, 1);
-        if (max_width >= 7) {
+        // A term materializes at every width.
+        if (max_width >= 7 || lora) {
             largest_materialized_width = max_width;
         } else if (min_width <= 4 && max_width >= 4) {
             largest_materialized_width = 4;
@@ -983,12 +1017,15 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora) {
     validate_policy(policy, parent_qtype);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
+    if (lora && !gdn_input_proj_lora_supported(parent_qtype, parent_rows, input_rows)) {
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: this parent takes no LoRA term");
+    }
     if (fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
         return detail::fp8_gdn_snapshot_workspace_capacity_bytes(parent_qtype, policy, input_rows, batch_size,
-                                                                 min_width, max_width);
+                                                                 min_width, max_width, lora);
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
         input_rows != detail::Nvfp4N16384K5120::kInputRows) {
@@ -996,7 +1033,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             "gdn_input_proj_conv_snapshot workspace: unsupported single-parent profile");
     }
     if (batch_size == 1 && !column_invariant(policy)) {
-        return detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width);
+        return detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width, lora);
     }
 
     (void)detail::nvfp4_gdn_conv_resolve_plan(policy, min_width, batch_size);
@@ -1018,7 +1055,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: invalid compute policy");
     }
@@ -1027,9 +1064,12 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     if (!q4_q5 && !q8) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: unregistered shape");
     }
+    if (lora && !q4_q5) {
+        throw std::invalid_argument("gdn_input_proj_conv_record workspace: the Q8 parent takes no LoRA term");
+    }
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (q4_q5) {
-        // The materialized projection writes directly to the caller's conv_record.
+        // The materialized projection (every width with a term) writes directly to the caller's conv_record.
         (void)resolve_q4_q5_conv_plan(min_width, batch_size, column_invariant(policy));
         (void)resolve_q4_q5_conv_plan(max_width, batch_size, column_invariant(policy));
     } else if (column_invariant(policy)) {
@@ -1044,12 +1084,15 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width, bool lora) {
     validate_policy(policy, parent_qtype);
     require_record_capacity_domain(batch_size, min_width, max_width);
+    if (lora && !gdn_input_proj_lora_supported(parent_qtype, parent_rows, input_rows)) {
+        throw std::invalid_argument("gdn_input_proj_conv_record workspace: this parent takes no LoRA term");
+    }
     if (fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
         return detail::fp8_gdn_record_workspace_capacity_bytes(parent_qtype, policy, input_rows, batch_size,
-                                                               min_width, max_width);
+                                                               min_width, max_width, lora);
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
         input_rows != detail::Nvfp4N16384K5120::kInputRows) {
@@ -1064,6 +1107,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
         if (minimum_plan.schedule == detail::Nvfp4GdnConvScheduleId::DecodeFusedA16) {
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
+        // A term materializes every width into the caller's record: the projection's workspace alone.
+        if (lora) { return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_width, max_width); }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
         // Below the fused A16 kernel's widths only A8Only materializes (nvfp4_gdn_conv_resolve_plan).
         return detail::nvfp4_gdn_input_workspace_capacity_bytes(
@@ -1091,10 +1136,11 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const LoraAddend* lora) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: invalid compute policy");
     }
+    require_two_parent_lora(lora, x.ne[1] * x.ne[2]);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -1130,14 +1176,15 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
             query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry, ws, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
                 gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, policy,
-                               stream);
+                               stream, lora);
             });
         return;
     }
 
     const detail::Q4Q5GdnInputConvPlan plan =
         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+    // A term has no fused form: it materializes at every width.
+    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused && lora == nullptr) {
         detail::q4_q5_gdn_input_conv_snapshot_launch(
             x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
             initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
@@ -1146,7 +1193,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
-    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
+    // One row, a policy that is not column-invariant: the A16 routes.
+    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, LinearPolicy::A16Only, stream, lora);
     detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,
                                                valid_columns, initial_state_slots,
                                                snapshot_base_slots, query, key, value, stream);
@@ -1169,10 +1217,11 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const LoraAddend* lora) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("gdn_input_proj_conv_record: invalid compute policy");
     }
+    require_two_parent_lora(lora, x.ne[1] * x.ne[2]);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -1200,7 +1249,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
 
     const detail::Q4Q5GdnInputConvPlan plan =
         resolve_q4_q5_conv_plan(geometry.width, geometry.batch, column_invariant(policy));
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+    // A term has no fused form: it materializes at every width.
+    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused && lora == nullptr) {
         detail::q4_q5_gdn_input_conv_record_launch(x, qk_weight, value_z_weight, conv_weight,
                                                    conv_states, valid_columns, initial_state_slots,
                                                    conv_record, query, key, value, z, stream);
@@ -1210,7 +1260,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    query, key, value, z, geometry, workspace, stream,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
-                                      policy, stream);
+                                      policy, stream, lora);
                    });
 }
 
@@ -1219,10 +1269,10 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const LoraAddend* lora) {
     dispatch_single_parent_snapshot(x, query_key_value_z_weight, conv_weight, conv_states,
                                     valid_columns, initial_state_slots, snapshot_base_slots, query,
-                                    key, value, z, policy, ws, stream);
+                                    key, value, z, policy, ws, stream, lora);
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
@@ -1301,10 +1351,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const LoraAddend* lora) {
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
-                                  value, z, policy, workspace, stream);
+                                  value, z, policy, workspace, stream, nullptr, lora);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
@@ -1312,10 +1362,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 const Tensor& tree_rows, Tensor& conv_record, Tensor& query,
                                 Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
-                                WorkspaceArena& workspace, cudaStream_t stream) {
+                                WorkspaceArena& workspace, cudaStream_t stream, const LoraAddend* lora) {
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
-                                  value, z, policy, workspace, stream, &tree_rows);
+                                  value, z, policy, workspace, stream, &tree_rows, lora);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

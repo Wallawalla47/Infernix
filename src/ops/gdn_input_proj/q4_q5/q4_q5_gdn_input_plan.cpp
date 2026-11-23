@@ -118,7 +118,7 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
                                   Tensor& qkv, Tensor& z, cudaStream_t stream,
-                                  bool column_invariant) {
+                                  bool column_invariant, const LoraAddend* lora) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};
@@ -131,19 +131,20 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
-        q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+        q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream, lora);
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2:
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
     case Q4Q5GdnInputScheduleId::GroupedMixedRingC128:
         q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, plan.schedule,
-                                           stream);
+                                           stream, lora);
         return;
     case Q4Q5GdnInputScheduleId::ColumnInvariant: {
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
-        q4_q5_gdn_input_column_invariant_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+        q4_q5_gdn_input_column_invariant_launch(x, qk_weight, value_z_weight, qk, value, z, stream,
+                                                lora);
         return;
     }
     }
@@ -152,13 +153,13 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream, bool column_invariant) {
+                              cudaStream_t stream, bool column_invariant, const LoraAddend* lora) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};
     const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem, column_invariant);
     q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream,
-                                 column_invariant);
+                                 column_invariant, lora);
 }
 
 } // namespace infernix::ops::detail

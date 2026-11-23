@@ -130,16 +130,26 @@ void rowsplit_grouped_ring_kernel(const __nv_bfloat16* __restrict__ x, RowSplitG
     const int gid = lane >> 2, lid = lane & 3;
     if constexpr (kLora) {
         // --lora: the term on each consumer warp's fragments (canonical chains), before the BF16 stores.
-        lora_add_rows_tile<MT, NT>(
-            lora.addend, acc,
-            [&](int mm, int i) {
-                const int r = m0 + wm * Tile::WM + mm * 16 + i;
-                return lora_row_base + (r < job.n ? r : job.n - 1);
-            },
-            [&](int mn, int j) {
-                const int c = t0 + wn * Tile::WN + mn * 8 + j;
-                return c < t ? c : -1;
-            });
+        if constexpr ((BM + BN) * (2 * std::remove_cvref_t<decltype(lora.addend)>::kMaxRank + 16) <=
+                      Ring::kBarrierOffset) {
+            // B's rows and U's columns staged in the free ring (every consumer warp busy each pass).
+            lora_add_rows_tile_staged<BM, BN, Ring::kBarrierOffset>(
+                lora.addend, acc, [&](int mm, int i) { return wm * Tile::WM + mm * 16 + i; },
+                [&](int mn, int j) { return wn * Tile::WN + mn * 8 + j; },
+                [&](int i) { return lora_row_base + (m0 + i < job.n ? m0 + i : job.n - 1); }, t0, t, Ring::storage(),
+                tid, Tile::THREADS, [] { asm volatile("bar.sync 1, %0;" ::"r"(Tile::THREADS) : "memory"); });
+        } else {
+            lora_add_rows_tile<MT, NT>(
+                lora.addend, acc,
+                [&](int mm, int i) {
+                    const int r = m0 + wm * Tile::WM + mm * 16 + i;
+                    return lora_row_base + (r < job.n ? r : job.n - 1);
+                },
+                [&](int mn, int j) {
+                    const int c = t0 + wn * Tile::WN + mn * 8 + j;
+                    return c < t ? c : -1;
+                });
+        }
     }
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
