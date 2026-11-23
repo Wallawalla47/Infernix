@@ -143,7 +143,7 @@ std::vector<std::uint16_t> run(const Case& c, bool graph, const std::string& lab
     }
     const DirectionCut cut{.direction = static_cast<const float*>(d_dir.p), .alpha = c.alpha};
     const Tensor inject(d_inject.p, DType::FP32, {c.streams, c.columns});
-    Tensor out(residual.data(), DType::BF16, {static_cast<std::int64_t>(c.streams) * c.hidden, c.columns});
+    Tensor out(residual.data(), DType::BF16, {c.streams * c.hidden, c.columns});
     infernix::ops::MoeRouting routing{
         Tensor(d_ids.p, DType::I32, {c.top_k, c.columns}), Tensor(d_weights.p, DType::FP32, {c.top_k, c.columns}),
         Tensor(d_gate.p, DType::FP32, {c.columns}), {}};
@@ -283,7 +283,7 @@ void inactive_is_plain(Case c, const std::string& label) {
     }();
     const std::size_t H = static_cast<std::size_t>(c.hidden), T = static_cast<std::size_t>(c.columns);
     infernix::DeviceBuffer d_inject = t::to_device(c.inject), residual = t::to_device(c.residual);
-    Tensor out(residual.p, DType::BF16, {static_cast<std::int64_t>(c.streams) * c.hidden, c.columns});
+    Tensor out(residual.p, DType::BF16, {c.streams * c.hidden, c.columns});
     const Tensor inject(d_inject.p, DType::FP32, {c.streams, c.columns});
     if (c.combine) {
         infernix::DeviceBuffer d_outputs = t::to_device(c.outputs), d_weights = t::to_device(c.weights),

@@ -128,12 +128,13 @@ acceptance rate.
 
 Measured on Qwen3.5 (2026-11-23, RTX 5090, `infernix_bench` on the default route, INT8 KV, one lane, plain decode
 without a drafter; four fresh processes an arm in A B C C B A blocks, each the mean of three repetitions), with a cut
-of both lanes of every layer at alpha 1e-30: the most a sidecar can cut, with the plain run's output. No Qwen3.5
-sidecar has been fitted, so a real one's cost (fewer lanes, and a changed text) is not measured.
+of both lanes of every layer at alpha 1e-30: the most a sidecar can cut, at a strength too small to move the output
+(on the reproducible route it keeps the plain run's bits). No Qwen3.5 sidecar has been fitted, so a real one's cost
+(fewer lanes, and a changed text) is not measured.
 
 | | pp1280 prefill | pp4096 prefill | tg256 decode |
 |---|---|---|---|
-| Qwen3.8-27B NVIDIA NVFP4, without `--ablate` | 14,139.9 tok/s | 13,466.6 tok/s | 82.74 tok/s |
+| Qwen3.8-27B NVFP4 (NInfer's official artifact), without `--ablate` | 14,139.9 tok/s | 13,466.6 tok/s | 82.74 tok/s |
 | the same, every lane cut (128 cuts a token) | 13,755.1 (-2.7 %) | 13,066.2 (-3.0 %) | 79.95 (-3.4 %) |
 | Qwen3.6-35B-A3B, without `--ablate` | 23,159.5 tok/s | 24,891.3 tok/s | 414.01 tok/s |
 | the same, every lane cut (80 cuts a token) | 22,797.5 (-1.6 %) | 24,571.2 (-1.3 %) | 381.51 (-7.9 %) |

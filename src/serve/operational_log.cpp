@@ -680,7 +680,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     }
 
     if (memory.draft_screen_bytes != 0 || memory.adapter_bytes != 0) {
-        logger_->debug("memory ledger | beside the weights: draft screen {} | LoRA adapter {}",
+        logger_->debug("memory ledger | beside the weights: draft screen {} | adapters {}",
                        product::format_pretty_bytes(memory.draft_screen_bytes),
                        product::format_pretty_bytes(memory.adapter_bytes));
     }
