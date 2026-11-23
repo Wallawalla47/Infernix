@@ -2070,6 +2070,10 @@ struct ScoreOptions {
     // distribution is scored position 0): ScoreResult::hidden_states (tools/ablate's capture). Not on the lossless
     // route.
     bool prompt_hidden_states = false;
+    // Only the most probable token of every scored position (equal logits: the lowest id), found on the device, in
+    // ScoreResult::top_ids (one a position, logprobs and top_logprobs empty): a token-frequency measurement over
+    // millions of positions (tools/freq_corpus). Excludes top_k, candidates and logits_positions.
+    bool argmax_only = false;
 };
 
 inline constexpr std::uint32_t kMaximumScoreLogitPositions = 256;

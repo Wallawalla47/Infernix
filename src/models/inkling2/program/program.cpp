@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "infernix/ops/argmax.h"
 #include "infernix/ops/inkling2_attention.h"
 #include "infernix/ops/sampling.h"
 #include "models/inkling2/execution/dspark.h"
@@ -928,6 +929,7 @@ public:
         if (lossless_) {
             // The lossless route: the window's positions 0 .. n - 2 in one pass, the head a slice of rows at a time.
             if (images) { throw std::invalid_argument("Inkling 2: the lossless route scores text windows"); }
+            if (options.argmax_only) { throw std::invalid_argument("Inkling 2: argmax_only is not on the lossless route"); }
             lossless_->run(std::span<const std::int32_t>(tokens.data(), n - 1), device_.stream);
             for (std::uint32_t c = first_target - 1; c < n - 1; c += LosslessForward::kHeadRows) {
                 const auto count = static_cast<std::int32_t>(std::min<std::uint32_t>(LosslessForward::kHeadRows, n - 1 - c));
@@ -960,6 +962,23 @@ public:
                                           : static_cast<std::int32_t>(std::max<std::int64_t>(0, std::int64_t{first_target} - 1 - at));
             // The final mix; the head runs below a slice of logits rows at a time.
             run_forward(from, 0, [&] { overlay_images(images, at, chunk); });
+            if (options.argmax_only) {
+                // Each slice's argmax on the device; the host reads only the ids (out.top_ids never reallocates).
+                if (score_ids_.bytes == 0) { score_ids_ = DeviceBuffer(static_cast<std::size_t>(kMaxForwardColumns) * 4); }
+                out.top_ids.resize(n - first_target);
+                for (std::int32_t c = from; c < static_cast<std::int32_t>(chunk); c += kMaxForwardColumns) {
+                    const std::int32_t count = std::min<std::int32_t>(kMaxForwardColumns, static_cast<std::int32_t>(chunk) - c);
+                    forward_.head(c, count, device_.stream);
+                    Tensor logits(forward_.buffers().logits, DType::FP32, {static_cast<std::int32_t>(vocab_), count});
+                    Tensor ids(score_ids_.p, DType::I32, {count});
+                    ops::argmax(logits, ids, static_cast<std::int32_t>(vocab_), device_.stream);
+                    CUDA_CHECK(cudaMemcpyAsync(out.top_ids.data() + (at + static_cast<std::uint32_t>(c) + 1 - first_target),
+                                               score_ids_.p, static_cast<std::size_t>(count) * 4, cudaMemcpyDeviceToHost,
+                                               device_.stream));
+                }
+                at += chunk;
+                continue;
+            }
             for (std::int32_t c = from; c < static_cast<std::int32_t>(chunk); ++c) {
                 const std::int32_t slice = (c - from) % kMaxForwardColumns;
                 if (slice == 0) {
@@ -2036,6 +2055,7 @@ private:
     // reading.
     static constexpr std::uint32_t kNoPosition = 0xFFFFFFFFU;
     DeviceBuffer unpackable_;
+    DeviceBuffer score_ids_; // ScoreOptions::argmax_only: a head slice's top token ids
     std::array<std::uint32_t, kMaximumConcurrency> unpackable_seen_ = [] {
         std::array<std::uint32_t, kMaximumConcurrency> a{};
         a.fill(kNoPosition);

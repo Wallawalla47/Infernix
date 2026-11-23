@@ -736,7 +736,25 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (options.prompt_hidden_states && impl_->options.lossless) {
         throw std::invalid_argument("score_tokens prompt_hidden_states is not offered on the lossless route");
     }
+    if (options.prompt_hidden_states && std::holds_alternative<std::unique_ptr<Impl::Inkling2ScoringCore>>(impl_->core)) {
+        throw std::invalid_argument("score_tokens prompt_hidden_states is not available on Inkling 2 yet");
+    }
     const bool hidden_states           = options.prompt_hidden_states;
+    const bool argmax_only = options.argmax_only;
+    bool argmax_by_top_k   = false;
+    if (argmax_only) {
+        if (options.top_k != 0 || options.candidates_per_position != 0 || !options.logits_positions.empty() ||
+            hidden_states) {
+            throw std::invalid_argument("score_tokens argmax_only excludes top_k, candidates, logits_positions and "
+                                        "prompt_hidden_states");
+        }
+        // Inkling 2's Program finds it in its own kernel; the other families' scoring ranks on the device: top_k = 1.
+        if (!std::holds_alternative<std::unique_ptr<Impl::Inkling2ScoringCore>>(impl_->core)) {
+            options.argmax_only = false;
+            options.top_k       = 1;
+            argmax_by_top_k     = true;
+        }
+    }
     const std::size_t logit_rows       = options.logits_positions.size();
     const std::size_t top_values       = positions * options.top_k;
     const std::size_t candidate_values = options.candidates.size();
@@ -752,13 +770,17 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
             }
         },
         impl_->core);
-    if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
-        result.top_logprobs.size() != top_values ||
+    if (result.logprobs.size() != (argmax_only && !argmax_by_top_k ? 0 : positions) ||
+        result.top_ids.size() != (argmax_only ? positions : top_values) || result.top_logprobs.size() != top_values ||
         result.candidate_logprobs.size() != candidate_values ||
         (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0) ||
         result.hidden_states.empty() == hidden_states ||
         (hidden_states && (result.hidden_state_layers == 0 || result.hidden_states.size() % result.hidden_state_layers != 0))) {
         throw std::logic_error("target Program returned an invalid causal score count");
+    }
+    if (argmax_by_top_k) {
+        result.logprobs.clear();
+        result.top_logprobs.clear();
     }
     return result;
 }
