@@ -538,38 +538,83 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const 
     const float* base = a.base + static_cast<std::size_t>(step - 1) * a.vocab;
     float best = -INFINITY, run_max = -INFINITY, run_sum = 0.0F;
     int best_index = 0x7FFFFFFF;
-    for (int v = v0 + warp; v < v1; v += kMarkovWarps) {
-        float fv[8];
-        if constexpr (Q8) {
-            // code * scale, exact in FP32 (8 by 11 significant bits): each byte c as 2^23 + (c + 128) by a byte
-            // permute into 0x4B000000, less 2^23 + 128.
-            const uint2 code = __ldg(reinterpret_cast<const uint2*>(a.fold_codes + static_cast<std::size_t>(v) * kMarkovRank) + lane);
-            const float s    = __half2float(__ushort_as_half(__ldg(a.fold_scales + static_cast<std::size_t>(v) * (kMarkovRank / 32) + lane / 4)));
-            const unsigned lo = code.x ^ 0x80808080U, hi = code.y ^ 0x80808080U;
+    // A warp takes 32 rows at a time: each lane its 8 of every row's 256 products, then a transposing butterfly (31
+    // shuffles) leaves row v + lane's dot on lane `lane`, which alone forms its logit (one lane a row instead of 32).
+    for (int v = v0 + 32 * warp; v < v1; v += 32 * kMarkovWarps) {
+        float p[32];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                fv[j]     = (__uint_as_float(__byte_perm(lo, 0x4B000000U, 0x7650U + j)) - 8388736.0F) * s;
-                fv[4 + j] = (__uint_as_float(__byte_perm(hi, 0x4B000000U, 0x7650U + j)) - 8388736.0F) * s;
+        for (int r = 0; r < 32; ++r) {
+            p[r] = 0.0F;
+            if (v + r >= v1) { continue; }
+            const std::size_t row = static_cast<std::size_t>(v + r);
+            float fv[8];
+            if constexpr (Q8) {
+                // code * scale, exact in FP32 (8 by 11 significant bits): each byte c as 2^23 + (c + 128) by a byte
+                // permute into 0x4B000000, less 2^23 + 128.
+                const uint2 code = __ldg(reinterpret_cast<const uint2*>(a.fold_codes + row * kMarkovRank) + lane);
+                const float s    = __half2float(__ushort_as_half(__ldg(a.fold_scales + row * (kMarkovRank / 32) + lane / 4)));
+                const unsigned lo = code.x ^ 0x80808080U, hi = code.y ^ 0x80808080U;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    fv[j]     = (__uint_as_float(__byte_perm(lo, 0x4B000000U, 0x7650U + j)) - 8388736.0F) * s;
+                    fv[4 + j] = (__uint_as_float(__byte_perm(hi, 0x4B000000U, 0x7650U + j)) - 8388736.0F) * s;
+                }
+            } else {
+                load8(a.fold + row * kMarkovRank + 8 * lane, fv);
             }
-        } else {
-            load8(a.fold + static_cast<std::size_t>(v) * kMarkovRank + 8 * lane, fv);
-        }
-        float acc = 0.0F;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) { acc = __fmaf_rn(fv[j], l8[j], acc); }
-        acc = warp_sum(acc);
-        const float corr = bf(rb(canon::add_rn(acc, bf(a.fold_bias[v]))));
-        const float z    = bf(rb(canon::add_rn(bf(rb(base[v])), corr)));
-        const float L    = bf(rb(canon::softcap_c(z, a.softcap)));
-        if (L > best) { // rows ascend within a warp: the first maximum is the lowest id
-            best       = L;
-            best_index = v;
+            for (int j = 0; j < 8; ++j) { p[r] = __fmaf_rn(fv[j], l8[j], p[r]); }
         }
-        if (L > run_max) {
-            run_sum = run_max == -INFINITY ? 1.0F : __fmaf_rn(run_sum, canon::exp_c(__fsub_rn(run_max, L)), 1.0F);
-            run_max = L;
-        } else {
-            run_sum = canon::add_rn(run_sum, canon::exp_c(__fsub_rn(L, run_max)));
+        // Level k: rows r and r + k pair up; lanes without bit k keep row r, lanes with it keep r + k, each adding its
+        // partner's partial of the row it keeps. After the five levels p[0] holds row v + lane's sum.
+#pragma unroll
+        for (int k = 16; k >= 1; k >>= 1) {
+            const bool upper = (lane & k) != 0;
+#pragma unroll
+            for (int r = 0; r < k; ++r) {
+                const float send = upper ? p[r] : p[r + k];
+                const float keep = upper ? p[r + k] : p[r];
+                p[r]             = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFU, send, k));
+            }
+        }
+        const int mine = v + lane;
+        if (mine < v1) {
+            const float corr = bf(rb(canon::add_rn(p[0], bf(a.fold_bias[mine]))));
+            const float z    = bf(rb(canon::add_rn(bf(rb(base[mine])), corr)));
+            const float L    = bf(rb(canon::softcap_c(z, a.softcap)));
+            if (L > best) { // a lane's rows ascend: the first maximum is its lowest id
+                best       = L;
+                best_index = mine;
+            }
+            if (L > run_max) {
+                run_sum = run_max == -INFINITY ? 1.0F : __fmaf_rn(run_sum, canon::exp_c(__fsub_rn(run_max, L)), 1.0F);
+                run_max = L;
+            } else {
+                run_sum = canon::add_rn(run_sum, canon::exp_c(__fsub_rn(L, run_max)));
+            }
+        }
+    }
+    // The warp's lanes in lane order (the lowest id on ties), lane 0 the result.
+    for (int src = 1; src < 32; ++src) {
+        const float cb = __shfl_sync(0xFFFFFFFFU, best, src), cm = __shfl_sync(0xFFFFFFFFU, run_max, src);
+        const float cs = __shfl_sync(0xFFFFFFFFU, run_sum, src);
+        const int ci   = __shfl_sync(0xFFFFFFFFU, best_index, src);
+        if (lane == 0) {
+            if (cb > best || (cb == best && ci < best_index)) {
+                best       = cb;
+                best_index = ci;
+            }
+            if (cm != -INFINITY) {
+                if (run_max == -INFINITY) {
+                    run_max = cm;
+                    run_sum = cs;
+                } else if (cm > run_max) {
+                    run_sum = __fmaf_rn(run_sum, canon::exp_c(__fsub_rn(run_max, cm)), cs);
+                    run_max = cm;
+                } else {
+                    run_sum = __fmaf_rn(cs, canon::exp_c(__fsub_rn(cm, run_max)), run_sum);
+                }
+            }
         }
     }
     if (lane == 0) {
@@ -604,25 +649,53 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const 
         last = acq_rel_add(&sc.logits_done) == gridDim.x - 1U ? 1 : 0;
     }
     __syncthreads();
-    if (last == 0 || threadIdx.x != 0) { return; }
+    if (last == 0) { return; }
     __threadfence();
-    float b = -INFINITY, m = -INFINITY, s = 0.0F;
-    int bi  = 0x7FFFFFFF;
-    for (int c = 0; c < static_cast<int>(gridDim.x); ++c) {
-        const float cb = __ldcg(sc.best + c), cm = __ldcg(sc.run_max + c), cs = __ldcg(sc.run_sum + c);
-        const int ci   = __ldcg(sc.best_index + c);
+    // The CTAs' partials merged by a fixed binary tree in CTA order (each thread two CTAs, then halving): the argmax
+    // (the lowest id on ties) is the one-thread merge's; the softmax sum is associated by the tree, deterministically.
+    // (A one-thread pass over 512 CTAs' partials held each step for most of its time: ncu 2026-11-23, issue slots 12 %
+    // busy.)
+    static_assert(kLogitCtas == 2 * 32 * kMarkovWarps, "a thread for each two CTAs' partials");
+    const auto merge = [](float& b, int& bi, float& m, float& s, float cb, int ci, float cm, float cs) {
         if (cb > b || (cb == b && ci < bi)) {
             b  = cb;
             bi = ci;
         }
-        if (cm == -INFINITY) { continue; }
-        if (cm > m) {
+        if (cm == -INFINITY) { return; }
+        if (m == -INFINITY) {
+            m = cm;
+            s = cs;
+        } else if (cm > m) {
             s = __fmaf_rn(s, canon::exp_c(__fsub_rn(m, cm)), cs);
             m = cm;
         } else {
             s = __fmaf_rn(cs, canon::exp_c(__fsub_rn(cm, m)), s);
         }
+    };
+    __shared__ float tb[kLogitCtas / 2], tm[kLogitCtas / 2], ts[kLogitCtas / 2];
+    __shared__ int ti[kLogitCtas / 2];
+    const int t = static_cast<int>(threadIdx.x);
+    {
+        float b = -INFINITY, m = -INFINITY, s = 0.0F;
+        int bi  = 0x7FFFFFFF;
+        for (int c = 2 * t; c < 2 * t + 2; ++c) {
+            merge(b, bi, m, s, __ldcg(sc.best + c), __ldcg(sc.best_index + c), __ldcg(sc.run_max + c), __ldcg(sc.run_sum + c));
+        }
+        tb[t] = b, ti[t] = bi, tm[t] = m, ts[t] = s;
     }
+    for (int stride = 1; stride < kLogitCtas / 2; stride *= 2) {
+        __syncthreads();
+        if (t % (2 * stride) == 0) {
+            float b = tb[t], m = tm[t], s = ts[t];
+            int bi  = ti[t];
+            merge(b, bi, m, s, tb[t + stride], ti[t + stride], tm[t + stride], ts[t + stride]);
+            tb[t] = b, ti[t] = bi, tm[t] = m, ts[t] = s;
+        }
+    }
+    __syncthreads();
+    if (t != 0) { return; }
+    const float b = tb[0], m = tm[0], s = ts[0];
+    const int bi  = ti[0];
     a.tokens[step - 1]        = bi;
     a.probabilities[step - 1] = canon::div_rn(canon::exp_c(__fsub_rn(b, m)), s);
     sc.logits_done            = 0U;

@@ -1155,6 +1155,17 @@ The proposal head (the larger lever) is not built. A plain-round policy that dra
 tokens-per-ms gain exceeded plain decoding's was tried and rejected: it chose plain rounds on 339 and 598 of the prose
 repetitions' rounds and lost on conv (265.8 → 260.9 tok/s).
 
+Where the draft went (2026-11-23, prose, 7 drafts a round, the round's draft time with one part left out): 2.16 ms in
+all; the Markov steps 1.27, the three layers 0.46 (attention 0.13, MLP 0.25), the head 0.36. Not the head, as read
+above: each step's logits kernel ended in its last CTA merging the 512 CTAs' argmax and softmax partials on one thread
+(ncu: 210 us a step at base clocks with the SMs' issue slots 12 % busy). That merge is now a fixed binary tree over the
+CTAs in order (the argmax, lowest id on ties, unchanged; the softmax sum associated by the tree), and each warp takes
+32 rows at a time, a transposing butterfly leaving one row's dot on each lane, which alone forms its logit (55 us a step
+at base clocks before the second change). Drafts only: the drafted tokens and the accept counts matched on the same
+text. Measured: a round's draft 2.16 → 1.24 ms (7 drafts, `--q8-weights` and `--a8-activations`); DSpark on Basalt's
+fixtures (conv / struct / prose, auto, -r 2) `--q8-weights` 272.9 / 557.1 / 218.9 → 294.5 / 608.2 / 234.2 tok/s,
+`--a8-activations` 276.1 / 610.3 / 212.7 → 296.5 / 665.1 / 227.6.
+
 ---
 
 ## 14. Prefill
