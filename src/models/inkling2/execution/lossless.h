@@ -106,6 +106,7 @@ private:
     // The window's tensors.
     std::int32_t* tokens_    = nullptr;
     std::int32_t* positions_ = nullptr;
+    std::int32_t* kv_planes_ = nullptr; // {0, .., kv_heads - 1}: the KV heads as tiles of one product
     std::uint16_t* blocks_   = nullptr; // e, h6, h12[3], h18[3] (BF16 [H, capacity] each)
     std::uint16_t* hidden_[2] = {};     // the visits' ping-pong rows
     std::uint16_t* final_    = nullptr; // the final norm's rows

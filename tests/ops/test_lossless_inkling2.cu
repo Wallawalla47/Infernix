@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "infernix/ops/lossless_inkling2.h"
+#include "infernix/ops/lossless_linear.h"
 #include "ops/lossless/wide.cuh"
 
 #include <cstdint>
@@ -72,7 +73,7 @@ float bits_float(std::uint32_t b) {
 const char* kNames[] = {"rmsnorm", "mix",   "message_gate", "clip",         "conv",   "dynamic_conv",
                         "sigmoid_gate", "add", "probs",     "router",       "four_over_six", "mxfp8",
                         "swiglu",  "combine", "softcap", "sqrt_magnitude", "ring_load", "ring_store", "keys_load",
-                        "keys_store"};
+                        "keys_store", "linear_planes"};
 
 // wide.cuh's sqrt_magnitude over ProductSum-sized magnitudes (the clips' norms): case i's 20 words, then its unit.
 __global__ void sqrt_cases(const std::uint32_t* words, int n, std::uint32_t* out) {
@@ -379,6 +380,31 @@ INFERNIX_OP_TEST(lossless_inkling2) {
             got = download16(k, n);
             const auto values = download16(v, n);
             got.insert(got.end(), values.begin(), values.end());
+            break;
+        }
+        case 20: { // lossless_linear_planes: K, rows, stride, planes, plane columns, FP32 out, out rows (the whole out compared)
+            const int K = I(0), rows = I(1), stride = I(2), planes = I(3), plane_columns = I(4), out_rows = I(6);
+            const bool fp32 = d[5] != 0;
+            DeviceBuffer x = upload16(inputs[0]), w = upload16(inputs[1]), tile_planes = upload32(inputs[2]);
+            DeviceBuffer out = fp32 ? upload32(inputs[3]) : upload16(inputs[3]);
+            const int columns = planes * plane_columns;
+            Tensor tx(x.p, DType::BF16, {K, columns}), tp(tile_planes.p, DType::I32, {planes});
+            Tensor to(out.p, fp32 ? DType::FP32 : DType::BF16, {out_rows, columns});
+            Weight weight{};
+            weight.qtype    = QType::BF16;
+            weight.layout   = QuantLayout::Contiguous;
+            weight.ndim     = 2;
+            weight.n        = planes * stride;
+            weight.k        = K;
+            weight.shape[0] = weight.padded_shape[0] = weight.n;
+            weight.shape[1] = weight.padded_shape[1] = K;
+            weight.qdata    = w.p;
+            weight.payload  = w.p;
+            WorkspaceArena arena(ops::lossless_linear_planes_workspace_bytes(weight, planes, stride, plane_columns, rows) + 4096);
+            ops::lossless_linear_planes(tx, weight, tp, stride, plane_columns, rows, to, arena, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const std::size_t n = static_cast<std::size_t>(out_rows) * columns;
+            got = fp32 ? download32(out, n) : download16(out, n);
             break;
         }
         default: std::cerr << "FAIL unknown op " << op << "\n"; return 1;

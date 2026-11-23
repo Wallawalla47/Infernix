@@ -93,6 +93,20 @@ void lossless_linear_grouped(const Tensor& x, const Weight& weight, const Tensor
                              std::int32_t expert_stride, std::int32_t row_offset, std::int32_t rows, Tensor& out,
                              WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * The planes form (one call over several key or value planes of a BF16 weight): plane p is the weight's rows
+ * [p plane_stride, p plane_stride + rows) and x holds plane_columns (1 to 64) columns a plane, plane-major:
+ * out[r, p plane_columns + c] = plane p's row r times x[:, p plane_columns + c], every output as lossless_linear's.
+ * tile_planes is device I32 {0, 1, .., planes - 1}, at most 8 planes; plane_stride a multiple of 32. x and out are
+ * contiguous, out [>= rows, x's columns]. The workspace is lossless_linear_planes_workspace_bytes.
+ */
+[[nodiscard]] std::size_t lossless_linear_planes_workspace_bytes(const Weight& weight, std::int32_t planes,
+                                                                 std::int32_t plane_stride, std::int32_t plane_columns,
+                                                                 std::int32_t rows);
+void lossless_linear_planes(const Tensor& x, const Weight& weight, const Tensor& tile_planes, std::int32_t plane_stride,
+                            std::int32_t plane_columns, std::int32_t rows, Tensor& out, WorkspaceArena& workspace,
+                            cudaStream_t stream);
+
 /** One 64-column tile of lossless_linear_tiles: its expert's record (null: the tile is skipped), the
  * matrix's FP32 multipliers of even and odd rows (NVFP4 records; bits), and the design reference's
  * activation scales of even and odd rows (the expert's FP32 input scales g, applied to the exact sum
@@ -124,7 +138,8 @@ struct LosslessBankMatrix {
  * parity's multiplier, exactly; a tile's act scales multiply it too, and `scale`'s divisor and column scales
  * (FP32 [columns], the product's columns: Inkling 2's per-row four-over-six factors) apply as
  * LosslessActivationScale's, exactly; its multiplier must be 0). x is contiguous BF16 [K, *]; out
- * contiguous BF16 or FP32 [rows, *].
+ * contiguous BF16 or FP32 [rows, *]. `sparse`: most columns are padding (negative out_columns), as when a few columns
+ * each take their own expert's tile: their warps skip the products.
  * The workspace is lossless_linear_tiles_workspace_bytes(matrix, columns).
  */
 [[nodiscard]] std::size_t lossless_linear_tiles_workspace_bytes(const LosslessBankMatrix& matrix, std::int32_t columns);
@@ -132,7 +147,7 @@ struct LosslessBankMatrix {
 void lossless_linear_tiles(const Tensor& x, const std::int32_t* in_columns, std::int32_t columns,
                            const LosslessBankMatrix& matrix, const LosslessTile* tiles, Tensor& out,
                            const std::int32_t* out_columns, WorkspaceArena& workspace, cudaStream_t stream,
-                           const LosslessActivationScale& scale = {});
+                           const LosslessActivationScale& scale = {}, bool sparse = false);
 
 /** Whether lossless_linear takes this weight's format. */
 [[nodiscard]] bool lossless_linear_supports(const Weight& weight) noexcept;

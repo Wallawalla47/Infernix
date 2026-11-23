@@ -74,6 +74,8 @@
 // exponent (and a lo grid 22 binades lower) as five balanced 7-bit digit planes, groups of 32 (their
 // sums below 2^63); the exact fallback's accumulator is 576 bits wide for them.
 
+#include <type_traits>
+
 namespace infernix::ops::lossless_linear_impl {
 
 using lossless::add_shifted;
@@ -92,6 +94,7 @@ constexpr int kThreads       = 256; // 8 warps: 4 along tokens (16 each) x 2 alo
 constexpr int kWarpRows      = kTileRows / 2;        // rows per warp
 constexpr int kRowTiles      = kWarpRows / 8;        // a warp's 8-row mma tiles
 constexpr int kRowParts      = kThreads / kTileRows; // threads per row in the prologue
+constexpr int kBitmapSelfClearCtas = 256; // a call of at most this many GEMM CTAs (one wave) clears its own bitmap words
 static_assert(kRowTiles % 2 == 0 && kRowParts <= 32, "B fragments load two 8-row tiles per ldmatrix_x4");
 constexpr int kBlockBytes    = kLimbs * kBlockK;     // 256 bytes of limbs per column and block
 constexpr int kAStride       = kBlockBytes + 16;     // padded shared row (ldmatrix without conflicts)
@@ -122,19 +125,21 @@ struct Layout {
         total;
 };
 
-inline Layout layout_of(std::int32_t k, std::int32_t rows, std::int32_t columns, bool bf16_weight) {
+// `encoded`: the columns the encode holds when they are fewer than the product's (the planes form); 0: the product's.
+inline Layout layout_of(std::int32_t k, std::int32_t rows, std::int32_t columns, bool bf16_weight, std::int32_t encoded = 0) {
     const std::size_t blocks = static_cast<std::size_t>(k) / kBlockK;
-    const std::size_t c      = static_cast<std::size_t>(std::min(columns, kChunkColumns));
+    const std::size_t p      = static_cast<std::size_t>(std::min(columns, kChunkColumns));
+    const std::size_t c      = encoded > 0 ? std::min(p, static_cast<std::size_t>(encoded)) : p;
     const std::size_t r      = bf16_weight ? static_cast<std::size_t>(rows) : 0;
     Layout l{};
     l.limbs     = 0;
     l.lo_limbs  = l.limbs + align256(c * blocks * kBlockBytes);
     l.tile_lo   = l.lo_limbs + align256(c * blocks * kBlockBytes);
-    l.exps      = l.tile_lo + align256((c + kTileTokens - 1) / kTileTokens * blocks);
+    l.exps      = l.tile_lo + align256((p + kTileTokens - 1) / kTileTokens * blocks);
     l.col_emax  = l.exps + align256(c * blocks * sizeof(std::int16_t));
     l.col_flags = l.col_emax + align256(c * sizeof(std::int32_t));
     l.bitmap    = l.col_flags + align256(c * sizeof(std::int32_t));
-    l.xsum        = l.bitmap + align256((static_cast<std::size_t>(rows) * c + 31) / 32 * sizeof(std::uint32_t));
+    l.xsum        = l.bitmap + align256(static_cast<std::size_t>(rows) * ((p + 31) / 32) * sizeof(std::uint32_t));
     l.block_exp   = l.xsum + align256(c * blocks * 4 * sizeof(long long));
     l.tile_lo_w   = l.block_exp + align256(r * blocks * sizeof(std::int16_t));
     l.row_inexact = l.tile_lo_w + align256((r + kTileRows - 1) / kTileRows * blocks);
@@ -146,9 +151,11 @@ inline Layout layout_of(std::int32_t k, std::int32_t rows, std::int32_t columns,
 
 // One warp per (column, block): lane i holds elements 2i and 2i + 1.
 // Column c reads x's column in_columns[c] (identity when null; a negative entry reads zeros). With xsum,
-// each half block's sums of X and X' (int64 [column][block][half][grid]).
+// each half block's sums of X and X' (int64 [column][block][half][grid]). `tile_columns`: the encoded columns of one
+// product tile, whose (tile, block) flags the lo grid.
+template <bool Planes>
 static __global__ void lossless_encode_kernel(const std::uint16_t* __restrict__ x, const std::int32_t* __restrict__ in_columns,
-                                       int k, int columns, std::uint8_t* __restrict__ limbs,
+                                       int k, int columns, int tile_columns, std::uint8_t* __restrict__ limbs,
                                        std::uint8_t* __restrict__ lo_limbs, std::uint8_t* __restrict__ tile_lo,
                                        std::int16_t* __restrict__ exps, std::int32_t* __restrict__ col_emax,
                                        std::int32_t* __restrict__ col_flags, long long* __restrict__ xsum) {
@@ -217,7 +224,13 @@ static __global__ void lossless_encode_kernel(const std::uint16_t* __restrict__ 
         const std::uint32_t c0 = (lo[0] >> (8 * l)) & 0xFFU, c1 = (lo[1] >> (8 * l)) & 0xFFU;
         *reinterpret_cast<std::uint16_t*>(lo_limbs + at + l * kBlockK + 2 * lane) = static_cast<std::uint16_t>(c0 | (c1 << 8));
     }
-    if (__any_sync(0xFFFFFFFFU, has_lo) && lane == 0) { tile_lo[(column / kTileTokens) * blocks + block] = 1; }
+    if (__any_sync(0xFFFFFFFFU, has_lo) && lane == 0) {
+        if constexpr (Planes) {
+            tile_lo[(column / tile_columns) * blocks + block] = 1;
+        } else {
+            tile_lo[(column / kTileTokens) * blocks + block] = 1;
+        }
+    }
     if (xsum != nullptr) {
         // Lanes 0-15 hold the block's first 32 elements, lanes 16-31 the rest.
         long long hs = static_cast<long long>(static_cast<int>(out[0])) + static_cast<int>(out[1]);
@@ -1036,6 +1049,9 @@ struct GemmArgs {
     int expert_stride;                // at expert * expert_stride + row_begin
     int max_expert;                   // grouped: the last expert whose rows lie in the weight (a larger id: no columns)
     int tile_base;                    // the chunk's first tile
+    int plane_columns;                // the planes form: the encoded columns of each tile (0: tile columns are encoded ones)
+    int bitmap_stride;                // the fallback bitmap's bits a row: the product's columns on a 32-column grid
+    bool clear_bitmap;                // each CTA clears its own words (a narrow call); else the launch's memset did
     int rows;
     int k;
     int columns;
@@ -1045,7 +1061,7 @@ struct GemmArgs {
     const std::int16_t* exps;
     const std::int32_t* col_emax;
     const std::int32_t* col_flags;
-    std::uint32_t* bitmap; // rows x columns, row-major bits (row * columns + column)
+    std::uint32_t* bitmap; // row-major bits (row * bitmap_stride + column)
     void* out;
     int ld;
     int out_row;
@@ -1079,7 +1095,10 @@ struct GemmShared {
     OffsetShared<Offset> off;
 };
 
-template <class F>
+// `Narrow`: a call whose tiles hold few live columns (one column of a decode, a KV head's three, an expert tile's
+// padding): a warp with none skips its products, the planes form maps a tile to its own encoded columns, and a call of
+// one wave clears its own bitmap words. The wide instantiation carries none of this: its loads are the hot path.
+template <class F, bool Narrow>
 __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmArgs args) {
     constexpr int kPlanes      = F::kPlanes;
     constexpr int kGroup       = F::kGroup;
@@ -1089,6 +1108,31 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
     const int warp_m = warp & 3, warp_n = warp >> 2;
     const int group = lane >> 2, tig = lane & 3;
     const int row0 = static_cast<int>(blockIdx.x) * kTileRows, tok0 = static_cast<int>(blockIdx.y) * kTileTokens;
+    // A narrow call: this tile's words of the fallback bitmap (a row's columns of the tile are whole words on the 32-column
+    // stride), the CTA's alone, cleared before any return below, as the fallback reads every word.
+    if constexpr (Narrow) {
+        if (args.clear_bitmap && tid < 2 * kTileRows) {
+            const int r = tid / 2, word = tid % 2;
+            if (row0 + r < args.rows && word < (min(args.bitmap_stride, tok0 + kTileTokens) - tok0) / 32) {
+                args.bitmap[(static_cast<std::size_t>(row0 + r) * args.bitmap_stride + tok0) / 32 + word] = 0U;
+            }
+        }
+    }
+    // Whether the tile's column t is encoded, and which encoded column it is.
+    const auto encoded = [&](int t) -> bool {
+        if constexpr (Narrow) {
+            return args.plane_columns > 0 ? t < args.plane_columns : tok0 + t < args.columns;
+        } else {
+            return tok0 + t < args.columns;
+        }
+    };
+    const auto source = [&](int t) -> int {
+        if constexpr (Narrow) {
+            return (args.plane_columns > 0 ? static_cast<int>(blockIdx.y) * args.plane_columns : tok0) + t;
+        } else {
+            return tok0 + t;
+        }
+    };
     int row_begin = args.row_begin;
     if (args.tile_experts != nullptr) {
         const int expert = args.tile_experts[args.tile_base + static_cast<int>(blockIdx.y)];
@@ -1105,9 +1149,8 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
 
     // Prologue: each row's largest scale exponent, each column's largest block exponent and flags.
     if (tid < kTileTokens) {
-        const int c       = tok0 + tid;
-        sh.col_emax[tid]  = c < args.columns ? args.col_emax[c] : 1;
-        sh.col_flags[tid] = c < args.columns ? args.col_flags[c] : 0;
+        sh.col_emax[tid]  = encoded(tid) ? args.col_emax[source(tid)] : 1;
+        sh.col_flags[tid] = encoded(tid) ? args.col_flags[source(tid)] : 0;
     }
     {
         const int r = tid / kRowParts, part = tid % kRowParts;
@@ -1131,6 +1174,16 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
         if (part == 0) { sh.row_emax[r] = emax; }
     }
 
+    // A warp holds 16 of the tile's columns and 16 of its rows: with no live column or no row (the columns past a narrow
+    // call's, an expert tile's padding) it stores nothing, so it helps load the tile and skips the products.
+    bool live = true;
+    if constexpr (Narrow) {
+        const int warp_column = warp_m * 16 + (lane & 15);
+        live = row0 + warp_n * kWarpRows < args.rows && encoded(warp_column) &&
+               (args.out_columns == nullptr || args.out_columns[tok0 + warp_column] >= 0);
+        live = __any_sync(0xFFFFFFFFU, live);
+    }
+
     // Accumulators: tile j (8 rows), value v (d0..d3: tokens group / group + 8, rows 2 tig / 2 tig + 1).
     I128 acc[kRowTiles][4];
     bool dropped[kRowTiles][4];
@@ -1149,15 +1202,15 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
         for (int i = tid; i < kTileTokens * (kBlockBytes / 16); i += kThreads) {
             const int t = i / (kBlockBytes / 16), part = i % (kBlockBytes / 16);
             std::uint8_t* dst = sh.a + t * kAStride + part * 16;
-            if (tok0 + t < args.columns) {
-                cp_async<16>(dst, args.limbs + (static_cast<std::size_t>(tok0 + t) * blocks + b) * kBlockBytes + part * 16);
+            if (encoded(t)) {
+                cp_async<16>(dst, args.limbs + (static_cast<std::size_t>(source(t)) * blocks + b) * kBlockBytes + part * 16);
             } else {
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
             }
         }
         cp_commit();
         if (tid < kTileTokens) {
-            sh.exps[tid] = tok0 + tid < args.columns ? args.exps[static_cast<std::size_t>(tok0 + tid) * blocks + b] : 1;
+            sh.exps[tid] = encoded(tid) ? args.exps[static_cast<std::size_t>(source(tid)) * blocks + b] : 1;
         }
         // B: 64 rows x 64 codes per plane (four 16-code parts per row), and each row's scales of this block.
         if (tid < kTileRows * 4) {
@@ -1337,8 +1390,8 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
             for (int i = tid; i < kTileTokens * (kBlockBytes / 16); i += kThreads) {
                 const int t = i / (kBlockBytes / 16), part = i % (kBlockBytes / 16);
                 std::uint8_t* dst = sh.a + t * kAStride + part * 16;
-                if (tok0 + t < args.columns) {
-                    cp_async<16>(dst, limbs + (static_cast<std::size_t>(tok0 + t) * blocks + b) * kBlockBytes + part * 16);
+                if (encoded(t)) {
+                    cp_async<16>(dst, limbs + (static_cast<std::size_t>(source(t)) * blocks + b) * kBlockBytes + part * 16);
                 } else {
                     *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
                 }
@@ -1351,7 +1404,7 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
         // activations sh.a holds x lo, then (with lo activations) hi x lo. One accumulate site.
         const bool a_lo = args.tile_lo[static_cast<std::size_t>(blockIdx.y) * blocks + b] != 0;
         bool w_lo       = false;
-        if constexpr (F::kWeightLo) { w_lo = w.tile_lo_w[static_cast<std::size_t>(row0 / kTileRows) * blocks + b] != 0; }
+        if constexpr (F::kWeightLo) { w_lo = w.tile_lo_w[static_cast<std::size_t>((row_begin - w.row_base + row0) / kTileRows) * blocks + b] != 0; }
         const int passes = 1 + (a_lo ? 1 : 0) + (w_lo ? (a_lo ? 2 : 1) : 0);
 #pragma unroll 1
         for (int pass = 0; pass < passes; ++pass) {
@@ -1374,8 +1427,15 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
                 load_a(args.limbs);
                 down = kLoShift;
             }
-            accumulate(down);
+            if constexpr (Narrow) {
+                if (live) { accumulate(down); }
+            } else {
+                accumulate(down);
+            }
         }
+    }
+    if constexpr (Narrow) {
+        if (!live) { return; }
     }
 
     // Round, or flag for the exact fallback.
@@ -1386,13 +1446,16 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
             const int t = warp_m * 16 + group + (v >> 1) * 8;
             const int r = warp_n * kWarpRows + j * 8 + 2 * tig + (v & 1);
             const int column = tok0 + t, row = row0 + r;
-            if (column >= args.columns || row >= args.rows) { continue; }
-            const int out_column = args.out_columns != nullptr ? args.out_columns[column] : column;
+            if (!encoded(t) || row >= args.rows) { continue; }
+            int out_column = args.out_columns != nullptr ? args.out_columns[column] : column;
+            if constexpr (Narrow) {
+                if (args.plane_columns > 0) { out_column = source(t); }
+            }
             if (out_column < 0) { continue; }
             bool inexact_row = false;
             if constexpr (F::kWeightLo) { inexact_row = w.row_inexact[row_begin - w.row_base + row] != 0; }
             if (dropped[j][v] || sh.col_flags[t] != 0 || inexact_row) {
-                const std::size_t bit = static_cast<std::size_t>(row) * args.columns + column;
+                const std::size_t bit = static_cast<std::size_t>(row) * args.bitmap_stride + column;
                 atomicOr(args.bitmap + bit / 32, 1U << (bit % 32));
                 continue;
             }
@@ -1417,6 +1480,8 @@ struct FallbackArgs {
     const std::int32_t* tile_experts;
     int expert_stride;
     int tile_base;
+    int plane_columns; // GemmArgs's
+    int bitmap_stride; // GemmArgs's
     int rows;
     int k;
     int columns;
@@ -1443,8 +1508,8 @@ template <class F>
 __global__ void lossless_fallback_kernel(const FallbackArgs args) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warps = static_cast<int>(gridDim.x * blockDim.x) >> 5;
-    const std::size_t total = static_cast<std::size_t>(args.rows) * args.columns;
-    const std::size_t words = (total + 31) / 32;
+    const std::size_t total = static_cast<std::size_t>(args.rows) * args.bitmap_stride;
+    const std::size_t words = total / 32;
     for (std::size_t wi = static_cast<std::size_t>((blockIdx.x * blockDim.x + threadIdx.x) >> 5); wi < words;
          wi += static_cast<std::size_t>(warps)) {
         std::uint32_t pending = args.bitmap[wi];
@@ -1453,7 +1518,7 @@ __global__ void lossless_fallback_kernel(const FallbackArgs args) {
             pending &= pending - 1;
             const std::size_t index = wi * 32 + bit;
             if (index >= total) { break; }
-            const int row = static_cast<int>(index / args.columns), column = static_cast<int>(index % args.columns);
+            const int row = static_cast<int>(index / args.bitmap_stride), column = static_cast<int>(index % args.bitmap_stride);
             const int row_begin =
                 args.row_begin + (args.tile_experts != nullptr
                                       ? args.tile_experts[args.tile_base + column / kTileTokens] * args.expert_stride
@@ -1461,8 +1526,9 @@ __global__ void lossless_fallback_kernel(const FallbackArgs args) {
             const int wrow = row_begin + row;
             WeightView w   = args.w;
             if (args.tiles != nullptr) { w = tile_view(args.w, args.tiles[args.tile_base + column / kTileTokens]); }
-            const int source        = args.in_columns != nullptr ? args.in_columns[column] : column;
-            const int out_column    = args.out_columns != nullptr ? args.out_columns[column] : column;
+            const int encoded       = args.plane_columns > 0 ? (column / kTileTokens) * args.plane_columns + column % kTileTokens : column;
+            const int source        = args.in_columns != nullptr ? args.in_columns[column] : encoded;
+            const int out_column    = args.out_columns != nullptr ? args.out_columns[column] : encoded;
             const std::uint16_t* xc = args.x + static_cast<std::size_t>(source < 0 ? 0 : source) * args.k;
             Wide<F::kWide> acc;
             acc.clear();
@@ -1553,6 +1619,9 @@ struct Call {
     const std::int32_t* out_columns = nullptr;
     const float* act_column         = nullptr; // the activation scales of x's columns (w.act_div: the divisor)
     int max_expert                  = 0;       // grouped (tile_experts): GemmArgs::max_expert
+    std::int32_t scan_rows          = 0;       // a BF16 weight's rows to scan (the planes form: all of them; 0: rows)
+    int plane_columns               = 0;       // the planes form: x's columns of each 64-column tile (GemmArgs)
+    bool sparse_columns             = false;   // the tile mode: most columns are padding (the narrow GEMM)
 };
 
 // The parts of a chunk a launch runs: `encode` encodes the chunk's activation columns (after zeroing the
@@ -1563,6 +1632,11 @@ struct ChunkStage {
     bool encode = true;
     bool xsum   = false;
 };
+
+// The formats with a narrow GEMM: BF16 weights (Inkling 2's dense projections, key and value planes) and the expert records.
+template <class F>
+inline constexpr bool kNarrowFormat =
+    std::is_same_v<F, Bf16GridFormat> || std::is_same_v<F, Rg16Format> || std::is_same_v<F, Mxfp8Rg16Format>;
 
 template <class F>
 void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::uint8_t* base, const Layout& l,
@@ -1584,16 +1658,31 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
     if (stage.encode) {
         // tile_lo, exps, col_emax and col_flags lie together: one memset zeroes them.
         CUDA_CHECK(cudaMemsetAsync(tile_lo, 0, l.bitmap - l.tile_lo, stream));
-        const int warps_total = blocks * columns;
+        const int encoded     = c.plane_columns > 0 ? c.x->ne[1] : columns;
+        const int warps_total = blocks * encoded;
         const int threads     = 256;
         const int grid        = (warps_total * 32 + threads - 1) / threads;
-        lossless_encode_kernel<<<grid, threads, 0, stream>>>(
-            xs, in_map, k, columns, limbs, lo_limbs, tile_lo, exps, col_emax, col_flags,
-            stage.xsum ? reinterpret_cast<long long*>(base + l.xsum) : nullptr);
+        long long* const encode_xsum = stage.xsum ? reinterpret_cast<long long*>(base + l.xsum) : nullptr;
+        if (c.plane_columns > 0) {
+            lossless_encode_kernel<true><<<grid, threads, 0, stream>>>(xs, in_map, k, encoded, c.plane_columns, limbs, lo_limbs,
+                                                                       tile_lo, exps, col_emax, col_flags, encode_xsum);
+        } else {
+            lossless_encode_kernel<false><<<grid, threads, 0, stream>>>(xs, in_map, k, encoded, kTileTokens, limbs, lo_limbs,
+                                                                        tile_lo, exps, col_emax, col_flags, encode_xsum);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaMemsetAsync(bitmap, 0, (static_cast<std::size_t>(c.rows) * columns + 31) / 32 * sizeof(std::uint32_t),
-                               stream));
+    // The fallback bitmap. A call of one wave of CTAs clears it in the GEMM, a launch fewer; in a wider one those stores
+    // would hold every CTA's first barrier (measured -0.6 % on a 27B's scoring), so it takes the memset.
+    const int bitmap_stride = (columns + 31) / 32 * 32;
+    // The narrow GEMM serves BF16 weights and the expert records' formats: a decode's narrow products, the planes form, an
+    // expert tile's padding. Every other call runs the wide kernel.
+    const bool narrow = kNarrowFormat<F> && (c.plane_columns > 0 || c.sparse_columns || columns <= kTileTokens);
+    const bool clear_in_gemm =
+        narrow && (c.rows + kTileRows - 1) / kTileRows * ((columns + kTileTokens - 1) / kTileTokens) <= kBitmapSelfClearCtas;
+    if (!clear_in_gemm) {
+        CUDA_CHECK(cudaMemsetAsync(bitmap, 0, static_cast<std::size_t>(c.rows) * (bitmap_stride / 32) * sizeof(std::uint32_t), stream));
+    }
     const bool bf16 = c.out->dtype == DType::BF16;
     void* out_data  = out_map != nullptr ? c.out->data
                                          : static_cast<std::uint8_t*>(c.out->data) +
@@ -1606,6 +1695,9 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         a.expert_stride = c.expert_stride;
         a.max_expert    = c.max_expert;
         a.tile_base = first / kTileTokens;
+        a.plane_columns = c.plane_columns;
+        a.bitmap_stride = bitmap_stride;
+        a.clear_bitmap  = clear_in_gemm;
         a.rows      = c.rows;
         a.k         = k;
         a.columns   = columns;
@@ -1625,7 +1717,15 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         a.xsum        = xsum;
         a.act_column  = c.act_column != nullptr ? c.act_column + first : nullptr;
         const dim3 grid((c.rows + kTileRows - 1) / kTileRows, (columns + kTileTokens - 1) / kTileTokens);
-        lossless_gemm_kernel<F><<<grid, kThreads, 0, stream>>>(a);
+        if constexpr (kNarrowFormat<F>) {
+            if (narrow) {
+                lossless_gemm_kernel<F, true><<<grid, kThreads, 0, stream>>>(a);
+            } else {
+                lossless_gemm_kernel<F, false><<<grid, kThreads, 0, stream>>>(a);
+            }
+        } else {
+            lossless_gemm_kernel<F, false><<<grid, kThreads, 0, stream>>>(a);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     {
@@ -1635,6 +1735,8 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         f.tile_experts  = c.tile_experts;
         f.expert_stride = c.expert_stride;
         f.tile_base = first / kTileTokens;
+        f.plane_columns = c.plane_columns;
+        f.bitmap_stride = bitmap_stride;
         f.rows      = c.rows;
         f.k         = k;
         f.columns   = columns;
@@ -1648,7 +1750,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         f.ld        = c.out->ne[0];
         f.out_row   = c.out_row;
         f.bf16      = bf16;
-        const std::size_t words = (static_cast<std::size_t>(c.rows) * columns + 31) / 32;
+        const std::size_t words = static_cast<std::size_t>(c.rows) * (bitmap_stride / 32);
         const int threads = 256;
         const int grid    = static_cast<int>(std::min<std::size_t>((words * 32 + threads - 1) / threads, 4096));
         lossless_fallback_kernel<F><<<grid, threads, 0, stream>>>(f);

@@ -257,7 +257,11 @@ column and grid from the encoding). The grouped form
 tile mode (`lossless_linear_tiles`) runs offloaded experts: each 64-column tile reads its own expert
 record (NVFP4 `nvfp4_expert_rg16_v1` units, the finished sum times the matrix's FP32 multiplier;
 `fp8_expert_b128_v1` rows with their BF16 128 x 128 tile scales per 64-element group; GGUF expert rows),
-its columns through an input map and written through an output map.
+its columns through an input map and written through an output map. The planes form (`lossless_linear_planes`) runs a
+few columns a plane against consecutive planes of one BF16 weight in one launch (Inkling 2's KV heads). A narrow call
+(at most 64 columns, the planes form, or expert tiles that are mostly padding; BF16 and the expert-record formats) runs
+its own instantiation of the product kernel, whose warps with no live column skip their products; the wide kernel
+carries none of that logic.
 
 **Offloaded experts** (`offloaded_moe::WideA16::kLossless`, `ops/offloaded_sparse_moe/cuda/lossless_expert.cuh`):
 the call reads each job's column count back once (the route is eager), and each staging pass of jobs is
@@ -354,7 +358,8 @@ causal scoring takes `--lossless` for text windows with `--kv-dtype bf16` and no
 through LosslessForward, §2b's operations over the window's own columns (`include/infernix/ops/lossless_inkling2.h`),
 from zero conv state, writing nothing to the KV pool or the lanes' images. Attention runs passes of up to 256 query
 columns (fewer once every head's scores would pass 256 MiB): the three query heads of a KV head are one product's
-columns, their scores lossless_linear's exact products against the KV head's keys as BF16 weight rows;
+columns, their scores lossless_linear's exact products against the KV head's keys as BF16 weight rows (when a KV
+head's columns fit a 64-column tile, one `lossless_linear_planes` launch over all eight);
 `lossless_inkling2_attention_probs` applies the eager form's roundings, bias, mask and sink in place, every head in one
 launch and a block per (head, query column) (each probability its quotient's correct rounding, decided in binary64 or
 else double-double), and the values are their exact product with the KV head's transposed value plane. The routed experts group each layer's entries by expert into 64-column

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lossless_cr_oracle as cr  # noqa: E402
 
 (RMSNORM, MIX, MESSAGE_GATE, CLIP, CONV, DYNAMIC_CONV, SIGMOID_GATE, ADD, PROBS, ROUTER, FOUR_OVER_SIX, MXFP8,
- SWIGLU, COMBINE, SOFTCAP, SQRT, RING_LOAD, RING_STORE, KEYS_LOAD, KEYS_STORE) = range(20)
+ SWIGLU, COMBINE, SOFTCAP, SQRT, RING_LOAD, RING_STORE, KEYS_LOAD, KEYS_STORE, PLANES) = range(21)
 
 F32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 
@@ -659,11 +659,36 @@ def keys_store_cases(rng):
         yield KEYS_STORE, [heads, ring_pages, pages, first, T, ld], [x_k, x_v, table or [0], k, v], out_k + out_v
 
 
+def planes_cases(rng):
+    # lossless_linear_planes: each plane's rows against its own columns, exact sums rounded once. Attention's shapes
+    # (eight planes of three columns: scores over keys, values over a transposed plane), a full tile a plane, partial
+    # rows of a plane, and exponent spreads that take the lo grids (spread 12) and the exact fallback (spread 40).
+    for K, rows, stride, planes, plane_columns, fp32, spread in (
+            (128, 40, 64, 8, 3, False, 2), (256, 128, 128, 8, 3, False, 2), (128, 33, 64, 8, 24, False, 12),
+            (64, 1, 32, 2, 64, False, 2), (128, 64, 64, 3, 5, True, 2), (128, 20, 32, 4, 3, False, 40),
+            (192, 16, 32, 8, 1, True, 12)):
+        columns = planes * plane_columns
+        out_rows = rows + 3
+        x = [random_bf16(rng, spread) for _ in range(K * columns)]
+        w = [random_bf16(rng, spread) for _ in range(planes * stride * K)]
+        before = [rng.getrandbits(32 if fp32 else 16) for _ in range(out_rows * columns)]
+        expected = list(before)
+        for column in range(columns):
+            plane = column // plane_columns
+            xc = [Fraction(v) for v in x[column * K:(column + 1) * K]]
+            for r in range(rows):
+                row = w[(plane * stride + r) * K:(plane * stride + r + 1) * K]
+                total = sum((Fraction(a) * b for a, b in zip(row, xc) if a != 0.0), Fraction(0))
+                expected[column * out_rows + r] = f32_bits(f32_exact(total)) if fp32 else bf_bits(bf(total))
+        yield (PLANES, [K, rows, stride, planes, plane_columns, int(fp32), out_rows],
+               [u16(x), u16(w), list(range(planes)), before], expected)
+
+
 def cases(rng):
     for generator in (rmsnorm_cases, mix_cases, message_gate_cases, clip_cases, conv_cases, dynamic_conv_cases,
                       sigmoid_gate_cases, add_cases, probs_cases, router_cases, quantize_cases, swiglu_cases,
                       combine_cases, softcap_cases, sqrt_cases, ring_load_cases, ring_store_cases, keys_load_cases,
-                      keys_store_cases):
+                      keys_store_cases, planes_cases):
         yield from generator(rng)
 
 

@@ -42,6 +42,7 @@ namespace {
 
 constexpr std::int32_t kQueryChunk  = 256;  // attention's query columns a pass, at most
 constexpr std::size_t kScoreBytes   = std::size_t{256} << 20U; // a pass's scores of every head, at most
+constexpr std::size_t kPlaneScoreBytes = std::size_t{64} << 20U; // ... for one product over the KV heads' planes
 constexpr std::int32_t kExpertChunk = 1024; // the experts' product columns a pass (whole tiles)
 constexpr int kTile                 = 64;
 
@@ -123,6 +124,18 @@ std::size_t LosslessForward::device_bytes(const TextConfig& c, std::int32_t max_
         attention = std::max({attention, ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, D, planes), planes, columns),
                               ops::lossless_linear_workspace_bytes(bf16_rows(nullptr, planes, D), D, columns)});
     }
+    // A narrow pass's products over the KV heads' planes, at the widest planes kPlaneScoreBytes admits for one query
+    // column and for the most a tile holds.
+    const auto kv = static_cast<std::int32_t>(c.kv_heads);
+    for (const std::int32_t n : {1, kTile / group}) {
+        const auto most = static_cast<std::int32_t>(kPlaneScoreBytes / (static_cast<std::size_t>(heads) * n * 2));
+        const std::int32_t planes = std::min(keys, most / kTile * kTile);
+        if (planes < kTile) { continue; }
+        attention = std::max({attention,
+                              ops::lossless_linear_planes_workspace_bytes(bf16_rows(nullptr, D, kv * planes), kv, planes,
+                                                                          group * n, planes),
+                              ops::lossless_linear_planes_workspace_bytes(bf16_rows(nullptr, planes, kv * D), kv, D, group * n, D)});
+    }
     const std::size_t linear = std::max<std::size_t>(512ULL << 20, attention);
     return persistent + visit + linear + (64ULL << 20);
 }
@@ -182,6 +195,7 @@ LosslessForward::LosslessForward(const Parameters& parameters, std::int32_t max_
     };
     tokens_    = reinterpret_cast<std::int32_t*>(take(T * 4));
     positions_ = reinterpret_cast<std::int32_t*>(take(T * 4));
+    kv_planes_ = reinterpret_cast<std::int32_t*>(take(static_cast<std::size_t>(c_.kv_heads) * 4));
     blocks_    = reinterpret_cast<std::uint16_t*>(take(9 * H * T * 2));
     hidden_[0] = reinterpret_cast<std::uint16_t*>(take(H * T * 2));
     hidden_[1] = reinterpret_cast<std::uint16_t*>(take(H * T * 2));
@@ -192,6 +206,9 @@ LosslessForward::LosslessForward(const Parameters& parameters, std::int32_t max_
     std::vector<std::int32_t> positions(T);
     for (std::size_t i = 0; i < T; ++i) { positions[i] = static_cast<std::int32_t>(i); }
     CUDA_CHECK(cudaMemcpy(positions_, positions.data(), T * 4, cudaMemcpyHostToDevice));
+    std::vector<std::int32_t> planes(c_.kv_heads);
+    for (std::size_t i = 0; i < planes.size(); ++i) { planes[i] = static_cast<std::int32_t>(i); }
+    CUDA_CHECK(cudaMemcpy(kv_planes_, planes.data(), planes.size() * 4, cudaMemcpyHostToDevice));
 }
 
 void LosslessForward::project(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t rows, Tensor& out,
@@ -596,6 +613,7 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
     // A pass of query columns: the query heads of one KV head (`group` of them, consecutive) are one product's columns
     // against its keys and one against its values, and every head's probabilities one launch.
     const std::int32_t group = heads / kv, chunk = query_chunk(Tp, heads);
+    Tensor kv_planes = matrix(kv_planes_, DType::I32, kv, 1);
     for (std::int32_t t0 = 0; t0 < T; t0 += chunk) {
         const std::int32_t n = std::min(chunk, T - t0);
         const std::int32_t keys = round_up(before + t0 + n, kTile); // the keys the chunk's queries can see
@@ -609,13 +627,22 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
         Tensor s = arena_->alloc(DType::BF16, {Tp, heads * n});
         Tensor o_chunk = columns_of(o, t0, n);
         Tensor rel_chunk = columns_of(r, t0, n), sink_chunk = columns_of(sink, t0, n);
-        for (std::int32_t g = 0; g < kv; ++g) {
-            Tensor x = matrix(static_cast<std::uint16_t*>(qc.data) + static_cast<std::size_t>(g) * group * n * D, DType::BF16, D,
-                              group * n);
-            const Weight kw = bf16_rows(static_cast<std::uint16_t*>(kh.data) + static_cast<std::size_t>(g) * Tp * D, D, keys);
-            Tensor s_g = columns_of(s, g * group * n, group * n);
-            auto ws    = arena_->scope();
-            ops::lossless_linear(x, kw, 0, keys, s_g, 0, *arena_, stream);
+        // A narrow pass is one product over every KV head's keys (each head's columns a tile of the same launch).
+        const bool narrow = group * n <= kTile && static_cast<std::size_t>(Tp) * heads * n * 2 <= kPlaneScoreBytes;
+        if (narrow) {
+            Tensor x        = matrix(qc.data, DType::BF16, D, heads * n);
+            const Weight kw = bf16_rows(kh.data, D, kv * Tp);
+            auto ws         = arena_->scope();
+            ops::lossless_linear_planes(x, kw, kv_planes, Tp, group * n, keys, s, *arena_, stream);
+        } else {
+            for (std::int32_t g = 0; g < kv; ++g) {
+                Tensor x = matrix(static_cast<std::uint16_t*>(qc.data) + static_cast<std::size_t>(g) * group * n * D, DType::BF16,
+                                  D, group * n);
+                const Weight kw = bf16_rows(static_cast<std::uint16_t*>(kh.data) + static_cast<std::size_t>(g) * Tp * D, D, keys);
+                Tensor s_g = columns_of(s, g * group * n, group * n);
+                auto ws    = arena_->scope();
+                ops::lossless_linear(x, kw, 0, keys, s_g, 0, *arena_, stream);
+            }
         }
         ops::LosslessInkling2Probs pa;
         pa.scores      = &s;
@@ -633,11 +660,17 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
         ops::lossless_inkling2_attention_probs(pa, stream);
         // The value products head-major ([heads n][D]); one query column's are o's own rows.
         Tensor oh = n == 1 ? matrix(o_chunk.data, DType::BF16, D, heads) : arena_->alloc(DType::BF16, {D, heads * n});
-        for (std::int32_t g = 0; g < kv; ++g) {
-            Tensor s_g = columns_of(s, g * group * n, group * n), o_g = columns_of(oh, g * group * n, group * n);
-            const Weight vw = bf16_rows(static_cast<std::uint16_t*>(vt.data) + static_cast<std::size_t>(g) * D * Tp, Tp, D);
+        if (narrow) {
+            const Weight vw = bf16_rows(vt.data, Tp, kv * D);
             auto ws         = arena_->scope();
-            ops::lossless_linear(s_g, vw, 0, D, o_g, 0, *arena_, stream);
+            ops::lossless_linear_planes(s, vw, kv_planes, D, group * n, D, oh, *arena_, stream);
+        } else {
+            for (std::int32_t g = 0; g < kv; ++g) {
+                Tensor s_g = columns_of(s, g * group * n, group * n), o_g = columns_of(oh, g * group * n, group * n);
+                const Weight vw = bf16_rows(static_cast<std::uint16_t*>(vt.data) + static_cast<std::size_t>(g) * D * Tp, Tp, D);
+                auto ws         = arena_->scope();
+                ops::lossless_linear(s_g, vw, 0, D, o_g, 0, *arena_, stream);
+            }
         }
         if (n > 1) {
             // [heads][n][D] to o's [n][heads][D]: the same copy with the two indices' roles exchanged.
@@ -684,7 +717,7 @@ void LosslessForward::experts(const LayerOperands& l, std::uint32_t layer, const
         by_expert[static_cast<std::size_t>(e)].push_back(static_cast<std::int32_t>(i));
     }
     std::vector<ops::LosslessTile> tiles_gu, tiles_down;
-    std::vector<std::int32_t> in_columns, out_columns;
+    std::vector<std::int32_t> in_columns, out_columns, live_columns;
     std::vector<float> gamma;
     for (std::int32_t e = 0; e < E; ++e) {
         const auto& entries = by_expert[static_cast<std::size_t>(e)];
@@ -699,11 +732,16 @@ void LosslessForward::experts(const LayerOperands& l, std::uint32_t layer, const
                 const std::int32_t entry = real ? entries[c] : -1;
                 in_columns.push_back(real ? entry / top_k : -1);
                 out_columns.push_back(entry);
+                // Gate/up's map, within its chunk of columns: a padding column stores nothing (nor is read: its h goes
+                // only to a down column with no output).
+                live_columns.push_back(real ? static_cast<std::int32_t>(in_columns.size() - 1) % kExpertChunk : -1);
                 gamma.push_back(real ? host_w[static_cast<std::size_t>(entry)] : 0.0F);
             }
         }
     }
     const auto product_columns = static_cast<std::int32_t>(in_columns.size());
+    // Few entries a tile (a decode's: each its own expert's tile): their padding columns take no products.
+    const bool sparse = static_cast<std::int64_t>(T) * top_k * 4 <= product_columns;
     // The record's matrices.
     ops::LosslessBankMatrix gu, down;
     gu.qtype = down.qtype = nvfp4 ? QType::NVFP4_MUL : QType::FP8_E4M3FN_G32_E8M0;
@@ -716,11 +754,13 @@ void LosslessForward::experts(const LayerOperands& l, std::uint32_t layer, const
     // Device copies of the plan.
     Tensor d_in = arena_->alloc(DType::I32, {product_columns}), d_out = arena_->alloc(DType::I32, {product_columns});
     Tensor d_gamma = arena_->alloc(DType::FP32, {product_columns});
+    Tensor d_live  = arena_->alloc(DType::I32, {product_columns});
     const auto tiles = static_cast<std::int32_t>(tiles_gu.size());
     auto* d_tiles = static_cast<ops::LosslessTile*>(arena_->alloc_bytes(2 * static_cast<std::size_t>(tiles) * sizeof(ops::LosslessTile)).data);
     CUDA_CHECK(cudaMemcpyAsync(d_in.data, in_columns.data(), in_columns.size() * 4, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_out.data, out_columns.data(), out_columns.size() * 4, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_gamma.data, gamma.data(), gamma.size() * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_live.data, live_columns.data(), live_columns.size() * 4, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_tiles, tiles_gu.data(), tiles_gu.size() * sizeof(ops::LosslessTile), cudaMemcpyHostToDevice,
                                stream));
     CUDA_CHECK(cudaMemcpyAsync(d_tiles + tiles, tiles_down.data(), tiles_down.size() * sizeof(ops::LosslessTile),
@@ -745,7 +785,9 @@ void LosslessForward::experts(const LayerOperands& l, std::uint32_t layer, const
                 s.divisor       = den_gu;
                 s.column_scales = static_cast<const float*>(outer.data);
             }
-            ops::lossless_linear_tiles(xq, nullptr, n, gu, d_tiles + c0 / kTile, gate_up, nullptr, *arena_, stream, s);
+            ops::lossless_linear_tiles(xq, nullptr, n, gu, d_tiles + c0 / kTile, gate_up,
+                                       sparse ? static_cast<const std::int32_t*>(d_live.data) + c0 : nullptr, *arena_, stream, s,
+                                       sparse);
         }
         Tensor hcol = arena_->alloc(DType::BF16, {I, n});
         Tensor g = matrix(static_cast<const float*>(d_gamma.data) + c0, DType::FP32, n, 1);
@@ -764,7 +806,7 @@ void LosslessForward::experts(const LayerOperands& l, std::uint32_t layer, const
                 s.column_scales = static_cast<const float*>(outer_h.data);
             }
             ops::lossless_linear_tiles(hq, nullptr, n, down, d_tiles + tiles + c0 / kTile, y,
-                                       static_cast<const std::int32_t*>(d_out.data) + c0, *arena_, stream, s);
+                                       static_cast<const std::int32_t*>(d_out.data) + c0, *arena_, stream, s, sparse);
         }
     }
     // The combine: entry t top_k + j is slot j of column t.

@@ -24,18 +24,20 @@ std::size_t bf16_meta_bytes(std::int32_t k, std::int32_t rows) {
            align256(r * sizeof(std::int32_t));
 }
 
+std::int32_t scanned_rows(const Call& c) { return c.scan_rows > 0 ? c.scan_rows : c.rows; }
+
 void scan_bf16(Call& c, std::uint8_t* meta, cudaStream_t stream) {
-    const int k = c.x->ne[0], blocks = k / kBlockK;
-    const std::size_t r = static_cast<std::size_t>(c.rows);
+    const int k = c.x->ne[0], blocks = k / kBlockK, rows = scanned_rows(c);
+    const std::size_t r = static_cast<std::size_t>(rows);
     auto* block_exp   = reinterpret_cast<std::int16_t*>(meta);
     auto* tile_lo_w   = meta + align256(r * blocks * sizeof(std::int16_t));
     auto* row_inexact = reinterpret_cast<std::int32_t*>(tile_lo_w + align256((r + kTileRows - 1) / kTileRows * blocks));
-    CUDA_CHECK(cudaMemsetAsync(tile_lo_w, 0, bf16_meta_bytes(k, c.rows) - align256(r * blocks * sizeof(std::int16_t)),
+    CUDA_CHECK(cudaMemsetAsync(tile_lo_w, 0, bf16_meta_bytes(k, rows) - align256(r * blocks * sizeof(std::int16_t)),
                                stream));
     const std::size_t warps = r * blocks;
     const int threads       = 256;
     bf16_weight_scan_kernel<<<static_cast<unsigned>((warps * 32 + threads - 1) / threads), threads, 0, stream>>>(
-        reinterpret_cast<const std::uint16_t*>(c.w.codes), k, c.row_begin, c.rows, block_exp, tile_lo_w, row_inexact);
+        reinterpret_cast<const std::uint16_t*>(c.w.codes), k, c.row_begin, rows, block_exp, tile_lo_w, row_inexact);
     CUDA_CHECK(cudaGetLastError());
     c.w.block_exp   = block_exp;
     c.w.tile_lo_w   = tile_lo_w;
@@ -77,6 +79,9 @@ struct Projection {
     Route route;
 };
 
+// The columns the encode holds when they are fewer than the product's (the planes form).
+std::int32_t encoded_columns(const Call& c) { return c.plane_columns > 0 ? c.x->ne[1] : 0; }
+
 // The workspace of projections of one input over `columns`: the encode's buffers and one bitmap for the
 // widest projection (shared, the projections run in turn), then each BF16 weight's block data.
 std::size_t projections_bytes(std::int32_t k, std::span<const Projection> ps, std::int32_t columns) {
@@ -84,9 +89,9 @@ std::size_t projections_bytes(std::int32_t k, std::span<const Projection> ps, st
     std::size_t meta  = 0;
     for (const Projection& p : ps) {
         rows = std::max(rows, p.call.rows);
-        if (p.route == Route::Bf16) { meta += bf16_meta_bytes(k, p.call.rows); }
+        if (p.route == Route::Bf16) { meta += bf16_meta_bytes(k, scanned_rows(p.call)); }
     }
-    return layout_of(k, rows, columns, false).total + meta;
+    return layout_of(k, rows, columns, false, encoded_columns(ps[0].call)).total + meta;
 }
 
 // Projections of one input (the same x, columns and column maps): each chunk's activation columns are encoded
@@ -99,14 +104,14 @@ void run(std::span<Projection> ps, WorkspaceArena& workspace, cudaStream_t strea
         rows = std::max(rows, p.call.rows);
         xsum = xsum || reads_xsum(p.call, p.route);
     }
-    const Layout l = layout_of(k, rows, columns, false);
+    const Layout l = layout_of(k, rows, columns, false, encoded_columns(ps[0].call));
     auto scope     = workspace.scope();
     auto* base     = static_cast<std::uint8_t*>(workspace.alloc_bytes(projections_bytes(k, ps, columns)).data);
     std::uint8_t* meta = base + l.total;
     for (Projection& p : ps) {
         if (p.route != Route::Bf16) { continue; }
         scan_bf16(p.call, meta, stream);
-        meta += bf16_meta_bytes(k, p.call.rows);
+        meta += bf16_meta_bytes(k, scanned_rows(p.call));
     }
     for (int first = 0; first < columns; first += kChunkColumns) {
         const int count = std::min(kChunkColumns, columns - first);
@@ -220,6 +225,38 @@ void lossless_linear_grouped(const Tensor& x, const Weight& weight, const Tensor
     run(call, route, workspace, stream);
 }
 
+std::size_t lossless_linear_planes_workspace_bytes(const Weight& weight, std::int32_t planes, std::int32_t plane_stride,
+                                                   std::int32_t plane_columns, std::int32_t rows) {
+    require(route_of(weight) == Route::Bf16 && planes > 0 && plane_columns > 0 && rows > 0 && weight.k % kBlockK == 0,
+            "the planes form takes a BF16 weight, positive planes, columns and rows");
+    return layout_of(weight.k, rows, planes * kTileTokens, false, planes * plane_columns).total +
+           bf16_meta_bytes(weight.k, (planes - 1) * plane_stride + rows);
+}
+
+void lossless_linear_planes(const Tensor& x, const Weight& weight, const Tensor& tile_planes, std::int32_t plane_stride,
+                            std::int32_t plane_columns, std::int32_t rows, Tensor& out, WorkspaceArena& workspace,
+                            cudaStream_t stream) {
+    const Route route = route_of(weight);
+    require(route == Route::Bf16, "the planes form takes a BF16 weight");
+    check_x(x, weight);
+    require(plane_columns > 0 && plane_columns <= kTileTokens && x.ne[1] % plane_columns == 0,
+            "the planes form's x holds 1 to 64 columns a plane");
+    const int planes = x.ne[1] / plane_columns;
+    require(planes * kTileTokens <= kChunkColumns, "the planes form's tiles fit one column chunk");
+    require(tile_planes.dtype == DType::I32 && tile_planes.is_contiguous() && tile_planes.numel() == planes,
+            "tile_planes must be device I32 [planes]");
+    require(plane_stride % kTileRows == 0 && rows > 0 && rows <= plane_stride &&
+                static_cast<std::int64_t>(planes - 1) * plane_stride + rows <= weight.n,
+            "the planes must lie within the weight, on a 32-row grid");
+    check_out(out, x.ne[1], 0, rows);
+    Call call{&x, view_of(weight, route), 0, static_cast<const std::int32_t*>(tile_planes.data), plane_stride, rows, &out, 0,
+              planes * kTileTokens, weight.qtype};
+    call.max_expert    = planes - 1;
+    call.scan_rows     = (planes - 1) * plane_stride + rows;
+    call.plane_columns = plane_columns;
+    run(call, route, workspace, stream);
+}
+
 namespace {
 
 Route bank_route(QType q) {
@@ -240,7 +277,7 @@ std::size_t lossless_linear_tiles_workspace_bytes(const LosslessBankMatrix& matr
 void lossless_linear_tiles(const Tensor& x, const std::int32_t* in_columns, std::int32_t columns,
                            const LosslessBankMatrix& matrix, const LosslessTile* tiles, Tensor& out,
                            const std::int32_t* out_columns, WorkspaceArena& workspace, cudaStream_t stream,
-                           const LosslessActivationScale& scale) {
+                           const LosslessActivationScale& scale, bool sparse) {
     require(scale.multiplier == 0.0F, "the tile mode's activation multipliers are its tiles' act scales");
     require(scale.divisor == 0.0F || (std::isfinite(scale.divisor) && scale.divisor > 0.0F),
             "an activation divisor is positive and finite");
@@ -268,6 +305,7 @@ void lossless_linear_tiles(const Tensor& x, const std::int32_t* in_columns, std:
     c.in_columns  = in_columns;
     c.out_columns = out_columns;
     c.act_column  = scale.column_scales;
+    c.sparse_columns = sparse;
     run(c, route, workspace, stream);
 }
 
