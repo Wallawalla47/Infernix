@@ -68,7 +68,8 @@ Keep these ownership boundaries visible when selecting a design:
   inference: it supervises one `infernix-serve` process per loaded model, proxies its HTTP
   endpoints, switches models on request, downloads artifacts and keeps per-model launch parameters.
   It links neither the Engine nor CUDA; what it shows of a server comes from the server's own HTTP
-  endpoints and log.
+  endpoints and log. Its Ablation page runs `tools/ablate` (Python) as a child that starts its own
+  `infernix-serve` engines; the launcher holds model loads off while that run has the GPU.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
 - Models own fixed mathematics, config interpretation, logical parameter binding, frontend

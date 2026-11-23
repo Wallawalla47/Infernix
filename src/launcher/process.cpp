@@ -25,6 +25,7 @@
 #else
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -636,6 +637,99 @@ bool spawn_detached(const std::filesystem::path& executable, const std::vector<s
     return true;
 }
 
+#endif
+
+#ifdef _WIN32
+bool end_leftover_process(std::uint32_t pid, std::string_view file_name, std::chrono::milliseconds wait) {
+    const HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (process == nullptr) { return true; } // gone, or another user's process (not one of ours)
+    bool ended = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+    if (!ended) {
+        // A process already being ended (its parent's job object just closed) may not tell its image name: it is
+        // not ended again, only waited for.
+        std::wstring image(32768, L'\0');
+        DWORD size = static_cast<DWORD>(image.size());
+        if (QueryFullProcessImageNameW(process, 0, image.data(), &size) != 0) {
+            image.resize(size);
+            if (!iequals(path_utf8(std::filesystem::path(image).filename()), file_name)) {
+                CloseHandle(process);
+                return true; // the id was reused by another program
+            }
+            TerminateProcess(process, 1);
+        }
+        ended = WaitForSingleObject(process, static_cast<DWORD>(wait.count())) == WAIT_OBJECT_0;
+    }
+    CloseHandle(process);
+    return ended;
+}
+
+std::optional<std::filesystem::path> find_program(std::string_view name) {
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetEnvironmentVariableW(L"PATH", path.data(), static_cast<DWORD>(path.size()));
+    if (length == 0 || length >= path.size()) { return std::nullopt; }
+    path.resize(length);
+    std::filesystem::path file = utf8_path(name);
+    if (!file.has_extension()) { file += ".exe"; }
+    for (std::size_t at = 0; at <= path.size();) {
+        const std::size_t end = std::min(path.find(L';', at), path.size());
+        std::wstring dir      = path.substr(at, end - at);
+        at                    = end + 1;
+        if (dir.size() >= 2 && dir.front() == L'"' && dir.back() == L'"') { dir = dir.substr(1, dir.size() - 2); }
+        if (dir.empty()) { continue; }
+        const std::filesystem::path candidate = std::filesystem::path(dir) / file;
+        // Not std::filesystem::is_regular_file: an app execution alias (WindowsApps\python.exe) is a reparse point
+        // that does not resolve to a file, yet starts its program.
+        const DWORD attributes = GetFileAttributesW(candidate.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) { return candidate; }
+    }
+    return std::nullopt;
+}
+#else
+namespace {
+// A process that ended and waits for its parent to collect its status ('Z' in /proc/<pid>/stat) holds nothing.
+bool zombie(std::uint32_t pid) {
+    std::ifstream stat("/proc/" + std::to_string(pid) + "/stat");
+    std::string text((std::istreambuf_iterator<char>(stat)), std::istreambuf_iterator<char>());
+    const std::size_t close = text.rfind(')');
+    return close != std::string::npos && close + 2 < text.size() && text[close + 2] == 'Z';
+}
+} // namespace
+
+bool end_leftover_process(std::uint32_t pid, std::string_view file_name, std::chrono::milliseconds wait) {
+#ifdef __linux__
+    std::error_code error;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/" + std::to_string(pid) + "/exe", error);
+    if (error) { return true; } // gone, or another user's process
+    std::string name = exe.filename().string();
+    if (name.ends_with(" (deleted)")) { name.resize(name.size() - 10); }
+    if (name != file_name) { return true; }
+    ::kill(static_cast<pid_t>(pid), SIGKILL);
+    const auto deadline = std::chrono::steady_clock::now() + wait;
+    for (;;) {
+        if (::kill(static_cast<pid_t>(pid), 0) != 0 || zombie(pid)) { return true; }
+        if (std::chrono::steady_clock::now() >= deadline) { return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+#else
+    (void)pid;
+    (void)file_name;
+    (void)wait;
+    return true;
+#endif
+}
+
+std::optional<std::filesystem::path> find_program(std::string_view name) {
+    const char* path = std::getenv("PATH");
+    if (path == nullptr) { return std::nullopt; }
+    std::stringstream dirs(path);
+    std::string dir;
+    while (std::getline(dirs, dir, ':')) {
+        if (dir.empty()) { continue; }
+        const std::filesystem::path candidate = std::filesystem::path(dir) / std::string(name);
+        if (::access(candidate.c_str(), X_OK) == 0 && !std::filesystem::is_directory(candidate)) { return candidate; }
+    }
+    return std::nullopt;
+}
 #endif
 
 ChildProcess::ChildProcess(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

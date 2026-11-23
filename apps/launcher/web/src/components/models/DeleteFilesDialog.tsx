@@ -1,5 +1,5 @@
-// Deleting an artifact's, a drafter's, an n-gram volume's or a LoRA adapter's files from disk. The
-// user types the file (an adapter's: folder) name to confirm (sent as `confirm`); files a running
+// Deleting an artifact's, a drafter's, an n-gram volume's, a LoRA adapter's or an ablation sidecar's files from disk.
+// The user types the file (an adapter's or sidecar's: folder) name to confirm (sent as `confirm`); files a running
 // server holds are refused here as the launcher refuses them.
 
 import { useEffect, useState, type ReactNode } from "react";
@@ -17,7 +17,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import type { DrafterArtifact, InstanceInfo, LoraAdapter, ModelArtifact, NgramVolume } from "@/lib/api-types";
+import type {
+  AblationSidecar,
+  DrafterArtifact,
+  InstanceInfo,
+  LoraAdapter,
+  ModelArtifact,
+  NgramVolume,
+} from "@/lib/api-types";
 import { loadedArtifactKey, pathInUse, useDeleteFiles, volumeInUse, type FileKind } from "@/lib/configs";
 import { formatBytes } from "@/lib/format";
 
@@ -110,6 +117,20 @@ export function adapterDeleteTarget(adapter: LoraAdapter, instance: InstanceInfo
       pathInUse(instance, adapter.path) || pathInUse(instance, weights)
         ? "The loaded model runs with this adapter. Unload it first."
         : null,
+  };
+}
+
+export function sidecarDeleteTarget(sidecar: AblationSidecar, instance: InstanceInfo | null): DeleteTarget {
+  return {
+    kind: "sidecar",
+    key: sidecar.key,
+    fileName: sidecar.name,
+    title: sidecar.name,
+    path: sidecar.path,
+    bytes: sidecar.bytes,
+    details:
+      "The ablation sidecar's sidecar.json and its direction file (and its folder, when nothing else is in it). Configurations that name it with --ablate fail to start until you pick another.",
+    blocked: pathInUse(instance, sidecar.path) ? "The loaded model runs with this sidecar. Unload it first." : null,
   };
 }
 

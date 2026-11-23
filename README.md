@@ -518,6 +518,9 @@ run without command lines:
   server's console, an event log, token usage by model and client, and a chat with image input.
 - **Watchdog**: restarts a server that crashes or locks up, and explains a load that does not fit,
   with suggested changes.
+- **Ablation**: makes a refusal-ablation sidecar ([`--ablate`](docs/ablate.md)) for one of your models:
+  downloads a public prompt set (licences shown), runs the fitter on your GPU and adds the sidecar to the
+  model's configuration choices, beside its LoRA adapters and drafter.
 
 To use it, build as in the quick start below and run `infernix-launcher.exe` from the folder of
 `infernix-serve.exe`: it opens `http://127.0.0.1:1234` in your browser. Add your model folders (or

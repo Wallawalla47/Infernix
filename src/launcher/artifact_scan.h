@@ -1,9 +1,9 @@
 #pragma once
 
-// Finds Infernix/NInfer v3 artifacts, Qwen3.8-Flash-Next n-gram volumes and LoRA adapters in the
-// model folders by reading their headers only: models (a `text` component), companion drafters (no
-// `text`), n-gram volumes and adapter folders (adapter_config.json), with the facts the launcher
-// shows, matches and configures by.
+// Finds Infernix/NInfer v3 artifacts, Qwen3.8-Flash-Next n-gram volumes, LoRA adapters and ablation
+// sidecars in the model folders by reading their headers only: models (a `text` component), companion
+// drafters (no `text`), n-gram volumes, adapter folders (adapter_config.json) and sidecars
+// (sidecar.json), with the facts the launcher shows, matches and configures by.
 
 #include "launcher/util.h"
 
@@ -115,6 +115,28 @@ struct ScannedAdapter {
     std::int64_t modified = 0;
 };
 
+// An ablation sidecar (`--ablate`, docs/ablate.md): a sidecar.json of format ablate-direction-v2 with its direction
+// file beside it. A sidecar that cuts no layer (tools/ablate's base direction) and the trial sidecars of a tools/ablate
+// run's fit/ folder are not listed. infernix-serve checks the rest at load (and --plan).
+struct ScannedSidecar {
+    std::string key;            // 32 hex digits of its sidecar.json's path's SHA-256
+    std::string name;           // its folder's name
+    std::filesystem::path path; // sidecar.json
+    std::filesystem::path direction_file;
+    std::uint64_t bytes          = 0; // the direction file
+    std::uint64_t direction_dim  = 0; // the hidden size it was fitted for
+    std::uint64_t rows           = 1; // 1 (one shared direction) or one per layer
+    std::uint64_t attn_layers    = 0; // layers whose attention lane it cuts (alpha above 0)
+    std::uint64_t mlp_layers     = 0; // layers whose MLP lane it cuts
+    std::uint64_t layer_bound    = 0; // 1 + the highest layer index its tables name
+    std::optional<std::string> artifact_id;     // the artifact it was fitted on (32 hex digits)
+    std::optional<std::string> fitted_artifact; // generation.fitted_under.artifact: that artifact's file name
+    std::optional<std::string> source;          // generation.source
+    std::vector<std::string> compatible_models; // the models whose geometry it fits
+    std::vector<std::string> fitted_models;     // of those, the one whose id it names
+    std::int64_t modified = 0;
+};
+
 struct ScannedDir {
     std::filesystem::path path;
     bool exists               = false;
@@ -122,6 +144,7 @@ struct ScannedDir {
     std::size_t drafters      = 0;
     std::size_t ngram_volumes = 0;
     std::size_t adapters      = 0;
+    std::size_t sidecars      = 0;
     // The room on its drive when it was scanned (nullopt when the drive did not say).
     std::optional<std::uint64_t> free_bytes;
     std::optional<std::uint64_t> total_bytes;
@@ -141,6 +164,7 @@ struct LibraryScan {
     std::vector<ScannedDrafter> drafters;
     std::vector<ScannedNgramVolume> ngram_volumes;
     std::vector<ScannedAdapter> adapters;
+    std::vector<ScannedSidecar> sidecars;
     std::vector<ScanIssue> issues;
 
     [[nodiscard]] const ScannedModel* model(std::string_view key) const;
@@ -175,6 +199,15 @@ struct ParsedEntry {
 // Whether an adapter was trained on this model's base: a dense Qwen3.5-architecture model (the --lora models) whose
 // family (Qwen3.8-27B, Qwen3.6-27B) the adapter's base_model_name_or_path names.
 [[nodiscard]] bool adapter_matches(const ScannedModel& model, const ScannedAdapter& adapter);
+
+// A sidecar.json's facts (exposed for tests): nothing when it is not an ablate-direction-v2 sidecar or cuts no layer;
+// `issue` when it claims to be one and is malformed (no direction file of the declared shape, bad tables).
+[[nodiscard]] std::optional<ScannedSidecar> parse_sidecar(const std::filesystem::path& path, const Json& sidecar,
+                                                          std::optional<std::string>& issue);
+
+// Whether a sidecar fits a model's geometry: its direction has the model's hidden size, one row or one per layer, and
+// its tables name no layer past the model's.
+[[nodiscard]] bool sidecar_fits(const ScannedModel& model, const ScannedSidecar& sidecar);
 
 // The API's Library object without each model's `config` (the launcher adds it).
 [[nodiscard]] Json to_json(const LibraryScan& scan);

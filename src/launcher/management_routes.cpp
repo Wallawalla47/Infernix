@@ -130,6 +130,7 @@ void Launcher::register_management_routes() {
     register_usage_routes(api);
     register_fs_routes(api);
     register_event_routes(api);
+    register_ablation_routes(api);
 }
 
 void Launcher::register_settings_routes(const std::string& api) {
@@ -432,6 +433,10 @@ void Launcher::register_config_routes(const std::string& api) {
                                                      json_or<std::string>(body, "file_name", "")));
                  }));
     server_.Post(api + config_path + "/plan", admin([this, with_config, parse_args, parse_env](const Request& q, Response& s) {
+                     // A plan reads the card's free memory, which the run's engine holds meanwhile.
+                     if (ablation_holds_gpu()) {
+                         throw std::invalid_argument("an ablation run has the GPU: the memory plan is made once it ends");
+                     }
                      const Json body = body_json(q);
                      const std::optional<Args> body_args =
                          body.contains("args") ? std::optional<Args>(parse_args(body["args"])) : std::nullopt;
@@ -448,6 +453,10 @@ void Launcher::register_config_routes(const std::string& api) {
                      send_json(s, fit_plan_json(id, model, args, env));
                  }));
     server_.Post(api + config_path + "/load", admin([this, with_config](const Request& q, Response& s) {
+                     if (ablation_holds_gpu()) {
+                         throw std::invalid_argument("an ablation run has the GPU (the Ablation page): stop it, or let "
+                                                     "it end, to load a model");
+                     }
                      const bool force = json_or<bool>(body_json(q), "force", false);
                      std::string key, alias;
                      with_config(q, [&](const ConfigRef& ref, const LibraryScan& scan) {
@@ -573,6 +582,9 @@ void Launcher::register_update_routes(const std::string& api) {
                      send_json(s, infernix_update_->state());
                  }));
     server_.Post(api + "/infernix/install", admin([this](const Request&, Response& s) {
+                     if (ablation_->busy()) {
+                         throw std::invalid_argument("an ablation run is in progress (the Ablation page): stop it first");
+                     }
                      infernix_update_->install();
                      event("info", "launcher", "installing the Infernix update: the launcher stops and starts again");
                      send_json(s, infernix_update_->state());
@@ -590,7 +602,7 @@ void Launcher::register_update_routes(const std::string& api) {
 }
 
 void Launcher::register_disk_routes(const std::string& api) {
-    // Disk: deleting an artifact's files, a drafter, an n-gram volume or a LoRA adapter.
+    // Disk: deleting an artifact's files, a drafter, an n-gram volume, a LoRA adapter or an ablation sidecar.
     const auto check_confirm = [](const Request& q, const std::string& file_name) {
         if (json_or<std::string>(body_json(q), "confirm", "") != file_name) {
             throw std::invalid_argument("type the file name (" + file_name + ") to confirm");
@@ -649,9 +661,9 @@ void Launcher::register_disk_routes(const std::string& api) {
                        request_scan();
                        send_json(s, library_json());
                    }));
-    server_.Delete(api + R"(/(drafters|ngram|adapters)/([0-9a-f]{32}))", admin([this, check_confirm, remove_files](const Request& q, Response& s) {
+    server_.Delete(api + R"(/(drafters|ngram|adapters|sidecars)/([0-9a-f]{32}))", admin([this, check_confirm, remove_files](const Request& q, Response& s) {
                        // The files to delete; what a running server would name (an adapter: its folder or its
-                       // weights file); the name the user types to confirm.
+                       // weights file; a sidecar: its sidecar.json); the name the user types to confirm.
                        std::vector<std::filesystem::path> files;
                        std::vector<std::filesystem::path> named_as;
                        std::filesystem::path folder;
@@ -666,6 +678,14 @@ void Launcher::register_disk_routes(const std::string& api) {
                            } else if (kind == "ngram") {
                                for (const ScannedNgramVolume& volume : library_.ngram_volumes) {
                                    if (volume.key == key) { files = named_as = {volume.path}, file_name = volume.file_name; }
+                               }
+                           } else if (kind == "sidecars") {
+                               for (const ScannedSidecar& sidecar : library_.sidecars) {
+                                   if (sidecar.key != key) { continue; }
+                                   folder    = sidecar.path.parent_path();
+                                   files     = {sidecar.path, sidecar.direction_file};
+                                   named_as  = {sidecar.path};
+                                   file_name = sidecar.name;
                                }
                            } else {
                                for (const ScannedAdapter& adapter : library_.adapters) {
@@ -692,7 +712,7 @@ void Launcher::register_disk_routes(const std::string& api) {
                        check_confirm(q, file_name);
                        remove_files(files, file_name);
                        if (!folder.empty()) {
-                           // The adapter's folder goes too when nothing else is left in it.
+                           // The adapter's or sidecar's folder goes too when nothing else is left in it.
                            std::error_code ignored;
                            if (std::filesystem::is_empty(folder, ignored)) { std::filesystem::remove(folder, ignored); }
                        }
@@ -860,6 +880,42 @@ void Launcher::register_event_routes(const std::string& api) {
                         },
                         [subscription](bool) { subscription->close(); });
                 }));
+}
+
+void Launcher::register_ablation_routes(const std::string& api) {
+    // The Ablation page: the sidecar fitter (tools/ablate), its Python and packages, prompt sets and one run.
+    server_.Get(api + "/ablation", admin([this](const Request&, Response& s) { send_json(s, ablation_->state()); }));
+    server_.Post(api + "/ablation/python", admin([this](const Request& q, Response& s) {
+                     ablation_->choose_python(json_or<std::string>(body_json(q), "path", ""));
+                     send_json(s, ablation_->state());
+                 }));
+    server_.Post(api + "/ablation/python/detect", admin([this](const Request&, Response& s) {
+                     ablation_->detect_python();
+                     send_json(s, ablation_->state());
+                 }));
+    server_.Post(api + "/ablation/setup", admin([this](const Request&, Response& s) {
+                     ablation_->setup();
+                     event("info", "ablation", "installation of the ablation tool's packages requested from the launcher");
+                     send_json(s, ablation_->state());
+                 }));
+    server_.Post(api + R"(/ablation/prompts/([a-z0-9-]+))", admin([this](const Request& q, Response& s) {
+                     ablation_->fetch(q.matches[1].str());
+                     event("info", "ablation", "download of the prompt set " + q.matches[1].str() + " requested from the launcher");
+                     send_json(s, ablation_->state());
+                 }));
+    server_.Post(api + "/ablation/runs", admin([this](const Request& q, Response& s) {
+                     const Json body = body_json(q);
+                     AblationRun run = ablation_run_for(json_or<std::string>(body, "config", ""));
+                     run.preset      = json_or<std::string>(body, "preset", "");
+                     run.trials      = json_or<int>(body, "trials", 300);
+                     run.name        = trim(json_or<std::string>(body, "name", ""));
+                     ablation_->start(run);
+                     send_json(s, ablation_->state());
+                 }));
+    server_.Post(api + "/ablation/stop", admin([this](const Request& q, Response& s) {
+                     ablation_->stop(json_or<bool>(body_json(q), "now", false));
+                     send_json(s, ablation_->state());
+                 }));
 }
 
 } // namespace infernix::launcher

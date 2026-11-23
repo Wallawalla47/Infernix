@@ -13,6 +13,7 @@ import {
   Moon,
   Pin,
   Plug,
+  Scissors,
   ScrollText,
   Settings as SettingsIcon,
   Sun,
@@ -55,6 +56,7 @@ const NAV: NavItem[] = [
   { to: "/chat", label: "Chat", icon: MessageSquare },
   { to: "/models", label: "Models", icon: Boxes },
   { to: "/discover", label: "Discover", icon: CloudDownload },
+  { to: "/ablation", label: "Ablation", icon: Scissors },
   { to: "/connect", label: "Connect", icon: Plug },
   { to: "/usage", label: "Usage", icon: ChartColumnBig },
   { to: "/logs", label: "Logs", icon: ScrollText },
@@ -148,6 +150,11 @@ function LiveStatus() {
       <div className="mt-1 text-xs text-muted-foreground tabular-nums">
         {state === "ready" ? (generating && rate !== null ? formatTokS(rate) : "Idle, ready for requests") : instance?.phase || " "}
       </div>
+      {instance?.ablation_holds_gpu ? (
+        <NavLink to="/ablation" className="mt-1 block text-xs text-warning hover:underline">
+          An ablation run has the GPU: no model loads until it ends
+        </NavLink>
+      ) : null}
       <IncidentLine />
       {launcher ? <div className="mt-2 text-[10px] text-muted-foreground/70">Launcher {launcher.version}</div> : null}
     </div>

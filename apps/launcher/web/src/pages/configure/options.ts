@@ -927,17 +927,9 @@ const ABLATE: FormSection = {
   title: "Ablation sidecar",
   description: "A direction cut out of the model's residual writes at load (refusal removal)",
   icon: Scissors,
-  controls: [
-    {
-      kind: "text",
-      flag: "--ablate",
-      label: "Ablation sidecar",
-      help: "An ablation sidecar's sidecar.json, with the direction file it names beside it: a direction removed from the attention and MLP outputs of the layers it lists, at the strength it gives each. Fitted to one artifact; the start refuses a malformed sidecar, and --lossless. docs/ablate.md",
-      placeholder: "none",
-      mono: true,
-      wide: true,
-    },
-  ],
+  // The page's own field: the library's sidecars that fit the model (the Ablation page makes them), or a path.
+  fields: ["--ablate"],
+  controls: [],
 };
 
 const LOGGING: FormSection = {

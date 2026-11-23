@@ -9,7 +9,9 @@ forwards the request to it, as LM Studio does.
 The launcher runs no inference itself. It supervises one `infernix-serve` process at a time on a
 private loopback port and relays requests and streamed answers to it. The server never outlives
 the launcher: if the launcher ends without stopping it (a crash, a forced kill), the system ends
-the server too, on Windows and Linux, so it does not keep holding the GPU.
+the server too, on Windows and Linux, so it does not keep holding the GPU. The one other program it
+runs is the ablation-sidecar fitter of the [Ablation](#ablation) page, which starts engines of its own
+and holds the GPU while it runs.
 
 ## Start
 
@@ -35,7 +37,7 @@ The console prints the addresses and the browser opens the web UI:
 | `--serve FILE` | the `infernix-serve` to run (default: the one beside the launcher) |
 | `--no-browser` | do not open the web UI |
 | `--ui-dir DIR` | serve the web UI from a folder (web UI development) |
-
+| `--ablate-tool DIR` | the sidecar fitter the [Ablation](#ablation) page runs: the folder holding `ablate.py` (default: the `ablate` folder beside the launcher) |
 Ctrl+C stops the loaded model in order, so it saves its prefix cache and expert-cache state, pauses
 running downloads and exits. Closing the console window, signing out or shutting Windows down does
 the same, but Windows ends the launcher and the model about 5 seconds after it: a save not finished
@@ -62,7 +64,10 @@ launcher is portable and its memory travels with its folder:
 Beside it are the logs ([Event log](#event-log); **Settings → Logging** can move them to another
 folder), `infernix-launcher-usage.json` ([Usage](#usage)), `chats/` (one file per chat, with its
 images), `launcher-prefix-cache/`, each model's saved prefix cache when **Keep each model's prefix
-cache** is on (several GB per model), and the scratch folders `plans/` and `updates/`.
+cache** is on (several GB per model), `ablation/` ([Ablation](#ablation): the fitter's packages, prompt
+sets, run folders with their recordings, up to a few GB a run, and the sidecars it made), and the scratch
+folders `plans/` and `updates/`. A portable Python the Ablation page downloaded is `ablate-python` beside the
+launcher itself.
 
 The memory belongs to that copy of the launcher, wherever it is started from: unzipping a new
 release into another folder starts afresh, so copy `infernix-launcher.json` across (or start the new
@@ -158,6 +163,11 @@ folder levels deep, reading file headers only:
   rank and modules its config names. It is matched to the dense models of that base (an adapter of
   `Qwen/Qwen3.8-27B`, or of a repackaging such as `unsloth/Qwen3.8-27B-bnb-4bit`, to the Qwen3.8-27B
   artifacts); whether `infernix-serve` can apply it is the server's to say (below).
+- **Ablation sidecars** ([`--ablate`](ablate.md)): a folder's `sidecar.json` in the `ablate-direction-v2`
+  format with the direction file it names, named by the folder, with the layers it cuts. It is matched
+  to the models whose hidden size and layer count it fits, the artifact it was fitted on (its
+  `artifact_id`) first. A base direction that cuts no layer, another program's `sidecar.json` and the
+  trial sidecars inside a `tools/ablate` run folder are not listed; the run's exports are.
 
 Folders are rescanned when they change in the launcher, after a download and every minute. A folder
 whose listing fails part way (a network share that goes away, say) is marked as scanned only in
@@ -165,11 +175,12 @@ part, with the reason; the files found before it stay listed.
 
 **Models** shows each folder's size, the free space on its drive (read by the last scan, so a
 sleeping network drive never holds up the web UI or the API), and each model's, drafter's,
-volume's and adapter's size on disk. **Delete files** removes a model's artifact (every part), a
-drafter, an n-gram volume or a LoRA adapter from the disk after you type its file (an adapter's:
-folder) name. A model's deletion takes the files at the location shown (every part, its
-`.conversion.json` and `.expert-state`) and its configurations; an adapter's takes its two files
-and then its folder when nothing else is left in it; files a running server uses cannot be deleted.
+volume's, adapter's and sidecar's size on disk. **Delete files** removes a model's artifact (every
+part), a drafter, an n-gram volume, a LoRA adapter or an ablation sidecar from the disk after you type
+its file (an adapter's: folder; a sidecar's: `sidecar.json`) name. A model's deletion takes the files at
+the location shown (every part, its `.conversion.json` and `.expert-state`) and its configurations; an
+adapter's takes its two files and a sidecar's its `sidecar.json` and direction file, then the folder
+when nothing else is left in it; files a running server uses cannot be deleted.
 
 ## Configure a model
 
@@ -299,6 +310,69 @@ Downloads run one repository at a time, each file in 64 MiB pieces over several 
 resumes where it stopped (a piece counts as done once it is on the disk). A finished file is checked
 against Hugging Face's hash (an LFS file's SHA-256, else its git blob id) and renamed into place;
 the destination becomes a model folder and is scanned. A Hugging Face token (settings, `HF_TOKEN`, or the `huggingface-cli login` token file) is sent for gated repositories.
+
+## Ablation
+
+**Ablation** makes a refusal-ablation sidecar ([`--ablate`](ablate.md)) for one of the library's models
+on this computer with the fitter in `tools/ablate` ([fitting guide](ablate-fitting.md)). It records the
+model's hidden states on harmful and harmless prompts and computes the direction its activations use to
+refuse. It then searches for the layers and strengths whose cut removes the most refusals while the
+first token on harmless prompts stays close to the stock model's (first-token KL below 0.4 on 40 held-out
+prompts of each list), grades the pick on a test pair the fit never saw and exports it. The page has
+three steps:
+
+1. **The tool.** A release keeps the fitter in the `ablate` folder beside the launcher (`--ablate-tool`
+   names another; a build tree finds `tools/ablate` of the checkout it is in). It needs Python 3.11 or
+   newer with pip: the launcher tries the Pythons the Windows `py` launcher lists, then `python3` and
+   `python` on PATH, runs each and takes the first new enough with pip (a Microsoft Store stub, a removed
+   Python, or Debian's and Ubuntu's Python without its `python3-pip` package is passed over); **Use this
+   Python** names one. When none is found, **Set up** first downloads a portable one: CPython 3.13 from
+   [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (the builds `uv`
+   installs; PSF licence; x86-64 only; a 46 MiB download that unpacks to about 150 MiB on Windows, 73 MiB
+   and about 560 MiB on Linux), one release pinned and
+   checked against its SHA-256, unpacked with the system's `tar` into `ablate-python` beside
+   `infernix-launcher` (whose folder must be writable for it); once there, it is the Python used. Set up
+   then installs the fitter's packages (numpy and optuna, about 40 MB from PyPI) with that Python's pip
+   into `ablation/packages` in the launcher's folder; nothing is installed into the Python itself.
+   Another Python version, or a launcher update that changes the requirements, asks for Set up again.
+2. **Prompt sets.** **Download** fetches a public set from its publishers' pinned files, checks their
+   SHA-256 and converts them to the fitter's lists in `ablation/prompts/<set>`, the publishers'
+   licences shown beside each source. A sidecar records its sets and their licences in its
+   `generation.source`.
+
+   | Set | Fit prompts | Test pair | Licences |
+   |---|---|---|---|
+   | AdvBench + Alpaca (heretic's defaults) | 400 AdvBench behaviors, 400 Alpaca instructions | JBB-Behaviors, harmful and benign | AdvBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 (non-commercial use; its README limits it to research) |
+   | HarmBench + Alpaca | 200 HarmBench standard behaviors, 200 Alpaca instructions | JBB-Behaviors, harmful and benign | HarmBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 |
+
+   Test prompts that are also fit prompts are dropped from the test pair (11 of JBB's harmful 100 are
+   AdvBench behaviors).
+3. **Make a sidecar.** Choose the model (a configuration: its launch parameters and environment are
+   used as they are, without its own sidecar, since a sidecar is fitted to the model as you run it), the
+   prompt set, the search (**Quick** 150 trials, **Standard** 300, the fitter's default, **Thorough**
+   600) and the sidecar's name, then **Start the run**. The fitter reads the configuration first and
+   refuses one it cannot fit, with its reason, before anything changes.
+
+A run takes the whole GPU. The loaded model is unloaded first, and no model loads until the run ends:
+requests for a model are refused with the reason, and **Load** and the memory plan say so. Each trial
+starts the model twice (a generating engine for the refusals, a scoring one for the KL), so a trial takes
+roughly half a minute to a minute and a half on a large model, and a standard run several hours. The
+page shows the phases, the trials, the stock model's refusals, the best trial so far, an estimate of the
+time left and the fitter's output.
+
+**Stop** asks the fitter to stop its engines (each saves its expert-cache state) and keeps every
+finished trial; **End now**, while it stops, ends it and its engines at once and loses the trial under
+way. Starting the same configuration, prompt set and name again continues the same run folder
+(`ablation/runs/<name>-<hash>`, with its recordings and trials), as **Run again** does after a stop or a
+failure; a changed command line, environment or `infernix-serve` starts a fresh one. The launcher stops
+a run before it exits; a run it could not finish shows as stopped when it starts again.
+
+The pick is the trial with the fewest held-out refusals among those whose KL is below the target, then
+the lowest KL. No sidecar is written when the stock model refuses none of the held-out prompts, no
+trial is below the target, or none refuses fewer than the stock model; the page says which. A sidecar
+goes to `ablation/sidecars/<name>`, which becomes a model folder, so it is listed on **Models** and
+offered first in its model's **Ablation sidecar** field; **Use it with** sets it there. Its test-pair
+results (refusals on both halves, and the KL where the stock model answered) are shown with it.
 
 ## Connect coding tools
 
@@ -615,4 +689,7 @@ instead, so the form shows every control.
 and checks the features (configurations, model ids, environment, the memory breakdown, script export
 and import, the fit plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys
 and sign-in, chats, idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
-started on a console without a window still stops its server in order.
+started on a console without a window still stops its server in order. Its `ablation` group runs the
+[Ablation](#ablation) page's backend with `tools/launcher/ablate_stub.py` in place of the fitter (Set up installs a
+local wheel, so no network): the GPU taken from a loaded model and given back, a refused configuration, stop and
+resume, End now with a tool that ignores the stop, and the last run after a restart.

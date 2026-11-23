@@ -102,6 +102,12 @@ New-Item -ItemType Directory -Force "$stage\chat_templates" | Out-Null
 foreach ($template in 'qwen3_6.jinja', 'qwen3_8.jinja', 'LICENSE') {
     Copy-Item "$repo\tools\chat_templates\$template" "$stage\chat_templates"
 }
+# The ablation-sidecar fitter the launcher's Ablation page runs (tools/ablate; Python's own caches left out).
+New-Item -ItemType Directory -Force "$stage\ablate\ablatelib" | Out-Null
+foreach ($file in 'ablate.py', 'README.md', 'requirements.txt', 'requirements-eval.txt') {
+    Copy-Item "$repo\tools\ablate\$file" "$stage\ablate"
+}
+Copy-Item "$repo\tools\ablate\ablatelib\*.py" "$stage\ablate\ablatelib"
 
 $zip = "$OutDir\$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

@@ -1,4 +1,5 @@
 import type {
+  AblationState,
   Activity,
   ApiError,
   ApiKeyScope,
@@ -127,6 +128,7 @@ export const api = {
   deleteDrafter: (key: string, confirm: string) => request<Library>("DELETE", `drafters/${enc(key)}`, { confirm }),
   deleteNgramVolume: (key: string, confirm: string) => request<Library>("DELETE", `ngram/${enc(key)}`, { confirm }),
   deleteAdapter: (key: string, confirm: string) => request<Library>("DELETE", `adapters/${enc(key)}`, { confirm }),
+  deleteSidecar: (key: string, confirm: string) => request<Library>("DELETE", `sidecars/${enc(key)}`, { confirm }),
 
   load: (id: string, force = false) => request<unknown>("POST", `models/${enc(id)}/load`, { force }),
   unload: (force = false) => request<unknown>("POST", "unload", { force }),
@@ -182,6 +184,16 @@ export const api = {
   infernixRelease: () => request<InfernixRelease>("GET", "infernix/release"),
   downloadInfernixUpdate: () => request<InfernixRelease>("POST", "infernix/update"),
   installInfernixUpdate: () => request<InfernixRelease>("POST", "infernix/install"),
+
+  // The Ablation page.
+  ablation: () => request<AblationState>("GET", "ablation"),
+  ablationPython: (path: string) => request<AblationState>("POST", "ablation/python", { path }),
+  ablationDetectPython: () => request<AblationState>("POST", "ablation/python/detect"),
+  ablationSetup: () => request<AblationState>("POST", "ablation/setup"),
+  ablationFetch: (preset: string) => request<AblationState>("POST", `ablation/prompts/${enc(preset)}`),
+  ablationStart: (body: { config: string; preset: string; trials: number; name: string }) =>
+    request<AblationState>("POST", "ablation/runs", body),
+  ablationStop: (now = false) => request<AblationState>("POST", "ablation/stop", { now }),
 };
 
 /** The public model list exactly as a coding tool requests it. */

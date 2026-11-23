@@ -212,10 +212,10 @@ export function useDeleteConfig() {
   });
 }
 
-export type FileKind = "model" | "drafter" | "ngram" | "adapter";
+export type FileKind = "model" | "drafter" | "ngram" | "adapter" | "sidecar";
 
-/** Deletes an artifact's, a drafter's, an n-gram volume's or a LoRA adapter's files; the launcher
- * answers the new library. `confirm` is the file (an adapter's: folder) name the user typed. */
+/** Deletes an artifact's, a drafter's, an n-gram volume's, a LoRA adapter's or an ablation sidecar's files; the
+ * launcher answers the new library. `confirm` is the file (an adapter's or sidecar's: folder) name the user typed. */
 export function useDeleteFiles() {
   const qc = useQueryClient();
   return useMutation({
@@ -226,7 +226,9 @@ export function useDeleteFiles() {
           ? api.deleteDrafter(key, confirm)
           : kind === "adapter"
             ? api.deleteAdapter(key, confirm)
-            : api.deleteNgramVolume(key, confirm),
+            : kind === "sidecar"
+              ? api.deleteSidecar(key, confirm)
+              : api.deleteNgramVolume(key, confirm),
     onSuccess: (library, { kind, key }) => {
       qc.setQueryData(["library"], library);
       if (kind === "model") {

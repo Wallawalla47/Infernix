@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useLive } from "@/lib/events";
 import { ThemeProvider, useTheme } from "@/lib/theme";
+import { AblationPage } from "@/pages/Ablation";
 import { ChatPage } from "@/pages/Chat";
 import { ConnectPage } from "@/pages/Connect";
 import { DashboardPage } from "@/pages/Dashboard";
@@ -60,6 +61,7 @@ export function App() {
                 <Route path="models" element={<ModelsPage />} />
                 <Route path="models/:key" element={<ModelConfigurePage />} />
                 <Route path="discover" element={<DiscoverPage />} />
+                <Route path="ablation" element={<AblationPage />} />
                 <Route path="connect" element={<ConnectPage />} />
                 <Route path="usage" element={<UsagePage />} />
                 <Route path="logs" element={<LogsPage />} />

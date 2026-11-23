@@ -2,6 +2,7 @@
 
 #include "launcher/process.h"
 
+#include <algorithm>
 #include <cctype>
 #include <exception>
 #include <mutex>
@@ -58,6 +59,11 @@ std::vector<ServeOption> parse_serve_help(std::string_view help) {
             const std::size_t space = head.find(' ');
             std::string flag        = head.substr(0, space);
             if (!flag.empty() && flag.back() == ',') { flag.pop_back(); }
+            // The NOTES section names options again ("  --greedy forces temperature 0"): the first listing counts.
+            if (std::any_of(options.begin(), options.end(), [&](const ServeOption& known) { return known.flag == flag; })) {
+                current = nullptr;
+                continue;
+            }
             option.flag = flag;
             if (space != std::string::npos) {
                 std::string arg = trim(head.substr(space));

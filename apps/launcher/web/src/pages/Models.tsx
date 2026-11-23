@@ -20,6 +20,7 @@ import {
   Plus,
   Puzzle,
   RefreshCw,
+  Scissors,
   Search,
   SlidersHorizontal,
   Sparkles,
@@ -38,6 +39,7 @@ import {
   DeleteFilesDialog,
   drafterDeleteTarget,
   modelDeleteTarget,
+  sidecarDeleteTarget,
   volumeDeleteTarget,
   type DeleteTarget,
 } from "@/components/models/DeleteFilesDialog";
@@ -65,6 +67,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Hint } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type {
+  AblationSidecar,
   DrafterArtifact,
   InstanceInfo,
   Library,
@@ -597,14 +600,15 @@ function DeleteButton({ label, onClick }: { label: string; onClick: () => void }
 }
 
 function Companions({ library, actions }: { library: Library; actions: Actions }) {
-  const { drafters, ngram_volumes: volumes, adapters } = library;
-  if (drafters.length === 0 && volumes.length === 0 && adapters.length === 0) return null;
+  const { drafters, ngram_volumes: volumes, adapters, sidecars } = library;
+  if (drafters.length === 0 && volumes.length === 0 && adapters.length === 0 && sidecars.length === 0) return null;
   return (
     <section className="flex flex-col gap-3">
       <div>
         <h2 className="text-sm font-semibold">Companions</h2>
         <p className="text-xs text-muted-foreground">
-          Drafters, n-gram tables and LoRA adapters found beside your models; pick them per configuration under Configure.
+          Drafters, n-gram tables, LoRA adapters and ablation sidecars found beside your models; pick them per
+          configuration under Configure.
         </p>
       </div>
       <div className="grid gap-4 lg:grid-cols-2">
@@ -742,6 +746,60 @@ function Companions({ library, actions }: { library: Library; actions: Actions }
             )}
           </CardContent>
         </Card>
+        <Card className="gap-2">
+          <CardHeader>
+            <CardTitle>
+              <Scissors className="size-4 text-muted-foreground" />
+              Ablation sidecars
+            </CardTitle>
+            <CardDescription>
+              Directions cut out at load (--ablate, refusal removal);{" "}
+              <Link to="/ablation" className="font-medium text-foreground underline-offset-4 hover:underline">
+                make one
+              </Link>
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="px-0">
+            {sidecars.length === 0 ? (
+              <div className="px-4 text-sm text-muted-foreground">None found.</div>
+            ) : (
+              <ul className="divide-y">
+                {sidecars.map((sidecar: AblationSidecar) => (
+                  <li key={sidecar.key} className="flex items-center gap-3 py-2.5 pr-2 pl-4">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">{sidecar.name}</div>
+                      <Hint label={[sidecar.path, sidecar.source].filter(Boolean).join("\n")}>
+                        <div className="cursor-default truncate text-xs text-muted-foreground">
+                          {sidecar.fitted_artifact ? `${sidecar.fitted_artifact} · ` : ""}
+                          {sidecar.dir}
+                        </div>
+                      </Hint>
+                    </div>
+                    <Badge variant="muted">{sidecar.rows === 1 ? "shared" : "per layer"}</Badge>
+                    <Hint
+                      label={
+                        sidecar.compatible_models.length === 0
+                          ? `No model in your folders has hidden size ${sidecar.direction_dim}`
+                          : sidecar.fitted_models.length > 0
+                            ? `Fitted on ${modelNames(library, sidecar.fitted_models)}; fits ${modelNames(library, sidecar.compatible_models)}`
+                            : `Fits ${modelNames(library, sidecar.compatible_models)} (fitted on none of them)`
+                      }
+                    >
+                      <span className="w-20 cursor-default text-right text-xs text-muted-foreground tabular-nums">
+                        {sidecar.compatible_models.length} model{sidecar.compatible_models.length === 1 ? "" : "s"}
+                      </span>
+                    </Hint>
+                    <span className="w-16 text-right text-xs tabular-nums">{formatBytes(sidecar.bytes)}</span>
+                    <DeleteButton
+                      label={`Delete ${sidecar.name}`}
+                      onClick={() => actions.deleteFiles("sidecar", sidecar.key)}
+                    />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
       </div>
     </section>
   );
@@ -820,6 +878,10 @@ export function ModelsPage() {
     if (deletingFiles.kind === "adapter") {
       const adapter = library.adapters.find((item) => item.key === deletingFiles.key);
       return adapter ? adapterDeleteTarget(adapter, instance) : null;
+    }
+    if (deletingFiles.kind === "sidecar") {
+      const sidecar = library.sidecars.find((item) => item.key === deletingFiles.key);
+      return sidecar ? sidecarDeleteTarget(sidecar, instance) : null;
     }
     const volume = library.ngram_volumes.find((item) => item.key === deletingFiles.key);
     return volume ? volumeDeleteTarget(volume, instance) : null;

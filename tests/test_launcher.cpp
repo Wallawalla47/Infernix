@@ -192,10 +192,14 @@ void test_help() {
         "                             the requested chunk\n"
         "  --reproducible             run the reproducible route\n"
         "  --spec auto|off|mtp|dflash|dflash2\n"
-        "                             speculative decoding\n";
+        "                             speculative decoding\n"
+        "\n"
+        "NOTES\n"
+        "  --reproducible forces the reproducible kernels.\n";
     const ServeOptions serve{.found = true, .options = parse_serve_help(help)};
     const std::vector<ServeOption>& options = serve.options;
-    check(options.size() == 5, "five options parsed");
+    check(options.size() == 5, "five options parsed (a NOTES line naming one again is not another)");
+    check(serve.takes_value("--reproducible") == false, "the first listing gives the arity");
     if (options.size() == 5) {
         check(options[0].flag == "--help" && !options[0].arg, "--help with its alias, no argument");
         check(options[1].flag == "--max-context" && options[1].arg == "N" && options[1].section == "MODEL & CONTEXT",
@@ -977,6 +981,86 @@ void test_scan_folder() {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// Ablation sidecars (--ablate) in the model folders: an ablate-direction-v2 sidecar.json with its direction file, the
+// models whose geometry it fits and the one it was fitted on; a base direction (no cut), another program's
+// sidecar.json and a tools/ablate run's trial sidecars are not listed.
+void test_library_sidecars() {
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "infernix-launcher-test-sidecars";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    const auto write = [](const std::filesystem::path& path, const std::string& text) {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream(path, std::ios::binary) << text;
+    };
+    const std::string id = "00112233445566778899aabbccddeeff";
+    const Json cut = {{"format", "ablate-direction-v2"},
+                      {"direction_dtype", "float32"},
+                      {"direction_dim", 4},
+                      {"direction_file", "d.f32.bin"},
+                      {"default_alpha", 0.0},
+                      {"alpha_attn_per_layer", {{"1", 1.0}, {"2", 0.0}}},
+                      {"alpha_mlp_per_layer", {{"3", 0.5}}},
+                      {"artifact_id", id},
+                      {"generation", {{"source", "test prompts"}, {"fitted_under", {{"artifact", "M-00001-of-00001.infernix"}}}}}};
+    write(root / "refusal-cut" / "sidecar.json", cut.dump());
+    write(root / "refusal-cut" / "d.f32.bin", std::string(16, '\0'));
+    Json base = cut;
+    base["alpha_attn_per_layer"] = Json::object();
+    base["alpha_mlp_per_layer"]  = Json::object();
+    write(root / "base" / "sidecar.json", base.dump());
+    write(root / "base" / "d.f32.bin", std::string(16, '\0'));
+    Json short_file = cut;
+    short_file["direction_layout"] = "per_layer";
+    write(root / "short" / "sidecar.json", short_file.dump());
+    write(root / "short" / "d.f32.bin", std::string(10, '\0'));
+    write(root / "other-tool" / "sidecar.json", Json{{"format", "something-else"}}.dump());
+    // A tools/ablate run directory: its trial sidecars stay out of the library, its export does not.
+    write(root / "run" / "run.json", Json{{"schema", "infernix-ablate-run-2"}}.dump());
+    write(root / "run" / "fit" / "s1" / "t0" / "sidecar.json", cut.dump());
+    write(root / "run" / "fit" / "s1" / "t0" / "d.f32.bin", std::string(16, '\0'));
+    write(root / "run" / "export" / "share" / "sidecar.json", cut.dump());
+    write(root / "run" / "export" / "share" / "d.f32.bin", std::string(16, '\0'));
+
+    const LibraryScan scan = scan_library({root}, 5);
+    std::vector<std::string> names;
+    for (const ScannedSidecar& sidecar : scan.sidecars) { names.push_back(sidecar.name); }
+    check(names == std::vector<std::string>{"refusal-cut", "share"},
+          "a sidecar that cuts, and a run's export, are listed; a base direction, another file and trials are not");
+    check(scan.dirs.size() == 1 && scan.dirs[0].sidecars == 2, "the folder counts its sidecars");
+    check(std::any_of(scan.issues.begin(), scan.issues.end(),
+                      [](const ScanIssue& issue) { return issue.path.parent_path().filename() == "short"; }),
+          "a direction file of the wrong size is a scan issue");
+    check(std::none_of(scan.issues.begin(), scan.issues.end(),
+                       [](const ScanIssue& issue) { return issue.path.parent_path().filename() == "other-tool"; }),
+          "another program's sidecar.json is no issue");
+    if (!scan.sidecars.empty()) {
+        const ScannedSidecar& sidecar = scan.sidecars[0];
+        check(sidecar.direction_dim == 4 && sidecar.rows == 1 && sidecar.attn_layers == 1 && sidecar.mlp_layers == 1 &&
+                  sidecar.layer_bound == 4 && sidecar.bytes == 16 && sidecar.artifact_id == id &&
+                  sidecar.fitted_artifact == "M-00001-of-00001.infernix" && sidecar.source == "test prompts",
+              "a sidecar's geometry, cut layers and provenance");
+        const Json json = to_json(scan)["sidecars"];
+        check(json.size() == 2 && json[0]["direction_dim"] == 4 && json[0]["artifact_id"] == id,
+              "the library lists the sidecars");
+
+        ScannedModel model;
+        model.key         = id;
+        model.hidden_size = 4;
+        model.num_layers  = 4;
+        check(sidecar_fits(model, sidecar), "a sidecar fits a model of its hidden size and layers");
+        ScannedModel fewer = model;
+        fewer.num_layers   = 3;
+        ScannedModel wider = model;
+        wider.hidden_size  = 8;
+        check(!sidecar_fits(fewer, sidecar) && !sidecar_fits(wider, sidecar),
+              "not one with fewer layers than its tables name, nor another hidden size");
+        ScannedSidecar stack = sidecar;
+        stack.rows           = 2;
+        check(!sidecar_fits(model, stack), "a per-layer stack needs one row a layer");
+    }
+    std::filesystem::remove_all(root, ignored);
+}
+
 // LoRA adapters (--lora) in the model folders: a folder with adapter_config.json and adapter_model.safetensors, the
 // models of the base it names, and the Hub's adapter search.
 void test_library_adapters() {
@@ -1489,6 +1573,7 @@ int main(int argc, char** argv) {
     test_library_part_paths();
     test_scan_folder();
     test_library_adapters();
+    test_library_sidecars();
     test_router();
     test_router_cancel();
     test_load_advice();

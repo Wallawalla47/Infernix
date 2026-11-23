@@ -6,6 +6,7 @@
 // supervisor's watchdog reports crashes, lock-ups and stalls; the launcher restarts the model (at
 // most kRestartLimit times in kRestartWindow) and records everything in its event log.
 
+#include "launcher/ablation.h"
 #include "launcher/artifact_scan.h"
 #include "launcher/chats.h"
 #include "launcher/downloads.h"
@@ -45,6 +46,8 @@ struct LauncherOptions {
     std::optional<int> port;
     std::optional<std::filesystem::path> serve_executable;
     std::optional<std::filesystem::path> ui_dir;
+    // The folder holding tools/ablate's ablate.py (--ablate-tool); otherwise found beside the launcher.
+    std::optional<std::filesystem::path> ablate_tool;
     bool open_browser = true;
     std::string version;
     // The command-line arguments, for starting again after an update.
@@ -137,6 +140,14 @@ private:
 
     // Model lifecycle and the watchdog's incidents.
     Router::Loaded load_model(const std::string& key);
+    // The Ablation page's run holds the GPU: no model loads (load_model refuses, without holding the model off as a
+    // failed load) until it ends. take_gpu_for_ablation unloads the model and returns once no server runs (false,
+    // with the GPU released again, when `abort` or the launcher's exit came first).
+    bool take_gpu_for_ablation(const std::function<bool()>& abort);
+    void release_gpu_from_ablation();
+    [[nodiscard]] bool ablation_holds_gpu() const;
+    // The run of a configuration: its command line (managed flags and --ablate removed) and environment.
+    [[nodiscard]] AblationRun ablation_run_for(const std::string& config_id);
     [[nodiscard]] Json instance_json() const;
     // Each takes its snapshot and publishes it in one step (threads publishing at once never publish an older state
     // after a newer one, which the UI would show until the next change).
@@ -201,6 +212,7 @@ private:
     void register_usage_routes(const std::string& api);
     void register_fs_routes(const std::string& api);
     void register_event_routes(const std::string& api);
+    void register_ablation_routes(const std::string& api);
     // A management route's handler behind admin_allowed, its exceptions answered as JSON errors (400 for an
     // invalid argument or invalid JSON, 502 for any other failure).
     [[nodiscard]] httplib::Server::Handler admin(httplib::Server::Handler handler);
@@ -299,6 +311,11 @@ private:
     std::unique_ptr<Router> router_;
     std::unique_ptr<Telemetry> telemetry_;
     std::unique_ptr<Downloads> downloads_;
+    std::unique_ptr<Ablation> ablation_;
+    // An ablation run holds the GPU. Read without the lock (a server's start publishes the instance, which reads it);
+    // closed under it, which load_model holds around a server's start, so it closes between starts.
+    std::mutex gpu_gate_mutex_;
+    std::atomic<bool> gpu_gate_{false};
 
     mutable std::mutex activity_mutex_;
     std::deque<ProxyRecord> activity_;

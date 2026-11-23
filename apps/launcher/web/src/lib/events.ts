@@ -331,6 +331,9 @@ export function startEvents(qc: QueryClient): () => void {
     listen(es, "model_updates", (updates: ModelUpdates) => {
       qc.setQueryData(MODEL_UPDATES_KEY, updates);
     });
+    listen(es, "ablation", (state) => {
+      qc.setQueryData(["ablation"], state);
+    });
 
     es.onerror = () => {
       es.close();

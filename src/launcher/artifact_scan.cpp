@@ -23,6 +23,9 @@ constexpr std::size_t kNgramHeaderBytes   = 68;
 constexpr std::uint64_t kMaxAdapterConfigBytes = 4ull << 20; // a PEFT adapter_config.json is about 1 kB
 constexpr const char* kAdapterConfig  = "adapter_config.json";
 constexpr const char* kAdapterWeights = "adapter_model.safetensors";
+constexpr const char* kSidecarFile    = "sidecar.json";
+constexpr std::uint64_t kMaxSidecarBytes = 1ull << 20; // a sidecar.json is a few kB
+constexpr const char* kSidecarFormat  = "ablate-direction-v2";
 
 // NVIDIA's published FP8 table records no scale in its header; infernix-serve knows it by id.
 constexpr const char* kKnownFp8Volumes[] = {"59e5d77e802ac95d8faf0a800b8f2301"};
@@ -177,6 +180,39 @@ std::optional<ScannedAdapter> read_adapter(const std::filesystem::path& config_p
     adapter.config   = parse_adapter_config(config);
     adapter.modified = modified_ms(folder / kAdapterWeights);
     return adapter;
+}
+
+// A sidecar.json in the folders: nothing when it is another file of that name or a sidecar cutting no layer.
+std::optional<ScannedSidecar> read_sidecar(const std::filesystem::path& path, std::optional<std::string>& issue) {
+    const std::uint64_t bytes = file_size_or_zero(path);
+    if (bytes == 0 || bytes > kMaxSidecarBytes) { return std::nullopt; }
+    std::ifstream in(path, std::ios::binary);
+    std::string text(static_cast<std::size_t>(bytes), '\0');
+    if (!in.read(text.data(), static_cast<std::streamsize>(text.size()))) { return std::nullopt; }
+    Json sidecar;
+    try {
+        sidecar = Json::parse(text);
+    } catch (const Json::exception&) {
+        return std::nullopt;
+    }
+    return parse_sidecar(path, sidecar, issue);
+}
+
+// A tools/ablate run directory's fit/ folder (one trial sidecar per trial): not walked.
+bool ablate_run_fit_folder(const std::filesystem::path& dir) {
+    if (!iequals(path_utf8(dir.filename()), "fit")) { return false; }
+    const std::filesystem::path run = dir.parent_path() / "run.json";
+    const std::uint64_t bytes       = file_size_or_zero(run);
+    if (bytes == 0 || bytes > kMaxSidecarBytes) { return false; }
+    std::ifstream in(run, std::ios::binary);
+    std::string text(static_cast<std::size_t>(bytes), '\0');
+    if (!in.read(text.data(), static_cast<std::streamsize>(text.size()))) { return false; }
+    try {
+        const Json json = Json::parse(text);
+        return json.is_object() && json.value("schema", std::string{}).starts_with("infernix-ablate-run-");
+    } catch (const Json::exception&) {
+        return false;
+    }
 }
 
 std::optional<std::string> recipe_of(const Json& provenance) {
@@ -538,11 +574,22 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             const std::filesystem::directory_entry& entry = *it;
             std::error_code status_error;
             if (entry.is_directory(status_error)) {
-                if (it.depth() >= depth) { it.disable_recursion_pending(); }
+                if (it.depth() >= depth || ablate_run_fit_folder(entry.path())) { it.disable_recursion_pending(); }
                 continue;
             }
             if (!entry.is_regular_file(status_error)) { continue; }
             const std::filesystem::path& path = entry.path();
+            if (iequals(path_utf8(path.filename()), kSidecarFile)) {
+                const std::string id = path_utf8(std::filesystem::weakly_canonical(path, status_error));
+                if (!visited_files.insert(id).second) { continue; }
+                std::optional<std::string> issue;
+                if (std::optional<ScannedSidecar> sidecar = read_sidecar(path, issue)) {
+                    ++dir.sidecars;
+                    scan.sidecars.push_back(std::move(*sidecar));
+                }
+                if (issue) { scan.issues.push_back({path, *issue}); }
+                continue;
+            }
             if (iequals(path_utf8(path.filename()), kAdapterConfig)) {
                 const std::string id = path_utf8(std::filesystem::weakly_canonical(path, status_error));
                 if (!visited_files.insert(id).second) { continue; }
@@ -661,6 +708,16 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
     std::sort(scan.adapters.begin(), scan.adapters.end(), [](const ScannedAdapter& a, const ScannedAdapter& b) {
         return std::tie(a.name, a.key) < std::tie(b.name, b.key);
     });
+    for (ScannedSidecar& sidecar : scan.sidecars) {
+        for (const ScannedModel& model : scan.models) {
+            if (!sidecar_fits(model, sidecar)) { continue; }
+            sidecar.compatible_models.push_back(model.key);
+            if (sidecar.artifact_id && *sidecar.artifact_id == model.key) { sidecar.fitted_models.push_back(model.key); }
+        }
+    }
+    std::sort(scan.sidecars.begin(), scan.sidecars.end(), [](const ScannedSidecar& a, const ScannedSidecar& b) {
+        return std::tie(a.name, a.key) < std::tie(b.name, b.key);
+    });
     std::sort(scan.models.begin(), scan.models.end(), [](const ScannedModel& a, const ScannedModel& b) {
         return std::tie(a.family_label, a.name) < std::tie(b.family_label, b.name);
     });
@@ -676,6 +733,7 @@ Json to_json(const LibraryScan& scan) {
                         {"drafters", dir.drafters},
                         {"ngram_volumes", dir.ngram_volumes},
                         {"adapters", dir.adapters},
+                        {"sidecars", dir.sidecars},
                         {"free_bytes", dir.free_bytes ? Json(*dir.free_bytes) : Json(nullptr)},
                         {"total_bytes", dir.total_bytes ? Json(*dir.total_bytes) : Json(nullptr)},
                         {"error", dir.error ? Json(*dir.error) : Json(nullptr)}});
@@ -766,6 +824,27 @@ Json to_json(const LibraryScan& scan) {
             {"modified", a.modified},
         });
     }
+    const auto optional_text = [](const std::optional<std::string>& text) { return text ? Json(*text) : Json(nullptr); };
+    Json sidecars = Json::array();
+    for (const ScannedSidecar& c : scan.sidecars) {
+        sidecars.push_back({
+            {"key", c.key},
+            {"name", c.name},
+            {"path", path_utf8(c.path)},
+            {"dir", path_utf8(c.path.parent_path())},
+            {"bytes", c.bytes},
+            {"direction_dim", c.direction_dim},
+            {"rows", c.rows},
+            {"attn_layers", c.attn_layers},
+            {"mlp_layers", c.mlp_layers},
+            {"artifact_id", optional_text(c.artifact_id)},
+            {"fitted_artifact", optional_text(c.fitted_artifact)},
+            {"source", optional_text(c.source)},
+            {"compatible_models", c.compatible_models},
+            {"fitted_models", c.fitted_models},
+            {"modified", c.modified},
+        });
+    }
     Json issues = Json::array();
     for (const ScanIssue& issue : scan.issues) {
         issues.push_back({{"path", path_utf8(issue.path)}, {"message", issue.message}});
@@ -777,6 +856,7 @@ Json to_json(const LibraryScan& scan) {
             {"drafters", drafters},
             {"ngram_volumes", volumes},
             {"adapters", adapters},
+            {"sidecars", sidecars},
             {"issues", issues}};
 }
 
@@ -833,6 +913,85 @@ bool adapter_matches(const ScannedModel& model, const ScannedAdapter& adapter) {
     if (model.family != "qwen3.8-27b" && model.family != "qwen3.6-27b") { return false; }
     // "Qwen/Qwen3.8-27B", "unsloth/Qwen3.8-27B-bnb-4bit", ...: the family's name in the base model's.
     return lower(*adapter.config.base_model).find(model.family) != std::string::npos;
+}
+
+std::optional<ScannedSidecar> parse_sidecar(const std::filesystem::path& path, const Json& sidecar,
+                                            std::optional<std::string>& issue) {
+    if (!sidecar.is_object()) { return std::nullopt; }
+    const auto format = sidecar.find("format");
+    if (format == sidecar.end() || !format->is_string() || format->get<std::string>() != kSidecarFormat) {
+        return std::nullopt;
+    }
+    const auto text = [](const Json& object, const char* key) -> std::optional<std::string> {
+        if (!object.is_object()) { return std::nullopt; }
+        const auto it = object.find(key);
+        return it != object.end() && it->is_string() ? std::optional<std::string>(it->get<std::string>()) : std::nullopt;
+    };
+    ScannedSidecar result;
+    result.path = path;
+    result.key  = sha256_hex(path_utf8(path)).substr(0, 32);
+    result.name = path_utf8(path.parent_path().filename());
+    const auto dim = sidecar.find("direction_dim");
+    if (dim == sidecar.end() || !dim->is_number_unsigned() || dim->get<std::uint64_t>() == 0) {
+        issue = "ablation sidecar: direction_dim is not a positive integer";
+        return std::nullopt;
+    }
+    result.direction_dim            = dim->get<std::uint64_t>();
+    const std::optional<std::string> file = text(sidecar, "direction_file");
+    if (!file || !safe_relative(*file)) {
+        issue = "ablation sidecar: no direction_file beside it";
+        return std::nullopt;
+    }
+    result.direction_file           = path.parent_path() / utf8_path(*file);
+    result.bytes                    = file_size_or_zero(result.direction_file);
+    const std::uint64_t row_bytes   = result.direction_dim * 4;
+    const bool per_layer            = text(sidecar, "direction_layout").value_or("shared") == "per_layer";
+    if (result.bytes == 0 || result.bytes % row_bytes != 0 || (!per_layer && result.bytes != row_bytes)) {
+        issue = "ablation sidecar: " + *file + " is not " + (per_layer ? "whole rows" : "one row") + " of " +
+                std::to_string(result.direction_dim) + " float32 values";
+        return std::nullopt;
+    }
+    result.rows = result.bytes / row_bytes;
+    // The lanes' tables: alpha_attn_per_layer and alpha_mlp_per_layer, or alpha_per_layer for both.
+    const auto lane = [&](const char* key, std::uint64_t& cut) -> bool {
+        const auto table = sidecar.find(key);
+        if (table == sidecar.end()) { return true; }
+        if (!table->is_object()) { return false; }
+        for (const auto& [layer, alpha] : table->items()) {
+            if (!alpha.is_number() || layer.empty() ||
+                !std::all_of(layer.begin(), layer.end(), [](char c) { return c >= '0' && c <= '9'; }) ||
+                layer.size() > 6) {
+                return false;
+            }
+            result.layer_bound = std::max<std::uint64_t>(result.layer_bound, std::stoull(layer) + 1);
+            if (alpha.get<double>() > 0.0) { ++cut; }
+        }
+        return true;
+    };
+    std::uint64_t shared_cut = 0;
+    if (!lane("alpha_attn_per_layer", result.attn_layers) || !lane("alpha_mlp_per_layer", result.mlp_layers) ||
+        !lane("alpha_per_layer", shared_cut)) {
+        issue = "ablation sidecar: an alpha table is not layer indices with numbers";
+        return std::nullopt;
+    }
+    result.attn_layers += shared_cut;
+    result.mlp_layers += shared_cut;
+    if (result.attn_layers == 0 && result.mlp_layers == 0) { return std::nullopt; } // a base direction: no cut
+    result.artifact_id = text(sidecar, "artifact_id");
+    const auto generation  = sidecar.find("generation");
+    if (generation != sidecar.end()) {
+        result.source = text(*generation, "source");
+        if (const auto fitted = generation->find("fitted_under"); generation->is_object() && fitted != generation->end()) {
+            result.fitted_artifact = text(*fitted, "artifact");
+        }
+    }
+    result.modified = modified_ms(path);
+    return result;
+}
+
+bool sidecar_fits(const ScannedModel& model, const ScannedSidecar& sidecar) {
+    return model.hidden_size != 0 && sidecar.direction_dim == model.hidden_size &&
+           (sidecar.rows == 1 || sidecar.rows == model.num_layers) && sidecar.layer_bound <= model.num_layers;
 }
 
 } // namespace infernix::launcher

@@ -68,6 +68,8 @@ void print_usage(const char* program) {
         "  --serve FILE      the infernix-serve executable (default: beside the launcher)\n"
         "  --no-browser      do not open the web UI in a browser\n"
         "  --ui-dir DIR      serve the web UI from DIR instead of the built-in copy (development)\n"
+        "  --ablate-tool DIR the sidecar fitter the Ablation page runs: the folder holding\n"
+        "                    ablate.py (default: the ablate folder beside the launcher)\n"
         "  --version         print the build and exit\n"
         "  --help, -h        show this help and exit\n",
         program, infernix::launcher::path_utf8(infernix::launcher::user_data_dir()).c_str());
@@ -131,6 +133,8 @@ int main(int argc, char** argv) {
             options.serve_executable = std::filesystem::absolute(infernix::launcher::utf8_path(value()));
         } else if (arg == "--ui-dir") {
             options.ui_dir = std::filesystem::absolute(infernix::launcher::utf8_path(value()));
+        } else if (arg == "--ablate-tool") {
+            options.ablate_tool = std::filesystem::absolute(infernix::launcher::utf8_path(value()));
         } else if (arg == "--no-browser") {
             options.open_browser = false;
         } else {

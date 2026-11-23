@@ -20,6 +20,7 @@ add_custom_command(
   VERBATIM)
 
 add_library(infernix_launcher STATIC
+  ablation.cpp
   activity.cpp
   args.cpp
   artifact_scan.cpp
