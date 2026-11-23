@@ -139,6 +139,62 @@ void mix_case() {
     std::printf("dspark_mix (5 columns, 3 dense consumers + the Markov ring of 2 lanes): worst %.3f of the bound\n",
                 worst.ratio);
     check(worst.ratio <= 1.0, "dspark_mix outside its bound");
+
+    // A call wider than the ring (a prompt's append): two lanes of 40 and 23 consecutive positions into a 16-row ring.
+    // Each row must hold the lane's latest position that maps to it (columns that a later column of the lane overwrites
+    // store nothing), the same in every call.
+    constexpr int W = 63;
+    const auto wide_features = random_bf16(static_cast<std::size_t>(W) * 4 * H, rng, 1.0);
+    std::vector<std::int32_t> wide_positions, wide_lanes;
+    for (int c = 0; c < W; ++c) {
+        wide_lanes.push_back(c < 40 ? 0 : 1);
+        wide_positions.push_back(c < 40 ? 300 + c : 1000 + (c - 40));
+    }
+    ik::DSparkMixArgs w = a;
+    w.features  = upload(wide_features);
+    w.columns   = W;
+    w.count     = 1;
+    w.rows[0]   = 3;
+    w.norms[0]  = a.norms[3];
+    w.ring[0]   = kRing;
+    w.out[0]    = zeros<std::uint16_t>(2ULL * kRing * H);
+    w.lane_stride[0] = static_cast<std::int64_t>(kRing) * H;
+    w.positions = upload(wide_positions);
+    w.lanes     = upload(wide_lanes);
+    std::vector<std::uint16_t> first_ring;
+    bool same = true;
+    for (int call = 0; call < 3; ++call) {
+        ik::dspark_mix(w, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "mix wide");
+        const auto ring = download(w.out[0], 2ULL * kRing * H);
+        if (call == 0) {
+            first_ring = ring;
+        } else {
+            same = same && ring == first_ring;
+        }
+    }
+    double l[4], top = -1e300, sum = 0, alpha[4];
+    for (int j = 0; j < 4; ++j) { top = std::max(top, l[j] = bf(fuse[3 * 4 + j])); }
+    for (int j = 0; j < 4; ++j) { sum += std::exp(l[j] - top); }
+    for (int j = 0; j < 4; ++j) { alpha[j] = rbd(std::exp(l[j] - top) / sum); }
+    Worst wide;
+    for (int c = 0; c < W; ++c) {
+        const int lane_last = wide_lanes[c] == 0 ? 39 : W - 1;
+        if (c + kRing <= lane_last) { continue; } // a later column of the lane owns the row
+        std::vector<double> mix(H), ref(H);
+        for (int e = 0; e < H; ++e) {
+            for (int j = 0; j < 4; ++j) { mix[e] += bf(wide_features[(static_cast<std::size_t>(c) * 4 + j) * H + e]) * alpha[j]; }
+        }
+        const double inv = rms_inv(mix.data(), H, 1e-6);
+        double peak      = 0;
+        for (int e = 0; e < H; ++e) { peak = std::max(peak, std::fabs(ref[e] = mix[e] * inv * bf(norms[3][e]))); }
+        const std::size_t row = static_cast<std::size_t>(wide_lanes[c]) * kRing + wide_positions[c] % kRing;
+        for (int e = 0; e < H; ++e) { wide.add(bf(first_ring[row * H + e]), ref[e], std::ldexp(1.0, -8), std::ldexp(peak, -10)); }
+    }
+    std::printf("dspark_mix (63 columns of 2 lanes into a 16-row ring): each row its lane's latest position, worst %.3f of "
+                "the bound; three calls %s\n",
+                wide.ratio, same ? "identical" : "DIFFER");
+    check(wide.ratio <= 1.0 && same, "dspark_mix: a ring row does not hold its lane's latest position, or calls differ");
 }
 
 // ---------------------------------------------------------------------------- rotate
@@ -239,6 +295,43 @@ void rotate_case() {
                 worst.ratio, values_exact ? "bit for bit" : "DIFFER");
     check(worst.ratio <= 1.0, "dspark_rotate outside its bound");
     check(values_exact, "dspark_rotate's values differ from their source");
+    {
+        // A call wider than the ring (a long prompt's append): ring + 5 rows of lane 0 at consecutive positions. Every
+        // slot holds the latest row that maps to it (the first 5 rows' slots their wrapped successors'), in each call.
+        constexpr int RW = kRing + 5;
+        const auto wk = random_bf16(static_cast<std::size_t>(RW) * 8 * D, rng, 1.0);
+        const auto wv = random_bf16(static_cast<std::size_t>(RW) * 8 * D, rng, 1.0);
+        std::vector<std::int32_t> wpos(RW);
+        for (int r = 0; r < RW; ++r) { wpos[r] = 6000 + r; }
+        ik::DSparkRotateArgs c = b;
+        c.x         = upload(wk);
+        c.values    = upload(wv);
+        c.rows      = RW;
+        c.positions = upload(wpos);
+        c.lane      = 0;
+        bool exact = true, same = true;
+        std::vector<std::uint16_t> first_v;
+        for (int call = 0; call < 3; ++call) {
+            ik::dspark_rotate(c, nullptr);
+            cuda_check(cudaDeviceSynchronize(), "rotate wide");
+            const auto got = download(cache_v, lane_words);
+            if (call == 0) {
+                first_v = got;
+            } else {
+                same = same && got == first_v;
+            }
+        }
+        for (int r = RW - kRing; r < RW; ++r) { // the latest row of each slot
+            for (int h = 0; h < 8; ++h) {
+                const std::size_t at = (static_cast<std::size_t>(h) * kRing + wpos[r] % kRing) * D;
+                for (int d = 0; d < D; ++d) { exact = exact && first_v[at + d] == wv[(static_cast<std::size_t>(r) * 8 + h) * D + d]; }
+            }
+        }
+        std::printf("dspark_rotate (%d rows of one lane into a %d-slot ring): each slot its latest row's values %s; three "
+                    "calls %s\n",
+                    RW, kRing, exact ? "bit for bit" : "DIFFER", same ? "identical" : "DIFFER");
+        check(exact && same, "dspark_rotate: a ring slot does not hold its latest row, or calls differ");
+    }
     // The full layer: the same keys into lane 1's pages (a page-major pool, a shuffled block-table row) at 4092-4099,
     // across a page edge: each key head within the bound of its reference, its values bit for bit, every other row
     // untouched.

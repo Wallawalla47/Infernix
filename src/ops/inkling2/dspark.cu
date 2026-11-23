@@ -129,6 +129,12 @@ __global__ void __launch_bounds__(kRowThreads) mix_kernel(const DSparkMixArgs a)
 #pragma unroll
     for (int k = 0; k < 8; ++k) { out[k] = canon::mul_rn(canon::mul_rn(mix[k], r), w[k]); }
     const int row = a.ring[m] > 0 ? a.positions[c] % a.ring[m] : c;
+    // A ring row a later column of the lane also takes (a lane's columns are consecutive positions) is left to it:
+    // concurrent CTAs storing one row would leave whichever landed last (a call wider than the ring, as a prompt's).
+    if (a.ring[m] > 0) {
+        const int later = c + a.ring[m];
+        if (later < a.columns && (a.lanes == nullptr || a.lanes[later] == a.lanes[c])) { return; }
+    }
     std::uint16_t* base = a.out[m];
     if (a.ring[m] > 0 && a.lanes != nullptr) { base += static_cast<std::size_t>(a.lanes[c]) * a.lane_stride[m]; }
     store8(base + static_cast<std::size_t>(row) * kH + e, out);
@@ -180,6 +186,9 @@ __global__ void __launch_bounds__(32) rotate_kernel(const DSparkRotateArgs a) {
     const int lane_index = a.lanes != nullptr ? a.lanes[r] : (a.lane >= 0 ? a.lane : a.round->lane);
     std::size_t at;
     if (a.ring > 0) {
+        // A slot a later row of the lane also takes is left to it (mix_kernel's rule; rows a lane's consecutive positions).
+        const int later = r + a.ring;
+        if (a.positions != nullptr && later < a.rows && (a.lanes == nullptr || a.lanes[later] == lane_index)) { return; }
         at = static_cast<std::size_t>(lane_index) * a.lane_stride +
              (static_cast<std::size_t>(h) * a.ring + position % a.ring) * kD + 4 * lane;
     } else { // the full layer's page (the lane's block-table row)
