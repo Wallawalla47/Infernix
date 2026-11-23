@@ -223,9 +223,6 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "the prefix cache has no tool-call holds");
         refuse(hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0,
                "no idle next-turn prefill yet");
-        // The SSD tier's code is in (prefix_cache.cpp) but its write-backs do not yet keep a snapshot (the prefix test's
-        // SSD case, run alone with INFERNIX_INKLING2_PREFIX_SSD_ONLY): refused until it passes.
-        refuse(cache.ssd_capacity_bytes != 0, "the prefix cache's SSD tier (--ssd-context-gib) is not ready for Inkling 2 yet");
         hybrid.device_snapshot_slots   = 0U;
         hybrid.tool_call_hold          = std::chrono::milliseconds{0};
         hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{0};

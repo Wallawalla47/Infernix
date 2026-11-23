@@ -212,12 +212,20 @@ pc::InsertResult PrefixCache::insert_block(pc::NodeRef parent, std::uint64_t loo
 
 // ---- captures and write-through ------------------------------------------------------------------
 
-bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer) {
+bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, std::span<const pc::NodeRef> path, cudaStream_t producer) {
     const bool tail = !capture.tail.empty();
     if (tail != capture.tail_page.has_value() || capture.tail.size() >= pc::kBlockTokens) {
         throw std::invalid_argument("Inkling 2 prefix cache: a capture's tail does not match its page");
     }
-    if (ssd_) { make_lossless_room(host_.image_slabs + (tail ? 1U : 0U)); }
+    if (ssd_) {
+        // The image, its tail and the path's blocks with no Host copy yet (write_blocks below): an image several times
+        // a prompt's blocks leaves the Host tier room for few snapshots, and the blocks would displace the last one.
+        std::uint64_t blocks = 0;
+        for (const pc::NodeRef node : path) {
+            blocks += index_->valid(node) && index_->node(node).host == pc::CopyState::Absent ? 1U : 0U;
+        }
+        make_lossless_room(host_.image_slabs + (tail ? 1U : 0U) + blocks);
+    }
     auto reserved = index_->reserve_host_image(tail, capture.claim);
     if (!reserved) {
         ++counters_.taps_skipped;
@@ -256,6 +264,7 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     (void)anchor.release();                   // poll unretains it
     counters_.host_write_bytes += host_.image_bytes + (tail ? host_.page.page_stride : 0U);
     ++counters_.host_image_writes;
+    write_blocks(path, producer);
     return true;
 }
 
@@ -389,6 +398,10 @@ void PrefixCache::service_ssd() {
 }
 
 void PrefixCache::make_lossless_room(std::uint64_t slabs) {
+    if (index_->host_lossless_slabs() >= slabs) { return; }
+    // The captures and block writes in flight first: the last request's snapshot is published, and its path on the
+    // Host, only once they land, and write-back takes nothing before (requests back to back gave it no poll between).
+    CUDA_CHECK(cudaStreamSynchronize(transfer_));
     // Each pass returns or lands a transfer, and a snapshot is written once, so the loop ends.
     while (index_->host_lossless_slabs() < slabs) {
         service_ssd();
@@ -399,6 +412,11 @@ void PrefixCache::make_lossless_room(std::uint64_t slabs) {
 
 pc::SsdTier::Promotion PrefixCache::promote(pc::SnapshotRef snapshot) {
     if (!ssd_) { return pc::SsdTier::Promotion::Ready; }
+    // The captures and block writes in flight land first and write-back starts for what they publish: a promotion that
+    // finds no Host room waits for a write in flight (Pending), and with none would start at the root (Unavailable)
+    // although the last request's snapshot, published moments ago, could be written back to make the room.
+    CUDA_CHECK(cudaStreamSynchronize(transfer_));
+    service_ssd();
     return ssd_->promote(*index_, snapshot);
 }
 

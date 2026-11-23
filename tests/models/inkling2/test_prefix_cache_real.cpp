@@ -17,8 +17,8 @@
 // 8. --a16-activations with --reproducible, and --q8-weights: resumed equals cold there too.
 // 9. Tap reach: a snapshot after a call ending k tokens past a frontier serves it (k up to 29; 15 with DSpark).
 // 10. Images (INFERNIX_INKLING2_VISION_ARTIFACT): another image never resumes past the image; the same image does.
-// 11. The SSD tier (not in the default run: refused until it passes; INFERNIX_INKLING2_PREFIX_SSD_ONLY runs it alone):
-//     what the Host tier gives up is written back, read back on a hit, and resumes as cold.
+// 11. The SSD tier (INFERNIX_INKLING2_PREFIX_SSD_ONLY runs it alone): what the Host tier gives up is written back, read
+//     back on a hit, and resumes as cold.
 //
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (skips without it)
 
@@ -130,9 +130,11 @@ void check_probe(const std::string& label, const infernix::test::ResumeProbe& pr
     require(probe.bit_identical(), label + ": the resumed continuation differs from the cold one");
 }
 
-// 11. The SSD tier (--ssd-context-gib, --ssd-context-dir): a Host tier of about two prompts' snapshots and blocks, so
-//     three unrelated prompts push the first one's out to the SSD; its continuation reads them back (a promotion) and
-//     equals its cold run. INFERNIX_INKLING2_PREFIX_SSD_ONLY runs this case alone.
+// 11. The SSD tier (--ssd-context-gib, --ssd-context-dir): a Host tier of one prompt's snapshot and blocks, so three
+//     unrelated prompts push the first one's out to the SSD; its continuation reads them back (a promotion) and
+//     equals its cold run. The prompts are 3,900 tokens: reading a shorter prompt's 200 MB image and blocks back from
+//     an SSD at the cost model's 2 GB/s takes longer than its prefill (a 2,300-token prompt: about 150 ms against
+//     136 ms), so the source choice re-prefills it. INFERNIX_INKLING2_PREFIX_SSD_ONLY runs this case alone.
 void ssd_tier(const std::filesystem::path& artifact) {
     using infernix::KvCacheStorage;
     const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix_inkling2_ssd_tier";
@@ -146,11 +148,11 @@ void ssd_tier(const std::filesystem::path& artifact) {
     options.context_cache.ssd_directory            = dir;
     {
         infernix::Engine engine(options);
-        const Tokens prompt         = long_prompt(engine, 2300, 41);
+        const Tokens prompt         = long_prompt(engine, 3900, 41);
         const infernix::TokenId sep = engine.tokenize_text("\n").front();
         (void)engine.generate(engine.prepare_tokens(prompt), infernix::test::resume_probe_request(1, true));
         for (int k = 0; k < 3; ++k) {
-            (void)engine.generate(engine.prepare_tokens(long_prompt(engine, 2300, 60 + k)),
+            (void)engine.generate(engine.prepare_tokens(long_prompt(engine, 3900, 60 + k)),
                                   infernix::test::resume_probe_request(1, true));
         }
         Tokens continuation = prompt;
@@ -175,7 +177,7 @@ void ssd_tier(const std::filesystem::path& artifact) {
         require(after.hybrid_ssd_write_bytes != 0, "ssd tier: nothing the Host tier gave up was written back");
         require(after.hybrid_ssd_promotions > before.hybrid_ssd_promotions,
                 "ssd tier: the continuation's source was not read back from the SSD tier");
-        require(resumed.reused_prompt_tokens >= 2048, "ssd tier: the continuation reused too little");
+        require(resumed.reused_prompt_tokens >= 3840, "ssd tier: the continuation reused too little");
         require(resumed.generated_token_ids == cold.generated_token_ids, "ssd tier: the tokens differ from cold");
         require(after.hybrid_ssd_failures == 0, "ssd tier: an SSD transfer failed");
     }
@@ -438,6 +440,8 @@ int main() {
             require(resumed.generated_token_ids == cold.generated_token_ids, "persist: the tokens differ from cold");
             std::filesystem::remove(file);
         }
+        // 11. The SSD tier.
+        ssd_tier(artifact);
         std::cout << "PASS\n";
         return 0;
     } catch (const std::exception& e) {

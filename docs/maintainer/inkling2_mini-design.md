@@ -623,9 +623,17 @@ form Qwen3.8-Flash-Next's binding takes:
   drafter's context depends on its call widths (projections_dmma at 16 columns or fewer, projections_mma above),
   which changes drafts only.
 - **Persistence** (`--prefix-cache-file`): the common file format, Inkling's magic and geometry (slab, page record,
-  the image's parts); the fingerprint adds the KV format, drafter, `--q8-weights`, `--a16-activations` and vision.
-- **Not built yet**: the SSD tier, next-turn prefill, tool-call holds, queue holds and prefetching for waiting
-  requests.
+  the image's parts); the fingerprint adds the KV format, drafter, `--q8-weights`, `--a16-activations`, `--lossless`
+  and vision.
+- **SSD tier** (`--ssd-context-gib`; [spec §5.7](hybrid-prefix-cache-spec.md)): the shared `SsdTier` over whole Host
+  slabs. An image is many times a prompt's blocks (190 MiB against 2 MiB per 64 tokens), so a small Host tier holds few
+  snapshots: a capture counts its image, tail and path blocks in the room it needs, and when that room is short lands
+  the captures and block writes in flight (write-back takes a snapshot only once it and its path are on the Host),
+  then starts and waits for the write-backs, so the last request's snapshot is written rather than displaced. A
+  promotion lands them the same way before it asks for Host room. The source choice weighs the read: at the cost
+  model's 2 GB/s a default-route prompt under about 2,800 tokens is re-prefilled instead; the lossless route's model
+  (about 3.3 ms a token and 0.86 us a query-key pair, fitted to its scoring runs) reads nearly every snapshot back.
+- **Not built yet**: next-turn prefill, tool-call holds, queue holds and prefetching for waiting requests.
 
 Sizes: an image is 190 MiB (BF16 rings) plus 9 MiB of drafter rings; restoring one takes ~8 ms over the PCIe link,
 against ~0.25 s to recompute 4K tokens.

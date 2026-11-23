@@ -138,8 +138,10 @@ public:
 
     // ---- Host-born captures ------------------------------------------------------------------
     // Copies lane `lane`'s image (and, with a tail, the partial page `tail_page`) to reserved Host slabs after
-    // `producer` reaches the current point, and publishes the snapshot when the copy lands (poll). The lane's next
-    // writes to its image wait on capture_events(id).
+    // `producer` reaches the current point, then the Device-only blocks of `path` (the snapshot's blocks below its
+    // frontier, root first: a snapshot outlives its blocks' Device copies only with their Host copies) behind it, and
+    // publishes the snapshot when the copy lands (poll). The lane's next writes to its image wait on
+    // capture_events(id) (the image's copy, not the blocks').
     struct Capture {
         std::uint64_t id = 0; // the caller's name for capture_result
         runtime::prefix_cache::NodeRef anchor;
@@ -151,7 +153,8 @@ public:
         std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
     };
     // Returns false when no slabs could be reserved for its claim (the capture is skipped).
-    [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
+    [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, std::span<const runtime::prefix_cache::NodeRef> path,
+                               cudaStream_t producer);
     // The capture's copy-out event (recorded once the image and tail have been read); empty once it has landed.
     [[nodiscard]] std::span<const cudaEvent_t> capture_events(std::uint64_t id) const noexcept;
     // Orders the compute stream after every pending capture whose tail is one of `pages`, before those pages return to
@@ -256,8 +259,9 @@ private:
     // The lane's image between its device bytes and the image slabs, runs of consecutive slabs as one copy.
     void copy_image(std::uint32_t lane, std::span<const std::uint32_t> slabs, bool to_host, cudaStream_t stream) const;
     void finish_restore(RestoreBatch& batch) noexcept;
-    // Before a capture takes `slabs` Host slabs: while the Host tier cannot free them without losing unwritten content,
-    // starts the write-backs it can and waits for them (SSD tier only).
+    // Before a capture takes `slabs` Host slabs (its image, its tail and its path's blocks): while the Host tier cannot
+    // free them without losing unwritten content, lands the captures and block writes in flight (a snapshot is written
+    // back only once it and its path are on the Host), starts the write-backs it can and waits for them (SSD tier only).
     void make_lossless_room(std::uint64_t slabs);
     void service_ssd();
 

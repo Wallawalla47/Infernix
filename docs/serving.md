@@ -2942,8 +2942,14 @@ first token in 72.6 ms resumed against 612 ms cold (with DSpark 74.8 against 615
 (179.4 against 181.2 tok/s over 128 tokens), as the first round waits for the copy of the prompt-end tap.
 
 `--prefix-cache-file` saves and restores the Host tier as for the other models (a file written for another KV
-format, drafter, `--q8-weights` or `--a16-activations` setting is ignored). `--ssd-context-gib`, `--cache-next-turn-ms`
-and `--cache-tool-hold-secs` are not built for Inkling 2 yet and are refused.
+format, drafter, `--q8-weights`, `--a16-activations` or `--lossless` setting is ignored). `--ssd-context-gib` adds the
+SSD tier as for the other models: what the Host tier gives up is written back first (a capture makes room for its
+image, its tail and its path's blocks, waiting for the write-backs that need) and read back when a request resumes
+from it. A snapshot's state image is about 200 MB beside 2 MiB of KV a 64-token block, so reading a short prompt back
+from the SSD is slower than its prefill and the source choice re-prefills it (at the cost model's 2 GB/s, below about
+2,800 tokens on the default route; on `--lossless`, whose prefill runs at most about 300 tokens a second, almost every
+snapshot is read back). `--cache-next-turn-ms` and `--cache-tool-hold-secs` are not built for Inkling 2 yet and are
+refused.
 
 ### Next-turn prefill
 

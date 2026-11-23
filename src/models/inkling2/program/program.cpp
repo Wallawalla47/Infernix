@@ -1403,13 +1403,12 @@ private:
         }
         c.claim                = prefix_->index().estimate_priority(below, F, !c.tail.empty());
         const std::uint64_t id = c.id;
-        if (prefix_->capture(idx, std::move(c), device_.stream)) {
+        // The path's Device-only blocks go to the Host tier behind the image (the lane's next call waits only for the
+        // image).
+        if (prefix_->capture(idx, std::move(c), std::span<const pc::NodeRef>(p.path).first(k), device_.stream)) {
             p.capture = id;
             p.captures.push_back(id);
             p.frontiers.push_back(F);
-            // The path's Device-only blocks go to the Host tier behind the image (the lane's next call waits only for
-            // the image): a snapshot outlives its blocks' Device copies only with their Host copies.
-            prefix_->write_blocks(std::span<const pc::NodeRef>(p.path).first(k), device_.stream);
         }
     }
 
