@@ -815,9 +815,10 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
 
 // Blocks in flight a warp: kDmmaAhead of BF16 storage, kDmmaQ8Ahead of Q8 (half the bytes a block; 12 against 8:
 // 2026-11-23, --q8-weights decode rounds at context 512 -0.79 / -0.37 / -0.59 / -0.28 % at one / two / three / eight
-// columns, 16 +0.09 to +0.46 %); a BF16 launch of at most kDmmaDeepWarps warps (a few tiles: the loop's message-gate
-// downs, 12 tiles of 16 runs) kDmmaDeep, so most of its weights load before the PDL wait, beside the kernel before it,
-// on the few SMs it occupies.
+// columns; 16 measured +0.09 to +0.46 %, but at 16 the 16-run instance, W_o's, spills to local memory, so that arm is
+// not a fair reading of depth 16 for K2's 4-run one); a BF16 launch of at most kDmmaDeepWarps warps (a few tiles: the
+// loop's message-gate downs, 12 tiles of 16 runs) kDmmaDeep, so most of its weights load before the PDL wait, beside the
+// kernel before it, on the few SMs it occupies.
 constexpr int kDmmaQ8Ahead   = 12;
 constexpr int kDmmaDeep      = 8;
 constexpr int kDmmaDeepWarps = 512;
