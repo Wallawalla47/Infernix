@@ -116,7 +116,7 @@ std::size_t a8_column_words() {
 template <class Add>
 void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, bool features,
                   moe::ExpertActivation activation, bool a8, ForwardBuffers& b, std::uint8_t*& moe_base,
-                  std::uint8_t*& attention_base, Add&& add) {
+                  std::uint8_t*& attention_base, std::uint8_t*& guess_base, Add&& add) {
     const std::size_t T = static_cast<std::size_t>(capacity);
     const std::size_t V = c.vocab_size, rank = c.loop.message_rank, lanes = static_cast<std::size_t>(max_lanes);
     const std::size_t row16         = T * kH * 2;
@@ -150,6 +150,13 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
     add(moe_base, moe::workspace_bytes(static_cast<std::int32_t>(c.experts), static_cast<std::int32_t>(c.intermediate),
                                        capacity, activation));
     add(attention_base, ik::attention_workspace_bytes(capacity));
+    // The expert prefetch's: guessing calls' MLP inputs a visit, guesses, the last verification call's records, the
+    // guesses' router workspace.
+    const std::size_t visits = c.visits();
+    add(b.guess_x, visits * Forward::kGuessColumns * kH * 2), add(b.guess_ids, visits * 16 * 4);
+    add(b.expert_record, visits * moe::kTopK * 4);
+    add(guess_base, moe::workspace_bytes(static_cast<std::int32_t>(c.experts), static_cast<std::int32_t>(c.intermediate),
+                                         Forward::kGuessColumns));
 }
 
 } // namespace
@@ -157,9 +164,9 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
 std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity, bool features,
                                   moe::ExpertActivation activation, bool a8) {
     ForwardBuffers b;
-    std::uint8_t *moe_base = nullptr, *attention_base = nullptr;
+    std::uint8_t *moe_base = nullptr, *attention_base = nullptr, *guess_base = nullptr;
     std::size_t at = 0;
-    walk_buffers(config, max_lanes, capacity, features, activation, a8, b, moe_base, attention_base,
+    walk_buffers(config, max_lanes, capacity, features, activation, a8, b, moe_base, attention_base, guess_base,
                  [&](auto*&, std::size_t bytes) { at = align(at + bytes); });
     return at;
 }
@@ -202,7 +209,8 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     std::vector<std::pair<void**, std::size_t>> slots;
     std::uint8_t* moe_base       = nullptr;
     std::uint8_t* attention_base = nullptr;
-    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, a8, b_, moe_base, attention_base,
+    std::uint8_t* guess_base     = nullptr;
+    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, a8, b_, moe_base, attention_base, guess_base,
                  [&](auto*& pointer, std::size_t bytes) {
         slots.emplace_back(reinterpret_cast<void**>(&pointer), at);
         at = align(at + bytes);
@@ -214,6 +222,9 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     b_.moe          = moe::carve_workspace(moe_base, static_cast<std::int32_t>(c_.experts),
                                            static_cast<std::int32_t>(c_.intermediate), capacity, activation);
     b_.attention_ws = ik::carve_attention_workspace(attention_base, capacity);
+    b_.guess        = moe::carve_workspace(guess_base, static_cast<std::int32_t>(c_.experts),
+                                           static_cast<std::int32_t>(c_.intermediate), kGuessColumns);
+    side_           = std::make_unique<SideStreams>();
     // conv_history's descriptors: every visit's four rings.
     std::vector<std::int64_t> rings;
     for (std::uint32_t v = 0; v < c_.visits(); ++v) {
@@ -222,6 +233,32 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
         }
     }
     CUDA_CHECK(cudaMemcpy(b_.history_rings, rings.data(), rings.size() * 8, cudaMemcpyHostToDevice));
+}
+
+Forward::SideStreams::SideStreams() {
+    try {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&guess, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&prefetch, cudaStreamNonBlocking));
+        for (cudaEvent_t* e : {&x, &k2, &guessed, &join_guess, &join_prefetch}) {
+            CUDA_CHECK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+        }
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+Forward::SideStreams::~SideStreams() { release(); }
+
+void Forward::SideStreams::release() noexcept {
+    for (cudaEvent_t* e : {&x, &k2, &guessed, &join_guess, &join_prefetch}) {
+        if (*e != nullptr) { (void)cudaEventDestroy(*e); }
+        *e = nullptr;
+    }
+    for (cudaStream_t* s : {&guess, &prefetch}) {
+        if (*s != nullptr) { (void)cudaStreamDestroy(*s); }
+        *s = nullptr;
+    }
 }
 
 std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
@@ -405,6 +442,10 @@ std::uint16_t* Forward::tail_out(std::uint32_t visit) const {
     return b_.hp;
 }
 
+const std::uint16_t* Forward::mlp_input(std::uint32_t visit) const {
+    return !prompt_ && columns_ <= kGuessColumns ? b_.guess_x + static_cast<std::size_t>(visit) * kGuessColumns * kH : b_.xm;
+}
+
 VisitInputs Forward::inputs(std::uint32_t visit) const {
     const std::uint32_t layer = c_.visit_layer(visit), pass = c_.visit_pass(visit);
     VisitInputs in;
@@ -432,6 +473,15 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     const std::size_t TH      = static_cast<std::size_t>(T) * kH;
     const ik::ColumnMap map = column_map();
     const std::uint16_t* h  = in.input;
+    // The expert prefetch: a guessing call's MLP input lives in its visit's slot (the guess stream's router reads it
+    // after the main stream has moved on); a reading call prefetches its visits' records.
+    // The read-ahead is a verification call's (one lane's consecutive columns, whose last column predicts the lane's
+    // next call); a decode round of 3-8 lanes prefetches nothing (8 lanes: 649.6 -> 646.4 tok/s with the last lane's).
+    const bool guessing = !prompt_ && T <= kGuessColumns;
+    const bool reading  = !prompt_ && T > kGuessColumns && T <= kReadAheadColumns && call_lanes_.size() == 1;
+    auto* xm            = const_cast<std::uint16_t*>(mlp_input(v)); // b_'s own memory
+    const std::uint64_t gate_up_bytes =
+        moe::gate_up_record_bytes(op.bank.format, kH, static_cast<std::int32_t>(c_.intermediate));
     if (v == 0 && wide_conv_) { // before the call's first ring write
         snapshot_history(s, stream);
         mark("conv_history");
@@ -536,6 +586,21 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     }
     project_fused(prompt_, k2, stream);
     mark("k2_projections");
+    // The expert prefetch, forked once K2 has streamed its weights: the visit's guessed experts (the guess the visit
+    // before made) or the previous verification call's record, into L2 beside attention, W_o and the glue.
+    if ((guessing && v > 0) || reading) {
+        CUDA_CHECK(cudaEventRecord(side_->k2, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(side_->prefetch, side_->k2, 0));
+        if (guessing) {
+            CUDA_CHECK(cudaStreamWaitEvent(side_->prefetch, side_->guessed, 0));
+            moe::moe_prefetch_l2(b_.guess_ids + static_cast<std::size_t>(v) * 16, (kGuessExperts / T) * T, op.bank,
+                                 gate_up_bytes, side_->prefetch);
+        } else {
+            moe::moe_prefetch_l2(b_.expert_record + static_cast<std::size_t>(v) * moe::kTopK, moe::kTopK, op.bank,
+                                 gate_up_bytes, side_->prefetch);
+        }
+        side_->forked_prefetch = true;
+    }
 
     // K3: attention.
     ik::AttentionArgs at;
@@ -619,7 +684,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         experts_x.activation = moe::ExpertActivation::A16;
         experts_x.rows       = nvfp4 ? b_.rows : nullptr;
         experts_x.emax       = nvfp4 ? b_.emax : nullptr;
-        experts_x.x16        = b_.xm;
+        experts_x.x16        = xm;
     }
     if (a8x) {
         experts_x.activation = moe::ExpertActivation::A8;
@@ -645,7 +710,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         m.gate_input         = b_.gate_input;
     } else {
         m.norm = op.mlp_norm;
-        m.x    = b_.xm;
+        m.x    = xm;
         m.rows = rows;
     }
     ik::mlp_entry(m, stream);
@@ -669,10 +734,23 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         g.message  = b_.message;
         g.fg       = b_.fg;
         g.norms[0] = op.mlp_norm;
-        g.x[0]     = b_.xm;
+        g.x[0]     = xm;
         g.rows     = rows;
         ik::gate_exit(g, stream);
         mark("message_gates");
+    }
+    if (guessing && v + 1 < c_.visits()) { // the expert prefetch: the next visit's router on this MLP input
+        const LayerOperands& next = p_.layers.at(c_.visit_layer(v + 1));
+        CUDA_CHECK(cudaEventRecord(side_->x, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(side_->guess, side_->x, 0));
+        moe::moe_route(xm, T, next.router, next.router_bias, next.bank.experts, kH, c_.route_scale, b_.guess, side_->guess);
+        // kGuessExperts in all: each column's first kGuessExperts / T slots (descending key: its likeliest experts).
+        const std::size_t take = static_cast<std::size_t>(kGuessExperts / T) * 4;
+        CUDA_CHECK(cudaMemcpy2DAsync(b_.guess_ids + static_cast<std::size_t>(v + 1) * 16, take, b_.guess.routed,
+                                     static_cast<std::size_t>(moe::kTopK) * 4, take, static_cast<std::size_t>(T),
+                                     cudaMemcpyDeviceToDevice, side_->guess));
+        CUDA_CHECK(cudaEventRecord(side_->guessed, side_->guess));
+        side_->forked_guess = true;
     }
 
     // K6-K8: route and the experts (their outputs combine in the next visit's entry). A prompt call: the router's logits
@@ -681,7 +759,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         ik::ProjectionArgs router{};
         router.columns  = T;
         router.k        = kH;
-        router.x[0]     = b_.xm;
+        router.x[0]     = xm;
         router.fp32_out = true;
         ik::ProjectionSegment s;
         s.weight = op.router;
@@ -697,9 +775,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
             : moe::moe_experts_prompt(experts_x, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
     } else if (T == 1 && moe::moe_single_supported(op.bank.format, experts_x.activation)) {
         // One column: the router and the experts in one launch (the same bits).
-        moe::moe_single(b_.xm, experts_x, op.router, op.router_bias, c_.route_scale, op.bank, b_.moe, b_.experts, stream);
+        moe::moe_single(xm, experts_x, op.router, op.router_bias, c_.route_scale, op.bank, b_.moe, b_.experts, stream);
     } else {
-        moe::moe_route(b_.xm, T, op.router, op.router_bias, op.bank.experts, kH, c_.route_scale, b_.moe, stream);
+        moe::moe_route(xm, T, op.router, op.router_bias, op.bank.experts, kH, c_.route_scale, b_.moe, stream,
+                       reading ? b_.expert_record + static_cast<std::size_t>(v) * moe::kTopK : nullptr);
         mark("router");
         moe::moe_experts(experts_x, moe::routed_routing(b_.moe), op.bank, b_.moe, b_.experts, stream);
     }
@@ -724,6 +803,17 @@ void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t str
     if (b_.features != nullptr) { tap(c_.visits(), b_.final_hidden, stream); }
     // The head over the requested columns only (a prefill chunk needs none, or its last).
     head(head_first, head_columns < 0 ? columns_ - head_first : head_columns, stream);
+    { // the expert prefetch: each side stream the call forked joins the call's stream once
+        if (side_->forked_guess) {
+            CUDA_CHECK(cudaEventRecord(side_->join_guess, side_->guess));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, side_->join_guess, 0));
+        }
+        if (side_->forked_prefetch) {
+            CUDA_CHECK(cudaEventRecord(side_->join_prefetch, side_->prefetch));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, side_->join_prefetch, 0));
+        }
+        side_->forked_guess = side_->forked_prefetch = false;
+    }
 }
 
 void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) {

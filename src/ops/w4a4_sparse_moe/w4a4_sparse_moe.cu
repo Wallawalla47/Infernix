@@ -241,7 +241,7 @@ constexpr int kRouteChunks  = Inkling::kHidden / 256; // 16-byte chunks of a row
 __global__ void __launch_bounds__(kRouteThreads) route_kernel(const std::uint16_t* __restrict__ x, int columns,
                                                               const std::uint16_t* __restrict__ router,
                                                               const float* __restrict__ bias, int experts,
-                                                              float route_scale, Workspace ws) {
+                                                              float route_scale, Workspace ws, std::int32_t* record) {
     __shared__ std::int32_t cursor[256];
     __shared__ float keys[kRouteWarps][256];
     __shared__ float sel[kRouteWarps][kTopK];
@@ -294,6 +294,10 @@ __global__ void __launch_bounds__(kRouteThreads) route_kernel(const std::uint16_
     __syncthreads();
     dispatch_block(ws.routed, columns, experts, ws, cursor);
     if (tid == 0) { *ws.route_done = 0U; }
+    if (record != nullptr && tid < kTopK) { // the last column's experts: a later call's prefetch hint (relaxed)
+        asm volatile("st.relaxed.gpu.global.s32 [%0], %1;" ::"l"(record + tid), "r"(ws.routed[(columns - 1) * kTopK + tid])
+                     : "memory");
+    }
 }
 
 // ---------------------------------------------------------------------------- NVFP4 gate/up
@@ -1961,13 +1965,13 @@ Workspace carve_workspace(void* base, std::int32_t experts, std::int32_t interme
 
 void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t* router, const float* bias,
                std::int32_t experts, std::int32_t hidden, float route_scale, const Workspace& workspace,
-               cudaStream_t stream) {
+               cudaStream_t stream, std::int32_t* record) {
     if (hidden != Inkling::kHidden || experts <= 0 || experts > 256 || columns <= 0 || columns > workspace.capacity) {
         throw std::invalid_argument("w4a4_sparse_moe router: H = 2304, at most 256 experts, 1..capacity columns");
     }
     const dim3 grid((experts + kRouteWarps - 1) / kRouteWarps, (columns + kRouteColumns - 1) / kRouteColumns);
     CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic, {grid, dim3(kRouteThreads), 0, stream}, route_kernel, x,
-                                columns, router, bias, experts, route_scale, workspace));
+                                columns, router, bias, experts, route_scale, workspace, record));
     check_launch("router");
 }
 
@@ -2205,6 +2209,53 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
                                 {dim3(S::kDownCtas, jobs), dim3(S::kDownThreads), sizeof(DownA8Smem<G>), stream},
                                 down_a8_kernel<G>, args));
     check_launch("MXFP8 down");
+}
+
+namespace {
+// moe_prefetch_l2's kernel: thread 0 gathers the distinct experts, then every thread issues 16 KB pieces of their
+// records' first `bytes` (one piece a thread for 8 NVFP4 experts' gate/up: 8 x 183 pieces).
+constexpr int kPrefetchThreads = 128, kPrefetchMax = 16, kPrefetchCtas = 12;
+__global__ void __launch_bounds__(kPrefetchThreads) prefetch_l2_kernel(const std::int32_t* experts, int count,
+                                                                         const std::uint8_t* records, std::uint64_t stride,
+                                                                         std::uint64_t bytes, int bank_experts) {
+    __shared__ int ids[kPrefetchMax];
+    __shared__ int distinct;
+    if (threadIdx.x == 0) {
+        int m = 0;
+        for (int i = 0; i < count; ++i) {
+            int e; // relaxed: a route's record may be rewritten concurrently (a stale hint, never undefined)
+            asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];" : "=r"(e) : "l"(experts + i) : "memory");
+            if (e < 0 || e >= bank_experts) { continue; }
+            bool seen = false;
+            for (int j = 0; j < m; ++j) { seen = seen || ids[j] == e; }
+            if (!seen) { ids[m++] = e; }
+        }
+        distinct = m;
+    }
+    __syncthreads();
+    constexpr std::uint64_t kPiece = 16384;
+    const std::uint64_t pieces     = (bytes + kPiece - 1) / kPiece;
+    const std::uint64_t total      = pieces * static_cast<std::uint64_t>(distinct);
+    for (std::uint64_t i = blockIdx.x * std::uint64_t{kPrefetchThreads} + threadIdx.x; i < total;
+         i += std::uint64_t{gridDim.x} * kPrefetchThreads) {
+        const std::uint64_t at = (i % pieces) * kPiece;
+        const auto piece       = static_cast<unsigned>(bytes - at < kPiece ? bytes - at : kPiece);
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(records + static_cast<std::uint64_t>(ids[i / pieces]) * stride + at),
+                     "r"(piece)
+                     : "memory");
+    }
+}
+} // namespace
+
+void moe_prefetch_l2(const std::int32_t* experts, std::int32_t count, const Bank& bank, std::uint64_t bytes,
+                     cudaStream_t stream) {
+    if (experts == nullptr || count <= 0 || count > kPrefetchMax || bytes == 0 || bytes % 16 != 0 ||
+        bytes > bank.record_stride || bank.record_stride % 16 != 0) {
+        throw std::invalid_argument("w4a4_sparse_moe prefetch: 1-16 experts, a 16-byte multiple of their records");
+    }
+    prefetch_l2_kernel<<<kPrefetchCtas, kPrefetchThreads, 0, stream>>>(experts, count, bank.records, bank.record_stride,
+                                                                        bytes, bank.experts);
+    check_launch("expert prefetch");
 }
 
 } // namespace infernix::ops::w4a4_moe

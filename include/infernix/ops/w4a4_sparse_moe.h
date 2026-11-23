@@ -159,9 +159,11 @@ inline constexpr std::int32_t kPromptHRowBytes = 1152 / 2 + 80;            // 57
 // kTopK by key, ties to the lower expert index, in slots of descending key; gamma_j = (s_j / sum8(s)) * route_scale
 // over the selected sigmoids s, sum8 the pairwise ((s0 + s2) + (s1 + s3)) + ((s4 + s6) + (s5 + s7)). W: BF16 [E][H]
 // (E <= 256), bias FP32 [E]. The routing lands in the workspace (routed_routing).
+// `record`, if set, receives the last column's kTopK experts in slot order (relaxed stores: a later call's prefetch
+// hint, moe_prefetch_l2 reads it with relaxed loads, so a record rewritten while it is read is a defined, stale hint).
 void moe_route(const std::uint16_t* x, std::int32_t columns, const std::uint16_t* router, const float* bias,
                std::int32_t experts, std::int32_t hidden, float route_scale, const Workspace& workspace,
-               cudaStream_t stream);
+               cudaStream_t stream, std::int32_t* record = nullptr);
 
 // The workspace's routing (moe_route's output) as a Routing.
 [[nodiscard]] inline Routing routed_routing(const Workspace& workspace) noexcept {
@@ -195,6 +197,19 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
 // quantized row. Needs moe_single_supported(bank.format): the device holds the grid resident (otherwise moe_route and
 // moe_experts). A8 (NVFP4 layers): rows is the column's A8 row; the separate kernels' A8 bits.
 [[nodiscard]] bool moe_single_supported(ExpertFormat format, ExpertActivation activation = ExpertActivation::Checkpoint);
+
+// The expert prefetch (a decode visit's guessed experts into L2 ahead of its experts' launch; models issue it on a
+// side stream). The bytes of an expert record's gate/up part (its first part: the gate/up row groups, then down's).
+[[nodiscard]] constexpr std::uint64_t gate_up_record_bytes(ExpertFormat format, std::int32_t hidden,
+                                                           std::int32_t intermediate) noexcept {
+    const bool mx = format == ExpertFormat::Mxfp8;
+    return std::uint64_t(2 * intermediate / 16) * std::uint64_t(hidden / (mx ? 32 : 16)) * std::uint64_t(mx ? 528 : 144);
+}
+// The first `bytes` (a multiple of 16, at most a record) of the records of the distinct experts among experts[0, count)
+// (count 1-16; ids outside the bank skipped; read with relaxed loads) into L2, as cp.async.bulk.prefetch.L2 in 16 KB
+// pieces from a grid of 12 CTAs (few SM slots beside the call's own kernels). A hint: no output depends on it.
+void moe_prefetch_l2(const std::int32_t* experts, std::int32_t count, const Bank& bank, std::uint64_t bytes,
+                     cudaStream_t stream);
 void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint16_t* router, const float* bias,
                 float route_scale, const Bank& bank, const Workspace& workspace, std::uint16_t* outputs,
                 cudaStream_t stream);

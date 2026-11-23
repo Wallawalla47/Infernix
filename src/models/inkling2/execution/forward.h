@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace infernix::models::inkling2 {
@@ -102,6 +103,13 @@ struct ForwardBuffers {
     float* logits = nullptr;          // [columns][V]
     ops::w4a4_moe::Workspace moe;
     ops::inkling2::AttentionWorkspace attention_ws;
+    // The expert prefetch (Forward::kGuessColumns): each visit's MLP input of a guessing call [visits][2][H], each
+    // visit's guessed experts [visits][16], the experts each visit's last column took in the last verification call
+    // [visits][kTopK], and the guesses' router workspace (2 columns).
+    std::uint16_t* guess_x       = nullptr;
+    std::int32_t* guess_ids      = nullptr;
+    std::int32_t* expert_record  = nullptr;
+    ops::w4a4_moe::Workspace guess;
 };
 
 // What a visit reads besides the state and the previous visit's MLP tail: its input, where its entry writes the
@@ -168,6 +176,9 @@ public:
     [[nodiscard]] const StateLayout& layout() const noexcept { return layout_; }
     [[nodiscard]] std::int32_t columns() const noexcept { return columns_; }
     [[nodiscard]] VisitInputs inputs(std::uint32_t visit) const;
+    // A visit's MLP input rows in the last call ([columns][H] BF16): buffers().xm, or a guessing call's visit slot
+    // (buffers().guess_x, kept for the expert prefetch).
+    [[nodiscard]] const std::uint16_t* mlp_input(std::uint32_t visit) const;
     [[nodiscard]] FinalInputs final_inputs() const;
 
 private:
@@ -221,6 +232,31 @@ private:
     bool one_group_lanes_ = true; // every lane's columns are one attention group (at most 16)
     DeviceBuffer memory_;
     ForwardBuffers b_;
+
+public:
+    // The expert prefetch (design §10.5): a decode call of at most kGuessColumns columns runs the next visit's router on
+    // this visit's MLP input (kept a visit each: ForwardBuffers::guess_x) on one side stream, kGuessExperts in all (each
+    // column's likeliest kGuessExperts / T), and after each visit's K2 prefetches that guess's gate/up bytes into L2 on
+    // another; a call of kGuessColumns + 1 to kReadAheadColumns columns (verification) prefetches instead the experts
+    // its visit's last column took in the previous such call (the router's record). The side streams join the call's
+    // stream once, at the end of finish(). No output depends on it (only what L2 holds).
+    static constexpr std::int32_t kGuessColumns     = 2;
+    static constexpr std::int32_t kGuessExperts     = 8;
+    static constexpr std::int32_t kReadAheadColumns = 8;
+
+private:
+    // The prefetch's two side streams and the events that fork and join them (created with the forward).
+    struct SideStreams {
+        cudaStream_t guess = nullptr, prefetch = nullptr;
+        cudaEvent_t x = nullptr, k2 = nullptr, guessed = nullptr, join_guess = nullptr, join_prefetch = nullptr;
+        bool forked_guess = false, forked_prefetch = false; // the current call's
+        SideStreams();
+        SideStreams(const SideStreams&)            = delete;
+        SideStreams& operator=(const SideStreams&) = delete;
+        ~SideStreams();
+        void release() noexcept;
+    };
+    std::unique_ptr<SideStreams> side_;
 };
 
 } // namespace infernix::models::inkling2

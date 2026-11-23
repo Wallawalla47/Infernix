@@ -918,6 +918,35 @@ after the row's job counter completes. The quantize-permute of x (four-over-six 
 rows, zeroing each expert's scale tail in the CTA writing its last row as SGLang does) is one kernel. SGLang's tile
 choices measured on an RTX 5090 for these shapes seed the tile search. The combine is FP32 in slot order, rounded once.
 
+### 10.5 Expert prefetch (decode and verification)
+
+A decode visit's experts are cold (47 other visits stream ~4 GB between two calls of a layer), and the bus sits idle
+through attention, W_o and the glue before them. The Forward fills that time from two side streams that join the call's
+stream once, at the end of `finish()`, so nothing on the visit's chain waits for them (Basalt's arrangement; the
+2026-11-22 in-chain prefetch from mlp_entry's CTA held ~25 us on the critical path and was rejected):
+
+- a call of 1-2 columns: after each visit's MLP input is formed (kept a visit each, `ForwardBuffers::guess_x`), the
+  NEXT visit's router runs on it on the guess stream (`moe_route` over a 2-column workspace); each column's likeliest
+  8 / T experts, 8 in all, are the guess (Basalt's count: 16 guesses at 2 columns cost more bus than they saved);
+- a call of 3-8 columns of one lane (verification): the router records each visit's last column's experts
+  (`moe_route`'s `record`, relaxed stores) for the next such call; a decode round of 3-8 lanes prefetches nothing
+  (its last lane's experts for every lane: 8 lanes 649.6 → 646.4 tok/s in all, 4 lanes 463.1 → 463.6);
+- after each visit's K2 the prefetch stream issues `moe_prefetch_l2` (12 CTAs of `cp.async.bulk.prefetch.L2`, 16 KB
+  pieces) over the guess's or the record's gate/up bytes.
+
+No output depends on it (only L2's contents; emitted token ids checked equal with and without it, DSpark and plain,
+2026-11-23). Measured (RTX 5090, 2026-11-23, against the same build without it; ranges over two or three slots where
+both ran). Context 512 decode rounds (median of 3): default 5.276-5.277 → 5.128-5.134 ms at one column, 6.479-6.481
+→ 6.183-6.316 at two; `--q8-weights` 4.630-4.631 → 4.467-4.523, 5.824-5.826 → 5.511-5.609, three columns 6.599 →
+6.233, eight 9.403 → 9.160; `--a8-activations` 4.610-4.612 → 4.558-4.560, two columns 5.962 → 5.789, three 6.776 →
+6.593, eight 9.635 → 9.467 (three and eight columns replay one call: the record is that call's own, an optimistic
+hit rate). infernix_bench tg128 / pp10000+tg128 (tok/s): default 193.0 / 179.4-179.9 → 196.4-198.0 / 182.9-183.9;
+`--q8-weights` 214.2-214.3 / 196.9-197.0 → 219.3-220.8 / 198.5-201.6; `--a8-activations` 214.5-214.7 / 197.2-197.8 →
+215.3-216.5 / 196.0-198.7. DSpark on Basalt's fixtures (conv / struct / prose): `--q8-weights` (-r 2) 267.5 / 549.2 /
+213.6 → 272.9 / 557.1 / 218.9; `--a8-activations` (-r 4) 274.5 / 606.6 / 211.7 → 276.1 / 610.3 / 212.7 (conv within
+its ±15, prose within its ±0.7). Prefetched experts that miss cost bus time: a decoy (the same bytes of other
+experts) ran 0.21-0.33 ms a round slower than none, and sixteen guesses at two columns lost (a8: 6.04 → 6.27 ms).
+
 ---
 
 ## 11. Dense projections and the head

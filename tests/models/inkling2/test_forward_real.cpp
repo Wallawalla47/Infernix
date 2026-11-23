@@ -385,7 +385,7 @@ void teacher_forced(const m::Parameters& p, m::Forward& fw, State& state, const 
                 }
             }
             if (dump_dir != nullptr) {
-                dump.rows(dump.xm, v, c0, bf16_values(b.xm, TH));
+                dump.rows(dump.xm, v, c0, bf16_values(fw.mlp_input(v), TH));
                 dump.rows(dump.cand, v, c0, f32_values(b.cand, TH));
                 const auto routed = download(b.moe.routed, static_cast<std::size_t>(kT) * 8);
                 std::copy(routed.begin(), routed.end(), dump.routed.begin() + (std::size_t{v} * kPositions + c0) * 8);
@@ -407,7 +407,7 @@ void teacher_forced(const m::Parameters& p, m::Forward& fw, State& state, const 
             compare("attention a", bf16_values(b.attention, kT * QW), ref, pre + "a", c0, kT, QW, none);
             compare("W_o", bf16_values(b.o, TH), ref, pre + "o", c0, kT, H, none);
             compare("cand", f32_values(b.cand, TH), ref, pre + "cand", c0, kT, H, none);
-            compare("x_mlp", bf16_values(b.xm, TH), ref, pre + "xm", c0, kT, H, none);
+            compare("x_mlp", bf16_values(fw.mlp_input(v), TH), ref, pre + "xm", c0, kT, H, none);
             // Routing: the experts in slot order, and gamma.
             const auto routed = download(b.moe.routed, static_cast<std::size_t>(kT) * 8);
             const auto gamma  = download(b.moe.gamma, static_cast<std::size_t>(kT) * 8);
@@ -554,7 +554,7 @@ std::vector<float> free_running(const m::Parameters& p, m::Forward& fw, State& s
                 std::printf("  %2u L%-2u p%u: %.2e %.2e %.2e\n", v, c.visit_layer(v), c.visit_pass(v),
                             drift(bf16_values(in.input, TH), ref, pre + "h_in", c0, width, H),
                             drift(bf16_values(b.x[0], TH), ref, pre + "xq", c0, width, H),
-                            drift(bf16_values(b.xm, TH), ref, pre + "xm", c0, width, H));
+                            drift(bf16_values(fw.mlp_input(v), TH), ref, pre + "xm", c0, width, H));
             }
         }
         fw.finish(state.view, nullptr);

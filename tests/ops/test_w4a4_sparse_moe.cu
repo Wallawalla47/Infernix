@@ -45,6 +45,8 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace canon = infernix::ops::canon;
@@ -1263,7 +1265,40 @@ void router_case() {
     check(worst_gamma_ulp <= 3.0, "a gamma is more than 3 ulp from FP64");
     check(fp64_differ == 0, "a column selects other experts than FP64 keys beyond a near-tie");
     check(dispatch_ok, "the router's dispatch is inconsistent");
-    for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x), static_cast<void*>(d_bias), workspace}) {
+
+    // The expert prefetch's hint: a call with a record gives the same routing and records its last column's experts in
+    // slot order; moe_prefetch_l2 takes ids outside the bank (skipped) and refuses what it cannot issue.
+    std::int32_t* d_record = upload(std::vector<std::int32_t>(K, -7));
+    moe::moe_route(d_x, T, d_w, d_bias, E, H, 8.0F, ws, nullptr, d_record);
+    cuda_check(cudaDeviceSynchronize(), "router with a record");
+    const auto routed_rec = download(ws.routed, std::size_t(T) * K);
+    const auto record     = download(d_record, K);
+    check(routed_rec == routed[0], "a router call with a record changes the routing");
+    check(std::equal(record.begin(), record.end(), routed_rec.begin() + std::size_t(T - 1) * K),
+          "the record is not the last column's experts in slot order");
+    constexpr std::uint64_t kStride = 65536, kBytes = 32768;
+    void* records = nullptr;
+    cuda_check(cudaMalloc(&records, std::size_t(E) * kStride), "cudaMalloc");
+    moe::Bank toy;
+    toy.records       = static_cast<const std::uint8_t*>(records);
+    toy.record_stride = kStride;
+    toy.experts       = E;
+    std::int32_t* d_ids = upload(std::vector<std::int32_t>{3, -1, 3, E, 127, 0, 64, 3});
+    moe::moe_prefetch_l2(d_ids, 8, toy, kBytes, nullptr);
+    moe::moe_prefetch_l2(d_record, K, toy, kBytes, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "expert prefetch");
+    int refused = 0;
+    for (const auto& [count, bytes] : {std::pair<int, std::uint64_t>{0, kBytes}, {17, kBytes}, {8, kBytes + 8}, {8, kStride + 16}}) {
+        try {
+            moe::moe_prefetch_l2(d_ids, count, toy, bytes, nullptr);
+        } catch (const std::invalid_argument&) {
+            ++refused;
+        }
+    }
+    std::printf("router record: the last column's %d experts; expert prefetch ran, %d of 4 bad arguments refused\n", K, refused);
+    check(refused == 4, "moe_prefetch_l2 accepted arguments it cannot issue");
+    for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x), static_cast<void*>(d_bias), workspace,
+                    static_cast<void*>(d_record), records, static_cast<void*>(d_ids)}) {
         cuda_check(cudaFree(p), "cudaFree");
     }
 }
