@@ -166,6 +166,10 @@ std::uint64_t PrefixCacheIndex::host_room(std::uint64_t count, std::uint32_t pro
 bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot, double claim) {
     out.clear();
+    return make_slabs_free(count, protect_snapshot, claim) && take_free_slabs(count, out);
+}
+
+bool PrefixCacheIndex::make_slabs_free(std::uint32_t count, std::uint32_t protect_snapshot, double claim) {
     if (count > ceiling_) { return false; }
     // Evicted one at a time, victims would be lost even when the rest cannot free enough (a pause's
     // resume point against a Host tier of held snapshots evicted every unheld one, then failed): the
@@ -183,17 +187,15 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
         // The claim is judged on the values the allocation begins with: what the check above counted
         // stays a victim (evict_for_slabs), so the allocation it found feasible completes.
         ++claim_epoch_;
-        for (Snapshot& snapshot : snapshots_) {
-            if (snapshot.occupied && snapshot.priority <= claim) { snapshot.claim_stamp = claim_epoch_; }
+        // A block write's claim is below every value: no retained snapshot is stamped, so no scan.
+        if (claim > -std::numeric_limits<double>::infinity()) {
+            for (Snapshot& snapshot : snapshots_) {
+                if (snapshot.occupied && snapshot.priority <= claim) { snapshot.claim_stamp = claim_epoch_; }
+            }
         }
     }
     while (free_slabs_.size() < count) {
         if (!evict_for_slabs(protect_snapshot, claim)) { return false; }
-    }
-    for (std::uint32_t taken = 0; taken < count; ++taken) {
-        std::pop_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
-        out.push_back(free_slabs_.back());
-        free_slabs_.pop_back();
     }
     return true;
 }

@@ -999,7 +999,15 @@ std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {
     }
     if (!config_.host_blocks) { return std::nullopt; }
     std::vector<std::uint32_t> slab;
-    if (!allocate_slabs(1, slab, kNoId)) { return std::nullopt; }
+    // A claim below every value: dead blocks, lossless copies and superseded snapshots yield, no retained one.
+    // Issue #77: at an infinite claim, a tier smaller than one conversation's blocks and image gave up that
+    // conversation's only snapshot for a second copy of a block the Device held, and its next turn re-prefilled.
+    // Without an SSD tier one image and its tail stay free for the lineage's next capture; with one, a capture
+    // makes its room losslessly (§5.7), and a reserve would only demote more than the write needs.
+    const std::uint32_t wanted = config_.ssd_slabs != 0 ? 1U : config_.image_slabs + 2U;
+    if (!make_slabs_free(wanted, kNoId, -std::numeric_limits<double>::infinity()) || !take_free_slabs(1, slab)) {
+        return std::nullopt;
+    }
     nodes_[ref.index].host = CopyState::Filling;
     set_node_slab(ref.index, slab.front());
     refresh_node(ref.index);

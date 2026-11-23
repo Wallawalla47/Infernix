@@ -180,6 +180,8 @@ struct LanePrefix {
     // evicted first), so a resend resumes from it.
     std::optional<runtime::prefix_cache::SnapshotRef> superseded;
     bool withdraw       = false;
+    // The request was cancelled or failed before its end: its endpoint is no state its conversation continues.
+    bool abandoned      = false;
     std::uint64_t saves = 0;
 };
 
@@ -1947,10 +1949,14 @@ public:
             const std::uint32_t reuse = chosen && chosen->snapshot ? chosen->frontier : 0U;
             // Coalescing only defers a fresh request (an empty list: the Engine asks again).
             if (b.reuse && maximum_frontier == UINT32_MAX && prefix_await_sibling(data, reuse)) { return {}; }
+            // A root start over cached blocks says so (their state to resume from is gone): the log and the request
+            // record report what the prefill computed again.
+            PrefixSelection root      = prefix_root(data, b);
+            root.cached_tokens        = chosen ? chosen->cached_tokens : 0U;
             if (chosen && chosen->snapshot && chosen->frontier > 0 && chosen->frontier <= maximum_frontier) {
                 out.push_back(make_source(b, data, std::move(chosen)));
             }
-            out.push_back(make_source(b, data, prefix_root(data, b)));
+            out.push_back(make_source(b, data, std::move(root)));
         } else {
             out.push_back(make_source(b, data, std::nullopt));
         }
@@ -3437,6 +3443,7 @@ public:
             // has already published its endpoint.
             if (pending_transaction_ == 0 && lanes_[index].phase != Phase::Free &&
                 lanes_[index].phase != Phase::Published && !(walk_.active && walk_.lane == index)) {
+                lanes_[index].prefix.abandoned = true;
                 prefix_finish(lanes_[index], index);
             }
             release(index);

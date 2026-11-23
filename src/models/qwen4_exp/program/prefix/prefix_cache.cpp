@@ -240,11 +240,14 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
         throw std::invalid_argument("Qwen4Exp prefix cache: a capture's tail does not match its page");
     }
     if (ssd_) { make_lossless_room(host_.image_slabs + (tail ? 1U : 0U)); }
-    auto reserved = index_->reserve_host_image(tail, capture.claim);
+    std::optional<pc::SnapshotRef> superseded;
+    auto reserved = reserve_capture(tail, capture.claim, capture.replaces_source, capture.continuation,
+                                    capture.replaces_opener, superseded);
     if (!reserved) {
         ++counters_.taps_skipped;
         return false;
     }
+    capture.source_superseded = superseded.has_value();
     // Until the capture is listed, the reservation and the anchor's retention are held here: owned by nothing else,
     // they would shrink the Host tier until clear(). Declared before the try, so they go back only after the catch
     // has let the copies enqueued so far land (the slabs go back once idle).
@@ -278,6 +281,7 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
         (void)cudaStreamSynchronize(transfer_);
         if (start != nullptr) { recycle(start); }
         for (cudaEvent_t event : pending.events) { recycle(event); }
+        if (superseded && index_->valid(*superseded)) { index_->unsupersede(*superseded); }
         throw;
     }
     captures_.back().image = image.release(); // poll publishes it
@@ -319,9 +323,51 @@ void PrefixCache::copy_capture_group(std::uint32_t group, std::uint32_t lane, co
     lanes_->copy_group_to_host(group, lane, destination, transfer_);
 }
 
-std::optional<std::uint64_t> PrefixCache::open_staged_capture(bool tail, double claim) {
-    if (ssd_) { make_lossless_room(host_.image_slabs + (tail ? 1U : 0U)); }
+std::optional<pc::SnapshotRef> PrefixCache::published_opener(std::uint64_t id) const {
+    const auto found = published_.find(id);
+    if (found == published_.end() || !found->second.snapshot.valid() || !index_->valid(found->second.snapshot)) {
+        return std::nullopt;
+    }
+    const pc::SnapshotRef snapshot = found->second.snapshot;
+    if (index_->snapshot(snapshot).kind != pc::SnapshotKind::Tap || !snapshot_meta_[snapshot.index].opener) {
+        return std::nullopt;
+    }
+    return snapshot;
+}
+
+std::optional<pc::HostImageReservation>
+PrefixCache::reserve_capture(bool tail, double claim, std::optional<pc::SnapshotRef> replaces_source,
+                             std::span<const TokenId> continuation, std::uint64_t replaces_opener,
+                             std::optional<pc::SnapshotRef>& superseded) {
+    superseded.reset();
     auto reserved = index_->reserve_host_image(tail, claim);
+    if (reserved) { return reserved; }
+    if (replaces_source && index_->valid(*replaces_source)) {
+        const bool changed = index_->supersede(*replaces_source, continuation);
+        reserved           = index_->reserve_host_image(tail, claim);
+        if (reserved) {
+            if (changed) { superseded = replaces_source; }
+            return reserved;
+        }
+        if (changed && index_->valid(*replaces_source)) { index_->unsupersede(*replaces_source); }
+    }
+    if (replaces_opener != 0) {
+        (void)await_capture(replaces_opener); // in flight it is a reservation, which nothing can take
+        if (const auto opener = published_opener(replaces_opener)) {
+            const bool changed = index_->supersede(*opener);
+            reserved           = index_->reserve_host_image(tail, claim);
+            if (!reserved && changed && index_->valid(*opener)) { index_->unsupersede(*opener); }
+        }
+    }
+    return reserved;
+}
+
+std::optional<std::uint64_t> PrefixCache::open_staged_capture(bool tail, double claim,
+                                                              std::optional<pc::SnapshotRef> replaces_source,
+                                                              std::span<const TokenId> continuation) {
+    if (ssd_) { make_lossless_room(host_.image_slabs + (tail ? 1U : 0U)); }
+    std::optional<pc::SnapshotRef> superseded;
+    auto reserved = reserve_capture(tail, claim, replaces_source, continuation, 0, superseded);
     if (!reserved) {
         ++counters_.taps_skipped;
         return std::nullopt;
@@ -329,7 +375,7 @@ std::optional<std::uint64_t> PrefixCache::open_staged_capture(bool tail, double 
     // Held until the staged capture is listed: an event that cannot be created, or the map's node, would otherwise
     // lose the reservation (and the events taken) until clear().
     pc::HostImageHold image(*index_, std::move(*reserved));
-    StagedCapture staged{{}, tail, {}, 0};
+    StagedCapture staged{{}, tail, {}, 0, superseded};
     try {
         staged.events.reserve(lanes_->layout().groups());
         for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) { staged.events.push_back(take_event()); }
@@ -339,6 +385,7 @@ std::optional<std::uint64_t> PrefixCache::open_staged_capture(bool tail, double 
         return id;
     } catch (...) {
         for (cudaEvent_t event : staged.events) { recycle(event); } // none recorded yet
+        if (superseded && index_->valid(*superseded)) { index_->unsupersede(*superseded); }
         throw;
     }
 }
@@ -376,6 +423,7 @@ void PrefixCache::commit_staged_capture(std::uint64_t staged, Capture&& capture)
     // the capture is listed, and given back only after the catch has waited for the copies.
     pc::HostImageHold image(*index_, std::move(s.image));
     pc::NodeRetention anchor;
+    capture.source_superseded = s.superseded.has_value();
     PendingCapture pending{std::move(capture), {}, std::move(s.events)};
     try {
         if (pending.capture.anchor.valid()) { anchor = pc::NodeRetention(*index_, pending.capture.anchor); }
@@ -403,6 +451,10 @@ void PrefixCache::abandon_staged_capture(std::uint64_t staged) noexcept {
         recycle(event);
     }
     index_->release_host_image(std::move(found->second.image));
+    // No deeper state of the lineage came of it: the source it superseded for room serves again.
+    if (const auto& superseded = found->second.superseded; superseded && index_->valid(*superseded)) {
+        index_->unsupersede(*superseded);
+    }
     staged_.erase(found);
 }
 
@@ -499,9 +551,17 @@ void PrefixCache::poll() {
             snapshot_meta_[result.snapshot.index] = c.capture.meta;
             ++(c.capture.kind == pc::SnapshotKind::Endpoint ? counters_.endpoints_created : counters_.taps_created);
         }
-        if (c.capture.supersedes && index_->valid(*c.capture.supersedes) &&
-            (!result.snapshot.valid() || *c.capture.supersedes != result.snapshot)) {
-            index_->supersede(*c.capture.supersedes, c.capture.continuation);
+        if (c.capture.supersedes && index_->valid(*c.capture.supersedes)) {
+            if (!result.snapshot.valid()) {
+                // Nothing replaced the source: it stays its lineage's resume point.
+                if (c.capture.source_superseded) { index_->unsupersede(*c.capture.supersedes); }
+            } else if (*c.capture.supersedes != result.snapshot) {
+                index_->supersede(*c.capture.supersedes, c.capture.continuation);
+            }
+        }
+        // A lineage that resumes at endpoints does not read this turn's opener tap: the first to give way.
+        if (result.created && c.capture.replaces_opener != 0) {
+            if (const auto opener = published_opener(c.capture.replaces_opener)) { (void)index_->supersede(*opener); }
         }
         if (c.capture.anchor.valid()) { index_->unretain_node(c.capture.anchor); }
         published_[c.capture.id] = result;

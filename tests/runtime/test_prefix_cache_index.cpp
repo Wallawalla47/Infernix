@@ -375,7 +375,7 @@ void test_backed_before_unbacked() {
 void test_host_dead_and_gdsf() {
     RecordingBackend backend;
     // 12 slabs: images need 4 slabs each.
-    PrefixCacheIndex index(small_config(12, 3), backend);
+    PrefixCacheIndex index(small_config(12, 4), backend);
     const auto dead_tokens = make_tokens(64 * 4, 9);
     const auto dead_path   = insert_sequence(index, backend, dead_tokens);
     for (const NodeRef node : dead_path) { backup_node(index, node); }
@@ -395,10 +395,13 @@ void test_host_dead_and_gdsf() {
     const SnapshotRef snap_b = publish_tap(index, path_b[0]);
     backup_snapshot(index, snap_b);
     require(index.stats().host_dead_reclaims == 0, "4 slabs were still free");
-    backup_node(index, path_b[0]);
-    require(index.stats().host_dead_reclaims == 1, "dead KV must be reclaimed before snapshots");
-    require(index.valid(snap_a) && index.valid(snap_b),
-            "no snapshot should be evicted for dead KV");
+    // The four dead slabs cannot also leave an image's room free, and a block write takes no retained image: it is
+    // refused and evicts nothing.
+    index.pin_node(path_b[0]);
+    require(!index.begin_host_fill(path_b[0]).has_value(), "a block write must not take a retained image");
+    index.unpin_node(path_b[0]);
+    require(index.stats().host_dead_reclaims == 0 && index.valid(snap_a) && index.valid(snap_b),
+            "a refused block write evicts nothing");
     index.release_path(path_b);
 
     // Hit b so it is more valuable; a new snapshot must evict a (the GDSF minimum).
@@ -406,10 +409,17 @@ void test_host_dead_and_gdsf() {
     const auto c             = make_tokens(64 * 1, 12);
     const auto path_c        = insert_sequence(index, backend, c);
     const SnapshotRef snap_c = publish_tap(index, path_c[0]);
-    const double before      = index.stats().gdsf_inflation;
-    // Consume the remaining dead nodes first, then a snapshot's host copy must go.
+    // An image takes the dead nodes' slabs before any snapshot's.
     backup_snapshot(index, snap_c);
     require(index.stats().host_dead_reclaims == 4, "all dead nodes must go before snapshots");
+    require(index.stats().host_snapshot_evictions == 0 && index.valid(snap_a) && index.valid(snap_b),
+            "no snapshot should be evicted for dead KV");
+    const auto d             = make_tokens(64 * 1, 13);
+    const auto path_d        = insert_sequence(index, backend, d);
+    const SnapshotRef snap_d = publish_tap(index, path_d[0]);
+    const double before      = index.stats().gdsf_inflation;
+    // No dead node is left: a snapshot's host copy must go.
+    backup_snapshot(index, snap_d);
     require(index.stats().host_snapshot_evictions == 1, "one snapshot host copy must be evicted");
     // a is the GDSF minimum; it is still complete on the Device, so only its host copy goes.
     require(index.valid(snap_a) && index.snapshot(snap_a).host == CopyState::Absent &&
@@ -437,6 +447,7 @@ void test_host_dead_and_gdsf() {
     index.release_device_slot(*slot);
     index.release_device_slot(*backed_slot);
     index.release_path(path_c);
+    index.release_path(path_d);
     index.check_invariants();
 }
 
@@ -1286,15 +1297,16 @@ void test_host_eviction_operation_counts() {
     {
         RecordingBackend backend;
         PrefixCacheIndex index(small_config(16, 2), backend);
-        const auto old_path = insert_sequence(index, backend, make_tokens(64 * 16, 900));
+        // Eleven blocks: block writes leave one tailed image's five slabs free.
+        const auto old_path = insert_sequence(index, backend, make_tokens(64 * 11, 900));
         for (const NodeRef node : old_path) { backup_node(index, node); }
         index.release_path(old_path);
         const PrefixIndexOperations before = index.operations();
         const std::uint64_t reclaims       = index.stats().host_dead_reclaims;
-        const auto fresh                   = insert_sequence(index, backend, make_tokens(64 * 16, 901));
+        const auto fresh                   = insert_sequence(index, backend, make_tokens(64 * 11, 901));
         for (const NodeRef node : fresh) { backup_node(index, node); }
         const PrefixIndexOperations after = index.operations();
-        require(index.stats().host_dead_reclaims - reclaims == 16, "sixteen dead blocks yield their slabs");
+        require(index.stats().host_dead_reclaims - reclaims == 11, "eleven dead blocks yield their slabs");
         require(after.victim_scans == before.victim_scans && after.room_scans == before.room_scans &&
                     after.snapshot_visits == before.snapshot_visits,
                 "evicting dead blocks scanned the snapshot table");
@@ -1687,9 +1699,13 @@ void test_queue_holds() {
     // Two conversations fill a 12-slab Host tier: 2 blocks and a 4-slab endpoint image each.
     const auto host_scenario = [&](RecordingBackend& backend, PrefixCacheIndex& index) {
         std::vector<SnapshotRef> out;
+        // The blocks first: a block write leaves an image's room free, and the images then fill the tier.
+        std::vector<std::vector<NodeRef>> paths;
         for (const std::uint32_t seed : {70U, 71U}) {
-            const auto path = insert_sequence(index, backend, make_tokens(128, seed));
-            for (const NodeRef node : path) { backup_node(index, node); }
+            paths.push_back(insert_sequence(index, backend, make_tokens(128, seed)));
+            for (const NodeRef node : paths.back()) { backup_node(index, node); }
+        }
+        for (const auto& path : paths) {
             auto image = index.reserve_host_image(false, kAny);
             require(image.has_value(), "an endpoint image fits");
             out.push_back(index.publish_host_snapshot(path[1], 128, {}, std::nullopt, std::move(*image),
@@ -2570,6 +2586,54 @@ void test_ssd_random_stress() {
             "the stress exercises every SSD path");
 }
 
+// A Host tier smaller than a conversation's blocks and image (issue #77): write-through of a block the Device holds
+// never takes the conversation's retained snapshot, and leaves room for its next capture at any claim. Once that
+// snapshot is superseded, it is what a block write takes first.
+void test_block_writes_keep_resume_state() {
+    RecordingBackend backend;
+    const PrefixIndexConfig config = small_config(16, 0);
+    PrefixCacheIndex index(config, backend);
+    const auto tokens = make_tokens(14U * kBlockTokens, 770);
+    const auto path   = insert_sequence(index, backend, tokens);
+    auto image        = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(image.has_value(), "the first image fits");
+    const PublishResult resume = index.publish_host_snapshot(path[5], 6U * kBlockTokens, {}, std::nullopt,
+                                                             std::move(*image), SnapshotKind::Endpoint);
+    require(resume.created, "the resume point is published");
+    std::uint32_t written = 0;
+    for (const NodeRef node : path) {
+        index.pin_node(node);
+        const auto slab = index.begin_host_fill(node);
+        if (!slab) {
+            index.unpin_node(node);
+            break;
+        }
+        index.complete_host_fill(node);
+        index.unpin_node(node);
+        ++written;
+    }
+    index.check_invariants();
+    require(written == 16U - config.image_slabs - (config.image_slabs + 1U), "block writes stop at the image reserve");
+    require(index.valid(resume.snapshot), "a block write must not evict the retained resume point");
+    require(index.stats().host_snapshot_evictions == 0, "no snapshot was evicted for a block copy");
+    require(index.stats().host_free_slabs == config.image_slabs + 1U, "one image and its tail stay free");
+
+    auto next = index.reserve_host_image(true, 0.0);
+    require(next.has_value(), "the next capture finds the reserve at any claim");
+    require(index.valid(resume.snapshot), "the reserve costs the resume point nothing");
+    index.release_host_image(std::move(*next));
+
+    require(index.supersede(resume.snapshot), "the lineage moves past it");
+    const NodeRef unwritten = path[written];
+    index.pin_node(unwritten);
+    require(index.begin_host_fill(unwritten).has_value(), "a superseded snapshot yields to a block write");
+    index.complete_host_fill(unwritten);
+    index.unpin_node(unwritten);
+    require(!index.valid(resume.snapshot), "the superseded snapshot was the victim");
+    index.release_path(path);
+    index.check_invariants();
+}
+
 void test_tap_planner() {
     TapPlannerConfig config;
     config.max_new_taps   = 8;
@@ -3285,6 +3349,7 @@ int main() {
         test_rotation_keeps_gdsf_time();
         test_holds();
         test_publish_refusals_consume();
+        test_block_writes_keep_resume_state();
         test_tap_planner();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -455,7 +455,10 @@ public:
 
     // ---- host residency (§9.3)
     // ------------------------------------------------------------------- Allocates a slab for a
-    // device-resident pinned node (write-through destination). Absent when no slab can be freed.
+    // device-resident pinned node (write-through destination). The block's Device copy serves until it is evicted,
+    // so the slab comes only from what no resume needs: free slabs, dead blocks, copies the SSD tier also holds and
+    // superseded snapshots, never a retained snapshot's image. Without an SSD tier one image with its tail stays free
+    // for the lineage's next capture (§9.3). Absent when that leaves no slab: the block stays Device-only.
     [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node);
     void complete_host_fill(NodeRef node);
     void abort_host_fill(NodeRef node);
@@ -915,6 +918,8 @@ private:
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot,
                                       double claim = std::numeric_limits<double>::infinity());
+    // allocate_slabs' eviction alone: at least `count` slabs are free when it returns true.
+    [[nodiscard]] bool make_slabs_free(std::uint32_t count, std::uint32_t protect_snapshot, double claim);
     // One eviction of allocate_slabs's order that frees Host slabs; false when nothing (or nothing worth at most
     // `claim`) can yield. `for_moves` (a shrink making room for its moves) also takes a snapshot whose slabs all
     // lie past the ceiling: its eviction is one move less.

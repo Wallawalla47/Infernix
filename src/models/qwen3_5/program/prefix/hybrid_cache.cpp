@@ -515,7 +515,8 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
             NodePin pin(*index_, node);
             const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node); // may evict, and allocate
             if (!slab_id) {
-                // Everything left on the Host tier is pinned or filling; retry at a later release.
+                // Nothing on the Host tier that a block write may take (retained images stay, and one image's room
+                // stays free): the block stays Device-only; retry at a later release.
                 ++counters_.host_block_write_refusals;
                 break;
             }

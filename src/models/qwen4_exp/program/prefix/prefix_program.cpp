@@ -1031,8 +1031,11 @@ bool ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     // snapshot that is not pinned (a refused capture makes the resume replay, with prefill arithmetic).
     // The claim only admits it; its retention priority is the snapshot's own afterwards.
     if (resume_point) {
-        c.claim         = pc::kResumePointClaim;
-        c.publish_claim = pc::kResumePointClaim; // a full snapshot table yields an entry as the Host tier its slabs
+        c.claim           = pc::kResumePointClaim;
+        c.publish_claim   = pc::kResumePointClaim; // a full snapshot table yields an entry as the Host tier its slabs
+        // Its claim displaces what it must, and the paused turn is not over: it replaces nothing of its lineage yet.
+        c.replaces_source.reset();
+        c.replaces_opener = 0;
     }
     const std::uint64_t id = c.id;
     if (!prefix_->capture(index, std::move(c), device_.stream)) { return false; }
@@ -1115,14 +1118,24 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     // The request's first capture supersedes the snapshot it resumed from, which then serves only
     // requests diverging before this one. Its own earlier captures stay retained: its ladder taps and
     // its system-block boundary are where edits and side calls over the history diverge (§19.3.1).
-    if (!lane.prefix.captured && lane.prefix.resume) {
-        c.supersedes = *lane.prefix.resume;
-        if (prefix_->index().valid(*lane.prefix.resume)) {
-            const std::uint32_t from = prefix_->index().snapshot(*lane.prefix.resume).frontier;
-            if (from < F) {
-                c.continuation.assign(lane.history.begin() + from, lane.history.begin() + F);
-            }
+    if (!lane.prefix.captured && lane.prefix.resume) { c.supersedes = *lane.prefix.resume; }
+    if (lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume)) {
+        // On a shortage of Host room: a deeper state of the path replaces the source for every client. A first
+        // capture that is an endpoint does so unless the conversation is known not to resume at endpoints (it
+        // continued only an opener) or the reply did not stand (a client usually drops a cancelled one, and its next
+        // turn reads the source).
+        if (kind != pc::SnapshotKind::Endpoint || lane.prefix.captured ||
+            (lane.prefix.follow != PrefixFollow::Opener && !lane.prefix.abandoned)) {
+            c.replaces_source = *lane.prefix.resume;
         }
+        if (c.supersedes || c.replaces_source) {
+            const std::uint32_t from = prefix_->index().snapshot(*lane.prefix.resume).frontier;
+            if (from < F) { c.continuation.assign(lane.history.begin() + from, lane.history.begin() + F); }
+        }
+    }
+    if (kind == pc::SnapshotKind::Endpoint && lane.prefix.captured && lane.prefix.follow == PrefixFollow::Endpoint &&
+        !lane.prefix.abandoned) {
+        c.replaces_opener = lane.prefix.capture;
     }
     return c;
 }
@@ -1176,8 +1189,14 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index, bool pausing) {
     // point its cold prefill does not cut, often with fewer than 16 tokens left, whose GDN update takes
     // the recurrent kernel instead of the chunked kernel's partial last chunk (resume-equals-cold:
     // mean |dlogprob| 0.0011 with such taps, 0 without).
+    // Blocks past the deepest snapshot are reachable from nothing: a Host copy would only take a slab until the
+    // dead-KV sweep (as Qwen3.5's write-through skips them).
+    const auto reachable = [&]() -> std::span<const pc::NodeRef> {
+        return std::span<const pc::NodeRef>(lane.prefix.path.data(),
+                                            std::min<std::size_t>(lane.prefix.path.size(), lane.prefix.deepest / kBlock));
+    };
     if (!options_.free_cache_resume) {
-        prefix_->write_blocks(lane.prefix.path, device_.stream);
+        prefix_->write_blocks(reachable(), device_.stream);
         lane.prefix.resident_capture = lane.prefix.deepest == F ? lane.prefix.capture : 0;
         return;
     }
@@ -1194,7 +1213,7 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index, bool pausing) {
         ++prefix_->counters().endpoint_skipped_mtp;
     }
     // Blocks reach the Host after the endpoint (one transfer stream, FIFO).
-    prefix_->write_blocks(lane.prefix.path, device_.stream);
+    prefix_->write_blocks(reachable(), device_.stream);
     // The lane's slot holds the image of its latest capture until the lane is reused, but only when
     // that capture is at the lane's frontier: when the endpoint was not captured (too close to the
     // deepest snapshot, unfinished MTP blocks), the latest capture is an earlier tap whose state the
@@ -1251,7 +1270,8 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.owned.clear();
     lane.prefix.captures.clear();
     lane.prefix.superseded.reset();
-    lane.prefix.withdraw = false;
+    lane.prefix.withdraw  = false;
+    lane.prefix.abandoned = false;
     lane.prefix.path.clear();
     lane.prefix.taps.clear();
     lane.prefix.exclusions.clear();

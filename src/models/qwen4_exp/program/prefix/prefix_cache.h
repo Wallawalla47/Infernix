@@ -169,6 +169,15 @@ public:
         // When `supersedes` is the snapshot the lane resumed from: the lane's tokens from its frontier
         // on, so the endpoints the lineage went past are superseded too (PrefixCacheIndex::supersede).
         std::vector<TokenId> continuation;
+        // What the capture replaces in its own lineage when the Host tier has no room for it, so that it does not
+        // lose its conversation's state to a low claim (hybrid-prefix-cache-spec §9.3): the snapshot the lane resumed
+        // from (`continuation` as above), and for an endpoint of a lineage that resumes at endpoints the capture id of
+        // this turn's generation-opener tap, which that lineage's next turn does not read. The tap is also superseded
+        // once the endpoint publishes, so it is the first to give way.
+        std::optional<runtime::prefix_cache::SnapshotRef> replaces_source;
+        std::uint64_t replaces_opener = 0;
+        // `replaces_source` was superseded for this capture's room: undone if nothing is published.
+        bool source_superseded = false;
     };
     // Returns false when no slabs could be reserved for its claim (the capture is skipped).
     [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
@@ -177,8 +186,12 @@ public:
     // so each group (with that layer's planes of the tail page) is copied once the walk has enqueued
     // that layer of the frontier's chunk, and the capture is committed after the span. Opening
     // reserves the slabs (nothing when none could be reserved: the capture is skipped) and the
-    // events the lane's next writes to each group wait on (staged_events, layer order).
-    [[nodiscard]] std::optional<std::uint64_t> open_staged_capture(bool tail, double claim);
+    // events the lane's next writes to each group wait on (staged_events, layer order). `replaces_source` and
+    // `continuation` as Capture's: the source is superseded for its room, and retained again if the capture is
+    // abandoned.
+    [[nodiscard]] std::optional<std::uint64_t>
+    open_staged_capture(bool tail, double claim, std::optional<runtime::prefix_cache::SnapshotRef> replaces_source,
+                        std::span<const TokenId> continuation);
     void capture_group(std::uint64_t staged, std::uint32_t group, std::uint32_t lane,
                        std::optional<DeviceKVPageHandle> tail_page, cudaStream_t producer);
     [[nodiscard]] std::span<const cudaEvent_t> staged_events(std::uint64_t staged) const;
@@ -325,7 +338,17 @@ private:
         bool tail = false;
         std::vector<cudaEvent_t> events; // decoder layers, then MTP; each recorded once its group is copied
         std::uint32_t copied = 0;        // groups copied
+        // The source its reservation superseded for room (open_staged_capture).
+        std::optional<runtime::prefix_cache::SnapshotRef> superseded;
     };
+    // Reserves a capture's image: on a shortage its lineage's source gives way, then `replaces_opener`'s tap (the
+    // wait for that tap's copy is an image's copy time). `superseded` names the source when it was superseded here.
+    [[nodiscard]] std::optional<runtime::prefix_cache::HostImageReservation>
+    reserve_capture(bool tail, double claim, std::optional<runtime::prefix_cache::SnapshotRef> replaces_source,
+                    std::span<const TokenId> continuation, std::uint64_t replaces_opener,
+                    std::optional<runtime::prefix_cache::SnapshotRef>& superseded);
+    // The snapshot of a published capture that is a generation-opener tap.
+    [[nodiscard]] std::optional<runtime::prefix_cache::SnapshotRef> published_opener(std::uint64_t id) const;
     // The image's segments, as HostImage takes them.
     [[nodiscard]] std::vector<std::byte*> image_segments(const runtime::prefix_cache::HostImageReservation& image) const;
     // Group g's copy-out (its layer's planes of a tail page first) on the transfer stream.

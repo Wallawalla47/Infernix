@@ -528,7 +528,16 @@ void ProgramImpl::walk_plan_taps(Lane& lane) {
             continue;
         }
         const bool tail   = B % kBlock != 0;
-        const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail));
+        // A tap is a deeper state of the path: on a shortage of Host room its lineage's source gives way.
+        std::optional<pc::SnapshotRef> source;
+        std::span<const TokenId> continuation;
+        if (lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume)) {
+            source                   = *lane.prefix.resume;
+            const std::uint32_t from = prefix_->index().snapshot(*source).frontier;
+            if (from < B) { continuation = std::span<const TokenId>(lane.history.data() + from, B - from); }
+        }
+        const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail),
+                                                         source, continuation);
         if (!staged) {
             prefix_retry_tap(lane, B, forward); // no Host room now: due again at the next chunk's end
             continue;

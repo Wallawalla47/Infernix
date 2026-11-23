@@ -44,7 +44,10 @@
 //   SSD scale    (--ssd-scale only: timing) A 100K-token conversation resumed from the Host tier and, once
 //                pushed out of it, from the SSD tier (INFERNIX_TEST_SSD_DIR): times to first token.
 //
-//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--next-turn] [--ssd] [--ssd-scale]
+//   small tier   (own Engine) A Host tier smaller than one conversation's blocks and image: every turn still resumes
+//                past the previous turn's prompt (issue #77).
+//
+//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--next-turn] [--ssd] [--ssd-scale] [--small-tier]
 //   (default: all but --ssd-scale)
 
 #include "test_temp_path.h"
@@ -431,6 +434,36 @@ int run_write_through(const char* artifact, const char* ngram) {
     failures += check(written == (1500 + 8) / 64 && written > at_taps,
                       "the release wrote only the blocks past the tap (" + std::to_string(written - at_taps) + " of " +
                           std::to_string(written) + ")");
+    return failures;
+}
+
+// A Host tier smaller than one conversation's blocks and image (issue #77): a turn's write-through used to evict the
+// snapshot its next turn resumes from, and that turn prefilled from the root. Each turn must resume past the whole of
+// the previous turn's prompt, whichever copy of its blocks is left.
+int run_small_host_tier(const char* artifact, const char* ngram) {
+    std::printf("== Host tier smaller than a conversation\n");
+    infernix::EngineOptions options = base_options(artifact, ngram);
+    options.max_context             = 16384;
+    options.kv_capacity             = infernix::KvCapacityPolicy::explicit_capacity(16384);
+    // 336 INT8 slabs: two tailed images take 250, which leaves 86 for the first prompt's 125 blocks.
+    options.context_cache.host_capacity_bytes = 300ULL << 20;
+    infernix::Engine engine(options, infernix::test::engine_host());
+    std::vector<infernix::TokenId> history = synthetic_tokens(8000, 91);
+    int failures                           = 0;
+    for (std::uint32_t turn = 0; turn < 6; ++turn) {
+        const auto prompt_tokens = static_cast<std::uint32_t>(history.size());
+        const Run run            = generate(engine, history, 8, true);
+        std::printf("        turn %u: prompt %u, resumed at %u\n", turn, prompt_tokens, run.reused);
+        // The cold turn's ladder taps fill this tier, so its endpoint may find no room and turn 1 resumes at its last
+        // tap, within a prefill chunk of the end. From then on each turn resumes at the previous turn's end.
+        if (turn != 0) {
+            failures += check(run.reused + (turn == 1 ? kChunk : 200U) >= prompt_tokens,
+                              "turn " + std::to_string(turn) + " resumes at the previous turn's end");
+        }
+        history.insert(history.end(), run.tokens.begin(), run.tokens.end());
+        const std::vector<infernix::TokenId> next = synthetic_tokens(150, 92 + turn);
+        history.insert(history.end(), next.begin(), next.end());
+    }
     return failures;
 }
 
@@ -955,17 +988,19 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true, next_turn = true, ssd = true, ssd_scale = false;
+    bool plain = true, mtp = true, next_turn = true, ssd = true, ssd_scale = false, small_tier = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--mtp") { plain = false; next_turn = false; ssd = false; }
-        if (arg == "--plain") { mtp = false; next_turn = false; ssd = false; }
-        if (arg == "--next-turn") { plain = false; mtp = false; ssd = false; }
-        if (arg == "--ssd") { plain = false; mtp = false; next_turn = false; }
-        if (arg == "--ssd-scale") { plain = false; mtp = false; next_turn = false; ssd = false; ssd_scale = true; }
+        if (arg == "--mtp") { plain = false; next_turn = false; ssd = false; small_tier = false; }
+        if (arg == "--plain") { mtp = false; next_turn = false; ssd = false; small_tier = false; }
+        if (arg == "--next-turn") { plain = false; mtp = false; ssd = false; small_tier = false; }
+        if (arg == "--ssd") { plain = false; mtp = false; next_turn = false; small_tier = false; }
+        if (arg == "--ssd-scale") { plain = false; mtp = false; next_turn = false; ssd = false; small_tier = false; ssd_scale = true; }
+        if (arg == "--small-tier") { plain = false; mtp = false; next_turn = false; ssd = false; }
     }
     try {
         int failures = 0;
+        if (small_tier) { failures += run_small_host_tier(artifact, ngram); }
         if (ssd) { failures += run_ssd_tier(artifact, ngram); }
         if (const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2"); ssd && drafter != nullptr) {
             failures += run_ssd_tier(artifact, ngram, drafter);

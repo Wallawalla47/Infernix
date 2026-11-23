@@ -1583,7 +1583,43 @@ Allocation of `k` slabs:
 
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
-Device-only (§9.2). KV block writes (write-through) are not bounded this way.
+Device-only (§9.2).
+
+A KV block write (write-through) takes a slab only from what no resume needs: free slabs, dead blocks,
+copies the SSD tier also holds and superseded snapshots. It never evicts a retained snapshot. Without an
+SSD tier it also leaves one image and its tail free for the lineage's next capture (with one, a capture
+makes its room losslessly, §5.7). A block it cannot place stays Device-only and is written by a later
+release if room appears. The block's Device copy serves until it
+is evicted, while a retained snapshot's Host image may be its only copy (always on Qwen3.8-Flash-Next).
+Before 2026-11-23 these writes had an infinite claim: on a tier smaller than one conversation's blocks
+plus an image (1 GiB holds 1,149 Flash-Next INT8 slabs, so about 65.5K tokens), a turn's own write-through
+evicted the snapshot its next turn needed, and that turn re-prefilled from the root (issue #77).
+
+On Qwen3.8-Flash-Next a capture reserves its image before it lands, so when the tier has no room its own
+lineage gives way first. A tap, or an endpoint after the turn's tap, supersedes the snapshot the lane
+resumed from. An endpoint that is the turn's first capture does so unless the conversation is known not
+to resume at endpoints (it continued only a generation opener) or the request was cancelled, because the
+client usually drops a cancelled reply and its next turn reads that source. In a lineage that resumes at
+endpoints the endpoint also supersedes the
+turn's generation-opener tap once it publishes. A supersession made for room is undone when the capture
+is refused or abandoned, and when a turn's first capture publishes nothing. One made by a later capture
+stays if that capture's publication is refused: the turn's earlier capture is the deeper state.
+
+Measured on the RTX 5090 (2026-11-23, INT8 KV, the old and new rules in one build; share of the prompt
+tokens recomputed after each run's first turn):
+
+| Workload | Host tier | Before | After |
+|---|---|---|---|
+| Flash-Next Dense8, one conversation 45K to 86K, client strips thinking | 1 GiB | 49.5 % | 3.5 % |
+| Same, client echoes its replies | 1 GiB | 49.0 % | 3.4 % |
+| Qwen3.8-27B, one conversation, client strips thinking | 2 GiB | 8.6 % | 3.5 % |
+| Same, client echoes its replies (never lost its endpoint) | 2 GiB | 3.5 % | 3.5 % |
+| `bench/agentic_ab` (131 requests, greedy), Flash-Next Dense8 | 7.5 GiB | 12.4 % | 11.1 % |
+| `bench/agentic_ab` (131 requests, greedy), Qwen3.8-27B | 4 GiB | 61.1 % | 20.6 % |
+
+The Flash-Next conversations went from seven full re-prefills to none (worst time to first token 10.3 s to
+3.5 s with a client stripping thinking, 2.6 s with one echoing). The agentic replay's conversations drift
+apart between runs, so its rows compare shares of slightly different prompt totals.
 
 **Jointly feasible eviction (2026-11-14, after NInfer).** Evicting one victim at a time lost victims
 even when the rest could not free enough: a pause's resume point against a Host tier of held
