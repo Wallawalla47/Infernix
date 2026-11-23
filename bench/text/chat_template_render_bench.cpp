@@ -479,11 +479,12 @@ std::vector<infernix::PromptCacheMarker> agent_markers(std::size_t count, std::s
     using infernix::PromptCacheMarker;
     using infernix::PromptCacheMarkerLocation;
     using infernix::SharedCandidateEvidence;
-    std::vector<PromptCacheMarker> markers;
-    markers.push_back({.after_message_count = static_cast<std::uint32_t>(count - 2)});
-    markers.push_back({.after_message_count = static_cast<std::uint32_t>(count)});
-    markers.push_back(
-        {.after_message_count = 1, .evidence = SharedCandidateEvidence::DefaultAutomatic});
+    // Built in one construction: GCC 13 warns (-Wstringop-overflow, a false positive) on push_back into an empty vector
+    // of these markers.
+    std::vector<PromptCacheMarker> markers{
+        {.after_message_count = static_cast<std::uint32_t>(count - 2)},
+        {.after_message_count = static_cast<std::uint32_t>(count)},
+        {.after_message_count = 1, .evidence = SharedCandidateEvidence::DefaultAutomatic}};
     if (tools) {
         markers.push_back({.evidence         = SharedCandidateEvidence::EngineStructural,
                            .location         = PromptCacheMarkerLocation::ToolBoundary,
