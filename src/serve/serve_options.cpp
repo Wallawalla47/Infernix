@@ -55,6 +55,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--reproducible", false},
     ServeOptionArity{"--lossless", false},
+    ServeOptionArity{"--causal-scoring", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--no-fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
@@ -332,6 +333,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             request and the artifact alone; text with\n"
            "                             --kv-dtype bf16, no speculation; slower\n"
            "                             (docs/maintainer/lossless-route.md)\n"
+           "  --causal-scoring           start for teacher-forced scoring: POST /v1/score\n"
+           "                             returns per-token log-probabilities and top_k;\n"
+           "                             nothing generates (docs/serving.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
            "  --no-fast-path NAME        leave this selected fast path out of the default\n"
@@ -921,6 +925,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_paths = false;
         } else if (arg == "--lossless") {
             options.lossless = true;
+        } else if (arg == "--causal-scoring") {
+            options.causal_scoring = true;
         } else if (arg == "--fast-path") {
             const std::string name(require_value("--fast-path"));
             const std::optional<FastPath> path = parse_fast_path(name);

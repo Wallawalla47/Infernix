@@ -196,6 +196,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | Engine-native expanded input-token count |
 | `POST /v1/decide` (alias `/v1/systemone`) | typed decisions read from the next-token distribution, with nothing generated ([Decisions](#decisions)) |
+| `POST /v1/score` | teacher-forced log-probabilities of a given continuation, with the top-k at every scored position and nothing generated; needs `--causal-scoring` ([Teacher-forced scoring](#teacher-forced-scoring)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
@@ -1979,6 +1980,67 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
 - Each question is one engine request in the request log and metrics (`protocol: "decide"`): a
   readout with one staged output token that is never returned, a generated primitive with its run.
 
+## Teacher-forced scoring
+
+`POST /v1/score` returns the log-probability of every token of a given continuation after a given
+prompt, and the engine's own top-k next-token distribution at each of those positions. Nothing is
+generated: the whole sequence is scored in one teacher-forced pass by `Engine::score_tokens`. It
+needs a server started with `--causal-scoring`; a generation server answers `501` with
+`code: "scoring_not_enabled"`.
+
+Uses: KL divergence between two models or settings over the same prompts (each response carries
+the distribution at every position, not only the target token's probability), and the
+log-likelihood requests of evaluation harnesses such as lm-evaluation-harness.
+
+| Field | Meaning |
+|---|---|
+| `apply_chat_template` | **Required**, `true` or `false`. `true` renders the prompt exactly as `/v1/chat/completions` renders it, generation prompt included; `false` encodes `prompt` as raw text with no template and no special tokens. There is no default, because it decides which distribution is measured. |
+| `prompt` | A string. With the template it is one user message. |
+| `messages` | Chat Completions turns, text only (`score_text_only` otherwise). Needs `apply_chat_template: true`. Exactly one of `prompt` and `messages`. |
+| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Template options, parsed as on `/v1/chat/completions`. Refused when `apply_chat_template` is false (`template_option_without_template`). |
+| `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. |
+| `top_k` | `0` to `256`: the most probable tokens returned per position, in descending order. Above `256` is refused (`top_k_out_of_range`), never narrowed. |
+| `model` | Optional string, echoed back. |
+
+An unknown field is refused with `400` and `code: "unknown_field"`. Prompt plus continuation must fit
+the server's `--max-context` (`context_length_exceeded`).
+
+A request (Qwen3.8-Flash-Next, NVIDIA NVFP4-QAD):
+
+```json
+{"model": "pr1test", "apply_chat_template": true, "messages": [{"role": "user", "content": "Say hello."}],
+ "enable_thinking": false, "continuation": " Hello there", "top_k": 2}
+```
+
+and its response:
+
+```json
+{
+  "object": "score",
+  "model": "pr1test",
+  "chat_template_applied": true,
+  "enable_thinking": false,
+  "top_k": 2,
+  "max_top_k": 256,
+  "positions": [
+    {"token_id": 21251, "token": " Hello", "logprob": -9.647107124328613,
+     "top_logprobs": [{"token_id": 9419, "token": "Hello", "logprob": -0.0006939148879610002},
+                      {"token_id": 12675, "token": "Hi", "logprob": -8.805469512939453}]},
+    {"token_id": 1017, "token": " there", "logprob": -5.637060165405273,
+     "top_logprobs": [{"token_id": 0, "token": "!", "logprob": -0.01845814660191536},
+                      {"token_id": 248046, "token": "<|im_end|>", "logprob": -4.612805366516113}]}
+  ],
+  "usage": {"prompt_tokens": 15, "continuation_tokens": 2}
+}
+```
+
+The continuation's own tokens are scored whatever their rank. Here the model's first choice after
+the generation prompt is `Hello` with no leading space, so the continuation's ` Hello` scores −9.65:
+write the continuation as the text that follows the prompt, boundary spacing included.
+
+`enable_thinking` is the template's thinking switch as rendered (`null` without a template).
+Repeating a request returns byte-identical output.
+
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
@@ -2019,6 +2081,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--expert-state FILE\|off` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file Qwen3.8-Flash-Next seeds the cache from a built-in calibrated expert order instead, and with one the SSD tier's RAM takes the experts the file never ranked in that order; the 122B seeds it the same way from its own calibrated order once one is generated into the build (none is yet, so today it starts with an empty cache that each prompt's routes seed). `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it. Beside it, `FILE.cpu-rates` keeps the CPU expert team's settled rates for this CPU, artifact and team: every start still reads the rates, and when its first two readings agree with the stored ones within 10 % it skips the 4 s settling pause (otherwise it settles in full and, on a quiet CPU, stores its own); the session always uses that start's readings, and a changed machine or configuration is simply a new entry | `<artifact>.expert-state` |
 | `--expert-stripe FILE` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive; each record not in RAM is then read in two parts, its head from the artifact and its tail from the stripe, at the same time. The stripe must belong to the artifact. Unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
+| `--causal-scoring` | start the engine for teacher-forced scoring (the `CausalScoring` purpose `perplexity` and `certify` use): `POST /v1/score` answers and nothing generates, so there is no warm-up ([Teacher-forced scoring](#teacher-forced-scoring)) | off |
 | `--max-pending-requests N` | additional requests allowed to wait for admission, 1 to 1024 (the HTTP pool starts a worker for each admitted or waiting request) | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--keep-alive-timeout-sec N` | how long an HTTP connection stays open after its response finishes, for the client's next request on the same connection (valid range `1..3600`). The server advertises it as `Keep-Alive: timeout=N` and closes an idle connection 10 s later. Client pools reuse connections between turns; when the server closes a connection first, a client can write its next request onto it (even one that checks a pooled socket before reusing it, if the close is in flight between the check and the write) and loses that request: Bun's `fetch` and the AI SDK do not retry a POST. The timeout close is graceful (a FIN first, then a short drain of anything the client sent), and a request that does arrive re-arms the window on both sides. Two kinds of client pool meet it: one that reads `Keep-Alive: timeout` retires the connection by the advertised deadline, before the server's close; one that ignores the header keeps its own idle timeout, which the window must exceed. Bun's `fetch` (opencode's client) is of the second kind, with a 5-minute idle timeout that fires 4-5 minutes after the last response, so the default outlasts it. Set the window above the longest idle timeout of the header-blind client pools you serve. Each open connection holds a request worker (an idle one wakes every 10 ms) for its whole idle window; the pool ceiling (`--max-http-clients`) bounds how many | `360` |

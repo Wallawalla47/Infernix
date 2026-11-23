@@ -713,6 +713,13 @@ const CLIENTS: FormSection = {
       min: 0,
       more: true,
     },
+    {
+      kind: "switch",
+      flag: "--causal-scoring",
+      label: "Scoring server",
+      help: "Start for teacher-forced scoring only: POST /v1/score returns per-token log-probabilities and top_k for a given continuation. Nothing generates, so chat and coding tools get no replies. docs/serving.md",
+      more: true,
+    },
   ],
 };
 

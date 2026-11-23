@@ -112,6 +112,9 @@ struct ServeOptions {
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true; // off with --reproducible or --lossless (EngineOptions)
     bool lossless                      = false; // --lossless (EngineOptions)
+    // --causal-scoring: start the Engine for teacher-forced scoring (EnginePurpose::CausalScoring):
+    // POST /v1/score answers and nothing generates (no warm-up). Off: /v1/score refuses.
+    bool causal_scoring                = false;
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
     // runs; EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;
