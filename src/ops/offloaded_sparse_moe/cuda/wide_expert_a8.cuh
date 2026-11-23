@@ -37,20 +37,23 @@
 
 namespace infernix::ops::offloaded_moe::wide {
 
-struct ScheduleA8 {
+// A schedule of the grouped kernel: Rows weight rows (Rows / 16 consumer warps of 64 tokens x 16 rows) by 64 tokens a
+// CTA tile, Stages stages of 128 K elements, MinBlocks CTAs an SM. A column's outputs are the same bits under any.
+template <int Rows, int Stages, int MinBlocks>
+struct ScheduleA8T {
     static constexpr int kBlockTokens     = kTileColumns; // 64
-    static constexpr int kBlockRows       = 128;
-    static constexpr int kRowGroups       = kBlockRows / 16; // 8
+    static constexpr int kBlockRows       = Rows;
+    static constexpr int kRowGroups       = kBlockRows / 16;
     static constexpr int kBlockK          = 128;
     static constexpr int kUnitsPerKTile   = kBlockK / 16; // 8 record units per row group
     static constexpr int kSlicesPerKTile  = kBlockK / 32; // 4 activation slice scales
     static constexpr int kCodeRowBytes    = kBlockK;      // a row's codes of a stage
     static constexpr int kScaleRowBytes   = 4 * kSlicesPerKTile;
     static constexpr int kRowStride       = kCodeRowBytes + kScaleRowBytes; // 144
-    static constexpr int kStages          = 2;
-    static constexpr int kMinBlocksPerSm  = 2;
+    static constexpr int kStages          = Stages;
+    static constexpr int kMinBlocksPerSm  = MinBlocks;
     static constexpr int kWarpsTokens     = 1;
-    static constexpr int kWarpsRows       = 8;
+    static constexpr int kWarpsRows       = kRowGroups;
     static constexpr int kConsumerWarps   = kWarpsTokens * kWarpsRows;
     static constexpr int kConsumerThreads = kConsumerWarps * 32;
     static constexpr int kProducerThreads = 32;
@@ -60,21 +63,33 @@ struct ScheduleA8 {
     static constexpr int kMmaTokens       = kWarpTokens / 16;            // 4
     static constexpr int kMmaRows         = kWarpRows / 8;               // 2: lo/hi halves of the row group
     static constexpr int kUnitRunBytes    = kUnitsPerKTile * static_cast<int>(kUnitBytes); // 1,152
-    static_assert(kRowStride % 16 == 0 && kUnitRunBytes % 16 == 0 && kWarpRows == 16);
+    static_assert(kRowStride % 16 == 0 && kUnitRunBytes % 16 == 0 && kWarpRows == 16 && kRowGroups <= 32);
 };
 
-struct StorageA8 {
-    alignas(128) std::uint8_t a_rows[ScheduleA8::kStages][ScheduleA8::kBlockTokens * ScheduleA8::kRowStride];
-    alignas(128) std::uint8_t b_units[ScheduleA8::kStages][ScheduleA8::kRowGroups * ScheduleA8::kUnitRunBytes];
+// Two CTAs of 8 consumer warps an SM, 2 stages (Flash-Next's offloaded experts).
+using ScheduleA8 = ScheduleA8T<128, 2, 2>;
+// One CTA of 16 consumer warps an SM, 3 stages (Inkling 2's prompt route; ncu 2026-11-23: under ScheduleA8 its
+// consumers waited on a stage's data in ~20 % of their samples): twice the bytes in flight an SM, each activation
+// stage read by 16 warps.
+using ScheduleA8Tall = ScheduleA8T<256, 3, 1>;
+
+template <class S>
+struct StorageA8T {
+    alignas(128) std::uint8_t a_rows[S::kStages][S::kBlockTokens * S::kRowStride];
+    alignas(128) std::uint8_t b_units[S::kStages][S::kRowGroups * S::kUnitRunBytes];
     float2 scaled[256]; // {S, -1.5 * 2^23 * S} of every E4M3 scale word, S = canon::e4m3_scaled (both exact)
-    alignas(8) std::uint64_t full[ScheduleA8::kStages];
-    alignas(8) std::uint64_t empty[ScheduleA8::kStages];
+    alignas(8) std::uint64_t full[S::kStages];
+    alignas(8) std::uint64_t empty[S::kStages];
 };
+using StorageA8 = StorageA8T<ScheduleA8>;
 
 static_assert(ScheduleA8::kMinBlocksPerSm * (sizeof(StorageA8) + 1024) <= 102400, "two A8 CTAs must fit an SM");
+static_assert(ScheduleA8Tall::kMinBlocksPerSm * (sizeof(StorageA8T<ScheduleA8Tall>) + 1024) <= 102400,
+              "a tall A8 CTA must fit an SM");
 
 // A consumer thread's accumulators: acc[m][r][v] holds token tile_column(m, v) and weight row
-// row_block * 128 + 16 warp_n + 8 r + 2 tig + (v & 1) (rows 2i and 2i + 1: gate_i and up_i of the gate/up matrix).
+// row_block * kBlockRows + 16 warp_n + 8 r + 2 tig + (v & 1) (rows 2i and 2i + 1: gate_i and up_i of the gate/up
+// matrix). The same shape under every schedule (a warp's 64 tokens x 16 rows).
 using AccumulatorsA8 = float[ScheduleA8::kMmaTokens][ScheduleA8::kMmaRows][4];
 
 // The matrix a grouped kernel computes: its row groups and K blocks, its offset in a job's record, K, the bytes of
@@ -94,16 +109,17 @@ struct A8Matrix {
     static_assert(kRowBytes >= kK + kK / 8 && kK % 16 == 0, "a row holds its codes, then its slice scales");
 };
 
-template <class Shape, class Epilogue>
-__global__ __launch_bounds__(ScheduleA8::kThreads, ScheduleA8::kMinBlocksPerSm) void grouped_kernel_a8(
+template <class Shape, class Epilogue, class S = ScheduleA8>
+__global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kernel_a8(
     const Call call, const std::int32_t pass, const Epilogue epilogue) {
-    using S                  = ScheduleA8;
     constexpr int kRowBlocks = Shape::kRowGroups / S::kRowGroups;
     constexpr int kKTiles    = Shape::kBlocks / S::kUnitsPerKTile;
     namespace a8             = ::infernix::ggml::a8;
+    static_assert(Shape::kRowGroups % S::kRowGroups == 0 && Shape::kBlocks % S::kUnitsPerKTile == 0,
+                  "whole row blocks and 128-element stages");
 
     extern __shared__ __align__(128) unsigned char a8_shared_bytes[];
-    auto& shared = *reinterpret_cast<StorageA8*>(a8_shared_bytes);
+    auto& shared = *reinterpret_cast<StorageA8T<S>*>(a8_shared_bytes);
     const int tile_begin = call.pass_tiles[pass];
     const int work       = (call.pass_tiles[pass + 1] - tile_begin) * kRowBlocks;
     if (static_cast<int>(blockIdx.x) >= work) { return; }
@@ -325,12 +341,11 @@ struct DownEpilogueA8 {
     }
 };
 
-template <class Shape, class Epilogue>
+template <class Shape, class Epilogue, class S = ScheduleA8>
 void launch_a8(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
-    using S             = ScheduleA8;
-    constexpr int bytes = static_cast<int>(sizeof(StorageA8));
+    constexpr int bytes = static_cast<int>(sizeof(StorageA8T<S>));
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = grouped_kernel_a8<Shape, Epilogue>;
+    static constexpr auto kernel = grouped_kernel_a8<Shape, Epilogue, S>;
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,

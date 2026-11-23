@@ -241,16 +241,19 @@ __device__ __forceinline__ bool kv_encode_bf16p(const std::uint16_t (&bits)[4], 
         if (lane >= d) { before += n; }
     }
     before -= mine;
-    // The record's bytes 2 + k hold escape k (k < 14): words w[0..3] of the 16 bytes.
-    unsigned rec[4] = {0, 0, 0, 0};
+    // The record's bytes 2 + k hold escape k (k < 14), gathered as its low and high 8 bytes (shifts, not an array a run
+    // time index would put in local memory).
+    std::uint64_t low = 0, high = 0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         if ((escaped >> i) & 1U) {
             if (before < kBf16p128Escapes) {
-                const unsigned byte = 2 + before;
-#pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    if (byte / 4 == static_cast<unsigned>(q)) { rec[q] |= e[i] << (8 * (byte % 4)); }
+                const unsigned byte    = 2 + before;
+                const std::uint64_t at = std::uint64_t{e[i]} << (8 * (byte & 7U));
+                if (byte < 8) {
+                    low |= at;
+                } else {
+                    high |= at;
                 }
             }
             ++before;
@@ -258,10 +261,10 @@ __device__ __forceinline__ bool kv_encode_bf16p(const std::uint16_t (&bits)[4], 
     }
     const unsigned count = min(total, kBf16p128Escapes) | (zeros ? 0x80U : 0U);
     uint4 record;
-    record.x = __reduce_or_sync(kAll, rec[0]) | base | count << 8;
-    record.y = __reduce_or_sync(kAll, rec[1]);
-    record.z = __reduce_or_sync(kAll, rec[2]);
-    record.w = __reduce_or_sync(kAll, rec[3]);
+    record.x = __reduce_or_sync(kAll, static_cast<unsigned>(low)) | base | count << 8;
+    record.y = __reduce_or_sync(kAll, static_cast<unsigned>(low >> 32));
+    record.z = __reduce_or_sync(kAll, static_cast<unsigned>(high));
+    record.w = __reduce_or_sync(kAll, static_cast<unsigned>(high >> 32));
     if (lane == 0) { *reinterpret_cast<uint4*>(side) = record; }
     return total <= kBf16p128Escapes;
 }
@@ -444,13 +447,12 @@ __device__ __forceinline__ void kv_decode16(KvForm form, const std::uint8_t* cod
                          __popc(n.y & (n.y >> 1) & (n.y >> 2) & (n.y >> 3) & 0x11111111U);
             }
         }
-        const std::uint32_t rw[4] = {record.x, record.y, record.z, record.w};
-        const auto escape = [&](unsigned k) { // escape k's exponent: record byte 2 + k
-            const unsigned byte = 2 + k;
-            std::uint32_t word  = rw[0];
-#pragma unroll
-            for (int q = 1; q < 4; ++q) { word = byte / 4 == static_cast<unsigned>(q) ? rw[q] : word; }
-            return (word >> (8 * (byte % 4))) & 0xFFU;
+        // Escape k's exponent: record byte 2 + k, its word chosen by two selects (an array indexed at run time lands
+        // in local memory).
+        const auto escape = [&](unsigned k) {
+            const unsigned byte = 2 + k, q = byte >> 2;
+            const std::uint32_t low = (q & 1U) != 0 ? record.y : record.x, high = (q & 1U) != 0 ? record.w : record.z;
+            return (((q & 2U) != 0 ? high : low) >> (8 * (byte & 3U))) & 0xFFU;
         };
         const std::uint32_t cw[4] = {code.x, code.y, code.z, code.w};
         std::uint32_t half[16];

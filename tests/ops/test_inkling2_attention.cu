@@ -704,6 +704,24 @@ Problem make_problem(bool full, const Call& call, std::uint32_t seed, ik::KvCode
         check(next <= kPoolPages, "the test's pool holds its lanes");
     }
     p.codec = full ? codec : ik::KvCodec::Bf16;
+    if (p.codec == ik::KvCodec::Bf16Packed) {
+        // Escapes (exponents below a row's 14-binade window; normal rows span fewer binades, so they have none): every
+        // fifth pool row holds 1 + row % 6 values far below the rest (K +-2^-40, V +-2^-20: an FP16 subnormal), so the
+        // decode reads escape records; column 0's new key row gets 5 (packable) from channels 32-36 of KV head 0 and
+        // their conv history at 2^-100.
+        const std::size_t rows = p.kv_k.size() / D;
+        for (std::size_t row = 0; row < rows; row += 5) {
+            for (int j = 0; j <= static_cast<int>(row % 6); ++j) {
+                const std::size_t at = row * D + static_cast<std::size_t>((37 * j + 11) % D);
+                p.kv_k[at]           = b16((j & 1) != 0 ? -0x1p-40F : 0x1p-40F);
+                p.kv_v[at]           = h16((j & 1) != 0 ? -0x1p-20F : 0x1p-20F);
+            }
+        }
+        for (int ch = 32; ch < 37; ++ch) {
+            p.k[ch] = b16(0x1p-100F);
+            for (int back = 1; back <= 3; ++back) { p.kring[(std::size_t(0) * R + (1100 - back) % R) * KVW + ch] = b16(0x1p-100F); }
+        }
+    }
     if (p.quantized()) {
         encode_pool(p.form(0), p.kv_k, p.k_side, false);
         encode_pool(p.form(1), p.kv_v, p.v_side, true);

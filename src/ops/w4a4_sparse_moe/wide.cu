@@ -217,8 +217,8 @@ struct A8Shape {
     static constexpr int kRowBytes       = M == wide::Matrix::GateUp ? kA8XRowBytes : kA8HRowBytes;
     static constexpr bool kTokenRows     = M == wide::Matrix::GateUp;
     static constexpr bool kSharedJobs    = false;
-    static_assert(kRowGroups % wide::ScheduleA8::kRowGroups == 0 && kBlocks % wide::ScheduleA8::kUnitsPerKTile == 0,
-                  "whole 128-row blocks and 128-element stages");
+    static_assert(kRowGroups % wide::ScheduleA8Tall::kRowGroups == 0 && kBlocks % wide::ScheduleA8Tall::kUnitsPerKTile == 0,
+                  "whole 256-row blocks and 128-element stages");
     static_assert(kRowBytes == kK + kK / 8, "a row holds its codes, then its slice scales");
 };
 
@@ -233,7 +233,7 @@ struct GateUpA8Epilogue {
     std::uint16_t* h;
 
     __device__ __forceinline__ void operator()(wide::AccumulatorsA8& acc, const wide::TileContext& ctx) const {
-        using S       = wide::ScheduleA8;
+        using S       = wide::ScheduleA8Tall;
         const float m = canon::div_rn(w_amax[2 * ctx.expert], denominators[0]);
 #pragma unroll
         for (int mt = 0; mt < S::kMmaTokens; ++mt) {
@@ -264,7 +264,7 @@ struct DownA8Epilogue {
     std::uint16_t* outputs;
 
     __device__ __forceinline__ void operator()(wide::AccumulatorsA8& acc, const wide::TileContext& ctx) const {
-        using S       = wide::ScheduleA8;
+        using S       = wide::ScheduleA8Tall;
         const float m = canon::div_rn(w_amax[2 * ctx.expert + 1], denominators[1]);
 #pragma unroll
         for (int mt = 0; mt < S::kMmaTokens; ++mt) {
@@ -565,14 +565,14 @@ void moe_experts_prompt(const Activations& x, const Routing& routing, const Bank
         call.h_rows             = ws.h_a8;
         const GateUpA8Epilogue gate_up{ws.entries,       routing.gamma,  bank.amax, bank.denominators,
                                        bank.gate_softcap, bank.up_softcap, ws.h};
-        wide::launch_a8<A8Shape<wide::Matrix::GateUp>>(call, 0, gate_up, stream);
+        wide::launch_a8<A8Shape<wide::Matrix::GateUp>, GateUpA8Epilogue, wide::ScheduleA8Tall>(call, 0, gate_up, stream);
         check_launch("A8 gate/up");
         // h's BF16 plane (dispatch order) as A8 rows, by the codec the x rows took.
         const Tensor h(ws.h, DType::BF16, {kInter, entries});
         Tensor h8(ws.h_a8, DType::I32, {kA8HRowBytes / 4, entries});
         ops::a8_encode_columns(h, h8, stream);
         const DownA8Epilogue down{ws.entries, bank.amax, bank.denominators, outputs};
-        wide::launch_a8<A8Shape<wide::Matrix::Down>>(call, 0, down, stream);
+        wide::launch_a8<A8Shape<wide::Matrix::Down>, DownA8Epilogue, wide::ScheduleA8Tall>(call, 0, down, stream);
         check_launch("A8 down");
         return;
     }

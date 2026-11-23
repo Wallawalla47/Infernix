@@ -994,6 +994,12 @@ choices measured on an RTX 5090 for these shapes seed the tile search. The combi
     the `w4a4_sparse_moe.h` contract): per 16-block in order `acc = fma(P_b S_b, d_s, acc)`, then
     `bf16(fl32(fl32(acc 2^-10) m))`, `m = amax_w / denominator`; the narrow kernels (decode, verification) and the
     prompt route's grouped GEMM (`wide_expert_a8.cuh` with this model's epilogues) give an entry the same bits.
+    Residency (ncu 2026-11-23): the narrow gate/up reads the columns' A8 x rows through L1 rather than staging them
+    (21 KB a CTA, 16 warps an SM, as the native core's), the narrow down runs 8 row groups a CTA over one h staging (8
+    warps an SM; 4 before); experts op bench, cold, bytes a second: 1,248 -> 1,332 GB/s at 3 columns, 1,349 -> 1,426
+    at 8 (the checkpoint's native core 1,514 / 1,612: A8's two FFMAs a 16-block per output keep it ~12 % below). The
+    prompt GEMM runs `ScheduleA8Tall` (256 rows, 3 stages, one CTA of 16 consumer warps an SM; Flash-Next keeps 128
+    rows, 2 stages, 2 CTAs): 4,096 columns 4,040 -> 3,693 us (141 TOPS; the FP4 GEMM 1,789 us, 292 TOPS).
   - Unchanged, as Basalt: the MXFP8 experts (W8A8 already; Basalt requantizes them to Q8_0, a lossy weight change not
     taken here), the message gates and the router (16-bit activations; Basalt FP32), the attention arithmetic.
   - The 8-bit inputs are written by the kernels that produce the BF16 ones, so a call launches no encoder for them:
@@ -1408,8 +1414,8 @@ component, kept byte for byte after the converter checks it names the processor 
 | `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` refused |
 | `--prefill-chunk` | default 16K if chunk-width invariance holds ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |
-| `--q8-weights` | approximate 8-bit K2 and head ([§11](#11-dense-projections-and-the-head)); refused with `--reproducible` and `--lossless` |
-| `--a16-activations` | the routed experts on 16-bit activations (`w4a4_sparse_moe.h`'s `ExpertActivation::A16`): NVFP4 layers on Qwen3.8-Flash-Next's exact W4A16 arithmetic (x and h as 21-bit fixed point per column, exact int64 sums, the multiplier fl32(amax / denominator)), MXFP8 layers W8A16 (E4M3 widened exactly to BF16, a block's two MMAs from zero, its power-of-two scale fused); accepted with `--reproducible`; prompt calls run the narrow kernels (no A16 grouped GEMM: pp2048 16,387 → 3,383 tok/s, tg128 184.9 → 188.1, 2026-11-22); MXFP8 decode at one column runs the separate router and experts. `--a8-activations`: not built |
+| `--q8-weights` | approximate 8-bit K2, W_o and head ([§11](#11-dense-projections-and-the-head)); refused with `--reproducible` and `--lossless` |
+| `--a16-activations` | the routed experts on 16-bit activations (`w4a4_sparse_moe.h`'s `ExpertActivation::A16`): NVFP4 layers on Qwen3.8-Flash-Next's exact W4A16 arithmetic (x and h as 21-bit fixed point per column, exact int64 sums, the multiplier fl32(amax / denominator)), MXFP8 layers W8A16 (E4M3 widened exactly to BF16, a block's two MMAs from zero, its power-of-two scale fused); accepted with `--reproducible`; prompt calls run the narrow kernels (no A16 grouped GEMM: pp2048 16,387 → 3,383 tok/s, tg128 184.9 → 188.1, 2026-11-22); MXFP8 decode at one column runs the separate router and experts. `--a8-activations` ([§11](#11-dense-projections-and-the-head)): 8-bit activations in every call for the dense Q8 matrices and the NVFP4 experts (implies `--q8-weights`); refused with `--reproducible`, `--lossless` and `--a16-activations` |
 
 No family-specific tuning switches ship; experiments use temporary `INFERNIX_TMP_*` switches removed before merge.
 

@@ -818,8 +818,14 @@ __global__ void __launch_bounds__(Shape<G, false>::kDownThreads) down_a16_kernel
 // table, and the term one more with the column's slice scale. One thread adds an output's terms in block order, so an
 // entry's bits depend on its own codes and its expert's record alone. A gate/up CTA's 32 intermediates are one slice of
 // h: it encodes each column's slice itself, and the down CTAs wait for every gate/up CTA's count.
-constexpr int kA8Warps   = 4; // row groups a CTA
+//
+// Residency (ncu, T = 3 and 8): the gate/up CTA reads the columns' x rows through L1 instead of staging them (20.7 KB
+// of shared memory a CTA), so four CTAs (16 warps) share an SM, as the native core's gate/up; a down CTA's 8 warps share
+// one copy of the pass's h rows (one SM a CTA, 8 warps, as the native down's two CTAs of 4).
+constexpr int kA8Warps   = 4; // gate/up row groups a CTA
 constexpr int kA8Threads = 32 * kA8Warps;
+constexpr int kA8DownWarps   = 8; // down row groups a CTA
+constexpr int kA8DownThreads = 32 * kA8DownWarps;
 constexpr int kA8Depth   = 4; // stages of a gate/up warp's ring
 constexpr int kA8StageUnits = 8;
 
@@ -870,7 +876,6 @@ struct GateUpA8iSmem {
     using S = Shape<G, false>;
     float2 scaled[256];
     alignas(16) std::uint8_t ring[kA8Warps][kA8Depth][kA8StageUnits * S::kUnit];
-    alignas(16) std::uint8_t x[kPass][kA8XRowBytes];
     std::uint16_t h[kPass][32]; // the pass's columns' BF16 h of this CTA's 32 intermediates (one slice)
 };
 
@@ -901,26 +906,22 @@ __global__ void __launch_bounds__(kA8Threads) gate_up_a8i_kernel(Args a) {
     const auto column_of_entry = [&](int c) { return a.ws.entries[v.first + c] / kTopK; };
     for (int base = 0; base < v.count; base += kPass) {
         const int n = min(kPass, v.count - base);
-        // The pass's columns' A8 rows (a missing column repeats the last: its outputs are not stored), then the ring.
-        for (int i = tid; i < kPass * (kA8XRowBytes / 16); i += kA8Threads) {
-            const int c = i / (kA8XRowBytes / 16), k = i % (kA8XRowBytes / 16);
-            const std::uint8_t* row = a.x.rows + static_cast<std::size_t>(column_of_entry(base + min(c, n - 1))) * kA8XRowBytes;
-            tile::cp_async16(sm.x[c] + 16 * k, row + 16 * k, 16);
-        }
-        tile::cp_async_commit();
 #pragma unroll
         for (int k = 0; k < kA8Depth - 1; ++k) {
             issue(k);
             tile::cp_async_commit();
         }
-        const std::uint8_t* xg = sm.x[g];
-        const float* d0s = reinterpret_cast<const float*>(sm.x[2 * t] + G::kHidden);
-        const float* d1s = reinterpret_cast<const float*>(sm.x[2 * t + 1] + G::kHidden);
+        // The pass's columns' A8 rows through L1 (written by kernels that finished before this one; a missing column
+        // repeats the last: its outputs are not stored): column g's codes, columns 2t and 2t + 1's slice scales.
+        const auto x_row = [&](int c) { return a.x.rows + static_cast<std::size_t>(column_of_entry(base + min(c, n - 1))) * kA8XRowBytes; };
+        const std::uint8_t* xg = x_row(g);
+        const float* d0s = reinterpret_cast<const float*>(x_row(2 * t) + G::kHidden);
+        const float* d1s = reinterpret_cast<const float*>(x_row(2 * t + 1) + G::kHidden);
         float c[4] = {0.0F, 0.0F, 0.0F, 0.0F};
         for (int st = 0; st < kStages; ++st) {
             tile::cp_async_wait<kA8Depth - 2>();
             if (st == 0) {
-                __syncthreads(); // every thread's x copies and the scale table
+                __syncthreads(); // the scale table
             } else {
                 __syncwarp();
             }
@@ -930,8 +931,8 @@ __global__ void __launch_bounds__(kA8Threads) gate_up_a8i_kernel(Args a) {
 #pragma unroll
             for (int u = 0; u < kA8StageUnits; ++u) {
                 const int b = st * kA8StageUnits + u;
-                a8_unit_terms(stage + u * S::kUnit, *reinterpret_cast<const unsigned*>(xg + 16 * b + 4 * t), d0s[b / 2],
-                              d1s[b / 2], sm.scaled, g, t, c);
+                a8_unit_terms(stage + u * S::kUnit, __ldg(reinterpret_cast<const unsigned*>(xg + 16 * b + 4 * t)),
+                              __ldg(d0s + b / 2), __ldg(d1s + b / 2), sm.scaled, g, t, c);
             }
             __syncwarp();
         }
@@ -973,14 +974,15 @@ template <class G>
 struct DownA8iSmem {
     using S = Shape<G, false>;
     float2 scaled[256];
-    alignas(16) std::uint8_t units[kA8Warps][S::kDownBytes];
+    alignas(16) std::uint8_t units[kA8DownWarps][S::kDownBytes];
     alignas(16) std::uint8_t h[kPass][kA8HRowBytes];
 };
 
 template <class G>
-__global__ void __launch_bounds__(kA8Threads) down_a8i_kernel(Args a) {
+__global__ void __launch_bounds__(kA8DownThreads) down_a8i_kernel(Args a) {
     using S = Shape<G, false>;
-    static_assert(S::kDownRowGroups % kA8Warps == 0, "whole row groups a CTA");
+    static_assert(S::kDownRowGroups % kA8DownWarps == 0, "whole row groups a CTA");
+    static_assert(sizeof(DownA8iSmem<G>) <= 99 * 1024, "a down CTA's shared memory fits an SM");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm = *reinterpret_cast<DownA8iSmem<G>*>(smem_raw);
     pdl::trigger_dependents();
@@ -989,12 +991,12 @@ __global__ void __launch_bounds__(kA8Threads) down_a8i_kernel(Args a) {
     if (!job_view(a, job, v)) { return; }
     const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
     const int g = lane / 4, t = lane % 4;
-    const int group = static_cast<int>(blockIdx.x) * kA8Warps + warp;
+    const int group = static_cast<int>(blockIdx.x) * kA8DownWarps + warp;
     // The weights do not depend on h: their copies start before the wait.
     const std::uint8_t* src = v.record + S::kGateUpBytes + static_cast<std::size_t>(group) * S::kDownBytes;
     for (int i = lane; i < S::kDownBytes / 16; i += 32) { tile::cp_async16(sm.units[warp] + 16 * i, src + 16 * i, 16); }
     tile::cp_async_commit();
-    fill_a8_scaled(sm.scaled, kA8Threads);
+    fill_a8_scaled(sm.scaled, kA8DownThreads);
     __shared__ int stalled;
     if (tid == 0) {
         stalled = wait_count(a.ws.job_done + job, static_cast<std::uint32_t>(S::kGateUpRowGroups / kA8Warps), a.ws.error)
@@ -1008,7 +1010,7 @@ __global__ void __launch_bounds__(kA8Threads) down_a8i_kernel(Args a) {
     const std::uint8_t* units = sm.units[warp];
     for (int base = 0; base < v.count; base += kPass) {
         const int n = min(kPass, v.count - base);
-        for (int i = tid; i < kPass * (kA8HRowBytes / 16); i += kA8Threads) {
+        for (int i = tid; i < kPass * (kA8HRowBytes / 16); i += kA8DownThreads) {
             const int c = i / (kA8HRowBytes / 16), k = i % (kA8HRowBytes / 16);
             const std::uint8_t* row =
                 a.ws.h_a8 + static_cast<std::size_t>(a.ws.entries[v.first + base + min(c, n - 1)]) * kA8HRowBytes;
@@ -2121,7 +2123,7 @@ void moe_experts(const Activations& x, const Routing& routing, const Bank& bank,
                                     gate_up_a8i_kernel<G>, args));
         check_launch("NVFP4 A8 gate/up");
         CUDA_CHECK(pdl::launch_with(pdl::Dependency::Programmatic,
-                                    {dim3(S::kDownRowGroups / kA8Warps, jobs), dim3(kA8Threads), sizeof(DownA8iSmem<G>),
+                                    {dim3(S::kDownRowGroups / kA8DownWarps, jobs), dim3(kA8DownThreads), sizeof(DownA8iSmem<G>),
                                      stream},
                                     down_a8i_kernel<G>, args));
         check_launch("NVFP4 A8 down");

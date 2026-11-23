@@ -4,12 +4,15 @@
 // between two of its calls). Random weights and router: each call routes T columns to their own top 8.
 //
 //   infernix_w4a4_sparse_moe_bench [--format nvfp4|mxfp8] [--tokens 1,2,4,8,16,32] [--repeat 20] [--warmup 3]
-//                                  [--part all|route|experts|single] [--layers 8] [--warm]   (single: moe_single, T = 1;
+//                                  [--part all|route|experts|single|prompt] [--layers 8] [--warm]
+//                                  (single: moe_single, T = 1; prompt: moe_experts_prompt, the prefill route's experts;
 //                                  --warm: no L2 flush between replays, with --layers 1 the weights stay in L2)
 //                                  [--core native|exact]   (NVFP4's decode / verify core, Nvfp4Core)
 //                                  [--warm-experts K [--warm-down]]   (the expert-prefetch sizing: each replay flushes
 //                                  L2, then reads K of the call's routed experts (column 0's first K slots) through L2,
 //                                  gate/up bytes only or with --warm-down the whole record; --layers 1 only)
+//                                  [--activation checkpoint|a8]   (NVFP4: the checkpoint's A4 rows, or --a8-activations'
+//                                  A8 rows (moe_encode_a8 of the columns' x) and h)
 //
 // Per T: the median and minimum call time, the distinct experts the call reads and their record bytes, and the
 // effective bandwidth over those bytes (the floor a weight-streaming kernel approaches).
@@ -76,6 +79,7 @@ int main(int argc, char** argv) {
     moe::Nvfp4Core core = moe::Nvfp4Core::Native;
     int warm_experts = -1; // --warm-experts K: K of the routed experts read into L2 after each flush
     bool warm_down   = false;
+    moe::ExpertActivation activation = moe::ExpertActivation::Checkpoint;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--format" && i + 1 < argc) { a8 = std::string(argv[++i]) == "mxfp8"; }
@@ -91,6 +95,8 @@ int main(int argc, char** argv) {
             warm_experts = std::clamp(std::atoi(argv[++i]), 0, K);
         } else if (arg == "--warm-down") {
             warm_down = true;
+        } else if (arg == "--activation" && i + 1 < argc) {
+            activation = std::string(argv[++i]) == "a8" ? moe::ExpertActivation::A8 : moe::ExpertActivation::Checkpoint;
         } else {
             std::fprintf(stderr, "usage: %s [--format nvfp4|mxfp8] [--tokens 1,2,4] [--repeat N] [--warmup N]\n", argv[0]);
             return 2;
@@ -98,6 +104,11 @@ int main(int argc, char** argv) {
     }
     if (warm_experts >= 0 && (layers != 1 || warm)) {
         std::fprintf(stderr, "--warm-experts needs --layers 1 and no --warm\n");
+        return 2;
+    }
+    const bool act8 = activation == moe::ExpertActivation::A8;
+    if (act8 && a8) {
+        std::fprintf(stderr, "--activation a8 is for NVFP4 banks\n");
         return 2;
     }
     const int unit = a8 ? 528 : 144, block = a8 ? 32 : 16;
@@ -155,9 +166,9 @@ int main(int argc, char** argv) {
     void* workspace = nullptr;
     // A workspace for the widest call of the sweep (prefill widths past the decode calls' 128).
     const int capacity = std::max(moe::kMaxColumns, *std::max_element(tokens.begin(), tokens.end()));
-    check(cudaMalloc(&workspace, moe::workspace_bytes(E, I, capacity)), "cudaMalloc");
-    check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I, capacity)), "cudaMemset");
-    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, capacity);
+    check(cudaMalloc(&workspace, moe::workspace_bytes(E, I, capacity, activation)), "cudaMalloc");
+    check(cudaMemset(workspace, 0, moe::workspace_bytes(E, I, capacity, activation)), "cudaMemset");
+    const moe::Workspace ws = moe::carve_workspace(workspace, E, I, capacity, activation);
     void* flush = nullptr;
     const std::size_t flush_bytes = std::size_t(256) << 20;
     check(cudaMalloc(&flush, flush_bytes), "cudaMalloc");
@@ -172,8 +183,8 @@ int main(int argc, char** argv) {
     bank.experts       = E;
     bank.hidden        = H;
     bank.intermediate  = I;
-    std::printf("w4a4_sparse_moe %s, record %.2f MB, %s, per layer of %d in one CUDA graph (own banks: cold weights)\n",
-                a8 ? "MXFP8" : "NVFP4", record / 1e6, part.c_str(), layers);
+    std::printf("w4a4_sparse_moe %s%s, record %.2f MB, %s, per layer of %d in one CUDA graph (own banks: cold weights)\n",
+                a8 ? "MXFP8" : "NVFP4", act8 ? " A8" : "", record / 1e6, part.c_str(), layers);
     for (const int T : tokens) {
         std::vector<std::uint16_t> x(std::size_t(T) * H);
         std::vector<float> xf(std::size_t(T) * H);
@@ -221,7 +232,7 @@ int main(int argc, char** argv) {
         check(cudaMalloc(&d_out, std::size_t(T) * K * H * 2), "cudaMalloc");
         cudaGraph_t graph;
         cudaGraphExec_t exec;
-        if (part == "experts" || warm_experts >= 0) { // the routing the timed experts read (and the warmed ones), once
+        if (part == "experts" || part == "prompt" || warm_experts >= 0) { // the routing the timed experts read, once
             moe::moe_route(d_x, T, d_router, d_bias, E, H, 8.0F, ws, stream);
             check(cudaStreamSynchronize(stream), "route");
         }
@@ -232,12 +243,26 @@ int main(int argc, char** argv) {
         const std::uint64_t warm_bytes = warm_down ? record : gate_up;
         moe::Activations act{d_rows, d_row_amax, T};
         act.core = core;
+        std::uint8_t* d_a8 = nullptr;
+        if (act8) { // the columns' A8 rows (the producers' codec)
+            check(cudaMalloc(&d_a8, std::size_t(T) * moe::kA8XRowBytes), "cudaMalloc");
+            moe::moe_encode_a8(d_x, T, d_a8, stream);
+            check(cudaStreamSynchronize(stream), "encode");
+            act.rows       = d_a8;
+            act.amax       = nullptr;
+            act.activation = moe::ExpertActivation::A8;
+        }
         check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture");
         for (int l = 0; l < layers; ++l) {
             moe::Bank layer_bank = bank;
             layer_bank.records   = d_banks[l];
             if (part == "single") { // the router and experts of one column in one launch (T = 1 only)
                 moe::moe_single(d_x, act, d_router, d_bias, 8.0F, layer_bank, ws, d_out, stream);
+                continue;
+            }
+            if (part == "prompt") { // the prompt route's experts (moe_experts_prompt) on the dispatched entries
+                moe::moe_dispatch(moe::routed_routing(ws), T, E, ws, stream);
+                moe::moe_experts_prompt(act, moe::routed_routing(ws), layer_bank, ws, d_out, stream);
                 continue;
             }
             if (part != "experts") { moe::moe_route(d_x, T, d_router, d_bias, E, H, 8.0F, ws, stream); }
@@ -272,12 +297,15 @@ int main(int argc, char** argv) {
         std::printf("T=%3d  median %8.1f us  min %8.1f us  experts %3zu  %7.1f MB  %6.0f GB/s", T, median, times.front(),
                     distinct.size(), bytes / 1e6, bytes / (median * 1e-6) / 1e9);
         if (warm_experts >= 0) { std::printf("  warm experts %d (%s)", warm_experts, warm_down ? "whole records" : "gate/up"); }
+        if (part == "prompt") { // the call's multiply-adds: T x top 8 x (gate, up and down: 3 x H x I)
+            std::printf("  %6.1f TOPS", 2.0 * T * K * 3.0 * H * I / (median * 1e-6) / 1e12);
+        }
         std::printf("\n");
         check(cudaFree(d_sink), "cudaFree");
         check(cudaGraphExecDestroy(exec), "destroy");
         check(cudaGraphDestroy(graph), "destroy");
         for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rows), static_cast<void*>(d_row_amax),
-                        static_cast<void*>(d_out)}) {
+                        static_cast<void*>(d_out), static_cast<void*>(d_a8)}) {
             check(cudaFree(p), "cudaFree");
         }
     }
