@@ -230,6 +230,7 @@ __device__ __forceinline__ void mix_columns(float (&src)[Mix<QA, QB>::kS][8], in
 
 using detail::Column;
 using detail::column_of;
+using detail::early_history;
 using detail::history_row;
 using detail::history_source;
 using detail::ring_row;
@@ -300,10 +301,22 @@ __device__ __forceinline__ void combine_rows(const uint4 (&e)[kTopK], float (&v)
     round8(v);
 }
 
+// A column's conv-history rows k = 1 .. 3 that come from the ring (Source::Ring), raw (the others zero): before the
+// PDL wait when early_history(ring).
+__device__ __forceinline__ void ring_history(const Ring& ring, const ColumnMap& map, const Column& col, int c,
+                                             uint4 (&h)[3]) {
+#pragma unroll
+    for (int k = 1; k < 4; ++k) {
+        h[k - 1] = history_source(map, col, k) == Source::Ring ? raw8(history_row(ring, col.lane, col.pos - k) + c)
+                                                                : make_uint4(0U, 0U, 0U, 0U);
+    }
+}
+
 // The MLP tail of the previous visit for column col: out = bf16(cand + bf16(conv(combined))), the combined output
-// written to the ring.
+// written to the ring. hist: ring_history's rows of tail.ring.
 __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& map, const Column& col, int c,
-                                         const float (&w)[4][8], const TailRows& rows, float (&out)[8]) {
+                                         const float (&w)[4][8], const TailRows& rows, const uint4 (&hist)[3],
+                                         float (&out)[8]) {
     float x[4][8];
     combine_rows(rows.e, x[0]);
 #pragma unroll
@@ -311,7 +324,7 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
         switch (history_source(map, col, k)) {
         case Source::Zero: zero8(x[k]); break;
         case Source::Call: combine8(tail.experts, col.t - k, c, x[k]); break;
-        case Source::Ring: load8(history_row(tail.ring, col.lane, col.pos - k) + c, x[k]); break;
+        case Source::Ring: unpack8(hist[k - 1], x[k]); break;
         }
     }
     float m[8];
@@ -486,6 +499,15 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
 #pragma unroll
         for (int i = 0; i < NQ; ++i) { weight8(a.norms[i] + c, nw[i]); }
     }
+    // The tail's column and its ring history (rows of earlier calls) before the wait when early_history; a call with a
+    // history snapshot (a prompt) reads them after it.
+    const bool early = tail && early_history(a.tail.ring);
+    Column col{};
+    uint4 hist[3] = {};
+    if (early) {
+        col = column_of(a.map, t);
+        ring_history(a.tail.ring, a.map, col, c, hist);
+    }
     pdl::enter();
 
     // Every row the column reads, issued before the first use: the tail's rows, the input, the blocks and the
@@ -514,10 +536,13 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
             if (!msg_tail[s]) { rmsg[s] = raw8(a.message_sources[s] + row); }
         }
     }
-    const Column col = column_of(a.map, t);
+    if (tail && !early) {
+        col = column_of(a.map, t);
+        ring_history(a.tail.ring, a.map, col, c, hist);
+    }
     float h[8], tail_h[8] = {};
     if (tail) {
-        mlp_tail(a.tail, a.map, col, c, conv, trows, tail_h);
+        mlp_tail(a.tail, a.map, col, c, conv, trows, hist, tail_h);
         store8(a.tail_out + row, tail_h);
 #pragma unroll
         for (int j = 0; j < 8; ++j) { h[j] = tail_h[j]; }
@@ -626,6 +651,15 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
     if constexpr (Messages) { weight8(a.message_query + c, q[1]); }
     float nw[8];
     if constexpr (!Messages) { weight8(a.norm + c, nw); }
+    // The column and its ring history (rows of earlier calls) before the wait when early_history; a call with a history
+    // snapshot (a prompt) reads them after it.
+    const bool early = early_history(a.ring);
+    Column col{};
+    uint4 hist[3] = {};
+    if (early) {
+        col = column_of(a.map, t);
+        ring_history(a.ring, a.map, col, c, hist);
+    }
     pdl::enter();
 
     // Every row the column reads, issued before the first use (none aliases what this kernel writes: the ring is
@@ -644,7 +678,10 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
 #pragma unroll
         for (int s = 0; s < 2; ++s) { rmsg[s] = raw8(a.message_sources[s] + row); }
     }
-    const Column col = column_of(a.map, t);
+    if (!early) {
+        col = column_of(a.map, t);
+        ring_history(a.ring, a.map, col, c, hist);
+    }
     // The post-attention conv of W_o's output (the call holds every column's o, so in-call history is a load).
     float x[4][8];
     unpack8(ro, x[0]);
@@ -653,7 +690,7 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
         switch (history_source(a.map, col, k)) {
         case Source::Zero: zero8(x[k]); break;
         case Source::Call: load8(a.o + row - static_cast<std::size_t>(k) * kHidden, x[k]); break;
-        case Source::Ring: load8(history_row(a.ring, col.lane, col.pos - k) + c, x[k]); break;
+        case Source::Ring: unpack8(hist[k - 1], x[k]); break;
         }
     }
     float attn[8];

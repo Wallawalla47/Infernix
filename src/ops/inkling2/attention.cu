@@ -33,6 +33,7 @@ namespace {
 
 using detail::Column;
 using detail::column_of;
+using detail::early_history;
 using detail::history_row;
 using detail::history_source;
 using detail::ring_row;
@@ -121,14 +122,50 @@ __device__ __forceinline__ void kv_conv_weights(const AttentionArgs& a, int kv, 
     for (int lag = 0; lag < 4; ++lag) { weight4(conv + lag * kKvWidth + kv * kD + 4 * lane, w[lag]); }
 }
 
+// Whether a call's K and V ring reads may be issued before the PDL wait (column.cuh).
+__device__ __forceinline__ bool early_kv_history(const AttentionArgs& a) {
+    return early_history(a.key_ring) && early_history(a.value_ring);
+}
+
+// Column col's conv-history rows k = 1 .. 3 of the K (which 0) or V ring, KV head kv, lane channels 4 lane .. + 3,
+// that come from the ring (Source::Ring), raw (the others zero).
+__device__ __forceinline__ void kv_history(const AttentionArgs& a, const Column& col, int kv, int which, int lane,
+                                           uint2 (&h)[3]) {
+    const Ring& ring = which == 0 ? a.key_ring : a.value_ring;
+    const int ch     = kv * kD + 4 * lane;
+#pragma unroll
+    for (int k = 1; k < 4; ++k) {
+        h[k - 1] = history_source(a.map, col, k) == Source::Ring
+                       ? *reinterpret_cast<const uint2*>(history_row(ring, col.lane, col.pos - k) + ch)
+                       : make_uint2(0U, 0U);
+    }
+}
+
+// kv_history's rows and the conv taps (kv_conv_weights') into L2: the fused attention's new rows, before its PDL wait,
+// holding no registers over the unit loop.
+__device__ __forceinline__ void kv_prefetch(const AttentionArgs& a, const Column& col, int kv, int which, int lane) {
+    const Ring& ring           = which == 0 ? a.key_ring : a.value_ring;
+    const std::uint16_t* conv  = which == 0 ? a.layer.key_conv : a.layer.value_conv;
+    const int ch               = kv * kD + 4 * lane;
+#pragma unroll
+    for (int k = 1; k < 4; ++k) {
+        if (history_source(a.map, col, k) == Source::Ring) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(history_row(ring, col.lane, col.pos - k) + ch));
+        }
+    }
+#pragma unroll
+    for (int lag = 0; lag < 4; ++lag) { asm volatile("prefetch.global.L2 [%0];" ::"l"(conv + lag * kKvWidth + ch)); }
+}
+
 // Column col's new key (which 0) or value (which 1) row of KV head kv, lane channels 4 lane .. + 3: the short conv of
-// its raw input and history, rounded; a key clipped by its head norm, a value RMS-normed to FP16. Stores the cache row
-// and (writes_ring) the raw input's ring row; returns the stored words (BF16 K or FP16 V bits).
+// its raw input and history (hist: kv_history's rows), rounded; a key clipped by its head norm, a value RMS-normed to
+// FP16. Stores the cache row and (writes_ring) the raw input's ring row; returns the stored words (BF16 K or FP16 V
+// bits).
 // Quantized: the kernel instance for a quantized full pool (KvCodec other than Bf16); the BF16 instance carries no
 // codec code.
 template <bool Quantized>
 __device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& col, int kv, int which, int lane,
-                                        const float (&w)[4][4]) {
+                                        const float (&w)[4][4], const uint2 (&hist)[3]) {
     const int ch = kv * kD + 4 * lane;
     const int t  = col.t;
     {
@@ -144,7 +181,7 @@ __device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& co
                 for (int j = 0; j < 4; ++j) { x[k][j] = 0.0F; }
                 break;
             case Source::Call: load4(raw + static_cast<std::size_t>(t - k) * kKvWidth + ch, x[k]); break;
-            case Source::Ring: load4(history_row(ring, col.lane, col.pos - k) + ch, x[k]); break;
+            case Source::Ring: unpack4(hist[k - 1], x[k]); break;
             }
         }
         float c[4];
@@ -279,8 +316,12 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
     } else {
         qr_scales(a, head, lane, scale, rscale);
     }
-    pdl::enter();
+    // The column (the call's upload) and the K / V warps' ring history (rows of earlier calls) before the wait.
     const Column col = column_of(a.map, t);
+    const bool early = early_kv_history(a);
+    uint2 hist[3]    = {};
+    if (warp < 2 && early) { kv_history(a, col, kv, warp, lane, hist); }
+    pdl::enter();
     if (col.lane < 0) {
         for (int i = static_cast<int>(threadIdx.x); i < kGroupHeads * kD; i += kPrologueThreads) {
             a.out[static_cast<std::size_t>(t) * kQWidth + kv * kGroupHeads * kD + i] = 0;
@@ -297,7 +338,8 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
         return;
     }
     if (warp < 2) {
-        (void)new_kv<Quantized>(a, col, kv, warp, lane, w);
+        if (!early) { kv_history(a, col, kv, warp, lane, hist); }
+        (void)new_kv<Quantized>(a, col, kv, warp, lane, w, hist);
         return;
     }
     uint2 q;
@@ -437,6 +479,10 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         __syncthreads();
         early = range[0] <= range[1];
         if (early) { issue_unit(range[0]); }
+        // The new rows' ring history (rows of earlier calls) and conv taps into L2.
+        if (early_kv_history(a)) {
+            for (int i = warp; i < 2 * count; i += kWarps) { kv_prefetch(a, column_of(a.map, c0 + (i >> 1)), kv, i & 1, wl); }
+        }
     }
     pdl::enter();
     // The rows' q and r: from the prologue's workspace, or (fused) computed here in its arithmetic, a warp a row.
@@ -489,7 +535,10 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
                 if (pos < b * kKeyUnit || pos >= (b + 1) * kKeyUnit) { continue; }
                 float w[4][4];
                 kv_conv_weights(a, kv, which, wl, w);
-                const uint2 v = new_kv<Quantized>(a, column_of(a.map, t), kv, which, wl, w);
+                const Column col = column_of(a.map, t);
+                uint2 hist[3];
+                kv_history(a, col, kv, which, wl, hist);
+                const uint2 v = new_kv<Quantized>(a, col, kv, which, wl, w, hist);
                 *reinterpret_cast<uint2*>((which == 0 ? s.k : s.v) + (pos - b * kKeyUnit) * kRowStride + 4 * wl) = v;
             }
             __syncthreads();
