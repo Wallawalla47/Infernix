@@ -690,7 +690,8 @@ __device__ __forceinline__ uint4 q8_words(uint2 c) {
 
 // BF16 storage: a block's two MMAs chain into acc. Q8 storage: they run from zero over the codes, and
 // acc = fma(the block's sum, the row's group scale, acc) (projections_mma's Q8 form at a block a group).
-template <int Splits, int NT, class Out, bool Q8>
+// Ahead: blocks in flight a warp, the first Ahead fetched before the PDL wait (launch_dmma's choice).
+template <int Splits, int NT, class Out, bool Q8, int Ahead>
 __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const MmaParams p) {
     __shared__ float partial[Splits][32][NT * 4];
     const int lane = static_cast<int>(threadIdx.x & 31U), warp = static_cast<int>(threadIdx.x >> 5);
@@ -716,9 +717,7 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
         w0 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r0) * K) + t;
         w1 = reinterpret_cast<const uint4*>(seg.weight + static_cast<std::size_t>(r1) * K) + t;
     }
-    // In flight a warp: kDmmaAhead blocks of BF16 storage, twice as many of Q8 (half the bytes a block). Q8 codes and
-    // scales stay raw until their block's MMAs, so a fetch never waits on its own load.
-    constexpr int Ahead = Q8 ? 2 * kDmmaAhead : kDmmaAhead;
+    // Q8 codes and scales stay raw until their block's MMAs, so a fetch never waits on its own load.
     uint4 a0[Ahead], a1[Ahead];
     uint2 q0[Ahead], q1[Ahead];
     unsigned short h0[Ahead], h1[Ahead];
@@ -810,13 +809,21 @@ __global__ void __launch_bounds__(Splits * 32) projections_dmma_kernel(const Mma
     }
 }
 
+// Blocks in flight a warp: kDmmaAhead of BF16 storage, twice as many of Q8 (half the bytes a block); a BF16 launch of at
+// most kDmmaDeepWarps warps (a few tiles: the loop's message-gate downs, 12 tiles of 16 runs) kDmmaDeep, so most of
+// its weights load before the PDL wait, beside the kernel before it, on the few SMs it occupies.
+constexpr int kDmmaDeep      = 8;
+constexpr int kDmmaDeepWarps = 512;
+
 template <int Splits, int NT, class Out>
 void launch_dmma(const MmaParams& p, std::int32_t tiles, cudaStream_t stream) {
     const pdl::LaunchConfig config{dim3(static_cast<unsigned>(tiles)), dim3(Splits * 32), 0, stream};
     if (p.seg[0].codes != nullptr) {
-        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, true>, p));
+        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, true, 2 * kDmmaAhead>, p));
+    } else if (tiles * Splits <= kDmmaDeepWarps) {
+        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, false, kDmmaDeep>, p));
     } else {
-        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, false>, p));
+        CUDA_CHECK(pdl::launch_consumer(config, projections_dmma_kernel<Splits, NT, Out, false, kDmmaAhead>, p));
     }
 }
 

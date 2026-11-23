@@ -2,8 +2,9 @@
 // column; thread g holds elements 8g .. 8g + 7 of every H-wide row, so an H-vector sum is the pinned order of
 // visit_math.h: a thread's 8 products folded by fma, the warp's 32 by a xor butterfly (the bfly32 tree), the 9 warps
 // folded from +0.0 through shared memory. Each reduction phase has its own shared scratch, so a phase needs one
-// barrier. Immutable weights (queries, norms, conv taps) are read before the PDL wait; everything a producer wrote is
-// read after it with ordinary loads (never the non-coherent path, which may be hoisted above the wait).
+// barrier. Immutable weights (queries, norms, conv taps) are read before the PDL wait, and so are rows of earlier calls
+// (the column map, the state's conv rings: column.cuh early_history); everything a kernel of the call wrote is read
+// after it with ordinary loads (never the non-coherent path, which may be hoisted above the wait).
 
 #include "infernix/ops/inkling2_visit.h"
 

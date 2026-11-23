@@ -38,8 +38,11 @@ __device__ __forceinline__ const std::uint16_t* history_row(const Ring& ring, in
 // Whether a column's ring reads (Source::Ring) may be issued before its kernel's PDL wait. A ring without a history
 // snapshot is the state's: earlier calls wrote the rows a column reads from it (a call writes at most kMaxLaneColumns
 // of a lane's kRingPositions rows, never one its columns read back), so they are complete before the call's first
-// kernel, as is the column map (an upload before it). A snapshot is written by the call's conv_history_kernel: its
-// rows are read after the wait.
+// kernel, as is the column map (an upload before it). That rests on the chain's rule: no kernel of a call completes
+// before its predecessor has (a dependency wait in at least one of its CTAs, pdl::enter / enter_streaming, or a
+// serialized launch), so the previous call's last kernel completing, which the next call's upload and first kernel
+// follow, means all of it completed. A kernel all of whose CTAs could exit without waiting would void it. A snapshot is
+// written by the call's conv_history_kernel: its rows are read after the wait.
 __device__ __forceinline__ bool early_history(const Ring& ring) { return ring.history == nullptr; }
 
 // Whether a column writes its raw input to the ring: it is among its lane's last kRingPositions columns in the call.
