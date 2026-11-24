@@ -26,6 +26,9 @@ a file-level side stream, addressed by block id. A row may hold at most four esc
 trailer bound); the encoder refuses a table with a row past it or with more than eight distinct
 row-base values table-wide. The decoder here is independent of the engine's.
 
+Long passes (census, write, verify, stats) report stage-labelled row progress on stderr; the JSON
+report stays on stdout.
+
 Only Python 3 and numpy are used (no torch).
 """
 
@@ -72,6 +75,43 @@ SIDE_SENTINEL = 7
 
 def align_block(value: int) -> int:
     return (value + BLOCK_BYTES - 1) // BLOCK_BYTES * BLOCK_BYTES
+
+
+
+def align_block(value: int) -> int:
+    return (value + BLOCK_BYTES - 1) // BLOCK_BYTES * BLOCK_BYTES
+
+
+class Status:
+    """Stage-labelled row progress on stderr: one line per ~1% of a pass and the pass's last line.
+
+    A pass is one full read of the source (a census scan, a write's base/escape survey, a verify);
+    each prints its own stage so a long encode is distinguishable from a hung one.
+    """
+
+    def __init__(self, label: str, stages: int) -> None:
+        self.label = label
+        self.stages = stages
+
+    def stage(self, index: int, name: str, total: int) -> "StatusStage":
+        return StatusStage(self, index, name, total)
+
+
+class StatusStage:
+    def __init__(self, status: Status, index: int, name: str, total: int) -> None:
+        self.status = status
+        self.index = index
+        self.name = name
+        self.total = total
+        self.reported = 0
+        self.interval = max(1, total // 100)
+
+    def update(self, done: int) -> None:
+        if done == self.total or done - self.reported >= self.interval:
+            self.reported = done
+            print(f"{self.status.label}: stage {self.index}/{self.status.stages} {self.name}: "
+                  f"{done}/{self.total} rows", file=sys.stderr, flush=True)
+
 
 
 class PackedVolume:
@@ -278,11 +318,13 @@ def pack_block(analysis: dict, bases: list[int]) -> tuple[np.ndarray, list[tuple
     return block, side
 
 
-def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
+def census(source: p12.Volume, chunk_blocks: int = 256, status: Status | None = None) -> dict:
     if source.row_bytes // 2 != WIDTH:
         raise ValueError(f"{source.path}: a blockdir row holds {WIDTH} values; this source's rows hold "
                          f"{source.row_bytes // 2}")
-    total_blocks = -(-source.rows // ROWS_PER_BLOCK)
+    rows = source.rows
+    stage = (status or Status("blockdir census", 1)).stage(1, "scan", rows)
+    total_blocks = -(-rows // ROWS_PER_BLOCK)
     distinct_histogram: dict[int, int] = {}
     escape_histogram: dict[int, int] = {}
     global_bases: set[int] = set()
@@ -291,7 +333,6 @@ def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
     delta_blocks = 0
     blocks_over_eight = 0
     escapes_total = 0
-    rows = source.rows
     begin = 0
     while begin < rows:
         end = min(rows, begin + chunk_blocks * ROWS_PER_BLOCK)
@@ -313,6 +354,7 @@ def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
                 if analysis["escapes"] <= MAX_BLOCK_ESCAPES:
                     delta_blocks += 1
         begin = end
+        stage.update(end)
     return {
         "source": str(source.path),
         "rows": rows,
@@ -342,10 +384,12 @@ def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
     }
 
 
-def build_bases(source: p12.Volume, chunk_blocks: int = 256) -> list[int]:
+def build_bases(source: p12.Volume, chunk_blocks: int = 256,
+                stage: StatusStage | None = None) -> list[int]:
     """The file's 8-entry base table, or a refusal: a blockdir volume needs all of a table's bases."""
     bases: set[int] = set()
     rows = source.rows
+    stage = stage or Status("blockdir bases", 1).stage(1, "scan", rows)
     begin = 0
     while begin < rows:
         end = min(rows, begin + chunk_blocks * ROWS_PER_BLOCK)
@@ -357,19 +401,22 @@ def build_bases(source: p12.Volume, chunk_blocks: int = 256) -> list[int]:
                 raise ValueError(f"{source.path}: more than eight distinct row-base values; a blockdir "
                                  f"volume's base table holds eight")
         begin = end
+        stage.update(end)
     return sorted(bases) + [0] * (BASE_TABLE_SIZE - len(bases))
 
 
-def write_volume(source: p12.Volume, out: Path, volume_id: bytes, progress=None) -> dict:
+def write_volume(source: p12.Volume, out: Path, volume_id: bytes, status: Status | None = None) -> dict:
     if len(volume_id) != 16:
         raise ValueError("the n-gram volume id is 16 bytes")
     if source.row_bytes // 2 != WIDTH:
         raise ValueError(f"{source.path}: a blockdir row holds {WIDTH} values")
     rows = source.rows
+    status = status or Status("blockdir write", 3)
     blocks = -(-rows // ROWS_PER_BLOCK)
-    bases = build_bases(source)
+    bases = build_bases(source, stage=status.stage(1, "build_bases", rows))
     side_records: list[tuple[int, list[tuple[int, int]]]] = []
     # The side stream's size is needed in the header: count its records first.
+    side_stage = status.stage(2, "side-count", rows)
     begin = 0
     while begin < rows:
         end = min(rows, begin + 256 * ROWS_PER_BLOCK)
@@ -379,6 +426,7 @@ def write_volume(source: p12.Volume, out: Path, volume_id: bytes, progress=None)
             if analysis["side"]:
                 side_records.append((begin // ROWS_PER_BLOCK + first // ROWS_PER_BLOCK, analysis["side"]))
         begin = end
+        side_stage.update(end)
     side_length = align_block(sum(6 + 4 * len(entries) for _, entries in side_records))
     side_offset = HEADER_BYTES + blocks * BLOCK_BYTES
     header = bytearray(HEADER_BYTES)
@@ -400,6 +448,7 @@ def write_volume(source: p12.Volume, out: Path, volume_id: bytes, progress=None)
     try:
         with temporary.open("xb") as stream:
             stream.write(header)
+            pack_stage = status.stage(3, "pack", rows)
             begin = 0
             while begin < rows:
                 end = min(rows, begin + 256 * ROWS_PER_BLOCK)
@@ -409,8 +458,7 @@ def write_volume(source: p12.Volume, out: Path, volume_id: bytes, progress=None)
                     block, _ = pack_block(analysis, bases)
                     stream.write(block.tobytes())
                 begin = end
-                if progress is not None:
-                    progress(end, rows)
+                pack_stage.update(end)
             written = 0
             for block, entries in side_records:
                 record = struct.pack("<IH", block, len(entries))
@@ -429,33 +477,40 @@ def write_volume(source: p12.Volume, out: Path, volume_id: bytes, progress=None)
             "file_bytes": side_offset + side_length}
 
 
-def verify(source: p12.Volume, volume: PackedVolume, rows: str, chunk_rows: int = 1 << 15) -> dict:
+def verify(source: p12.Volume, volume: PackedVolume, rows: str, chunk_rows: int = 1 << 15,
+           status: Status | None = None) -> dict:
     if source.row_bytes // 2 != WIDTH:
         raise ValueError(f"{source.path}: a blockdir row holds {WIDTH} values")
     if volume.rows != source.rows:
         raise ValueError(f"{volume.path}: {volume.rows} rows differ from the source's {source.rows}")
+    status = status or Status("blockdir verify", 1)
     checked = 0
     bad = 0
     if rows == "all":
+        stage = status.stage(1, "compare", source.rows)
         for begin in range(0, source.rows, chunk_rows):
             end = min(source.rows, begin + chunk_rows)
             want = source.words(begin, end)
             got = volume.words(begin, end)
             bad += int((got != want).any(axis=1).sum())
             checked += end - begin
+            stage.update(end)
     else:
         count = min(int(rows), source.rows)
+        stage = status.stage(1, "compare", count)
         rng = np.random.default_rng(7)
         indices = np.sort(rng.choice(source.rows, size=count, replace=False))
         want = np.ascontiguousarray(source.read_many(indices)).view("<u2").reshape(len(indices), WIDTH)
         got = volume.words_from(indices)
         bad += int((got != want).any(axis=1).sum())
         checked += len(indices)
+        stage.update(checked)
     return {"source": str(source.path), "volume": str(volume.path), "rows_checked": checked,
             "row_mismatches": bad}
 
 
-def stats(source: p12.Volume, volume: PackedVolume) -> dict:
+def stats(source: p12.Volume, volume: PackedVolume, status: Status | None = None) -> dict:
+    stage = (status or Status("blockdir stats", 1)).stage(1, "scan", volume.rows)
     histogram: dict[int, int] = {}
     distinct_histogram: dict[int, int] = {}
     for block in range(volume.blocks):
@@ -466,6 +521,7 @@ def stats(source: p12.Volume, volume: PackedVolume) -> dict:
         histogram[count] = histogram.get(count, 0) + 1
         codes = {(directory >> (BASE_CODE_BITS * row)) & (BASE_TABLE_SIZE - 1) for row in range(ROWS_PER_BLOCK)}
         distinct_histogram[len(codes)] = distinct_histogram.get(len(codes), 0) + 1
+        stage.update(min(volume.rows, (block + 1) * ROWS_PER_BLOCK))
     return {
         "volume": str(volume.path),
         "format": "bf16_p12_blockdir",
@@ -520,14 +576,7 @@ def main() -> None:
     if writing:
         require_bf16_source(source, "--out")
         volume_id = packed_volume_id(source.volume_id)
-        printed = [0]
-
-        def progress(done: int, total: int) -> None:
-            if done == total or done - printed[0] >= max(1, total // 100):
-                printed[0] = done
-                print(f"{done}/{total} rows", file=sys.stderr, flush=True)
-
-        geometry = write_volume(source, args.out, volume_id, progress=progress)
+        geometry = write_volume(source, args.out, volume_id)
         print(json.dumps({"volume": str(args.out), "format": "bf16_p12_blockdir",
                           "volume_id": volume_id.hex(), **geometry}, indent=2))
         return
