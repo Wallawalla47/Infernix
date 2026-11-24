@@ -239,6 +239,24 @@ int main() {
         }
         std::cout << echoed << " of " << cases << " generated turns echo token for token\n";
 
+        // A tool result that loads a definition (MessagePartKind::LoadedTools): Inkling's declaration form inside the
+        // message (its template's tool_declare specs), not Qwen's <tools> wording.
+        {
+            PromptInput loaded = question;
+            infernix::ChatMessage result{.role = ChatRole::Tool};
+            result.parts.push_back({.text = "Found one."});
+            result.parts.push_back(
+                {.kind       = infernix::MessagePartKind::LoadedTools,
+                 .tool_jsons = {R"({"type":"function","function":{"name":"get_forecast","description":"Forecast.","parameters":{"type":"object","properties":{"city":{"type":"string"}}},"strict":false}})"}});
+            loaded.messages.push_back(std::move(result));
+            const std::string text = frontend.render(loaded, 1U << 20).text;
+            const std::string spec =
+                R"([{"description":"Forecast.","name":"get_forecast","parameters":{"properties":{"city":{"type":"string"}},"type":"object"},"type":"function"}])";
+            check(text.find("These tools are now also available:\n" + spec) != std::string::npos &&
+                      text.find("<tools>") == std::string::npos,
+                  "a loaded definition renders in Inkling's declaration form");
+        }
+
         // 3. Refusals and limits.
         PromptInput image = question;
         image.messages.back().parts.push_back({.kind = infernix::MessagePartKind::Media});

@@ -127,7 +127,9 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
 
-    // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
+    // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added; a special token's
+    // text in `text` (Qwen's <|im_end|>, Inkling 2's <|message_model|>) encodes as that token, on every model, as
+    // Hugging Face's tokenizers encode by default.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
     // Artifact-tokenizer decoding of token ids, special tokens included. A character the ids cut

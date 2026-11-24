@@ -1293,12 +1293,17 @@ struct ChatTemplateRoleSupport {
 enum class MessagePartKind : std::uint8_t {
     Text,
     Media,
+    // Tool declarations a message makes available mid-conversation (a tool search's result, an Anthropic tool
+    // addition): `tool_jsons`, in the OpenAI function form PromptOptions::tool_jsons uses. Each model renders them in
+    // its own wording; the names become callable through PromptOptions::deferred_tool_jsons.
+    LoadedTools,
 };
 
 struct MessagePart {
     MessagePartKind kind = MessagePartKind::Text;
     std::string text;
     OwnedMedia media;
+    std::vector<std::string> tool_jsons; // MessagePartKind::LoadedTools
 };
 
 struct ChatMessage {
@@ -1380,7 +1385,8 @@ struct PromptOptions {
     // there and generates a primitive from there). A Qwen template's generation prompt with thinking off already ends
     // there, so Qwen requires enable_thinking false and renders nothing more; Inkling 2, whose lowest effort still
     // thinks, ends the prompt with the answer's opener `<|message_model|><|content_text|>`. With a new assistant turn
-    // only, and no output constraint or tool policy beside it.
+    // only (both refuse another); Inkling 2 also refuses an output constraint or a tool policy beside it (its output
+    // session would have to start inside the answer), where Qwen's answer region takes them as a thinking-off turn does.
     bool open_answer = false;
 };
 

@@ -497,6 +497,41 @@ int main() {
             check(!frontend.make_output_session(plain, {}).constrained(), "no tools and no constraint is free");
         }
 
+        // A tool the conversation redefined (an Anthropic tool addition after the tool section listed it): the listed
+        // declaration is withdrawn, the newer one is among the deferred ones, and the tool stays callable by name. A
+        // withdrawal alone leaves it uncallable.
+        {
+            const std::string weather_v2 =
+                R"({"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city","days"]}}})";
+            infernix::PromptInput redefined = question({kWeather});
+            redefined.options.deferred_tool_jsons  = {weather_v2};
+            redefined.options.withdrawn_tool_names = {"get_weather"};
+            const ink::PreparedPrompt prompt = frontend.prepare(std::move(redefined));
+            const ToolChoice named{.mode = ToolChoiceMode::Required, .allowed_names = std::vector<std::string>{"get_weather"},
+                                   .constraints = ToolConstraintMode::Basic};
+            std::size_t ended = 0;
+            for (int seed = 0; seed < 8; ++seed) {
+                ink::OutputSession session = frontend.make_output_session(prompt, {}, {}, {}, {}, named);
+                const Walk w = walk(c, session, rng, 3000, "redefined tool", false);
+                if (w.finish != FinishReason::StopToken) { continue; }
+                ++ended;
+                check(!w.calls.empty(), "redefined tool: a named choice calls");
+                for (const auto& call : w.calls) { check(call.name == "get_weather", "redefined tool: the call names it"); }
+            }
+            check(ended > 0, "redefined tool: a walk ends");
+            infernix::PromptInput removed = question({kWeather, kSearchStrict});
+            removed.options.withdrawn_tool_names = {"get_weather"};
+            const ink::PreparedPrompt gone = frontend.prepare(std::move(removed));
+            bool refused = false;
+            try {
+                (void)frontend.make_output_session(gone, {}, {}, {}, {}, named);
+            } catch (const infernix::RequestError& error) {
+                refused = error.kind() == infernix::RequestErrorKind::InvalidToolConstraint;
+            }
+            check(refused, "a withdrawn tool: a named choice of it is refused");
+            std::cout << "redefined tool: " << ended << " of 8 walks ended, every call names it\n";
+        }
+
         // 3. Refusals.
         {
             const ink::PreparedPrompt plain = frontend.prepare(question());

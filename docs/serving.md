@@ -1764,11 +1764,16 @@ cache keeps serving the conversation, and the first prompt carries none of the d
 
 - **Rendering.** Listed tools render in the template's tool section exactly as before; a request
   that defers nothing renders token-identically to one without these features. A result that loads
-  tools ends with `You now also have access to the following functions:`, a blank line, and the
-  definitions inside `<tools>`...`</tools>`, one JSON function definition per line in the form the
-  listed tools use (with `input_examples` when declared). The text depends only on the loaded
-  definitions, so a continuation Infernix runs and a later request that replays the same history
-  render the same tokens. Each tool loads once per result.
+  tools ends with the definitions in the model's own declaration wording. On the Qwen models that is
+  `You now also have access to the following functions:`, a blank line, and the definitions inside
+  `<tools>`...`</tools>`, one JSON function definition per line in the form the listed tools use (with
+  `input_examples` when declared). On Inkling 2 it is `These tools are now also available:` and the
+  definitions as its template's `tool_declare` block lists tools (one compact JSON array of
+  `description`, `name`, `parameters` and `type`); its template declares tools only before the
+  conversation, so tools loaded later are declared in the message that brings them, a form its
+  calls on them have not been measured with. The text depends only on the loaded definitions, so a
+  continuation Infernix runs and a later request that replays the same history render the same
+  tokens. Each tool loads once per result.
 - **Calls.** Every declared tool, deferred or not, belongs to the tool-call contract, which the
   Engine builds from the listed tools followed by the deferred ones (`PromptOptions::deferred_tool_jsons`).
   A call to a deferred tool parses, and is constrained under basic constraints or `strict:true`,
@@ -2028,11 +2033,11 @@ log-likelihood requests of evaluation harnesses such as lm-evaluation-harness.
 
 | Field | Meaning |
 |---|---|
-| `apply_chat_template` | **Required**, `true` or `false`. `true` renders the prompt exactly as `/v1/chat/completions` renders it, generation prompt included; `false` encodes `prompt` as raw text with no template and no special tokens. There is no default, because it decides which distribution is measured. |
+| `apply_chat_template` | **Required**, `true` or `false`. `true` renders the prompt exactly as `/v1/chat/completions` renders it, generation prompt included; `false` encodes `prompt` as raw text with no template and no special token added. There is no default, because it decides which distribution is measured. |
 | `prompt` | A string. With the template it is one user message. |
 | `messages` | Chat Completions turns, text only (`score_text_only` otherwise). Needs `apply_chat_template: true`. Exactly one of `prompt` and `messages`. |
 | `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Template options, parsed as on `/v1/chat/completions`. Refused when `apply_chat_template` is false (`template_option_without_template`). |
-| `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. |
+| `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. Raw text (here and a raw `prompt`) encodes a special token's text as that token on every model, as Hugging Face's tokenizers do by default: on Inkling 2, whose chat prompt ends after a closed message, a continuation that starts with `<\|message_model\|><\|content_text\|>` scores the reply header at positions 0 and 1 and the answer's first token at position 2. |
 | `top_k` | `0` to `256`: the most probable tokens returned per position, in descending order. Above `256` is refused (`top_k_out_of_range`), never narrowed. |
 | `hidden_states` | Optional, `true` or `false` (default). `true` also returns every layer's hidden state at the prompt's last token, the position whose distribution is position 0 (below). Not on `--lossless` (`invalid_score_request`). |
 | `model` | Optional. Resolved as on `/v1/chat/completions`: another name than the server's answers `404` `model_not_found` (unless `--any-model-name`). The response's `model` is the server's public model ID. |

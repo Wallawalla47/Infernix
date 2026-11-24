@@ -562,8 +562,9 @@ void OutputSession::validate_generation_capacity(std::uint32_t effective_output_
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     const std::optional<std::uint32_t> budget = impl_->s.thinking.budget;
     if (!budget || impl_->raw || effective_output_tokens <= *budget) { return; }
-    // The budget is reached after its opener and *budget thinking tokens; the control and one model token follow.
-    const std::uint64_t required = static_cast<std::uint64_t>(*budget) + 1U + impl_->s.thinking_control->size() + 1U;
+    // The budget is reached after its block's two-token header (<|message_model|><|content_thinking|>) and *budget
+    // thinking tokens; the control and one model token follow.
+    const std::uint64_t required = static_cast<std::uint64_t>(*budget) + 2U + impl_->s.thinking_control->size() + 1U;
     if (effective_output_tokens < required) {
         throw std::invalid_argument(
             "effective output capacity after the thinking budget must fit the complete control suffix and one "

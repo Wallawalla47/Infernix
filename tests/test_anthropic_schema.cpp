@@ -1880,24 +1880,24 @@ int test_client_tool_references() {
                              request.messages[2].loaded_tools.size() == 1 &&
                              request.messages[2].loaded_tools[0].name == "get_forecast",
                          "tool_reference blocks did not load their tool once into the result");
+    // The definition reaches the model's frontend as a LoadedTools part after the result's text (each model words it:
+    // Qwen in its tool section's wording, Inkling 2 in its declaration form).
     const infernix::PromptInput translated = prompt(request);
-    const std::string loaded = render_loaded_tools(request.messages[2].loaded_tools);
+    const auto loaded_part = [](const infernix::MessagePart& part) {
+        return part.kind == infernix::MessagePartKind::LoadedTools && part.tool_jsons.size() == 1 &&
+               part.tool_jsons[0].find("\"get_forecast\"") != std::string::npos &&
+               part.tool_jsons[0].find("City name") != std::string::npos;
+    };
     failures += check(translated.messages[2].parts.size() == 2 &&
                           translated.messages[2].parts[0].text == "Found one." &&
-                          translated.messages[2].parts[1].text == "\n\n" + loaded &&
-                          loaded.find("\"get_forecast\"") != std::string::npos &&
-                          loaded.find("City name") != std::string::npos &&
-                          loaded.starts_with("You now also have access to the following "
-                                             "functions:\n\n<tools>\n") &&
-                          loaded.ends_with("\n</tools>"),
-                      "a loaded definition was not rendered after the tool result");
+                          loaded_part(translated.messages[2].parts[1]),
+                      "a loaded definition did not follow the tool result as a LoadedTools part");
 
     body["messages"][2]["content"][0]["content"] = Json::array(
         {Json{{"type", "tool_reference"}, {"tool_name", "get_forecast"}}});
     const infernix::PromptInput only_reference = prompt(parse(body).generation);
-    failures += check(only_reference.messages[2].parts.size() == 1 &&
-                          only_reference.messages[2].parts[0].text == loaded,
-                      "a reference-only result rendered an empty part or separator");
+    failures += check(only_reference.messages[2].parts.size() == 1 && loaded_part(only_reference.messages[2].parts[0]),
+                      "a reference-only result rendered an empty part beside its definition");
 
     body["messages"][2]["content"][0]["content"][0]["tool_name"] = "missing_tool";
     failures += check(api_code([&] { (void)parse(body); }) == "tool_reference_not_found",
