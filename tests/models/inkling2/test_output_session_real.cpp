@@ -238,15 +238,20 @@ void rule_cases(const Harness& h) {
         const std::vector<TokenId> control{k.end_message};
         (void)session.preview_control(control, total);
         (void)session.commit_preview();
-        check(!session.reasoning_ban().active(), "budget: the ban ends with the thinking");
+        // The budget holds for the turn: after the control every column refuses the thinking opener, and the ban never
+        // lifts (its close is the opener itself).
+        const infernix::runtime::ReasoningBan after = session.reasoning_ban();
+        check(after.active() && after.close == k.thinking && after.ends[0] == k.thinking && after.ends[1] == -1 &&
+                  after.withheld == -1,
+              "budget: after the control the thinking opener is banned for the rest of the turn");
         const Turn rest = Harness::run(session, answer, 16, false, total - 1);
         check(turn.reasoning == h.decode(std::span(thinking.data(), 3)) && rest.content == "done",
               "budget: reasoning " + Json(turn.reasoning).dump() + ", content " + Json(rest.content).dump());
         const auto stats = session.thinking_stats();
         check(stats.applied && stats.model_thinking_tokens == 3 && stats.injected_tokens == 1, "budget: stats");
     }
-    { // A thinking block that closes on its own at the budget spends it: later rounds are not capped, and a thinking
-      // block opened again is not policed.
+    { // A thinking block that closes on its own at the budget spends it: later rounds are not capped, and every later
+      // column refuses the thinking opener (a turn's budget, not a block's).
         auto s = h.settings(nullptr);
         s.thinking.budget = 3;
         ink::OutputSession session(std::move(s));
@@ -265,10 +270,17 @@ void rule_cases(const Harness& h) {
         check(d2.continuation == infernix::runtime::ContinuationAction::Decode && session.pending_control_tokens().empty(),
               "spent: the close at the budget needs no control");
         check(session.model_token_budget_remaining(total) == total, "spent: rounds are no longer capped");
-        const Turn rest = Harness::run(session, cat({M, CT, h.encode("again"), E, M, CX, h.encode("ok"), E, EOS}), 16,
-                                       false, total);
-        check(rest.finish == FinishReason::StopToken && rest.reasoning == "again" && rest.content == "ok",
-              "spent: the turn goes on uncapped");
+        const infernix::runtime::ReasoningBan between = session.reasoning_ban();
+        check(between.active() && between.close == k.thinking && between.ends[0] == k.thinking,
+              "spent: between blocks the thinking opener is banned");
+        const auto d3 = session.preview_model(cat({M, CX}), total, FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        total -= d3.accepted_tokens;
+        check(session.reasoning_ban().active() && session.reasoning_ban().ends[0] == k.thinking,
+              "spent: inside the answer the thinking opener stays banned");
+        const Turn rest = Harness::run(session, cat({h.encode("ok"), E, EOS}), 16, false, total);
+        check(rest.finish == FinishReason::StopToken && rest.content == "ok", "spent: the answer follows");
+        check(!session.reasoning_ban().active(), "spent: a finished turn bans nothing");
         check(!session.thinking_stats().applied, "spent: no control was applied");
     }
     { // Raw output: every byte, markers included, is content.

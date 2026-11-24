@@ -1539,6 +1539,31 @@ int reasoning_ban_accept_case(int token_domain, bool closed) {
                                raw_targets, bits, token_domain, drafts, 100, token_domain, config, counts, expected);
 }
 
+// A ban that never lifts (Inkling 2's thinking opener once its budget is spent: SamplingConfig::reasoning_close and
+// reasoning_ends[0] are the same token, 7). Drafts {7, 4}: column 0 has no draft before it, so its best token 7 is
+// refused and its next best 2 corrects the first draft; the drafted 7 the later columns' overlay holds is never
+// accepted, so their lifted ban changes nothing.
+int reasoning_opener_ban_case(int token_domain) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{7, 4};
+    const std::vector<std::int32_t> raw_targets{7, 4, 3};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[7]                    = 5.0F;
+    logits[2]                    = 4.5F;
+    logits[token_domain + 4]     = 5.0F;
+    logits[2 * token_domain + 3] = 5.0F;
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) { bits[index] = f32_to_bf16(logits[index]); }
+    ops::SamplingConfig config{};
+    config.temperature       = 0.0F;
+    config.reasoning_close   = 7;
+    config.reasoning_ends[0] = 7;
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected = accept_state_oracle(drafts, 0, 2, 100);
+    return execute_accept_case("speculative opener ban that never lifts token-domain=" + std::to_string(token_domain),
+                               raw_targets, bits, token_domain, drafts, 100, token_domain, config, counts, expected);
+}
+
 // A verification column without a finite logit (every value NaN) sets the row's
 // SamplingConfig::nonfinite flag and selects token 0 in its place, on the single-block (64) and
 // multi-block (257) routes; the finite column before it is still verified and accepted.
@@ -2873,6 +2898,7 @@ INFERNIX_OP_TEST(speculative_round) {
     for (const int domain : {64, 257}) {
         failures += reasoning_ban_accept_case(domain, true);
         failures += reasoning_ban_accept_case(domain, false);
+        failures += reasoning_opener_ban_case(domain);
     }
     failures += nonfinite_column_case(64);
     failures += nonfinite_column_case(257);

@@ -115,7 +115,8 @@ public:
     // Inkling has no constrained route yet (the frontend refuses an OutputConstraint).
     [[nodiscard]] bool constrained() const noexcept { return false; }
     // While the committed output's thinking is open: <|end_message|> closes it, and the end-of-turn token (and the
-    // tool-call opener, when the turn declares tools) take no probability before it.
+    // tool-call opener, when the turn declares tools) take no probability before it. Once a thinking budget is used up
+    // (its control applied, or a block ended at it): <|content_thinking|> takes no probability for the rest of the turn.
     [[nodiscard]] runtime::ReasoningBan reasoning_ban() const noexcept;
     void observe_constraint(bool, double) noexcept {}
     void constraint_uploaded(std::size_t) noexcept {}

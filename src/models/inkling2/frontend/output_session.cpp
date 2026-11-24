@@ -50,7 +50,7 @@ struct State {
     bool control_pending                = false;
     bool applied                        = false; // the control closed the thinking
     // A thinking block closed on its own with the budget used up: the budget is spent, as an applied control spends
-    // it (later thinking is not capped, and answer rounds are not held to one token).
+    // it (answer rounds are not held to one token, and reasoning_ban refuses another thinking block for the turn).
     bool spent = false;
     std::vector<GeneratedToolCall> calls;
     ToolCallParseDiagnostics diagnostics;
@@ -454,10 +454,16 @@ void OutputSession::discard_preview() {
 }
 
 runtime::ReasoningBan OutputSession::reasoning_ban() const noexcept {
-    if (impl_ == nullptr || impl_->raw || impl_->s.thinking.end_turn_in_thinking ||
-        impl_->committed.phase != Phase::Reasoning || impl_->committed.terminal) {
-        return {};
+    if (impl_ == nullptr || impl_->raw || impl_->committed.terminal) { return {}; }
+    const State& state = impl_->committed;
+    // A thinking budget holds for the whole turn: once its control closed the thinking (applied) or a block closed with
+    // the budget used up (spent), the model may not open another thinking block, which would think uncapped to the
+    // output limit. Every later column refuses the thinking opener. The ban never lifts: its close is the opener itself,
+    // which no column can draw (a drafted opener in a verify column's overlay is a draft that column 0 already refused).
+    if (impl_->s.thinking.budget && (state.applied || state.spent) && state.phase != Phase::Reasoning) {
+        return {.close = impl_->s.markers.thinking, .ends = {impl_->s.markers.thinking, -1}, .withheld = -1};
     }
+    if (impl_->s.thinking.end_turn_in_thinking || state.phase != Phase::Reasoning) { return {}; }
     return {.close    = impl_->s.markers.end_message,
             .ends     = {impl_->s.markers.end_of_turn, -1},
             .withheld = impl_->parse_calls ? impl_->s.markers.tool_call : TokenId{-1}};

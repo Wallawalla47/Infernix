@@ -216,7 +216,10 @@ over HTTP) to a level; without one it uses 0.9.
 
 - `--no-thinking` selects level 0, the template's lowest. **It does not turn reasoning off**, as
   Thinking Machines' card also says.
-- `--thinking-budget` (CLI) and `--default-thinking-budget` (server) cap the thinking tokens.
+- `--thinking-budget` (CLI) and `--default-thinking-budget` (server) cap the thinking tokens of the whole
+  turn. Inkling 2 may think in several blocks; they count together, and once the budget is used up (the
+  control closes the block, or a block ends at the budget) the model cannot open another thinking block in
+  that turn.
 - The checkpoint's card warns that the model can get stuck in long reasoning loops. Infernix's
   `--reasoning-loop` guard is not available here, so set an output limit and a thinking budget for
   agent work.

@@ -1477,6 +1477,12 @@ fixture where summation order is visible ([op development §6.3](op-development.
   its table; numbers in [0, 0.99]); the default is the template's 0.9 (D6).
 - **Output session.** Channels from `response_template`: thinking, content, tool calls (JSON per call). Constrained tool
   calls use the existing JSON grammar inside `<|content_invoke_tool_json|>` (TokenSpeed's `inkling2_json` frames the same).
+- **Thinking budget.** A turn may hold several thinking blocks, so the budget counts them together and holds for the
+  whole turn (Qwen's one `<think>` block makes its one-shot control a turn budget; Inkling's does not): once the
+  control has closed a block or a block has ended at the budget, `reasoning_ban()` refuses `<|content_thinking|>` at
+  every later column (its close is the opener itself, so the ban never lifts). Without it the model could open a new
+  block after the control and think uncapped to the output limit (Basalt #588, llama.cpp #32836). Only turns that use
+  up their budget sample differently.
 - **Stops.** EOS `<|content_model_end_sampling|>`; `<|end_message|>` ends a channel, not the turn.
 
 ---
