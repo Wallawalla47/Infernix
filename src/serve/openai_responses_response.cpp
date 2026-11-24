@@ -47,10 +47,14 @@ struct ItemIds {
     std::vector<std::string> search_outputs; // per call: a hosted search's tool_search_output id
     // A streamed call the turn's end cut: its incomplete Item, in the output but not the history.
     std::optional<Json> cut_call;
-    // Reasoning a stream gave Items of their own after the message began (a model that thinks in several blocks):
-    // (id, text) in order, listed after the message Item. Empty for a whole response, whose one reasoning Item joins
-    // them as the Engine does.
-    std::vector<std::pair<std::string, std::string>> late_reasoning;
+    // Reasoning a stream gave Items of their own after the message began (a model that thinks in several blocks), in
+    // order, listed after the message Item with the status each one's output_item.done carried (completed once content
+    // or a call followed it; the turn's status for the one the generation's end closed). Empty for a whole response,
+    // whose one reasoning Item joins them as the Engine does.
+    struct LateReasoningItem {
+        std::string id, text, status;
+    };
+    std::vector<LateReasoningItem> late_reasoning;
 };
 
 enum class CallKind : std::uint8_t {
@@ -295,7 +299,7 @@ void append_round(BuiltOpenAIResponse& built, const OpenAIResponsesCreateRequest
 
     // A stream's late reasoning Items hold the end of the generation's reasoning; the first Item holds the rest.
     std::size_t late_bytes = 0;
-    for (const auto& item : ids.late_reasoning) { late_bytes += item.second.size(); }
+    for (const auto& item : ids.late_reasoning) { late_bytes += item.text.size(); }
     const std::string first_reasoning =
         outcome.reasoning.substr(0, outcome.reasoning.size() - std::min(late_bytes, outcome.reasoning.size()));
     const auto reasoning_item = [&](const std::string& id, const std::string& text, const char* item_status_text) {
@@ -328,8 +332,9 @@ void append_round(BuiltOpenAIResponse& built, const OpenAIResponsesCreateRequest
                                                {"annotations", Json::array()},
                                                {"text", outcome.text}}})}});
     }
-    for (const auto& [id, text] : ids.late_reasoning) {
-        built.output_items.push_back(reasoning_item(id, text, item_status.c_str()));
+    for (const ItemIds::LateReasoningItem& late : ids.late_reasoning) {
+        built.output_items.push_back(
+            reasoning_item(late.id, late.text, late.status.empty() ? item_status.c_str() : late.status.c_str()));
     }
 
     complete_call_ids(ids, request, round);
@@ -579,6 +584,7 @@ public:
         if (late.empty() || late.back().done) { return {}; }
         LateReasoning& item = late.back();
         item.done           = true;
+        item.status         = item_status;
         return reasoning_done_events(item.id, item.output_index, item.text, item_status);
     }
 
@@ -851,7 +857,9 @@ public:
 
     // The next generation's deltas open new Items.
     void next_round() {
-        for (LateReasoning& item : late) { ids.late_reasoning.emplace_back(std::move(item.id), std::move(item.text)); }
+        for (LateReasoning& item : late) {
+            ids.late_reasoning.push_back({std::move(item.id), std::move(item.text), std::move(item.status)});
+        }
         late.clear();
         round_ids.push_back(std::move(ids));
         ids               = ItemIds{};
@@ -877,6 +885,7 @@ public:
         int output_index = 0;
         std::string text;
         bool done = false;
+        std::string status; // the status its output_item.done carried
     };
 
     std::string id;
