@@ -544,6 +544,8 @@ void test_option_support() {
     row("--ngram-archive-mib", true, true, true, false, false);
     row("--ngram-volume", false, false, false, true, false);
     row("--preserve-thinking", true, true, true, true, false);
+    row("--tool-parameter-names", true, true, true, true, false);
+    row("--context-cost-presets", true, true, true, true, false);
     row("--no-cuda-graph", true, true, true, false, true);
     row("--fast-path", true, true, true, true, false);
     row("--max-context", true, true, true, true, true);

@@ -4,7 +4,8 @@ One process serves one purpose (infernix-serve: generation, or --causal-scoring)
 KL starts two. Every engine gets:
   production's carried options (serve_flags CARRY: placement, files, numerics, the chat template), then
   --host 127.0.0.1 --port <free> --model-id ablate --max-context <16384> --max-concurrency 1 --spec off
-  --expert-state <run>/expert.state [--causal-scoring] [--ablate <sidecar>].
+  --expert-state <run>/expert.state (not on Inkling 2, whose experts stay in VRAM: it refuses the option)
+  [--causal-scoring] [--ablate <sidecar>].
 The run keeps its own expert-cache state: engines write it when they stop, so production's file is never written,
 and each boot starts with a warm cache (a cold one costs a fit about 40 s a trial). The first engine seeds it from
 production's file when there is one.
@@ -43,7 +44,10 @@ class Engine:
         self.proc = None
         # Inkling 2's template has no thinking-off: enable_thinking false renders its lowest effort, and the reply may
         # still open with a thinking channel (measure.grade_refusals grades what the model says first in either channel).
-        self.reasons_when_off = text_model_type(run.production.artifact) == "inkling2_loop_text"
+        inkling = text_model_type(run.production.artifact) == "inkling2_loop_text"
+        self.reasons_when_off = inkling
+        # Inkling 2 keeps its experts in VRAM and refuses --expert-state: there is no expert-cache state to keep.
+        self.keeps_expert_state = not inkling
 
     def argv(self, port: int | None = None) -> list[str]:
         prod = self.run.production
@@ -51,8 +55,9 @@ class Engine:
         for flag, value in prod.by_kind(SF.CARRY):
             cmd += [flag] if value is None else [flag, value]
         cmd += ["--host", "127.0.0.1", "--port", str(port or self.port or 0), "--model-id", MODEL_ID,
-                "--max-context", str(self.context), "--max-concurrency", "1", "--spec", "off",
-                "--expert-state", str(self.expert_state)]
+                "--max-context", str(self.context), "--max-concurrency", "1", "--spec", "off"]
+        if self.keeps_expert_state:
+            cmd += ["--expert-state", str(self.expert_state)]
         if self.purpose == "score":
             cmd += ["--causal-scoring"]
         if self.sidecar is not None:
@@ -64,7 +69,7 @@ class Engine:
         return self.run.dir / "expert.state"
 
     def seed_expert_state(self) -> None:
-        if self.expert_state.exists():
+        if not self.keeps_expert_state or self.expert_state.exists():
             return
         named = self.run.production.value("--expert-state")
         source = None if named == "off" else Path(named) if named else Path(str(self.run.production.artifact) + ".expert-state")

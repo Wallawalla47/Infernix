@@ -392,8 +392,8 @@ std::string usage_text(const char* argv0) {
            "                           (the 27Bs) and Inkling 2; --lossless computes it as PEFT\n"
            "                           does (docs/lora.md)\n"
            "  --ablate FILE            apply an ablation sidecar at runtime: its sidecar.json,\n"
-           "                           the direction file beside it; not on Inkling 2\n"
-           "                           (docs/ablate.md)\n"
+           "                           the direction file beside it; every model; refused\n"
+           "                           with --lossless (docs/ablate.md)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"
            "                           only), Qwen3.8-Flash-Next dflash2: one-request rounds\n"
@@ -471,7 +471,6 @@ Options parse_options(int argc, char** argv) {
     options.artifact_path     = program.model;
     options.config_path       = std::move(program.config_path);
     options.config_arguments  = program.config_arguments;
-    bool kv_capacity_explicit = false;
     bool spec_explicit        = false; // without --spec: product::apply_default_speculation
 
     const std::vector<std::string>& arguments = program.arguments;
@@ -522,7 +521,7 @@ Options parse_options(int argc, char** argv) {
             if (!options.max_context_auto) { options.max_context = parse_u32(context, "max-context"); }
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
-            kv_capacity_explicit = true;
+            options.kv_capacity_explicit = true;
         } else if (arg == "--vram-past-budget") {
             options.vram_past_budget = true;
         } else if (arg == "--expert-tail-skip") {
@@ -729,7 +728,7 @@ Options parse_options(int argc, char** argv) {
         1)
         throw std::invalid_argument("select only one of --grammar-file, --json-object, "
                                     "--json-schema-file, --regex or --choice");
-    if (!kv_capacity_explicit) {
+    if (!options.kv_capacity_explicit) {
         // An automatic context takes the KV pool it sizes.
         options.kv_capacity = options.max_context_auto ? KvCapacityPolicy::automatic()
                                                        : KvCapacityPolicy::explicit_capacity(options.max_context);

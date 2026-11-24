@@ -83,6 +83,11 @@ infernix_add_test(infernix_serve_options_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
   LIBRARIES infernix_serve)
 
+# Inkling 2's launch options: refused by flag, never ignored; the callers' configurations start (CPU only).
+infernix_add_test(infernix_inkling2_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_inkling2_options.cpp"
+  LIBRARIES infernix_serve infernix_engine infernix_core)
+
 infernix_add_test(infernix_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
   LIBRARIES infernix_serve infernix_product_logging)

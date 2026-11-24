@@ -56,6 +56,7 @@ constexpr std::array kRules = {
     Rule{"--cache-tool-hold-secs", kQwen35},  // refused by Flash-Next and Inkling
     Rule{"--cache-next-turn-ms", kQwen},    // refused by Inkling
     Rule{"--no-queue-holds", kQwen},        // Inkling's Program builds no queue holds
+    Rule{"--context-cost-presets", kQwen},  // Inkling's prefix cache has no cost model
     // Speculative decoding.
     Rule{"--draft-model", kFlash},
     Rule{"--draft-tree-nodes", kQwen35},    // Flash-Next verifies neural drafts as chains and refuses it
@@ -69,10 +70,12 @@ constexpr std::array kRules = {
     Rule{"--ngram-native-sessions", kQwen35},
     Rule{"--ngram-volume", kFlash},
     Rule{"--ngram-residency", kFlash},
-    // Thinking: Inkling's template has an effort instead, a prompt never starts in reasoning (so no thinking budget),
-    // and its output session has no loop guard or tolerant tool-call parsing.
+    // Thinking and tools: Inkling's template has an effort instead, a prompt never starts in reasoning (so infernix-serve
+    // applies no thinking budget), its output session has no loop guard or tolerant tool-call parsing, and it has no
+    // constrained tool route (infernix-serve refuses each: serve::refuse_unsupported_options).
     Rule{"--preserve-thinking", kQwen},
     Rule{"--tolerant-tool-calls", kQwen},
+    Rule{"--tool-parameter-names", kQwen},
     Rule{"--reasoning-loop", kQwen},
     Rule{"--default-thinking-budget", kQwen},
     Rule{"--no-thinking-answer-room", kQwen},

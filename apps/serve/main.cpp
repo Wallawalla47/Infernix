@@ -229,6 +229,8 @@ int run_plan(const infernix::serve::ServeOptions& options, const std::shared_ptr
     try {
         const infernix::EnginePlan plan = infernix::Engine::plan(
             make_engine_options(options, {}, infernix::product::engine_diagnostic_observer(logger)));
+        // The start would refuse these once its model has loaded: no plan of it.
+        refuse_unsupported_options(options, plan.architecture);
         body   = render_plan_json(plan);
         status = plan.fits ? kPlanFitsExitStatus : kPlanDoesNotFitExitStatus;
         if (plan.fits) {
@@ -343,10 +345,7 @@ int main(int argc, char** argv) {
         }
         infernix::serve::GenerationService service(
             options, startup_log.observer(), infernix::product::engine_diagnostic_observer(logger));
-        if (options.reasoning_loop != infernix::ReasoningLoopAction::Off &&
-            service.load_summary().architecture == "Inkling2LoopForCausalLM") {
-            throw std::invalid_argument("--reasoning-loop: Inkling 2 has no reasoning-loop guard (use off)");
-        }
+        infernix::serve::refuse_unsupported_options(options, service.load_summary().architecture);
         startup_log.engine_ready(service.load_summary());
         if (options.context_cache.ssd_capacity_bytes != 0) {
             // The SSD tier (hybrid-prefix-cache-spec §5.7): a scratch file, removed at exit.

@@ -53,7 +53,7 @@ def check(run, log=print) -> int:
     dropped = [f for f, _ in prod.by_kind(SF.DROP)]
     say(None, f"carried from production: {' '.join(carried) or '(nothing)'}")
     say(None, f"set by the tool: --max-context {run.context} --max-concurrency 1 --spec off --expert-state <run>/expert.state "
-              f"(production's {' '.join(f for f, _ in prod.by_kind(SF.OWNED)) or 'none'} replaced)")
+              f"(not on Inkling 2) (production's {' '.join(f for f, _ in prod.by_kind(SF.OWNED)) or 'none'} replaced)")
     if dropped:
         say(None, f"left out: {' '.join(dropped)}")
 

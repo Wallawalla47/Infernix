@@ -90,7 +90,9 @@ See [Sizing a start without loading](serving.md#sizing-a-start-without-loading).
 ## Not supported yet
 
 Each of these fails with a clear error instead of running differently, except where the table says
-otherwise.
+otherwise. The engine refuses an option before the model loads. The options only `infernix-serve` or `infernix` reads
+(the thinking and tool options, `--expert-state FILE`, `--ram-resize`, `--kv-capacity` without the cache) are refused
+once the model has loaded; `--plan` reports them without loading.
 
 | Feature | On Inkling 2 Mini |
 |---|---|
@@ -99,9 +101,18 @@ otherwise.
 | `tool_choice` set to required or to a named tool | the request is refused. `auto` and `none` work; tool calls are parsed from the model's free output, so no grammar protects their arguments |
 | A tool declared with `strict: true` | the request is refused, since nothing would check its arguments against the schema. Tools with `strict: false` or no `strict` field work |
 | A request ending in an assistant message (prefill) | the request is refused: only a new assistant turn is rendered |
-| `--reasoning-loop stop` or `conclude` | refused at startup |
-| N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens N` | refused at startup |
-| The MTP, DFlash and DFlash2 backends | `--spec mtp`, `dflash` and `dflash2` are refused: the model's drafter is DSpark |
+| `--reasoning-loop stop` or `conclude` | refused: the model has no reasoning-loop guard |
+| The server's thinking budget: `--default-thinking-budget`, `--no-thinking-answer-room`, `--thinking-budget-message` | refused: `infernix-serve` applies no thinking budget to Inkling yet (its prompts never start in reasoning). A request's own budget (Anthropic `budget_tokens`) is not applied either. The CLI's `--thinking-budget` works |
+| `--preserve-thinking`, `--tolerant-tool-calls`, `--tool-parameter-names declared` | refused: Qwen template and tool-call options. The template renders the history's reasoning as given |
+| `--end-in-thinking allow` with `--no-thinking` | refused: `--no-thinking` selects the lowest effort, which still thinks, and the server applies no thinking controls with thinking off. `allow` alone works |
+| N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens`, `--ngram-min-match`, `--ngram-tree-nodes`, `--ngram-archive-mib`, `--ngram-session-mib`, `--ngram-residency` | refused |
+| The MTP, DFlash and DFlash2 backends | `--spec mtp`, `dflash` and `dflash2` are refused: the model's drafter is DSpark. So are `--draft-model`, `--spec-min-p`, `--draft-tree-nodes` and `--draft-tree-paths` (DSpark verifies a chain) |
+| `--lm-head-draft` when no drafter runs | refused: an artifact without DSpark, `--spec off` or `--lossless` |
+| Offloaded-expert options: `--expert-state`, `--expert-ram-mib`, `--expert-ram-layout`, `--expert-pin-mib`, `--expert-csf`, `--expert-stripe`, `--expert-tail-skip`, `--route-trace`, and `--ram-resize` | refused: the experts stay in VRAM and the Host tier keeps its startup size |
+| Qwen kernel, fast-path and media options: `--use-original-int8-prefill-kernel`, `--use-original-nvfp4-prefill-kernel`, `--prefill-split-workspace-mib`, `--fast-path`, `--no-fast-path`, `--media-cache-mib`, `--media-live-mib`, `--media-preprocess-threads`, `--context-cost-presets`, `--no-queue-holds` | refused: Inkling has its own prompt route and image path, registers no fast path, and its prefix cache has no cost model or queue holds |
+| Sizing options that a start would not use: `--vram-headroom-mib` and `--vram-past-budget` without `--max-context auto` or the cache's `--kv-capacity auto`; `--ram-free-mib` without the automatic Host tier; `--vision-max-merged` without `--vision` | refused |
+| `--kv-capacity N` below every lane's context, with `--max-context auto`, or without the prefix cache (`--no-prefix-reuse`, the CLI) | refused: each lane reserves its whole context |
+| Generation options on a `--causal-scoring` start (`--prefix-cache-file`, `--host-context-mib`, `--ssd-context-gib`, `--lm-head-draft`, the sizing options) | not refused: scoring runs without them, and the start lists them as unused in its log, as the other models do |
 | `--logits-dtype bf16` | refused at startup: the logits are FP32 |
 | `--rope-yarn-factor` other than 1 | refused at startup: the model has no RoPE and reaches its full context natively |
 | `--expert-a4-activations` | refused at startup (it belongs to one Qwen3.8-Flash-Next artifact) |
@@ -129,7 +140,7 @@ vocabulary, which makes each round's draft cheaper.
 Infernix builds the shortlist at load from the ranking stored in the artifact
 (`proposal/token_rank`). A token outside the list is never drafted; verification still produces it,
 so **the output does not change**. An artifact without a ranking refuses the option, and it needs a
-drafter (`--spec off` refuses it).
+drafter: a start that runs none (`--spec off`, an artifact without DSpark, `--lossless`) refuses it.
 
 On nine English, code, Chinese and other-language prompts (RTX 5090, DSpark `auto`, two runs each) it decoded 2.4 to 5.8 %
 faster than DSpark on the full head on the default route, 2.9 to 4.9 % faster with `--q8-weights` and 2.5 to 4.0 % faster
@@ -192,7 +203,8 @@ Measured quality per format: [design §7.6](maintainer/inkling2_mini-design.md#7
 - **The prefix cache** is on by default in `infernix-serve` (the `infernix` CLI runs without it). It
   caches only state computed from prompts, so a continuing turn resumes at the previous prompt's end
   and prefills the previous reply again. `--kv-capacity` then defaults to `auto`, so with a fixed
-  `--max-context` the cache also gets the VRAM beyond the lanes' contexts. `--prefix-cache-file` keeps
+  `--max-context` the cache also gets the VRAM beyond the lanes' contexts. An explicit `--kv-capacity N`
+  must hold every lane's whole context and needs a fixed `--max-context`. `--prefix-cache-file` keeps
   it across restarts, and `--ssd-context-gib` with `--ssd-context-dir` adds an SSD tier. Details:
   [Inkling 2's prefix cache](serving.md#inkling-2s-prefix-cache).
 - **`--embedding-host`** keeps the token embedding in pinned RAM and gives its VRAM to the KV and
@@ -217,15 +229,16 @@ over HTTP) to a level; without one it uses 0.9.
 
 - `--no-thinking` selects level 0, the template's lowest. **It does not turn reasoning off**, as
   Thinking Machines' card also says.
-- `--thinking-budget` (CLI) and `--default-thinking-budget` (server) cap the thinking tokens of the whole
-  turn. Inkling 2 may think in several blocks; they count together, and once the budget is used up (the
-  control closes the block, or a block ends at the budget) the model cannot open another thinking block in
-  that turn.
+- `--thinking-budget` (CLI) caps the thinking tokens of the whole turn. Inkling 2 may think in several
+  blocks; they count together, and once the budget is used up (the control closes the block, or a block
+  ends at the budget) the model cannot open another thinking block in that turn. `infernix-serve` does not
+  apply thinking budgets to this model yet: it refuses `--default-thinking-budget` and ignores a request's
+  `budget_tokens`.
 - The checkpoint's card warns that the model can get stuck in long reasoning loops. Infernix's
-  `--reasoning-loop` guard is not available here, so set an output limit and a thinking budget for
-  agent work.
+  `--reasoning-loop` guard is not available here, so set an output limit for agent work (and with the CLI a
+  thinking budget).
 - Tool calls work through the OpenAI and Anthropic APIs. `--preserve-thinking` and
-  `--tolerant-tool-calls` have not been checked on this model, so the commands here leave them out.
+  `--tolerant-tool-calls` are Qwen options and are refused.
 
 ## Convert
 

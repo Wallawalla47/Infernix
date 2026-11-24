@@ -439,9 +439,21 @@ int main(int argc, char** argv) {
         engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);
 
         infernix::Engine engine(std::move(engine_options));
-        if (cli.reasoning_loop != infernix::ReasoningLoopAction::Off &&
-            engine.load_summary().architecture == "Inkling2LoopForCausalLM") {
-            throw std::invalid_argument("--reasoning-loop: Inkling 2 has no reasoning-loop guard (use off)");
+        if (engine.load_summary().architecture == "Inkling2LoopForCausalLM") {
+            // What the Engine's options cannot tell from their defaults, or the CLI's own (the Engine refuses the
+            // rest before the load).
+            if (cli.reasoning_loop != infernix::ReasoningLoopAction::Off) {
+                throw std::invalid_argument("Inkling 2: --reasoning-loop stop and conclude: Inkling 2 has no "
+                                            "reasoning-loop guard (use off)");
+            }
+            if (cli.expert_state) {
+                throw std::invalid_argument("Inkling 2: --expert-state applies to models with offloaded experts; "
+                                            "Inkling 2 keeps its experts in VRAM");
+            }
+            if (cli.kv_capacity_explicit) {
+                throw std::invalid_argument("Inkling 2: --kv-capacity sizes the prefix cache's KV pool, which the CLI "
+                                            "runs without: the lane reserves its whole context (--max-context)");
+            }
         }
         startup_log.engine_ready(engine.load_summary());
         startup_log.chat_template_roles(engine.chat_template_role_support(),

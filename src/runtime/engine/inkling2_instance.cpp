@@ -27,6 +27,19 @@ void refuse(bool condition, const char* what) {
     if (condition) { throw std::invalid_argument(std::string("Inkling 2: ") + what); }
 }
 
+// An option another family applies and nothing on Inkling 2's path reads: refused by its flag, so a start never runs
+// without what it asked for.
+void refuse_option(bool given, const char* flag, const char* why) {
+    if (given) { throw std::invalid_argument(std::string("Inkling 2: ") + flag + " " + why); }
+}
+
+constexpr const char* kResidentExperts = "applies to models with offloaded experts; Inkling 2 keeps its experts in VRAM";
+constexpr const char* kQwenPromptKernel =
+    "selects a Qwen3.5 prompt-attention kernel; Inkling 2 has its own prompt route for every KV format";
+constexpr const char* kQwenMedia =
+    "sizes the Qwen models' media pipeline; Inkling 2's frontend decodes each image without it";
+constexpr const char* kNoNgrams = "configures n-gram drafting, which Inkling 2 does not have (its drafter is DSpark)";
+
 void report(const EngineOptions& options, const std::string& text) {
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "%s", text.c_str());
 }
@@ -145,6 +158,45 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     // As every model (validate_engine_options, which this family's start does not run): the lossless route computes
     // the model's own forward correctly rounded, and a cut is not part of it.
     refuse(!options.ablate_sidecar_path.empty() && options.lossless, "--ablate does not combine with --lossless (docs/ablate.md)");
+    // As every model (validate_engine_options): the design reference and the noise twin are the lossless route's
+    // causal scoring.
+    refuse(options.reference && options.purpose != EnginePurpose::CausalScoring,
+           "the design reference (--reference) is the lossless route's causal scoring");
+    refuse(options.lossless_noise_seed != 0 && (!options.lossless || options.purpose != EnginePurpose::CausalScoring),
+           "the noise twin (lossless_noise_seed) is the lossless route's causal scoring");
+    refuse(!(options.lossless_noise_scale > 0.0F && options.lossless_noise_scale <= 1.0F),
+           "lossless_noise_scale must be in (0, 1]");
+    // The other families' options, which nothing on Inkling 2's path reads (docs/inkling2-mini.md, "Not supported").
+    // Options that take a default are refused when they differ from it: a default given explicitly asks for nothing.
+    refuse_option(options.original_int8_prefill_kernel, "--use-original-int8-prefill-kernel", kQwenPromptKernel);
+    refuse_option(options.original_nvfp4_prefill_kernel, "--use-original-nvfp4-prefill-kernel", kQwenPromptKernel);
+    refuse_option(options.prefill_split_workspace_mib != kDefaultPrefillSplitWorkspaceMiB, "--prefill-split-workspace-mib",
+                  "sizes the Qwen3.5 prompt-attention split; Inkling 2's prompt attention takes no split workspace");
+    refuse_option(!options.fast_path_candidates.empty(), "--fast-path",
+                  "selects a registered fast path; Inkling 2 registers none (its approximate routes are --q8-weights and "
+                  "--a8-activations)");
+    refuse_option(!options.fast_path_exclusions.empty(), "--no-fast-path",
+                  "leaves out a registered fast path; Inkling 2 registers none");
+    refuse_option(options.expert_tail_skip != 0, "--expert-tail-skip", kResidentExperts);
+    refuse_option(options.expert_ram_bytes.has_value(), "--expert-ram-mib", kResidentExperts);
+    refuse_option(options.expert_ram_layout.has_value(), "--expert-ram-layout", kResidentExperts);
+    refuse_option(options.expert_csf, "--expert-csf", kResidentExperts);
+    refuse_option(options.expert_pin_bytes.has_value(), "--expert-pin-mib", kResidentExperts);
+    // --expert-state FILE cannot be told from infernix-serve's and the CLI's default path here: they refuse it
+    // (serve::refuse_unsupported_options, the CLI's start).
+    refuse_option(options.expert_state_off, "--expert-state", kResidentExperts);
+    refuse_option(!options.expert_stripe_path.empty(), "--expert-stripe", kResidentExperts);
+    refuse_option(!options.route_trace_path.empty(), "--route-trace", kResidentExperts);
+    refuse_option(!options.context_cost.preset_path.empty(), "--context-cost-presets",
+                  "calibrates the Qwen prefix caches' cost model; Inkling 2's prefix cache has none");
+    refuse_option(!options.context_cache.hybrid.queue_holds, "--no-queue-holds",
+                  "turns off the queue holds of the Qwen prefix caches; Inkling 2's prefix cache builds none");
+    refuse_option(options.media_cache_bytes != kDefaultMediaCacheBytes, "--media-cache-mib", kQwenMedia);
+    refuse_option(options.media_live_bytes != kDefaultMediaLiveBytes, "--media-live-mib", kQwenMedia);
+    refuse_option(options.media_preprocess_threads != 0, "--media-preprocess-threads", kQwenMedia);
+    refuse_option(!options.enable_vision && options.vision_max_merged_tokens != 0 &&
+                      options.vision_max_merged_tokens != 32768U,
+                  "--vision-max-merged", "bounds an image's tokens: it needs --vision");
     if (options.a8_activations) {
         // The 8-bit route (Forward's a8): the --q8-weights matrices, whose attention input and output projections take
         // 8-bit activations in prompt calls.
@@ -202,13 +254,27 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                                   (options.vision_max_merged_tokens != 0 && options.vision_max_merged_tokens < 64U))) {
         throw std::invalid_argument("--vision-max-merged must be 64-32768 image tokens");
     }
-    refuse(!options.ngram_volume_path.empty() || options.speculative.ngram_draft_tokens != 0 ||
-               options.speculative.ngram_draft_tokens_auto,
-           "no n-gram drafting");
-    refuse(options.speculative.draft_tree_auto ||
-               std::any_of(options.speculative.draft_tree_nodes.begin(), options.speculative.draft_tree_nodes.end(),
-                           [](std::uint32_t nodes) { return nodes != 0; }),
-           "DSpark verifies its drafts as a chain (no --draft-tree-nodes)");
+    const SpeculativeOptions defaults;
+    const SpeculativeOptions& asked = options.speculative;
+    refuse_option(!options.ngram_volume_path.empty(), "--ngram-volume", kNoNgrams);
+    refuse_option(options.ngram_residency != NgramResidency::Auto, "--ngram-residency", kNoNgrams);
+    refuse_option(asked.ngram_draft_tokens != 0 || asked.ngram_draft_tokens_auto, "--ngram-draft-tokens", kNoNgrams);
+    refuse_option(asked.ngram_min_match != defaults.ngram_min_match, "--ngram-min-match", kNoNgrams);
+    refuse_option(asked.ngram_tree_nodes != 0, "--ngram-tree-nodes", kNoNgrams);
+    refuse_option(asked.ngram_batch_draft_tokens != 0, "ngram_batch_draft_tokens", kNoNgrams);
+    refuse_option(asked.ngram_archive_bytes != 0, "--ngram-archive-mib", kNoNgrams);
+    // The resolved options carry 0 (below), and a start from them is the same start.
+    refuse_option(asked.ngram_session_bytes != defaults.ngram_session_bytes && asked.ngram_session_bytes != 0,
+                  "--ngram-session-mib", kNoNgrams);
+    refuse_option(!asked.draft_model.empty(), "--draft-model",
+                  "names Qwen3.8-Flash-Next's DFlash2 companion; Inkling 2's drafter is the artifact's DSpark component");
+    refuse_option(asked.draft_min_p.has_value(), "--spec-min-p",
+                  "tunes MTP and DFlash2 rounds; DSpark drafts --draft-tokens");
+    refuse(asked.draft_tree_auto ||
+               std::any_of(asked.draft_tree_nodes.begin(), asked.draft_tree_nodes.end(),
+                           [](std::uint32_t nodes) { return nodes != 0; }) ||
+               asked.draft_tree_paths != defaults.draft_tree_paths,
+           "DSpark verifies its drafts as a chain (no --draft-tree-nodes or --draft-tree-paths)");
     refuse(options.max_context_auto && options.purpose != EnginePurpose::Generation,
            "--max-context auto sizes a generation server: causal scoring takes N");
     refuse(options.max_concurrency == 0 || options.max_concurrency > models::inkling2::kMaximumConcurrency,
@@ -220,12 +286,10 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     refuse(options.prefill_chunk > static_cast<std::uint32_t>(models::inkling2::kMaxPrefillChunk),
            "prefill chunks are at most 8191 columns");
     // The prefix cache (models/inkling2/program/prefix_cache.h): generation only, its snapshots born in the Host tier.
+    // What it does not have is refused on every purpose.
     ContextCacheOptions& cache = options.context_cache;
-    if (options.purpose != EnginePurpose::Generation) { cache.enabled = false; }
-    if (cache.enabled) {
-        HybridPrefixCacheOptions& hybrid = cache.hybrid;
-        refuse(cache.host_capacity_bytes && *cache.host_capacity_bytes == 0,
-               "the prefix cache keeps its snapshots in the Host tier: --host-context-mib must be positive");
+    {
+        const HybridPrefixCacheOptions& hybrid = cache.hybrid;
         refuse(hybrid.device_snapshot_slots.value_or(0U) != 0, "the prefix cache has no Device snapshot slots");
         refuse(hybrid.host_state_precision != HybridHostStatePrecision::Fp32,
                "the prefix cache keeps snapshot state exact (--cache-host-state fp32)");
@@ -233,6 +297,54 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "the prefix cache has no tool-call holds");
         refuse(hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0,
                "no idle next-turn prefill yet");
+    }
+    if (options.purpose == EnginePurpose::Generation) {
+        // The VRAM and RAM figures size --max-context auto, --kv-capacity auto (the prefix cache's Device pool) and
+        // the automatic Host tier (--host-context-mib auto); a start that sizes none of them would leave them unread.
+        const bool sizes_vram = options.max_context_auto ||
+                                (cache.enabled && options.kv_capacity.mode == KvCapacityMode::Automatic);
+        refuse_option(options.vram_headroom_bytes.has_value() && !sizes_vram, "--vram-headroom-mib",
+                      "sizes --max-context auto and the prefix cache's --kv-capacity auto; this start sizes neither");
+        refuse_option(options.vram_past_budget && !sizes_vram, "--vram-past-budget",
+                      "widens the VRAM --max-context auto and the prefix cache's --kv-capacity auto size from; this "
+                      "start sizes neither");
+        refuse_option(options.ram_free_bytes != kDefaultRamFreeBytes &&
+                          !(cache.enabled && !cache.host_capacity_bytes.has_value()),
+                      "--ram-free-mib", "sizes the prefix cache's automatic Host tier (--host-context-mib auto); this "
+                      "start has none");
+        if (cache.enabled && options.kv_capacity.mode == KvCapacityMode::Explicit) {
+            // Each lane reserves its whole context in the pool, so a smaller pool would be raised to it.
+            refuse_option(options.max_context_auto, "--kv-capacity N",
+                          "with --max-context auto: each lane reserves its whole context, which --max-context auto "
+                          "sizes from the free VRAM (give --max-context N, or --kv-capacity auto)");
+            refuse_option(std::uint64_t{options.kv_capacity.explicit_tokens} <
+                              std::uint64_t{options.max_context} * options.max_concurrency,
+                          "--kv-capacity N",
+                          "must hold every lane's whole context (--max-context x --max-concurrency): each lane "
+                          "reserves it in the prefix cache's pool");
+        }
+    } else {
+        // Causal scoring runs without the prefix cache, the drafter or the automatic sizings: as the other models
+        // (normalize_engine_options), a scoring start with a generation configuration says what it leaves unused.
+        std::string unused;
+        const auto note = [&unused](const char* what) { unused += (unused.empty() ? "" : ", ") + std::string(what); };
+        if (!cache.hybrid.persistent_file.empty()) { note("--prefix-cache-file"); }
+        if (cache.host_capacity_bytes.value_or(0U) != 0) { note("--host-context-mib"); }
+        if (cache.ssd_capacity_bytes != 0) { note("--ssd-context-gib"); }
+        if (options.speculative.proposal_head == ProposalHead::Optimized) { note("--lm-head-draft"); }
+        if (options.vram_headroom_bytes) { note("--vram-headroom-mib"); }
+        if (options.vram_past_budget) { note("--vram-past-budget"); }
+        if (options.ram_free_bytes != kDefaultRamFreeBytes) { note("--ram-free-mib"); }
+        if (!unused.empty()) {
+            report(options, "Inkling 2: causal scoring runs without the prefix cache, the drafter and the automatic "
+                            "memory sizing: " + unused + " unused");
+        }
+        cache.enabled = false;
+    }
+    if (cache.enabled) {
+        HybridPrefixCacheOptions& hybrid = cache.hybrid;
+        refuse(cache.host_capacity_bytes && *cache.host_capacity_bytes == 0,
+               "the prefix cache keeps its snapshots in the Host tier: --host-context-mib must be positive");
         hybrid.device_snapshot_slots   = 0U;
         hybrid.tool_call_hold          = std::chrono::milliseconds{0};
         hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{0};
@@ -271,7 +383,10 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     } else if (spec.backend != SpeculativeBackend::None) {
         throw std::invalid_argument("Inkling 2's drafter is DSpark (--spec dspark)");
     }
-    options.speculative.ngram_archive_bytes = 0;
+    refuse_option(options.purpose == EnginePurpose::Generation && spec.proposal_head == ProposalHead::Optimized &&
+                      spec.backend != SpeculativeBackend::DSpark,
+                  "--lm-head-draft", "shortlists DSpark's drafts: this start runs no drafter (--spec auto finds none "
+                  "bundled, or the route has no speculation)");
     options.speculative.ngram_session_bytes = 0;
     return options;
 }

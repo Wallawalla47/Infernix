@@ -42,6 +42,7 @@ struct Options {
     std::uint32_t max_context    = 2048;
     bool max_context_auto        = false; // --max-context auto (EngineOptions::max_context_auto)
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    bool kv_capacity_explicit    = false; // --kv-capacity given (else the parser's default above)
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
