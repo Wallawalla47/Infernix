@@ -472,6 +472,12 @@ SettledThinking settle_thinking(const GenerationRequest& request, const ServeOpt
         out.controls.budget.reset();
         return out;
     }
+    if (prompt.opens_reasoning && !request.token_constraint.empty()) {
+        // A token constraint owns every output step, so no budget's close fits (Engine refuses the pair); such a model
+        // then answers with its own refusal of the constraint, if it has one.
+        out.controls.budget.reset();
+        return out;
+    }
     if (semantics.enable_thinking == false) {
         // Thinking off on a model that opens reasoning in its output: its lowest effort (the frontend renders `none`)
         // may still think, so the turn takes a thinking request's controls. Otherwise nothing changes.
