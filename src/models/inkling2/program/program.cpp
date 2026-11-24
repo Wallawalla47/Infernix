@@ -1475,6 +1475,16 @@ private:
         namespace pc    = runtime::prefix_cache;
         Lane::Prefix& p = lane.prefix;
         try {
+            // Only the lane's next call waits for its copies (order_after_cache), and a lane released before one (a
+            // request cancelled or failed after its binding, or one that ends at its prompt call) may still have a
+            // restore landing in its image and tail page or a capture reading its image: the next binding of the lane
+            // writes the image on the compute stream (the cold start's zeroing, a restore that follows the compute
+            // stream, its first call) and its pages go back to the pool below, so the compute stream waits for both
+            // here (free once they have landed), as Qwen3.5's and Flash-Next's lane releases do.
+            if (p.restore) { prefix_->order_after_restore(*p.restore, device_.stream); }
+            for (const cudaEvent_t event : prefix_->capture_events(p.capture)) {
+                CUDA_CHECK(cudaStreamWaitEvent(device_.stream, event, 0));
+            }
             if (!p.path.empty()) { prefix_->index().release_path(p.path); }
             if (p.withdraw && (!p.published.empty() || !p.captures.empty())) {
                 prefix_->drain();
