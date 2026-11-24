@@ -210,6 +210,8 @@ public:
         const std::uint32_t pages = pages_per_lane(o_.max_context);
         if (o_.lossless) {
             lossless_ = std::make_unique<LosslessForward>(p_, lossless_columns(o_), o_.reference, lossless_keys(o_));
+        } else if (o_.causal_scoring) { // ScoreOptions::prompt_hidden_states: BF16 [layers][H]
+            score_hidden_ = DeviceBuffer(static_cast<std::size_t>(c_.num_hidden_layers) * c_.hidden_size * 2);
         }
         images_ = DeviceBuffer(static_cast<std::size_t>(layout.lane_words) * 2 * lanes_.size());
         // The full visits' page pool and the lanes' block-table rows (kv_layout), zeroed: a key beyond a lane's frontier
@@ -945,6 +947,11 @@ public:
         clear_unpackable(0);
         release_pages(0); // a failed window's pages
         reserve_pages(0, lane_pages()); // lane 0 maps its pages as the window's calls reach them
+        // ScoreOptions::prompt_hidden_states: the call holding the last prompt position captures its column.
+        if (options.prompt_hidden_states && score_hidden_.p == nullptr) {
+            throw std::invalid_argument("Inkling 2: hidden states need a scoring Program off the lossless route");
+        }
+        bool hidden_captured = false;
         for (std::uint32_t at = 0; at < n - 1;) {
             const std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, n - 1 - at);
             CallPlan call;
@@ -960,8 +967,21 @@ public:
             const std::int32_t from = at + chunk <= first_target - 1
                                           ? static_cast<std::int32_t>(chunk)
                                           : static_cast<std::int32_t>(std::max<std::int64_t>(0, std::int64_t{first_target} - 1 - at));
+            const bool capture_hidden = options.prompt_hidden_states && first_target - 1 >= at && first_target - 1 < at + chunk;
+            if (capture_hidden) {
+                forward_.set_hidden_capture(static_cast<std::uint16_t*>(score_hidden_.p),
+                                            static_cast<std::int32_t>(first_target - 1 - at));
+            }
             // The final mix; the head runs below a slice of logits rows at a time.
             run_forward(from, 0, [&] { overlay_images(images, at, chunk); });
+            if (capture_hidden) {
+                forward_.clear_hidden_capture();
+                const auto& counts = forward_.hidden_counts();
+                if (std::any_of(counts.begin(), counts.end(), [](std::uint8_t c) { return c != 1; })) {
+                    throw std::logic_error("Inkling 2: the scored prompt's hidden states were not captured once per layer");
+                }
+                hidden_captured = true;
+            }
             if (options.argmax_only) {
                 // Each slice's argmax on the device; the host reads only the ids (out.top_ids never reallocates).
                 if (score_ids_.bytes == 0) { score_ids_ = DeviceBuffer(static_cast<std::size_t>(kMaxForwardColumns) * 4); }
@@ -992,6 +1012,19 @@ public:
         }
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
         release_pages(0);
+        if (options.prompt_hidden_states) {
+            if (!hidden_captured) { throw std::logic_error("Inkling 2: the scored prompt's last position was not captured"); }
+            // [layers][H], the BF16 values widened exactly.
+            const std::size_t values = static_cast<std::size_t>(c_.num_hidden_layers) * c_.hidden_size;
+            std::vector<std::uint16_t> raw(values);
+            CUDA_CHECK(cudaMemcpy(raw.data(), score_hidden_.p, values * 2, cudaMemcpyDeviceToHost));
+            out.hidden_states.resize(values);
+            out.hidden_state_layers = c_.num_hidden_layers;
+            for (std::size_t i = 0; i < values; ++i) {
+                const std::uint32_t bits = std::uint32_t{raw[i]} << 16U;
+                std::memcpy(&out.hidden_states[i], &bits, sizeof(bits));
+            }
+        }
         if (unpackable_.p != nullptr) {
             CUDA_CHECK(cudaMemcpy(unpackable_seen_.data(), unpackable_.p, 4, cudaMemcpyDeviceToHost));
             if (unpackable_seen_[0] != kNoPosition) {
@@ -1021,6 +1054,7 @@ public:
         out.device.kv        = plan_.kv;
         out.device.state     = plan_.state + plan_.io;
         out.device.workspace = plan_.workspace;
+        out.device.adapter   = p_.adapter_bytes(); // --lora's factors and --ablate's direction (0 without them)
         out.device.kv_used   = mapped_pages() * plan_.page_bytes;
         out.host.staging   = host_.size();
         return out;
@@ -1032,6 +1066,7 @@ public:
         out.kv_capacity      = o_.max_context * o_.max_concurrency;
         out.kv_cache         = kv_storage(o_.kv_codec);
         out.kv_payload_bytes = plan_.kv;
+        out.adapter_bytes    = p_.adapter_bytes();
         return out;
     }
 
@@ -2017,6 +2052,7 @@ private:
     std::int32_t vocab_ = 0;
     std::vector<Lane> lanes_;
     DeviceBuffer images_, counts_, configs_, positions_, sampled_, gathered_;
+    DeviceBuffer score_hidden_; // ScoreOptions::prompt_hidden_states: BF16 [layers][H]
     StateView view_;
     WorkspaceArena sampling_;
     PinnedHostBuffer host_;
@@ -2178,6 +2214,16 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     if (options.lossless) {
         out.workspace +=
             LosslessForward::device_bytes(config.text, detail::lossless_columns(options), detail::lossless_keys(options));
+        if (options.lora_rank != 0) {
+            out.workspace += LosslessForward::lora_workspace_bytes(config.text, static_cast<std::int32_t>(options.lora_rank),
+                                                                  detail::lossless_columns(options));
+        }
+    } else if (options.lora_rank != 0) {
+        out.workspace += LoraForward::device_bytes(static_cast<std::int32_t>(options.lora_rank), detail::forward_capacity(options));
+    }
+    // ScoreOptions::prompt_hidden_states: every layer's output at one column.
+    if (options.causal_scoring && !options.lossless) {
+        out.workspace += detail::align_256(std::uint64_t{config.text.num_hidden_layers} * config.text.hidden_size * 2);
     }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     return out;

@@ -65,13 +65,14 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         if (architecture == models::Architecture::Qwen4Exp) {
             throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
                                         " is refused: Qwen3.8-Flash-Next is a mixture-of-experts model, and Infernix "
-                                        "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) only");
+                                        "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) and "
+                                        "Inkling 2 only");
         }
         if (offloaded_experts) {
             throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
                                         " is refused: this artifact is a mixture-of-experts model (its experts are "
                                         "offloaded), and Infernix applies LoRA adapters to the dense Qwen3.5-family "
-                                        "models (the 27B) only");
+                                        "models (the 27B) and Inkling 2 only");
         }
     }
     // The lossless route computes the model's own forward correctly rounded; a cut is not part of it. Refused here,

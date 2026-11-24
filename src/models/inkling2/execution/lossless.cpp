@@ -28,6 +28,7 @@
 #include "infernix/ops/inkling2_visit.h"
 #include "infernix/ops/lossless_inkling2.h"
 #include "infernix/ops/lossless_linear.h"
+#include "infernix/ops/lossless_lora.h"
 #include "infernix/ops/lossless_quantize.h"
 #include "infernix/ops/rows.h"
 
@@ -140,6 +141,17 @@ std::size_t LosslessForward::device_bytes(const TextConfig& c, std::int32_t max_
     return persistent + visit + linear + (64ULL << 20);
 }
 
+// One term's u (FP32 [rank, T]) with the shrink's and the add's workspaces, at the widest input (a gate's 2H) and the
+// tallest output (the query's or gate's Q rows).
+std::size_t LosslessForward::lora_workspace_bytes(const TextConfig& c, std::int32_t rank, std::int32_t max_columns) {
+    const std::int32_t T = round_up(max_columns, kTile);
+    const std::int32_t k = 2 * static_cast<std::int32_t>(c.hidden_size);
+    const std::int32_t rows = static_cast<std::int32_t>(std::max(c.query_width(), c.hidden_size));
+    const std::size_t u = static_cast<std::size_t>(rank) * T * 4;
+    return ((u + 255) / 256 * 256) + ops::lossless_lora_shrink_workspace_bytes(rank, k, T) +
+           ops::lossless_lora_add_workspace_bytes(rows, rank, T);
+}
+
 LosslessForward::LosslessForward(const Parameters& parameters, std::int32_t max_columns, bool reference,
                                  std::int32_t max_keys)
     : p_(parameters), c_(parameters.model.config().text), capacity_(round_up(max_columns, kTile)),
@@ -184,7 +196,8 @@ LosslessForward::LosslessForward(const Parameters& parameters, std::int32_t max_
     require(ops::lossless_linear_supports(p_.head), "the output head's format");
     const std::size_t H = c_.hidden_size, T = static_cast<std::size_t>(capacity_);
     std::size_t persistent = (9 + 3) * H * T * 2 + T * 8 + static_cast<std::size_t>(kHeadRows) * c_.vocab_size * 4 + 4096;
-    const std::size_t total = device_bytes(c_, max_columns, max_keys);
+    const std::size_t total =
+        device_bytes(c_, max_columns, max_keys) + (p_.lora ? lora_workspace_bytes(c_, p_.lora->rank, max_columns) : 0);
     memory_ = DeviceBuffer(total);
     auto* base = static_cast<std::uint8_t*>(memory_.p);
     std::size_t at = 0;
@@ -414,7 +427,16 @@ void LosslessForward::head(std::int32_t first, std::int32_t count, cudaStream_t 
     ops::lossless_inkling2_softcap(l, c_.final_logit_softcap, l, stream);
 }
 
-void LosslessForward::message_gate(const GateOperands& g, Tensor& x, const Tensor& m, cudaStream_t stream) {
+void LosslessForward::lora_term(const LosslessLoraTerm& term, const Tensor& x, Tensor& y, cudaStream_t stream) {
+    if (!term.present()) { return; }
+    auto scope = arena_->scope();
+    Tensor u   = arena_->alloc(DType::FP32, {p_.lora->rank, x.ne[1]});
+    ops::lossless_lora_shrink(x, term.a3, p_.lora->rank, u, *arena_, stream);
+    ops::lossless_lora_add(y, 0, term.b, term.rows, p_.lora->rank, u, 0, term.scale, *arena_, stream);
+}
+
+void LosslessForward::message_gate(const GateOperands& g, Tensor& x, const Tensor& m, cudaStream_t stream,
+                                   const LoraGateTerms<LosslessLoraTerm>* terms) {
     const std::int32_t H = x.ne[0], T = x.ne[1], rank = g.down.n;
     auto scope = arena_->scope();
     Tensor zin = arena_->alloc(DType::BF16, {2 * H, T});
@@ -426,9 +448,14 @@ void LosslessForward::message_gate(const GateOperands& g, Tensor& x, const Tenso
     ops::lossless_inkling2_rmsnorm(m, nullptr, c_.rms_norm_eps, hi, stream);
     Tensor z = arena_->alloc(DType::BF16, {rank, T});
     project(zin, g.down, 0, rank, z, stream);
+    if (terms != nullptr) { lora_term(terms->down, zin, z, stream); }
     Tensor f = arena_->alloc(DType::FP32, {H, T}), gn = arena_->alloc(DType::FP32, {H, T});
     project(z, g.forget_gain, 0, H, f, stream);
     project(z, g.forget_gain, H, H, gn, stream);
+    if (terms != nullptr) {
+        lora_term(terms->forget, z, f, stream);
+        lora_term(terms->message, z, gn, stream);
+    }
     ops::lossless_inkling2_message_gate(f, gn, x, m, x, stream);
 }
 
@@ -439,6 +466,8 @@ void LosslessForward::visit(std::uint32_t v, const Tensor& h, std::span<const Te
     const LayerOperands& l    = p_.layers[layer];
     const std::int32_t H = static_cast<std::int32_t>(c_.hidden_size), T = h.ne[1];
     const float eps = c_.rms_norm_eps;
+    // --lora: the layer's terms (the message gates' here, the attention projections' in attention()).
+    const LoraLayerTerms<LosslessLoraTerm>* lora = p_.lora ? &p_.lora->lossless_layers[layer] : nullptr;
     auto scope = arena_->scope();
     // The attention inputs: the block mix (layer 0: the embedding itself), the messages' gates, the input norms.
     Tensor xq = arena_->alloc(DType::BF16, {H, T}), xk = arena_->alloc(DType::BF16, {H, T}), xv = arena_->alloc(DType::BF16, {H, T});
@@ -469,7 +498,7 @@ void LosslessForward::visit(std::uint32_t v, const Tensor& h, std::span<const Te
                     gated[k] = arena_->alloc(DType::FP32, {H, T});
                     CUDA_CHECK(cudaMemcpyAsync(gated[k].data, mixed[nq == 3 ? k : 0].data,
                                                static_cast<std::size_t>(H) * T * 4, cudaMemcpyDeviceToDevice, stream));
-                    message_gate(l.gates[k], gated[k], messages[k], stream);
+                    message_gate(l.gates[k], gated[k], messages[k], stream, lora ? &lora->gates[k] : nullptr);
                 } else {
                     gated[k] = mixed[nq == 3 ? k : 0];
                 }
@@ -500,7 +529,9 @@ void LosslessForward::visit(std::uint32_t v, const Tensor& h, std::span<const Te
         Tensor* outs[1] = {&mixed};
         Tensor query = matrix(l.mlp_mix_query, DType::FP32, H, 1);
         ops::lossless_inkling2_mix(sources, query, outs, stream);
-        if (messages != nullptr) { message_gate(l.gates[3], mixed, messages[3], stream); }
+        if (messages != nullptr) {
+            message_gate(l.gates[3], mixed, messages[3], stream, lora ? &lora->gates[3] : nullptr);
+        }
         Tensor w = matrix(l.mlp_norm, DType::BF16, H, 1);
         ops::lossless_inkling2_rmsnorm(mixed, &w, eps, x_mlp, stream);
     }
@@ -542,6 +573,14 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
                                                      {&a.sink, 0, heads, &sink, 0}};
         ops::lossless_linear_shared(xq, list, *arena_, stream);
     }
+    // --lora: each adapted projection's term on its output, before the clips, convolutions and sigmoid gate read it.
+    const LoraLayerTerms<LosslessLoraTerm>* lora = p_.lora ? &p_.lora->lossless_layers[c_.visit_layer(v)] : nullptr;
+    if (lora != nullptr) {
+        lora_term(lora->query, xq, q, stream);
+        lora_term(lora->relative, xq, r, stream);
+        lora_term(lora->gate, xq, gate, stream);
+        lora_term(lora->sink, xq, sink, stream);
+    }
     // q: the scaled clip (full layers: then the log scale); r: the same with its threshold.
     ops::LosslessLogScale log_scale;
     Tensor positions = matrix(positions_, DType::I32, T, 1);
@@ -561,6 +600,10 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
         ConvInput kp = conv_input(KW, T), vp = conv_input(KW, T);
         project(xk, a.key, 0, KW, kp.call, stream);
         project(xv, a.value, 0, KW, vp.call, stream);
+        if (lora != nullptr) {
+            lora_term(lora->key, xk, kp.call, stream);
+            lora_term(lora->value, xv, vp.call, stream);
+        }
         load_history(kp, v, kKeyRing, stream);
         load_history(vp, v, kValueRing, stream);
         Tensor kt = matrix(a.layer.key_conv, DType::BF16, KW, ck), vt = matrix(a.layer.value_conv, DType::BF16, KW, ck);
@@ -574,6 +617,10 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
             Tensor kd_call = columns_of(kd, hc, T), vd_call = columns_of(vd, hc, T);
             project(xk, a.key_taps, 0, kv * ck, kd_call, stream);
             project(xv, a.value_taps, 0, kv * ck, vd_call, stream);
+            if (lora != nullptr) {
+                lora_term(lora->key_taps, xk, kd_call, stream);
+                lora_term(lora->value_taps, xv, vd_call, stream);
+            }
             ops::lossless_inkling2_dynamic_conv(kp.all, kd, kt, kv, k_all, stream);
             ops::lossless_inkling2_dynamic_conv(vp.all, vd, vt, kv, v_all, stream);
         } else {
@@ -683,6 +730,7 @@ void LosslessForward::attention(std::uint32_t v, const LayerOperands& l, const T
     ops::lossless_inkling2_sigmoid_gate(o, gate, gated, stream);
     ConvInput y = conv_input(H, T);
     project(gated, a.output, 0, H, y.call, stream);
+    if (lora != nullptr) { lora_term(lora->output, gated, y.call, stream); }
     load_history(y, v, kAttentionRing, stream);
     Tensor taps = matrix(l.attention_conv, DType::BF16, H, ck);
     ops::lossless_inkling2_conv(y.all, taps, c, stream);

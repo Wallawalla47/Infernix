@@ -242,7 +242,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         if (!std::holds_alternative<DenseConfig>(out->config.text.ffn)) {
             throw artifact::ArtifactError("LoRA adapter " + options.lora.string() +
                                           " is refused: this artifact's MLPs are mixtures of experts, and Infernix "
-                                          "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) only");
+                                          "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) and "
+                                          "Inkling 2 only");
         }
         out->lora = bind_lora(options.lora, out->config.text);
     }

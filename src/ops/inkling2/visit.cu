@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace infernix::ops::inkling2 {
 namespace {
@@ -170,6 +171,19 @@ __device__ __forceinline__ float cta_max(float v, float (&scratch)[kWarpsH]) {
 #pragma unroll
     for (int w = 0; w < kWarpsH; ++w) { m = scratch[w] > m ? scratch[w] : m; }
     return m;
+}
+
+// --ablate (inkling2_visit.h ResidualCut): y -= fl32(alpha c) d with c = d . y, the column's dot in the pinned order
+// (a thread's 8 products folded, then the CTA's reduction).
+__device__ __forceinline__ void cut8(float (&y)[8], const float* d, float alpha, float (*scratch)[1][kWarpsH]) {
+    float acc = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { acc = canon::fma_rn(d[j], y[j], acc); }
+    float dot[1] = {acc};
+    cta_sum<1>(dot, *scratch);
+    const float g = canon::mul_rn(alpha, dot[0]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { y[j] = canon::fma_rn(-g, d[j], y[j]); }
 }
 
 // ---------------------------------------------------------------------------- mixes
@@ -369,6 +383,41 @@ __device__ __forceinline__ void mlp_tail(const MlpTail& tail, const ColumnMap& m
     if (writes_ring(map, col)) { store8(ring_row(tail.ring, col.lane, col.pos) + c, x[0]); }
 }
 
+// mlp_tail in the entry's cut instances (--ablate): the conv's output is cut before the add, the ring keeping the uncut
+// combined output. A function of its own, so the plain instances' code is mlp_tail's alone.
+__device__ __forceinline__ void mlp_tail_cut(const MlpTail& tail, const ColumnMap& map, const Column& col, int c,
+                                             const float (&w)[4][8], const TailRows& rows, const uint4 (&hist)[3],
+                                             float (&out)[8], const float* direction, float alpha,
+                                             float (*scratch)[1][kWarpsH]) {
+    float x[4][8];
+    combine_rows(rows.e, x[0]);
+#pragma unroll
+    for (int k = 1; k < 4; ++k) {
+        switch (history_source(map, col, k)) {
+        case Source::Zero: zero8(x[k]); break;
+        case Source::Call: combine8(tail.experts, col.t - k, c, x[k]); break;
+        case Source::Ring: unpack8(hist[k - 1], x[k]); break;
+        }
+    }
+    float m[8];
+    conv8(w, x, m);
+    cut8(m, direction, alpha, scratch);
+    float cand[8];
+    unpack8(rows.cand, cand);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { out[j] = canon::add_rn(cand[j], m[j]); }
+    round8(out);
+    if (writes_ring(map, col)) { store8(ring_row(tail.ring, col.lane, col.pos) + c, x[0]); }
+}
+
+// The direction's 8 words a cut instance reads before its PDL wait; nothing at all in a plain instance.
+template <bool Cut>
+struct CutWords {};
+template <>
+struct CutWords<true> {
+    float d[8];
+};
+
 // ---------------------------------------------------------------------------- 8-bit rows (--a8-activations)
 
 // The thread's 8 values (elements 8g .. 8g + 7 of a K = kHidden row; 4 threads a 32-slice) as an A8 row: the codec of
@@ -501,9 +550,11 @@ __global__ void __launch_bounds__(kThreads) embed_kernel(const std::int32_t* tok
     store8(out + static_cast<std::size_t>(t) * kHidden + c, x);
 }
 
-// visit_entry and final_mix. Layer0: the input unmixed; NQ: the attention mix's queries; Messages: loop passes 2-3.
-template <int NQ, bool Messages, bool Layer0>
-__global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
+// visit_entry and final_mix. Layer0: the input unmixed; NQ: the attention mix's queries; Messages: loop passes 2-3;
+// Args = EntryCutArgs: the tail's conv output cut (--ablate), a separate instance.
+template <int NQ, bool Messages, bool Layer0, class Args = EntryArgs>
+__global__ void __launch_bounds__(kThreads) entry_kernel(const Args a) {
+    constexpr bool kCut = std::is_same_v<Args, EntryCutArgs>;
     constexpr int QA = NQ, QB = Messages ? 3 : 0;
     using M          = Mix<QA, QB>;
     __shared__ float s1[M::kS][kWarpsH];
@@ -531,6 +582,8 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
 #pragma unroll
         for (int i = 0; i < NQ; ++i) { weight8(a.norms[i] + c, nw[i]); }
     }
+    [[maybe_unused]] CutWords<kCut> cut_d;
+    if constexpr (kCut) { weight8(a.tail_cut.direction + c, cut_d.d); }
     // The tail's column and its ring history (rows of earlier calls) before the wait when early_history; a call with a
     // history snapshot (a prompt) reads them after it.
     const bool early = tail && early_history(a.tail.ring);
@@ -574,7 +627,12 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
     }
     float h[8], tail_h[8] = {};
     if (tail) {
-        mlp_tail(a.tail, a.map, col, c, conv, trows, hist, tail_h);
+        if constexpr (kCut) {
+            __shared__ float s_cut[1][kWarpsH];
+            mlp_tail_cut(a.tail, a.map, col, c, conv, trows, hist, tail_h, cut_d.d, a.tail_cut.alpha, &s_cut);
+        } else {
+            mlp_tail(a.tail, a.map, col, c, conv, trows, hist, tail_h);
+        }
         store8(a.tail_out + row, tail_h);
 #pragma unroll
         for (int j = 0; j < 8; ++j) { h[j] = tail_h[j]; }
@@ -665,8 +723,10 @@ __global__ void __launch_bounds__(kThreads) entry_kernel(const EntryArgs a) {
     }
 }
 
-template <bool Messages>
-__global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs a) {
+// Args = MlpEntryCutArgs: the post-attention conv's output cut (--ablate), a separate instance.
+template <bool Messages, class Args = MlpEntryArgs>
+__global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const Args a) {
+    constexpr bool kCut = std::is_same_v<Args, MlpEntryCutArgs>;
     constexpr int QB = Messages ? 1 : 0;
     using M          = Mix<1, QB>;
     __shared__ float s1[M::kS][kWarpsH];
@@ -683,6 +743,8 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
     if constexpr (Messages) { weight8(a.message_query + c, q[1]); }
     float nw[8];
     if constexpr (!Messages) { weight8(a.norm + c, nw); }
+    [[maybe_unused]] CutWords<kCut> cut_d;
+    if constexpr (kCut) { weight8(a.cut.direction + c, cut_d.d); }
     // The column and its ring history (rows of earlier calls) before the wait when early_history; a call with a history
     // snapshot (a prompt) reads them after it.
     const bool early = early_history(a.ring);
@@ -728,6 +790,10 @@ __global__ void __launch_bounds__(kThreads) mlp_entry_kernel(const MlpEntryArgs 
     float attn[8];
     conv8(conv, x, attn);
     if (writes_ring(a.map, col)) { store8(ring_row(a.ring, col.lane, col.pos) + c, x[0]); }
+    if constexpr (kCut) {
+        __shared__ float s_cut[1][kWarpsH];
+        cut8(attn, cut_d.d, a.cut.alpha, &s_cut);
+    }
 
     float cand[8];
     if (a.boundary) {
@@ -885,17 +951,25 @@ pdl::LaunchConfig columns_launch(std::int32_t columns, cudaStream_t stream) {
     return {dim3(static_cast<unsigned>(columns)), dim3(kThreads), 0, stream};
 }
 
-void launch_entry(const EntryArgs& a, cudaStream_t stream) {
+template <class Args>
+void launch_entry(const Args& a, cudaStream_t stream) {
     const bool messages = a.message_queries != nullptr;
     const auto config   = columns_launch(a.columns, stream);
     if (a.queries == nullptr) {
-        CUDA_CHECK(pdl::launch_consumer(config, entry_kernel<1, false, true>, a));
+        CUDA_CHECK(pdl::launch_consumer(config, entry_kernel<1, false, true, Args>, a));
     } else if (a.nq == 1) {
-        CUDA_CHECK(messages ? pdl::launch_consumer(config, entry_kernel<1, true, false>, a)
-                            : pdl::launch_consumer(config, entry_kernel<1, false, false>, a));
+        CUDA_CHECK(messages ? pdl::launch_consumer(config, entry_kernel<1, true, false, Args>, a)
+                            : pdl::launch_consumer(config, entry_kernel<1, false, false, Args>, a));
     } else {
-        CUDA_CHECK(messages ? pdl::launch_consumer(config, entry_kernel<3, true, false>, a)
-                            : pdl::launch_consumer(config, entry_kernel<3, false, false>, a));
+        CUDA_CHECK(messages ? pdl::launch_consumer(config, entry_kernel<3, true, false, Args>, a)
+                            : pdl::launch_consumer(config, entry_kernel<3, false, false, Args>, a));
+    }
+}
+
+// --ablate: a cut's direction is a 16-byte aligned device vector and its strength in (0, 4].
+void check_cut(const ResidualCut& cut, const char* op) {
+    if (cut.direction == nullptr || !aligned16(cut.direction) || !(cut.alpha > 0.0F) || !(cut.alpha <= 4.0F)) {
+        throw std::invalid_argument(std::string(op) + ": a cut needs a 16-byte aligned direction and alpha in (0, 4]");
     }
 }
 
@@ -920,7 +994,10 @@ void check_x8(std::int32_t* const (&x8)[3], std::int32_t stride, const char* op)
     }
 }
 
-void visit_entry(const EntryArgs& a, cudaStream_t stream) {
+namespace {
+
+// visit_entry's checks of the common arguments (both forms).
+void check_entry(const EntryArgs& a) {
     constexpr const char* op = "inkling2 visit_entry";
     check_columns(a.columns, op);
     check_map(a.map, a.columns, op);
@@ -956,10 +1033,10 @@ void visit_entry(const EntryArgs& a, cudaStream_t stream) {
             throw std::invalid_argument("inkling2 visit_entry: no output");
         }
     }
-    launch_entry(a, stream);
 }
 
-void mlp_entry(const MlpEntryArgs& a, cudaStream_t stream) {
+// mlp_entry's checks of the common arguments, and whether the visit has messages.
+bool check_mlp_entry(const MlpEntryArgs& a) {
     constexpr const char* op = "inkling2 mlp_entry";
     check_columns(a.columns, op);
     check_map(a.map, a.columns, op);
@@ -969,18 +1046,45 @@ void mlp_entry(const MlpEntryArgs& a, cudaStream_t stream) {
         a.query == nullptr) {
         throw std::invalid_argument("inkling2 mlp_entry: o, the conv taps, h, cand and the query are needed");
     }
-    const auto config = columns_launch(a.columns, stream);
     if (a.message_query != nullptr) {
         if (a.message_sources[0] == nullptr || a.message_sources[1] == nullptr || a.mixed == nullptr ||
             a.message == nullptr || a.gate_input == nullptr) {
             throw std::invalid_argument("inkling2 mlp_entry: messages need two sources and three outputs");
         }
-        CUDA_CHECK(pdl::launch_consumer(config, mlp_entry_kernel<true>, a));
-    } else {
-        if (a.norm == nullptr || a.x == nullptr) { throw std::invalid_argument("inkling2 mlp_entry: norm and x"); }
-        if (a.rows.rows != nullptr) { check_rows(a.rows, op); } // none: an MXFP8 layer under --a16-activations
-        CUDA_CHECK(pdl::launch_consumer(config, mlp_entry_kernel<false>, a));
+        return true;
     }
+    if (a.norm == nullptr || a.x == nullptr) { throw std::invalid_argument("inkling2 mlp_entry: norm and x"); }
+    if (a.rows.rows != nullptr) { check_rows(a.rows, op); } // none: an MXFP8 layer under --a16-activations
+    return false;
+}
+
+} // namespace
+
+void visit_entry(const EntryArgs& a, cudaStream_t stream) {
+    check_entry(a);
+    launch_entry(a, stream);
+}
+
+void visit_entry(const EntryCutArgs& a, cudaStream_t stream) {
+    check_entry(a);
+    check_cut(a.tail_cut, "inkling2 visit_entry");
+    if (a.tail.experts == nullptr) { throw std::invalid_argument("inkling2 visit_entry: a tail cut needs a tail"); }
+    launch_entry(a, stream);
+}
+
+void mlp_entry(const MlpEntryArgs& a, cudaStream_t stream) {
+    const bool messages = check_mlp_entry(a);
+    const auto config   = columns_launch(a.columns, stream);
+    CUDA_CHECK(messages ? pdl::launch_consumer(config, mlp_entry_kernel<true, MlpEntryArgs>, a)
+                        : pdl::launch_consumer(config, mlp_entry_kernel<false, MlpEntryArgs>, a));
+}
+
+void mlp_entry(const MlpEntryCutArgs& a, cudaStream_t stream) {
+    const bool messages = check_mlp_entry(a);
+    check_cut(a.cut, "inkling2 mlp_entry");
+    const auto config = columns_launch(a.columns, stream);
+    CUDA_CHECK(messages ? pdl::launch_consumer(config, mlp_entry_kernel<true, MlpEntryCutArgs>, a)
+                        : pdl::launch_consumer(config, mlp_entry_kernel<false, MlpEntryCutArgs>, a));
 }
 
 void gate_exit(const GateExitArgs& a, cudaStream_t stream) {
@@ -1005,7 +1109,9 @@ void gate_exit(const GateExitArgs& a, cudaStream_t stream) {
     CUDA_CHECK(pdl::launch_consumer(config, gate_exit_kernel, a));
 }
 
-void final_mix(const FinalArgs& f, cudaStream_t stream) {
+namespace {
+
+EntryArgs final_entry(const FinalArgs& f) {
     EntryArgs a;
     a.columns  = f.columns;
     a.map      = f.map;
@@ -1019,6 +1125,17 @@ void final_mix(const FinalArgs& f, cudaStream_t stream) {
     if (f.tail.experts == nullptr || f.query == nullptr) {
         throw std::invalid_argument("inkling2 final_mix: the last visit's tail and the output query are needed");
     }
+    return a;
+}
+
+} // namespace
+
+void final_mix(const FinalArgs& f, cudaStream_t stream) { visit_entry(final_entry(f), stream); }
+
+void final_mix(const FinalArgs& f, const ResidualCut& tail_cut, cudaStream_t stream) {
+    EntryCutArgs a;
+    static_cast<EntryArgs&>(a) = final_entry(f);
+    a.tail_cut                 = tail_cut;
     visit_entry(a, stream);
 }
 

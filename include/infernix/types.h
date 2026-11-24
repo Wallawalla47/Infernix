@@ -713,7 +713,8 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     // A LoRA adapter applied at runtime (--lora): a Hugging Face PEFT adapter's directory, or its
     // adapter_model.safetensors with adapter_config.json beside it. Every projection it targets computes
-    // W x + s B (A x) exactly (include/infernix/ops/lora.h); the artifact is unchanged. Qwen3.5 dense models only.
+    // W x + s B (A x) exactly (include/infernix/ops/lora.h); the artifact is unchanged. Qwen3.5 dense models and
+    // Inkling 2.
     std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
@@ -2093,7 +2094,8 @@ struct ScoreResult {
     // ScoreOptions::prompt_hidden_states: [layers][hidden_size], layer-major, the BF16 values widened exactly. Row L
     // is the hidden state layer L hands on at the last prompt token: on Qwen3.5 the residual after layer L; on
     // Qwen3.8-Flash-Next (four hyper-connection streams) layer L + 1's mixer input, and for the last layer its MoE
-    // input. Empty otherwise.
+    // input; on Inkling 2 the residual after physical layer L on its last visit (a core layer's on the third pass).
+    // Empty otherwise.
     std::vector<float> hidden_states;
     std::uint32_t hidden_state_layers = 0; // hidden_states' rows (0 when empty)
 };

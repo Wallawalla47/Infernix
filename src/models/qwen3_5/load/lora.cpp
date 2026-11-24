@@ -119,7 +119,7 @@ LoraBinding bind_lora(const std::filesystem::path& path, const TextConfig& text)
             if (dense == nullptr) {
                 refuse(*adapter, "it adapts MLP module '" + m.module +
                                      "', but this model's MLPs are mixtures of experts. Infernix applies LoRA adapters "
-                                     "to the dense models (the 27B) only");
+                                     "to the dense models (the 27B) and Inkling 2 only");
             }
             if (leaf == "gate_proj") {
                 expect(text.hidden_size, dense->intermediate_size);

@@ -428,6 +428,8 @@ struct LoadPlan::Impl {
     std::optional<VisionHostWeights> vision_host; // --vision-offload on (block filled at materialization)
     FrontendResources resources;
     InstanceInfo info;
+    std::optional<LoraBinding> lora;             // LoadOptions::lora
+    std::optional<AblateSidecarBinding> ablate; // LoadOptions::ablate
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -438,6 +440,8 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 const Config& LoadPlan::config() const { return impl_->config; }
 const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 const artifact::MaterializationPlan& LoadPlan::materialization() const { return impl_->materialization; }
+const LoraBinding* LoadPlan::lora() const { return impl_->lora ? &*impl_->lora : nullptr; }
+const AblateSidecarBinding* LoadPlan::ablate() const { return impl_->ablate ? &*impl_->ablate : nullptr; }
 std::uint64_t LoadPlan::device_bytes() const {
     return impl_->materialization.device_capacity_bytes + impl_->packed_bytes + impl_->q8_bytes + impl_->draft_bytes;
 }
@@ -453,6 +457,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    if (!options.lora.empty()) { out->lora = bind_lora(options.lora, out->config.text); }
+    if (!options.ablate.empty()) {
+        out->ablate = bind_ablate(options.ablate, out->config.text.num_hidden_layers, out->config.text.hidden_size);
+    }
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config.text);
     Bindings bindings(binder);
@@ -563,10 +571,13 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         CUDA_CHECK(cudaHostGetDevicePointer(&mapped, const_cast<std::byte*>(pinned.data()), 0));
         data->vision_host->block_device = static_cast<const std::byte*>(mapped);
     }
-    return std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
-                                            std::move(bound), std::move(data->resources), std::move(data->info),
-                                            std::move(backing), std::move(packed), std::move(q8), std::move(draft_head),
-                                            std::move(data->vision_host)));
+    auto model = std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
+                                                  std::move(bound), std::move(data->resources), std::move(data->info),
+                                                  std::move(backing), std::move(packed), std::move(q8), std::move(draft_head),
+                                                  std::move(data->vision_host)));
+    model->lora_   = std::move(data->lora);
+    model->ablate_ = std::move(data->ablate);
+    return model;
 }
 
 } // namespace infernix::models::inkling2

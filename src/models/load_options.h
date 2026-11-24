@@ -46,7 +46,7 @@ struct LoadOptions {
     bool expert_csf = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;
-    // Qwen3.5: the LoRA adapter applied at runtime (EngineOptions::lora_path), empty for none.
+    // Qwen3.5 dense and Inkling 2: the LoRA adapter applied at runtime (EngineOptions::lora_path), empty for none.
     std::filesystem::path lora;
     // Every model: the ablation sidecar applied at runtime (EngineOptions::ablate_sidecar_path), empty for none.
     std::filesystem::path ablate;

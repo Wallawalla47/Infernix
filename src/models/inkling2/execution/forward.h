@@ -11,6 +11,7 @@
 // h6 as its input while its entry kernel computes the previous visit's output into h18[p - 1].
 
 #include "core/arena.h"
+#include "models/inkling2/execution/lora_forward.h"
 #include "models/inkling2/execution/parameters.h"
 
 #include <cuda_runtime.h>
@@ -175,6 +176,12 @@ public:
     // Profiling: `marker` is called with each Op's name right after its launches (null: none), so a caller can record
     // events between them.
     void set_marker(std::function<void(const char*)> marker) { marker_ = std::move(marker); }
+    // ScoreOptions::prompt_hidden_states: while set, the calls copy `column` of each layer's output on its last visit
+    // (the prelude's and coda's only visit, the core's third pass) to rows[layer][H] (BF16), and hidden_counts()[layer]
+    // counts the row written.
+    void set_hidden_capture(std::uint16_t* rows, std::int32_t column);
+    void clear_hidden_capture() noexcept { hidden_rows_ = nullptr; }
+    [[nodiscard]] const std::vector<std::uint8_t>& hidden_counts() const noexcept { return hidden_counts_; }
 
     [[nodiscard]] const ForwardBuffers& buffers() const noexcept { return b_; }
     [[nodiscard]] const StateLayout& layout() const noexcept { return layout_; }
@@ -203,6 +210,8 @@ private:
     void stage_window(const StateView& s, const VisitState& vs, bool in, cudaStream_t stream) const;
     // DSpark's context features: `rows` (a visit's input, or the final state) into the feature slot of its tap, if any.
     void tap(std::uint32_t visit, const std::uint16_t* rows, cudaStream_t stream) const;
+    // set_hidden_capture's copy of the visit's output (`rows`: where its successor's entry wrote it).
+    void capture_hidden(std::uint32_t visit, const std::uint16_t* rows, cudaStream_t stream);
 
     // A lane's columns in the call.
     struct CallLane {
@@ -236,6 +245,10 @@ private:
     bool one_group_lanes_ = true; // every lane's columns are one attention group (at most 16)
     DeviceBuffer memory_;
     ForwardBuffers b_;
+    std::unique_ptr<LoraForward> lora_; // --lora on this route (the lossless route's terms are LosslessForward's)
+    std::uint16_t* hidden_rows_ = nullptr;
+    std::int32_t hidden_column_ = 0;
+    std::vector<std::uint8_t> hidden_counts_;
 
 public:
     // The expert prefetch (design §10.5): a decode call of at most kGuessColumns columns runs the next visit's router on

@@ -234,6 +234,47 @@ int check_case(std::int32_t rows, std::int32_t k, std::int32_t t, std::uint32_t 
     return failures;
 }
 
+// The FP32 output's form (Inkling 2's message gates, whose forget and message projections are FP32 modules):
+// y = fp32(y + fp32(d fp32(s))), d the exact sum rounded once.
+int check_fp32_add(std::int32_t rows, std::int32_t t, std::uint32_t seed, std::int32_t rank = 64) {
+    std::mt19937 rng(seed);
+    std::vector<float> b(static_cast<std::size_t>(rows) * rank), u(static_cast<std::size_t>(rank) * t),
+        y0(static_cast<std::size_t>(rows) * t);
+    for (auto& v : b) { v = wide_value(rng, 0.05F); }
+    for (auto& v : u) { v = wide_value(rng, 1.0F); }
+    for (auto& v : y0) { v = wide_value(rng, 1.0F); }
+    test::GuardedDeviceBuffer b_d(b.size() * 4), u_d(u.size() * 4), y_d(y0.size() * 4);
+    b_d.copy_from_host(b.data(), b.size() * 4);
+    u_d.copy_from_host(u.data(), u.size() * 4);
+    y_d.copy_from_host(y0.data(), y0.size() * 4);
+    Tensor ut(u_d.data(), DType::FP32, {rank, t});
+    Tensor yt(y_d.data(), DType::FP32, {rows, t});
+    WorkspaceArena workspace(ops::lossless_lora_add_workspace_bytes(rows, rank, t));
+    const float scale = -0.75F;
+    ops::lossless_lora_add(yt, 0, static_cast<const float*>(b_d.data()), rows, rank, ut, 0, scale, workspace, nullptr);
+    test::cuda_synchronize();
+    std::vector<float> y(y0.size());
+    y_d.copy_to_host(y.data(), y.size() * 4);
+    std::vector<std::uint32_t> got, want;
+    for (std::int32_t c = 0; c < t; ++c) {
+        for (std::int32_t r = 0; r < rows; ++r) {
+            ExactSum sum;
+            for (std::int32_t j = 0; j < rank; ++j) {
+                std::int64_t mb, mu;
+                int eb, eu;
+                parts(b[static_cast<std::size_t>(r) * rank + j], mb, eb);
+                parts(u[static_cast<std::size_t>(c) * rank + j], mu, eu);
+                sum.add(mb * mu, eb + eu);
+            }
+            const std::size_t at = static_cast<std::size_t>(c) * rows + r;
+            got.push_back(bits_of(y[at]));
+            want.push_back(bits_of(y0[at] + sum.round() * scale)); // binary32 operations, each correctly rounded
+        }
+    }
+    return compare_words("lossless_lora_add (FP32 y) rows=" + std::to_string(rows) + " T=" + std::to_string(t), got.data(),
+                         want.data(), got.size());
+}
+
 int check_split_refusal() {
     // (1 + 2^-23) 2^-120: its last bit, 2^-143, is below the smallest BF16 subnormal (2^-133), so no three BF16
     // parts hold it exactly.
@@ -272,6 +313,8 @@ INFERNIX_OP_TEST(lossless_lora) {
         failures += check_case(64, 17408, 5, 3U);
         failures += check_case(32, 1024, 600, 4U); // two column chunks
         failures += check_case(256, 5120, 37, 5U, 128); // the largest rank, 128
+        failures += check_fp32_add(2304, 3, 6U);        // Inkling 2's gate projections
+        failures += check_fp32_add(2304, 600, 7U, 128); // two column chunks, the largest rank
     } catch (const std::exception& error) {
         std::cerr << "lossless lora test: " << error.what() << '\n';
         return 1;

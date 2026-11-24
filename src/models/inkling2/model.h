@@ -2,10 +2,12 @@
 
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
+#include "models/ablate/binding.h"
 #include "models/bf16_packing.h"
 #include "models/q8_weights.h"
 #include "models/inkling2/config.h"
 #include "models/inkling2/draft_head.h"
+#include "models/inkling2/lora.h"
 #include "models/inkling2/weights.h"
 #include "text/tokenizer.h"
 
@@ -88,6 +90,9 @@ public:
     [[nodiscard]] const Q8Weights& q8() const noexcept { return q8_; }
     // --vision-offload on: the tower's pinned weights (the bound views address the pinned block); otherwise empty.
     [[nodiscard]] const std::optional<VisionHostWeights>& vision_host() const noexcept { return vision_host_; }
+    // --lora / --ablate (docs/lora.md, docs/ablate.md): the adapter and the sidecar read at load; null without one.
+    [[nodiscard]] const LoraBinding* lora() const noexcept { return lora_ ? &*lora_ : nullptr; }
+    [[nodiscard]] const AblateSidecarBinding* ablate() const noexcept { return ablate_ ? &*ablate_ : nullptr; }
 
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
@@ -107,6 +112,8 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<VisionHostWeights> vision_host_;
+    std::optional<LoraBinding> lora_;
+    std::optional<AblateSidecarBinding> ablate_;
 };
 
 } // namespace infernix::models::inkling2

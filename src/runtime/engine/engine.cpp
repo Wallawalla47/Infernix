@@ -736,10 +736,7 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (options.prompt_hidden_states && impl_->options.lossless) {
         throw std::invalid_argument("score_tokens prompt_hidden_states is not offered on the lossless route");
     }
-    if (options.prompt_hidden_states && std::holds_alternative<std::unique_ptr<Impl::Inkling2ScoringCore>>(impl_->core)) {
-        throw std::invalid_argument("score_tokens prompt_hidden_states is not available on Inkling 2 yet");
-    }
-    const bool hidden_states           = options.prompt_hidden_states;
+    const bool hidden_states          = options.prompt_hidden_states;
     const bool argmax_only = options.argmax_only;
     bool argmax_by_top_k   = false;
     if (argmax_only) {

@@ -36,9 +36,10 @@ void lossless_lora_shrink(const Tensor& x, const void* a3, std::int32_t rows, Te
 /**
  * The adapted output: for n in [0, rows) and every column t,
  *   d = fp32(sum_j B[n, j] u[u_row + j, t])       (the exact sum, rounded once),
- *   y[y_row + n, t] = bf16(fp32(y + fp32(d fp32(scale)))).
- * B is FP32 [rows, rank] on the device (each value exactly split by lossless_lora_split3), u FP32 [*, T], y BF16
- * [*, T] (updated in place). The sum is lossless_linear's over B's and u's exact BF16 parts (nine products a term);
+ *   y[y_row + n, t] = bf16(fp32(y + fp32(d fp32(scale)))),
+ * or, for a y of FP32 (an FP32 module, Inkling 2's gate projections), fp32(y + fp32(d fp32(scale))), unrounded.
+ * B is FP32 [rows, rank] on the device (each value exactly split by lossless_lora_split3), u FP32 [*, T], y BF16 or
+ * FP32 [*, T] (updated in place). The sum is lossless_linear's over B's and u's exact BF16 parts (nine products a term);
  * a column of u holding a nonzero value below 2^-110 times its largest makes that column's outputs NaN (it cannot
  * be split exactly: never seen; a visible failure instead of a rounded one).
  */

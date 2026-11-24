@@ -52,6 +52,9 @@ public:
                     std::int32_t max_keys = 0);
     [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t max_columns,
                                                   std::int32_t max_keys = 0);
+    // The scratch one LoRA term adds on top of device_bytes (--lora, an adapter of padded rank `rank`).
+    [[nodiscard]] static std::size_t lora_workspace_bytes(const TextConfig& config, std::int32_t rank,
+                                                          std::int32_t max_columns);
 
     // The window `tokens` (positions 0 ..) through the final norm; the final rows stay for head().
     void run(std::span<const std::int32_t> tokens, cudaStream_t stream);
@@ -74,8 +77,11 @@ private:
     // One layer visit over the call: h (BF16 [H, T]) in, out (BF16 [H, T]) its output.
     void visit(std::uint32_t visit, const Tensor& h, std::span<const Tensor* const> attention_blocks,
                std::span<const Tensor* const> mlp_blocks, const Tensor* messages, Tensor& out, cudaStream_t stream);
-    // A message gate on FP32 x (in place) with message m.
-    void message_gate(const GateOperands& g, Tensor& x, const Tensor& m, cudaStream_t stream);
+    // A message gate on FP32 x (in place) with message m, its projections' LoRA terms (--lora) when given.
+    void message_gate(const GateOperands& g, Tensor& x, const Tensor& m, cudaStream_t stream,
+                      const LoraGateTerms<LosslessLoraTerm>* terms);
+    // --lora: y (BF16 or FP32 [rows, T], the projection's output) + the term of `term` over x (lossless_lora.h).
+    void lora_term(const LosslessLoraTerm& term, const Tensor& x, Tensor& y, cudaStream_t stream);
     // The attention sublayer from its normed inputs: into c the post-attention conv's output (BF16 [H, history + T],
     // the call's columns from `history`).
     void attention(std::uint32_t visit, const LayerOperands& l, const Tensor& xq, const Tensor& xk, const Tensor& xv,

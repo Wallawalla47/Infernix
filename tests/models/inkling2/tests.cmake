@@ -89,6 +89,20 @@ infernix_add_test(infernix_inkling2_chat_template_test
   LIBRARIES infernix_jinja infernix::json
   NEEDS_SOURCE_DIR)
 
+# --lora: a PEFT adapter's modules bound to the text configuration, and every refusal (host only).
+infernix_add_test(infernix_inkling2_lora_binding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_binding.cpp"
+  LIBRARIES infernix_model_loading infernix::json)
+
+# --lora and --ablate through the scoring Engine on a real artifact (generated adapter and sidecar): a zero adapter's and
+# a tiny cut's logits bit for bit the plain model's on every route, the adapted route chunk-invariant, the hidden states'
+# capture; skips without INFERNIX_INKLING2_ARTIFACT.
+infernix_add_test(infernix_inkling2_adapters_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_adapters_real.cpp"
+  LIBRARIES infernix_engine infernix::json)
+set_tests_properties(infernix_inkling2_adapters_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 3600)
+
 # The loader's plan on a real artifact (CPU only): skips without INFERNIX_INKLING2_ARTIFACT.
 infernix_add_test(infernix_inkling2_load_plan_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_load_plan_real.cpp"

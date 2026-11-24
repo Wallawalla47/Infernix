@@ -91,7 +91,7 @@ std::string usage_text() {
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
-           "       [--lora PATH] (Qwen3.5 dense: a LoRA adapter applied at runtime, a Hugging Face PEFT\n"
+           "       [--lora PATH] (Qwen3.5 dense, Inkling 2: a LoRA adapter applied at runtime, a Hugging Face PEFT\n"
            "        adapter directory or its adapter_model.safetensors with adapter_config.json beside it)\n"
            "       [--ablate FILE] (an ablation sidecar applied at runtime, every model: its\n"
            "        sidecar.json with the direction file beside it)\n"

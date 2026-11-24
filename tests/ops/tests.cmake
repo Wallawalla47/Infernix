@@ -624,6 +624,18 @@ infernix_add_family_op_test(infernix_inkling2_visit_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_visit.cu"
   LIBRARIES infernix_ops)
 
+# Inkling 2's LoRA term (--lora) against an FP64 oracle at the model's output shapes, ranks 16-128, narrow and wide tiles:
+# B = 0 leaves y's bits, a column's bits are its own.
+infernix_add_family_op_test(infernix_inkling2_lora_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_lora.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's cut instances of the visit chain (--ablate) against an FP64 oracle over the plain instance's conv output:
+# the attn lane in mlp_entry, the mlp lane in the tail; a tiny alpha keeps every plain bit, the rings hold the uncut input.
+infernix_add_family_op_test(infernix_inkling2_visit_cut_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_visit_cut.cu"
+  LIBRARIES infernix_ops)
+
 # Inkling 2's fused projections bit for bit ops::linear's BF16 route on one visit's real shapes, widths 1-40.
 # Q8 storage within FP64 bounds; 8-bit inputs (x8) bit for bit their order, every width and tile shape.
 infernix_add_family_op_test(infernix_inkling2_projections_test FAMILY inkling2

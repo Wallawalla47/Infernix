@@ -4,10 +4,13 @@ target_sources(infernix_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/draft_head.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/lora.cpp"
 )
 # Execution: the native operands and the forward composition.
 target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/lora_parameters.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/lora_forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/dspark.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"

@@ -243,6 +243,8 @@ Parameters::Parameters(const Model& source) : model(source) {
     for (std::uint32_t i = 0; i < w.layers.size(); ++i) { layers.push_back(layer_operands(model, w.layers[i], c, i)); }
     if (w.dspark) { dspark = dspark_operands(model, *w.dspark, *model.config().dspark); }
     if (w.vision) { vision = vision_operands(model, *w.vision); }
+    lora   = prepare_lora(model.lora(), c, model.options().lossless);
+    ablate = prepare_ablate(model.ablate(), c.num_hidden_layers, c.hidden_size);
 }
 
 } // namespace infernix::models::inkling2

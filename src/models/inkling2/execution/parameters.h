@@ -6,7 +6,10 @@
 
 #include "core/weight.h"
 #include "infernix/ops/inkling2_attention.h"
+#include "infernix/ops/inkling2_visit.h"
 #include "infernix/ops/w4a4_sparse_moe.h"
+#include "models/ablate/parameters.h"
+#include "models/inkling2/execution/lora_parameters.h"
 #include "models/inkling2/model.h"
 
 #include <array>
@@ -107,6 +110,20 @@ struct Parameters {
     std::vector<LayerOperands> layers;
     std::optional<DSparkOperands> dspark; // --spec dspark
     std::optional<VisionOperands> vision; // --vision
+    std::optional<LoraParameters> lora;     // --lora (docs/lora.md): the adapter's device factors
+    std::optional<AblateParameters> ablate; // --ablate (docs/ablate.md): the direction's device copy, each layer's cuts
+
+    // A lane's cut at `layer` (a physical layer, the same on every pass): inactive without --ablate or where the sidecar
+    // leaves the lane uncut.
+    [[nodiscard]] ops::inkling2::ResidualCut ablate_cut(std::uint32_t layer, AblateParameters::Lane lane) const noexcept {
+        if (!ablate) { return {}; }
+        const ops::DirectionCut cut = ablate->cut(layer, lane);
+        return {cut.direction, cut.alpha};
+    }
+    // The device bytes of the adapter factors and the sidecar's direction (MemorySummary::adapter_bytes).
+    [[nodiscard]] std::uint64_t adapter_bytes() const noexcept {
+        return (lora ? lora->factors.bytes : 0) + (ablate ? ablate->direction.bytes : 0);
+    }
 };
 
 } // namespace infernix::models::inkling2

@@ -149,6 +149,22 @@ __global__ void lossless_lora_apply_kernel(__nv_bfloat16* __restrict__ y, std::i
     }
 }
 
+// The FP32 output's form (Inkling 2's message gates, whose forget and message projections are FP32 modules):
+// y[y_row + n, column0 + t] = fp32(y + fp32(d fp32(s))). A chunk's rows x columns fits 31 bits (lossless_lora_add), so
+// the element index divides in 32 bits.
+__global__ void lossless_lora_apply_fp32_kernel(float* __restrict__ y, std::int32_t y_rows, std::int32_t y_row,
+                                                const float* __restrict__ d, std::int32_t rows, std::int32_t columns,
+                                                std::int32_t column0, float scale) {
+    const auto urows  = static_cast<std::uint32_t>(rows);
+    const std::uint32_t total = urows * static_cast<std::uint32_t>(columns);
+    for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+        const std::uint32_t t = i / urows;
+        const std::uint32_t n = i % urows;
+        float& out = y[(static_cast<std::int64_t>(column0) + t) * y_rows + y_row + n];
+        out        = __fadd_rn(out, __fmul_rn(d[i], scale));
+    }
+}
+
 unsigned blocks_for(std::int64_t total) {
     return static_cast<unsigned>(std::min<std::int64_t>((total + 255) / 256, 4096));
 }
@@ -210,9 +226,10 @@ void lossless_lora_add(Tensor& y, std::int32_t y_row, const float* b, std::int32
                        const Tensor& u, std::int32_t u_row, float scale, WorkspaceArena& workspace,
                        cudaStream_t stream) {
     const std::int32_t columns = y.ne[1];
-    if (y.dtype != DType::BF16 || !y.is_contiguous() || y_row < 0 || y_row + rows > y.ne[0] || u.dtype != DType::FP32 ||
-        !u.is_contiguous() || u.ne[1] != columns || u_row < 0 || u_row + rank > u.ne[0] || rank <= 0 || b == nullptr) {
-        throw std::invalid_argument("lossless_lora_add: y BF16 [*, T], u FP32 [*, T], B FP32 [rows, rank]");
+    if ((y.dtype != DType::BF16 && y.dtype != DType::FP32) || !y.is_contiguous() || y_row < 0 || y_row + rows > y.ne[0] ||
+        u.dtype != DType::FP32 || !u.is_contiguous() || u.ne[1] != columns || u_row < 0 || u_row + rank > u.ne[0] ||
+        rank <= 0 || b == nullptr || (y.dtype == DType::FP32 && rows > INT32_MAX / kChunk)) {
+        throw std::invalid_argument("lossless_lora_add: y BF16 or FP32 [*, T], u FP32 [*, T], B FP32 [rows, rank]");
     }
     const std::int32_t k9 = nine_k(rank);
     auto scope            = workspace.scope();
@@ -234,9 +251,14 @@ void lossless_lora_add(Tensor& y, std::int32_t y_row, const float* b, std::int32
         LosslessActivationScale column_scale;
         column_scale.column_scales = static_cast<const float*>(scales.data);
         lossless_linear(x9, weight, 0, rows, d, 0, workspace, stream, column_scale);
-        lossless_lora_apply_kernel<<<blocks_for(static_cast<std::int64_t>(rows) * n), 256, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(y.data), y.ne[0], y_row, static_cast<const float*>(d.data), rows, n, c0,
-            scale);
+        if (y.dtype == DType::FP32) {
+            lossless_lora_apply_fp32_kernel<<<blocks_for(static_cast<std::int64_t>(rows) * n), 256, 0, stream>>>(
+                static_cast<float*>(y.data), y.ne[0], y_row, static_cast<const float*>(d.data), rows, n, c0, scale);
+        } else {
+            lossless_lora_apply_kernel<<<blocks_for(static_cast<std::int64_t>(rows) * n), 256, 0, stream>>>(
+                static_cast<__nv_bfloat16*>(y.data), y.ne[0], y_row, static_cast<const float*>(d.data), rows, n, c0,
+                scale);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }

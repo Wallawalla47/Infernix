@@ -299,6 +299,8 @@ struct ProgramOptions {
     // --a8-activations (with the 8-bit weights it implies): 8-bit activations in the attention projections, the head
     // and the NVFP4 layers' routed experts, in every call (Forward's a8; the experts' ExpertActivation::A8).
     bool a8                     = false;
+    // --lora: the adapter's padded rank (0: none), which sizes its per-call workspace on the route the Program runs.
+    std::uint32_t lora_rank     = 0;
     // --vision (the tower bound in the Parameters): the tower's buffers for images of up to vision_max_cells cells.
     bool vision                    = false;
     std::uint32_t vision_max_cells = 0;

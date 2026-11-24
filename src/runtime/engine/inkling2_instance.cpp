@@ -43,7 +43,7 @@ models::inkling2::FrontendOptions frontend_options(const models::inkling2::Model
             .vision_max_cells        = vision_max_cells(options)};
 }
 
-models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
+models::inkling2::ProgramOptions program_options(const EngineOptions& options, std::uint32_t lora_rank) {
     return {.max_context     = options.max_context,
             .max_concurrency = options.max_concurrency,
             .causal_scoring  = options.purpose == EnginePurpose::CausalScoring,
@@ -57,6 +57,7 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options) {
             .draft_tokens_auto = options.speculative.draft_tokens_auto,
             .expert_a16        = options.expert_a16_activations,
             .a8                = options.a8_activations,
+            .lora_rank         = lora_rank,
             .vision            = options.enable_vision,
             .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
             .kv_codec          = models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
@@ -127,8 +128,6 @@ bool artifact_has_inkling2_drafter(const artifact::Reader& reader) {
 }
 
 EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter) {
-    refuse(!options.lora_path.empty(), "--lora applies to the dense Qwen3.5-family models, not to Inkling 2");
-    refuse(!options.ablate_sidecar_path.empty(), "--ablate is not available on Inkling 2 yet");
     refuse(options.reference && !options.lossless, "--reference implies --lossless");
     refuse(options.reference && options.kv_cache != KvCacheStorage::BFloat16,
            "the design reference is built for --kv-dtype bf16 only (V stored as FP16); the coded formats are not yet");
@@ -143,6 +142,9 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
         refuse(options.fast_paths, "--lossless has no fast paths");
     }
     refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
+    // As every model (validate_engine_options, which this family's start does not run): the lossless route computes
+    // the model's own forward correctly rounded, and a cut is not part of it.
+    refuse(!options.ablate_sidecar_path.empty() && options.lossless, "--ablate does not combine with --lossless (docs/ablate.md)");
     if (options.a8_activations) {
         // The 8-bit route (Forward's a8): the --q8-weights matrices, whose attention input and output projections take
         // 8-bit activations in prompt calls.
@@ -287,11 +289,11 @@ namespace {
 // the 64-position page grid; empty when none fits. `vision_host`: the tower's pinned groups, as the Program plans them.
 std::optional<std::uint32_t> largest_context(const EngineOptions& options, const models::inkling2::Config& config,
                                              const models::inkling2::VisionHostWeights* vision_host,
-                                             std::uint64_t free_bytes, std::uint64_t headroom) {
+                                             std::uint32_t lora_rank, std::uint64_t free_bytes, std::uint64_t headroom) {
     const auto fits = [&](std::uint32_t context) {
         EngineOptions trial                      = options;
         trial.max_context                        = context;
-        models::inkling2::ProgramOptions program = program_options(trial);
+        models::inkling2::ProgramOptions program = program_options(trial, lora_rank);
         program.vision_host                      = vision_host;
         return models::inkling2::Program::plan_device(program, config).fixed_bytes() + headroom <= free_bytes;
     };
@@ -313,11 +315,16 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     const VramSnapshot vram  = open_vram_budget_source(device.device, options.vram_past_budget)->query();
     const std::uint64_t headroom =
         expert_offload::display_headroom(vram.display, false, options.vram_headroom_bytes);
+    // --lora's factors and --ablate's direction, allocated with the Parameters after the free memory is read below.
+    const std::uint32_t lora_rank = plan.lora() != nullptr ? plan.lora()->padded_rank : 0;
+    const std::uint64_t adapter_bytes = (plan.lora() != nullptr ? plan.lora()->device_bytes(options.lossless) : 0) +
+                                        (plan.ablate() != nullptr ? plan.ablate()->device_bytes() : 0);
     if (planned != nullptr) {
         // Engine::plan: the free memory a start reads after its weights, so the largest context is the start's.
-        const std::uint64_t free_after = planned_free_after_weights(free_device_bytes(vram), plan.device_bytes());
+        const std::uint64_t free_after =
+            planned_free_after_weights(free_device_bytes(vram), plan.device_bytes(), adapter_bytes);
         const auto* vision_host        = plan.vision_host() ? &*plan.vision_host() : nullptr;
-        planned->max_context           = largest_context(options, plan.config(), vision_host, free_after, headroom);
+        planned->max_context           = largest_context(options, plan.config(), vision_host, lora_rank, free_after, headroom);
         if (options.max_context_auto) {
             if (!planned->max_context) {
                 plan_refuse(*planned, "--max-context auto: no context fits beside the weights in the free VRAM");
@@ -325,16 +332,19 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
                 options.max_context = *planned->max_context;
             }
         }
-        models::inkling2::ProgramOptions program = program_options(options);
+        models::inkling2::ProgramOptions program = program_options(options, lora_rank);
         program.vision_host                      = vision_host;
         if (program.prefix_cache) { program.kv_pages = cache_pool_pages(options, program, plan.config(), free_after, headroom); }
         const models::inkling2::ProgramDevicePlan device_plan = models::inkling2::Program::plan_device(program, plan.config());
         planned->architecture                   = std::string(models::architecture_name(models::Architecture::Inkling2Loop));
         planned->vram.weights_bytes             = plan.device_bytes();
+        if (adapter_bytes != 0) { planned->vram.adapter_bytes = adapter_bytes; }
         planned->vram.kv_bytes                  = device_plan.kv;
         planned->vram.kv_tokens                 = options.max_context * options.max_concurrency;
         planned->vram.minimum_reservation_bytes = device_plan.fixed_bytes();
         planned->vram.workspace_bytes           = device_plan.workspace;
+        planned->vram.planned_bytes =
+            planned->vram.weights_bytes + planned_beside_weights_bytes(planned->vram) + device_plan.fixed_bytes();
         return {};
     }
     std::string template_override;
@@ -343,7 +353,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     const auto* vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
     if (options.max_context_auto) {
         const VramSnapshot after = open_vram_budget_source(device.device, options.vram_past_budget)->query();
-        const auto context       = largest_context(options, model->config(), vision_host, free_device_bytes(after), headroom);
+        const std::uint64_t free_after = free_device_bytes(after) > adapter_bytes ? free_device_bytes(after) - adapter_bytes : 0;
+        const auto context = largest_context(options, model->config(), vision_host, lora_rank, free_after, headroom);
         if (!context) { throw std::runtime_error("--max-context auto: no context fits beside the weights in the free VRAM"); }
         options.max_context = *context;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
@@ -351,13 +362,14 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
                            "lane reserves its whole context: no request is paused)",
                            options.max_context, options.max_concurrency);
     }
-    models::inkling2::ProgramOptions program = program_options(options);
+    models::inkling2::ProgramOptions program = program_options(options, lora_rank);
     program.vision_host                      = vision_host;
     if (program.prefix_cache) {
         const VramSnapshot now                     = open_vram_budget_source(device.device, options.vram_past_budget)->query();
         options.context_cache.host_capacity_bytes  = cache_host_bytes(options, pinned_bytes, now);
         program.prefix_host_bytes                  = *options.context_cache.host_capacity_bytes;
-        program.kv_pages = cache_pool_pages(options, program, model->config(), free_device_bytes(now), headroom);
+        const std::uint64_t free_now = free_device_bytes(now) > adapter_bytes ? free_device_bytes(now) - adapter_bytes : 0;
+        program.kv_pages = cache_pool_pages(options, program, model->config(), free_now, headroom);
         const models::inkling2::ProgramDevicePlan sized = models::inkling2::Program::plan_device(program, model->config());
         constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
         const std::uint64_t lane_pages =
@@ -385,6 +397,19 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     }
     EngineOptions resolved = options;
     auto instance          = std::make_unique<Inkling2Instance>(std::move(model), resolved);
+    // --lora / --ablate: what the start applied (the factors and the direction were allocated with the Parameters).
+    if (const auto* lora = instance->model->lora()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "LoRA adapter %s: %s; %llu MiB of VRAM",
+                           lora->adapter->weights_path().parent_path().string().c_str(), lora->describe().c_str(),
+                           static_cast<unsigned long long>((instance->parameters.lora->factors.bytes + (1U << 20) - 1) >> 20));
+    }
+    if (const auto* ablate = instance->model->ablate()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "ablation sidecar %s: %s",
+                           ablate->path.string().c_str(), ablate->describe().c_str());
+        if (const std::string warning = ablate->artifact_mismatch(instance->model->info().artifact_id); !warning.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s", warning.c_str());
+        }
+    }
     if (!options.chat_template_path.empty()) {
         template_override = read_text(options.chat_template_path);
         models::inkling2::FrontendResources resources = instance->model->resources();
@@ -436,6 +461,12 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     summary.fast_paths_disabled  = !options.fast_paths;
     summary.request_invariant    = true; // every route is column-invariant and the decode rows independent
     summary.prefix_cache         = std::move(restore);
+    if (const auto* lora = instance->model->lora()) {
+        summary.lora_adapter = lora->adapter->weights_path().parent_path().string() + ": " + lora->describe();
+    }
+    if (const auto* ablate = instance->model->ablate()) {
+        summary.ablate_sidecar = ablate->path.string() + ": " + ablate->describe();
+    }
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

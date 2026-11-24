@@ -28,6 +28,9 @@ public:
     [[nodiscard]] std::uint32_t public_token_count() const;
     // --vision-offload on: the tower's pinned groups (their block address set at materialization); otherwise empty.
     [[nodiscard]] const std::optional<VisionHostWeights>& vision_host() const;
+    // --lora / --ablate: read at planning (a broken one fails before the weights load, and a plan counts their VRAM).
+    [[nodiscard]] const LoraBinding* lora() const;
+    [[nodiscard]] const AblateSidecarBinding* ablate() const;
 
 private:
     struct Impl;

@@ -124,6 +124,22 @@ struct EntryArgs {
 };
 void visit_entry(const EntryArgs& args, cudaStream_t stream);
 
+// --ablate (docs/ablate.md): a unit direction and its strength. A cut write y (a BF16 conv output) becomes
+// y - fl32(alpha c) d in FP32, c = d . y summed in the pinned order (visit_math.h: one CTA a column), each element one
+// FMA and unrounded: the residual sum it joins keeps its one BF16 rounding. A column's bits depend only on that column.
+struct ResidualCut {
+    const float* direction = nullptr; // FP32 [H], unit length, 16-byte aligned
+    float alpha            = 0.0F;    // in (0, 4]
+    [[nodiscard]] bool active() const noexcept { return direction != nullptr && alpha != 0.0F; }
+};
+
+// visit_entry with the tail's post-MLP conv output cut before the residual add (the tail's layer's mlp lane). The
+// plain entry kernels are separate instances (the cut's arguments and code exist only in these).
+struct EntryCutArgs : EntryArgs {
+    ResidualCut tail_cut;
+};
+void visit_entry(const EntryCutArgs& args, cudaStream_t stream);
+
 // The experts' activation rows of the MLP input: [T][row_bytes(format, H)], and for NVFP4 each row's amax [T]. With
 // emax (an NVFP4 layer under --a16-activations): rows are A16 limb rows [T][w4a4_moe::kA16XRowBytes] and emax [T]
 // their exponents (canon::a16_column_exponent of the BF16 row). rows null: none (an MXFP8 layer under A16 reads x).
@@ -162,6 +178,13 @@ struct MlpEntryArgs {
 };
 void mlp_entry(const MlpEntryArgs& args, cudaStream_t stream);
 
+// mlp_entry with the post-attention conv's output cut before it joins the residual (the attn lane; at a block boundary
+// cand is the cut output itself). The ring keeps W_o's uncut output, as the conv's history is the model's own.
+struct MlpEntryCutArgs : MlpEntryArgs {
+    ResidualCut cut;
+};
+void mlp_entry(const MlpEntryCutArgs& args, cudaStream_t stream);
+
 struct GateExitArgs {
     std::int32_t columns = 0;
     std::int32_t kinds   = 1;          // 3 (attention: q, k, v) or 1 (mlp)
@@ -189,6 +212,8 @@ struct FinalArgs {
     std::uint16_t* out        = nullptr; // the head's input [T][H]
 };
 void final_mix(const FinalArgs& args, cudaStream_t stream);
+// The same with the last visit's post-MLP conv output cut (its layer's mlp lane).
+void final_mix(const FinalArgs& args, const ResidualCut& tail_cut, cudaStream_t stream);
 
 // logits[i] = softcap_c(logits[i], cap) over `count` FP32 values, in place.
 void softcap(float* logits, std::int64_t count, float cap, cudaStream_t stream);

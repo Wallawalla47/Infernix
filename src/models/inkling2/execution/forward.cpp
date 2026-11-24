@@ -225,6 +225,7 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     b_.guess        = moe::carve_workspace(guess_base, static_cast<std::int32_t>(c_.experts),
                                            static_cast<std::int32_t>(c_.intermediate), kGuessColumns);
     side_           = std::make_unique<SideStreams>();
+    if (p_.lora && !p_.lora->lossless) { lora_ = std::make_unique<LoraForward>(*p_.lora, c_, capacity); }
     // conv_history's descriptors: every visit's four rings.
     std::vector<std::int64_t> rings;
     for (std::uint32_t v = 0; v < c_.visits(); ++v) {
@@ -392,6 +393,22 @@ void Forward::tap(std::uint32_t visit, const std::uint16_t* rows, cudaStream_t s
     }
 }
 
+void Forward::set_hidden_capture(std::uint16_t* rows, std::int32_t column) {
+    if (rows == nullptr || column < 0) { throw std::invalid_argument("inkling2 forward: a hidden-state capture's rows"); }
+    hidden_rows_   = rows;
+    hidden_column_ = column;
+    hidden_counts_.assign(c_.num_hidden_layers, 0);
+}
+
+void Forward::capture_hidden(std::uint32_t visit, const std::uint16_t* rows, cudaStream_t stream) {
+    const std::uint32_t layer = c_.visit_layer(visit);
+    if (c_.in_core(layer) && c_.visit_pass(visit) + 1 != c_.loop.passes) { return; } // the core's last pass only
+    CUDA_CHECK(cudaMemcpyAsync(hidden_rows_ + static_cast<std::size_t>(layer) * kH,
+                               rows + static_cast<std::size_t>(hidden_column_) * kH, static_cast<std::size_t>(kH) * 2,
+                               cudaMemcpyDeviceToDevice, stream));
+    ++hidden_counts_[layer];
+}
+
 void Forward::embed(cudaStream_t stream) {
     ik::embed(b_.tokens, columns_, p_.embedding, p_.embedding_norm, b_.e, stream);
     mark("embed");
@@ -528,8 +545,19 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         e.x8_stride = k2_words;
         for (int i = 0; i < 3; ++i) { e.x8[i] = e.x[i] != nullptr ? k2_x8(i) : nullptr; }
     }
-    ik::visit_entry(e, stream);
+    // --ablate: the tail's post-MLP conv output is the previous visit's layer's mlp lane.
+    if (const ik::ResidualCut cut = v > 0 ? p_.ablate_cut(c_.visit_layer(v - 1), AblateParameters::Lane::Mlp)
+                                          : ik::ResidualCut{};
+        cut.active()) {
+        ik::EntryCutArgs cut_args;
+        static_cast<ik::EntryArgs&>(cut_args) = e;
+        cut_args.tail_cut                     = cut;
+        ik::visit_entry(cut_args, stream);
+    } else {
+        ik::visit_entry(e, stream);
+    }
     mark("visit_entry");
+    if (hidden_rows_ != nullptr && v > 0) { capture_hidden(v - 1, in.tail_out, stream); }
     if (b_.features != nullptr) { tap(v, h, stream); } // h: the partial block sum entering the visit
     if (messages) {
         // K1b: the three kinds' gate projections (one launch for the downs, one for forget and gain), then the gating
@@ -546,8 +574,11 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
             add_segment(down, op.gates[k].down, k, b_.z + k * T * rank);
             add_segment(fg, op.gates[k].forget_gain, k, b_.fg + k * TH * 2);
         }
+        const bool lora_down = lora_ && lora_->fold_gate_down(layer, 0, 3, down);
         project_fused(prompt_, down, stream);
+        if (lora_) { lora_->gate_down(layer, 0, 3, T, b_.gate_input, b_.z, prompt_, lora_down, stream); }
         project_fused(prompt_, fg, stream);
+        if (lora_) { lora_->gate_outputs(layer, 0, 3, T, b_.z, b_.fg, prompt_, stream); }
         ik::GateExitArgs g;
         g.columns  = T;
         g.kinds    = 3;
@@ -588,6 +619,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         for (int i = 0; i < 3; ++i) { k2.x8[i] = k2_x8(i); }
         k2.x8_encoded = true;
     }
+    const bool lora_k2 = lora_ && lora_->fold_attention_inputs(layer, k2, prompt_); // U = A x inside this launch
     project_fused(prompt_, k2, stream);
     mark("k2_projections");
     // The expert prefetch, forked once K2 has streamed its weights: the visit's guessed experts (the guess the visit
@@ -604,6 +636,12 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
                                  gate_up_bytes, side_->prefetch);
         }
         side_->forked_prefetch = true;
+    }
+    if (lora_) { // --lora: the term on each adapted output of K2, after its own rounding (docs/lora.md)
+        lora_->attention_inputs(layer, T, xq, xk, xv,
+                                {b_.q, b_.r, b_.gate, b_.sink, b_.k, b_.v, op.full ? b_.key_taps : nullptr,
+                                 op.full ? b_.value_taps : nullptr},
+                                prompt_, lora_k2, stream);
     }
 
     // K3: attention.
@@ -676,8 +714,10 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         wo.x8[0]      = b_.x8;
         wo.x8_encoded = !prompt_; // attention() wrote them; a prompt call encodes them here (the same bits)
     }
+    const bool lora_wo = lora_ && lora_->fold_output(layer, wo);
     project_fused(prompt_, wo, stream);
     mark("w_o");
+    if (lora_) { lora_->attention_output(layer, T, b_.attention, b_.o, prompt_, lora_wo, stream); }
     // The experts' x: the checkpoint's rows, or under A16 an NVFP4 layer's limb rows and an MXFP8 layer's BF16 x alone,
     // or under A8 an NVFP4 layer's A8 rows (written by the entry from the BF16 x; MXFP8 layers keep their rows).
     const bool a16   = activation_ == moe::ExpertActivation::A16;
@@ -721,7 +761,15 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         m.x    = xm;
         m.rows = rows;
     }
-    ik::mlp_entry(m, stream);
+    // --ablate: the post-attention conv's output is this layer's attn lane.
+    if (const ik::ResidualCut cut = p_.ablate_cut(layer, AblateParameters::Lane::Attn); cut.active()) {
+        ik::MlpEntryCutArgs cut_args;
+        static_cast<ik::MlpEntryArgs&>(cut_args) = m;
+        cut_args.cut                             = cut;
+        ik::mlp_entry(cut_args, stream);
+    } else {
+        ik::mlp_entry(m, stream);
+    }
     mark("mlp_entry");
     if (messages) {
         ik::ProjectionArgs down{}, fg{};
@@ -733,8 +781,11 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         fg.x[0]                   = b_.z;
         add_segment(down, op.gates[3].down, 0, b_.z);
         add_segment(fg, op.gates[3].forget_gain, 0, b_.fg);
+        const bool lora_down = lora_ && lora_->fold_gate_down(layer, 3, 1, down);
         project_fused(prompt_, down, stream);
+        if (lora_) { lora_->gate_down(layer, 3, 1, T, b_.gate_input, b_.z, prompt_, lora_down, stream); }
         project_fused(prompt_, fg, stream);
+        if (lora_) { lora_->gate_outputs(layer, 3, 1, T, b_.z, b_.fg, prompt_, stream); }
         ik::GateExitArgs g;
         g.columns  = T;
         g.kinds    = 1;
@@ -806,8 +857,13 @@ void Forward::finish(const StateView& s, const FinalInputs& in, cudaStream_t str
     f.query    = p_.output_query;
     f.norm     = p_.final_norm;
     f.out      = b_.final_hidden;
-    ik::final_mix(f, stream);
+    if (const ik::ResidualCut cut = p_.ablate_cut(c_.visit_layer(last), AblateParameters::Lane::Mlp); cut.active()) {
+        ik::final_mix(f, cut, stream);
+    } else {
+        ik::final_mix(f, stream);
+    }
     mark("final_mix");
+    if (hidden_rows_ != nullptr) { capture_hidden(last, in.tail_out, stream); }
     if (b_.features != nullptr) { tap(c_.visits(), b_.final_hidden, stream); }
     // The head over the requested columns only (a prefill chunk needs none, or its last).
     head(head_first, head_columns < 0 ? columns_ - head_first : head_columns, stream);
