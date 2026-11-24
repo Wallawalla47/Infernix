@@ -571,7 +571,7 @@ std::string usage_text(std::string_view program) {
         << "                             round's length (0..7; Qwen3.5/3.6 1..5 by adaptive-mtp where\n"
         << "                             qualified, else the model's fastest fixed length)\n"
         << "  --draft-model <path>       Qwen3.8-Flash-Next DFlash2: the drafter's companion artifact\n"
-        << "  --lora <path>              Qwen3.5 dense: a LoRA adapter applied at runtime (PEFT directory)\n"
+        << "  --lora <path>              Qwen3.5 dense and Inkling 2: a LoRA adapter applied at runtime (PEFT directory)\n"
         << "  --ablate <path>            an ablation sidecar applied at runtime, every model (sidecar.json)\n"
         << "  --spec-min-p <p>           MTP (Flash-Next: fixed --draft-tokens only), Flash-Next DFlash2\n"
         << "                             draft-confidence gate 0..1 (default 0: every draft)\n"

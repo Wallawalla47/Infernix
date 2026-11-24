@@ -171,11 +171,11 @@ __device__ __forceinline__ uint2 kv_encode_nvfp4(const float (&x)[4], int lane, 
 
 // bf16p (ops/kv_cache/bf16p_codec.cuh's form at 128): `bits` the lane's four BF16 words (a V row's BF16 source, which
 // its FP16 storage rounds). Codes [0, 128): sign << 7 | the seven fraction bits; nibbles [128, 192) (value d's in
-// byte 128 + d / 2, d even the low nibble): 0..13 exponent base + nibble, 14 exponent 0, 15 an escape; the 8-byte side
-// record: base, min(escapes, 6) | 0x80 when some exponent is 0, the escapes' exponents in column order. The base: a
+// byte 128 + d / 2, d even the low nibble): 0..13 exponent base + nibble, 14 exponent 0, 15 an escape; the 16-byte side
+// record: base, min(escapes, 14) | 0x80 when some exponent is 0, the escapes' exponents in column order. The base: a
 // row whose normal exponents span at most 14 binades takes clamp(lowest, 1, 240) (1 with none); a wider one the lowest
-// base of the 14-binade windows holding most of them. Returns whether the row has a packed form (at most 6 escapes;
-// otherwise the record keeps the first 6 and the request fails). Uniform over the warp.
+// base of the 14-binade windows holding most of them. Returns whether the row has a packed form (at most 14 escapes,
+// kBf16p128Escapes; otherwise the record keeps the first 14 and the request fails). Uniform over the warp.
 __device__ __forceinline__ bool kv_encode_bf16p(const std::uint16_t (&bits)[4], int lane, std::uint8_t* row,
                                                 std::uint8_t* side) {
     constexpr unsigned kAll = 0xFFFFFFFFU;
