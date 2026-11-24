@@ -553,6 +553,13 @@ reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it rep
 turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them. Each `--kv-dtype` format of
 the full pools runs as such a variant too (accepted with `--reproducible`), with DSpark equal to its plain tokens and a
 10,000-token prompt's continuation the same in chunks of 4,096 and 1,000; bf16p must give bf16's tokens throughout.
+A forced MoE stall (the down pass's error word, through a test seam) must fail its request with the stall's error, and
+the next request must equal an undisturbed run (`INFERNIX_INKLING2_STALL_ONLY=1` runs that case alone).
+`infernix_inkling2_options_test` (CPU only) passes every launch option Inkling 2 refuses through infernix-serve's parser,
+`normalize_inkling2_options` and `serve::refuse_unsupported_options` (each must be refused by its flag), and the
+configurations its callers start with (the server's and the launcher's defaults, tools/ablate's engines,
+infernix_bench's, the real tests' and infernix-perplexity's options), which must start; a scoring start must report
+the generation options it leaves unused.
 `infernix_inkling2_lossless_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) checks the `--lossless` route's cache form
 (generation) against its window form (scoring), the exact oracle: a 1,226-token sequence's logits byte for byte over
 calls of mixed widths (one wider than a sliding visit's ring, single-column decode calls, calls across the ring's wrap
