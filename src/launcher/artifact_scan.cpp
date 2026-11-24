@@ -924,6 +924,12 @@ Json to_json(const AdapterConfigFacts& facts) {
 }
 
 bool adapter_matches(const ScannedModel& model, const ScannedAdapter& adapter) {
+    if (model.family == "inkling2-mini") {
+        if (!adapter.config.base_model) { return false; }
+        // "thinkingmachines/Inkling-2-Mini" and its repackagings.
+        const std::string base = lower(*adapter.config.base_model);
+        return base.find("inkling-2-mini") != std::string::npos || base.find("inkling2-mini") != std::string::npos;
+    }
     if (model.model_type != "qwen3_5_text" || model.num_experts || !adapter.config.base_model) { return false; }
     if (model.family != "qwen3.8-27b" && model.family != "qwen3.6-27b") { return false; }
     // "Qwen/Qwen3.8-27B", "unsloth/Qwen3.8-27B-bnb-4bit", ...: the family's name in the base model's.

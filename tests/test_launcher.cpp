@@ -527,8 +527,8 @@ void test_option_support() {
                   supports_option(inkling, flag) == i,
               (std::string("option support: ") + flag).c_str());
     };
-    row("--lora", true, false, false, false, false);
-    row("--ablate", true, true, true, true, false);
+    row("--lora", true, false, false, false, true);
+    row("--ablate", true, true, true, true, true);
     row("--q8-weights", false, false, false, false, true);
     row("--expert-state", false, false, true, true, false);
     row("--expert-tail-skip", false, false, true, true, false);
@@ -563,8 +563,8 @@ void test_option_support() {
     Args saved = {"--kv-dtype", "int8", "--preserve-thinking", "--ngram-draft-tokens", "12", "--spec", "mtp",
                   "--ablate",   "x.json", "--rope-yarn-factor=1.5", "--temperature", "0.7"};
     const std::vector<std::string> removed = strip_unsupported_options(saved, inkling);
-    check(saved == Args{"--kv-dtype", "int8", "--temperature", "0.7"}, "unsupported options leave the list");
-    check(removed.size() == 5 && removed.back() == "--spec", "the removed options are named");
+    check(saved == Args{"--kv-dtype", "int8", "--ablate", "x.json", "--temperature", "0.7"}, "unsupported options leave the list");
+    check(removed.size() == 4 && removed.back() == "--spec", "the removed options are named");
     Args auto_context = {"--max-context", "auto", "--spec", "dflash2"};
     check(strip_unsupported_options(auto_context, next).size() == 1 && !has_flag(auto_context, "--max-context") &&
               has_flag(auto_context, "--spec"),
@@ -1210,13 +1210,17 @@ void test_library_adapters() {
     check(!adapter_matches(qwen36, adapter) && !adapter_matches(moe, adapter), "nor another base or a MoE model");
     adapter.config.base_model.reset();
     check(!adapter_matches(qwen38, adapter), "an adapter that names no base fits no model");
-    // Inkling 2 Mini refuses --lora, so no adapter fits it.
+    // Inkling 2 Mini (its routed experts are no obstacle: --lora adapts its attention and message gates).
     ScannedModel inkling = qwen38;
     inkling.model_type   = "inkling2_loop_text";
     inkling.num_experts  = 128;
     inkling.family       = "inkling2-mini";
+    check(!adapter_matches(inkling, adapter), "an adapter that names no base fits no Inkling either");
     adapter.config.base_model = "thinkingmachines/Inkling-2-Mini";
-    check(!adapter_matches(inkling, adapter), "an adapter does not fit Inkling");
+    check(adapter_matches(inkling, adapter), "an adapter of Inkling 2 Mini fits an Inkling artifact");
+    check(!adapter_matches(qwen38, adapter), "and not a 27B");
+    adapter.config.base_model = "unsloth/Qwen3.8-27B-bnb-4bit";
+    check(!adapter_matches(inkling, adapter), "a 27B adapter does not fit Inkling");
     std::filesystem::remove_all(root, ignored);
 
     // The Hub's model list: only repositories with both files at their root.

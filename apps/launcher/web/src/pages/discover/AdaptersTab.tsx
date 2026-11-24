@@ -21,10 +21,11 @@ import { formatCount } from "@/lib/format";
 import { useLibrary } from "@/lib/hooks";
 import { repoName } from "@/pages/discover/DownloadDialog";
 
-/** The base models whose adapters --lora applies: the dense 27Bs the catalog offers. */
+/** The base models whose adapters --lora applies: the dense 27Bs the catalog offers, and Inkling 2 Mini. */
 const BASES = [
   { repo: "Qwen/Qwen3.8-27B", label: "Qwen3.8-27B" },
   { repo: "Qwen/Qwen3.6-27B", label: "Qwen3.6-27B" },
+  { repo: "thinkingmachines/Inkling-2-Mini", label: "Inkling 2 Mini" },
 ] as const;
 
 interface HarnessAdapter {
@@ -212,9 +213,10 @@ export function AdaptersTab({ onDownload }: { onDownload: (repo: string) => void
         <Puzzle />
         <AlertDescription>
           A LoRA adapter fine-tunes a model when it loads (--lora), without changing the artifact. Infernix applies
-          plain LoRA on the attention, Gated DeltaNet and MLP projections, up to rank 128, to the dense 27B models.
-          Download one here, then pick it on a 27B model's Configure page (LoRA adapter): its "Will it fit?" check
-          asks the server whether it can apply it.
+          plain LoRA, up to rank 128, on the attention, Gated DeltaNet and MLP projections of the dense 27B models, and
+          on Inkling 2's attention and message-gate projections (its routed experts are not adaptable). Download one
+          here, then pick it on the model's Configure page (LoRA adapter): its "Will it fit?" check asks the server
+          whether it can apply it.
         </AlertDescription>
       </Alert>
 

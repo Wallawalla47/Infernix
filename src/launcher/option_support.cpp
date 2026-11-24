@@ -27,8 +27,7 @@ struct Rule {
 // The options that do not apply to every model. Why, for the model types left out:
 constexpr std::array kRules = {
     // Adapters and weights.
-    Rule{"--lora", kDense},                 // the Qwen MoE models and Inkling refuse it (validate_engine_options, ...)
-    Rule{"--ablate", kQwen},                // Inkling refuses it (normalize_inkling2_options)
+    Rule{"--lora", kDense | kInkling},      // the Qwen MoE models refuse it (validate_engine_options, bind_lora)
     Rule{"--q8-weights", kInkling},         // normalize_engine_options refuses it elsewhere
     // Routed experts held off the GPU.
     Rule{"--expert-ram-mib", kOffload},
