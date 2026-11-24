@@ -124,11 +124,18 @@ one request is decoding, and rounds of several requests decode plainly. The
 [Inkling 2 Mini guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/inkling2-mini.md) covers the KV formats,
 the prefix cache, images, reasoning effort and conversion.
 
+From `main` at `8ee3149fa`, `--lora PATH` applies a Hugging Face PEFT adapter at runtime (its attention projections,
+convolution taps and loop message gates, rank up to 128) and `--ablate FILE` applies a directional-ablation sidecar, on
+every route but `--ablate` with `--lossless`. The launcher offers both. See
+[LoRA adapters](https://github.com/Wallawalla47/Infernix/blob/main/docs/lora.md#inkling-2) and
+[ablation sidecars](https://github.com/Wallawalla47/Infernix/blob/main/docs/ablate.md), which give their measured speed
+costs. No adapter or sidecar for this model has been published yet, so the adapter module names Infernix accepts follow
+the Transformers implementation and have not been checked against a real adapter's files.
+
 ## Limits
 
 Not supported on this model yet:
 
-- `--lora` and `--ablate` (refused at startup);
 - video input (images work);
 - constrained output: grammars, JSON schemas, choices and regex;
 - `tool_choice` set to required or to a named tool (`auto` and `none` work, without a grammar protecting the
