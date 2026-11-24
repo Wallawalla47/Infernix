@@ -1475,8 +1475,11 @@ fixture where summation order is visible ([op development §6.3](op-development.
   next-turn rendering as Qwen's.
 - **Reasoning effort.** OpenAI `reasoning_effort` and Anthropic thinking budgets map to the template's effort (strings as
   its table; numbers in [0, 0.99]); the default is the template's 0.9 (D6).
-- **Output session.** Channels from `response_template`: thinking, content, tool calls (JSON per call). Constrained tool
-  calls use the existing JSON grammar inside `<|content_invoke_tool_json|>` (TokenSpeed's `inkling2_json` frames the same).
+- **Output session.** Channels from `response_template`: thinking, content, tool calls (JSON per call). Constrained
+  output (built 2026-11-24: `frontend/constraints.cpp`, [constrained-decoding §4.4](constrained-decoding.md#44-inkling-2-mini))
+  states the whole turn's block framing as one grammar: thinking blocks, then the answer block holding the content
+  constraint, or call blocks holding `{"name": ..., "args": ...}` under the tool policy (TokenSpeed's `inkling2_json`
+  frames the same answer block).
 - **Thinking budget.** A turn may hold several thinking blocks, so the budget counts them together and holds for the
   whole turn (Qwen's one `<think>` block makes its one-shot control a turn budget; Inkling's does not): once the
   control has closed a block or a block has ended at the budget, `reasoning_ban()` refuses `<|content_thinking|>` at

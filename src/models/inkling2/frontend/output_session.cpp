@@ -1,11 +1,15 @@
 #include "models/inkling2/frontend/output_session.h"
 
 #include "models/output_text.h"
+#include "runtime/contract/execution.h"
+#include "text/grammar.h"
 #include "text/tokenizer.h"
+#include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <stdexcept>
 #include <utility>
 
@@ -54,6 +58,9 @@ struct State {
     bool spent = false;
     std::vector<GeneratedToolCall> calls;
     ToolCallParseDiagnostics diagnostics;
+    // A constrained turn's branch (ConstraintObservation::branch): it opened a content block, or a call block.
+    bool opened_content = false;
+    bool opened_call    = false;
 };
 
 void feed_channel(State& state, OutputChannel channel, std::string_view text, const StopPolicy& policy,
@@ -96,6 +103,124 @@ void flush_channel(State& state, OutputChannel channel, PublishedOutput& emitted
     pending.clear();
 }
 
+// A call's JSON read for its syntax alone: each value's text is kept as written, so a number keeps its digits whatever
+// its range (a grammar admits any JSON number; a JSON library would round a 20-digit integer or refuse 1e400).
+class CallJson {
+public:
+    explicit CallJson(std::string_view text) : s_(text) {}
+
+    // The top-level object's "name" string token and "args" value text (the last of a repeated member); false when the
+    // text is not one JSON object.
+    bool members(std::string_view& name, std::string_view& args) {
+        ws();
+        if (!take('{')) { return false; }
+        ws();
+        if (!take('}')) {
+            for (;;) {
+                ws();
+                const std::size_t key_at = i_;
+                if (!string()) { return false; }
+                const std::string_view key_token = s_.substr(key_at, i_ - key_at);
+                ws();
+                if (!take(':')) { return false; }
+                ws();
+                const std::size_t value_at = i_;
+                if (!value(0)) { return false; }
+                const std::string_view text = s_.substr(value_at, i_ - value_at);
+                if (key_token == "\"name\"") { name = text; }
+                if (key_token == "\"args\"") { args = text; }
+                ws();
+                if (take(',')) { continue; }
+                if (take('}')) { break; }
+                return false;
+            }
+        }
+        ws();
+        return i_ == s_.size();
+    }
+
+private:
+    static constexpr int kMaximumDepth = 256;
+
+    bool take(char c) {
+        if (i_ < s_.size() && s_[i_] == c) {
+            ++i_;
+            return true;
+        }
+        return false;
+    }
+    void ws() {
+        while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' || s_[i_] == '\r')) { ++i_; }
+    }
+    bool digits() {
+        const std::size_t start = i_;
+        while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') { ++i_; }
+        return i_ > start;
+    }
+    bool string() {
+        if (!take('"')) { return false; }
+        for (; i_ < s_.size(); ++i_) {
+            const auto c = static_cast<unsigned char>(s_[i_]);
+            if (c == '"') {
+                ++i_;
+                return true;
+            }
+            if (c < 0x20) { return false; }
+            if (c != '\\') { continue; }
+            if (++i_ >= s_.size()) { return false; }
+            if (s_[i_] == 'u') {
+                for (int k = 0; k < 4; ++k) {
+                    if (++i_ >= s_.size() || std::isxdigit(static_cast<unsigned char>(s_[i_])) == 0) { return false; }
+                }
+            } else if (std::string_view("\"\\/bfnrt").find(s_[i_]) == std::string_view::npos) {
+                return false;
+            }
+        }
+        return false;
+    }
+    bool value(int depth) {
+        if (i_ >= s_.size() || depth > kMaximumDepth) { return false; }
+        const char c = s_[i_];
+        if (c == '{' || c == '[') {
+            const char close = c == '{' ? '}' : ']';
+            ++i_;
+            ws();
+            if (take(close)) { return true; }
+            for (;;) {
+                ws();
+                if (c == '{') {
+                    if (!string()) { return false; }
+                    ws();
+                    if (!take(':')) { return false; }
+                    ws();
+                }
+                if (!value(depth + 1)) { return false; }
+                ws();
+                if (take(',')) { continue; }
+                return take(close);
+            }
+        }
+        if (c == '"') { return string(); }
+        for (const std::string_view word : {"true", "false", "null"}) {
+            if (s_.substr(i_, word.size()) == word) {
+                i_ += word.size();
+                return true;
+            }
+        }
+        take('-');
+        if (!take('0') && !digits()) { return false; }
+        if (take('.') && !digits()) { return false; }
+        if (take('e') || take('E')) {
+            if (!take('+')) { take('-'); }
+            if (!digits()) { return false; }
+        }
+        return true;
+    }
+
+    std::string_view s_;
+    std::size_t i_ = 0;
+};
+
 } // namespace
 
 void PublishedOutput::append(OutputChannel channel, std::string_view text) {
@@ -124,6 +249,11 @@ public:
         raw            = s.output.raw;
         preserve       = s.output.raw || s.output.preserve_special_tokens;
         parse_calls    = !raw && s.tools != nullptr;
+        // An opened answer: the turn starts inside its text block.
+        if (s.answer_opened && !raw) {
+            committed.phase          = Phase::Content;
+            committed.opened_content = true;
+        }
     }
 
     [[nodiscard]] bool stop_token(TokenId token) const {
@@ -164,33 +294,38 @@ public:
         feed_channel(state, OutputChannel::Content, text, kNoStops, emitted, 0, nullptr);
     }
 
-    // The response_template's tool_calls field: {"name": NAME, "args": {...}} becomes the call NAME(args).
+    // The response_template's tool_calls field: {"name": NAME, "args": {...}} becomes the call NAME(args), its arguments
+    // the args object's text as the model wrote it (CallJson: every number as written).
     void close_call(State& state, PublishedOutput& emitted) const {
         std::string body = std::move(state.call_body);
         state.call_body.clear();
-        nlohmann::ordered_json call;
-        try {
-            call = nlohmann::ordered_json::parse(body);
-        } catch (const nlohmann::json::exception&) {
+        std::string_view name_token, args;
+        const bool utf8 = [&] {
+            try {
+                (void)text::unicode_internal::utf8_codepoints(body, "tool call");
+                return true;
+            } catch (const std::exception&) { return false; }
+        }();
+        if (!utf8 || !CallJson(body).members(name_token, args) || args.empty() || args.front() != '{' ||
+            name_token.empty()) {
             fall_back(state, std::move(body), ToolCallParseFallbackReason::MalformedStructure, emitted);
             return;
         }
-        const auto name = call.is_object() ? call.find("name") : call.end();
-        const auto args = call.is_object() ? call.find("args") : call.end();
-        if (!call.is_object() || args == call.end() || !args->is_object() || name == call.end()) {
-            fall_back(state, std::move(body), ToolCallParseFallbackReason::MalformedStructure, emitted);
-            return;
+        std::string tool;
+        if (name_token.front() == '"') {
+            try {
+                tool = nlohmann::json::parse(name_token).get<std::string>();
+            } catch (const nlohmann::json::exception&) { tool.clear(); } // a lone surrogate's escape
         }
-        if (!name->is_string() || name->get_ref<const std::string&>().empty()) {
+        if (tool.empty()) {
             fall_back(state, std::move(body), ToolCallParseFallbackReason::InvalidToolName, emitted);
             return;
         }
-        const std::string& tool = name->get_ref<const std::string&>();
         if (!s.tools->open && !s.tools->declared.contains(tool)) {
             fall_back(state, std::move(body), ToolCallParseFallbackReason::UndeclaredTool, emitted);
             return;
         }
-        state.calls.push_back(GeneratedToolCall{.name = tool, .arguments_json = args->dump()});
+        state.calls.push_back(GeneratedToolCall{.name = std::move(tool), .arguments_json = std::string(args)});
         ++state.diagnostics.structured_call_count;
     }
 
@@ -207,9 +342,11 @@ public:
             if (token == s.markers.thinking) {
                 state.phase = Phase::Reasoning;
             } else if (content_opener(token)) {
-                state.phase = Phase::Content;
+                state.phase          = Phase::Content;
+                state.opened_content = true;
             } else if (token == s.markers.tool_call) {
-                state.phase = Phase::Call;
+                state.phase                   = Phase::Call;
+                state.opened_call             = true;
                 state.diagnostics.marker_seen = true;
             }
             return; // headers, stray text and other tokens between blocks publish nothing
@@ -263,6 +400,18 @@ public:
         preview_output.clear();
     }
 
+    // The matcher takes a round's accepted tokens (tentatively, until the commit). A refusal fails this request only
+    // (runtime::RequestOutputError): its sampler drew only legal tokens, so one is a defect, never the model's choice.
+    void accept_grammar(std::span<const TokenId> tokens) const {
+        if (!s.grammar) { return; }
+        try {
+            s.grammar->accept(tokens);
+        } catch (const std::exception& error) {
+            s.grammar->discard();
+            throw runtime::RequestOutputError(std::string("constrained output: ") + error.what());
+        }
+    }
+
     Settings s;
     bool raw         = false;
     bool preserve    = false;
@@ -303,6 +452,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
 
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation = runtime::ContinuationAction::Decode) {
+        m.accept_grammar(tokens.first(count));
         m.preview_finish_reason = reason;
         m.preview_ready         = true;
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason, .continuation = continuation};
@@ -399,6 +549,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     if (state.phase != Phase::Between) {
         throw std::logic_error("the thinking control did not close the thinking block");
     }
+    m.accept_grammar(tokens);
     state.control_pending   = false;
     state.applied           = true;
     state.injected_tokens   = static_cast<std::uint32_t>(tokens.size());
@@ -443,12 +594,14 @@ PublishedOutput OutputSession::commit_preview() {
     m.preview_ready       = false;
     PublishedOutput output = std::move(m.preview_output);
     m.preview_output.clear();
+    if (m.s.grammar) { m.s.grammar->confirm(); }
     if (m.committed.terminal) { m.tool_calls = std::move(m.committed.calls); }
     return output;
 }
 
 void OutputSession::discard_preview() {
     if (impl_ == nullptr) { return; }
+    if (impl_->s.grammar) { impl_->s.grammar->discard(); }
     impl_->preview_ready = false;
     impl_->preview_output.clear();
 }
@@ -469,8 +622,35 @@ runtime::ReasoningBan OutputSession::reasoning_ban() const noexcept {
             .withheld = impl_->parse_calls ? impl_->s.markers.tool_call : TokenId{-1}};
 }
 
-std::uint64_t OutputSession::grammar_masks(std::span<const TokenId>, std::span<std::uint32_t>) {
-    throw std::logic_error("mask requested for unconstrained output");
+bool OutputSession::constrained() const noexcept { return impl_ != nullptr && impl_->s.grammar != nullptr; }
+
+void OutputSession::observe_constraint(bool timings, double prepare_seconds) noexcept {
+    if (constrained()) { impl_->s.grammar->observe(timings, prepare_seconds); }
+}
+
+void OutputSession::constraint_uploaded(std::size_t bytes) noexcept {
+    if (constrained()) { impl_->s.grammar->uploaded(bytes); }
+}
+
+std::optional<ConstraintObservation> OutputSession::constraint_observation() const {
+    if (!constrained()) { return std::nullopt; }
+    ConstraintObservation result = impl_->s.grammar->observation();
+    const State& state           = impl_->committed;
+    result.branch                = state.opened_call || !impl_->tool_calls.empty() ? ConstraintOutputBranch::Tools
+                                   : state.opened_content                          ? ConstraintOutputBranch::Content
+                                                                                   : ConstraintOutputBranch::Undecided;
+    return result;
+}
+
+std::uint64_t OutputSession::grammar_masks(std::span<const TokenId> drafts, std::span<std::uint32_t> words) {
+    if (!constrained()) { throw std::logic_error("mask requested for unconstrained output"); }
+    return impl_->s.grammar->masks(drafts, words);
+}
+
+bool OutputSession::constraint_pending() const noexcept { return constrained() && impl_->s.grammar->pending(); }
+
+std::exception_ptr OutputSession::constraint_failure() const noexcept {
+    return constrained() ? impl_->s.grammar->failure() : std::exception_ptr{};
 }
 
 std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {

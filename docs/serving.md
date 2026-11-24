@@ -450,7 +450,8 @@ Invalid choices and regexes use `invalid_choice` and `invalid_regex`, with the r
 
 These constraints apply to answer content; thinking is separate. GBNF supports recursive rules,
 Unicode and repetition. All modes support streaming and all speculative backends, including
-Qwen3.8-Flash-Next MTP and n-gram copy rounds. For assistant
+Qwen3.8-Flash-Next MTP and n-gram copy rounds and Inkling 2's DSpark (whose turn framing is described in
+[its guide](inkling2-mini.md#constrained-output-and-tool-calls)). For assistant
 continuation, the grammar covers the existing assistant content plus the generated suffix. Completion uses the model's EOS tokens;
 output limits and cancellation can produce an incomplete answer. JSON modes can be combined with
 active tools; GBNF, choice and regex require no active tools or `tool_choice:"none"`.
@@ -647,6 +648,10 @@ The three protocols share one constrained tool implementation:
 | OpenAI named function | Exactly one call to that function |
 | Anthropic named `tool` | One or more calls to that tool |
 | OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
+
+Inkling 2 applies the same choices to its own call blocks (JSON in `<|content_invoke_tool_json|>`, described in
+[its guide](inkling2-mini.md#constrained-output-and-tool-calls)); the `<tool_call>`, parameter and streaming rules below
+are the Qwen models', and an Inkling 2 call arrives whole when its block closes.
 
 OpenAI `allowed_tools` supports `auto` and `required`; an entry naming a tool as the other kind (a
 declared function as `custom`, or the reverse) is a 400 `invalid_tool_choice`. Selection changes generation permissions,
@@ -1956,7 +1961,7 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   - `scalar`: a number of at most `digits` digits (1-15, default 8) that may be negative or have a
     decimal part, closed by the model with `}`; answers `value`, the `text` the model wrote, and the
     errors `malformed_scalar`, `too_many_digits` or `run_cut_short` instead of a guess. Unlike ignis,
-    the colon after `{"value` is a choice between `":` and `":-`, the single token the tokenizer
+    the colon after `{"value` is a choice between `":` and `":-`, the single token the Qwen tokenizer
     writes for a colon followed by a minus sign: ignis forces `":` and offers a separate `-`, a
     sequence the model almost never writes, which left a negative answer about 1 % of the mass.
   - `point` and `box`: a position (`x`, `y`) or bounding box (`x0`, `y0`, `x1`, `y1`) on a
@@ -1965,6 +1970,11 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
     `method: "chain"`. A state without exactly one image is refused (`spatial_needs_one_image`).
   Their prompts are ignis's texts (`point` at three digits is the one its pointing measurements
   used); `answer_mass` is the lowest share of the distribution any chosen step's tokens held.
+  The primitives spell a number one digit a step. A model whose tokenizer writes digits in groups
+  (`"10"` one token, as Inkling 2's does) never writes a number that way, so the digits' share of the
+  distribution collapses and the answer is noise (a spider's legs read 60 at a mass of 5e-9 on Inkling
+  2): such a server refuses the generated types (`question_type_unsupported`, HTTP 400) and serves
+  the readout types.
 - **Option order is part of the prompt**: each option is shown under the label at its position, so
   reordering options asks a different question.
 - **`answer_mass`** is the declared labels' share of the whole next-token distribution. Near 1 the
@@ -1977,7 +1987,10 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   digits out of range, or a type not listed here (`question_type_unsupported`; ignis's
   attention-read `locate` and head-based `point`/`box` are not served) refuses the whole request with
   HTTP 400. Thinking is refused (`thinking_unsupported`): the answer
-  is read where the prompt ends, where a thinking prompt opens a reasoning block.
+  is read where the prompt ends, where a thinking prompt opens a reasoning block. Every question's prompt ends where
+  the answer starts: a Qwen template's prompt with thinking off already does, and on Inkling 2, which writes its own
+  reply header and thinks at every effort, the prompt ends with that header (`<|message_model|><|content_text|>`), so
+  the model answers without a thinking block (the prompts were measured on Qwen; Inkling's accuracy on them is not).
 - **Evidence placement and reuse.** JSON evidence follows the instruction in the system message, and
   content parts lead the user turn and end at an explicit prefix-cache boundary. The first question
   runs alone; the rest run in waves of `--max-concurrency` and resume from the cached evidence, so
@@ -2197,7 +2210,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default (Qwen templates; Inkling 2 refuses it) | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and (with `--end-in-thinking allow`) complete calls stranded in thinking the model never closed. Qwen tool calls; Inkling 2 refuses it | off |
-| `--tool-parameter-names open\|declared` | on the constrained tool route, `declared` lets a call to a non-strict tool that declares parameters name only those (each once, in any order), and a value keeps a quoted `<parameter=NAME>` line its call cannot take as its text (see the constrained route). Inkling 2 has no constrained tool route and refuses `declared` | `open` |
+| `--tool-parameter-names open\|declared` | on the constrained tool route, `declared` lets a call to a non-strict tool that declares parameters name only those (each once, in any order), and a value keeps a quoted `<parameter=NAME>` line its call cannot take as its text (see the constrained route). Inkling 2's constrained tool route has no such policy (its calls are JSON objects), and it refuses `declared` | `open` |
 | `--restore-reasoning` | give a Chat Completions assistant message sent back without reasoning the reasoning this server generated for it: a tool-call message by its call ids, an answer by its text and the conversation before it. Changes the prompt the model sees from the history the client sent (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |

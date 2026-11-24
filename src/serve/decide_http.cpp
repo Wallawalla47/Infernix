@@ -33,6 +33,9 @@ GenerationRequest question_request(const DecideRequest& request, const DecideQue
     GenerationRequest generation;
     generation.messages        = decide_messages(request, question, labels);
     generation.enable_thinking = false;
+    // The decision is read, and a primitive generated, where the answer starts: on a model that writes its own reply
+    // header (Inkling 2) the prompt ends with it.
+    generation.open_answer = true;
     // Greedy and penalty-free: penalties would push a repeated digit away from the answer.
     generation.sampling.temperature       = 0.0;
     generation.sampling.presence_penalty  = 0.0;

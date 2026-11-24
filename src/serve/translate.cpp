@@ -352,6 +352,7 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.add_vision_id             = false;
     input.options.open_tool_names           = request.open_tool_names;
     input.options.declared_parameter_names  = semantics.declared_parameter_names;
+    input.options.open_answer               = request.open_answer;
     // Listed tools render in the prompt's tool section in request order; deferred ones only join
     // the output contract, so declaring one never changes the prompt. So do a conversation's later changes to a
     // listed tool (withdrawn_tool_names, and a redefinition among the deferred declarations).
@@ -469,12 +470,8 @@ SettledThinking settle_thinking(const GenerationRequest& request, const ServeOpt
                         .controls = requested,
                         .effort   = semantics.reasoning_effort};
     if (!out.enabled) {
-        out.controls.budget.reset();
-        return out;
-    }
-    if (prompt.opens_reasoning && !request.token_constraint.empty()) {
-        // A token constraint owns every output step, so no budget's close fits (Engine refuses the pair); such a model
-        // then answers with its own refusal of the constraint, if it has one.
+        // A prompt that cannot think, or one that opened the answer (/v1/decide's token constraints own every output
+        // step): no budget.
         out.controls.budget.reset();
         return out;
     }

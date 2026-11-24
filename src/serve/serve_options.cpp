@@ -813,7 +813,7 @@ void refuse_unsupported_options(const ServeOptions& options, std::string_view ar
     refuse(options.tolerant_tool_calls, "--tolerant-tool-calls",
            "recovers malformed Qwen tool calls; Inkling 2's tool-call parser has no tolerant mode");
     refuse(options.tool_parameter_names == ToolParameterNames::Declared, "--tool-parameter-names declared",
-           "limits the constrained tool route; Inkling 2 parses tool calls unconstrained");
+           "limits the Qwen constrained tool route's parameter names; Inkling 2's constrained route has no such policy");
 }
 
 const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {

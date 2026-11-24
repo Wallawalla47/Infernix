@@ -8,6 +8,7 @@
 #include "infernix/ops/argmax.h"
 #include "infernix/ops/inkling2_attention.h"
 #include "infernix/ops/sampling.h"
+#include "infernix/ops/token_constraint.h"
 #include "models/inkling2/execution/dspark.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/lossless.h"
@@ -36,7 +37,18 @@ namespace detail {
 
 using Clock = std::chrono::steady_clock;
 
+// A request's token constraint (TokenConstraint; /v1/decide's generated primitives), compiled at admission: step i
+// permits set steps[i] of `sets`, or forces token -2 - steps[i]; `observe` and `capture_logits` as the request's.
+struct ConstraintPlan {
+    std::vector<std::int32_t> steps;
+    std::vector<std::vector<TokenId>> sets;
+    std::vector<std::vector<TokenId>> observe;
+    bool capture_logits = false;
+    std::uint64_t serial = 0;
+};
+
 struct BasePlanImpl {
+    std::shared_ptr<const ConstraintPlan> constraint; // null: unconstrained
     std::vector<TokenId> tokens;
     std::shared_ptr<const std::vector<PromptImage>> images; // null: a text prompt
     runtime::RequestPlanSummary summary;
@@ -193,6 +205,38 @@ KvLayout kv_layout(const ProgramOptions& o, std::int32_t full_visits) {
 
 std::uint64_t align_256(std::uint64_t bytes) { return (bytes + 255) / 256 * 256; }
 
+// Constrained rows' token masks (constrained-decoding.md §7.1): one packed vocabulary mask a position. Slot r is a plain
+// round's row r, slot i a DSpark verify call's column i (one row drafts at a time), so the slots cover both.
+constexpr std::int32_t kMaskSlots = std::max<std::int32_t>(kMaximumConcurrency, ops::inkling2::kDSparkBlock);
+std::uint64_t mask_words(std::uint64_t vocab) { return (vocab + 31) / 32; }
+// Device and pinned bytes of the masks (generation only: scoring samples nothing).
+std::uint64_t mask_bytes(const ProgramOptions& options, std::uint64_t vocab) {
+    return options.causal_scoring ? 0 : align_256(4 * mask_words(vocab) * kMaskSlots);
+}
+
+// Token constraints' operands for one sample call of at most kMaximumConcurrency rows (ops::constrain_logits), in 4-byte
+// words: every lane's sets [kChoices][lanes x kSets] and their counts, then per row its descriptor, its record, its
+// observe list and its observed record (a constrained row samples on the plain route, never in a DSpark verify call).
+struct ConstraintWords {
+    std::size_t sets = 0, choices = 0, counts = 0, descriptors = 0, records = 0, observe = 0, observed = 0, total = 0;
+};
+ConstraintWords constraint_words(std::uint32_t lanes) {
+    constexpr std::size_t rows = kMaximumConcurrency;
+    ConstraintWords w;
+    w.sets        = static_cast<std::size_t>(lanes) * kMaximumConstraintSets;
+    w.choices     = 0;
+    w.counts      = w.choices + w.sets * ops::kTokenConstraintChoices;
+    w.descriptors = w.counts + w.sets;
+    w.records     = w.descriptors + rows;
+    w.observe     = w.records + rows * ops::kTokenConstraintRecord;
+    w.observed    = w.observe + rows * ops::kTokenObserveTokens;
+    w.total       = w.observed + rows * ops::kTokenObserveRecord;
+    return w;
+}
+std::uint64_t constraint_bytes(const ProgramOptions& options) {
+    return options.causal_scoring ? 0 : align_256(4 * constraint_words(options.max_concurrency).total);
+}
+
 } // namespace
 
 class ProgramImpl {
@@ -254,6 +298,14 @@ public:
         configs_           = DeviceBuffer(sizeof(ops::SamplingConfig) * kMaximumConcurrency);
         positions_         = DeviceBuffer(4 * kMaximumConcurrency);
         sampled_           = DeviceBuffer(4 * kMaximumConcurrency);
+        if (const std::uint64_t bytes = mask_bytes(o_, static_cast<std::uint64_t>(vocab_)); bytes != 0) {
+            masks_ = DeviceBuffer(bytes);
+            host_masks_.emplace(bytes);
+        }
+        if (const std::uint64_t bytes = constraint_bytes(o_); bytes != 0) {
+            constraint_ = DeviceBuffer(bytes);
+            constraint_host_.emplace(bytes);
+        }
         auto* base         = static_cast<std::byte*>(host_.data());
         staging_           = reinterpret_cast<std::int32_t*>(base);
         base += align_256(forward_.upload_words() * 4 * kStagingSlots);
@@ -354,13 +406,11 @@ public:
         std::unique_ptr<PreparedPromptData> data = std::move(prompt).take();
         const auto n                             = static_cast<std::uint32_t>(data->token_ids.size());
         if (n == 0 || n > o_.max_context) { throw std::invalid_argument("Inkling 2: the prompt is empty or exceeds max_context"); }
-        if (!options.constraint.empty()) {
-            throw std::invalid_argument("Inkling 2: token constraints are not available yet");
-        }
         for (const TokenId id : options.readout_tokens) {
             if (id < 0 || id >= vocab_) { throw std::invalid_argument("readout token is outside the public token domain"); }
         }
         auto base                             = std::make_unique<BasePlanImpl>();
+        base->constraint                      = compile_constraint(options.constraint);
         if (!data->images.empty()) {
             check_images(data->images, n);
             base->images = std::make_shared<const std::vector<PromptImage>>(std::move(data->images));
@@ -517,6 +567,7 @@ public:
         lane.images        = base.impl_->images;
         lane.prompt_tokens = base.impl_->summary.prompt_tokens;
         lane.options       = base.impl_->options;
+        lane.constraint    = base.impl_->constraint;
         lane.penalties     = lane.options.sampling.presence_penalty != 0.0F || lane.options.sampling.frequency_penalty != 0.0F;
         lane.calibration.reset();
         clear_unpackable(lane_id.value);
@@ -666,9 +717,10 @@ public:
         if (last) {
             const std::uint64_t transaction = ++transaction_;
             const SequenceHandle row        = handle(index);
-            // The head ran over the chunk's last column only: its logits are row 0.
-            sample({&row, 1}, {&index, 1}, 0, ops::kSamplePurposePrefill, masks);
+            // The head ran over the chunk's last column only: its logits are row 0. A readout reads them before a
+            // token constraint masks them in place for the sampler.
             if (!lane.options.readout_tokens.empty()) { out.readout = readout(lane, 0); }
+            sample({&row, 1}, {&index, 1}, 0, ops::kSamplePurposePrefill, masks);
             out.timing = timing_since(start);
             out.pending.emplace(ContractAccess::batch(this, transaction, {&row, 1}, {sampled_tokens_.data(), 1},
                                                       out.timing, {failures_.data(), 1}));
@@ -688,7 +740,7 @@ public:
         if (sequences.empty() || sequences.size() > lanes_.size()) { throw std::invalid_argument("Inkling 2: a decode of 1-8 rows"); }
         // A row's round licenses at most its remaining generated tokens: a DSpark round needs two of them.
         const std::uint32_t remaining = budgets.empty() ? 0U : budgets[0].generated_tokens_remaining;
-        if (remaining >= 2 && dspark_round(sequences, masks)) { return decode_dspark(sequences[0], remaining, masks, start); }
+        if (remaining >= 2 && dspark_round(sequences)) { return decode_dspark(sequences[0], remaining, masks, start); }
         if (lossless_) { return decode_lossless(sequences, masks, start); }
         if (drafter_ && sequences.size() == 1) { ++lanes_[lane_of(sequences[0])].fallback; } // a plain round of a drafting row
         std::vector<std::uint32_t> rows;
@@ -778,6 +830,7 @@ public:
                 throw std::logic_error("Inkling 2: a commit decision is invalid");
             }
             if (d.cancelled || d.failed) {
+                lane.constraint_round.clear();
                 out.rows[row].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
                                                      : runtime::CommitDisposition::CancelledReleased;
                 continue;
@@ -793,6 +846,9 @@ public:
             } else {
                 if (d.accepted_tokens != 1) { throw std::logic_error("Inkling 2: a row commits exactly one token"); }
                 lane.tokens.push_back(sampled_tokens_[row]);
+                // A token-constrained row's draw is the request's with its token.
+                for (ConstrainedDraw& draw : lane.constraint_round) { lane.constraint_trace.push_back(std::move(draw)); }
+                lane.constraint_round.clear();
             }
             out.rows[row].disposition =
                 d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
@@ -829,6 +885,10 @@ public:
         }
         out.row_count = ContractAccess::rows(pending).size();
         out.status    = runtime::ConsumeStatus::Consumed;
+        for (const SequenceHandle& row : ContractAccess::rows(pending)) {
+            const std::uint32_t index = ContractAccess::lane(row);
+            if (index < lanes_.size()) { lanes_[index].constraint_round.clear(); }
+        }
         ContractAccess::consume(pending);
         pending_.reset();
         pending_draft_ = {};
@@ -841,6 +901,7 @@ public:
         const std::uint32_t index = ContractAccess::lane(sequence);
         out.timings               = timings(lanes_[index]);
         out.status                = runtime::ConsumeStatus::Consumed;
+        out.constrained_draws     = std::move(lanes_[index].constraint_trace);
         CommitRowResult stats;
         speculative_of(lanes_[index], stats);
         out.speculative = std::move(stats.speculative);
@@ -1090,6 +1151,9 @@ private:
         std::uint32_t processed     = 0; // positions whose state the lane holds
         runtime::ResolvedExecutionOptions options;
         bool penalties = false;
+        // A token constraint: its plan, the round's draw (committed with its token) and the request's draws.
+        std::shared_ptr<const ConstraintPlan> constraint;
+        std::vector<ConstrainedDraw> constraint_round, constraint_trace;
         std::uint64_t prefill_ns = 0, decode_ns = 0, decode_share_ns = 0;
         // DSpark: the drafts' acceptance by probability decile (draft_length.h) and the request's counters.
         runtime::speculative::DraftCalibration calibration;
@@ -1614,6 +1678,7 @@ private:
             identity.push_back(static_cast<std::int32_t>(r));
         }
         stage_sample(rows, identity, ops::kSamplePurposeDecode, masks);
+        fill_staged_masks(masks);
         launch_sample(rows.size(), identity, ops::kSamplePurposeDecode, gathered);
         finish_sample(rows.size());
         for (const std::uint32_t index : rows) { lanes_[index].processed = static_cast<std::uint32_t>(lanes_[index].tokens.size()); }
@@ -1645,17 +1710,16 @@ private:
     static constexpr double kProposalCost = 0.18;
 
     // A round drafts when one row decodes with its one pending input, the drafter has its context (F >= 1), the
-    // position after the anchor fits the context, and nothing per position constrains the draw (penalties, a
-    // grammar, a reasoning ban): verification samples each column as plain decoding would.
-    [[nodiscard]] bool dspark_round(std::span<const SequenceHandle> sequences, runtime::TokenMaskProvider* masks) const {
+    // position after the anchor fits the context, and no penalty counts the draws: verification samples each column as
+    // plain decoding would. A reasoning ban is fine (every column samples under it, and the round ends at the first close
+    // it draws), and so is a grammar (each column samples under the mask of its position after the drafts before it,
+    // constrained-decoding.md §8.1).
+    [[nodiscard]] bool dspark_round(std::span<const SequenceHandle> sequences) const {
         if (!drafter_ || sequences.size() != 1) { return false; }
         const Lane& lane = lanes_[lane_of(sequences[0])];
-        if (lane.penalties || lane.processed == 0 || lane.tokens.size() != lane.processed + 1U ||
-            lane.processed + 1U >= o_.max_context) {
-            return false;
-        }
-        // A reasoning ban is fine: every column samples under it, and the round ends at the first close it draws.
-        return masks == nullptr || !masks->constrained(0);
+        // A token-constrained row decodes plainly: its steps' records come from its one column a round.
+        return !lane.penalties && !lane.constraint && lane.processed != 0 && lane.tokens.size() == lane.processed + 1U &&
+               lane.processed + 1U < o_.max_context;
     }
 
     PendingBatch decode_dspark(SequenceHandle sequence, std::uint32_t remaining, runtime::TokenMaskProvider* masks,
@@ -1723,7 +1787,21 @@ private:
         stage_sample({rows.data(), n}, {logit_rows.data(), n}, ops::kSamplePurposeDecode, masks, {positions.data(), n},
                      true);
         CUDA_CHECK(cudaEventRecord(round_events_[2], device_.stream));
-        if (o_.use_cuda_graph) {
+        // A constrained row: column i samples under the mask of its position after drafts 0 .. i - 1 (an illegal draft
+        // leaves the columns after it a filler: its own column's draw differs from it, so none of them is accepted). The
+        // matcher walks the drafts while the verify forward runs; the sample follows the masks' upload.
+        std::uint64_t dead = 0;
+        const bool constrained = masks != nullptr && masks->constrained(0);
+        if (constrained) {
+            if (o_.use_cuda_graph) {
+                verify_graph(index, columns, false).launch(device_.stream);
+            } else {
+                run_decode_call(columns);
+            }
+            fill_masks(*masks, 0, 0, std::span<const TokenId>(drafts.data(), static_cast<std::size_t>(k)));
+            dead = mask_dead_[0];
+            launch_sample(n, {logit_rows.data(), n}, ops::kSamplePurposeDecode);
+        } else if (o_.use_cuda_graph) {
             verify_graph(index, columns).launch(device_.stream);
         } else {
             run_decode_call(columns);
@@ -1744,13 +1822,6 @@ private:
                failures_[static_cast<std::size_t>(a)] == runtime::PendingRowFailure::None) {
             ++a;
         }
-        runtime::PendingRowFailure failure = runtime::PendingRowFailure::None;
-        for (std::int32_t i = 0; i <= a; ++i) {
-            if (failures_[static_cast<std::size_t>(i)] != runtime::PendingRowFailure::None) {
-                failure = failures_[static_cast<std::size_t>(i)];
-                break;
-            }
-        }
         lane.calibration.observe(std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)),
                                  static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(a), kAcceptanceWeight);
         // The round ends at the first reasoning close it draws: later columns sampled under the ban the close lifts.
@@ -1762,6 +1833,20 @@ private:
                 }
             }
         }
+        // A kept column's failure (0 .. a) fails the request; a cut column's does not count. Under a grammar a column
+        // past a drafted close can have no legal token outside the ban it still samples under (the tool-call opener the
+        // ban withholds while thinking is open, after a drafted close and a tool's name): its draw is discarded.
+        runtime::PendingRowFailure failure = runtime::PendingRowFailure::None;
+        for (std::int32_t i = 0; i <= a; ++i) {
+            if (failures_[static_cast<std::size_t>(i)] != runtime::PendingRowFailure::None) {
+                failure = failures_[static_cast<std::size_t>(i)];
+                break;
+            }
+        }
+        // A dead position among the kept ones (0 .. a) fails the request as plain decoding would.
+        if (failure == runtime::PendingRowFailure::None && (dead & ((std::uint64_t{2} << a) - 1U)) != 0) {
+            failure = runtime::PendingRowFailure::ConstraintDeadEnd;
+        }
         // bf16p: a row with no packed form at a kept position (the anchor's F .. F + a) fails the request as plain
         // decoding would; one at a rejected draft's position is forgotten (the next calls rewrite that row).
         if (const std::uint32_t at = unpackable_seen_[index]; at != kNoPosition) {
@@ -1772,6 +1857,9 @@ private:
             }
         }
         failures_[0] = failure;
+        if (failure != runtime::PendingRowFailure::None && failure != runtime::PendingRowFailure::ConstraintDeadEnd) {
+            lane.prefix.withdraw = true; // as finish_sample does for a plain row
+        }
         ++lane.rounds;
         lane.drafted += static_cast<std::uint64_t>(k);
         lane.accepted += static_cast<std::uint64_t>(a);
@@ -1806,9 +1894,11 @@ private:
     }
 
     // The captured verify call of one lane and `columns` columns (its call plan, configs and positions uploaded
-    // before the launch): the forward, the context rows and the sample of every column.
-    DecodeGraphExecutable& verify_graph(std::uint32_t lane, std::int32_t columns) {
-        const std::uint64_t key = (1ULL << 63) | static_cast<std::uint64_t>(lane) << 32 | static_cast<std::uint32_t>(columns);
+    // before the launch): the forward, the context rows and, with `sample`, the sample of every column (a constrained
+    // row samples after its masks, filled while this runs).
+    DecodeGraphExecutable& verify_graph(std::uint32_t lane, std::int32_t columns, bool sample = true) {
+        const std::uint64_t key = (1ULL << 63) | (sample ? 0ULL : kForwardOnlyGraph) |
+                                  static_cast<std::uint64_t>(lane) << 32 | static_cast<std::uint32_t>(columns);
         auto found = graphs_.find(key);
         if (found == graphs_.end()) {
             std::vector<std::int32_t> identity(static_cast<std::size_t>(columns));
@@ -1816,7 +1906,7 @@ private:
             DecodeGraphDefinition definition;
             definition.capture(device_.stream, [&] {
                 run_decode_call(columns);
-                launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode);
+                if (sample) { launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode); }
             });
             DecodeGraphExecutable exec;
             exec.instantiate(definition);
@@ -1869,14 +1959,197 @@ private:
         sample(rows, lanes, std::span<const std::int32_t>(&r, 1), purpose, masks);
     }
 
+    // A constrained row's masks: its matcher's legal tokens at its committed position and at each draft's position
+    // after it (the provider's row `row`), into mask slots `slot`.. and uploaded; its dead positions into
+    // mask_dead_[row].
+    void fill_masks(runtime::TokenMaskProvider& masks, std::size_t row, std::size_t slot, std::span<const TokenId> drafts) {
+        const auto words = static_cast<std::size_t>(mask_words(static_cast<std::uint64_t>(vocab_)));
+        if (slot + drafts.size() + 1 > static_cast<std::size_t>(kMaskSlots)) {
+            throw std::logic_error("Inkling 2: a constrained round needs more mask slots than it has");
+        }
+        auto* host = static_cast<std::uint32_t*>(host_masks_->data()) + slot * words;
+        const std::span<std::uint32_t> span(host, (drafts.size() + 1) * words);
+        mask_dead_[row] = masks.fill(row, drafts, span);
+        upload_pinned(static_cast<std::uint32_t*>(masks_.p) + slot * words, host, span.size_bytes(), device_.stream);
+        masks.uploaded(row, span.size_bytes());
+    }
+
+    [[nodiscard]] ops::SamplingMask mask_slot(std::size_t slot) const noexcept {
+        const auto words = static_cast<std::size_t>(mask_words(static_cast<std::uint64_t>(vocab_)));
+        return {static_cast<const std::uint32_t*>(masks_.p) + slot * words, static_cast<std::int32_t>(words)};
+    }
+
+    // ---------------------------------------------------------------- token constraints (TokenConstraint)
+    // A request's plan: each step's tokens in the public domain, at most kMaximumConstraintChoices; a one-token step is
+    // forced; at most kMaximumConstraintSets distinct multi-token sets (constraint_words' columns).
+    std::shared_ptr<const ConstraintPlan> compile_constraint(const TokenConstraint& constraint) {
+        if (constraint.empty()) { return nullptr; }
+        auto plan = std::make_shared<ConstraintPlan>();
+        for (const std::vector<TokenId>& step : constraint.steps) {
+            if (step.empty() || step.size() > kMaximumConstraintChoices) {
+                throw std::invalid_argument("constraint step has an invalid token count");
+            }
+            for (const TokenId id : step) {
+                if (id < 0 || id >= vocab_) { throw std::invalid_argument("constraint token is outside the public token domain"); }
+            }
+            if (step.size() == 1) {
+                plan->steps.push_back(-2 - step.front());
+                continue;
+            }
+            auto set = std::find(plan->sets.begin(), plan->sets.end(), step);
+            if (set == plan->sets.end()) {
+                if (plan->sets.size() == kMaximumConstraintSets) {
+                    throw std::invalid_argument("constraint uses too many distinct token sets");
+                }
+                set = plan->sets.insert(plan->sets.end(), step);
+            }
+            plan->steps.push_back(static_cast<std::int32_t>(set - plan->sets.begin()));
+        }
+        for (const std::vector<TokenId>& observed : constraint.observe) {
+            if (observed.size() > static_cast<std::size_t>(ops::kTokenObserveTokens)) {
+                throw std::invalid_argument("constraint step observes too many tokens");
+            }
+            for (const TokenId id : observed) {
+                if (id < 0 || id >= vocab_) { throw std::invalid_argument("observed token is outside the public token domain"); }
+            }
+        }
+        plan->observe        = constraint.observe;
+        plan->capture_logits = constraint.capture_logits;
+        plan->serial         = next_constraint_serial_++;
+        return plan;
+    }
+
+    // The staged rows' descriptors, a constrained lane's sets (once a request) and the observe lists, uploaded before
+    // the sample (stage_sample's last step). A row samples output step (its generated tokens).
+    void stage_constraints(std::span<const std::uint32_t> lanes) {
+        staged_constraint_      = false;
+        staged_constraint_rows_ = lanes.size();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            staged_descriptors_[row] = -1;
+            const Lane& lane         = lanes_[lanes[row]];
+            if (!lane.constraint) { continue; }
+            const std::size_t step = lane.tokens.size() - lane.prompt_tokens;
+            if (step >= lane.constraint->steps.size()) {
+                throw std::logic_error("Inkling 2: a constrained row samples past its last step");
+            }
+            const std::int32_t d     = lane.constraint->steps[step];
+            staged_descriptors_[row] = d >= 0 ? static_cast<std::int32_t>(lanes[row] * kMaximumConstraintSets) + d : d;
+            staged_steps_[row]       = step;
+            staged_constraint_       = true;
+        }
+        if (!staged_constraint_) { return; }
+        const ConstraintWords w = constraint_words(static_cast<std::uint32_t>(lanes_.size()));
+        auto* host              = static_cast<std::int32_t*>(constraint_host_->data());
+        auto* device            = static_cast<std::int32_t*>(constraint_.p);
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t index = lanes[row];
+            const Lane& lane          = lanes_[index];
+            if (!lane.constraint || constraint_serials_[index] == lane.constraint->serial) { continue; }
+            const std::size_t first = static_cast<std::size_t>(index) * kMaximumConstraintSets;
+            std::int32_t* choices   = host + w.choices + first * ops::kTokenConstraintChoices;
+            std::int32_t* counts    = host + w.counts + first;
+            std::fill(choices, choices + kMaximumConstraintSets * ops::kTokenConstraintChoices, 0);
+            std::fill(counts, counts + kMaximumConstraintSets, 0);
+            for (std::size_t set = 0; set < lane.constraint->sets.size(); ++set) {
+                std::copy(lane.constraint->sets[set].begin(), lane.constraint->sets[set].end(),
+                          choices + set * ops::kTokenConstraintChoices);
+                counts[set] = static_cast<std::int32_t>(lane.constraint->sets[set].size());
+            }
+            upload_pinned(device + w.choices + first * ops::kTokenConstraintChoices, choices,
+                          4ULL * kMaximumConstraintSets * ops::kTokenConstraintChoices, device_.stream);
+            upload_pinned(device + w.counts + first, counts, 4ULL * kMaximumConstraintSets, device_.stream);
+            constraint_serials_[index] = lane.constraint->serial;
+        }
+        std::copy_n(staged_descriptors_.begin(), lanes.size(), host + w.descriptors);
+        upload_pinned(device + w.descriptors, host + w.descriptors, 4ULL * lanes.size(), device_.stream);
+        std::int32_t* observe = host + w.observe;
+        std::fill(observe, observe + lanes.size() * ops::kTokenObserveTokens, -1);
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const Lane& lane = lanes_[lanes[row]];
+            if (staged_descriptors_[row] == -1 || staged_steps_[row] >= lane.constraint->observe.size()) { continue; }
+            const std::vector<TokenId>& tokens = lane.constraint->observe[staged_steps_[row]];
+            std::copy(tokens.begin(), tokens.end(), observe + row * ops::kTokenObserveTokens);
+        }
+        upload_pinned(device + w.observe, observe, 4ULL * lanes.size() * ops::kTokenObserveTokens, device_.stream);
+    }
+
+    // The staged rows' constraint on `logits` (the sample's operand, rows in staged order), before the sampler reads it:
+    // a capturing row's logits copied out first, then each constrained column masked to its step's tokens and its
+    // records written (ops::constrain_logits). Never inside a captured graph (a constrained round samples eagerly).
+    void constrain_staged(float* logits, std::size_t rows) {
+        const ConstraintWords w = constraint_words(static_cast<std::uint32_t>(lanes_.size()));
+        auto* device            = static_cast<std::int32_t*>(constraint_.p);
+        const auto columns      = static_cast<std::int32_t>(rows);
+        captured_rows_.clear();
+        for (std::size_t row = 0; row < rows; ++row) {
+            const Lane& lane = lanes_[sample_lanes_[row]];
+            if (staged_descriptors_[row] == -1 || !lane.constraint->capture_logits) { continue; }
+            captured_rows_.resize(rows * static_cast<std::size_t>(vocab_));
+            CUDA_CHECK(cudaMemcpyAsync(captured_rows_.data() + row * vocab_, logits + row * vocab_,
+                                       static_cast<std::size_t>(vocab_) * 4, cudaMemcpyDeviceToHost, device_.stream));
+        }
+        const auto sets = static_cast<std::int32_t>(w.sets);
+        Tensor in(logits, DType::FP32, {vocab_, columns});
+        const Tensor choices(device + w.choices, DType::I32, {ops::kTokenConstraintChoices, sets});
+        const Tensor counts(device + w.counts, DType::I32, {sets});
+        const Tensor descriptors(device + w.descriptors, DType::I32, {columns});
+        Tensor records(device + w.records, DType::FP32, {ops::kTokenConstraintRecord, columns});
+        const Tensor observe(device + w.observe, DType::I32, {ops::kTokenObserveTokens, columns});
+        Tensor observed(device + w.observed, DType::FP32, {ops::kTokenObserveRecord, columns});
+        ops::constrain_logits(in, nullptr, descriptors, choices, counts, vocab_, records, &observe, &observed,
+                              device_.stream);
+    }
+
+    // After the call's synchronize: each constrained row's draw (its step's restricted distribution, mass, observed
+    // log-probabilities and captured row) as its lane's round draw, committed with its token.
+    void take_constraint_draws(std::size_t rows) {
+        const ConstraintWords w = constraint_words(static_cast<std::uint32_t>(lanes_.size()));
+        std::vector<float> records(rows * ops::kTokenConstraintRecord), observed(rows * ops::kTokenObserveRecord);
+        CUDA_CHECK(cudaMemcpy(records.data(), static_cast<const std::int32_t*>(constraint_.p) + w.records,
+                              4ULL * records.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(observed.data(), static_cast<const std::int32_t*>(constraint_.p) + w.observed,
+                              4ULL * observed.size(), cudaMemcpyDeviceToHost));
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::int32_t d = staged_descriptors_[row];
+            if (d == -1) { continue; }
+            Lane& lane              = lanes_[sample_lanes_[row]];
+            const ConstraintPlan& p = *lane.constraint;
+            const std::int32_t set  = d >= 0 ? d - static_cast<std::int32_t>(sample_lanes_[row] * kMaximumConstraintSets) : -1;
+            const std::size_t count = set >= 0 ? p.sets[static_cast<std::size_t>(set)].size() : 1U;
+            const float* record     = records.data() + row * ops::kTokenConstraintRecord;
+            ConstrainedDraw draw{.token         = sampled_tokens_[row],
+                                 .probabilities = std::vector<float>(record, record + count),
+                                 .mass          = record[ops::kTokenConstraintChoices]};
+            if (staged_steps_[row] < p.observe.size()) {
+                const float* values = observed.data() + row * ops::kTokenObserveRecord;
+                draw.observed_logprobs.assign(values, values + p.observe[staged_steps_[row]].size());
+                draw.top_logprob = values[ops::kTokenObserveTokens];
+            }
+            if (p.capture_logits) {
+                draw.logits.assign(captured_rows_.begin() + static_cast<std::ptrdiff_t>(row * vocab_),
+                                   captured_rows_.begin() + static_cast<std::ptrdiff_t>((row + 1) * vocab_));
+            }
+            lane.constraint_round = {std::move(draw)};
+        }
+    }
+
+    // The staged constrained rows' masks (stage_sample), filled while the call's forward runs: every caller launches
+    // the forward first, then this, then the sample.
+    void fill_staged_masks(runtime::TokenMaskProvider* masks) {
+        for (std::size_t i = 0; i < staged_masks_; ++i) { fill_masks(*masks, staged_rows_[i], staged_rows_[i], {}); }
+        staged_masks_ = 0;
+    }
+
     // The rows' configs and positions to pinned memory, and the logits rows gathered: everything a sample needs
-    // before its launch (outside a graph).
+    // before its launch (outside a graph). A constrained row's config names its mask slot; fill_staged_masks fills it.
     // `positions`: each row's draw key (a verify call's columns); empty: the lane's. `mask_row_zero`: every row takes the
-    // masks' row 0 (a verify call's columns of one row).
+    // masks' row 0 (a verify call's columns of one row), whose masks decode_dspark fills into the columns' slots.
     void stage_sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> logit_rows, std::int32_t purpose,
                       runtime::TokenMaskProvider* masks, std::span<const std::int32_t> positions = {},
                       bool mask_row_zero = false) {
+        staged_masks_ = 0;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (!mask_row_zero) { mask_dead_[row] = 0; }
             const Lane& lane                       = lanes_[lanes[row]];
             const ResolvedSamplingParameters& s    = lane.options.sampling;
             ops::SamplingConfig config;
@@ -1894,11 +2167,17 @@ private:
             config.nonfinite         = &nonfinite_[row];
             sample_lanes_[row]       = lanes[row];
             if (masks != nullptr) {
-                const runtime::ReasoningBan ban = masks->reasoning_ban(mask_row_zero ? 0 : row);
+                const std::size_t provider_row  = mask_row_zero ? 0 : row;
+                const runtime::ReasoningBan ban = masks->reasoning_ban(provider_row);
                 config.reasoning_close          = ban.close;
                 config.reasoning_ends[0]        = ban.ends[0];
                 config.reasoning_ends[1]        = ban.ends[1];
                 config.reasoning_withheld       = ban.withheld;
+                // A constrained row samples among its grammar's legal tokens (constrained-decoding.md §7.3).
+                if (masks->constrained(provider_row)) {
+                    if (!mask_row_zero) { staged_rows_[staged_masks_++] = row; }
+                    config.mask = mask_slot(row);
+                }
             }
             host_configs_[row] = config;
             // Prefill keys the draw by the prompt's next position (the lane has processed the prompt), decode by its
@@ -1912,6 +2191,12 @@ private:
                                    cudaMemcpyHostToDevice, device_.stream));
         CUDA_CHECK(cudaMemcpyAsync(positions_.p, host_positions_, 4 * lanes.size(), cudaMemcpyHostToDevice,
                                    device_.stream));
+        // A verify call's columns are one drafting row's, and a token-constrained row never drafts (dspark_round).
+        if (mask_row_zero) {
+            staged_constraint_ = false;
+        } else {
+            stage_constraints(lanes);
+        }
         (void)logit_rows;
     }
 
@@ -1936,6 +2221,8 @@ private:
             }
             logits = static_cast<const float*>(gathered_.p);
         }
+        // A token-constrained row's logits are masked to its step's tokens (records written) before the sampler reads them.
+        if (staged_constraint_) { constrain_staged(const_cast<float*>(logits), rows); }
         const Tensor in(const_cast<float*>(logits), DType::FP32, {vocab_, static_cast<std::int32_t>(rows)});
         Tensor out(sampled_.p, DType::I32, {static_cast<std::int32_t>(rows)});
         const Tensor positions(positions_.p, DType::I32, {static_cast<std::int32_t>(rows)});
@@ -1944,9 +2231,11 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_, sampled_.p, 4 * rows, cudaMemcpyDeviceToHost, device_.stream));
     }
 
+    // After the call's forward was launched: its constrained rows' masks are filled while it runs.
     void enqueue_sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> logit_rows,
                         std::int32_t purpose, runtime::TokenMaskProvider* masks) {
         stage_sample(lanes, logit_rows, purpose, masks);
+        fill_staged_masks(masks);
         launch_sample(lanes.size(), logit_rows, purpose);
     }
 
@@ -1982,14 +2271,21 @@ private:
         for (std::size_t row = 0; row < rows; ++row) {
             sampled_tokens_[row] = host_sampled_[row];
             const bool unpackable = !verify && unpackable_seen_[sample_lanes_[row]] != kNoPosition;
+            // A plain row's one position with no legal token (its sampler drew the filler) fails it; a verify call's
+            // dead positions count only where they are accepted (decode_dspark).
+            const bool dead       = !verify && (mask_dead_[row] & 1U) != 0;
             failures_[row]        = nonfinite_[row] != 0 ? runtime::PendingRowFailure::NonFiniteLogits
                                     : unpackable         ? runtime::PendingRowFailure::UnpackableKv
+                                    : dead               ? runtime::PendingRowFailure::ConstraintDeadEnd
                                                          : runtime::PendingRowFailure::None;
-            // A request whose state may be wrong takes back what it published (release_prefix).
-            if (failures_[row] != runtime::PendingRowFailure::None && sample_lanes_[row] < lanes_.size()) {
+            // A request whose state may be wrong takes back what it published (release_prefix); a dead end's state is
+            // right. A verify call's columns count only where kept (decode_dspark decides).
+            if (!verify && failures_[row] != runtime::PendingRowFailure::None &&
+                failures_[row] != runtime::PendingRowFailure::ConstraintDeadEnd && sample_lanes_[row] < lanes_.size()) {
                 lanes_[sample_lanes_[row]].prefix.withdraw = true;
             }
         }
+        if (!verify && staged_constraint_) { take_constraint_draws(rows); }
     }
 
     // A uniform decode round (every lane one input) as the graph of its (lanes, columns), captured on first use; the
@@ -1997,36 +2293,48 @@ private:
     void decode_graph(std::int32_t lanes, std::int32_t columns, std::span<const std::uint32_t> rows,
                       std::span<const std::int32_t> logit_rows, runtime::TokenMaskProvider* masks) {
         stage_sample(rows, logit_rows, ops::kSamplePurposeDecode, masks);
-        const std::uint64_t key = static_cast<std::uint64_t>(lanes) << 32 | static_cast<std::uint32_t>(columns);
+        // A round with a constrained row (a grammar's masks, a token constraint) runs the forward's graph alone, fills
+        // the masks while it runs, then constrains and samples.
+        const bool sample        = staged_masks_ == 0 && !staged_constraint_;
+        const std::uint64_t key  = (sample ? 0ULL : kForwardOnlyGraph) | static_cast<std::uint64_t>(lanes) << 32 |
+                                  static_cast<std::uint32_t>(columns);
         // A graph samples the call's rows in column order; rows given in another order are gathered eagerly.
         bool identity = true;
         for (std::size_t i = 0; i < rows.size(); ++i) { identity = identity && logit_rows[i] == static_cast<std::int32_t>(i); }
         if (!identity) {
             run_decode_call(columns);
+            fill_staged_masks(masks);
             launch_sample(rows.size(), logit_rows, ops::kSamplePurposeDecode);
             finish_sample(rows.size());
             return;
         }
         auto found = graphs_.find(key);
-        if (found == graphs_.end()) { found = capture_decode(lanes, columns); }
+        if (found == graphs_.end()) { found = capture_decode(lanes, columns, sample); }
         found->second.launch(device_.stream);
+        if (!sample) {
+            fill_staged_masks(masks);
+            launch_sample(rows.size(), logit_rows, ops::kSamplePurposeDecode);
+        }
         finish_sample(rows.size());
     }
 
     // The graph of a uniform decode call over `lanes` lanes with `columns` of them active (its rows the call's columns
     // in order). Its topology depends on those two counts only: tokens, lanes, positions, configs and the state are
     // device data the launch reads.
-    std::map<std::uint64_t, DecodeGraphExecutable>::iterator capture_decode(std::int32_t lanes, std::int32_t columns) {
+    // `sample` false: the forward alone (a constrained round samples after its masks, captured at its first use).
+    std::map<std::uint64_t, DecodeGraphExecutable>::iterator capture_decode(std::int32_t lanes, std::int32_t columns,
+                                                                            bool sample = true) {
         std::vector<std::int32_t> identity(static_cast<std::size_t>(columns));
         for (std::int32_t i = 0; i < columns; ++i) { identity[static_cast<std::size_t>(i)] = i; }
         DecodeGraphDefinition definition;
         definition.capture(device_.stream, [&] {
             run_decode_call(columns);
-            launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode);
+            if (sample) { launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode); }
         });
         DecodeGraphExecutable exec;
         exec.instantiate(definition);
-        const std::uint64_t key = static_cast<std::uint64_t>(lanes) << 32 | static_cast<std::uint32_t>(columns);
+        const std::uint64_t key = (sample ? 0ULL : kForwardOnlyGraph) | static_cast<std::uint64_t>(lanes) << 32 |
+                                  static_cast<std::uint32_t>(columns);
         return graphs_.emplace(key, std::move(exec)).first;
     }
 
@@ -2050,10 +2358,13 @@ private:
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
     }
 
+    // On the compute stream: the call's forward may still be running (the readout precedes the sample, which a token
+    // constraint's mask would change).
     PromptReadout readout(const Lane& lane, std::int32_t column) {
         std::vector<float> row(static_cast<std::size_t>(vocab_));
-        CUDA_CHECK(cudaMemcpy(row.data(), call_logits() + static_cast<std::size_t>(column) * vocab_, row.size() * 4,
-                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(row.data(), call_logits() + static_cast<std::size_t>(column) * vocab_, row.size() * 4,
+                                   cudaMemcpyDeviceToHost, device_.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device_.stream));
         double max = -std::numeric_limits<double>::infinity();
         std::int32_t top = 0;
         for (std::int32_t v = 0; v < vocab_; ++v) {
@@ -2137,6 +2448,27 @@ private:
         return a;
     }();
     std::array<std::uint32_t, kMaximumConcurrency> sample_lanes_{}; // the staged sample rows' lanes
+    // Constrained rows' masks (mask_bytes, fill_masks): device and pinned [kMaskSlots][words], and each staged row's
+    // dead positions (bit j: its j-th position has no legal token).
+    DeviceBuffer masks_;
+    std::optional<PinnedHostBuffer> host_masks_;
+    std::array<std::uint64_t, kMaximumConcurrency> mask_dead_{};
+    // The rows stage_sample left for fill_staged_masks.
+    std::array<std::size_t, kMaximumConcurrency> staged_rows_{};
+    std::size_t staged_masks_ = 0;
+    // Token constraints (constraint_words): device and pinned operands, the plan whose sets each lane's columns hold,
+    // and the staged call's rows: each one's descriptor (-1 unconstrained) and step.
+    DeviceBuffer constraint_;
+    std::optional<PinnedHostBuffer> constraint_host_;
+    std::array<std::uint64_t, kMaximumConcurrency> constraint_serials_{};
+    std::uint64_t next_constraint_serial_ = 1;
+    bool staged_constraint_               = false;
+    std::size_t staged_constraint_rows_   = 0;
+    std::array<std::int32_t, kMaximumConcurrency> staged_descriptors_{};
+    std::array<std::size_t, kMaximumConcurrency> staged_steps_{};
+    std::vector<float> captured_rows_; // TokenConstraint::capture_logits: the staged rows' logits, before the mask
+    // A graph key's bit for a capture without the sample (a constrained round samples after its masks).
+    static constexpr std::uint64_t kForwardOnlyGraph = 1ULL << 62;
     std::array<TokenId, kMaximumConcurrency> sampled_tokens_{};
     std::array<runtime::PendingRowFailure, kMaximumConcurrency> failures_{};
     std::map<std::uint64_t, DecodeGraphExecutable> graphs_;
@@ -2234,7 +2566,8 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     out.kv         = kv.bytes;
     out.page_bytes = kv.page_bytes;
     out.state     = static_cast<std::uint64_t>(layout.lane_words) * 2 * lanes;
-    out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2;
+    out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2 +
+             detail::mask_bytes(options, config.text.vocab_size) + detail::constraint_bytes(options);
     const bool dspark = options.dspark && !options.causal_scoring;
     out.workspace = Forward::device_bytes(config.text, static_cast<std::int32_t>(lanes), detail::forward_capacity(options),
                                           dspark, detail::expert_activation(options), options.a8) +

@@ -71,8 +71,8 @@ constexpr std::array kRules = {
     Rule{"--ngram-volume", kFlash},
     Rule{"--ngram-residency", kFlash},
     // Thinking and tools: Inkling's template has an effort instead of preserve_thinking, its output session has no loop
-    // guard or tolerant tool-call parsing, and it has no constrained tool route (infernix-serve refuses each:
-    // serve::refuse_unsupported_options). Its thinking budgets work as every model's.
+    // guard or tolerant tool-call parsing, and its constrained tool route has no parameter-name policy (infernix-serve
+    // refuses each: serve::refuse_unsupported_options). Its thinking budgets work as every model's.
     Rule{"--preserve-thinking", kQwen},
     Rule{"--tolerant-tool-calls", kQwen},
     Rule{"--tool-parameter-names", kQwen},

@@ -917,6 +917,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
+    // PromptOptions::open_answer: the template's generation prompt with thinking off already ends in the answer.
+    if (options.open_answer && (options.enable_thinking != false ||
+                                options.continuation != PromptContinuationMode::NewAssistantTurn)) {
+        throw std::invalid_argument("a prompt that opens the answer needs a new assistant turn with thinking off");
+    }
     const auto tool_call_output =
         fi::build_tool_call_output_contract(options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names,
                                             options.declared_parameter_names, options.withdrawn_tool_names);

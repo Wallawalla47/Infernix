@@ -10,7 +10,8 @@
 // count by token identity: their spellings in ordinary text tokens are the block's text. The end-of-turn token
 // `<|content_model_end_sampling|>` is the model's default stop token. A thinking budget closes the open thinking with
 // `<|end_message|>` (after the configured message, when there is one); the model then writes its answer's header
-// itself.
+// itself. A constrained turn's matcher (constraints.h) reads the same tokens in the same transactions: a round's
+// preview advances it, its commit confirms it and its discard rolls it back.
 
 #include "infernix/types.h"
 #include "runtime/contract/request.h"
@@ -27,6 +28,7 @@
 
 namespace infernix::text {
 class Tokenizer;
+class GrammarSession;
 }
 
 namespace infernix::models::inkling2 {
@@ -42,11 +44,22 @@ struct OutputMarkers {
     TokenId end_of_turn    = -1; // <|content_model_end_sampling|>
 };
 
+// One declared tool: its name, its declaration's parameter schema (JSON text; `{}` when it declares none), whether its
+// calls' arguments must satisfy that schema (strict), and its index among the declarations (the deferred ones after the
+// listed ones).
+struct DeclaredTool {
+    std::string name;
+    std::string parameters = "{}";
+    bool strict            = false;
+    std::size_t declaration_index = 0;
+};
+
 // The tools a call may name: the declared ones, or any name when the client keeps its own (PromptOptions::
 // open_tool_names). Without one, a call is text.
 struct ToolNames {
     std::unordered_set<std::string> declared;
     bool open = false;
+    std::vector<DeclaredTool> tools; // in declaration order, the withdrawn ones left out
 };
 
 class PublishedOutput {
@@ -90,6 +103,11 @@ public:
         // <|end_message|>.
         std::shared_ptr<const std::vector<TokenId>> thinking_control;
         std::shared_ptr<const ToolNames> tools; // null: no tools (calls are text)
+        // The turn's matcher (constraints.h), or null: the turn is free. It reads every token the session commits,
+        // the thinking control's included.
+        std::shared_ptr<text::GrammarSession> grammar;
+        // The prompt ended with the answer's opener (PromptOptions::open_answer): the first token is the answer's.
+        bool answer_opened = false;
     };
 
     OutputSession() noexcept;
@@ -112,18 +130,20 @@ public:
     [[nodiscard]] PublishedOutput commit_preview();
     void discard_preview();
 
-    // Inkling has no constrained route yet (the frontend refuses an OutputConstraint).
-    [[nodiscard]] bool constrained() const noexcept { return false; }
+    // Whether the turn runs under a grammar (Settings::grammar).
+    [[nodiscard]] bool constrained() const noexcept;
     // While the committed output's thinking is open: <|end_message|> closes it, and the end-of-turn token (and the
     // tool-call opener, when the turn declares tools) take no probability before it. Once a thinking budget is used up
     // (its control applied, or a block ended at it): <|content_thinking|> takes no probability for the rest of the turn.
     [[nodiscard]] runtime::ReasoningBan reasoning_ban() const noexcept;
-    void observe_constraint(bool, double) noexcept {}
-    void constraint_uploaded(std::size_t) noexcept {}
-    [[nodiscard]] std::optional<ConstraintObservation> constraint_observation() const { return std::nullopt; }
-    [[nodiscard]] std::uint64_t grammar_masks(std::span<const TokenId>, std::span<std::uint32_t>);
-    [[nodiscard]] bool constraint_pending() const noexcept { return false; }
-    [[nodiscard]] std::exception_ptr constraint_failure() const noexcept { return nullptr; }
+    void observe_constraint(bool timings, double prepare_seconds) noexcept;
+    void constraint_uploaded(std::size_t bytes) noexcept;
+    [[nodiscard]] std::optional<ConstraintObservation> constraint_observation() const;
+    // The legal tokens of the committed position and of each draft's after it (text::GrammarSession::masks); waits
+    // for a compile still running beside the prefill.
+    [[nodiscard]] std::uint64_t grammar_masks(std::span<const TokenId> drafts, std::span<std::uint32_t> words);
+    [[nodiscard]] bool constraint_pending() const noexcept;
+    [[nodiscard]] std::exception_ptr constraint_failure() const noexcept;
 
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] bool has_tool_calls() const noexcept;

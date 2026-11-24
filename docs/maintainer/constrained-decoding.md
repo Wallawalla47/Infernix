@@ -2,8 +2,9 @@
 
 This document defines the architecture, functional semantics and execution contract of Infernix's
 constrained decoding. GBNF, JSON object, JSON Schema, choice, regex and tool constraints are
-implemented across ordinary decoding, MTP, DFlash and DFlash2 (Qwen3.5) and ordinary decoding, MTP
-and n-gram copy drafting (Qwen3.8-Flash-Next). Content constraints are used through
+implemented across ordinary decoding, MTP, DFlash and DFlash2 (Qwen3.5), ordinary decoding, MTP
+and n-gram copy drafting (Qwen3.8-Flash-Next), and ordinary decoding, DSpark and the lossless route (Inkling 2
+Mini, §4.4). Content constraints are used through
 `RequestOptions::constraint`, the CLI and the three HTTP protocols; tool declarations belong to the
 Prompt and the call policy to `RequestOptions::tool_choice`.
 
@@ -114,7 +115,8 @@ not become Infernix's public contract.
 | Sampling / speculative Ops | legal-candidate filtering, probability normalization, p/q acceptance, residuals and sampling results |
 | Gateway / CLI | file acquisition, protocol field translation, protocol errors and response encoding |
 
-The generic adapter lives in `src/text/`; Qwen output semantics in `src/models/qwen3_5/frontend/`. The
+The generic adapter lives in `src/text/`; Qwen output semantics in `src/models/qwen3_5/frontend/`, Inkling 2's in
+`src/models/inkling2/frontend/` (`constraints.cpp`, §4.4). The
 execution data contract belongs to `src/runtime/contract/`; the physical consumers are owned by the
 Programs and Ops.
 
@@ -518,6 +520,44 @@ contract and are not part of the shared grammar's meaning. A continuation may ad
 unfinished call; a raw assistant prefix containing completed calls is rejected so history calls are
 never published again.
 
+### 4.4 Inkling 2 Mini
+
+Inkling 2's turn is blocks the model writes itself, `<|message_model|>NAME?<|content_K|>BODY<|end_message|>`,
+then its stop token `<|content_model_end_sampling|>` (`src/models/inkling2/frontend/output_session.h`). Its
+grammars (`src/models/inkling2/frontend/constraints.cpp`) state that framing with token-level rules, so the
+framing is one grammar with the content or calls, and a matcher step covers the block structure as well:
+
+| Turn | Grammar |
+|---|---|
+| content constraint C | thinking* answer(C) |
+| tools, `auto` | (thinking \| text)* calls? |
+| tools, `required` or named | thinking* calls |
+| tools, `none` (calls declared) | (thinking \| text)* |
+| JSON beside callable tools, `auto` | thinking* (answer(JSON) \| calls) |
+
+thinking is `<|message_model|><|content_thinking|>` free text `<|end_message|>`, free text being any token but
+the seven markers (so a thinking budget's control, its message text then `<|end_message|>`, ends a block);
+answer(C) is `<|message_model|><|content_text|>` C `<|end_message|>`; text is a block with any content opener
+(text, tool_error, invoke_tool_text) and free text; calls is one call block, then more when parallel. A call block
+is `<|message_model|>` the tool's name (optional, as the chat template writes it) `<|content_invoke_tool_json|>`
+`{"name": NAME, "args": ARGS}` `<|end_message|>`, one alternative per callable tool, ARGS the tool's schema when
+it is strict (its root must be an object) or any object; the call JSON, like a JSON answer, takes whitespace in
+runs of at most 32. The tool policy is selected as §4.3's (`select_tool_policy`), and the frontend's refusals are
+the Qwen ones (custom stops, raw output, preserved special tokens; a non-JSON answer beside callable tools).
+
+XGrammar admits no special token in a matcher or a mask, and Inkling's markers are special tokens. The Inkling
+compiler's vocabulary therefore spells each marker as the byte 0xFF, which is not UTF-8: no GBNF literal or class
+(code points, `CharToUTF8`), regex or JSON rule can match it, and only a `Token()` rule writes it, by id. The
+markers are the compiler's reserved ids (`GrammarCompiler`'s `reserved`): a request's GBNF may not name one in
+`Token()`/`ExcludeToken()`, and its `ExcludeToken` free text excludes them too, so a content constraint never
+writes the framing. Every other special token has no spelling and no rule admits it. A content constraint is
+compiled under `GrammarCompiler::compile_framed(constraint, ContentFraming)`, which keeps the content's validation and
+error kinds; tool grammars go through `compile_model`. The calls are parsed by the free route's parser from the
+committed blocks and arrive whole when their block closes (no argument streaming). The parser reads a call's JSON for
+its syntax alone and publishes the `args` object's text as the model wrote it: a grammar admits any JSON number, and a
+JSON library would round a 20-digit integer or refuse `1e400`, turning a strict call's arguments into something its
+schema refuses or the call into text.
+
 ## 5. Thinking, content and continuation
 
 ### 5.1 Shared output framing
@@ -856,6 +896,13 @@ verify forward, outside the CUDA Graph. The Program fills each constrained row's
 just before acceptance, so it needs no Forward/Finish split; drafts stay unconstrained. The two-row pair
 policy and the one-row confidence cut apply unchanged.
 
+Inkling 2 DSpark: the drafts are on the host before the verify call (the draft graph's copy-out). Inkling's
+verification keeps a draft only when it equals the target's own draw at its position (every column samples as plain
+decoding would), so it needs no proposal distribution and the masks only restrict each column's draw. A constrained
+row launches the verify forward alone (a forward-only graph), the matcher walks the drafts while it runs, and the
+masks' upload and the columns' sample follow on the stream. A dead position fails the request only where the round
+keeps it (positions 0 to the accepted count).
+
 ## 9. Speculative CPU/GPU timing (Qwen3.5)
 
 ### 9.1 Two phases
@@ -1029,7 +1076,10 @@ sharing one execution.
 
 Row masks are produced sequentially on the worker. Ordinary decode prepares them before sampling;
 speculative decode after the Forward is submitted (Qwen3.5) or just before acceptance
-(Qwen3.8-Flash-Next). Compile threads and active matcher advancement each own their objects.
+(Qwen3.8-Flash-Next). Inkling 2 fills every constrained row's masks after its call's forward is submitted,
+ordinary and DSpark rounds alike: a round with a constrained row launches its forward-only graph, and the
+masks' upload and the sample follow it on the stream, so mask work overlaps the forward. Compile threads and
+active matcher advancement each own their objects.
 
 Drafts stay unconstrained, which may lower acceptance on constrained workloads. The actual accepted
 length and total time are reported; the target constraint is never loosened to recover acceptance.

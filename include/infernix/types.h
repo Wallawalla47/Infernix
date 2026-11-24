@@ -1376,6 +1376,12 @@ struct PromptOptions {
     // NAME the call cannot take as its text (infernix-serve --tool-parameter-names declared). Off: names
     // stay open. The prompt does not change.
     bool declared_parameter_names = false;
+    // The prompt ends inside the reply's answer, so its next token is the answer's first (/v1/decide reads a decision
+    // there and generates a primitive from there). A Qwen template's generation prompt with thinking off already ends
+    // there, so Qwen requires enable_thinking false and renders nothing more; Inkling 2, whose lowest effort still
+    // thinks, ends the prompt with the answer's opener `<|message_model|><|content_text|>`. With a new assistant turn
+    // only, and no output constraint or tool policy beside it.
+    bool open_answer = false;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {

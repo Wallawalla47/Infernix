@@ -8,8 +8,9 @@
 // tool calls) and tool turns, images in user and tool turns (with --vision: each image part's one placeholder expanded
 // to its cells' image tokens; image.h processes the pixels), declared tools and the template's thinking effort
 // (PromptOptions::reasoning_effort, enable_thinking false = "none", or a chat_template_kwargs reasoning_effort string
-// or number in [0, 0.99]). It refuses what later milestones add: video, continuing a final assistant message, the
-// next-turn history prefill, constrained output and required or named tool choices (the constrained route), and the
+// or number in [0, 0.99]). A turn's output may be constrained (constraints.h): a content constraint, a tool policy
+// (required, named, strict, parallel false or ToolConstraintMode::Basic's protection of every call), or both. It
+// refuses what later milestones add: video, continuing a final assistant message, the next-turn history prefill and the
 // reasoning-loop guard.
 
 #include "infernix/types.h"
@@ -37,6 +38,8 @@ struct FrontendOptions {
     // --vision: the tower's config (image input accepted) and the image-token budget of an image (--vision-max-merged).
     std::optional<VisionConfig> vision;
     std::uint32_t vision_max_cells = 32768;
+    // The constraint compiler's cache of compiled grammars (EngineOptions::grammar_cache_bytes).
+    std::size_t grammar_cache_bytes = 0;
 };
 
 // One image of a prompt: its image tokens [first_token, first_token + cells) and its processed patches.
@@ -58,6 +61,8 @@ struct PreparedPromptData {
     std::vector<runtime::prefix_cache::TapHint> tap_hints;
     // False: the prompt neither reuses nor publishes cached state (Engine::prepare_tokens without a prefix identity).
     bool reusable = true;
+    // The prompt ends with the answer's opener (PromptOptions::open_answer): the reply starts inside its answer.
+    bool answer_opened = false;
     PromptPreparationStats stats;
 };
 
@@ -106,7 +111,8 @@ public:
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const noexcept { return {}; }
     [[nodiscard]] VisionImageBudget vision_image_budget() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const noexcept { return {}; }
-    void warm_constraints() const noexcept {}
+    // Builds the constraint compiler's vocabulary index (the Engine runs it beside startup).
+    void warm_constraints() const;
 
     // The rendered prompt text and its token ids (tests and tools).
     struct Rendered {

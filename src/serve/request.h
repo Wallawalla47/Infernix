@@ -295,6 +295,8 @@ struct GenerationRequest {
     // Tokens whose log-probabilities at the prompt's next position the outcome reports
     // (/v1/decide). Empty for every ordinary generation.
     std::vector<infernix::TokenId> readout_tokens;
+    // The prompt ends inside the reply's answer (PromptOptions::open_answer; /v1/decide).
+    bool open_answer = false;
     // Restricts each output token to its step's set (/v1/decide's generated primitives).
     infernix::TokenConstraint token_constraint;
     // Tokens that end generation once committed (a scalar's closing brace).

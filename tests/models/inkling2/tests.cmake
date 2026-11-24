@@ -30,6 +30,31 @@ infernix_add_test(infernix_inkling2_frontend_real_test
   NEEDS_SOURCE_DIR)
 set_tests_properties(infernix_inkling2_frontend_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# The constrained route (content constraints, tool policies, both) through the frontend and the output session: seeded
+# walks over the masks end in the declared language, refusals, and the masks' cost (CPU only); skips without
+# INFERNIX_TEST_INKLING_TOKENIZER_DIR.
+infernix_add_test(infernix_inkling2_constraints_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_constraints_real.cpp"
+  LIBRARIES infernix_model_runtime infernix_text infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_inkling2_constraints_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# POST /v1/decide's recipe on the real tokenizer: labels, every generated primitive's schedule, and a prompt that opens
+# the answer (CPU only); skips without INFERNIX_TEST_INKLING_TOKENIZER_DIR.
+infernix_add_test(infernix_inkling2_decide_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
+  LIBRARIES infernix_serve infernix_model_runtime infernix_text infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_inkling2_decide_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Constrained decoding through the public Engine on a real artifact: graphs, DSpark and C = 4 beside unconstrained
+# requests give the eager reference's tokens, in each request's language; skips without INFERNIX_INKLING2_ARTIFACT.
+infernix_add_test(infernix_inkling2_constrained_engine_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_constrained_engine_real.cpp"
+  LIBRARIES infernix_engine infernix::json)
+set_tests_properties(infernix_inkling2_constrained_engine_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 1800)
+
 # Through the public Engine (the Program's first slice), against an eager one-request Engine: the golden greedy
 # continuation, graphs, request invariance at C = 2, 4 and 8, prefill chunk width, and a scoring Engine's logits against
 # the forward test's (INFERNIX_INKLING2_LOGITS_GUARD). Skips without INFERNIX_INKLING2_ARTIFACT and

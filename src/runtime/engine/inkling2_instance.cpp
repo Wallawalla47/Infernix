@@ -53,7 +53,8 @@ models::inkling2::FrontendOptions frontend_options(const models::inkling2::Model
     return {.max_context             = options.max_context,
             .thinking_budget_message = options.thinking_budget_message,
             .vision                  = model.config().vision,
-            .vision_max_cells        = vision_max_cells(options)};
+            .vision_max_cells        = vision_max_cells(options),
+            .grammar_cache_bytes     = options.grammar_cache_bytes};
 }
 
 models::inkling2::ProgramOptions program_options(const EngineOptions& options, std::uint32_t lora_rank) {

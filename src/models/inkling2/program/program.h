@@ -3,12 +3,12 @@
 // Inkling 2's Program (design docs/maintainer/inkling2_mini-design.md §7-§8): the lanes, their state and KV, the
 // calls of the Forward (execution/forward.h), sampling and the commit of each round, behind the common EngineCore.
 //
-// First slice (.local tracker "F3 Program, first slice"): every lane's KV is reserved to the context limit at startup,
-// so a binding never waits for pages and no request is paused; the prefix cache, speculation, the n-gram archive,
-// next-turn prefill and constrained output are off for this architecture (normalize_inkling2_options refuses them).
-// Prompts prefill in chunks of up to 128 columns of one lane through the decode and verify kernels' arithmetic (a wide
-// call runs the same per-column bits; the wide-route milestone moves each Op's pass loop inside its kernel), decode
-// rounds are B lanes x 1 column as CUDA graphs per (B, T) captured at startup.
+// Every lane's KV is reserved to the context limit at startup, so a binding never waits for pages and no request is
+// paused; the n-gram archive and next-turn prefill are off for this architecture. Prompts prefill in chunks of one
+// lane; decode rounds are B lanes x 1 column as CUDA graphs per (B, T) captured at startup, and one decoding lane drafts
+// with DSpark. A constrained row (constrained-decoding.md §4.4) samples under its matcher's masks, filled while its
+// call's forward runs (a forward-only graph, then the sample); a token-constrained row (TokenConstraint, /v1/decide)
+// decodes plainly, its logits masked to its step's tokens before the sample (ops::constrain_logits).
 
 #include "core/startup.h"
 #include "infernix/types.h"

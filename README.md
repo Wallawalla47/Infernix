@@ -154,7 +154,7 @@ Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
   and deferred tools (`defer_loading`, regex/BM25 tool search, `tool_reference`) that keep large MCP
   catalogs out of the prompt.
 - **Constrained decoding**: JSON object and Schema, strict tool arguments, GBNF, regex and choice
-  grammars, with every Qwen model and drafter (not on Inkling 2 Mini yet).
+  grammars, with every model and drafter.
 - **Thinking control**: budgets with a wrap-up message, effort levels and a repetition guard
   (`--reasoning-loop`).
 - **Concurrency and resilience**: one to eight requests with preemption under memory pressure (Inkling

@@ -1374,17 +1374,16 @@ int main() {
         settled = settle(turn, server_off, qwen_plain);
         failures += check(!settled.enabled && !settled.controls.budget,
                           "--no-thinking gave a Qwen prompt that cannot think a budget");
-        // A token constraint owns every output step (POST /decide's, with thinking off): no budget, so Inkling 2
-        // answers with its own refusal of the constraint, not Engine's refusal of a budget beside one.
-        GenerationRequest constrained = off;
-        constrained.token_constraint.steps.assign(1024, std::vector<infernix::TokenId>{7});
-        constrained.max_tokens = 1024;
-        settled = settle(constrained, large_default, inkling);
-        failures += check(!settled.controls.budget, "a token-constrained Inkling 2 request took a thinking budget");
-        constrained.enable_thinking.reset();
-        settled = settle(constrained, large_default, inkling);
-        failures += check(!settled.controls.budget,
-                          "a token-constrained Inkling 2 request with thinking on took a thinking budget");
+        // An Inkling 2 prompt that opened the answer (POST /v1/decide: its token constraints own every output step)
+        // opens no reasoning: no budget, whatever the server's default.
+        const infernix::PromptSummary inkling_answer{.prompt_tokens = 100};
+        GenerationRequest decision = off;
+        decision.open_answer       = true;
+        decision.token_constraint.steps.assign(1024, std::vector<infernix::TokenId>{7});
+        decision.max_tokens = 1024;
+        settled = settle(decision, large_default, inkling_answer);
+        failures += check(!settled.enabled && !settled.controls.budget,
+                          "an Inkling 2 prompt that opened the answer took a thinking budget");
     }
     request.enable_thinking = false;
     const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);

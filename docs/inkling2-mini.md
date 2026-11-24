@@ -10,10 +10,11 @@ checkpoint's weights are unchanged ([what is stored](#what-the-artifact-stores))
 
 Generation works through `infernix` and `infernix-serve` (OpenAI Chat Completions and Responses,
 Anthropic Messages) with DSpark drafting, images, one to eight lanes, every KV format and the prefix
-cache. `infernix-perplexity` scores it, on the default route or with `--lossless`. It takes
-[LoRA adapters](lora.md#inkling-2) and [ablation sidecars](ablate.md). Several features
-of the Qwen models are [not available on Inkling yet](#not-supported-yet), among them constrained
-output and video.
+cache, and [constrained output and tool calls](#constrained-output-and-tool-calls).
+`infernix-perplexity` scores it, on the default route or with `--lossless`, and `infernix-serve` answers
+[`/v1/decide`](serving.md#decisions)'s readout questions (each prompt ends with the answer's opener, so the model answers
+without thinking first). It takes [LoRA adapters](lora.md#inkling-2) and [ablation sidecars](ablate.md). Several features
+of the Qwen models are [not available on Inkling yet](#not-supported-yet), among them video.
 
 **Engine version:** this model needs a build from `main` at `a487ad24f` or later, or a Windows release after
 `windows-2026.11.20`.
@@ -97,9 +98,7 @@ once the model has loaded; `--plan` reports them without loading.
 | Feature | On Inkling 2 Mini |
 |---|---|
 | Video input | the request is refused; images work |
-| Constrained output: `--grammar-file`, `--json-object`, `--json-schema-file`, `--choice`, `--regex` and the APIs' structured-output fields | the request is refused |
-| `tool_choice` set to required or to a named tool | the request is refused. `auto` and `none` work; tool calls are parsed from the model's free output, so no grammar protects their arguments |
-| A tool declared with `strict: true` | the request is refused, since nothing would check its arguments against the schema. Tools with `strict: false` or no `strict` field work |
+| `/v1/decide`'s generated types (`number`, `scalar`, `point`, `box`) | the request is refused (`question_type_unsupported`): they spell a number one digit a step, and Inkling's tokenizer writes digits in groups of up to three, so the answer would be noise. `noul`, `choice` and `score` work |
 | A request ending in an assistant message (prefill) | the request is refused: only a new assistant turn is rendered |
 | `--reasoning-loop stop` or `conclude` | refused: the model has no reasoning-loop guard |
 | `--preserve-thinking`, `--tolerant-tool-calls`, `--tool-parameter-names declared` | refused: Qwen template and tool-call options. The template renders the history's reasoning as given |
@@ -242,6 +241,33 @@ over HTTP) to a level; without one it uses 0.9.
   work.
 - Tool calls work through the OpenAI and Anthropic APIs. `--preserve-thinking` and
   `--tolerant-tool-calls` are Qwen options and are refused.
+
+## Constrained output and tool calls
+
+Constrained decoding works as on the Qwen models ([output constraints](serving.md#openai-chat-completions),
+[tool constraints](serving.md#tool-constraints), [design](maintainer/constrained-decoding.md#44-inkling-2-mini)): JSON object
+and JSON Schema answers, GBNF, regex and choice (`--json-object`, `--json-schema-file`, `--grammar-file`, `--regex`,
+`--choice` and the APIs' structured-output fields), and tool constraints: `tool_choice` required or a named tool, tools
+declared with `strict: true`, `parallel_tool_calls: false`, and the protection of every call
+(`tool_constraints:"basic"`, the default).
+
+- The model still thinks first: any number of thinking blocks, then the answer in one text block, then the end of the
+  turn. Only the answer follows the constraint, and thinking budgets work as without one. The grammar never lets the
+  turn end inside a thinking block, whatever `--end-in-thinking` says.
+- A tool call is the block the chat template writes, `<|message_model|>NAME<|content_invoke_tool_json|>` and
+  `{"name": "NAME", "args": {...}}`: the name must be a callable tool's, and the arguments an object (a strict tool's
+  must satisfy its schema, whose root must be an object). An `auto` choice lets the model think and answer in text before
+  its calls; `required` and named choices allow thinking, then calls; `none` allows no call.
+- A JSON answer and the call JSON take whitespace in runs of at most 32 characters. A JSON answer beside callable
+  tools (`auto`) is either the answer or the calls.
+- Calls arrive whole when they close, not streamed argument by argument as Qwen's constrained calls are. A call's
+  arguments are its `args` object as the model wrote it (with or without a constraint).
+- A constrained request needs the model's own end of turn: custom stop strings and raw output are refused beside a
+  constraint. `--tool-parameter-names declared` remains a Qwen option and is refused.
+- DSpark keeps drafting under a constraint: each verified position samples under its own mask, so the output is the
+  same as without the drafter. The masks are computed on the CPU while the GPU runs the forward pass: on an RTX 5090
+  (DSpark, one request) a turn with a tool declared decoded within 0.5 % of the same turn free, with the same tokens
+  (2026-11-24; several requests at once and `--spec off` not measured yet).
 
 ## Convert
 

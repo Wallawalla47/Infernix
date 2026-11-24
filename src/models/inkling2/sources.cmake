@@ -16,10 +16,12 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/lossless.cpp"
 )
-# Frontend: the prompt renderer and the output session (channels from the checkpoint's response_template).
+# Frontend: the prompt renderer, the output session (channels from the checkpoint's response_template) and the
+# constrained route's grammars.
 target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/frontend.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/output_session.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/frontend/constraints.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/image.cpp"
 )
 # Program: lanes, state, the Forward's calls, sampling and commit behind the common EngineCore.
