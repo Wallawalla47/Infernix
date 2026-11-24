@@ -66,12 +66,12 @@ public:
 };
 
 // The widest prefill call the CPU split (the gated stream) takes: `configured` columns on the reference link
-// (`reference_bytes_per_second`), inversely to the measured one, at most the CPU channel's call width. Probes of one
+// (`reference_bytes_per_second`), inversely to the measured one, at most `widest_call` columns. Probes of one
 // link differ by a few percent (27.4-27.7 GB/s on the reference box), so a link within 5 % of the reference counts as
 // it: otherwise a call exactly at the width (4,096 columns) takes the gated stream in one process and the blind one in
 // the next (candidates BX-09's first A/B mixed both).
 [[nodiscard]] std::int32_t split_width(double configured, double reference_bytes_per_second,
-                                       double link_bytes_per_second) noexcept;
+                                       double link_bytes_per_second, std::int32_t widest_call) noexcept;
 
 // The model-independent subset of a Program's options the engine follows (the Program's own
 // ProgramOptions carry them from the EngineOptions).

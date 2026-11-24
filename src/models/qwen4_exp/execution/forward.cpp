@@ -420,7 +420,7 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     const std::size_t sj = c.moe.shared_bank ? 1 : 0;
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts + sj), dim((k + sj) * t));
     // A gated call's copy-ahead guess (its routing and dispatch; gated calls are at most the CPU channel's width).
-    const std::size_t g = std::min<std::size_t>(t, ops::offloaded_moe::kMaxCpuCallColumns);
+    const std::size_t g = std::min<std::size_t>(t, ops::offloaded_moe::kMaxCpuWideCallColumns);
     bytes += k * g * 8 + g * 4 + ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * g));
     bytes += h * (k + sj) * t * bf +
              ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts + sj),
@@ -1949,7 +1949,8 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
             split.max_job_columns = channel.max_job_columns;
             split.narrow_a16      = channel.narrow_a16;
             split.ggml_a8         = channel.ggml_a8;
-            split.max_columns     = ops::offloaded_moe::kMaxCpuCallColumns;
+            // 4,096 stays the assisted share ramp's end; a wider gated call keeps no assisted share (split_keep_columns).
+            split.max_columns     = std::max(T, ops::offloaded_moe::kMaxCpuCallColumns);
             split.pcie_divisor    = 0;
             split.wide_from       = 1;
             split.wide_jobs       = static_cast<std::int32_t>(cpu);

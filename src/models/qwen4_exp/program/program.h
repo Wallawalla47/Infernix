@@ -525,7 +525,8 @@ struct ProgramOptions {
     // pp1024 gated without the copy-ahead, pp2048 and pp4096 blind; the row threshold then ExpertStream::ahead_rows'
     // T / 128): +10.2 %, +14.4 %, +8.9 %; without the copy-ahead the gated stream lost from 2,048 columns
     // (-2.3 % / -9.6 %). Since 2026-11-09 the guess routes the streams normed for the next layer and the threshold is
-    // T / 64 (Forward::moe, candidates YH-02).
+    // T / 64 (Forward::moe, candidates YH-02). An NVFP4 bank on FP4-Local's arithmetic with every expert in RAM or
+    // VRAM takes calls of up to 8,192 columns on free-cache-resume (ProgramImpl::wide_split, 2026-11-24).
     bool prefill_cpu_split           = true;
     double cpu_split_expert_rate     = 21000.0;
     double cpu_split_column_rate     = 66000.0;

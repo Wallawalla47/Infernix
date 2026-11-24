@@ -41,7 +41,7 @@ public:
     struct Options {
         int workers     = 8;     // including the service thread
         int max_jobs    = 4;     // CPU-served experts per layer call, at most kMaxCpuJobs
-        int max_columns = 64;    // calls with more columns stay on the GPU, at most kMaxCpuCallColumns
+        int max_columns = 64;    // calls with more columns stay on the GPU, at most kMaxCpuWideCallColumns
         int pcie_divisor = 3;    // misses / pcie_divisor stay on the GPU stage (0: none)
         int one_column_divisor = 0; // one-column calls' divisor instead (0: pcie_divisor)
         int pcie_share = 0;      // > 0: (misses * pcie_share) >> 8 stay on the GPU stage instead (MoeCpuChannel)

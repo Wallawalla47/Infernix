@@ -12705,7 +12705,7 @@ walk) fails on FP4-Local with and without this change and on main c2afefb2 alike
 tokens; not investigated here).
 
 **Bounded by the CPU split (2026-11-23, issue #77; same bits).** The walk streams every expert a layer lacks, while a
-single call within the prefill CPU split's width (`split_columns()`, 4,096 columns on the reference link) copies only
+single call within the prefill CPU split's width (`split_columns()`, 4,096 or 8,192 columns on the reference link) copies only
 what its gated stream routes and serves the rest on the CPU. An agent turn that does not echo its reply has exactly
 this shape: a few thousand new tokens and the generation opener's short last call. It walked, so a 2K-token turn moved
 17,000 experts (43.8 GiB, 18 GiB of them read from the SSD where the experts do not fit in RAM) where the same turn as
@@ -12731,6 +12731,45 @@ rule acts on the call grid: 1.69 s -> 1.20-1.54 s on Dense8, and on the reproduc
 with the rule on and off. That disagrees with 2026-10-27's pp4125 ABBA, which measured the walk level with chunk-major
 (Dense8 1.000x, IQ3_S 0.999x); the two are not reconciled, and IQ3_S was not measured here. A 16K-token call and its
 narrow last call still walk, so §19.3.42's pp16413 gain is untouched.
+
+**A wider split for NVFP4 banks with every expert held (2026-11-24, issue #77 follow-up; same bits).** Past 4,096 columns
+a resumed turn's call and its narrow last call walked, and an echoing client's single call took the blind stream: both
+moved every expert a layer lacks (44-46 GiB, 1.86-2.01 s on Dense8), where a gated call of 3,950-4,100 columns took
+1.28-1.56 s. For an NVFP4 bank on FP4-Local's arithmetic (`wide_assist`: Dense8 runs its 4-bit route, FP4-Local the
+exact 16-bit one) with every expert in RAM (full placement: no SSD tier, and no RAM resize takes expert RAM back), on
+free-cache-resume, `split_columns()` is now 8,192 on the reference link (`ProgramImpl::wide_split`). It scales with the
+link as before but never past 8,192, so about 4,300 on an x16 link, which is not measured. The exclusive layout (an SSD
+tier whose RAM holds only the experts VRAM does not) keeps 4,096 because it was not measured: every run below held every
+expert in RAM. The CPU plan's column map grew with it:
+`kMaxCpuWideCallColumns` (16,384) bounds a gated call, `kMaxCpuXColumns` (512 jobs of up to 8 columns) still bounds the
+columns one request publishes, the fused route (decode) no longer holds the map it never read, and the other plan names
+a column by its mask word's rank plus a popcount (a short per 32 columns where it kept one per column). The assisted
+calls' share ramp still ends at 4,096 columns.
+
+Measured (RTX 5090, PCIe 5.0 x8, INT8 KV, MTP auto, one conversation from 30K tokens growing by these widths, each arm
+from its own copy of the saved expert state, two rotated runs of two repeats: four samples a width; ratio of median
+prefill to the 4,096 limit; the limit was set by a temporary switch on this code, at 8,192 except for the echoing client's
+column, measured at 16,384, which takes the same path up to 8,192):
+
+| new tokens | Dense8, resumed | Dense8, echoing client | Dense8, cold prompt | FP4-Local, resumed |
+|---:|---:|---:|---:|---:|
+| 4,200 | 0.729x (1.93 -> 1.41 s) | 0.720x | 0.713x | 0.741x |
+| 5,000 | 0.779x | 0.779x | 0.746x | 0.767x |
+| 6,000 | 0.830x | 0.825x | 0.823x | 0.794x |
+| 7,000 | 0.862x | 0.860x | 0.851x | 0.839x |
+| 8,000 | 0.943x | 0.954x | 0.915x | 0.918x |
+| 10,000 (walks either way) | 1.001x | | | 0.996x |
+
+A limit of 16,384 lost past the crossover (resumed 10,000 tokens 1.045x, 12,000 1.144x, 16,000 1.233x; echoing 1.061x,
+1.189x, 1.353x), so 8,192. Kept at 4,096, because 8,192 measured slower there: IQ3_S (1.09-1.36x at 4,200-8,000), the
+block-FP8 bank on the SSD tier (1.05-1.13x), Dense8 with 32 GiB of expert RAM (0.97x at 4,200, 1.03-1.06x at
+5,000-8,000: the gated call reads its SSD-only experts on demand), and the reproducible route (one sample: 8,434 new
+tokens on its 8,192-token call grid 1.13x; the cause was not traced). Unchanged widths: 600-4,000
+tokens 0.997-1.006x a width, 1.002x summed, against the binary before the change. Decode after a 4,000-token prompt
+(eight prompts, 320 tokens each, MTP 3): before 180.8 and 180.9 tok/s, after 188.7 and 180.6 (the faster run is not
+explained); every reply identical. On the reproducible route the 8,192 limit gave the same replies as before for seven
+of seven, a gated 8,192-column call with 3,039 CPU experts among them. `infernix_offloaded_moe_layer_test` covers gated
+calls of 4,100, 8,200 and 16,384 columns whose CPU jobs read columns across the whole call.
 
 ### 19.3.43 NVFP4 W4A16 banks split decode misses by the share form (2026-10-30; placement only; default)
 

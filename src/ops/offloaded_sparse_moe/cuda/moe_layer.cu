@@ -2169,25 +2169,36 @@ __device__ __forceinline__ void plan_barrier() {
     }
 }
 
+// The non-fused plan's column compaction. The fused route (Named) names each column by its own index and has none, so
+// its static shared memory holds no column map. A column's compact index is its word's rank plus the used columns below
+// it in the word, which takes one short per 32 columns where a per-column map took one per column.
+template <bool Named>
+struct CpuPlanColumns {
+    static constexpr int kMaskWords = offloaded_moe::kMaxCpuWideCallColumns / 32;
+    unsigned used[kMaskWords];                       // x columns the chosen jobs read
+    short rank[kMaskWords];                          // used columns below each mask word
+    short published[offloaded_moe::kMaxCpuXColumns]; // compact index -> column
+    int publish_count;
+};
+template <>
+struct CpuPlanColumns<true> {};
+
 // The shared state of one CPU plan (one allocation, so the fused route kernel's static shared memory
 // holds a single plan).
-struct CpuPlanShared {
+template <bool Named>
+struct CpuPlanShared : CpuPlanColumns<Named> {
     static constexpr int kWidths    = offloaded_moe::kMaxCpuColumns;
     // A miss's category: its width w for an SSD-only expert (no host record, MoeExpertSource::
     // host_table), kWidths + w for one in host memory. SSD-only experts are chosen first (only the
     // CPU can serve them), then host-memory misses under the PCIe divisor rule; without a host table
     // every miss is in host memory and the choice is the width-ordered one alone.
     static constexpr int kCats      = 2 * kWidths;
-    static constexpr int kMaskWords = offloaded_moe::kMaxCpuCallColumns / 32;
     // cpu_plan_body ranks at most kChunks chunks of kThreads jobs: the dispatch's 1,024 experts
     // (moe_dispatch requires at most kDispatchThreads), so every call fits.
     static constexpr int kChunks    = kDispatchThreads / kThreads;
     int take[kCats + 1], first_slot[kCats + 1];
-    unsigned used[kMaskWords];                          // x columns the chosen jobs read
-    short compact[offloaded_moe::kMaxCpuCallColumns];   // column -> compact index
-    short published[offloaded_moe::kMaxCpuXColumns];    // compact index -> column
     int slot_first[offloaded_moe::kMaxCpuJobs];         // a chosen job's first dispatch entry
-    int chosen, publish_count;
+    int chosen;
     // Each (chunk, warp)'s misses of each category, then their exclusive prefix in (chunk, warp)
     // order; each (chunk, warp)'s host-memory misses; a chosen job's width.
     int chunk_misses[kChunks][kWarps][kCats + 1];
@@ -2223,10 +2234,10 @@ template <bool Named>
 __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const MoeExpertSource& source,
                                               const bf16* __restrict__ x, int columns, int top_k, int max_jobs,
                                               std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call,
-                                              CpuPlanShared& sm) {
-    constexpr int kWidths = CpuPlanShared::kWidths;
-    constexpr int kCats   = CpuPlanShared::kCats;
-    constexpr int kChunks = CpuPlanShared::kChunks;
+                                              CpuPlanShared<Named>& sm) {
+    constexpr int kWidths = CpuPlanShared<Named>::kWidths;
+    constexpr int kCats   = CpuPlanShared<Named>::kCats;
+    constexpr int kChunks = CpuPlanShared<Named>::kChunks;
     const auto& channel   = source.cpu;
     const int jobs        = min(*dispatch.job_count, max_jobs);
     const int chunks      = (jobs + kThreads - 1) / kThreads; // at most kChunks (cpu_plan)
@@ -2234,7 +2245,10 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
     const int cap = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int j = threadIdx.x; j < max_jobs; j += kThreads) { cpu_flags[j] = 0; }
-    if (threadIdx.x < CpuPlanShared::kMaskWords) { sm.used[threadIdx.x] = 0; }
+    if constexpr (!Named) {
+        const int used_words = (columns + 31) / 32;
+        for (int w = threadIdx.x; w < used_words; w += kThreads) { sm.used[w] = 0; }
+    }
     // A job's category (0: not a CPU candidate) | its rank among its warp's jobs of that category << 8.
     int packed[kChunks];
 #pragma unroll
@@ -2412,17 +2426,14 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         }
     } else {
         if (warp == 0) {
-            // Lane l compacts mask words 4l .. 4l + 3 after the used columns of the lower lanes.
-            static_assert(CpuPlanShared::kMaskWords == 4 * 32, "warp 0 compacts four mask words a lane");
-            const int words = (columns + 31) / 32;
-            unsigned word[4];
-            int count = 0;
-#pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const int w = 4 * lane + u;
-                word[u]     = w < words ? sm.used[w] : 0U;
-                count += __popc(word[u]);
-            }
+            // The call's mask words, an equal run per lane: lane l ranks its run after the used columns of the lower
+            // lanes and names the run's columns in order.
+            const int words    = (columns + 31) / 32;
+            const int per_lane = (words + 31) / 32;
+            const int first    = per_lane * lane;
+            const int last     = min(first + per_lane, words);
+            int count          = 0;
+            for (int w = first; w < last; ++w) { count += __popc(sm.used[w]); }
             int incl = count;
 #pragma unroll
             for (int offset = 1; offset < 32; offset <<= 1) {
@@ -2430,12 +2441,10 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
                 if (lane >= offset) { incl += v; }
             }
             int k = incl - count;
-#pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                for (unsigned m = word[u]; m != 0U; m &= m - 1U) {
-                    const int t     = (4 * lane + u) * 32 + __ffs(static_cast<int>(m)) - 1;
-                    sm.compact[t]   = static_cast<short>(k);
-                    sm.published[k] = static_cast<short>(t);
+            for (int w = first; w < last; ++w) {
+                sm.rank[w] = static_cast<short>(k);
+                for (unsigned m = sm.used[w]; m != 0U; m &= m - 1U) {
+                    sm.published[k] = static_cast<short>(w * 32 + __ffs(static_cast<int>(m)) - 1);
                     ++k;
                 }
             }
@@ -2445,8 +2454,8 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += kThreads) {
             const int slot = i / offloaded_moe::kMaxCpuColumns, c = i % offloaded_moe::kMaxCpuColumns;
             if (c < sm.slot_width[slot]) {
-                channel.request->column[slot][c] = sm.compact[moe::wide::entry_column(
-                    dispatch.entries[sm.slot_first[slot] + c], top_k, dispatch.shared_first)];
+                const int t = moe::wide::entry_column(dispatch.entries[sm.slot_first[slot] + c], top_k, dispatch.shared_first);
+                channel.request->column[slot][c] = sm.rank[t / 32] + __popc(sm.used[t / 32] & ((1U << (t % 32)) - 1U));
             }
         }
         const int publish_count = sm.publish_count;
@@ -2472,8 +2481,8 @@ template <bool Named>
 __device__ __forceinline__ void cpu_plan(const MoeDispatch& dispatch, const MoeExpertSource& source,
                                          const bf16* __restrict__ x, int columns, int top_k, int max_jobs,
                                          std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
-    static_assert(CpuPlanShared::kChunks * kThreads >= kDispatchThreads, "a call's jobs fit the plan's chunks");
-    __shared__ CpuPlanShared sm;
+    static_assert(CpuPlanShared<Named>::kChunks * kThreads >= kDispatchThreads, "a call's jobs fit the plan's chunks");
+    __shared__ CpuPlanShared<Named> sm;
     cpu_plan_body<Named>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call, sm);
 }
 
@@ -3073,7 +3082,7 @@ void require_cpu_channel(const Tensor& x, const MoeExpertSource& source) {
                 source.cpu.done != nullptr && source.cpu.sequence != nullptr &&
                 source.cpu.max_jobs <= offloaded_moe::kMaxCpuJobs && source.cpu.wide_jobs >= 0 &&
                 source.cpu.wide_jobs <= offloaded_moe::kMaxCpuJobs &&
-                source.cpu.max_columns <= offloaded_moe::kMaxCpuCallColumns && source.cpu.max_job_columns >= 1 &&
+                source.cpu.max_columns <= offloaded_moe::kMaxCpuWideCallColumns && source.cpu.max_job_columns >= 1 &&
                 source.cpu.max_job_columns <= offloaded_moe::kMaxCpuColumns &&
                 reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
                 reinterpret_cast<std::uintptr_t>(source.cpu.x) % 16 == 0,

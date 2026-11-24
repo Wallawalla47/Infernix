@@ -5320,7 +5320,7 @@ private:
     [[nodiscard]] std::size_t wide_need(std::int32_t width) const {
         if (!planner_) { return workspace_bytes(c_, options_, plan_, plan_.lanes, width); }
         const std::int32_t cells = mtp_ ? width + 1 : 0;
-        const bool gate          = width <= ops::offloaded_moe::kMaxCpuCallColumns;
+        const bool gate          = width <= std::max(ops::offloaded_moe::kMaxCpuCallColumns, split_columns());
         return std::max({planner_->plan_run({.columns = width, .mtp_cells = cells, .logits = true, .may_gate = gate}),
                          planner_->plan_walk_mixer(width), planner_->plan_walk_finish(width, cells, true),
                          planner_->plan_walk_moe(width), drafter_bytes()}) +
@@ -7658,10 +7658,33 @@ private:
     }
 
     // The widest call the prefill CPU split takes (ProgramOptions::cpu_split_columns on the reference
-    // link, inversely to the measured one; at most the CPU channel's call width): runtime::expert_offload::split_width.
+    // link, inversely to the measured one): runtime::expert_offload::split_width. wide_split() raises it to
+    // kWideSplitColumns.
     [[nodiscard]] std::int32_t split_columns() const noexcept {
-        return runtime::expert_offload::split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond,
-                                                    link_bytes_per_second_);
+        return wide_split()
+                   ? runtime::expert_offload::split_width(kWideSplitColumns, kReferenceLinkBytesPerSecond, link_bytes_per_second_,
+                                                          static_cast<std::int32_t>(kWideSplitColumns))
+                   : runtime::expert_offload::split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond,
+                                                          link_bytes_per_second_, ops::offloaded_moe::kMaxCpuCallColumns);
+    }
+    // An NVFP4 bank on FP4-Local's arithmetic (wide_assist: the 4-bit route, as Dense8 runs, or the exact 16-bit one, as
+    // FP4-Local runs) with every expert in RAM (no SSD tier: full placement, whose RAM no resize takes back), on
+    // free-cache-resume, splits calls up to kWideSplitColumns on
+    // the reference link, at most that on a slower one (design §19.3.42): a resumed turn of 4,097-8,192 new tokens, one call
+    // and the opener's narrow last call (or one call for an echoing client), keeps the gated stream and the CPU split where
+    // it walked, and a cold prompt of that width takes them instead of the blind stream. RTX 5090 on PCIe 5.0 x8, prefill
+    // against the 4,096 limit (2026-11-24, ABBA, four samples a width, ratio of medians):
+    //   Dense8, a resumed turn: 4,200 tokens 0.729x (1.93 -> 1.41 s), 5,000 0.779x, 6,000 0.830x, 7,000 0.862x,
+    //   8,000 0.943x; an echoing client 0.720-0.954x (measured with a 16,384 limit, the same path to 8,192); cold
+    //   prompts 0.713-0.915x. FP4-Local: 0.741-0.918x. 10,000+ tokens walk as before. A 16,384 limit lost past the
+    //   crossover (Dense8 10,000 1.045x, 12,000 1.144x, 16,000 1.233x). Kept at 4,096, where 8,192 measured slower:
+    //   IQ3_S (1.09-1.36x), the block-FP8 bank on the SSD tier (1.05-1.13x), Dense8 with 32 GiB of expert RAM (0.97x at
+    //   4,200, 1.03-1.06x at 5,000-8,000; its gated calls read SSD-only experts on demand), and the reproducible route
+    //   (one sample, 8,434 tokens on its 8,192-token call grid, 1.13x; the cause was not traced). Not measured, so kept:
+    //   the exclusive RAM layout (an SSD tier whose RAM holds only what VRAM does not).
+    static constexpr double kWideSplitColumns = 8192.0;
+    [[nodiscard]] bool wide_split() const noexcept {
+        return options_.free_cache_resume && !tier_ && wide_assist();
     }
 
 public:

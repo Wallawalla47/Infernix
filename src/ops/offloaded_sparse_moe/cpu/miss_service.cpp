@@ -73,7 +73,7 @@ void pin(std::uint64_t cpus) {
 CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     : layers_(std::move(layers)), options_(std::move(options)) {
     if (options_.workers < 1 || options_.max_jobs < 1 || options_.max_jobs > kMaxCpuJobs ||
-        options_.max_columns < 1 || options_.max_columns > kMaxCpuCallColumns || options_.max_job_columns < 1 ||
+        options_.max_columns < 1 || options_.max_columns > kMaxCpuWideCallColumns || options_.max_job_columns < 1 ||
         options_.max_job_columns > kMaxCpuColumns || options_.wide_from < 0 || options_.wide_jobs < 0 ||
         options_.wide_jobs > kMaxCpuJobs || (options_.wide_from > 0) != (options_.wide_jobs > 0)) {
         throw std::invalid_argument("CPU miss service options are out of range");

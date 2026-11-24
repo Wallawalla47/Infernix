@@ -11,7 +11,10 @@ namespace infernix::ops::offloaded_moe {
 inline constexpr int kMaxCpuJobs        = 512;  // CPU-served experts per layer call (a prefill call's CPU share: up to every expert)
 inline constexpr int kMaxCpuColumns     = 8;    // columns per CPU-served expert (the narrow route's n)
 inline constexpr int kMaxCpuCallColumns = 4096; // columns of a CPU-served call (decode: 8 lanes x width 16; prefill: one chunk)
-inline constexpr int kMaxCpuXColumns    = 4096; // x columns one request publishes (compacted: at most the call's columns)
+inline constexpr int kMaxCpuXColumns    = 4096; // x columns one request publishes (compacted: at most jobs x columns per job)
+// The widest gated prefill call whose CPU share the plan compacts (Flash-Next's split): its CPU experts still publish at
+// most kMaxCpuXColumns columns.
+inline constexpr int kMaxCpuWideCallColumns = 16384;
 inline constexpr int kMaxLandingSlots   = 32;  // landing frames of one call (MoeExpertSource::landing)
 
 // Written by the device: every field, a system-scope fence, then `sequence` (never 0: the device
