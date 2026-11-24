@@ -186,32 +186,43 @@ def rmsnorm_cases(rng):
                [u32(x) if x_fp32 else u16(x), u16(w)], u32(out) if out_fp32 else u16(out))
 
 
+def mix_case(H, T, kinds, queries, sources, q):
+    scale = f32(H ** -0.5)
+    outs = [[] for _ in range(queries)]
+    for t in range(T):
+        n = []
+        for s in sources:
+            row = s[t * H:(t + 1) * H]
+            f = rms_factor(row, 1e-6)
+            n.append([f32(v * f) for v in row])
+        for qi in range(queries):
+            qq = q[qi * H:(qi + 1) * H]
+            logits = [f32(f32_exact(sum((Fraction(a) * Fraction(b) for a, b in zip(qq, nj)), Fraction(0))) * scale)
+                      for nj in n]
+            p = softmax_f32(logits)
+            for i in range(H):
+                outs[qi].append(f32_exact(sum((Fraction(p[j]) * Fraction(n[j][i]) for j in range(len(n))),
+                                              Fraction(0))))
+    inputs = [u32(s) if fp32 else u16(s) for s, fp32 in zip(sources, kinds)] + [u32(q)]
+    expected = []
+    for o in outs:
+        expected += u32(o)
+    return MIX, [H, T, len(kinds), queries] + [int(k) for k in kinds], inputs, expected
+
+
 def mix_cases(rng):
     for H, T, kinds, queries in ((2304, 2, [False, False, False, True], 1), (2304, 1, [False, False, True], 3),
                                  (256, 3, [False, False, False, False, False, False], 4), (2304, 1, [False, True], 4)):
         sources = [[(random_f32 if fp32 else random_bf16)(rng, 3) for _ in range(H * T)] for fp32 in kinds]
         q = [f32(rng.gauss(0.0, 1.0) * 0.5) for _ in range(H * queries)]
-        scale = f32(H ** -0.5)
-        outs = [[] for _ in range(queries)]
-        for t in range(T):
-            n = []
-            for s in sources:
-                row = s[t * H:(t + 1) * H]
-                f = rms_factor(row, 1e-6)
-                n.append([f32(v * f) for v in row])
-            for qi in range(queries):
-                qq = q[qi * H:(qi + 1) * H]
-                logits = [f32(f32_exact(sum((Fraction(a) * Fraction(b) for a, b in zip(qq, nj)), Fraction(0))) * scale)
-                          for nj in n]
-                p = softmax_f32(logits)
-                for i in range(H):
-                    outs[qi].append(f32_exact(sum((Fraction(p[j]) * Fraction(n[j][i]) for j in range(len(n))),
-                                                  Fraction(0))))
-        inputs = [u32(s) if fp32 else u16(s) for s, fp32 in zip(sources, kinds)] + [u32(q)]
-        expected = []
-        for o in outs:
-            expected += u32(o)
-        yield MIX, [H, T, len(kinds), queries] + [int(k) for k in kinds], inputs, expected
+        yield mix_case(H, T, kinds, queries, sources, q)
+    # A softmax whose largest logit is a tiny nonzero value (about 2^-45, a full 24-bit significand) beside logits
+    # of -8..-100: l_j - m is not exact in binary64, so the kernel takes its exponents from 0 there. Source j is one
+    # at element j and zero elsewhere, so logit j is set by query element j alone (n_j[j] * scale is about 1).
+    H, wanted = 256, [2.0 ** -45 * 1.3710938, -8.0, -20.5, -41.25, -70.125, -100.0625]
+    sources = [[1.0 if i == j else 0.0 for i in range(H)] for j in range(len(wanted))]
+    q = [f32(wanted[i]) if i < len(wanted) else 0.0 for i in range(H)]
+    yield mix_case(H, 1, [False] * len(wanted), 1, sources, q)
 
 
 def message_gate_cases(rng):
@@ -355,6 +366,16 @@ def probs_cases(rng):
             out += row[:keys] + scores[column * ld + keys:(column + 1) * ld]
         yield (PROBS, [keys, ld, T, begin, window, head, heads, rel, extent, f32_bits(scale), count],
                [u16(scores), u16(r), u16(table), u16(sinks)], u16(out))
+    # A row whose maximum is a tiny nonzero logit (2^-45) beside logits of -8..-700: s_j - m is not exact in binary64,
+    # so the kernel takes its exponents from 0 there. No relative bias (zero factors), one head, one query column.
+    keys, ld, heads, extent, scale = 64, 64, 1, 40, f32(128 ** -0.5)
+    logits_wanted = [-(8.0 + 692.0 * j / (keys - 2)) for j in range(keys - 1)] + [2.0 ** -45]
+    scores = [bf(Fraction(v) / Fraction(scale)) for v in logits_wanted]
+    r, table, sinks = [0.0] * rel, [0.0] * (rel * extent), [bf(-750.0)]
+    logits = [bf(Fraction(s) * Fraction(scale)) for s in scores]
+    p = softmax_f32(logits + sinks)[:-1]
+    yield (PROBS, [keys, ld, 1, keys - 1, 0, 0, heads, rel, extent, f32_bits(scale), 1],
+           [u16(scores), u16(r), u16(table), u16(sinks)], u16([bf(pj) for pj in p]))
 
 
 def router_cases(rng):

@@ -395,6 +395,7 @@ void set_noise_seed_rope(unsigned long long seed, float scale);
 void set_noise_seed_linear(unsigned long long seed, float scale);
 void set_noise_seed_linear_ggml_i(unsigned long long seed, float scale);
 void set_noise_seed_linear_ggml_k(unsigned long long seed, float scale);
+void set_noise_seed_lora(unsigned long long seed, float scale);
 } // namespace lossless
 
 void lossless_set_noise(std::uint64_t seed, std::uint32_t units, float scale) {
@@ -408,6 +409,7 @@ void lossless_set_noise(std::uint64_t seed, std::uint32_t units, float scale) {
     lossless::set_noise_seed_moe(pick(LosslessNoiseUnit::Moe), scale);
     lossless::set_noise_seed_rope(pick(LosslessNoiseUnit::Rope), scale);
     lossless::set_noise_seed_linear(pick(LosslessNoiseUnit::Linear), scale);
+    lossless::set_noise_seed_lora(pick(LosslessNoiseUnit::Linear), scale);
     lossless::set_noise_seed_linear_ggml_i(pick(LosslessNoiseUnit::Gguf), scale);
     lossless::set_noise_seed_linear_ggml_k(pick(LosslessNoiseUnit::Gguf), scale);
 }

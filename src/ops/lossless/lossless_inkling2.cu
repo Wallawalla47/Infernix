@@ -153,9 +153,13 @@ __device__ void softmax_small(const float* l, int n, float* p) {
         for (int j = 0; j < n; ++j) { p[j] = NAN; }
         return;
     }
+    // The reference the exponents are taken from: the maximum, or 0 when it is below 2^-16 in magnitude (a tiny
+    // nonzero maximum would make l_j - m inexact in binary64; every l_j is at most it, so e^(l_j) cannot overflow).
+    // With it l_j - m is exact wherever e^(l_j - m) is not negligible, and the softmax does not depend on the reference.
+    m = fabsf(m) < 0x1p-16F ? 0.0F : m;
     double e[8], s = 0.0;
     for (int j = 0; j < n; ++j) {
-        const double d = static_cast<double>(l[j]) - static_cast<double>(m); // exact
+        const double d = static_cast<double>(l[j]) - static_cast<double>(m); // exact (the reference above)
         e[j]           = d < -745.0 ? 0.0 : exp(d);
         s += e[j];
     }
@@ -518,6 +522,10 @@ __global__ void __launch_bounds__(kProbsThreads) probs_kernel(ProbsArgs a) {
     nan = block_any(nan, shared_flag);
     m   = block_max(m, shared_max);
     const bool invalid = nan || isinf(m);
+    // The exponents' reference: the maximum, or 0 when it is below 2^-16 in magnitude (a tiny nonzero maximum would
+    // make s_j - m inexact in binary64, an error the 2^-50 margin below does not cover; every value is at most it, so
+    // e^(s_j) cannot overflow). With it s_j - m is exact wherever e^(s_j - m) is not negligible.
+    m = fabsf(m) < 0x1p-16F ? 0.0F : m;
     // Pass 2: the sum of exponentials in double-double (each term within an ulp of binary64).
     DD s = {0.0, 0.0};
     if (!invalid) {

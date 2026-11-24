@@ -11,6 +11,7 @@
 #include "core/device.h"
 #include "core/weight.h"
 #include "infernix/ops/lossless_linear.h"
+#include "ops/lossless/cr_math.cuh"
 
 #include <cuda_bf16.h>
 
@@ -134,6 +135,22 @@ __global__ void lossless_lora_expand_b_kernel(const float* __restrict__ b, std::
     }
 }
 
+// fp32(d s) and fp32(y + term), each correctly rounded, or with a noise seed the twin's stochastic rounding of the same
+// exact value (ops/lossless/noise.cuh): d s is exact in binary64, and y + term's rounding error is TwoSum's.
+__device__ __forceinline__ float lora_term(float d, float s) {
+    const float r = __fmul_rn(d, s);
+    if (!lossless::noise_active()) { return r; }
+    const double exact = static_cast<double>(d) * static_cast<double>(s);
+    return lossless::f32_noise(r, exact - static_cast<double>(r), lossless::value_key(exact));
+}
+__device__ __forceinline__ float lora_sum(float y, float term) {
+    const float r = __fadd_rn(y, term);
+    if (!lossless::noise_active()) { return r; }
+    const float back = __fsub_rn(r, y);
+    const float err  = __fadd_rn(__fsub_rn(y, __fsub_rn(r, back)), __fsub_rn(term, back)); // TwoSum: exact
+    return lossless::f32_noise(r, static_cast<double>(err), lossless::value_key(static_cast<double>(r), err));
+}
+
 // y[y_row + n, column0 + t] = bf16(fp32(y + fp32(d fp32(s)))).
 __global__ void lossless_lora_apply_kernel(__nv_bfloat16* __restrict__ y, std::int32_t y_rows, std::int32_t y_row,
                                            const float* __restrict__ d, std::int32_t rows, std::int32_t columns,
@@ -144,8 +161,9 @@ __global__ void lossless_lora_apply_kernel(__nv_bfloat16* __restrict__ y, std::i
         const std::int64_t t = i / rows;
         const std::int64_t n = i % rows;
         __nv_bfloat16& out   = y[(column0 + t) * y_rows + y_row + n];
-        const float term     = __fmul_rn(d[t * rows + n], scale);
-        out                  = __float2bfloat16_rn(__fadd_rn(__bfloat162float(out), term));
+        const float sum      = lora_sum(__bfloat162float(out), lora_term(d[t * rows + n], scale));
+        out = lossless::noise_active() ? __ushort_as_bfloat16(lossless::bf16_of_double(static_cast<double>(sum)))
+                                       : __float2bfloat16_rn(sum);
     }
 }
 
@@ -161,7 +179,7 @@ __global__ void lossless_lora_apply_fp32_kernel(float* __restrict__ y, std::int3
         const std::uint32_t t = i / urows;
         const std::uint32_t n = i % urows;
         float& out = y[(static_cast<std::int64_t>(column0) + t) * y_rows + y_row + n];
-        out        = __fadd_rn(out, __fmul_rn(d[i], scale));
+        out        = lora_sum(out, lora_term(d[i], scale));
     }
 }
 
@@ -264,3 +282,6 @@ void lossless_lora_add(Tensor& y, std::int32_t y_row, const float* b, std::int32
 }
 
 } // namespace infernix::ops
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh): the adapter term's roundings belong to Linear.
+INFERNIX_LOSSLESS_NOISE_UNIT(lora)
