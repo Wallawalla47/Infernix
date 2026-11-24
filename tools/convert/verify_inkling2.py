@@ -2,7 +2,7 @@
 docs/maintainer/inkling2_mini-design.md §18), independent of the converter: its own safetensors reader and its own
 inverse of every mapping.
 
-    python -m tools.convert.verify_inkling2 --model CHECKPOINT --artifact OUT.infernix [--report FILE]
+    python -m tools.convert.verify_inkling2 --model CHECKPOINT --artifact OUT.infernix [--report FILE] [--token-rank F]
 
 Every bound parameter must equal its checkpoint source:
 
@@ -231,7 +231,23 @@ def _verify_mxfp8(artifact: Artifact, name: str, ck: _Checkpoint, x: str, shape)
             raise AssertionError(f"{name}: {key} differ from the checkpoint")
 
 
-def verify(model: Path, artifact_path: Path) -> dict:
+def _verify_rank(stored: bytes, model: Path, vocab: int, token_rank: Path | None) -> None:
+    """The stored rank order: a permutation of the vocabulary, the tokenizer's special tokens first, and (given the
+    file it was made from) that file's words."""
+    if len(stored) != 4 * vocab:
+        raise AssertionError("proposal/token_rank: not one int32 per token")
+    order = [int.from_bytes(stored[i : i + 4], "little", signed=True) for i in range(0, len(stored), 4)]
+    if sorted(order) != list(range(vocab)):
+        raise AssertionError("proposal/token_rank: not a permutation of the vocabulary")
+    added = json.loads((model / "tokenizer.json").read_text(encoding="utf-8"))["added_tokens"]
+    special = {int(token["id"]) for token in added if token.get("special")}
+    if set(order[: len(special)]) != special:
+        raise AssertionError("proposal/token_rank: the special tokens do not come first")
+    if token_rank is not None and token_rank.read_bytes() != stored:
+        raise AssertionError("proposal/token_rank: differs from the rank file")
+
+
+def verify(model: Path, artifact_path: Path, token_rank: Path | None = None) -> dict:
     began = time.time()
     index = model / "model.safetensors.index.json"
     if index.exists():
@@ -263,6 +279,10 @@ def verify(model: Path, artifact_path: Path) -> dict:
                         raise AssertionError(f"{name}: stored as {obj_format}, its config says MXFP8")
                     _verify_mxfp8(artifact, name, ck, x, shape)
                     counts["mxfp8_banks"] += 1
+                continue
+            if name == "proposal/token_rank":
+                _verify_rank(_bound(artifact, name), model, vocab, token_rank)
+                counts["token_rank"] = vocab
                 continue
             if name in ("dspark/markov/fold", "dspark/markov/fold_bias"):
                 expected = _fold(ck, mtp, vocab, bias=name.endswith("bias"))
@@ -299,8 +319,9 @@ def main(argv=None) -> None:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--token-rank", type=Path, help="the rank file proposal/token_rank was made from")
     args = parser.parse_args(argv)
-    result = verify(args.model, args.artifact)
+    result = verify(args.model, args.artifact, args.token_rank)
     print(json.dumps(result, indent=1))
     if args.report:
         args.report.write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")

@@ -328,6 +328,42 @@ int main() {
                 }
             }
             {
+                // --lm-head-draft: the drafter reads a shortlist, and verification still decides every output. On an
+                // artifact without a ranking the flag is refused (INFERNIX_INKLING2_RANKED=1: the artifact must have one).
+                infernix::EngineOptions options       = engine_options(artifact, 0, true, 2);
+                options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                options.speculative.draft_tokens_auto = true;
+                options.speculative.draft_tokens      = 7;
+                options.speculative.proposal_head     = infernix::ProposalHead::Optimized;
+                std::unique_ptr<infernix::Engine> shortlisted;
+                try {
+                    shortlisted = std::make_unique<infernix::Engine>(options);
+                } catch (const std::exception& error) {
+                    if (std::getenv("INFERNIX_INKLING2_RANKED") != nullptr ||
+                        std::string(error.what()).find("no token ranking") == std::string::npos) {
+                        throw;
+                    }
+                    std::cout << "--lm-head-draft: refused on an artifact without a ranking\n";
+                }
+                if (shortlisted) {
+                    infernix::Engine& engine = *shortlisted;
+                    const auto result = engine.generate(engine.prepare(chat(texts()[1])), long_greedy);
+                    require_same("--lm-head-draft: a 160-token greedy reply", plain_long, result.generated_token_ids);
+                    require_same("--lm-head-draft: the same request again (from the prefix cache)", plain_long,
+                                 engine.generate(engine.prepare(chat(texts()[1])), long_greedy).generated_token_ids);
+                    require_same("--lm-head-draft: a parsed greedy reply (reasoning ban)", plain_reasoning,
+                                 engine.generate(engine.prepare(chat(texts()[0])), reasoning).generated_token_ids);
+                    require_alone("--lm-head-draft", engine, reference_tokens);
+                    auto second = engine.submit(engine.prepare(chat(texts()[1])), sampled(1));
+                    auto first  = engine.submit(engine.prepare(chat(texts()[0])), sampled(0));
+                    require_same("--lm-head-draft, C = 2, request 1", reference_tokens[1], second.wait().generated_token_ids);
+                    require_same("--lm-head-draft, C = 2, request 0", reference_tokens[0], first.wait().generated_token_ids);
+                    const infernix::SpeculativeStats& s = result.speculative;
+                    std::cout << "--lm-head-draft: " << s.rounds << " rounds, " << s.drafted_tokens << " drafted, "
+                              << s.accepted_tokens << " accepted, " << s.fallback_steps << " plain steps\n";
+                }
+            }
+            {
                 // Under --a16-activations: DSpark (auto, graphs) gives the A16 route's plain tokens (its verify calls
                 // run the experts at other widths than plain decoding).
                 infernix::EngineOptions plain = engine_options(artifact, 0, true, 1);
@@ -580,6 +616,17 @@ int main() {
                     }
                 }
             }
+        }
+        {
+            // ScoreOptions::argmax_only (the token-ranking tool's device argmax): each position's top_k = 1 token.
+            infernix::EngineOptions options = engine_options(artifact, 16, false, 1);
+            options.purpose                 = infernix::EnginePurpose::CausalScoring;
+            infernix::Engine engine(options);
+            infernix::ScoreOptions ranked, device;
+            ranked.top_k       = 1;
+            device.argmax_only = true;
+            const Tokens by_host = engine.score_tokens(golden, 1, ranked).top_ids;
+            require_same("scoring: argmax_only against top_k = 1", by_host, engine.score_tokens(golden, 1, device).top_ids);
         }
         if (guard != nullptr) {
             infernix::EngineOptions options = engine_options(artifact, 16, false, 1);

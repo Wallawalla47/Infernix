@@ -95,6 +95,31 @@ def add_proposal(
     recipe.assign("proposal/head", format=format, method="grouped_absmax")
 
 
+def add_token_rank(recipe: Recipe, order: str | Path) -> None:
+    """``proposal/token_rank``: the whole vocabulary in rank order (tools/freq_corpus/build_rank.py). An engine gathers
+    its shortlist's rows at load, so the stored bytes do not fix the shortlist's length or format. Added after the
+    other parameters: they keep their bytes and their order."""
+    model = recipe.model
+    if "proposal/token_rank" in model.parameters:
+        raise ValueError("token rank already configured")
+    ids = np.fromfile(order, dtype="<i4")
+    if ids.size != model.token_count or not np.array_equal(np.sort(ids), np.arange(model.token_count)):
+        raise ValueError("the rank order must be a permutation of the model's tokens")
+    special = set(int(i) for i in model.special_token_ids)
+    if set(ids[: len(special)].tolist()) != special:
+        raise ValueError("the rank order must start with the tokenizer's special tokens")
+    model.add(
+        Parameter(
+            "proposal/token_rank",
+            (ids.size,),
+            array_source(torch.from_numpy(ids.astype(np.int32)), f"rank({Path(order).name})"),
+            direct_format="int32",
+            residency="proposal",
+        )
+    )
+    recipe.add_parameter("proposal/token_rank")
+
+
 def add_official_proposal(
     recipe: Recipe, *, ranking=DEFAULT_RANKING, rows=131072
 ) -> None:

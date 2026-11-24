@@ -420,6 +420,8 @@ struct LoadPlan::Impl {
     std::vector<PendingWeight> pending;
     std::vector<artifact::ObjectHandle> packed_objects; // LoadOptions::pack_bf16: loaded transient, packed at load
     std::uint64_t packed_bytes = 0;
+    std::vector<std::int32_t> draft_ids; // --lm-head-draft: the shortlist's tokens, ascending
+    std::uint64_t draft_bytes = 0;
     std::vector<artifact::ObjectHandle> q8_objects; // LoadOptions::q8_weights: loaded transient, converted at load
     std::uint64_t q8_bytes = 0;
     artifact::MaterializationPlan materialization;
@@ -437,7 +439,7 @@ const Config& LoadPlan::config() const { return impl_->config; }
 const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 const artifact::MaterializationPlan& LoadPlan::materialization() const { return impl_->materialization; }
 std::uint64_t LoadPlan::device_bytes() const {
-    return impl_->materialization.device_capacity_bytes + impl_->packed_bytes + impl_->q8_bytes;
+    return impl_->materialization.device_capacity_bytes + impl_->packed_bytes + impl_->q8_bytes + impl_->draft_bytes;
 }
 std::uint32_t LoadPlan::public_token_count() const { return impl_->resources.public_token_count; }
 const std::optional<VisionHostWeights>& LoadPlan::vision_host() const { return impl_->vision_host; }
@@ -456,6 +458,19 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text, options.embedding_host);
     if (out->config.dspark) { out->weights.dspark = bind_dspark(bindings, *out->config.dspark, out->config.text); }
+    if (options.proposal_enabled()) {
+        // --lm-head-draft: the drafter's shortlist, the ranking's first rows (their tables are built at load).
+        if (!out->config.dspark) { throw ArtifactError("--lm-head-draft needs the artifact's DSpark drafter"); }
+        if (!binder.contains("proposal/token_rank")) {
+            throw ArtifactError("--lm-head-draft: this artifact has no token ranking (proposal/token_rank)");
+        }
+        const WeightId rank = bindings.direct("proposal/token_rank", {out->config.text.vocab_size}, QType::INT32);
+        const std::vector<std::int32_t> order =
+            binder.values(bindings.weights.at(rank.index).reference.binding, QType::INT32).integers();
+        out->draft_ids   = draft_head_ids(order);
+        out->draft_bytes = draft_head_bytes(static_cast<std::int32_t>(out->draft_ids.size()),
+                                            static_cast<std::int32_t>(out->config.text.hidden_size), 256);
+    }
     if (out->config.vision) {
         // --vision-offload on: the tower in pinned host memory, staged through the tower's device slots per encode.
         bindings.residency  = options.vision_offload ? Residency::HostPinned : Residency::Device;
@@ -499,8 +514,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
              FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed,
-             Q8Weights q8, std::optional<VisionHostWeights> vision_host)
-    : backing_(std::move(backing)), packed_(std::move(packed)), q8_(std::move(q8)), config_(std::move(config)), options_(options),
+             Q8Weights q8, std::optional<DraftHead> draft_head, std::optional<VisionHostWeights> vision_host)
+    : backing_(std::move(backing)), packed_(std::move(packed)), q8_(std::move(q8)), draft_head_(std::move(draft_head)),
+      config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)),
       vision_host_(std::move(vision_host)) {}
 
@@ -522,6 +538,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     }
     PackedWeights packed = models::pack_bf16_objects(backing, data->packed_objects, {}, device);
     Q8Weights q8         = models::quantize_q8_objects(backing, data->q8_objects, device);
+    std::optional<DraftHead> draft_head;
+    if (!data->draft_ids.empty()) {
+        // From the stored BF16 tables, which the views still address (before the repoint below releases them).
+        const DSparkWeights& d    = *data->weights.dspark;
+        const WeightRegion bias   = contiguous_weight_region(bound.at(d.fold_bias.index).view);
+        draft_head                = build_draft_head(native_weight(bound.at(data->weights.output_head.index).view),
+                                                     native_weight(bound.at(d.fold.index).view),
+                                                     reinterpret_cast<const std::uint16_t*>(bias.parent->device + bias.begin * 2),
+                                                     data->draft_ids, device);
+    }
     if (!data->packed_objects.empty() || !data->q8_objects.empty()) {
         for (auto& weight : bound) {
             models::repoint(weight.view, packed);
@@ -539,7 +565,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     }
     return std::unique_ptr<Model>(new Model(std::move(data->config), data->options, std::move(data->weights),
                                             std::move(bound), std::move(data->resources), std::move(data->info),
-                                            std::move(backing), std::move(packed), std::move(q8),
+                                            std::move(backing), std::move(packed), std::move(q8), std::move(draft_head),
                                             std::move(data->vision_host)));
 }
 

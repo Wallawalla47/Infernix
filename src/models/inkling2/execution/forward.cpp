@@ -853,15 +853,17 @@ void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) 
 }
 
 void Forward::project_head(const std::uint16_t* x, std::int32_t count, float* out, cudaStream_t stream,
-                           std::int32_t* x8) const {
+                           std::int32_t* x8, const Weight* head) const {
     if (count <= 0 || count > kMaxForwardColumns) { throw std::invalid_argument("inkling2 forward: 1-128 head rows"); }
-    if (q8(p_.head)) {
+    if (head != nullptr && !q8(*head)) { throw std::invalid_argument("inkling2 forward: a shortlist head is 8-bit"); }
+    const Weight& matrix = head != nullptr ? *head : p_.head;
+    if (q8(matrix)) {
         ik::ProjectionArgs h{};
         h.columns  = count;
         h.k        = kH;
         h.x[0]     = x;
         h.fp32_out = true;
-        add_segment(h, p_.head, 0, out);
+        add_segment(h, matrix, 0, out);
         if (x8 != nullptr) {
             h.x8[0] = x8; // encoded here
             ik::projections_mma(h, stream);

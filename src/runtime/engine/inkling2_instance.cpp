@@ -12,6 +12,7 @@
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/prefix_cache/persist_file.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <optional>
@@ -126,6 +127,8 @@ bool artifact_has_inkling2_drafter(const artifact::Reader& reader) {
 }
 
 EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter) {
+    refuse(!options.lora_path.empty(), "--lora applies to the dense Qwen3.5-family models, not to Inkling 2");
+    refuse(!options.ablate_sidecar_path.empty(), "--ablate is not available on Inkling 2 yet");
     refuse(options.reference && !options.lossless, "--reference implies --lossless");
     refuse(options.reference && options.kv_cache != KvCacheStorage::BFloat16,
            "the design reference is built for --kv-dtype bf16 only (V stored as FP16); the coded formats are not yet");
@@ -197,8 +200,13 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                                   (options.vision_max_merged_tokens != 0 && options.vision_max_merged_tokens < 64U))) {
         throw std::invalid_argument("--vision-max-merged must be 64-32768 image tokens");
     }
-    refuse(!options.ngram_volume_path.empty() || options.speculative.ngram_draft_tokens != 0,
+    refuse(!options.ngram_volume_path.empty() || options.speculative.ngram_draft_tokens != 0 ||
+               options.speculative.ngram_draft_tokens_auto,
            "no n-gram drafting");
+    refuse(options.speculative.draft_tree_auto ||
+               std::any_of(options.speculative.draft_tree_nodes.begin(), options.speculative.draft_tree_nodes.end(),
+                           [](std::uint32_t nodes) { return nodes != 0; }),
+           "DSpark verifies its drafts as a chain (no --draft-tree-nodes)");
     refuse(options.max_context_auto && options.purpose != EnginePurpose::Generation,
            "--max-context auto sizes a generation server: causal scoring takes N");
     refuse(options.max_concurrency == 0 || options.max_concurrency > models::inkling2::kMaximumConcurrency,
@@ -253,7 +261,6 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     if (spec.backend == SpeculativeBackend::DSpark) {
         refuse(options.purpose != EnginePurpose::Generation, "DSpark drafts for generation only");
         refuse(options.lossless, "--lossless has no speculation (no --spec dspark)");
-        refuse(spec.proposal_head != ProposalHead::Full, "--lm-head-draft is not available with DSpark yet");
         if (spec.draft_tokens_auto) {
             if (spec.draft_tokens == 0 || spec.draft_tokens > 7) { spec.draft_tokens = 7; } // the block less its anchor
         } else {

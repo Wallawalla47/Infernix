@@ -168,9 +168,10 @@ public:
     // The head's raw products W_head x (FP32, no softcap) of `count` BF16 rows x [count][H] (at most
     // kMaxForwardColumns) into out [count][V]: the DSpark drafter's base logits. With x8 (count 8-bit input rows of
     // ops::inkling2::projection_a8_column_words(H) words) a Q8 head runs on 8-bit inputs: tensor cores at the block's
-    // rows, other bits than head()'s (drafts only: no output depends on them).
+    // rows, other bits than head()'s (drafts only: no output depends on them). `head`: a shortlist's Q8 head instead
+    // of the target's (--lm-head-draft: out is [count][its rows]).
     void project_head(const std::uint16_t* x, std::int32_t count, float* out, cudaStream_t stream,
-                      std::int32_t* x8 = nullptr) const;
+                      std::int32_t* x8 = nullptr, const Weight* head = nullptr) const;
     // Profiling: `marker` is called with each Op's name right after its launches (null: none), so a caller can record
     // events between them.
     void set_marker(std::function<void(const char*)> marker) { marker_ = std::move(marker); }

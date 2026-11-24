@@ -580,7 +580,8 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const 
     float l8[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) { l8[j] = lat[8 * lane + j]; }
-    const int per_cta = (a.vocab + kLogitCtas - 1) / kLogitCtas;
+    // The whole vocabulary over 512 CTAs; a shortlist over CTAs of one 32-row batch a warp (dspark_markov's grid).
+    const int per_cta = (a.vocab + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
     const int v0 = static_cast<int>(blockIdx.x) * per_cta, v1 = min(a.vocab, v0 + per_cta);
     const float* base = a.base + static_cast<std::size_t>(step - 1) * a.vocab;
     float best = -INFINITY, run_max = -INFINITY, run_sum = 0.0F;
@@ -725,7 +726,7 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const 
     {
         float b = -INFINITY, m = -INFINITY, s = 0.0F;
         int bi  = 0x7FFFFFFF;
-        for (int c = 2 * t; c < 2 * t + 2; ++c) {
+        for (int c = 2 * t; c < min(2 * t + 2, static_cast<int>(gridDim.x)); ++c) { // a shortlist's grid may be smaller
             merge(b, bi, m, s, __ldcg(sc.best + c), __ldcg(sc.best_index + c), __ldcg(sc.run_max + c), __ldcg(sc.run_sum + c));
         }
         tb[t] = b, ti[t] = bi, tm[t] = m, ts[t] = s;
@@ -743,12 +744,30 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const 
     if (t != 0) { return; }
     const float b = tb[0], m = tm[0], s = ts[0];
     const int bi  = ti[0];
-    a.tokens[step - 1]        = bi;
+    a.tokens[step - 1]        = a.row_ids != nullptr ? a.row_ids[bi] : bi;
     a.probabilities[step - 1] = canon::div_rn(canon::exp_c(__fsub_rn(b, m)), s);
     sc.logits_done            = 0U;
 }
 
+__global__ void __launch_bounds__(256) gather_rows_kernel(const std::uint16_t* src, int row_words, const std::int32_t* ids,
+                                                          int rows, std::uint16_t* out) {
+    const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= static_cast<long long>(rows) * row_words) { return; }
+    const long long row = i / row_words, word = i % row_words;
+    out[i] = src[static_cast<long long>(ids[row]) * row_words + word];
+}
+
 } // namespace
+
+void dspark_gather_rows(const std::uint16_t* src, std::int32_t row_words, const std::int32_t* ids, std::int32_t rows,
+                        std::uint16_t* out, cudaStream_t stream) {
+    if (src == nullptr || ids == nullptr || out == nullptr || row_words <= 0 || rows <= 0) {
+        throw std::invalid_argument("inkling2 dspark_gather_rows: a table, its row ids and an output");
+    }
+    const long long words = static_cast<long long>(rows) * row_words;
+    gather_rows_kernel<<<static_cast<unsigned>((words + 255) / 256), 256, 0, stream>>>(src, row_words, ids, rows, out);
+    check(cudaGetLastError(), "gather rows");
+}
 
 void dspark_mix(const DSparkMixArgs& a, cudaStream_t stream) {
     if (a.features == nullptr || a.fuse_weight == nullptr || a.columns <= 0 || a.count <= 0 || a.count > 4) {
@@ -839,12 +858,15 @@ void dspark_markov(const DSparkMarkovArgs& a, std::int32_t steps, cudaStream_t s
     check(pdl::launch_consumer(config(dim3(kRank3 / kMarkovWarps), dim3(32 * kMarkovWarps), 0, stream),
                                markov_invariant_kernel, a, static_cast<int>(steps)),
           "markov invariant");
+    // A shortlist: one 32-row batch a warp (fewer rows than 512 CTAs' would leave warps idle).
+    const int batch_ctas      = (a.vocab + 32 * kMarkovWarps - 1) / (32 * kMarkovWarps);
+    const unsigned logit_ctas = static_cast<unsigned>(a.row_ids != nullptr && batch_ctas < kLogitCtas ? batch_ctas : kLogitCtas);
     for (int step = 1; step <= steps; ++step) {
         check(pdl::launch_consumer(config(dim3(kGateCtas), dim3(32 * kMarkovWarps), 0, stream), markov_gate_kernel, a, step),
               "markov gates");
-        check(q8 ? pdl::launch_consumer(config(dim3(kLogitCtas), dim3(32 * kMarkovWarps), 0, stream),
+        check(q8 ? pdl::launch_consumer(config(dim3(logit_ctas), dim3(32 * kMarkovWarps), 0, stream),
                                         markov_logits_kernel<true>, a, step)
-                 : pdl::launch_consumer(config(dim3(kLogitCtas), dim3(32 * kMarkovWarps), 0, stream),
+                 : pdl::launch_consumer(config(dim3(logit_ctas), dim3(32 * kMarkovWarps), 0, stream),
                                         markov_logits_kernel<false>, a, step),
               "markov logits");
     }

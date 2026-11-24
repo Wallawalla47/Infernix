@@ -5,6 +5,7 @@
 #include "models/bf16_packing.h"
 #include "models/q8_weights.h"
 #include "models/inkling2/config.h"
+#include "models/inkling2/draft_head.h"
 #include "models/inkling2/weights.h"
 #include "text/tokenizer.h"
 
@@ -76,8 +77,11 @@ public:
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept { return backing_.stats(); }
     [[nodiscard]] std::uint64_t device_weight_bytes() const noexcept {
-        return backing_.stats().device_capacity_bytes + packed_.storage.bytes + q8_.storage.bytes;
+        return backing_.stats().device_capacity_bytes + packed_.storage.bytes + q8_.storage.bytes +
+               (draft_head_ ? draft_head_->storage.bytes : 0);
     }
+    // --lm-head-draft: the drafter's shortlist tables, built at load.
+    [[nodiscard]] const std::optional<DraftHead>& draft_head() const noexcept { return draft_head_; }
     // The matrices packed to bf16_p12 at load (LoadOptions::pack_bf16), which the bound views address.
     [[nodiscard]] const PackedWeights& packed() const noexcept { return packed_; }
     // The matrices converted to 8-bit weights at load (LoadOptions::q8_weights), which the bound views address.
@@ -89,12 +93,13 @@ private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed,
-          Q8Weights q8, std::optional<VisionHostWeights> vision_host);
+          Q8Weights q8, std::optional<DraftHead> draft_head, std::optional<VisionHostWeights> vision_host);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
     PackedWeights packed_;
     Q8Weights q8_;
+    std::optional<DraftHead> draft_head_;
     Config config_;
     LoadOptions options_;
     TextWeights weights_;

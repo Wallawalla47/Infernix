@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <type_traits>
 #include <vector>
 
 namespace canon = infernix::ops::canon;
@@ -513,8 +514,9 @@ void swiglu_case() {
 // ---------------------------------------------------------------------------- Markov head
 
 // q8: the Fold as Q8_G32_FP16 (q8_g32.h's rule over the BF16 values: scale fl16(m / 127), codes rne(v / scale)); the
-// oracle then reads its represented values code * scale.
-void markov_case(bool q8) {
+// oracle then reads its represented values code * scale. list: a shortlist (--lm-head-draft), every third token left
+// out: the tables hold the listed rows in ascending id, and each draft is the oracle's argmax over them as a token id.
+void markov_case(bool q8, bool list) {
     std::mt19937 rng(17);
     constexpr int V = 6000, R3 = 768, K = 5120, kRank = 256, kRing = 16, kSteps = 7;
     const int first = 205, anchor = 4321;
@@ -550,6 +552,25 @@ void markov_case(bool q8) {
         std::normal_distribution<float> normal(0.0F, 3.0F);
         for (float& b : base) { b = normal(rng); }
     }
+    std::vector<std::int32_t> ids;
+    for (int v = 0; v < V; ++v) {
+        if (!list || v % 3 != 1) { ids.push_back(v); }
+    }
+    const int R = static_cast<int>(ids.size());
+    const auto listed = [&](const auto& table, std::size_t row_words) {
+        std::decay_t<decltype(table)> out(static_cast<std::size_t>(R) * row_words);
+        for (int r = 0; r < R; ++r) {
+            std::copy_n(table.data() + static_cast<std::size_t>(ids[r]) * row_words, row_words,
+                        out.data() + static_cast<std::size_t>(r) * row_words);
+        }
+        return out;
+    };
+    std::vector<float> listed_base(static_cast<std::size_t>(kSteps) * R);
+    for (int step = 0; step < kSteps; ++step) {
+        for (int r = 0; r < R; ++r) {
+            listed_base[static_cast<std::size_t>(step) * R + r] = base[static_cast<std::size_t>(step) * V + ids[r]];
+        }
+    }
     ik::DSparkMarkovArgs a;
     a.projection    = upload(proj);
     a.bias          = upload(bias);
@@ -559,15 +580,16 @@ void markov_case(bool q8) {
     a.f_lane_stride = static_cast<std::int64_t>(kRing) * H;
     a.embedding     = upload(w1);
     if (q8) {
-        a.fold_codes  = upload(codes);
-        a.fold_scales = upload(scales);
+        a.fold_codes  = upload(listed(codes, kRank));
+        a.fold_scales = upload(listed(scales, kRank / 32));
     } else {
-        a.fold = upload(fold);
+        a.fold = upload(listed(fold, kRank));
     }
-    a.fold_bias     = upload(fbias);
-    a.base          = upload(base);
-    a.vocab         = V;
-    a.round         = upload(std::vector<ik::DSparkRound>{{first, anchor, 0}});
+    a.fold_bias     = upload(listed(fbias, 1));
+    a.base          = upload(listed_base);
+    a.vocab         = R;
+    if (list) { a.row_ids = upload(ids); }
+    a.round        = upload(std::vector<ik::DSparkRound>{{first, anchor, 0}});
     a.tokens        = zeros<std::int32_t>(kSteps);
     a.probabilities = zeros<float>(kSteps);
     a.scratch       = zeros<float>(ik::dspark_markov_scratch_bytes(V) / 4 + 1);
@@ -604,18 +626,19 @@ void markov_case(bool q8) {
             s[c]               = rbd(kept + blend);
             lat[c]             = rbd(std::tanh(u[2 * kRank + c]));
         }
-        std::vector<double> L(V);
+        std::vector<double> L(R);
         int best = 0;
-        for (int vv = 0; vv < V; ++vv) {
-            double acc = bf(fbias[vv]);
+        for (int r = 0; r < R; ++r) {
+            const int vv = ids[r];
+            double acc   = bf(fbias[vv]);
             for (int c = 0; c < kRank; ++c) { acc += fold_value[static_cast<std::size_t>(vv) * kRank + c] * lat[c]; }
             const double z = rbd(rbd(base[static_cast<std::size_t>(step - 1) * V + vv]) + rbd(acc));
-            L[vv]          = rbd(30.0 * std::tanh(z / 30.0));
-            if (L[vv] > L[best]) { best = vv; }
+            L[r]           = rbd(30.0 * std::tanh(z / 30.0));
+            if (L[r] > L[best]) { best = r; }
         }
         double second = -1e300;
-        for (int vv = 0; vv < V; ++vv) {
-            if (vv != best) { second = std::max(second, L[vv]); }
+        for (int r = 0; r < R; ++r) {
+            if (r != best) { second = std::max(second, L[r]); }
         }
         double sum = 0;
         for (const double l : L) { sum += std::exp(l - L[best]); }
@@ -625,13 +648,13 @@ void markov_case(bool q8) {
             break;
         }
         ++compared;
-        agree      = tokens[static_cast<std::size_t>(step - 1)] == best;
+        agree      = tokens[static_cast<std::size_t>(step - 1)] == ids[best];
         worst_prob = std::max(worst_prob, std::fabs(probs[static_cast<std::size_t>(step - 1)] - 1.0 / sum) / (1.0 / sum));
-        prev       = best;
+        prev       = ids[best];
     }
-    std::printf("dspark_markov (V = 6000, 7 steps, %s Fold): %d drafts compared%s, %s; worst probability %.2e relative; "
-                "repeat %s\n",
-                q8 ? "8-bit" : "BF16", compared, near_tie ? " (then a near tie)" : "",
+    std::printf("dspark_markov (%d rows of V = 6000, 7 steps, %s Fold): %d drafts compared%s, %s; worst probability %.2e "
+                "relative; repeat %s\n",
+                R, q8 ? "8-bit" : "BF16", compared, near_tie ? " (then a near tie)" : "",
                 agree ? "all equal the oracle's argmax" : "a draft DIFFERS", worst_prob, repeat ? "identical" : "DIFFERS");
     check(agree, "dspark_markov drafts another token than the oracle's argmax");
     check(compared >= 1, "dspark_markov: no draft compared (a near tie at the first step)");
@@ -650,8 +673,10 @@ INFERNIX_OP_TEST(inkling2_dspark) {
     attention_case(false, 3);
     add_norm_case();
     swiglu_case();
-    markov_case(false);
-    markov_case(true);
+    markov_case(false, false);
+    markov_case(true, false);
+    markov_case(false, true);
+    markov_case(true, true);
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

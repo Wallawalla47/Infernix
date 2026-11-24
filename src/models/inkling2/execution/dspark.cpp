@@ -334,7 +334,8 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
     fin.rows     = kB;
     ik::dspark_add_norm(fin, stream);
     // The target head over the block's rows 1 .. steps (the anchor's row predicts nothing); a Q8 head on 8-bit inputs.
-    forward_.project_head(final_ + kH, steps, base_, stream, head_x8_);
+    const std::optional<DraftHead>& shortlist = p_.model.draft_head(); // --lm-head-draft
+    forward_.project_head(final_ + kH, steps, base_, stream, head_x8_, shortlist ? &shortlist->head : nullptr);
     ik::DSparkMarkovArgs mk;
     mk.projection    = bf16_words(d_.markov_projection);
     mk.bias          = d_.markov_projection_bias;
@@ -355,6 +356,14 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
     mk.fold_bias     = d_.fold_bias;
     mk.base          = base_;
     mk.vocab         = static_cast<std::int32_t>(vocab_);
+    if (shortlist) {
+        mk.fold        = nullptr;
+        mk.fold_codes  = shortlist->fold_codes;
+        mk.fold_scales = shortlist->fold_scales;
+        mk.fold_bias   = shortlist->fold_bias;
+        mk.vocab       = shortlist->rows;
+        mk.row_ids     = shortlist->token_ids;
+    }
     mk.softcap       = p_.model.config().text.final_logit_softcap;
     mk.round         = round_;
     mk.tokens        = tokens_;

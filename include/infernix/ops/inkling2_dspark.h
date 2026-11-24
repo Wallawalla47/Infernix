@@ -154,7 +154,8 @@ struct DSparkMarkovArgs {
     const std::uint16_t* fold_scales = nullptr; // Q8 FP16 [V][rank / 32] scales
     const std::uint16_t* fold_bias  = nullptr; // BF16 [V]
     const float* base               = nullptr; // FP32 [steps][V]: the target head over the block's rows 1 .. steps
-    std::int32_t vocab              = 0;
+    std::int32_t vocab              = 0;       // V: the vocabulary, or a shortlist's rows (row_ids)
+    const std::int32_t* row_ids     = nullptr; // a shortlist: each row's token id, ascending (null: rows are token ids)
     float softcap                   = 30.0F;
     const DSparkRound* round        = nullptr;
     std::int32_t* tokens            = nullptr; // [steps] out
@@ -163,5 +164,9 @@ struct DSparkMarkovArgs {
 };
 void dspark_markov(const DSparkMarkovArgs& args, std::int32_t steps, cudaStream_t stream);
 [[nodiscard]] std::size_t dspark_markov_scratch_bytes(std::int32_t vocab);
+
+// out[r][c] = src[ids[r]][c] for BF16 tables of `row_words` words a row (--lm-head-draft's tables, at load).
+void dspark_gather_rows(const std::uint16_t* src, std::int32_t row_words, const std::int32_t* ids, std::int32_t rows,
+                        std::uint16_t* out, cudaStream_t stream);
 
 } // namespace infernix::ops::inkling2
