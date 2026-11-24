@@ -175,7 +175,7 @@ Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
   ([serving](docs/serving.md#documents-pdfs-and-citations)).
 - **Conversion**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources; Q4-Q8, FP8, NVFP4 and
   mixed recipes.
-- **LoRA adapters**: `--lora` applies a Hugging Face PEFT adapter to the Qwen3.8-27B artifacts at runtime,
+- **LoRA adapters**: `--lora` applies a Hugging Face PEFT adapter to the Qwen3.8-27B and Inkling 2 artifacts at runtime,
   read from its own files ([LoRA adapters](docs/lora.md)).
 - **Windows and Linux**: native MSVC and GCC builds, WSL2 included.
 

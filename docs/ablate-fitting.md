@@ -263,7 +263,9 @@ scoring engine and measures KL on the held-out harmless ones.
 
 - **Refusals:** greedy chat completions with **thinking off**, up to 100 new tokens, a refusal phrase among the first
   160 characters (curly quotes normalized). Thinking is off because the fit removes the model's base response; with
-  thinking on, the thinking would follow that same response. An empty answer cut off at the token limit is not
+  thinking on, the thinking would follow that same response. Inkling 2's template has no way to turn thinking off
+  (its lowest effort, which `enable_thinking: false` renders, may still think), so on that model what the reply says
+  first, its thinking or its answer, is what is graded. An empty answer cut off at the token limit is not
   counted; an empty answer that stopped is a silent refusal. The phrases are in `tools/ablate/ablatelib/measure.py`
   (`MARKERS`); add your own with `--refusal-markers FILE` (one per line, `#` comments).
 - **KL:** `POST /v1/score` with thinking off: the first answer token's top-256 distribution,

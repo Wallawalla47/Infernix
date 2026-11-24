@@ -1,6 +1,7 @@
 # LoRA adapters
 
-`--lora PATH` applies a LoRA adapter to a Qwen3.5-family dense model (the Qwen3.8-27B artifacts) at runtime. The
+`--lora PATH` applies a LoRA adapter at runtime to a Qwen3.5-family dense model (the Qwen3.8-27B artifacts) or to
+Inkling 2 Mini ([its own section](#inkling-2)). The
 artifact is unchanged: the engine reads the adapter's own Hugging Face files at load and adds the adapter's term to
 every projection it targets. Every product command takes the option: `infernix-serve`, `infernix` (CLI),
 `infernix-perplexity` and `infernix-bench`. The launcher finds adapters on Hugging Face and downloads them
@@ -37,6 +38,7 @@ LoRA adapter C:\adapters\my-adapter: 64 attention and 192 MLP projections in 64 
 For a projection `y = W x` the adapter makes `y = W x + s B (A x)`, with `A` its `lora_A` ([r, in]), `B` its
 `lora_B` ([out, r]) and `s` its scale: `lora_alpha / r`, or `lora_alpha / sqrt(r)` with `use_rslora`, each module's
 `r` and `lora_alpha` from `rank_pattern` and `alpha_pattern` where a key matches its path (as PEFT matches them).
+The rest of this section and the next two describe the Qwen3.5 dense models; [Inkling 2](#inkling-2) has its own.
 
 | Module | Where |
 |---|---|
@@ -53,7 +55,7 @@ Refused, with a message that names the adapter and says why ("LoRA adapter C:\ad
 - a rank above 128: "its rank is 256 (module '...'), and Infernix currently supports LoRA adapters up to rank 128";
 - vision, MTP, the embeddings and the head, and other linear-attention leaves (Qwen3-Next's fused `in_proj_qkvz` and
   `in_proj_ba` among them);
-- the mixture-of-experts models (Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next);
+- the Qwen mixture-of-experts models (Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next);
 - everything that is not plain LoRA on linear weights: DoRA (`use_dora`), LoRA biases (`lora_bias`, `bias` other than
   `none`), `modules_to_save`, trainable tokens, `layer_replication`, `fan_in_fan_out`, aLoRA, QALoRA,
   `target_parameters`, and every variant's own `*_config` (an initialization method's config — LoftQ, EVA, CorDA,
@@ -104,11 +106,82 @@ are other kernels than the unadapted model runs, so a zero adapter on these modu
 (everywhere else it does). `out_proj` takes its term as `o_proj` does. On the lossless route the terms are added to the BF16 `qkv`, `z`, `a` and `b` and
 to `out_proj`'s output, as PEFT adds them.
 
+## Inkling 2
+
+Inkling 2 Mini takes an adapter on its text layers' linear projections. No public adapter for this model exists yet,
+so the module paths below are derived from the Transformers implementation (`modeling_inkling2_loop.py`) and have not
+been checked against a real adapter's files. Paths start `model.language_model.layers.N.` (or a text-only export's
+`model.layers.N.`):
+
+| Module | Maps | Where |
+|---|---|---|
+| `self_attn.q_proj.linear` | 2304 → 3072 | the query, before its clip |
+| `self_attn.relative_position_bias.linear` | 2304 → 384 | the relative states, before their clip |
+| `self_attn.sink_proj` | 2304 → 24 | the sink logits |
+| `self_attn.o_proj.gate_proj` | 2304 → 3072 | the output gate, before its sigmoid |
+| `self_attn.k_proj.linear`, `v_proj.linear` | 2304 → 1024 | the key and value, before their convolutions |
+| `self_attn.k_proj.sconv.weight_proj`, `v_proj.sconv.weight_proj` | 2304 → 32 | the dynamic convolutions' taps (full-attention layers: 5, 11, 17, 23) |
+| `self_attn.o_proj.linear` | 3072 → 2304 | the attention output, before the post-attention convolution |
+| `{q,k,v,mlp}_message_gate.down_proj` | 4608 → 64 | a loop message gate's input (core layers 6-17) |
+| `{q,k,v,mlp}_message_gate.forget_gate_proj`, `message_gate_proj` | 64 → 2304 | its forget and message gates (FP32 modules) |
+
+A core layer's weights are shared by the loop's three passes, so its adapter applies on every pass.
+
+Refused, by name: the **routed experts and the router** (they are `nn.Parameter` tensors of the mixture of experts,
+which a plain PEFT LoRA cannot target; an adapter using PEFT's `target_parameters` is refused by the reader), the
+embeddings, the output head, the vision tower, the DSpark drafter, a sliding layer's `weight_proj`, a message gate
+outside the core, the wrapper modules without their `.linear`, a rank above 128, and every PEFT variant the
+[list above](#what-an-adapter-may-adapt) names. All text routes take an adapter: the default, `--q8-weights`,
+`--a8-activations`, `--a16-activations`, `--reproducible` and `--lossless`.
+
+How it is computed:
+
+- The term is added **after** the projection's own rounding, as PEFT adds it to the base layer's output:
+  `y = bf16(fl32(y) + fl32(c s))` (the gates' forget and message outputs are FP32, so `fl32(y + fl32(c s))`). The
+  projection kernels are the ones the model runs without an adapter (BF16, packed or 8-bit), and a separate kernel
+  (`ops::inkling2::lora_term_add`) adds the term, so without `--lora` nothing changes and with a zero `B` the output is
+  the unadapted one's bits (except that a negative zero becomes `+0`).
+- Factors are rounded to BF16 at load, and each group of outputs that shares a launch of the term (K2's, W_o, a pass's
+  gate downs, their forget and message projections) runs at its own rank, the largest of its modules rounded up to 16.
+  `U = bf16(A x)` runs through the same fused projections as the call's base projections (tensor cores for a prompt
+  call, the decode-width MMA for decode and verification). Where that gives the same bits, `A`'s rows are extra
+  segments of the base launch itself, so `U` takes no launch: W_o and the gate downs on BF16 storage, and K2 in prompt
+  calls when its segments fit. `c` is the canonical chain of [`include/infernix/ops/lora.h`](../include/infernix/ops/lora.h):
+  BF16 `m16n8k16` steps over the padded rank from `+0`. The term reads the BF16 `x` on every route, also under
+  `--a8-activations`, whose 8-bit inputs are the base projection's only.
+- The reproducible route stays deterministic and request-invariant: a column's term depends only on that column's
+  `x` and the factors. As for the base projections, a prompt call and a decode call are two routes (a prompt column
+  need not equal the same position computed by decode), each the same at every width.
+- `--lossless` computes PEFT's arithmetic exactly: FP32 factors, `u = A x` and `B u` each an exact sum rounded once,
+  the term added to the base output and rounded back (`ops::lossless_lora_*`, with an FP32 output form for the gates).
+
+The DSpark drafter is not adapted; it reads the adapted model's hidden states as its context and proposes, and the
+adapted model verifies. An adapter that moves the model's choices lowers the acceptance rate. The saved prefix cache
+belongs to the artifact and the adapter, as below.
+
+Memory: the factors take about `2 r (in + out)` bytes per module on the fast routes (`r` its group's rank; on
+`--lossless` the adapter's largest, about 2.5 times the bytes), counted in `vram.adapter_bytes`, and a call's `U` takes
+`16 r T` bytes of workspace at the adapter's largest rank and the prefill chunk's `T`.
+
+Speed: a synthetic adapter on all 320 modules an adapter can reach, against the same artifact without one (prefill of
+2,048 tokens / plain decode of 128; RTX 5090, `infernix_bench`, BF16 KV, one run of three repetitions per cell, 2026-11-24):
+
+| Route | Rank 16 | Rank 32 | Rank 48 | Rank 64 | Rank 128 |
+|---|---:|---:|---:|---:|---:|
+| default | -7.0 / -5.3 % | -7.3 / -6.8 % | -8.0 / -7.2 % | -8.2 / -8.6 % | -10.8 / -12.6 % |
+| `--q8-weights` | -7.7 / -10.9 % | -8.3 / -11.9 % | -8.9 / -12.5 % | -9.5 / -13.5 % | -12.1 / -17.5 % |
+| `--a8-activations` | -6.9 / -11.0 % | -6.9 / -11.7 % | -7.8 / -12.6 % | -7.9 / -13.4 % | -10.1 / -17.3 % |
+
+With DSpark `auto` and `--lm-head-draft` on the chat, structured and prose fixtures (default route), decode changed by
+-8.8, -0.3 and -2.9 % at rank 32, and -11.9, -4.7 and -5.8 % at rank 128 (two runs each; the chat row at rank 128 spread
+±5 %). The adapter changes the text, so these runs do not decode the same tokens as the run without it. No real adapter for
+this model has been timed.
+
 ## Speculative decoding and the prefix cache
 
-The drafters (MTP, DFlash2) are not adapted: they propose the base model's likely tokens and the adapted model
-verifies them, so the output is the adapted model's whatever the drafter. An adapter that moves the model's
-choices a long way lowers the acceptance rate, and with it the speed-up.
+The drafters (MTP, DFlash2, and Inkling 2's DSpark) are not adapted: they propose the base model's likely tokens and
+the adapted model verifies them, so the output is the adapted model's whatever the drafter. An adapter that moves the
+model's choices a long way lowers the acceptance rate, and with it the speed-up.
 
 The saved prefix cache (`--prefix-cache-file`) belongs to the artifact and the adapter: a cache saved without the
 adapter, or with another (or a changed) one, is not reused.

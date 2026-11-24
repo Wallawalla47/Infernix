@@ -1072,6 +1072,32 @@ experts) ran 0.21-0.33 ms a round slower than none, and sixteen guesses at two c
   any arm: the 8-bit expert activations, not the dense route, bring the KL below this model's usual ~1e-2 floor (the
   checkpoint's 4-bit activations may amplify any upstream difference).
 
+### 11.1 LoRA adapters (`--lora`)
+
+User-facing contract in [LoRA adapters](../lora.md#inkling-2). Binding: `models/inkling2/lora.h` (Model data, read at
+load planning); operands: `execution/lora_parameters.h` (BF16 factors, or the lossless route's exact form); execution:
+`execution/lora_forward.h` and `ops::inkling2::lora_term_add`.
+
+- **Where the term lands.** After each projection's own rounding, as PEFT adds it. The alternative, fusing it into the
+  epilogues of `projections`, `projections_mma`, `projections_dmma` and the a8 kernels, would save a launch per group but
+  needs an adapter instance of each and changes the order PEFT computes; not attempted, and the cost of the separate
+  launch is unmeasured.
+- **A launch per group.** K2's outputs are one group (one `lora_term_add`), W_o, a pass's gate downs and their forget
+  and message projections others, each at its own padded rank with a compile-time k-step count; `B` is loaded before
+  the PDL wait. No group's work runs for a layer the adapter does not touch.
+- **The shrink without a launch, where the bits allow it.** `U = A x` joins the base launch as extra BF16 segments
+  (`LoraForward::fold_*`) for W_o and the gate downs on either route, and for K2 in prompt calls when the segments fit
+  (8 at most; K2's A rows are one stack per input, one segment when the three inputs alias). Q8 storage cannot share a
+  launch with BF16. **K2's decode shrink stays a launch of its own**: `dmma_splits` sets the runs of K from the launch's
+  total row tiles, 4 for K2's 538 and 8 for A's alone, so inside K2's launch `U` would take another FP32 association.
+  The gates' forget and message projections are FP32 launches and `U` is BF16.
+- **Routes.** The shrink takes the call's projection route (tensor cores for a prompt call, the decode-width MMA
+  otherwise) and reads the BF16 inputs on every route, so `--q8-weights` and `--a8-activations` change only the base
+  projection. On `--lossless` `LosslessForward` applies `lossless_lora_shrink` and `lossless_lora_add` to the same
+  outputs in the same places.
+- **The experts are out of scope**: they and the router are `nn.Parameter`s of the mixture of experts, so a plain PEFT
+  adapter holds no factors for them.
+
 ---
 
 ## 12. Residual mixing, message gates and short convolutions
@@ -1093,6 +1119,15 @@ and previous pass's h12 and h18, the partial sum). Two forms:
 or 1/√9), always fused into a neighbour (K3 prologue, K4 epilogue, K1) with the ring as state. Prefill runs them over
 the chunk with the ring as left history and writes the ring's positions back (the decode and verify kernels take at
 most 29 columns a lane, so no write of a call reaches a slot its reads need).
+
+**Directional ablation (`--ablate`, [Ablation sidecars](../ablate.md)).** The sidecar's layers are the 24 physical layers,
+cut on every pass. The attn lane is the post-attention conv's BF16 output inside `mlp_entry` (at a boundary it is `cand`
+itself); the mlp lane is the post-MLP conv's output inside the next visit's entry tail, or `final_mix` for visit 47,
+so its alpha is the previous visit's layer's. Each is a template instance (`EntryCutArgs`, `MlpEntryCutArgs`): the plain
+instances' argument structs and code are unchanged. The cut value goes unrounded into the residual sum, which keeps its
+one BF16 rounding; the rings keep the uncut inputs. `prompt_hidden_states` returns each physical layer's output on its
+last visit (the core's third pass), captured from `in.tail_out` (at a pass restart `h` is `h6`, not the previous
+visit's output). `--lossless` refuses `--ablate`, as on every model.
 
 ---
 
@@ -1499,6 +1534,8 @@ component, kept byte for byte after the converter checks it names the processor 
 | `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` streams the tower from pinned host memory |
 | `--prefill-chunk` | default 4,096; a multiple of 128 up to 8,064 ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |
+| `--lora` | a PEFT adapter of the attention and message-gate projections, on every text route ([§11.1](#111-lora-adapters---lora)) |
+| `--ablate` | a direction cut from each layer's attention and MLP writes ([§12](#12-residual-mixing-message-gates-and-short-convolutions)); refused with `--lossless` |
 | `--q8-weights` | approximate 8-bit K2, W_o and head ([§11](#11-dense-projections-and-the-head)); refused with `--reproducible` and `--lossless` |
 | `--a16-activations` | the routed experts on 16-bit activations (`w4a4_sparse_moe.h`'s `ExpertActivation::A16`): NVFP4 layers on Qwen3.8-Flash-Next's exact W4A16 arithmetic (x and h as 21-bit fixed point per column, exact int64 sums, the multiplier fl32(amax / denominator)), MXFP8 layers W8A16 (E4M3 widened exactly to BF16, a block's two MMAs from zero, its power-of-two scale fused); accepted with `--reproducible`; prompt calls run the narrow kernels (no A16 grouped GEMM: pp2048 16,387 → 3,383 tok/s, tg128 184.9 → 188.1, 2026-11-22); MXFP8 decode at one column runs the separate router and experts. `--a8-activations` ([§11](#11-dense-projections-and-the-head)): 8-bit activations in every call for the dense Q8 matrices and the NVFP4 experts (implies `--q8-weights`); refused with `--reproducible`, `--lossless` and `--a16-activations` |
 

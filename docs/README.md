@@ -14,7 +14,7 @@ run the CLI or HTTP server.
 | [Qwen3.5-122B-A10B](qwen3_5-122b.md) | Ornith-1.5-122B-NVFP4 and its UNCENSORED export with offloaded experts (in progress): requirements, conversion and verification, running, measured speed |
 | [Inkling 2 Mini](inkling2-mini.md) | Thinking Machines' looped model resident on one RTX 5090: requirements, running, what is not supported yet, DSpark and `--lm-head-draft`, precision routes, KV formats, images, conversion and the token ranking |
 | [Ngram copy proposals](ngram.md) | optional copy acceleration alongside MTP, DFlash or DFlash2 at any concurrency |
-| [Ablation sidecars](ablate.md) | `--ablate`: directional ablation (refusal removal) applied at runtime to every model except Inkling 2 Mini; the sidecar format, what it cuts, memory and speed |
+| [Ablation sidecars](ablate.md) | `--ablate`: directional ablation (refusal removal) applied to any model at runtime; the sidecar format, what it cuts, memory and speed |
 | [Fitting an ablation sidecar](ablate-fitting.md) | `tools/ablate`: fitting a refusal-ablation sidecar for your own setup and evaluating it; prompt sets, requirements, time, reading the results |
 | [LoRA adapters](lora.md) | `--lora`: a Hugging Face PEFT adapter applied to the Qwen3.8-27B artifacts at runtime; what it may adapt, how the term is computed, memory |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |

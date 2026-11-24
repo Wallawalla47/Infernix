@@ -134,7 +134,7 @@ plan's `error`.
 | `vram.bytes_per_page_group`, `page_group_tokens` | Qwen3.5 family: each further 64-token KV page group's bytes, the capacity curve's slope |
 | `vram.workspace_bytes`, `graph_allowance_bytes` | the Program workspace and the CUDA Graph allowance (Qwen3.8-Flash-Next: the expert cache's reserve for graph executables) |
 | `vram.expert_frames`, `expert_cache_bytes` | offloaded experts: the VRAM expert cache's frames and bytes |
-| `vram.draft_screen_bytes`, `adapter_bytes` | Qwen3.5 family, beside the weights' arena: the DFlash2 drafter's proposal-head screen, and a LoRA adapter's factors (`--lora`) and an ablation sidecar's direction (`--ablate`; their per-call workspace is in `workspace_bytes`); `null` when the start has none |
+| `vram.draft_screen_bytes`, `adapter_bytes` | Beside the weights' arena: the Qwen3.5 family's DFlash2 proposal-head screen, and a LoRA adapter's factors (`--lora`, Qwen3.5 dense and Inkling 2) and an ablation sidecar's direction (`--ablate`; their per-call workspace is in `workspace_bytes`); `null` when the start has none |
 | `vram.headroom_bytes` | VRAM left free for the display and other programs (`--vram-headroom-mib` or the automatic headroom) |
 | `vram.planned_bytes`, `left_bytes` | everything planned on the device (the weights, the draft screen and the adapter, the Program's reservation, the expert cache), and what free VRAM leaves beside it, the headroom and the expert cache's reserve |
 | `ram.total_bytes`, `available_bytes`, `ram_free_bytes` | physical RAM, what is available now, and the reserve (`--ram-free-mib`) |
@@ -2056,7 +2056,8 @@ Repeating a request returns byte-identical output.
 With `"hidden_states": true` the response also carries `hidden_states`: one row per layer, `hidden_size` numbers
 each (the BF16 values exactly), at the prompt's last token. Row `L` is the hidden state layer `L` hands on: on the
 Qwen3.5 family the residual after layer `L`; on Qwen3.8-Flash-Next, whose residual is four hyper-connection streams,
-layer `L + 1`'s mixer input, and for the last layer its MoE input. It is what
+layer `L + 1`'s mixer input, and for the last layer its MoE input; on Inkling 2 the residual after layer `L` on its last
+visit (the 24 physical layers, a core layer's on the loop's third pass). It is what
 [fitting an ablation sidecar](ablate-fitting.md) measures directions from; the scores are the same with and without
 it. A 27B's rows are 64 x 5,120 numbers, so the response grows by a few MB.
 
@@ -2088,7 +2089,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--any-model-name` | serve OpenAI-route requests whatever non-empty `model` they name, reporting the public model ID (see Chat Completions) | off: other names are 404 `model_not_found` |
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
-| `--lora PATH` | apply a LoRA adapter at runtime: a Hugging Face PEFT adapter's folder, or its `adapter_model.safetensors` with `adapter_config.json` beside it. Qwen3.5 dense models (the 27Bs); `--lossless` computes it as PEFT does. `--model-id` names the adapted model ([LoRA adapters](lora.md)) | none |
+| `--lora PATH` | apply a LoRA adapter at runtime: a Hugging Face PEFT adapter's folder, or its `adapter_model.safetensors` with `adapter_config.json` beside it. Qwen3.5 dense models (the 27Bs) and Inkling 2; `--lossless` computes it as PEFT does. `--model-id` names the adapted model ([LoRA adapters](lora.md)) | none |
 | `--ablate FILE` | apply an ablation sidecar at runtime: `sidecar.json` and the direction file it names, cutting one direction from the residual writes of the layers and lanes it lists. Every model; refused with `--lossless` ([Ablation sidecars](ablate.md)) | none |
 | `--claude-code-prompt as-sent\|local` | Anthropic Messages from Claude Code: use its System prompt as sent, or replace its Claude-specific parts with a short local-agent preamble ([Anthropic Messages](#anthropic-messages)) | `as-sent` |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only; Inkling 2 refuses it (no RoPE: it reaches 1,048,576 positions natively) | `1` |

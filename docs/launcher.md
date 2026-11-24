@@ -162,7 +162,8 @@ folder levels deep, reading file headers only:
   `adapter_config.json` and `adapter_model.safetensors`, named by the folder, with the base model,
   rank and modules its config names. It is matched to the models of that base (an adapter of
   `Qwen/Qwen3.8-27B`, or of a repackaging such as `unsloth/Qwen3.8-27B-bnb-4bit`, to the Qwen3.8-27B
-  artifacts); whether `infernix-serve` can apply it is the server's to say (below).
+  artifacts; one of `thinkingmachines/Inkling-2-Mini` to the Inkling 2 Mini artifacts); whether `infernix-serve`
+  can apply it is the server's to say (below).
 - **Ablation sidecars** ([`--ablate`](ablate.md)): a folder's `sidecar.json` in the `ablate-direction-v2`
   format with the direction file it names, named by the folder, with the layers it cuts. It is matched
   to the models whose hidden size and layer count it fits, the artifact it was fitted on (its
@@ -194,10 +195,10 @@ Inkling 2) accepts, from what the engine accepts and reads for it, and which `--
 **Will it fit?** plan: a saved value for an option the model does not take is left out of the command line, and the
 preview names it. A model type the launcher does not know is not restricted. Inkling 2's defaults are
 `--max-context auto` and `--spec auto --draft-tokens auto` (DSpark when the artifact bundles it); `--lm-head-draft` is
-offered when the artifact holds its `proposal/token_rank` parameter; `--lora` and `--ablate` are not offered for it yet.
-The **DFlash2 drafter** and **N-gram volume** pickers (Qwen3.8-Flash-Next) list the compatible
+offered when the artifact holds its `proposal/token_rank` parameter. The **DFlash2 drafter** and **N-gram volume**
+pickers (Qwen3.8-Flash-Next) list the compatible
 files found and write `--draft-model` and `--ngram-volume`; the **LoRA adapter** picker (the dense
-27Bs) lists the adapters found, those of the model's base first (another base's is marked, and
+27Bs and Inkling 2) lists the adapters found, those of the model's base first (another base's is marked, and
 picking it warns), or takes a folder or file elsewhere, and writes `--lora`. The full command line is previewed with
 warnings (an option this `infernix-serve` does not have, a missing file, a Flash-Next model without
 a volume). Every option of the installed `infernix-serve --help` is listed in the reference drawer,
@@ -302,7 +303,7 @@ the folder browser; by default each repository gets its own subfolder. Any other
 entered by its `owner/name`.
 
 **Discover → LoRA adapters** asks Hugging Face for the PEFT LoRA adapters of a base model
-(Qwen3.8-27B or Qwen3.6-27B) whose repository holds `adapter_config.json` and
+(Qwen3.8-27B, Qwen3.6-27B or Inkling 2 Mini) whose repository holds `adapter_config.json` and
 `adapter_model.safetensors` at its root, the files [`--lora`](lora.md) reads (GGUF exports and merged
 models are left out): [Harness Hub](https://huggingface.co/harness-hub)'s adapters for agent
 harnesses first (the rank-32 specialists for Pi, OpenCode and Hermes, and the rank-96 super-adapter

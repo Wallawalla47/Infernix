@@ -117,7 +117,14 @@ no-term call plus the FP64 term at every route and policy, a zero `B`'s bits, `A
 the snapshot and record forms bit for bit against the projection with the term and the convolution over it. On the
 host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT configuration handling (patterns,
 rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module binding (the Gated DeltaNet modules
-included), ranks to 128 and its refusals (a rank above 128 by its wording).
+included), ranks to 128 and its refusals (a rank above 128 by its wording). On Inkling 2,
+`infernix_inkling2_lora_test` checks the term Op (`lora_term_add`) against an FP64 oracle at the model's output shapes
+(K2's, W_o, the gates' down and their FP32 forget and message rows, a partial 16-row group for the sink) at ranks 16, 64
+and 128: a zero `B` keeps `y`'s bits, rows outside a target stay, and a column equals the column computed alone;
+`infernix_inkling2_lora_binding_test` the PEFT module binding and its refusals (host only);
+`infernix_lossless_lora_test` also the FP32 output form against its exact oracle; and
+`infernix_inkling2_adapters_real_test` (a real artifact, generated adapter and sidecar) that a zero adapter keeps the
+logits' bits on the default, reproducible and lossless routes.
 
 `--ablate` ([Ablation sidecars](../docs/ablate.md)): `infernix_direction_cut_test` checks the cut injects (the plain
 lane form and the fused MoE combine) at Flash-Next's shapes and the single-stream cut after a lane's write
@@ -125,6 +132,10 @@ lane form and the fused MoE combine) at Flash-Next's shapes and the single-strea
 mathematics, with residual elements in the thousands), a column's bits whatever the call's width or the column's
 position, graph replay, that an inactive cut is the plain kernel bit for bit (a negligible one too, for the cut after
 the write) and that the fused combine equals `moe_combine` followed by the cut inject. On the host, `infernix_artifact_ablate_sidecar_test` covers the sidecar reader and every refusal.
+`infernix_inkling2_visit_cut_test` checks Inkling 2's cut instances (the attn lane in `mlp_entry`, the mlp lane in the
+tail of `visit_entry` / `final_mix`) against an FP64 oracle over the plain instance's conv output: a negligible alpha keeps
+the plain bits, the rings hold the uncut input; `infernix_inkling2_adapters_real_test` the same through the Engine, the
+24 hidden-state rows at any prefill chunk and the refusal with `--lossless`.
 `infernix_qwen4_exp_ablate_real_test` (Flash-Next, the reproducible route) checks that a negligible cut keeps the
 plain run's bits on every cut path, that cuts of the last layer's lanes and of layer 0's move the first-token
 readouts, that a strong cut's decode agrees with its own prefill, and that a cut prompt reads the same bits at two

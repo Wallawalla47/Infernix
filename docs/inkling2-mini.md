@@ -10,14 +10,15 @@ checkpoint's weights are unchanged ([what is stored](#what-the-artifact-stores))
 
 Generation works through `infernix` and `infernix-serve` (OpenAI Chat Completions and Responses,
 Anthropic Messages) with DSpark drafting, images, one to eight lanes, every KV format and the prefix
-cache. `infernix-perplexity` scores it, on the default route or with `--lossless`. Several features
-of the Qwen models are [not available on Inkling yet](#not-supported-yet), among them `--lora`,
-`--ablate`, constrained output and video.
+cache. `infernix-perplexity` scores it, on the default route or with `--lossless`. It takes
+[LoRA adapters](lora.md#inkling-2) and [ablation sidecars](ablate.md). Several features
+of the Qwen models are [not available on Inkling yet](#not-supported-yet), among them constrained
+output and video.
 
 **Engine version:** this model needs a build from `main` at `a487ad24f` or later, or a Windows release after
 `windows-2026.11.20`.
 
-**Launcher:** the launcher runs this model and shows the options it takes. `--lora` and `--ablate` are not offered yet.
+**Launcher:** the launcher runs this model and shows the options it takes, `--lora` and `--ablate` among them.
 
 ## Model
 
@@ -93,8 +94,6 @@ otherwise.
 
 | Feature | On Inkling 2 Mini |
 |---|---|
-| `--lora` | refused at startup |
-| `--ablate` | refused at startup |
 | Video input | the request is refused; images work |
 | Constrained output: `--grammar-file`, `--json-object`, `--json-schema-file`, `--choice`, `--regex` and the APIs' structured-output fields | the request is refused |
 | `tool_choice` set to required or to a named tool | the request is refused. `auto` and `none` work; tool calls are parsed from the model's free output, so no grammar protects their arguments |

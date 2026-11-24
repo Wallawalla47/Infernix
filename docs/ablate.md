@@ -1,8 +1,8 @@
 # Ablation sidecars
 
 `--ablate FILE` removes one direction from a model's residual writes at runtime (directional ablation, the technique
-behind "abliterated" models), on Qwen3.5 and Qwen3.6/3.8 dense (the 27Bs), Qwen3.5-MoE (the 35B-A3B, the 122B-A10B) and
-Qwen3.8-Flash-Next; Inkling 2 refuses it for now. The artifact is unchanged: the engine reads a small sidecar at
+behind "abliterated" models), on every architecture Infernix runs: Qwen3.5 and Qwen3.6/3.8 dense (the 27Bs), Qwen3.5-MoE
+(the 35B-A3B, the 122B-A10B), Qwen3.8-Flash-Next and Inkling 2 Mini. The artifact is unchanged: the engine reads a small sidecar at
 startup, and without the flag nothing loads and nothing is hooked. A sidecar fitted to the refusal direction removes
 the model's refusals while the rest of its behaviour stays close to the original; [examples/ablate](../examples/ablate)
 ships one for Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8, with its measurements. No sidecar has been fitted for a
@@ -48,6 +48,13 @@ kernels, and without `--ablate` nothing loads and every kernel is the one that r
   the direction's component of what the write added and rounds the residual to BF16 once more. A cut too small to
   move a residual element keeps its bits, and the result differs from the ideal `x + y - alpha (d . y) d` by the
   write's own rounding (its component along `d` scaled by `1 - alpha`) and that last rounding.
+- **Inkling 2** has a looped residual: the sidecar's layers are the model's 24 physical layers, so a core layer's alpha
+  (layers 6-17) applies on each of its three passes, where it shares the weights. A lane's output is what the layer adds
+  to the residual after its short convolution: `attn` the post-attention convolution's output (at a block boundary,
+  layers 0, 6, 12 and 18, the output replaces the partial sum, and is cut the same), `mlp` the post-MLP convolution's
+  output. Each is cut inside the kernel that writes it, in separate instances of `mlp_entry` and of the next visit's
+  entry (`final_mix` for the last), unrounded into the residual's one BF16 rounding; the convolutions' rings keep the
+  uncut inputs, because a convolution's history is the model's own. A cut therefore launches no extra kernel.
 
 Cutting a direction out of a projection's output is a rank-1 low-rank term in principle, but `--lora`'s kernels do not
 serve it: on Qwen3.8-Flash-Next its term is in none of the projections the model runs, the MoE lanes of every MoE
@@ -66,7 +73,7 @@ row). Every field is checked at load; anything malformed fails the start, naming
 |---|---|
 | `format` | `ablate-direction-v2` |
 | `direction_dtype` | `float32` |
-| `direction_dim` | the model's hidden size, an integer (5120 on the 27Bs, 3072 on the 122B-A10B, 2560 on Qwen3.8-Flash-Next, 2048 on the 35B-A3B) |
+| `direction_dim` | the model's hidden size, an integer (5120 on the 27Bs, 3072 on the 122B-A10B, 2560 on Qwen3.8-Flash-Next, 2304 on Inkling 2 Mini, 2048 on the 35B-A3B) |
 | `direction_layout` | optional: `shared` (one row for every layer, the default) or `per_layer` (`num_hidden_layers` rows) |
 | `direction_file` | the direction file's name, beside `sidecar.json` |
 | `default_alpha` | optional; must be 0: a layer missing from a table is not cut |
@@ -83,16 +90,18 @@ degenerate row on a cut layer, and no `generation.source`.
 
 ## Where it applies
 
-- Qwen3.5 dense, Qwen3.5-MoE (resident and offloaded experts) and Qwen3.8-Flash-Next. Inkling 2 refuses `--ablate`.
+- Every architecture: Qwen3.5 dense, Qwen3.5-MoE (resident and offloaded experts), Qwen3.8-Flash-Next and Inkling 2 Mini
+  (the default, `--q8-weights`, `--a8-activations`, `--a16-activations` and `--reproducible` routes).
 - Every product command takes it: `infernix-serve`, `infernix` (the CLI), `infernix-perplexity` (which scores the cut
   model) and `infernix-bench`, and the launcher's configure page has an **Ablation sidecar** field. What a run applied
   is recorded beside the startup log line: `server_start.artifact.ablate_sidecar` in the request log,
   `execution.ablate_sidecar` in `infernix-perplexity`'s `report.json`, and `config.ablate` and `load.ablate_sidecar`
   in an `infernix-bench` report.
 - Not with `--lossless` (refused).
-- The drafters (MTP, DFlash, DFlash2, n-gram) are not cut: they propose and the cut model verifies, so the output is
-  the cut model's. A cut that moves the model's choices lowers the acceptance rate.
-- With `--lora` (the Qwen3.5 dense models) both apply: the adapter's term is part of each lane's write the cut acts on.
+- The drafters (MTP, DFlash, DFlash2, Inkling 2's DSpark, n-gram) are not cut: they propose and the cut model verifies,
+  so the output is the cut model's. A cut that moves the model's choices lowers the acceptance rate.
+- With `--lora` (the Qwen3.5 dense models and Inkling 2) both apply: the adapter's term is part of each lane's write
+  the cut acts on.
 - The saved prefix cache (`--prefix-cache-file`) belongs to the artifact and the sidecar: a cache saved without the
   sidecar, or with another (or a changed one), is not reused.
 - A sidecar is fitted to one artifact's activations. One fitted on another conversion of the same model may load (the
@@ -144,6 +153,13 @@ of both lanes of every layer at alpha 1e-30: the most a sidecar can cut, at a st
 
 The rows' run-to-run spreads are 0.04 to 0.84 %. A cut costs about 3 us of decode per lane (a copy and a kernel per cut), which
 is a larger share of the 35B's 2.4 ms token than of the 27B's 12 ms; a sidecar cutting half the lanes costs about half.
+
+On Inkling 2 a cut launches no extra kernel (its cut instances do the dot and the cut in the kernels that write the
+residual; the direction is 9 KiB of VRAM shared, 221 KiB per layer). A synthetic sidecar cutting both lanes of all 24
+layers cost -0.21 / -0.07 % (prefill of 2,048 tokens / plain decode of 128) on the default route, -0.15 / -0.09 % with
+`--q8-weights` and -0.31 / -0.29 % with `--a8-activations` (RTX 5090, BF16 KV, one run of three repetitions each,
+2026-11-24). With DSpark the cut changes the text and so the acceptance: decode moved -2.9, -0.7 and +4.2 % on the chat,
+structured and prose fixtures (two runs each; the chat row spread ±6 %). No sidecar has been fitted for this model yet.
 
 ## Making a sidecar
 
