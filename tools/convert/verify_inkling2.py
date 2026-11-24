@@ -303,14 +303,19 @@ def verify(model: Path, artifact_path: Path, token_rank: Path | None = None) -> 
             refs = artifact.directory.components["vision"]["resources"]
             if artifact.read_object(refs["processor_config.json"]) != (model / "processor_config.json").read_bytes():
                 raise AssertionError("processor_config.json differs from the checkpoint's")
+        with_dspark = "dspark" in artifact.directory.components
     mtp.used.add("markov_head.hidden_out.weight")
     mtp.used.add("markov_head.hidden_out.bias")
     unused = sorted(n for n in ck.header
                     if n not in ck.used and (with_vision or not n.startswith("model.visual.")))
-    unused += sorted("mtp:" + n for n in mtp.header if n not in mtp.used)
+    # The drafter's file is consumed only by an artifact with the dspark component (--components text has none).
+    if with_dspark:
+        unused += sorted("mtp:" + n for n in mtp.header if n not in mtp.used)
     if unused:
         raise AssertionError(f"checkpoint tensors not in the artifact: {unused[:8]} ({len(unused)})")
     unconverted = {} if with_vision else {"unconverted": "model.visual.* (no vision component)"}
+    if not with_dspark:
+        unconverted["unconverted_drafter"] = "mtp.safetensors (no dspark component)"
     return {**counts, **unconverted, "seconds": round(time.time() - began, 1)}
 
 

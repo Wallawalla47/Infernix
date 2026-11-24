@@ -1002,10 +1002,10 @@ INFERNIX_OP_TEST(lora) {
         return check_linear_swiglu_terms(QType::FP8_E4M3FN_ROW_BF16, {},
                                          {P::A16Only, P::AllowA8, P::AllowA8Residual, P::A8Only, P::A16ColumnInvariant});
     });
-    // The staged term operands beyond rank 32: 48 (an odd last k-step: one ldmatrix of two matrices) and 64 (the
+    // The staged term operands at padded rank 16 (one k-step: PEFT's default r 8 and the common r 16) and beyond rank 32: 48 (an odd last k-step: one ldmatrix of two matrices) and 64 (the
     // largest; paired gate/up rows' two segments then take two passes on the A4 tile), on the routes that stage them
     // (NVFP4 / FP8 / Q4 / Q5 decode and small-T rows, the A4 tile).
-    for (const std::int32_t rank : {48, 64}) {
+    for (const std::int32_t rank : {16, 48, 64}) {
         run("linear_add nvfp4 rank", [&] {
             return check_linear_add_terms(QType::NVFP4, 17408, nvfp4, {P::A16Only, P::AllowA4}, rank);
         });
@@ -1078,7 +1078,7 @@ INFERNIX_OP_TEST(lora) {
     run("linear_add q5 K6144 wide", [&] {
         return check_linear_add_terms(QType::Q5_G64_FP16, 6144, {}, {P::A16Only, P::A16ColumnInvariant}, 128);
     });
-    for (const std::int32_t rank : {80, 96}) {
+    for (const std::int32_t rank : {80, 96, 112}) {
         run("linear_add nvfp4 wide rank", [&] {
             return check_linear_add_terms(QType::NVFP4, 17408, nvfp4, {P::A16Only, P::AllowA4}, rank);
         });

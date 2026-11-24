@@ -46,6 +46,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -77,6 +78,17 @@ void check(bool ok, const std::string& what) {
     if (!ok) { ++failures; }
 }
 
+// The sidecar directories this run wrote, removed when it ends (none stays in the temp directory).
+struct SidecarDirs {
+    std::vector<std::filesystem::path> dirs;
+    ~SidecarDirs() {
+        for (const std::filesystem::path& dir : dirs) {
+            std::error_code ignored;
+            std::filesystem::remove_all(dir, ignored);
+        }
+    }
+} sidecar_dirs;
+
 // A sidecar in its own directory: a deterministic unit direction and alpha(layer, lane), lane 0 attn, 1 mlp, over
 // `layers` layers (more than the model's for check 0).
 std::filesystem::path write_sidecar(const std::string& name, const std::function<double(std::uint32_t, int)>& alpha,
@@ -84,6 +96,7 @@ std::filesystem::path write_sidecar(const std::string& name, const std::function
     if (layers == 0) { layers = kind.layers; }
     const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("infernix_qwen3_5_ablate_real_" + name);
     std::filesystem::remove_all(dir);
+    sidecar_dirs.dirs.push_back(dir);
     std::filesystem::create_directories(dir);
     std::vector<float> d(kind.hidden);
     std::uint32_t state = 0x5EEDU;

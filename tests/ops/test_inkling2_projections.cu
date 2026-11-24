@@ -655,6 +655,9 @@ INFERNIX_OP_TEST(inkling2_projections) {
         for (const int columns : {1, 3, 16, 17, 40, 300, 2048}) { run_mma(c, columns, seed++); }
         // The decode-width MMA arithmetic (projections_dmma) at decode and verify widths.
         for (const int columns : {1, 2, 3, 8, 9, 16, 17, 40, 128}) { run_mma(c, columns, seed++, ik::projections_dmma, "DMMA"); }
+        // The default route's SIMT fold (projections) against the same FP64 oracle: its own bound, (K / 32 + 5) 2^-24
+        // sum |w x|, lies inside this criterion, and its narrow and wide kernels give a column's bits alone.
+        for (const int columns : {1, 3, 16, 17, 40, 300}) { run_mma(c, columns, seed++, ik::projections, "SIMT"); }
     }
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

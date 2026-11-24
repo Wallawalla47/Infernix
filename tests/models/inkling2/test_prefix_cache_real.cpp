@@ -430,15 +430,19 @@ int main() {
                 engine.stop(); // the orderly stop saves the Host tier
             }
             require(std::filesystem::exists(file), "persist: no file was saved at shutdown");
-            infernix::Engine engine(options);
-            const infernix::GenerationResult resumed =
-                engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, true));
-            const infernix::GenerationResult cold =
-                engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, false));
-            std::cout << "persist: the restarted Engine reused " << resumed.reused_prompt_tokens << " prompt tokens\n";
-            require(resumed.reused_prompt_tokens >= 2048, "persist: the restarted Engine reused too little");
-            require(resumed.generated_token_ids == cold.generated_token_ids, "persist: the tokens differ from cold");
+            {
+                infernix::Engine engine(options);
+                const infernix::GenerationResult resumed =
+                    engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, true));
+                const infernix::GenerationResult cold =
+                    engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, false));
+                std::cout << "persist: the restarted Engine reused " << resumed.reused_prompt_tokens << " prompt tokens\n";
+                require(resumed.reused_prompt_tokens >= 2048, "persist: the restarted Engine reused too little");
+                require(resumed.generated_token_ids == cold.generated_token_ids, "persist: the tokens differ from cold");
+                engine.stop(); // its stop saves the file again: removed after it
+            }
             std::filesystem::remove(file);
+            require(!std::filesystem::exists(file), "persist: the test's cache file stays in the temp directory");
         }
         // 11. The SSD tier.
         ssd_tier(artifact);
