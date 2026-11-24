@@ -30,6 +30,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <utility>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -283,7 +284,7 @@ void check_trailing_calls(int experts, int columns, int top_k, const float* d_lo
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 moe::ExpertActivation activation = moe::ExpertActivation::kA4,
                 moe::NarrowA16 narrow = moe::NarrowA16::kExact, moe::WideA16 wide = moe::WideA16::kExact,
-                bool shared_input = false) {
+                bool shared_input = false, bool sparse_wide = false) {
     const bool a16 = activation == moe::ExpertActivation::kA16;
     if (a16) {
         std::printf("--- W4A16 experts%s%s\n", narrow == moe::NarrowA16::kA4Residual ? ", two-term narrow route" : "",
@@ -385,6 +386,16 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::normal_distribution<float> n(0.0F, 1.0F);
     std::vector<float> logits(static_cast<std::size_t>(experts + 1) * columns);
     for (auto& v : logits) { v = n(rng); }
+    // A gated call wider than 4,096 columns (sparse_wide): every column routes to the first top_k experts, and every
+    // eleventh swaps one of them for an expert of a column or two, so the CPU's narrow jobs read columns across the
+    // whole call.
+    if (sparse_wide) {
+        for (int t = 0; t < columns; ++t) {
+            float* column = &logits[static_cast<std::size_t>(t) * (experts + 1)];
+            for (int s = 0; s < top_k; ++s) { column[s] += 16.0F; }
+            if (t % 11 == 0) { column[top_k + (t / 11) % (experts - top_k)] += 32.0F; }
+        }
+    }
     auto* d_logits = device_copy(logits);
     std::int32_t* d_ids  = nullptr;
     float* d_weights     = nullptr;
@@ -476,9 +487,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                                      .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .assist_share = 77,
                                                      .assist_share_wide = 149, .assist_ramp_from = 64, .cpus = {},
                                                      .activation = activation, .narrow_a16 = narrow});
-    // A prefill call's CPU share (design §19.3.12): calls up to a chunk of 4,096 columns, every narrow
-    // miss offered (no PCIe share), up to every expert of the layer.
-    moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = moe::kMaxCpuCallColumns,
+    // A prefill call's CPU share (design §19.3.12): calls up to a chunk of 4,096 columns (or this call's width past it),
+    // every narrow miss offered (no PCIe share), up to every expert of the layer.
+    moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8,
+                                              .max_columns = std::max(columns, moe::kMaxCpuCallColumns),
                                               .pcie_divisor = 0, .wide_from = 256, .wide_jobs = moe::kMaxCpuJobs,
                                               .cpus = {}, .activation = activation, .narrow_a16 = narrow});
     // SSD tier (design §19.3.7): services that read SSD-only records through a provider.
@@ -663,6 +675,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     for (auto& event : fork_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
     for (auto& event : split_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
     double gpu_idle_extra = 0.0; // what 60 ms of idle adds to a call without the CPU service (the GPU's own wake-up)
+    if (sparse_wide) {
+        check(columns > moe::kMaxCpuCallColumns && expected_cpu_jobs(service_wide, false, nullptr) >= 64,
+              "a wide gated call gives the CPU narrow jobs");
+    }
     for (const Config config : {Config{0, nullptr}, Config{1, nullptr}, Config{3, nullptr}, Config{64, nullptr},
                                 Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
@@ -780,6 +796,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             (g_idle_checks == IdleChecks::kOnly && config.idle == 0)) {
             continue;
         }
+        if (sparse_wide && config.service != &service_wide) { continue; } // only the split's channel takes these widths
         // The long-quiet modes (3, 4: five calls after 1.2 s each) test the service's long waits, which no layer
         // shape changes: they run on each route's decode call (one column). On all 41 shapes they took ~750 s.
         if (config.idle >= 3 && columns != 1) { continue; }
@@ -2348,6 +2365,10 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
+        // Gated calls past 4,096 columns: the compaction's last partial word, a part-filled lane run, and the widest call.
+        for (const auto [width, seed] : {std::pair{4100, 301U}, std::pair{8200, 303U}, std::pair{moe::kMaxCpuWideCallColumns, 307U}}) {
+            test_layer(512, width, 3, seed, moe::ExpertActivation::kA4, moe::NarrowA16::kExact, moe::WideA16::kExact, false, true);
+        }
         {
             // W4A4 experts sharing their input scales: the narrow jobs of calls of one column and more on the
             // tensor-core narrow kernels (one to eight columns per job, misses staged, forked and CPU-served; wider

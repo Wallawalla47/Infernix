@@ -496,15 +496,17 @@ void ExpertOffload::set_plain_position(std::int32_t position, cudaStream_t compu
     divisor_now_ = d;
 }
 
-std::int32_t split_width(double configured, double reference_bytes_per_second, double link_bytes_per_second) noexcept {
+std::int32_t split_width(double configured, double reference_bytes_per_second, double link_bytes_per_second,
+                         std::int32_t widest_call) noexcept {
     constexpr double kTolerance = 0.05;
     const double ratio = reference_bytes_per_second / link_bytes_per_second;
     const double scale = ratio >= 1.0 - kTolerance && ratio <= 1.0 + kTolerance ? 1.0 : ratio;
-    return static_cast<std::int32_t>(std::min<double>(configured * scale, moe::kMaxCpuCallColumns));
+    return static_cast<std::int32_t>(std::min<double>(configured * scale, widest_call));
 }
 
 std::int32_t ExpertOffload::split_columns() const noexcept {
-    return split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond, link_bytes_per_second_);
+    return split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond, link_bytes_per_second_,
+                       moe::kMaxCpuCallColumns);
 }
 
 std::uint64_t ExpertOffload::promotion_interval() const noexcept {

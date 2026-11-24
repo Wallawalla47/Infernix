@@ -149,7 +149,7 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
 /// of staging_slots jobs, so every miss is staged; staging_slots == 0 reads misses zero-copy.
 /// The staging slots are scratch of this call and are shared by every layer.
 /// CPU-served misses (design section 10.3). When enabled for a call (max_jobs > 0 and the call
-/// has at most max_columns <= kMaxCpuCallColumns columns), up to max_jobs <= kMaxCpuJobs of its
+/// has at most max_columns <= kMaxCpuWideCallColumns columns), up to max_jobs <= kMaxCpuJobs of its
 /// non-resident experts with at most max_job_columns columns, the fewest-column ones first, are
 /// published as a request in mapped host memory, with the x columns they read (compacted: the
 /// request's column k is x's k-th column read by a chosen job, in column order), and computed by
