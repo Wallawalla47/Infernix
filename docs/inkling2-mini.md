@@ -99,7 +99,7 @@ otherwise.
 | Constrained output: `--grammar-file`, `--json-object`, `--json-schema-file`, `--choice`, `--regex` and the APIs' structured-output fields | the request is refused |
 | `tool_choice` set to required or to a named tool | the request is refused. `auto` and `none` work; tool calls are parsed from the model's free output, so no grammar protects their arguments |
 | A request ending in an assistant message (prefill) | the request is refused: only a new assistant turn is rendered |
-| `--reasoning-loop stop` or `conclude` | accepted at startup, then the requests it applies to fail. Leave it `off` |
+| `--reasoning-loop stop` or `conclude` | refused at startup |
 | N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens N` | refused at startup |
 | The MTP, DFlash and DFlash2 backends | `--spec mtp`, `dflash` and `dflash2` are refused: the model's drafter is DSpark |
 | `--logits-dtype bf16` | refused at startup: the logits are FP32 |
