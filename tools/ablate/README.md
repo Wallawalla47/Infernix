@@ -1,7 +1,7 @@
 # tools/ablate
 
-Fits a refusal-ablation sidecar for `infernix-serve --ablate` (every model it runs on: the Qwen3.5 family and
-Qwen3.8-Flash-Next) on your own setup, and evaluates it against the stock model. One entry point with subcommands; all state lives in one run directory, and every step is
+Fits a refusal-ablation sidecar for `infernix-serve --ablate` (every model it runs on: the Qwen3.5 family,
+Qwen3.8-Flash-Next and Inkling 2) on your own setup, and evaluates it against the stock model. One entry point with subcommands; all state lives in one run directory, and every step is
 resumable. The guide, with requirements, prompt sets, timings and how to read the results, is
 [docs/ablate-fitting.md](../../docs/ablate-fitting.md).
 

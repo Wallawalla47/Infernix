@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import platform_util as PU
 from . import serve_flags as SF
-from .run import write_json
+from .run import text_model_type, write_json
 
 MODEL_ID = "ablate"
 
@@ -41,6 +41,9 @@ class Engine:
         self.boot_timeout_s = boot_timeout_s
         self.port = 0
         self.proc = None
+        # Inkling 2's template has no thinking-off: enable_thinking false renders its lowest effort, and the reply may
+        # still open with a thinking channel (measure.grade_refusals grades what the model says first in either channel).
+        self.reasons_when_off = text_model_type(run.production.artifact) == "inkling2_loop_text"
 
     def argv(self, port: int | None = None) -> list[str]:
         prod = self.run.production

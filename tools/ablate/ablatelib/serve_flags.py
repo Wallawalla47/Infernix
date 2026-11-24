@@ -55,6 +55,7 @@ RULES: dict[str, Rule] = {
     # --expert-a16-activations: "a W4A4 checkpoint's banks (NVFP4-QAD) with 16-bit activations"
     "--a16-activations": Rule(CARRY, _NUMERICS, capture="--expert-a16-activations"),
     "--a8-activations": Rule(CARRY, _NUMERICS, capture="--a8-activations"),
+    "--q8-weights": Rule(CARRY, _NUMERICS),  # Inkling 2's 8-bit dense weights: the fit measures the route production runs
     "--embedding-host": Rule(CARRY, _MEMORY),
     "--no-cuda-graph": Rule(CARRY, "decode route"),
     "--default-max-tokens": Rule(DROP, "every request names its own max_tokens"),
@@ -66,8 +67,8 @@ RULES: dict[str, Rule] = {
     "--model-id": Rule(OWNED, "the tool names its own engine"),
     "--any-model-name": Rule(DROP, _TRAFFIC),
     "--chat-template": Rule(CARRY, "the template the model is served with renders every prompt the fit measures"),
-    # Qwen3.5 dense: the adapted model is the one production serves, so the direction and every trial are measured on
-    # its activations (--ablate cuts each lane's write with the adapter's term in it).
+    # Qwen3.5 dense and Inkling 2: the adapted model is the one production serves, so the direction and every trial are
+    # measured on its activations (--ablate cuts each lane's write with the adapter's term in it).
     "--lora": Rule(CARRY, "the adapter is part of the model production serves"),
     "--claude-code-prompt": Rule(DROP, _TRAFFIC),
     "--ngram-volume": Rule(CARRY, "the model's n-gram embedding volume"),

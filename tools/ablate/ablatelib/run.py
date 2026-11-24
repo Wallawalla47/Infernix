@@ -93,6 +93,20 @@ def artifact_id(artifact: Path) -> str:
     return ENTRY_HEADER.unpack(raw)[2].hex()
 
 
+def text_model_type(artifact: Path) -> str:
+    """The model_type of the artifact's text component (its directory JSON, after the entry header), or "" when it
+    cannot be read: tells a fit which model's rendering rules apply, nothing more."""
+    try:
+        with Path(artifact).open("rb") as fh:
+            magic, length, _ = ENTRY_HEADER.unpack(fh.read(ENTRY_HEADER.size))
+            if magic != ENTRY_MAGIC or length > (1 << 30):
+                return ""
+            directory = json.loads(fh.read(length).decode("utf-8"))
+        return str(directory["components"]["text"]["config"]["model_type"])
+    except (OSError, ValueError, KeyError, TypeError, struct.error):
+        return ""
+
+
 def replace_file(tmp: Path, path: Path) -> None:
     """tmp.replace(path), tried again for a few seconds while Windows refuses it: a rename over a file another program
     has open fails there (the launcher reads progress.json every second; a virus scanner opens new files)."""
