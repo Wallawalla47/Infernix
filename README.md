@@ -9,7 +9,7 @@
 > written with AI (mostly Claude Opus 5.5 and Qwen3.8-27B running on Infernix). It is likely to be
 > neither complete nor entirely accurate. This is hobby development.
 
-Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RTX 5090. It began as a fork of [NInfer](https://github.com/Neroued/ninfer) by
+Infernix is a C++/CUDA inference engine that serves Qwen models and Thinking Machines' Inkling 2 Mini on one NVIDIA RTX 5090. It began as a fork of [NInfer](https://github.com/Neroued/ninfer) by
 [Neroued](https://github.com/Neroued) and reads NInfer's `.ninfer` artifacts as well as its own
 `.infernix` files.
 
@@ -72,6 +72,7 @@ it:
 | Uncensored NVFP4 Flash-Next | 16-bit (weight-only NVFP4 experts) | `--a8-activations`: experts 8-bit |
 | IQ3_S GGUF Flash-Next | 16-bit everywhere | `--a8-activations`: dense projections and experts 8-bit, as Strata and Basalt |
 | Qwen3.8-27B NVFP4 | Prompts **4-bit** at the NVFP4 layers and **8-bit** at the FP8 ones, as the artifact specifies (NInfer the same); decode and verification 16-bit (wide rounds of several requests: the MLP two-term 4-bit residual, fast path batched-a4-residual-decode). NVIDIA's NVFP4-QAD bit-exact conversion: the same, with NVIDIA's calibrated input scales (W4A4 and static W8A8, as NVIDIA serves it) | `--a16-activations`: 16-bit everywhere. `--a8-activations`: every NVFP4 and FP8 projection 8-bit at every width, for precision comparisons. On the NVFP4-QAD conversion (RTX 5090, INT8 KV): prompts 3.9x slower than the default and 1.3x faster than `--a16-activations` (pp16384 15.5K / 3.96K / 3.0K tok/s, each with its fast paths), plain decode 5 % slower (85.7 against 90.2 tok/s) |
+| Inkling 2 Mini | Routed experts **4-bit** at the NVFP4 layers (the checkpoint's four-over-six rule) and **8-bit** at the MXFP8 layers, as the model was trained; everything else 16-bit | `--a16-activations`: experts 16-bit. `--a8-activations` (approximate, implies `--q8-weights`): the NVFP4 experts, attention projections and head 8-bit; the MXFP8 experts keep their 8-bit arithmetic, the message gates and router 16-bit |
 
 On NVIDIA's NVFP4 weights Strata, strata-nvfp4 and Basalt run the experts at 8 bits in decode and
 every other activation at 8 bits. The options on Dense8 (RTX 5090, one request):
@@ -125,6 +126,26 @@ Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer
   (`--draft-tree-nodes`) are an option on top.
 - **Smaller KV**: `k4v2` and `vq2` hold 2.7 and 4 times the context of INT8.
 
+### Inkling 2 Mini on one RTX 5090
+
+Thinking Machines' looped 24-layer model (48 layer visits a token), resident in VRAM:
+
+- **The checkpoint's weights, bit-exact**, computed by default in the arithmetic the model was trained
+  with: NVFP4 experts on 4-bit four-over-six activations, MXFP8 experts on 8-bit activations.
+- **Optional 8-bit routes**: `--a8-activations` runs the NVFP4 experts, attention projections and head on
+  8 bits, and `--q8-weights` makes only the attention projections and head 8-bit weights, leaving about
+  770 MiB more VRAM for the KV cache. Both change the output slightly
+  ([measured quality](docs/inkling2-mini.md#routes-and-precision)).
+- **DSpark drafting** with the model's own drafter, and an optional shortlist (`--lm-head-draft`) built
+  from a token ranking I measured with Inkling itself. Verification decides every token, so the output
+  does not change.
+- **Images, one to eight lanes, every KV format, the prefix cache** and the lossless route.
+- **Not yet**: `--lora`, `--ablate`, video, constrained output, required or named tool choices, assistant
+  prefill and n-gram drafting.
+
+Download: [wallawalla47/Inkling-2-Mini-Infernix](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix).
+Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
+
 ### Built for agents
 
 - **APIs**: OpenAI Chat Completions and Responses, Anthropic Messages and streaming, with the options
@@ -133,21 +154,22 @@ Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer
   and deferred tools (`defer_loading`, regex/BM25 tool search, `tool_reference`) that keep large MCP
   catalogs out of the prompt.
 - **Constrained decoding**: JSON object and Schema, strict tool arguments, GBNF, regex and choice
-  grammars, with every model and drafter.
+  grammars, with every Qwen model and drafter (not on Inkling 2 Mini yet).
 - **Thinking control**: budgets with a wrap-up message, effort levels and a repetition guard
   (`--reasoning-loop`).
-- **Concurrency and resilience**: one to eight requests with preemption under memory pressure; the
-  prefix cache persists across restarts; a failed Flash-Next expert read fails only the requests
-  running then.
+- **Concurrency and resilience**: one to eight requests with preemption under memory pressure (Inkling
+  2 Mini reserves each lane's whole context instead, so it never pauses a request); the prefix cache
+  persists across restarts; a failed Flash-Next expert read fails only the requests running then.
 - **`/v1/decide`**: decisions from token probabilities (yes/no, choice, score, number, scalar, point
   and box).
 
 ### And also
 
-- **Speculative decoding**: MTP, DFlash, DFlash2 and n-gram drafting with exact sampling, on by
-  default with the drafter measured fastest for each model (`--spec auto`).
+- **Speculative decoding**: MTP, DFlash, DFlash2, DSpark (Inkling 2 Mini) and n-gram drafting with
+  exact sampling, on by default with the drafter measured fastest for each model (`--spec auto`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
-- **Vision**: images and video; the vision encoder can stay in system RAM.
+- **Vision**: images and video (Inkling 2 Mini: images only); the vision encoder can stay in system
+  RAM.
 - **Documents**: PDFs (page text, and page images with vision, read with PDFium), plain-text documents and
   search results, with Anthropic citations
   ([serving](docs/serving.md#documents-pdfs-and-citations)).
@@ -615,8 +637,17 @@ infernix-serve.exe Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-
 The uncensored conversion (`Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix`) takes the same
 options.
 
-**Recommended settings per model** (each with `--kv-dtype int8`; the drafter flags are the fastest
-measured overall, and `auto` picks the draft length):
+Inkling 2 Mini ([guide](docs/inkling2-mini.md#run); add `--vision` for images):
+
+```bat
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --spec dspark --draft-tokens auto --lm-head-draft
+```
+
+That runs the checkpoint's own arithmetic. Add `--a8-activations` for 8-bit activations, or `--q8-weights` for 8-bit
+attention and head weights alone ([what each changes](docs/inkling2-mini.md#routes-and-precision)).
+
+**Recommended settings per model** (each with `--kv-dtype int8` unless its row says otherwise; the
+drafter flags are the fastest measured overall, and `auto` picks the draft length):
 
 | Model | Drafting | What `--draft-tokens auto` does there |
 |---|---|---|
@@ -626,6 +657,7 @@ measured overall, and `auto` picks the draft length):
 | Qwen3.6-35B-A3B | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length, 1-5 (DFlash `auto` is faster only on code at one request) |
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
+| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft`, with the default `--kv-dtype bf16` | the calibrated number of drafts, up to 7, while one request decodes; rounds of several requests decode plainly |
 
 For long conversations on the 27Bs, whose KV cache two long conversations outgrow, add `--embedding-host`:
 the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes
@@ -784,10 +816,18 @@ behind a VRAM expert cache, as for Flash-Next ([guide](docs/qwen3_5-122b.md)).
 | **[Ornith-1.5-122B-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Ornith-1.5-122B-NVFP4-Infernix)** | [ornith-ai/Ornith-1.5-122B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-122B-NVFP4) | Every computed weight as the checkpoint stores it (NVFP4 experts, FP8 projections), plus the MTP drafter, the [DFlash2 drafter](https://huggingface.co/incoai/Ornith-1.5-122B-DFlash2) re-quantized, vision, a Q4 proposal head and the card's sampling defaults. About 64-97 tok/s plain decode depending on the text, 6,500 tok/s prefill at 32K; `--spec mtp --draft-tokens auto` (2 gated drafts) decodes 14 % faster at one request, and the decode split of 2026-10-30 adds 8-9 % to that on real code (3 % plain) ([performance](docs/qwen3_5-122b.md#performance-rtx-5090-one-request-bf16-kv-default-route)). |
 | **[Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix)** | [dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4](https://huggingface.co/dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4) | The refusal-removed export, every computed weight as it stores it (NVFP4 experts; per-row FP8 projections, shared experts and head), with the same drafters, vision, proposal head and its card's sampling defaults (temperature 0.6, presence penalty 0). Same prefill and decode as the original at the same settings ([guide](docs/qwen3_5-122b.md#ornith-15-122b-uncensored-nvfp4)). |
 
+### Inkling 2 Mini
+
+Thinking Machines' looped model, resident in VRAM ([guide](docs/inkling2-mini.md)).
+
+| Repository | Converted from | What it is |
+|---|---|---|
+| **[Inkling-2-Mini-Infernix](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix)** | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | The checkpoint's NVFP4 and MXFP8 experts and BF16 weights bit-exact, with its DSpark drafter, vision tower and a token ranking for `--lm-head-draft`; one file of about 20.3 GB. Plain decode at 212 tok/s on an RTX 5090 (default route, one request); DSpark speeds depend on the text and are in the guide. Needs `main` at `a487ad24f` or later. Apache 2.0. |
+
 ## Documentation
 
 [Launcher](docs/launcher.md), [CLI](docs/cli.md), [serving](docs/serving.md), [Qwen3.8-Flash-Next](docs/qwen3_8-flash-next.md),
-[Qwen3.5-122B-A10B](docs/qwen3_5-122b.md), [perplexity](docs/perplexity.md),
+[Qwen3.5-122B-A10B](docs/qwen3_5-122b.md), [Inkling 2 Mini](docs/inkling2-mini.md), [perplexity](docs/perplexity.md),
 [performance](docs/performance.md), [quality](docs/quality.md) and the [documentation map](docs/README.md).
 
 ## Contributing

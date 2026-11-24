@@ -1,11 +1,8 @@
 # Inkling 2 Mini on one RTX 5090: design
 
-**Status: design proposal, not implemented.** Nothing in this document is built. It is a temporary planning
-document for adding `Inkling2LoopForConditionalGeneration` (Thinking Machines' Inkling 2 Mini, model type
-`inkling2_loop`) to Infernix. When the implementation lands, its stable content moves into the active
-authorities named in [§22](#22-documentation-and-authority-changes) and this file is removed. A new mathematical
-architecture is a product change ([AGENTS.md](../../AGENTS.md)): this design does not authorize implementation,
-and its first open decision ([§23.1](#231-owner-decisions)) is whether the family is added at all.
+**Status: implemented.** This is the design record of `Inkling2LoopForConditionalGeneration` (Thinking Machines'
+Inkling 2 Mini, model type `inkling2_loop`) in Infernix. Parts were written before the code: where they differ, the
+[user guide](../inkling2-mini.md), the [CLI reference](../cli.md) and the code are the authority.
 
 Labels used for numbers: **upstream** (read from the checkpoint, its configs or another engine's code or
 reports), **measured** (on this machine, with the method named; most are Infernix's own records on other models),
@@ -68,7 +65,7 @@ The product supports `Inkling2LoopForConditionalGeneration` through the public E
 - the reproducible route (`--reproducible`: deterministic and request-invariant), the default route and the
   lossless route (`--lossless`);
 - the bundled DSpark drafter as a speculative backend (`--spec dspark`, chosen by `--spec auto`) with the
-  calibrated per-request draft length, and n-gram copy proposals;
+  calibrated per-request draft length (n-gram copy proposals are refused);
 - the existing KV profiles where they apply to 128-wide heads, `int8` and `bf16` first ([§7.6](#76-kv-profiles));
 - the hybrid prefix cache, preemption with Replay, one to eight lanes;
 - the Inkling chat format: reasoning effort, thinking channel, tool declarations and JSON tool calls in the
@@ -1179,9 +1176,18 @@ DSpark = plain holds on every request). Measured (RTX 5090, Basalt's sampled fix
 an arm, slot DS3): a round's draft 1.94-1.98 → 1.84-1.87 ms on conv, 1.73 → 1.62-1.66 on prose, 2.17-2.27 →
 2.07-2.13 on struct (about −5 %: the 0.69 GB target head dominates); decode 264.7 → 265.8 tok/s on conv, 191.3 →
 194.3 on prose (plain 191.5), 399.4 → 402.9 on struct; pp2048 under DSpark unchanged (16,337-16,344 → 16,339-16,340).
-The proposal head (the larger lever) is not built. A plain-round policy that drafted only while the measured
+The proposal head is `--lm-head-draft` (below). A plain-round policy that drafted only while the measured
 tokens-per-ms gain exceeded plain decoding's was tried and rejected: it chose plain rounds on 339 and 598 of the prose
 repetitions' rounds and lost on conv (265.8 → 260.9 tok/s).
+
+**`--lm-head-draft`** (`models/inkling2/draft_head.*`): the artifact stores the vocabulary's rank order
+(`proposal/token_rank`, int32 [V]: the model's own argmax counts on a chat corpus, `tools/freq_corpus`, the tokenizer's
+special tokens first), and nothing else, so the stored bytes fix neither the list's length nor its format. At load the
+Engine takes the first rows of the order, sorts them by id (so ties still break to the lowest id), gathers those rows of
+the target head, the Fold and `fold_bias` from their stored BF16 and makes the two matrices 8-bit. A round's draft then
+reads only the list: the head on 8-bit inputs, and each Markov step over the list on CTAs of one 32-row batch a warp,
+its winning row mapped back to a token id. A target token off the list is never drafted; the round's verification
+commits it as after any rejected draft, so no route's output changes.
 
 Where the draft went (2026-11-23, prose, 7 drafts a round, the round's draft time with one part left out): 2.16 ms in
 all; the Markov steps 1.27, the three layers 0.46 (attention 0.13, MLP 0.25), the head 0.36. Not the head, as read
@@ -1458,8 +1464,10 @@ products copied into BF16; D2 may store FP8). The `vision` component (`--compone
 tower as the checkpoint does (BF16; the patch embedding's columns in (ky, kx, channel) order, the position table
 [1024 = 32 × 32, 1024] row-major by (row, column)), q/k/v and their biases each one parent, and the class token's row
 derived as the one BF16 addition `class_embedding + cls_position_embedding` both references make.
+`--token-rank FILE` adds `proposal/token_rank` after every other parameter (their bytes and order do not change).
 `tools/convert/verify_inkling2.py` re-derives every bound word from the checkpoint with its own reader and fails on any
-difference or unconsumed checkpoint tensor (the tower's only when the artifact has no vision component). Measured
+difference or unconsumed checkpoint tensor (the tower's only when the artifact has no vision component); it checks the
+rank is a permutation of the vocabulary with the special tokens first and, given `--token-rank`, equal to that file. Measured
 2026-11-22: `out/inkling2-mini/inkling2-mini-vision.infernix` (text, dspark, vision) 20.29 GB, 908 objects, converted in
 66 s; the verifier passed (1,168 direct tensors, 24 expert banks, 3 derived).
 
@@ -1467,8 +1475,8 @@ difference or unconsumed checkpoint tensor (the tower's only when the artifact h
 
 NVFP4 experts in `nvfp4_expert_rg16_v1`, the Flash-Next narrow kernels' layout; MXFP8 experts in `mxfp8_expert_rg16_v1`
 (16-row groups of 528-byte units per 32-element K block: 512 code bytes in `mma.m16n8k32` A-fragment order, then the 16
-rows' UE8M0 scales; provisional until M3's op benchmark against row-major g32), both with the checkpoint's gate/up row
-interleaving (2i gate, 2i + 1 up). Attention matrices grouped per layer into the K2 parent [8,576 × 2304] (q, r, gate,
+rows' UE8M0 scales; the stored layout is final: another code order, were one ever measured faster, is a value-preserving
+permutation an engine can make at load), both with the checkpoint's gate/up row interleaving (2i gate, 2i + 1 up). Attention matrices grouped per layer into the K2 parent [8,576 × 2304] (q, r, gate,
 k, v) and a small parent (sink, taps); the four message gates' down projections one parent, each gate's forget and gain
 another; the head row-major.
 
@@ -1485,11 +1493,11 @@ component, kept byte for byte after the converter checks it names the processor 
 
 | Option | Values for this family |
 |---|---|
-| `--spec` | `none`, `dspark`, `auto` (= `dspark` when the artifact carries the drafter) |
+| `--spec` | `off`, `dspark`, `auto` (= `dspark` when the artifact carries the drafter) |
 | `--draft-tokens` | `auto` (calibrated), 1-7 |
 | `--kv-dtype` | the full visits' pools ([§7.6](#76-kv-profiles)): `bf16` (default), `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`; the sliding windows stay BF16 K / FP16 V |
-| `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` refused |
-| `--prefill-chunk` | default 16K if chunk-width invariance holds ([§14.1](#141-chunk-width-invariance)) |
+| `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` streams the tower from pinned host memory |
+| `--prefill-chunk` | default 4,096; a multiple of 128 up to 8,064 ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |
 | `--q8-weights` | approximate 8-bit K2, W_o and head ([§11](#11-dense-projections-and-the-head)); refused with `--reproducible` and `--lossless` |
 | `--a16-activations` | the routed experts on 16-bit activations (`w4a4_sparse_moe.h`'s `ExpertActivation::A16`): NVFP4 layers on Qwen3.8-Flash-Next's exact W4A16 arithmetic (x and h as 21-bit fixed point per column, exact int64 sums, the multiplier fl32(amax / denominator)), MXFP8 layers W8A16 (E4M3 widened exactly to BF16, a block's two MMAs from zero, its power-of-two scale fused); accepted with `--reproducible`; prompt calls run the narrow kernels (no A16 grouped GEMM: pp2048 16,387 → 3,383 tok/s, tg128 184.9 → 188.1, 2026-11-22); MXFP8 decode at one column runs the separate router and experts. `--a8-activations` ([§11](#11-dense-projections-and-the-head)): 8-bit activations in every call for the dense Q8 matrices and the NVFP4 experts (implies `--q8-weights`); refused with `--reproducible`, `--lossless` and `--a16-activations` |

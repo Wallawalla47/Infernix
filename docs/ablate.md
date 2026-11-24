@@ -1,8 +1,8 @@
 # Ablation sidecars
 
 `--ablate FILE` removes one direction from a model's residual writes at runtime (directional ablation, the technique
-behind "abliterated" models), on every architecture Infernix runs: Qwen3.5 and Qwen3.6/3.8 dense (the 27Bs), Qwen3.5-MoE
-(the 35B-A3B, the 122B-A10B) and Qwen3.8-Flash-Next. The artifact is unchanged: the engine reads a small sidecar at
+behind "abliterated" models), on Qwen3.5 and Qwen3.6/3.8 dense (the 27Bs), Qwen3.5-MoE (the 35B-A3B, the 122B-A10B) and
+Qwen3.8-Flash-Next; Inkling 2 refuses it for now. The artifact is unchanged: the engine reads a small sidecar at
 startup, and without the flag nothing loads and nothing is hooked. A sidecar fitted to the refusal direction removes
 the model's refusals while the rest of its behaviour stays close to the original; [examples/ablate](../examples/ablate)
 ships one for Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8, with its measurements. No sidecar has been fitted for a
@@ -83,7 +83,7 @@ degenerate row on a cut layer, and no `generation.source`.
 
 ## Where it applies
 
-- Every architecture: Qwen3.5 dense, Qwen3.5-MoE (resident and offloaded experts) and Qwen3.8-Flash-Next.
+- Qwen3.5 dense, Qwen3.5-MoE (resident and offloaded experts) and Qwen3.8-Flash-Next. Inkling 2 refuses `--ablate`.
 - Every product command takes it: `infernix-serve`, `infernix` (the CLI), `infernix-perplexity` (which scores the cut
   model) and `infernix-bench`, and the launcher's configure page has an **Ablation sidecar** field. What a run applied
   is recorded beside the startup log line: `server_start.artifact.ablate_sidecar` in the request log,

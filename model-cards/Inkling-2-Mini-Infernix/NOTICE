@@ -1,0 +1,74 @@
+Inkling-2-Mini-Infernix
+A conversion of thinkingmachines/Inkling-2-Mini for Infernix, by Wallawalla47.
+
+Inkling 2 Mini is by Thinking Machines Lab, Inc.
+(https://huggingface.co/thinkingmachines/Inkling-2-Mini, revision
+6e7c8248f75265bdd4fbab5273304243b5d8c2cb), published under the Apache License,
+Version 2.0 (see LICENSE). Its card links the Model Acceptable Use Policy:
+https://thinkingmachines.ai/model-acceptable-use-policy/
+
+------------------------------------------------------------------------------
+Changes made in this conversion (Apache License 2.0, Section 4(b)):
+
+  - The checkpoint's text model, DSpark drafter (mtp.safetensors) and vision tower
+    were converted into one Infernix v3 artifact, Inkling-2-Mini-Infernix.infernix,
+    with the inkling2_mini recipe of Infernix's tools.convert.
+  - The NVFP4 and MXFP8 routed experts keep their codes and scales unchanged,
+    regrouped into one record per expert. Each NVFP4 expert also stores the multiplier
+    fl32(amax / denominator), beside the checkpoint's amax and denominator.
+  - BF16 and FP32 tensors keep their values. Some are reordered without changing a
+    value: the static convolutions (lag-major) and the looped layers' cross-pass
+    queries.
+  - The token embedding, output head and DSpark Markov embedding keep the rows of the
+    200,058 assigned tokens; the checkpoint's 966 padding rows, which no token id can
+    reach, are not stored.
+  - DSpark's Fold and fold_bias are derived from the output head and hidden_out, which
+    is not stored. The vision class row is derived as the BF16 sum of class_embedding
+    and cls_position_embedding.
+  - Added proposal/token_rank, an ordering of the vocabulary (below).
+  - Tokenizer, chat template, generation and processor configs: stored unchanged as
+    artifact resources.
+  - README.md, config.json (metadata only) and the conversion report added.
+
+------------------------------------------------------------------------------
+Token ranking (proposal/token_rank):
+
+The ranking orders the vocabulary by Inkling 2 Mini's own top prediction at each
+assistant position of a chat corpus, built from the datasets below. The artifact
+stores only the resulting order of token ids. It contains no text from any dataset.
+The datasets were selected, filtered, tokenized and counted by Infernix's
+tools/freq_corpus; they are not redistributed here.
+
+  WildChat-1M, by the Allen Institute for AI
+  https://huggingface.co/datasets/allenai/WildChat-1M
+  revision 7d6490e462285cf85d91eabea0f9a954fbddcd1f
+  Contains information from WildChat-1M, which is made available under the Open Data
+  Commons Attribution License (ODC-By) v1.0:
+  https://opendatacommons.org/licenses/by/1-0/
+
+  OpenCodeInstruct, by NVIDIA
+  https://huggingface.co/datasets/nvidia/OpenCodeInstruct
+  revision 8f3ba5bafe4d6e8db46082cf7ae6741bc370604d
+  Creative Commons Attribution 4.0 International (CC BY 4.0):
+  https://creativecommons.org/licenses/by/4.0/
+
+  OpenMathInstruct-2, by NVIDIA
+  https://huggingface.co/datasets/nvidia/OpenMathInstruct-2
+  revision 469216e3f46f4dacf476b382e192485ea51a143e
+  Creative Commons Attribution 4.0 International (CC BY 4.0):
+  https://creativecommons.org/licenses/by/4.0/
+
+  Aya Dataset, by Cohere Labs
+  https://huggingface.co/datasets/CohereLabs/aya_dataset
+  revision f9ea04583f02a8f86404ff6c58bf75fe637df8a2
+  Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
+  OASST2, by OpenAssistant
+  https://huggingface.co/datasets/OpenAssistant/oasst2
+  revision 179dd21fc55192153d94adb0e0ce8f69e222bf75
+  Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
+  GSM8K, by OpenAI
+  https://huggingface.co/datasets/openai/gsm8k
+  revision 740312add88f781978c0658806c59bc2815b9866
+  MIT License: https://opensource.org/license/mit
