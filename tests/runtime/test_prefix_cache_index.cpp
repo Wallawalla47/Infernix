@@ -1174,6 +1174,14 @@ void test_passed_endpoints() {
     const auto next_suffix = make_tokens(64 * 5 - 150, 72);
     next.insert(next.end(), next_suffix.begin(), next_suffix.end());
     const auto next_path = insert_sequence(index, backend, next);
+    // A supersession for room that is undone (the capture refused or abandoned) is undone whole: the endpoint it
+    // passed is retained again with the tap (hybrid-prefix-cache-spec §9.3).
+    require(index.supersede(tap, std::span<const TokenId>(next.data() + 64 * 2, next.size() - 64 * 2)),
+            "the tap is superseded");
+    require(index.snapshot(dead).superseded, "the passed endpoint is superseded with it");
+    index.unsupersede(tap);
+    require(!index.snapshot(tap).superseded && !index.snapshot(dead).superseded,
+            "an undone supersession retains the endpoint it passed again");
     index.supersede(tap, std::span<const TokenId>(next.data() + 64 * 2, next.size() - 64 * 2));
     require(index.snapshot(dead).superseded && index.snapshot(tap).superseded,
             "the passed endpoint and the resumed tap must both be superseded");

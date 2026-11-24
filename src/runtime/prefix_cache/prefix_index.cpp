@@ -233,6 +233,7 @@ void PrefixCacheIndex::retain_again(std::uint32_t index) {
     collect_retained_dependents(index, dependents);
     entry.superseded      = false;
     entry.superseded_tick = 0;
+    entry.passed_by       = kNoId;
     adjust_retained(entry.anchor, +1);
     revalue_around(index, dependents);
     revalue_sibling(entry.anchor, index, 1);
@@ -352,6 +353,7 @@ bool PrefixCacheIndex::leaves_path(const Snapshot& snapshot, std::uint32_t from,
 bool PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> continuation) {
     // Below a Boundary the endpoints may be other conversations': one conversation passing them
     // says nothing about theirs.
+    std::vector<std::uint32_t> passed_now; // the endpoints this call superseded as passed
     if (!continuation.empty() && require(snapshot).kind != SnapshotKind::Boundary) {
         const Snapshot& source = require(snapshot);
         std::vector<std::uint32_t> passed;
@@ -363,7 +365,9 @@ bool PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> 
             }
         }
         // Before `snapshot`, so they are evicted first.
-        for (const std::uint32_t endpoint : passed) { (void)supersede(ref_of_snapshot(endpoint)); }
+        for (const std::uint32_t endpoint : passed) {
+            if (supersede(ref_of_snapshot(endpoint))) { passed_now.push_back(endpoint); }
+        }
     }
     Snapshot& entry = require(snapshot);
     // A boundary serves the conversations that share it, so it is superseded only while the tree
@@ -380,12 +384,29 @@ bool PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> 
     // Its retained dependents now value what lies between them and the retained ancestor above.
     revalue_around(snapshot.index, dependents);
     revalue_sibling(entry.anchor, snapshot.index, 0);
+    // The endpoints passed with this supersession: an unsupersede of it retains them again.
+    for (const std::uint32_t endpoint : passed_now) {
+        snapshots_[endpoint].passed_by   = snapshot.index;
+        snapshots_[endpoint].passed_tick = entry.superseded_tick;
+    }
     return true;
 }
 
 void PrefixCacheIndex::unsupersede(SnapshotRef snapshot) {
-    if (!require(snapshot).superseded) { return; }
+    const Snapshot& entry = require(snapshot);
+    if (!entry.superseded) { return; }
+    const std::uint64_t tick = entry.superseded_tick;
     retain_again(snapshot.index);
+    // The endpoints this supersession passed (dependents_of lists every snapshot whose nearest one this is); one an
+    // earlier supersession of it passed stays superseded.
+    const std::vector<std::uint32_t> dependents = dependents_of(snapshot.index);
+    for (const std::uint32_t dependent : dependents) {
+        const Snapshot& endpoint = snapshots_[dependent];
+        if (endpoint.occupied && endpoint.superseded && endpoint.passed_by == snapshot.index &&
+            endpoint.passed_tick == tick) {
+            retain_again(dependent);
+        }
+    }
 }
 
 // ---- pins --------------------------------------------------------------------------------------
@@ -1408,6 +1429,7 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
     snapshot.priority_base   = inflation_;
     snapshot.superseded      = false;
     snapshot.superseded_tick = 0;
+    snapshot.passed_by       = kNoId;
     snapshot.hold            = kNoHold;
     ++snapshot_epoch_;
     if (device_slot != kNoId) {
