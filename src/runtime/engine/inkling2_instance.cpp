@@ -165,6 +165,11 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
            "the design reference (--reference) is the lossless route's causal scoring");
     refuse(options.lossless_noise_seed != 0 && (!options.lossless || options.purpose != EnginePurpose::CausalScoring),
            "the noise twin (lossless_noise_seed) is the lossless route's causal scoring");
+    // Inkling 2's own lossless kernels (ops/lossless/lossless_inkling2.cu) round to nearest only: a seed would perturb
+    // the shared linear kernels alone, a twin of no defined noise level.
+    refuse(options.lossless_noise_seed != 0,
+           "the noise twin (lossless_noise_seed, --noise-seed) is built for the Qwen families' lossless kernels, not "
+           "Inkling 2's");
     refuse(!(options.lossless_noise_scale > 0.0F && options.lossless_noise_scale <= 1.0F),
            "lossless_noise_scale must be in (0, 1]");
     // The other families' options, which nothing on Inkling 2's path reads (docs/inkling2-mini.md, "Not supported").
@@ -461,6 +466,37 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         planned->vram.workspace_bytes           = device_plan.workspace;
         planned->vram.planned_bytes =
             planned->vram.weights_bytes + planned_beside_weights_bytes(planned->vram) + device_plan.fixed_bytes();
+        planned->vram.headroom_bytes = headroom;
+        // The readings the plan was made against, and whether the start fits them (an explicit --max-context,
+        // --kv-capacity or --max-concurrency that does not fit is refused here, as its start would fail).
+        const HostMemorySnapshot host = host_memory_snapshot();
+        plan_readings(*planned, device.props.name, vram, host, options);
+        const std::uint64_t free_now = free_device_bytes(vram);
+        const std::uint64_t used     = planned->vram.planned_bytes + headroom;
+        planned->vram.left_bytes     = free_now > used ? free_now - used : 0;
+        if (used > free_now) {
+            plan_refuse(*planned, "the weights, KV cache and workspaces need " + std::to_string(used >> 20U) +
+                                      " MiB with the display headroom, and " + std::to_string(free_now >> 20U) +
+                                      " MiB of VRAM is free");
+        }
+        // RAM: the weights the load pins (the vision tower offloaded with --vision-offload on) and the Host tier.
+        const std::uint64_t pinned = plan.materialization().pinned_capacity_bytes;
+        if (pinned != 0) { planned->ram.pinned_bytes = pinned; }
+        std::uint64_t host_tier = 0;
+        if (program.prefix_cache) {
+            host_tier                       = cache_host_bytes(options, pinned, vram);
+            planned->ram.host_context_bytes = host_tier;
+        }
+        planned->ram.planned_bytes      = pinned + host_tier;
+        const std::uint64_t spare       = host.available_physical > options.ram_free_bytes
+                                              ? host.available_physical - options.ram_free_bytes
+                                              : 0U;
+        planned->ram.left_bytes         = spare > planned->ram.planned_bytes ? spare - planned->ram.planned_bytes : 0U;
+        if (planned->ram.planned_bytes > spare) {
+            plan_refuse(*planned, "the pinned weights and the Host tier need " +
+                                      std::to_string(planned->ram.planned_bytes >> 20U) + " MiB of RAM, and " +
+                                      std::to_string(spare >> 20U) + " MiB is available beyond --ram-free-mib");
+        }
         return {};
     }
     std::string template_override;

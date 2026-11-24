@@ -234,6 +234,15 @@ Parameters::Parameters(const Model& source) : model(source) {
         c.residual_block == 0) {
         throw std::invalid_argument("inkling2: the kernels are built for Inkling 2 Mini's geometry");
     }
+    // The default and reproducible routes' kernels compute these scalars as constants (the lossless route reads the
+    // config): another value would give those routes another model's arithmetic.
+    if (c.rms_norm_eps != k::kRmsEps || c.qk_clip_threshold != k::kQkClipThreshold ||
+        c.relative_clip_threshold != k::kRelativeClipThreshold || c.log_scaling_alpha != k::kLogScalingAlpha ||
+        static_cast<float>(c.log_scaling_floor) != k::kLogScalingFloor) {
+        throw std::invalid_argument("inkling2: the kernels are built for Inkling 2 Mini's rms_norm_eps 1e-6, "
+                                    "qk_clip_threshold 16*sqrt(2), relative_clip_threshold 8 and log scaling 0.1 / 8192; "
+                                    "the artifact's config states others");
+    }
     embedding      = bf16(model, w.token_embedding);
     embedding_norm = bf16(model, w.embedding_norm);
     final_norm     = bf16(model, w.final_norm);

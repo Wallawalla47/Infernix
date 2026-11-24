@@ -39,6 +39,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -2086,6 +2087,26 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
     }
     check_launch("single");
 }
+
+void moe_clear_counters(const Workspace& workspace, cudaStream_t stream) {
+    if (workspace.route_done == nullptr || workspace.single == nullptr) {
+        throw std::invalid_argument("w4a4_sparse_moe clear: a carved workspace");
+    }
+    CUDA_CHECK(cudaMemsetAsync(workspace.route_done, 0, sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(workspace.single, 0, kSingleCounters * sizeof(std::uint32_t), stream));
+}
+
+namespace testing {
+void leave_stalled_single_counters(const Workspace& workspace, cudaStream_t stream) {
+    std::array<std::uint32_t, kSingleCounters> counts{};
+    counts[0] = kRouterCtas;
+    counts[1] = static_cast<std::uint32_t>(kSingleCtas - kSingleCtasPerJob);
+    counts[2] = static_cast<std::uint32_t>(kSingleRowGroups - 1);
+    for (int job = 1; job < kTopK; ++job) { counts[2 + job] = static_cast<std::uint32_t>(kSingleRowGroups); }
+    CUDA_CHECK(cudaMemcpyAsync(workspace.single, counts.data(), sizeof(counts), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+} // namespace testing
 
 void moe_encode_a8(const std::uint16_t* x, std::int32_t columns, std::uint8_t* rows, cudaStream_t stream) {
     if (x == nullptr || rows == nullptr || columns <= 0 || reinterpret_cast<std::uintptr_t>(rows) % 16 != 0 ||

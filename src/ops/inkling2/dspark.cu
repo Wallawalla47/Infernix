@@ -743,9 +743,12 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const 
     __syncthreads();
     if (t != 0) { return; }
     const float b = tb[0], m = tm[0], s = ts[0];
-    const int bi  = ti[0];
+    // Every logit NaN (a non-finite drafter state): no row won, so the draft is row 0 with probability 0 (a valid id the
+    // verification rejects or accepts on the target's own terms), never an index past the rows.
+    const bool any = ti[0] < a.vocab;
+    const int bi   = any ? ti[0] : 0;
     a.tokens[step - 1]        = a.row_ids != nullptr ? a.row_ids[bi] : bi;
-    a.probabilities[step - 1] = canon::div_rn(canon::exp_c(__fsub_rn(b, m)), s);
+    a.probabilities[step - 1] = any ? canon::div_rn(canon::exp_c(__fsub_rn(b, m)), s) : 0.0F;
     sc.logits_done            = 0U;
 }
 

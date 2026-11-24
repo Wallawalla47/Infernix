@@ -5,6 +5,7 @@
 // tests' emulations and the kernels share one definition. Only IEEE binary32 operations with round-to-nearest-even and
 // explicit fma are used (host translation units compile with -ffp-contract=off).
 
+#include "infernix/ops/inkling2_attention.h"
 #include "infernix/ops/inkling2_visit.h"
 #include "ops/common/canonical_math.h"
 
@@ -21,7 +22,6 @@ namespace infernix::ops::inkling2 {
 
 inline constexpr int kGroups    = kHidden / 8; // 288 groups of 8 contiguous elements: one a thread
 inline constexpr int kWarpsH    = kGroups / 32; // 9
-inline constexpr float kRmsEps  = 1e-6F;
 inline constexpr float kMixScale = static_cast<float>(1.0 / 48.0); // fl32(H^-0.5), the mixes' score scale
 
 INFERNIX_VISIT_HD float sqrt_rn(float x) {
@@ -44,7 +44,7 @@ INFERNIX_VISIT_HD float clip_factor(float sum, float threshold) {
 }
 
 // The full layers' log scaling: 1 + 0.1 ln(max(1, (pos + 1) / 8192)) (the division by 8192 exact).
-INFERNIX_VISIT_HD float tau(std::int32_t position, float alpha = 0.1F, float floor = 8192.0F) {
+INFERNIX_VISIT_HD float tau(std::int32_t position, float alpha = kLogScalingAlpha, float floor = kLogScalingFloor) {
     const float ratio = canon::div_rn(static_cast<float>(position + 1), floor);
     return canon::add_rn(1.0F, canon::mul_rn(alpha, canon::log_c(ratio > 1.0F ? ratio : 1.0F)));
 }

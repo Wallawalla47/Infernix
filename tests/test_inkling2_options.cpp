@@ -149,6 +149,12 @@ void test_refused_options() {
     api = {};
     api.lossless_noise_seed = 7;
     check(engine_error(api).find("noise twin") != std::string::npos, "the noise twin outside lossless scoring is refused");
+    // ... and on lossless scoring too: Inkling 2's own lossless kernels have no twin.
+    api.lossless   = true;
+    api.fast_paths = false;
+    api.purpose    = EnginePurpose::CausalScoring;
+    check(engine_error(api).find("not Inkling 2's") != std::string::npos,
+          "the noise twin on Inkling 2's lossless scoring is refused");
     // The prefix cache's options Inkling 2 does not have are refused on a scoring start too (it would drop them).
     api         = {};
     api.purpose = EnginePurpose::CausalScoring;

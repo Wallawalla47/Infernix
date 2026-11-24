@@ -555,7 +555,8 @@ column equal to the same column projected alone.
 `infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2 through the public Engine against an eager
 one-request Engine prefilling 16 columns a call: the golden prompt's greedy continuation, CUDA graphs, four sampled
 requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's logits equal to the forward test's
-(`INFERNIX_INKLING2_LOGITS_GUARD`) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
+prompt route (`INFERNIX_INKLING2_PROMPT_LOGITS_GUARD`, which the forward test's `INFERNIX_INKLING2_PROMPT_LOGITS_OUT`
+writes; without it that one check is skipped and says so) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
 128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of
 16 byte for byte; under `--q8-weights` (refused with `--reproducible`) an eager one-request Engine is again the
 reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it reports a chat turn, a thinking-budget
@@ -579,6 +580,12 @@ under Basic protection as free.
 configurations its callers start with (the server's and the launcher's defaults, tools/ablate's engines,
 infernix_bench's, the real tests' and infernix-perplexity's options), which must start; a scoring start must report
 the generation options it leaves unused.
+`infernix_inkling2_withdraw_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) reports a row as non-finite through
+`runtime::testing::set_nonfinite_fault`, as the other families' withdrawal tests do: a failed prompt's entries leave the
+prefix cache (its retry resumes from nothing and equals a cache-off run, which also reports its
+`cache_created_prompt_tokens`); with two lanes, a request prefilling beside the failure is unaffected and keeps its own
+entries (a prompt publishes at its prefill's end, so this case does not reach the withdrawal's pinned remainder); with
+`--prefix-cache-file`, a restarted Engine resumes the clean prompt and not the failed one.
 `infernix_inkling2_lossless_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) checks the `--lossless` route's cache form
 (generation) against its window form (scoring), the exact oracle: a 1,226-token sequence's logits byte for byte over
 calls of mixed widths (one wider than a sliding visit's ring, single-column decode calls, calls across the ring's wrap

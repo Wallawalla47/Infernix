@@ -199,11 +199,16 @@ void require_alone(const std::string& label, infernix::Engine& engine, const std
 }
 
 // 9. A stalled MoE call (testing::force_moe_stall writes kErrorDownStalled through the MoE workspace's error word, as a
-//    down CTA that waited past its bound sets it): the request holding the lane fails with the Engine's recoverable
-//    error instead of committing tokens, and the Engine keeps serving: the next request gives its solo tokens.
+//    down CTA that waited past its bound sets it, and leaves the one-column MoE's counters as a stalled call does: that
+//    CTA never counted itself, so its last-CTA reset never ran): the request holding the lane fails with the Engine's
+//    recoverable error instead of committing tokens, and the Engine keeps serving: the next request (one-column decodes
+//    included) gives its solo tokens.
 void stalled_moe(const std::filesystem::path& artifact) {
     namespace inkling_testing = infernix::models::inkling2::testing;
-    infernix::Engine engine(engine_options(artifact, 16, true, 1));
+    // Plain decoding: every decode call is one column, the one-column MoE (moe_single) whose counters a stall leaves.
+    infernix::EngineOptions options = engine_options(artifact, 16, true, 1);
+    options.speculative.backend     = infernix::SpeculativeBackend::None;
+    infernix::Engine engine(options);
     const Tokens solo = engine.generate(engine.prepare(chat(texts()[1])), sampled(1)).generated_token_ids;
     inkling_testing::force_moe_stall(1);
     std::string error;
@@ -647,6 +652,23 @@ int main() {
             }
         }
         {
+            // Engine::plan: the readings are filled, a start that fits says so with its VRAM left, and an explicit
+            // configuration that cannot fit (eight lanes of the model's whole context) is refused with an error.
+            infernix::EngineOptions fits = engine_options(artifact, 16, false, 1);
+            const infernix::EnginePlan plan = infernix::Engine::plan(fits);
+            require(plan.fits && plan.error.empty() && !plan.gpu.name.empty() && plan.gpu.free_bytes != 0 &&
+                        plan.ram.total_bytes != 0 && plan.vram.left_bytes != 0,
+                    "plan: a start that fits is reported with its readings and VRAM left (" + plan.error + ")");
+            infernix::EngineOptions too_big = fits;
+            too_big.max_context             = 262144;
+            too_big.max_concurrency         = 8;
+            too_big.kv_capacity             = infernix::KvCapacityPolicy::explicit_capacity(8U * 262144U);
+            const infernix::EnginePlan refused = infernix::Engine::plan(too_big);
+            require(!refused.fits && !refused.error.empty(), "plan: eight lanes of 262,144 tokens were reported to fit");
+            std::cout << "plan: fits with " << (plan.vram.left_bytes >> 20U) << " MiB left; eight 262K lanes refused: "
+                      << refused.error << '\n';
+        }
+        {
             // ScoreOptions::argmax_only (the token-ranking tool's device argmax): each position's top_k = 1 token.
             infernix::EngineOptions options = engine_options(artifact, 16, false, 1);
             options.purpose                 = infernix::EnginePurpose::CausalScoring;
@@ -656,6 +678,19 @@ int main() {
             device.argmax_only = true;
             const Tokens by_host = engine.score_tokens(golden, 1, ranked).top_ids;
             require_same("scoring: argmax_only against top_k = 1", by_host, engine.score_tokens(golden, 1, device).top_ids);
+            // A stalled MoE call fails the scores (the stall word is read after the window), and the next window
+            // scores as before.
+            namespace inkling_testing = infernix::models::inkling2::testing;
+            inkling_testing::force_moe_stall(1);
+            std::string error;
+            try {
+                (void)engine.score_tokens(golden, 1, ranked);
+            } catch (const std::exception& e) { error = e.what(); }
+            inkling_testing::force_moe_stall(0);
+            require(error.find("down pass waited past its bound") != std::string::npos,
+                    "scoring: a stalled MoE call did not fail the scores");
+            require_same("scoring: after the stall", by_host, engine.score_tokens(golden, 1, ranked).top_ids);
+            std::cout << "scoring: a stalled MoE call fails the scores; the next window scores as before\n";
         }
         if (guard != nullptr) {
             infernix::EngineOptions options = engine_options(artifact, 16, false, 1);

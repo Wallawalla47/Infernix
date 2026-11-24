@@ -191,6 +191,9 @@ public:
         b_.moe.error   = word;
         b_.guess.error = word;
     }
+    // After a call that set the error word (and once it has finished): the MoE workspaces' cross-call counters, which
+    // a CTA that gave up never counted itself in, start from zero again (ops::w4a4_moe::moe_clear_counters).
+    void clear_moe_counters(cudaStream_t stream) const;
     [[nodiscard]] const StateLayout& layout() const noexcept { return layout_; }
     [[nodiscard]] std::int32_t columns() const noexcept { return columns_; }
     [[nodiscard]] VisitInputs inputs(std::uint32_t visit) const;

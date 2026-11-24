@@ -57,7 +57,8 @@ set_tests_properties(infernix_inkling2_constrained_engine_real_test PROPERTIES S
 
 # Through the public Engine (the Program's first slice), against an eager one-request Engine: the golden greedy
 # continuation, graphs, request invariance at C = 2, 4 and 8, prefill chunk width, and a scoring Engine's logits against
-# the forward test's (INFERNIX_INKLING2_LOGITS_GUARD). Skips without INFERNIX_INKLING2_ARTIFACT and
+# the forward test's prompt route (INFERNIX_INKLING2_PROMPT_LOGITS_GUARD, written by the forward test's
+# INFERNIX_INKLING2_PROMPT_LOGITS_OUT; that check alone is skipped without it). Skips without INFERNIX_INKLING2_ARTIFACT and
 # INFERNIX_INKLING2_REFERENCE.
 infernix_add_test(infernix_inkling2_engine_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
@@ -71,6 +72,14 @@ infernix_add_test(infernix_inkling2_prefix_cache_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_cache_real.cpp"
   LIBRARIES infernix_engine infernix_media_decode)
 set_tests_properties(infernix_inkling2_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 1800)
+
+# Withdrawal after non-finite logits on a real artifact (hybrid-prefix-cache-spec §7.8): alone, beside a lane that
+# prefills the same prompt (it publishes at its prefill's end, so nothing is pinned), and with --prefix-cache-file; skips without INFERNIX_INKLING2_ARTIFACT.
+infernix_add_test(infernix_inkling2_withdraw_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_withdraw_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_inkling2_withdraw_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
   LABELS "gpu;real" TIMEOUT 1800)
 
 # The --lossless route on a real artifact: the cache form's logits equal the window form's byte for byte over mixed

@@ -214,6 +214,19 @@ void moe_single(const std::uint16_t* x, const Activations& rows, const std::uint
                 float route_scale, const Bank& bank, const Workspace& workspace, std::uint16_t* outputs,
                 cudaStream_t stream);
 
+// After a call that set kErrorDownStalled: a CTA that gave up returned before it counted itself, so the counters a
+// call's last CTA resets (route_done, single) may hold that call's counts, and the next call would pass its waits on
+// them. Zeroes both on `stream` (the dispatch rebuilds every other word a call reads). The caller runs it once the
+// stalled call has finished (after its synchronization) and before any later call.
+void moe_clear_counters(const Workspace& workspace, cudaStream_t stream);
+
+namespace testing {
+// What a moe_single call whose job 0 stalled at its last row group leaves in the workspace's counters (the router done,
+// every CTA but job 0's finished, the other jobs complete), written on `stream` and waited for: the Engine's forced
+// stall pairs it with the error word, so a test sees the stall's real aftermath.
+void leave_stalled_single_counters(const Workspace& workspace, cudaStream_t stream);
+} // namespace testing
+
 // The prompt route (a prefill call's columns, any width). Its arithmetic differs from the narrow route's in the
 // router's logits and the experts' sums, and each column is still computed from its own inputs alone, so a prompt
 // column's outputs never depend on the call's width or other columns.

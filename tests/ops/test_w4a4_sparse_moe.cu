@@ -1347,7 +1347,7 @@ void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core
     std::uint16_t *d_ref = nullptr, *d_one = nullptr;
     cuda_check(cudaMalloc(&d_ref, std::size_t(K) * H * 2), "cudaMalloc");
     cuda_check(cudaMalloc(&d_one, std::size_t(K) * H * 2), "cudaMalloc");
-    int differ = 0, routing_differ = 0, graph_differ = 0;
+    int differ = 0, routing_differ = 0, graph_differ = 0, stall_differ = 0;
     // Column 3 at 8x the scale, column 4 all zeros, column 5 one NaN element (every logit NaN: the selection must still
     // fill its slots, with experts 0-7 in order, and both paths agree).
     constexpr int kColumns = 6;
@@ -1427,6 +1427,18 @@ void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core
         }
         cuda_check(cudaGraphExecDestroy(exec), "destroy");
         cuda_check(cudaGraphDestroy(graph), "destroy");
+        // After a stalled call (its CTA that gave up never counted itself): moe_clear_counters puts the counters back
+        // at zero, so the next call passes no wait early, gives the separate path's outputs and leaves them at zero.
+        moe::testing::leave_stalled_single_counters(ws, stream);
+        moe::moe_clear_counters(ws, stream);
+        cuda_check(cudaMemsetAsync(d_one, 0xFF, std::size_t(K) * H * 2, stream), "clear");
+        single(stream);
+        cuda_check(cudaStreamSynchronize(stream), "after a stall");
+        const auto counters = download(ws.single, 2 + K);
+        stall_differ += download(d_one, std::size_t(K) * H) != ref ||
+                                std::any_of(counters.begin(), counters.end(), [](std::uint32_t c) { return c != 0U; })
+                            ? 1
+                            : 0;
         cuda_check(cudaStreamDestroy(stream), "stream");
         for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rows), static_cast<void*>(d_amax),
                         static_cast<void*>(d_emax), static_cast<void*>(d_a8)}) {
@@ -1442,6 +1454,7 @@ void single_case(bool a8, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core
     check(differ == 0 && routing_differ == 0, "the single-column launch differs from moe_route + moe_experts");
     check(nan_routing_wrong == 0, "a NaN column's selection did not fill its slots with experts 0-7 in order");
     check(graph_differ == 0, "a graph interleaving the single-column launch and the separate kernels differs");
+    check(stall_differ == 0, "after a stalled call and moe_clear_counters, the next call differs or leaves counts");
     check(error_clear, "the single-column launch set the error word");
     for (void* p : {static_cast<void*>(db.records), static_cast<void*>(db.amax), static_cast<void*>(db.den),
                     static_cast<void*>(d_w), static_cast<void*>(d_bias), static_cast<void*>(d_ref),

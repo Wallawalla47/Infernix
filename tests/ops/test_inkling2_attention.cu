@@ -1245,6 +1245,22 @@ void run_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec::Bf
     same_pools(fu, one_fused, got);
     fu.exact(one_fused.kring.data(), got.kring.data(), got.kring.size());
 
+    // A NaN column (its q all NaN: every visible score NaN beside the masked keys of its unit): the call completes
+    // (a NaN once split a warp before a full-mask shuffle) and every other column keeps its bits.
+    if (!p.quantized()) {
+        constexpr int kNan = 4; // lane 1, position 60: its unit holds masked keys past the position
+        Problem poisoned = p;
+        std::fill_n(poisoned.q.begin() + std::size_t(kNan) * QW, QW, std::uint16_t{0x7FC0});
+        reset_state(poisoned, d);
+        const Outputs nan_out = run(poisoned, call, all, d);
+        Tally nan_tally{full ? "  full: a NaN column leaves the others' bits" : "  sliding: a NaN column leaves the others' bits"};
+        for (int t = 0; t < T; ++t) {
+            if (t == kNan || call.lane[t] < 0) { continue; }
+            nan_tally.exact(nan_out.out.data() + std::size_t(t) * QW, got.out.data() + std::size_t(t) * QW, QW);
+        }
+        nan_tally.report();
+    }
+
     if (p.codec == ik::KvCodec::Bf16Packed) {
         // Lossless: the BF16 storage holding the packed pool's decoded words gives the same outputs and appended words.
         Problem words = p;
