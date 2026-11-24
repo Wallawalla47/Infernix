@@ -770,14 +770,14 @@ pass it at run time.
 A BF16 P12 blockdir volume holds the same BF16 values as the BF16 volume, bit for bit, in 240 data
 bytes a row and 17 rows a 4 KiB block instead of the P12 volume's 16. The data bytes are P12's
 (160 sign-and-mantissa bytes and 80 q-nibble bytes); the 17 per-row 16-byte P12 tails become one
-16-byte directory a block: 17 two-bit codes into a four-entry base table in the file header, a 3-bit
-escape count and five 18-bit slots (12-bit position in the block, 6-bit signed exponent delta). A
-block that needs more than five slots, or an escape outside six signed bits, moves its escapes to a
-file-level side stream addressed by block id. The volume is 17 x 240 + 16 = 4096 bytes a block,
-0.94 of the P12 volume's size, and the engine decodes each row to the same canonical P12 row. The
-volume reader resolves a block's directory into the row (the cache holds that self-contained row),
-so a cached row needs no second lookup. The packer refuses a table with more than four distinct
-row bases or a row past P12's four escapes:
+16-byte directory a block: 17 three-bit codes into an eight-entry base table in the file header, a
+3-bit escape count and four 18-bit slots (12-bit position in the block, 6-bit signed exponent
+delta). A block that needs more than four slots, or an escape outside six signed bits, moves its
+escapes to a file-level side stream addressed by block id. The volume is 17 x 240 + 16 = 4096 bytes
+a block, 0.94 of the P12 volume's size, and the engine decodes each row to the same canonical P12
+row. The volume reader resolves a block's directory into the row (the cache holds that
+self-contained row), so a cached row needs no second lookup. The packer refuses a table with more
+than eight distinct row bases or a row past P12's four escapes:
 
 ```text
 python -m tools.flash_next.ngram_p12_ext --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --format blockdir --census

@@ -130,11 +130,11 @@ struct NgramTableConfig {
     std::uint64_t blocks          = 0;
     std::uint64_t file_bytes      = 0;
     std::array<std::uint8_t, 16> volume_id{};
-    // BF16 P12 blockdir (a run-time volume only): W, the directory's four-entry base table, and the
-    // file-level side stream that holds a block's escapes when they do not fit its five slots.
+    // BF16 P12 blockdir (a run-time volume only): W, the directory's eight-entry base table, and the
+    // file-level side stream that holds a block's escapes when they do not fit its four slots.
     std::uint16_t block_width               = 0;
     std::uint16_t slot_bytes                = 0;
-    std::array<std::uint8_t, 4> blockdir_bases{};
+    std::array<std::uint8_t, 8> blockdir_bases{};
     std::uint64_t side_offset               = 0;
     std::uint64_t side_bytes                = 0;
     std::uint64_t side_count                = 0;

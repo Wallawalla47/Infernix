@@ -23,25 +23,30 @@ constexpr std::size_t kScaleOffset = kHeaderSize;
 // 2026-10-19, whose row size tells their format) and an NVFP4 table's FP32 multiplier (bits).
 constexpr std::size_t kFormatOffset      = kScaleOffset + 2;
 constexpr std::size_t kNvfp4ScaleOffset  = kFormatOffset + 2;
-// The P12 follow-on formats' extension after the fixed fields: W, the on-disk row size, a blockdir
-// volume's four-entry base table, a qhuf volume's 16 Huffman code lengths, and the side stream's
-// offset, length and record count.
+// The P12 follow-on formats' extension after the fixed fields: W, the on-disk row size, a qhuf
+// volume's 16 Huffman code lengths, the side stream's offset, length and record count, and a
+// blockdir volume's eight-entry base table in the eight bytes after those fields.
 constexpr std::size_t kWidthOffset         = kNvfp4ScaleOffset + 4; // 68
 constexpr std::size_t kSlotBytesOffset     = kWidthOffset + 2;      // 70
-constexpr std::size_t kBasesOffset         = kSlotBytesOffset + 2;  // 72
-constexpr std::size_t kCodeLengthsOffset   = kBasesOffset + 4;      // 76
+constexpr std::size_t kCodeLengthsOffset   = kSlotBytesOffset + 6;  // 76
 constexpr std::size_t kSideOffsetOffset    = kCodeLengthsOffset + 16; // 92
 constexpr std::size_t kSideBytesOffset     = kSideOffsetOffset + 8;   // 100
 constexpr std::size_t kSideCountOffset     = kSideBytesOffset + 8;    // 108
-constexpr std::size_t kHeaderFieldsBytes   = kSideCountOffset + 8;    // 116
+constexpr std::size_t kBasesOffset         = kSideCountOffset + 8;    // 116
+constexpr std::size_t kHeaderFieldsBytes   = kBasesOffset + 8;        // 124
 static_assert(kHeaderFieldsBytes <= 4096);
 // BF16 P12 blockdir: W values a row, 17 rows and one 16-byte directory a 4 KiB block, decoded into
-// canonical P12 rows (W + W/2 + 16 bytes).
+// canonical P12 rows (W + W/2 + 16 bytes). The directory holds a 3-bit base code per row (an index
+// into the file's eight-entry base table), a 3-bit escape count and four 18-bit escape slots; a
+// block that needs a fifth slot puts all of its escapes in the side stream (count 7).
 constexpr std::uint32_t kBlockdirWidth       = 160;
 constexpr std::uint32_t kBlockdirRows        = 17;
 constexpr std::uint32_t kBlockdirPlaneBytes  = kBlockdirWidth + kBlockdirWidth / 2;
 constexpr std::uint32_t kBlockdirRowBytes    = kBlockdirPlaneBytes + 16;
 constexpr unsigned kBlockdirMaxRowEscapes    = 4;
+constexpr unsigned kBlockdirCodeBits         = 3;
+constexpr unsigned kBlockdirBlockSlots       = 4;   // 17 x 3 + 3 + 4 x 18 = 126 of the 128 bits
+constexpr unsigned kBlockdirBaseTableSize    = 8;
 
 template <class T>
 T read_le(const std::byte* p) {
@@ -162,7 +167,7 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
 }
 
 // A blockdir block's row as the canonical P12 row the decoder reads: the 240 data bytes verbatim,
-// then the base its 2-bit code selects and that row's escaped values as P12's 3-byte entries (the
+// then the base its 3-bit code selects and that row's escaped values as P12's 3-byte entries (the
 // exponent from the directory's 6-bit signed delta, or the full BF16 word from the side stream).
 void NgramVolume::decode_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
                                       std::byte* out) const {
@@ -170,10 +175,16 @@ void NgramVolume::decode_blockdir_row(const std::byte* block, std::uint32_t row,
     const auto bit = [&](unsigned at) {
         return (static_cast<unsigned>(directory[at / 8]) >> (at % 8)) & 1U;
     };
-    const unsigned code  = bit(2 * row_in_block) | (bit(2 * row_in_block + 1) << 1U);
+    const auto code_at = [&](unsigned at) {
+        unsigned value = 0;
+        for (unsigned k = 0; k < kBlockdirCodeBits; ++k) { value |= bit(at + k) << k; }
+        return value;
+    };
+    const unsigned code  = code_at(kBlockdirCodeBits * row_in_block);
     const unsigned base  = table_.blockdir_bases[code];
-    const unsigned count = bit(2 * kBlockdirRows) | (bit(2 * kBlockdirRows + 1) << 1U) |
-                           (bit(2 * kBlockdirRows + 2) << 2U);
+    const unsigned count = bit(kBlockdirCodeBits * kBlockdirRows) |
+                           (bit(kBlockdirCodeBits * kBlockdirRows + 1) << 1U) |
+                           (bit(kBlockdirCodeBits * kBlockdirRows + 2) << 2U);
     std::memcpy(out, block + static_cast<std::size_t>(row_in_block) * kBlockdirPlaneBytes, kBlockdirPlaneBytes);
     std::uint8_t columns[kBlockdirMaxRowEscapes];
     std::uint16_t values[kBlockdirMaxRowEscapes];
@@ -196,10 +207,10 @@ void NgramVolume::decode_blockdir_row(const std::byte* block, std::uint32_t row,
         for (std::uint32_t e = 0; e < it->second.count; ++e) {
             add(read_le<std::uint16_t>(entries + 4ULL * e), read_le<std::uint16_t>(entries + 4ULL * e + 2));
         }
-    } else if (count <= 5) {
+    } else if (count <= kBlockdirBlockSlots) {
         for (unsigned e = 0; e < count; ++e) {
             std::uint32_t slot = 0;
-            const unsigned start = 2 * kBlockdirRows + 3 + 18 * e;
+            const unsigned start = kBlockdirCodeBits * kBlockdirRows + 3 + 18 * e;
             for (unsigned k = 0; k < 18; ++k) { slot |= bit(start + k) << k; }
             const std::uint32_t position = slot & 0xFFFU;
             int delta = static_cast<int>(slot >> 12U);

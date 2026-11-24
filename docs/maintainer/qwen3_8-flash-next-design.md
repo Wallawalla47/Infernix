@@ -2300,15 +2300,18 @@ carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
   because rows share blocks).
 - **BF16 P12 blockdir (2026-11-24).** The P12 data planes (240 B a row: 160 sign-and-mantissa
   bytes and 80 q-nibble bytes) with one 16-byte directory a 4 KiB block in place of 17 P12 trailers:
-  17 x 240 + 16 = 4096, so 17 rows a block and 0.94 of P12's bytes. The directory holds 17 two-bit
-  codes into a four-entry base table in the header, a 3-bit escape count and five 18-bit slots
+  17 x 240 + 16 = 4096, so 17 rows a block and 0.94 of P12's bytes. The directory holds 17 three-bit
+  codes into an eight-entry base table in the header, a 3-bit escape count and four 18-bit slots
   (12-bit position in the block, 6-bit signed exponent delta from the row's base). A block past the
-  five slots, or an escape outside six signed bits, puts all its escapes in a file-level side stream
+  four slots, or an escape outside six signed bits, puts all its escapes in a file-level side stream
   addressed by block id (`ngram_p12_ext.py`). The reader resolves a block's directory into the
   canonical P12 row (the base code and the row's escapes from the slots or side stream) and the row
-  cache holds that self-contained row. The packer refuses a table with more than four distinct row
-  bases or a row past P12's four escapes; on Qwen's table the census has yet to be taken (the
-  synthetic slice exercises both gates). No artifact binds the format; it is a run-time volume only
+  cache holds that self-contained row. The packer refuses a table with more than eight distinct row
+  bases or a row past P12's four escapes. The base budget came from Qwen's table (320,001,536 rows,
+  measured 2026-11-24): seven distinct row bases {53, 54, 105, 106, 107, 108, 109} — a 2-bit code
+  and a four-entry table cannot name them — and per-block escapes {0: 14324783, 1: 3911887,
+  2: 534570, 3: 48823, 4: 3380, 5: 167, 6: 10} over 18,823,620 blocks, so 177 blocks take the side
+  stream. No artifact binds the format; it is a run-time volume only
   and ranks after BF16 P12.
 - **NVFP4 (2026-10-19).** `ple_embed_nvfp4` decodes each value as `bf16_rn(e2m1 · e4m3 · m)`, the
   exact product (at most 30 significant bits) rounded once (an FMA residual decides the FP32 product's
