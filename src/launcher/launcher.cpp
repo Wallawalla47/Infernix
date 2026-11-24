@@ -119,7 +119,7 @@ int pick_free_port() {
 // Construction
 
 Launcher::Launcher(LauncherOptions options)
-    : options_(std::move(options)), store_(options_.data_dir),
+    : options_(std::move(options)), data_lock_(options_.data_dir), store_(options_.data_dir),
       event_log_(resolve_log_dir(store_.settings(), options_.data_dir)),
       logs_(resolve_log_dir(store_.settings(), options_.data_dir) / kServeLogDir),
       applied_log_dir_(resolve_log_dir(store_.settings(), options_.data_dir)), usage_(options_.data_dir),
@@ -1360,21 +1360,22 @@ Json Launcher::hf_files_json(const std::string& repo) const {
         }
     }
     // A PEFT LoRA adapter's two files (--lora), at the repository's root. Every adapter's files have these names, and
-    // adapters of one rank and module set have the same sizes: one is in the library only in a folder of the
-    // repository's name, where a download puts it (adapters always get a folder of their own).
+    // adapters of one rank and module set have the same sizes: one is in the library only in the folder a download puts
+    // it in, named for its owner and repository (adapter_folder_name), so another owner's adapter of the same name is
+    // not taken for it.
     const auto adapter_file = [](const std::string& path) {
         return path == "adapter_config.json" || path == "adapter_model.safetensors";
     };
     const bool adapter = !has_model && std::count_if(listing.files.begin(), listing.files.end(), [&](const HfFile& file) {
                                            return adapter_file(file.path);
                                        }) == 2;
-    const std::string repo_name = listing.repo.substr(listing.repo.find('/') + 1);
+    const std::string folder = adapter_folder_name(listing.repo);
     const auto adapter_present = [&](const HfFile& file) -> Json {
         for (const std::string& dir : settings.model_dirs) {
             const std::filesystem::path root = utf8_path(dir);
             for (const std::filesystem::path& candidate :
-                 {root / utf8_path(repo_name) / utf8_path(file.path), root / utf8_path(file.path)}) {
-                if (!iequals(path_utf8(candidate.parent_path().filename()), repo_name)) { continue; }
+                 {root / utf8_path(folder) / utf8_path(file.path), root / utf8_path(file.path)}) {
+                if (!iequals(path_utf8(candidate.parent_path().filename()), folder)) { continue; }
                 std::error_code status;
                 if (std::filesystem::is_regular_file(candidate, status) &&
                     std::filesystem::file_size(candidate, status) == file.size) {

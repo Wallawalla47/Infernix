@@ -325,9 +325,9 @@ Json Downloads::create(const Json& request) {
         return entry.is_string() &&
                (entry.get<std::string>() == "adapter_config.json" || entry.get<std::string>() == "adapter_model.safetensors");
     });
-    job->target_dir = adapter || json_or<bool>(request, "subfolder", true)
-                          ? dest_dir / utf8_path(repo.substr(repo.find('/') + 1))
-                          : dest_dir;
+    job->target_dir = adapter ? dest_dir / utf8_path(adapter_folder_name(repo))
+                      : json_or<bool>(request, "subfolder", true) ? dest_dir / utf8_path(repo.substr(repo.find('/') + 1))
+                                                                  : dest_dir;
     job->created_at = now_ms();
     job->replace    = json_or<bool>(request, "replace", false);
     std::uint64_t needed = 0;

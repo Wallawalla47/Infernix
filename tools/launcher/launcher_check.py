@@ -1268,6 +1268,26 @@ def ablation(launcher: Launcher, port: int, data: Path, tool: Path) -> None:
         warned = [e["message"] for e in events(port) if "did not end" in e.get("message", "")]
         check("ablation: the ended engine's record is cleared, with no false warning",
               not list((run_dir / "engines").glob("*.json")) and not warned, str(warned))
+    with section("ablation: a second launcher on the same data folder"):
+        # It refuses to start before it reads the folder, so the running run's engines live on (it once ended them as
+        # leftovers of a run, then failed to bind the port).
+        configure({"STUB_AUTO": "stubborn"})
+        status, body = start("stubborn", 10)
+        running = wait_job({"running"}, 30)
+        run_dir = Path(running["run_dir"]) if running else data
+        engines = wait_for(lambda: list((run_dir / "engines").glob("*.json")), 10, 0.2) or []
+        pids = [json.loads(p.read_text(encoding="utf-8"))["pid"] for p in engines]
+        second = subprocess.run([str(launcher.exe), "--port", str(port + 7), "--data-dir", str(data),
+                                 "--serve", str(launcher.fake), "--no-browser"],
+                                capture_output=True, text=True, errors="replace", timeout=60)
+        check("ablation: a second launcher on the folder refuses to start",
+              second.returncode != 0 and "another infernix-launcher uses the data folder" in second.stderr,
+              f"exit {second.returncode}: {second.stderr.strip()[-300:]}")
+        check("ablation: the running run and its engines live on",
+              bool(pids) and all(process_alive(p) for p in pids) and job()["state"] == "running",
+              f"engines {pids}, state {job()['state']}")
+        call(port, "POST", f"{api}/stop", {"now": True})
+        wait_job(ended, 60)
     with section("ablation: runs without a sidecar"):
         configure({"STUB_AUTO": "no_sidecar", "STUB_TRIAL_S": "0.05"})
         start("none", 10)

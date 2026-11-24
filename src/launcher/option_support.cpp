@@ -133,7 +133,11 @@ bool supports_option(const ScannedModel& model, std::string_view flag) {
     if (kind == ModelKind::Unknown) { return true; }
     if (flag == "--expert-a4-activations") { return kind == ModelKind::FlashNext && fp4_local(model); }
     if (flag == "--a16-activations") { return takes_a16(model); }
-    if (flag == "--lm-head-draft") { return model.has_proposal; } // on Inkling: its proposal/token_rank parameter
+    if (flag == "--lm-head-draft") {
+        // On Inkling its proposal/token_rank parameter, and the DSpark drafter it shortlists for (the Engine refuses
+        // the flag without one).
+        return model.has_proposal && (kind != ModelKind::Inkling2 || model.has_dspark);
+    }
     if (std::find(kNeedsVision.begin(), kNeedsVision.end(), flag) != kNeedsVision.end() && !model.has_vision) {
         return false;
     }

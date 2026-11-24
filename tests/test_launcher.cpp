@@ -556,7 +556,12 @@ void test_option_support() {
     check(!supports_option(inkling, "--lm-head-draft"), "--lm-head-draft needs Inkling's proposal/token_rank");
     ScannedModel ranked = inkling;
     ranked.has_proposal = true;
-    check(supports_option(ranked, "--lm-head-draft"), "an Inkling artifact with its ranking takes --lm-head-draft");
+    ranked.has_dspark   = false;
+    check(!supports_option(ranked, "--lm-head-draft"),
+          "an Inkling artifact with a ranking but no DSpark drafter does not take --lm-head-draft");
+    ranked.has_dspark = true;
+    check(supports_option(ranked, "--lm-head-draft"),
+          "an Inkling artifact with its ranking and DSpark drafter takes --lm-head-draft");
     check(!supports_context_auto(next) && !supports_context_auto(moe_off) && supports_context_auto(dense) &&
               supports_context_auto(inkling),
           "--max-context auto where experts stay in VRAM");
@@ -1154,6 +1159,10 @@ void test_library_sidecars() {
 // LoRA adapters (--lora) in the model folders: a folder with adapter_config.json and adapter_model.safetensors, the
 // models of the base it names, and the Hub's adapter search.
 void test_library_adapters() {
+    // Two owners' adapters of one name download into folders of their own.
+    check(adapter_folder_name("alice/qwen-lora") == "alice--qwen-lora" &&
+              adapter_folder_name("bob/qwen-lora") != adapter_folder_name("alice/qwen-lora"),
+          "an adapter's download folder names its owner");
     const std::filesystem::path root = std::filesystem::temp_directory_path() / "infernix-launcher-test-adapters";
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
