@@ -143,6 +143,20 @@ void valid_adapters() {
         const PeftLoraAdapter adapter(dir.path);
         require(module_named(adapter, kQ).scale == 2.0F, "pattern 'proj' must not match q_proj");
     }
+    // Two keys match down_proj: the first in the file's order wins (PEFT's get_pattern_key), not the alphabetically
+    // first ("down_proj" sorts before "mlp.down_proj").
+    {
+        Dir dir("pattern_order");
+        write_safetensors(dir.path / "adapter_model.safetensors", factors("BF16"));
+        Json c = config();
+        c.erase("alpha_pattern");
+        std::string text = c.dump();
+        text.pop_back(); // the closing brace
+        text += R"(,"alpha_pattern":{"mlp.down_proj":8,"down_proj":4}})";
+        std::ofstream(dir.path / "adapter_config.json", std::ios::binary) << text;
+        const PeftLoraAdapter adapter(dir.path);
+        require(module_named(adapter, kDown).scale == 0.25F, "the first matching alpha_pattern key in file order (8 / 32)");
+    }
 }
 
 void refusals() {
