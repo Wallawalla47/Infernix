@@ -26,6 +26,8 @@
 // 8. --kv-dtype (the full visits' pools quantized): each format as a variant of 6 (accepted with --reproducible),
 //    DSpark (auto, graphs) giving its plain tokens, and a 10,000-token prompt's greedy continuation the same in chunks
 //    of 4,096 and 1,000; bf16p (lossless) gives bf16's tokens throughout, the others' agreement with BF16's is reported.
+// 9. A stalled MoE call (INFERNIX_INKLING2_STALL_ONLY runs it alone): the request fails with the stall, the next one
+//    gives its solo tokens.
 // Reported, not judged: a chat turn's channels, a turn whose thinking budget (6) injects the control (the mixed-width
 // decode after forced tokens), and how long --q8-weights' tokens agree with the BF16 weights'.
 //
@@ -34,6 +36,7 @@
 //   INFERNIX_INKLING2_PROMPT_LOGITS_GUARD  the forward test's prompt-route logits ([32][V] FP32), for 5
 
 #include "infernix/engine.h"
+#include "models/inkling2/program/test_taps.h"
 
 #include <nlohmann/json.hpp>
 
@@ -195,6 +198,26 @@ void require_alone(const std::string& label, infernix::Engine& engine, const std
     for (std::size_t i = 0; i < mine.size(); ++i) { require_same(label + ", request " + std::to_string(i), reference[i], mine[i]); }
 }
 
+// 9. A stalled MoE call (testing::force_moe_stall writes kErrorDownStalled through the MoE workspace's error word, as a
+//    down CTA that waited past its bound sets it): the request holding the lane fails with the Engine's recoverable
+//    error instead of committing tokens, and the Engine keeps serving: the next request gives its solo tokens.
+void stalled_moe(const std::filesystem::path& artifact) {
+    namespace inkling_testing = infernix::models::inkling2::testing;
+    infernix::Engine engine(engine_options(artifact, 16, true, 1));
+    const Tokens solo = engine.generate(engine.prepare(chat(texts()[1])), sampled(1)).generated_token_ids;
+    inkling_testing::force_moe_stall(1);
+    std::string error;
+    try {
+        (void)engine.generate(engine.prepare(chat(texts()[0])), sampled(0));
+    } catch (const std::exception& e) { error = e.what(); }
+    inkling_testing::force_moe_stall(0);
+    std::cout << "stalled MoE: " << (error.empty() ? std::string("the request completed") : error) << '\n';
+    require(error.find("down pass waited past its bound") != std::string::npos,
+            "stalled MoE: the request did not fail with the stall");
+    require_same("stalled MoE: the next request", solo,
+                 engine.generate(engine.prepare(chat(texts()[1])), sampled(1)).generated_token_ids);
+}
+
 } // namespace
 
 int main() {
@@ -206,6 +229,12 @@ int main() {
         return 77;
     }
     try {
+        if (std::getenv("INFERNIX_INKLING2_STALL_ONLY") != nullptr) {
+            stalled_moe(artifact);
+            std::cout << "PASS (the stalled-MoE case alone)\n";
+            return 0;
+        }
+        stalled_moe(artifact);
         const Tokens golden = golden_ids(reference);
         require(golden.size() == 32, "the dump holds 32 ids");
         const Tokens prompt(golden.begin(), golden.begin() + 24);

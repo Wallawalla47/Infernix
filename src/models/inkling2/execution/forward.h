@@ -184,6 +184,13 @@ public:
     [[nodiscard]] const std::vector<std::uint8_t>& hidden_counts() const noexcept { return hidden_counts_; }
 
     [[nodiscard]] const ForwardBuffers& buffers() const noexcept { return b_; }
+    // Points the MoE workspaces' error word (a down CTA's lost count sets kErrorDownStalled there) at `word`, a
+    // mapped pinned word the host reads after each round's own synchronization (Program::finish_sample). Called
+    // before any graph captures a call.
+    void set_moe_error_word(std::uint32_t* word) noexcept {
+        b_.moe.error   = word;
+        b_.guess.error = word;
+    }
     [[nodiscard]] const StateLayout& layout() const noexcept { return layout_; }
     [[nodiscard]] std::int32_t columns() const noexcept { return columns_; }
     [[nodiscard]] VisitInputs inputs(std::uint32_t visit) const;

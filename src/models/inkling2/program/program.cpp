@@ -13,6 +13,7 @@
 #include "models/inkling2/execution/lossless.h"
 #include "models/inkling2/execution/vision.h"
 #include "models/inkling2/program/prefix_cache.h"
+#include "models/inkling2/program/test_taps.h"
 #include "runtime/prefix_cache/prefix_holds.h"
 #include "runtime/prefix_cache/tap_planner.h"
 #include "runtime/speculative/draft_length.h"
@@ -205,7 +206,8 @@ public:
           sampling_(ops::sampling_workspace_capacity_bytes(vocab_, 1, static_cast<std::int32_t>(kMaximumConcurrency)) +
                     4096),
           host_(align_256(forward_.upload_words() * 4 * kStagingSlots) +
-                align_256(sizeof(ops::SamplingConfig) * kMaximumConcurrency) + 3 * align_256(4 * kMaximumConcurrency)) {
+                align_256(sizeof(ops::SamplingConfig) * kMaximumConcurrency) + 3 * align_256(4 * kMaximumConcurrency) +
+                align_256(4)) {
         const StateLayout& layout = forward_.layout();
         const std::uint32_t pages = pages_per_lane(o_.max_context);
         if (o_.lossless) {
@@ -262,6 +264,12 @@ public:
         host_sampled_ = reinterpret_cast<std::int32_t*>(base);
         base += align_256(4 * kMaximumConcurrency);
         nonfinite_ = reinterpret_cast<std::int32_t*>(base);
+        base += align_256(4 * kMaximumConcurrency);
+        // The MoE's error word, mapped: a down CTA that waited past its bound sets it, and finish_sample reads it after
+        // the round's own synchronization (no copy).
+        moe_error_  = reinterpret_cast<std::uint32_t*>(base);
+        *moe_error_ = 0;
+        forward_.set_moe_error_word(moe_error_);
         if (o_.kv_codec == ops::inkling2::KvCodec::Bf16Packed) {
             // bf16p: each lane's lowest appended position with no packed form (atomicMin; 0xFFFFFFFF: none).
             unpackable_ = DeviceBuffer(4 * kMaximumConcurrency);
@@ -1942,12 +1950,32 @@ private:
         launch_sample(lanes.size(), logit_rows, purpose);
     }
 
+    // A down CTA of the MoE that waited past its bound for its job's h set the error word and wrote nothing, so a call
+    // since the last check (this round's, or a prefill chunk that sampled nothing) may have left wrong expert output
+    // in any bound lane's state: the requests holding lanes fail with a RecoverableExecutionError (the Engine keeps
+    // serving: recover() releases them, queued requests wait) and what every bound lane published is withdrawn.
+    void check_moe_error() {
+        if (inkling2::testing::take_forced_stall()) {
+            *forward_.buffers().moe.error |= ops::w4a4_moe::kErrorDownStalled; // through the kernels' own pointer
+        }
+        const std::uint32_t word = *static_cast<volatile std::uint32_t*>(moe_error_);
+        if (word == 0) { return; }
+        *moe_error_ = 0;
+        for (Lane& lane : lanes_) {
+            if (lane.bound) { lane.prefix.withdraw = true; }
+        }
+        throw runtime::RecoverableExecutionError(
+            "Inkling 2: an expert's down pass waited past its bound for its h (error word " + std::to_string(word) +
+            "); the call's expert output is incomplete");
+    }
+
     // `verify`: a DSpark verify call, whose rows with no packed form fail the request only at accepted positions
     // (decode_dspark decides once the accepted prefix is known).
     void finish_sample(std::size_t rows, bool verify = false) {
         const auto wait = Clock::now();
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
         wait_ns_ += elapsed_ns(wait);
+        check_moe_error();
         if (unpackable_.p != nullptr) {
             CUDA_CHECK(cudaMemcpy(unpackable_seen_.data(), unpackable_.p, 4 * kMaximumConcurrency, cudaMemcpyDeviceToHost));
         }
@@ -2071,6 +2099,7 @@ private:
     std::int32_t* host_positions_         = nullptr;
     std::int32_t* host_sampled_           = nullptr;
     std::int32_t* nonfinite_              = nullptr;
+    std::uint32_t* moe_error_             = nullptr;
     // The full visits' KV (map_call_pages): the pool and the lanes' block-table rows over kv_backing_, the scratch page,
     // and each lane's reservation and mapped pages. Declared in teardown order: leases before their pool.
     // A lane's pages: block b is mapped for b < mapped, its page pages[b] while the lane owns it (an invalid lease

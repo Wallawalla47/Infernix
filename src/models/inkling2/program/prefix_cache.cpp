@@ -1,14 +1,34 @@
 #include "models/inkling2/program/prefix_cache.h"
 
 #include "core/device.h"
+#include "models/inkling2/program/test_taps.h"
 #include "runtime/prefix_cache/prefix_holds.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <exception>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+namespace infernix::models::inkling2::testing {
+namespace {
+
+std::atomic<std::uint32_t> forced_stalls{0};
+
+} // namespace
+
+void force_moe_stall(std::uint32_t rounds) noexcept { forced_stalls.store(rounds); }
+
+bool take_forced_stall() noexcept {
+    std::uint32_t left = forced_stalls.load();
+    while (left != 0 && !forced_stalls.compare_exchange_weak(left, left - 1U)) {}
+    return left != 0;
+}
+
+} // namespace infernix::models::inkling2::testing
 
 namespace infernix::models::inkling2::prefix {
 
