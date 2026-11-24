@@ -356,10 +356,19 @@ void test_blockdir(const std::filesystem::path& path) {
     const std::uint8_t bases[8] = {96, 120, 200, 220, 0, 0, 0, 0};
     write_blockdir_header(path, rows, bases, 4096);
     std::vector<std::uint8_t> blocks(3 * 4096, 0);
-    // Block 0: row 0 has one escape at column 5, exponent 120 (base 96, delta +24, in its slot).
-    for (std::uint32_t r = 0; r < 17; ++r) { put_blockdir_plane(blocks.data(), r, 96, r == 0 ? 5 : -1, 120); }
-    put_directory_bits(blocks.data() + 17 * 240, 3 * 17, 3, 1);
-    put_directory_bits(blocks.data() + 17 * 240, 3 * 17 + 3, 18, 5U | (24U << 12U));
+    // Block 0: four rows with one escape each in one of the four slots (delta +20 from the row's
+    // base), the rows' bases from the directory's 3-bit codes 0..3.
+    for (std::uint32_t r = 0; r < 17; ++r) {
+        const bool escaped = r < 4;
+        put_blockdir_plane(blocks.data(), r, escaped ? bases[r] : 96, escaped ? static_cast<int>(5 + r) : -1,
+                           escaped ? bases[r] + 20 : 0);
+    }
+    for (std::uint32_t r = 0; r < 4; ++r) {
+        put_directory_bits(blocks.data() + 17 * 240, 3 * r, 3, r);
+        put_directory_bits(blocks.data() + 17 * 240, 3 * 17 + 3 + 18 * r, 18,
+                           (r * 160U + 5U + r) | (20U << 12U));
+    }
+    put_directory_bits(blocks.data() + 17 * 240, 3 * 17, 3, 4);
     // Block 1: six rows each with one escape at exponent 40 (delta -56, outside six signed bits):
     // the whole block's escapes go to the side stream (count 7).
     for (std::uint32_t r = 0; r < 17; ++r) { put_blockdir_plane(blocks.data() + 4096, r, 96, r < 6 ? 3 : -1, 40); }
@@ -399,14 +408,15 @@ void test_blockdir(const std::filesystem::path& path) {
         const std::uint64_t block = r / 17, slot = r % 17;
         std::memcpy(want.data() + r * 256, blocks.data() + block * 4096 + slot * 240, 240);
         std::uint8_t* row = want.data() + r * 256;
-        row[240]          = 96;
-        const bool first  = block == 0 && slot == 0;
-        const bool spilled = block == 1 && slot < 6;
-        row[241]           = static_cast<std::uint8_t>(first || spilled ? 1 : 0);
-        if (first) {
-            row[242] = 5;
-            row[243] = static_cast<std::uint8_t>(((120 << 7) | 0x11) & 0xFF);
-            row[244] = static_cast<std::uint8_t>(((120 << 7) | 0x11) >> 8);
+        const bool inline_escape = block == 0 && slot < 4;
+        const bool spilled       = block == 1 && slot < 6;
+        row[240]                 = bases[inline_escape ? slot : 0];
+        row[241]                 = static_cast<std::uint8_t>(inline_escape || spilled ? 1 : 0);
+        if (inline_escape) {
+            const std::uint16_t value = static_cast<std::uint16_t>(((bases[slot] + 20) << 7) | 0x11);
+            row[242] = static_cast<std::uint8_t>(5 + slot);
+            row[243] = static_cast<std::uint8_t>(value & 0xFF);
+            row[244] = static_cast<std::uint8_t>(value >> 8);
         } else if (spilled) {
             row[242] = 3;
             row[243] = static_cast<std::uint8_t>(((40 << 7) | 0x11) & 0xFF);

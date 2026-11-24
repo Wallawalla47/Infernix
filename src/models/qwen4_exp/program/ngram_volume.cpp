@@ -46,7 +46,8 @@ constexpr std::uint32_t kBlockdirRowBytes    = kBlockdirPlaneBytes + 16;
 constexpr unsigned kBlockdirMaxRowEscapes    = 4;
 constexpr unsigned kBlockdirCodeBits         = 3;
 constexpr unsigned kBlockdirBlockSlots       = 4;   // 17 x 3 + 3 + 4 x 18 = 126 of the 128 bits
-constexpr unsigned kBlockdirBaseTableSize    = 8;
+constexpr unsigned kBlockdirBaseTableSize    = 8;   // bytes the header's base table occupies
+static_assert(kBlockdirBaseTableSize == std::tuple_size_v<decltype(NgramTableConfig::blockdir_bases)>);
 
 template <class T>
 T read_le(const std::byte* p) {
@@ -116,7 +117,7 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
         // on-disk row size, the base table and the side stream.
         if (read_le<std::uint16_t>(p + kWidthOffset) != table_.block_width ||
             read_le<std::uint16_t>(p + kSlotBytesOffset) != table_.slot_bytes ||
-            std::memcmp(p + kBasesOffset, table_.blockdir_bases.data(), table_.blockdir_bases.size()) != 0 ||
+            std::memcmp(p + kBasesOffset, table_.blockdir_bases.data(), kBlockdirBaseTableSize) != 0 ||
             read_le<std::uint64_t>(p + kSideOffsetOffset) != table_.side_offset ||
             read_le<std::uint64_t>(p + kSideBytesOffset) != table_.side_bytes ||
             read_le<std::uint64_t>(p + kSideCountOffset) != table_.side_count) {
@@ -486,7 +487,7 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
         // the decoded P12 row width are the format's, not the row size's, geometry.
         out.block_width = read_le<std::uint16_t>(p + kWidthOffset);
         out.slot_bytes  = read_le<std::uint16_t>(p + kSlotBytesOffset);
-        std::memcpy(out.blockdir_bases.data(), p + kBasesOffset, out.blockdir_bases.size());
+        std::memcpy(out.blockdir_bases.data(), p + kBasesOffset, kBlockdirBaseTableSize);
         out.side_offset = read_le<std::uint64_t>(p + kSideOffsetOffset);
         out.side_bytes  = read_le<std::uint64_t>(p + kSideBytesOffset);
         out.side_count  = read_le<std::uint64_t>(p + kSideCountOffset);
