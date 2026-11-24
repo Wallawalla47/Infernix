@@ -272,10 +272,11 @@ Json OpenAIChatStream::live_timings_json() const {
     return timings_json(observation_timings(prompt_tokens_, cached_tokens_, *live_timing_));
 }
 
+// Reasoning may follow content: a model that thinks in several blocks (Inkling 2) writes a thinking block after text.
+// A chunk's delta carries either field in any order, and a client joins each field's deltas into the whole response's
+// reasoning_content and content, which the Engine joins the same way.
 std::string OpenAIChatStream::reasoning_delta(const std::string& text) {
-    if (!started_ || finished_ || content_started_) {
-        throw std::logic_error("invalid OpenAI Chat reasoning delta state");
-    }
+    if (!started_ || finished_) { throw std::logic_error("invalid OpenAI Chat reasoning delta state"); }
     reasoning_ += text;
     return chunk(identity_, Json{{"reasoning_content", text}, {"reasoning", text}}, nullptr, include_usage_,
                  live_timings_json());
@@ -285,7 +286,6 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     if (!started_ || finished_) {
         throw std::logic_error("invalid OpenAI Chat content delta state");
     }
-    content_started_ = true;
     content_ += text;
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
@@ -340,9 +340,6 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     std::vector<std::string> events;
     const std::string reasoning_suffix = outcome.reasoning.substr(reasoning_.size());
     if (!reasoning_suffix.empty()) {
-        if (content_started_) {
-            throw std::logic_error("terminal reasoning appeared after streamed content");
-        }
         events.push_back(chunk(identity_, Json{{"reasoning_content", reasoning_suffix}, {"reasoning", reasoning_suffix}},
                                nullptr, include_usage_, output_timings));
     }

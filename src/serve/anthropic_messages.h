@@ -229,7 +229,8 @@ private:
     std::vector<AnthropicToolSearch> searches_;
     std::shared_ptr<const CitationRegistry> citations_;
     std::unique_ptr<CiteParser> cite_parser_; // the current generation's, with citations
-    std::string reasoning_;
+    std::string reasoning_;      // the generation's reasoning so far, every thinking block's
+    std::string thinking_block_; // the open (or last) thinking block's text: its signature's
     std::string content_; // the generated text as the Engine gave it (cite tags included)
     std::vector<StreamedCall> calls_; // the current generation's streamed calls
     int input_tokens_   = 0;

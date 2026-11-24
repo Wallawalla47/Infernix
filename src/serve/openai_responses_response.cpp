@@ -47,6 +47,10 @@ struct ItemIds {
     std::vector<std::string> search_outputs; // per call: a hosted search's tool_search_output id
     // A streamed call the turn's end cut: its incomplete Item, in the output but not the history.
     std::optional<Json> cut_call;
+    // Reasoning a stream gave Items of their own after the message began (a model that thinks in several blocks):
+    // (id, text) in order, listed after the message Item. Empty for a whole response, whose one reasoning Item joins
+    // them as the Engine does.
+    std::vector<std::pair<std::string, std::string>> late_reasoning;
 };
 
 enum class CallKind : std::uint8_t {
@@ -289,20 +293,28 @@ void append_round(BuiltOpenAIResponse& built, const OpenAIResponsesCreateRequest
     const GenerationOutcome& outcome = *round.outcome;
     const std::string item_status = !final_round || status == "completed" ? "completed" : "incomplete";
 
-    if (!outcome.reasoning.empty()) {
+    // A stream's late reasoning Items hold the end of the generation's reasoning; the first Item holds the rest.
+    std::size_t late_bytes = 0;
+    for (const auto& item : ids.late_reasoning) { late_bytes += item.second.size(); }
+    const std::string first_reasoning =
+        outcome.reasoning.substr(0, outcome.reasoning.size() - std::min(late_bytes, outcome.reasoning.size()));
+    const auto reasoning_item = [&](const std::string& id, const std::string& text, const char* item_status_text) {
+        Json item = {{"id", id},
+                     {"type", "reasoning"},
+                     {"status", item_status_text},
+                     {"summary", reasoning_summary(request)},
+                     {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", text}}})}};
+        add_reasoning_encrypted_content(item, request, text);
+        return item;
+    };
+
+    if (!first_reasoning.empty()) {
         if (ids.reasoning.empty()) { ids.reasoning = new_openai_response_item_id("rs"); }
         const char* reasoning_status =
-            (!outcome.text.empty() || !outcome.tool_calls.empty() || ids.cut_call) ? "completed"
-                                                                                    : item_status.c_str();
-        Json reasoning_item = {
-            {"id", ids.reasoning},
-            {"type", "reasoning"},
-            {"status", reasoning_status},
-            {"summary", reasoning_summary(request)},
-            {"content",
-             Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}};
-        add_reasoning_encrypted_content(reasoning_item, request, outcome.reasoning);
-        built.output_items.push_back(std::move(reasoning_item));
+            (!outcome.text.empty() || !outcome.tool_calls.empty() || ids.cut_call || !ids.late_reasoning.empty())
+                ? "completed"
+                : item_status.c_str();
+        built.output_items.push_back(reasoning_item(ids.reasoning, first_reasoning, reasoning_status));
     }
 
     if (final_round ? needs_message_item(outcome, status) : !outcome.text.empty()) {
@@ -315,6 +327,9 @@ void append_round(BuiltOpenAIResponse& built, const OpenAIResponsesCreateRequest
                  {"content", Json::array({Json{{"type", "output_text"},
                                                {"annotations", Json::array()},
                                                {"text", outcome.text}}})}});
+    }
+    for (const auto& [id, text] : ids.late_reasoning) {
+        built.output_items.push_back(reasoning_item(id, text, item_status.c_str()));
     }
 
     complete_call_ids(ids, request, round);
@@ -454,13 +469,10 @@ public:
         return fields;
     }
 
-    std::vector<std::string> ensure_reasoning() {
-        if (reasoning_started) { return {}; }
-        reasoning_started               = true;
-        ids.reasoning                   = new_openai_response_item_id("rs");
-        reasoning_index                 = next_output_index++;
+    // A reasoning Item's added events: the Item, its summary placeholder (when the request asks for one) and its part.
+    std::vector<std::string> reasoning_added(const std::string& item_id, int output_index) {
         const Json summary              = reasoning_summary(request);
-        const Json item                 = {{"id", ids.reasoning},
+        const Json item                 = {{"id", item_id},
                                            {"type", "reasoning"},
                                            {"status", "in_progress"},
                                            {"summary", summary},
@@ -468,61 +480,112 @@ public:
         const Json part                 = {{"type", "reasoning_text"}, {"text", ""}};
         std::vector<std::string> events = {
             sse(event("response.output_item.added",
-                      Json{{"output_index", reasoning_index}, {"item", item}}))};
+                      Json{{"output_index", output_index}, {"item", item}}))};
         if (!summary.empty()) {
             const Json added_summary_part = {{"type", "summary_text"}, {"text", ""}};
             const Json& done_summary_part = summary.at(0);
             events.push_back(sse(event("response.reasoning_summary_part.added",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item_id},
+                                            {"output_index", output_index},
                                             {"summary_index", 0},
                                             {"part", added_summary_part}})));
             events.push_back(sse(event("response.reasoning_summary_text.delta",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item_id},
+                                            {"output_index", output_index},
                                             {"summary_index", 0},
                                             {"delta", kReasoningSummaryPlaceholder}})));
             events.push_back(sse(event("response.reasoning_summary_text.done",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item_id},
+                                            {"output_index", output_index},
                                             {"summary_index", 0},
                                             {"text", kReasoningSummaryPlaceholder}})));
             events.push_back(sse(event("response.reasoning_summary_part.done",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item_id},
+                                            {"output_index", output_index},
                                             {"summary_index", 0},
                                             {"part", done_summary_part}})));
         }
         events.push_back(
-            sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
-                                                          {"output_index", reasoning_index},
+            sse(event("response.content_part.added", Json{{"item_id", item_id},
+                                                          {"output_index", output_index},
                                                           {"content_index", 0},
                                                           {"part", part}})));
         return events;
     }
 
-    std::vector<std::string> close_reasoning(const std::string& final_text,
-                                             const char* item_status = "completed") {
-        if (!reasoning_started || reasoning_done) { return {}; }
-        reasoning_done  = true;
-        reasoning_text  = final_text;
-        const Json part = {{"type", "reasoning_text"}, {"text", reasoning_text}};
-        Json item = {{"id", ids.reasoning},
+    // A reasoning Item's done events with its whole text.
+    std::vector<std::string> reasoning_done_events(const std::string& item_id, int output_index,
+                                                   const std::string& text, const char* item_status) {
+        const Json part = {{"type", "reasoning_text"}, {"text", text}};
+        Json item = {{"id", item_id},
                      {"type", "reasoning"},
                      {"status", item_status},
                      {"summary", reasoning_summary(request)},
                      {"content", Json::array({part})}};
-        add_reasoning_encrypted_content(item, request, reasoning_text);
-        return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
-                                                               {"output_index", reasoning_index},
+        add_reasoning_encrypted_content(item, request, text);
+        return {sse(event("response.reasoning_text.done", Json{{"item_id", item_id},
+                                                               {"output_index", output_index},
                                                                {"content_index", 0},
-                                                               {"text", reasoning_text}})),
-                sse(event("response.content_part.done", Json{{"item_id", ids.reasoning},
-                                                             {"output_index", reasoning_index},
+                                                               {"text", text}})),
+                sse(event("response.content_part.done", Json{{"item_id", item_id},
+                                                             {"output_index", output_index},
                                                              {"content_index", 0},
                                                              {"part", part}})),
                 sse(event("response.output_item.done",
-                          Json{{"output_index", reasoning_index}, {"item", item}}))};
+                          Json{{"output_index", output_index}, {"item", item}}))};
+    }
+
+    std::vector<std::string> ensure_reasoning() {
+        if (reasoning_started) { return {}; }
+        reasoning_started = true;
+        ids.reasoning     = new_openai_response_item_id("rs");
+        reasoning_index   = next_output_index++;
+        return reasoning_added(ids.reasoning, reasoning_index);
+    }
+
+    std::vector<std::string> close_reasoning(const std::string& final_text,
+                                             const char* item_status = "completed") {
+        if (!reasoning_started || reasoning_done) { return {}; }
+        reasoning_done = true;
+        reasoning_text = final_text;
+        return reasoning_done_events(ids.reasoning, reasoning_index, reasoning_text, item_status);
+    }
+
+    // Reasoning after the generation's first reasoning Item closed or its message began (a model that thinks in
+    // several blocks: Inkling 2) is a reasoning Item of its own, after the message Item, open until content, a call or
+    // the generation's end; build_response lists it there (ItemIds::late_reasoning).
+    [[nodiscard]] bool reasoning_is_late() const noexcept { return reasoning_done || message_started; }
+
+    std::vector<std::string> ensure_late_reasoning() {
+        if (!late.empty() && !late.back().done) { return {}; }
+        LateReasoning item{.id = new_openai_response_item_id("rs"), .output_index = next_output_index++};
+        std::vector<std::string> events = reasoning_added(item.id, item.output_index);
+        late.push_back(std::move(item));
+        return events;
+    }
+
+    std::vector<std::string> late_reasoning_delta(const std::string& text) {
+        std::vector<std::string> events = ensure_late_reasoning();
+        LateReasoning& item             = late.back();
+        item.text += text;
+        events.push_back(sse(event("response.reasoning_text.delta", Json{{"item_id", item.id},
+                                                                         {"output_index", item.output_index},
+                                                                         {"content_index", 0},
+                                                                         {"delta", text}})));
+        return events;
+    }
+
+    std::vector<std::string> close_late_reasoning(const char* item_status = "completed") {
+        if (late.empty() || late.back().done) { return {}; }
+        LateReasoning& item = late.back();
+        item.done           = true;
+        return reasoning_done_events(item.id, item.output_index, item.text, item_status);
+    }
+
+    [[nodiscard]] std::size_t late_reasoning_bytes() const noexcept {
+        std::size_t bytes = 0;
+        for (const LateReasoning& item : late) { bytes += item.text.size(); }
+        return bytes;
     }
 
     std::vector<std::string> ensure_message() {
@@ -580,18 +643,33 @@ public:
         };
         const char* item_status =
             !final_round || status == "completed" ? "completed" : "incomplete";
-        if (!outcome.reasoning.empty() && !reasoning_started) {
-            append(ensure_reasoning());
-            reasoning_text = outcome.reasoning;
-            events.push_back(sse(event("response.reasoning_text.delta",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
-                                            {"content_index", 0},
-                                            {"delta", outcome.reasoning}})));
+        // The generation's reasoning is the first Item's text, then each late Item's (the Engine joins them in that
+        // order).
+        const std::string streamed_reasoning = reasoning_text;
+        if (!late.empty() || (reasoning_is_late() && outcome.reasoning.size() > streamed_reasoning.size())) {
+            std::string joined = streamed_reasoning;
+            for (const LateReasoning& item : late) { joined += item.text; }
+            if (!outcome.reasoning.starts_with(joined)) {
+                throw std::logic_error("streamed reasoning does not match terminal reasoning");
+            }
+            if (outcome.reasoning.size() > joined.size()) {
+                append(late_reasoning_delta(outcome.reasoning.substr(joined.size())));
+            }
+            append(close_late_reasoning(item_status));
+        } else {
+            if (!outcome.reasoning.empty() && !reasoning_started) {
+                append(ensure_reasoning());
+                reasoning_text = outcome.reasoning;
+                events.push_back(sse(event("response.reasoning_text.delta",
+                                           Json{{"item_id", ids.reasoning},
+                                                {"output_index", reasoning_index},
+                                                {"content_index", 0},
+                                                {"delta", outcome.reasoning}})));
+            }
+            const char* reasoning_status =
+                (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
+            append(close_reasoning(outcome.reasoning, reasoning_status));
         }
-        const char* reasoning_status =
-            (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
-        append(close_reasoning(outcome.reasoning, reasoning_status));
 
         if (final_round ? needs_message_item(outcome, status) : !outcome.text.empty()) {
             append(ensure_message());
@@ -652,6 +730,9 @@ public:
     std::vector<std::string> open_call(const infernix::ToolCallDelta& delta) {
         // Content never follows a constrained call: the reasoning and answer Items are complete.
         std::vector<std::string> events = close_reasoning(reasoning_text);
+        std::vector<std::string> late_done = close_late_reasoning();
+        events.insert(events.end(), std::make_move_iterator(late_done.begin()),
+                      std::make_move_iterator(late_done.end()));
         std::vector<std::string> message = close_message(content_text);
         events.insert(events.end(), std::make_move_iterator(message.begin()),
                       std::make_move_iterator(message.end()));
@@ -770,6 +851,8 @@ public:
 
     // The next generation's deltas open new Items.
     void next_round() {
+        for (LateReasoning& item : late) { ids.late_reasoning.emplace_back(std::move(item.id), std::move(item.text)); }
+        late.clear();
         round_ids.push_back(std::move(ids));
         ids               = ItemIds{};
         reasoning_started = false;
@@ -787,6 +870,13 @@ public:
         CallKind kind    = CallKind::Function;
         int output_index = 0;
         bool complete    = false;
+    };
+
+    struct LateReasoning {
+        std::string id;
+        int output_index = 0;
+        std::string text;
+        bool done = false;
     };
 
     std::string id;
@@ -809,6 +899,7 @@ public:
     ItemIds ids;                     // the current generation's
     std::vector<ItemIds> round_ids; // generations the server continued
     std::vector<StreamedCall> calls; // the current generation's streamed calls
+    std::vector<LateReasoning> late; // the current generation's late reasoning Items
 };
 
 OpenAIResponsesEventStream::OpenAIResponsesEventStream(std::string response_id,
@@ -844,6 +935,7 @@ std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::
         throw std::logic_error("invalid reasoning delta event state");
     }
     if (text.empty()) { return {}; }
+    if (impl_->reasoning_is_late()) { return impl_->late_reasoning_delta(text); }
     std::vector<std::string> events = impl_->ensure_reasoning();
     impl_->reasoning_text += text;
     events.push_back(sse(
@@ -860,6 +952,8 @@ std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::st
     }
     if (text.empty()) { return {}; }
     std::vector<std::string> events = impl_->close_reasoning(impl_->reasoning_text);
+    std::vector<std::string> late   = impl_->close_late_reasoning();
+    events.insert(events.end(), std::make_move_iterator(late.begin()), std::make_move_iterator(late.end()));
     std::vector<std::string> added  = impl_->ensure_message();
     events.insert(events.end(), std::make_move_iterator(added.begin()),
                   std::make_move_iterator(added.end()));

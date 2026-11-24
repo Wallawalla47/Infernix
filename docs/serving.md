@@ -501,7 +501,9 @@ the request log report the public model ID, as OpenAI reports the snapshot an al
 `/v1/models` and `/v1/models/{id}` still list and retrieve only the public model ID.
 Reasoning is returned separately, under both `reasoning_content` (SGLang and earlier vLLM) and
 `reasoning` (current vLLM) with the same text, in messages and stream deltas alike; answer text
-remains in `content`.
+remains in `content`. A model that thinks in several blocks (Inkling 2) may write reasoning after answer
+text: a stream then sends those reasoning deltas after content deltas, and each field's deltas join to
+the whole response's field (all of the turn's reasoning, in order).
 
 For non-strict tools, the JSON types a top-level tool-parameter schema admits guide conversion of
 Qwen's untyped parameter text. They are read from its `type`, the values of its `enum` or `const`, a
@@ -1206,7 +1208,9 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 
 Contiguous assistant-owned Items form one assistant history turn in the representable order
 `reasoning` -> assistant message content -> `function_call` (or `custom_tool_call`). Multiple message Items append their
-content parts, multiple calls retain declaration order, and a reasoning-only turn is retained. A
+content parts, a `reasoning` Item after another or after message content joins the turn's reasoning in order (a model
+that thinks in several blocks streams them so), multiple calls retain declaration order, and a reasoning-only turn is
+retained. A
 user, system, developer, or `function_call_output` Item ends the group; an order that would require
 rearranging assistant content fails with `invalid_assistant_history`. Results are validated by
 `call_id` and reordered to call declaration order before prompt rendering; unknown, duplicate, or
@@ -1302,6 +1306,9 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 - a `reasoning` item containing raw `reasoning_text`; it returns a placeholder summary if
   `reasoning.summary` is requested;
 - an assistant `message` containing an `output_text` part;
+- when a model that thinks in several blocks (Inkling 2) streams reasoning after its message began, one more
+  `reasoning` Item after the message for each such block, each with its own text (a whole, non-streamed response
+  joins all of the turn's reasoning into its one `reasoning` Item);
 - one or more `function_call` Items.
 
 When `include:["reasoning.encrypted_content"]` is requested, reasoning Items also
@@ -1554,7 +1561,10 @@ takes its place: the
 output limit would end thinking first, with no answer. Clients such as Qwen Code send a fixed
 budget while shrinking `max_tokens` to the context left. Visible
 Thinking is returned with an opaque compatibility signature; SSE emits its `signature_delta`
-before closing the block. Request lowering reconstructs the local prompt from the visible
+before closing the block. A model that thinks in several blocks (Inkling 2) may think again after
+text: a stream then closes the text block and opens a new Thinking block (and text after it a new text
+block), as interleaved thinking does; each block's signature covers its own text. A whole response
+keeps one Thinking block with all of the turn's reasoning. Request lowering reconstructs the local prompt from the visible
 `thinking` text and treats `signature` as non-semantic transport metadata, so retained history
 remains usable across serve restarts.
 

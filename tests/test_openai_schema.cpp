@@ -1111,6 +1111,38 @@ int test_aggregate_response() {
     return failures;
 }
 
+// A model that thinks in several blocks (Inkling 2): reasoning after content is a reasoning delta like any other (a
+// client joins each field's deltas, as the Engine joins the channels), and the finish emits only what the deltas did
+// not show of either field.
+int test_stream_late_reasoning() {
+    int failures = 0;
+    OpenAIChatStream stream(identity(), true);
+    (void)stream.start();
+    std::string reasoning, content;
+    const auto take = [&](const std::string& event) {
+        const Json delta = parse_sse(event)["choices"][0]["delta"];
+        if (delta.contains("reasoning_content")) { reasoning += delta["reasoning_content"].get<std::string>(); }
+        if (delta.contains("content")) { content += delta["content"].get<std::string>(); }
+    };
+    try {
+        take(stream.reasoning_delta("first"));
+        take(stream.content_delta("A"));
+        take(stream.reasoning_delta("second"));
+        take(stream.content_delta("B"));
+        GenerationOutcome outcome = sample_outcome();
+        outcome.reasoning         = "firstsecond third";
+        outcome.text              = "AB";
+        for (const std::string& event : stream.finish(outcome)) {
+            if (event.find("[DONE]") == std::string::npos) { take(event); }
+        }
+    } catch (const std::exception& error) {
+        return check(false, std::string("late reasoning: the stream threw: ") + error.what());
+    }
+    failures += check(reasoning == "firstsecond third" && content == "AB",
+                      "late reasoning: the deltas join to the whole response's fields");
+    return failures;
+}
+
 int test_stream_response() {
     int failures = 0;
     OpenAIChatStream stream(identity(), true);
@@ -1591,6 +1623,7 @@ int main() {
     failures += test_stops_and_ranges();
     failures += test_aggregate_response();
     failures += test_stream_response();
+    failures += test_stream_late_reasoning();
     failures += test_stream_observations();
     failures += test_lazy_stream_timing();
     failures += test_common_objects();

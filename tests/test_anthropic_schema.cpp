@@ -11,7 +11,9 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <tuple>
@@ -1574,6 +1576,86 @@ int test_hidden_reasoning_signature() {
     return failures;
 }
 
+// A model that thinks in several blocks (Inkling 2) streams thinking, text, thinking, text: the late thinking closes
+// the text block and opens a new thinking block (index 2), and the text after it a new text block (index 3); every
+// delta lands in an open block. With hidden thinking each block's signature carries its own text, so the message sent
+// back restores the turn's reasoning once ("first" + "second"), not with the first block's text twice.
+int test_late_thinking_stream() {
+    int failures = 0;
+    for (const bool hidden : {false, true}) {
+        const AnthropicResponseIdentity identity = make_anthropic_response_identity("req_late", "claude-local");
+        AnthropicMessagesStream stream(identity, 100, hidden);
+        std::vector<std::string> events{stream.start()};
+        const auto append = [&](std::vector<std::string> values) {
+            events.insert(events.end(), std::make_move_iterator(values.begin()), std::make_move_iterator(values.end()));
+        };
+        GenerationOutcome outcome = sample_outcome();
+        outcome.reasoning         = "firstsecond";
+        outcome.text              = "AB";
+        try {
+            append(stream.reasoning_delta("first"));
+            append(stream.content_delta("A"));
+            append(stream.reasoning_delta("second"));
+            append(stream.content_delta("B"));
+            append(stream.finish(outcome));
+        } catch (const std::exception& error) {
+            failures += check(false, std::string("late thinking: the stream threw: ") + error.what());
+            continue;
+        }
+        std::vector<std::string> block_types;
+        std::set<int> open;
+        std::vector<Json> returned;
+        std::map<int, std::string> thinking_text, signatures, texts;
+        for (const std::string& wire : events) {
+            const Json parsed = parse_event(wire);
+            const std::string type = parsed.at("type").get<std::string>();
+            if (type == "content_block_start") {
+                const int index = parsed.at("index").get<int>();
+                failures += check(index == static_cast<int>(block_types.size()), "late thinking: blocks start in order");
+                block_types.push_back(parsed["content_block"]["type"].get<std::string>());
+                open.insert(index);
+            } else if (type == "content_block_delta") {
+                const int index = parsed.at("index").get<int>();
+                failures += check(open.contains(index), "late thinking: a delta for a block that is not open");
+                const Json& delta = parsed["delta"];
+                if (delta["type"] == "thinking_delta") { thinking_text[index] += delta["thinking"].get<std::string>(); }
+                if (delta["type"] == "signature_delta") { signatures[index] = delta["signature"].get<std::string>(); }
+                if (delta["type"] == "text_delta") { texts[index] += delta["text"].get<std::string>(); }
+            } else if (type == "content_block_stop") {
+                open.erase(parsed.at("index").get<int>());
+            }
+        }
+        failures += check(block_types == std::vector<std::string>{"thinking", "text", "thinking", "text"} && open.empty(),
+                          "late thinking: blocks are thinking, text, thinking, text, all closed");
+        failures += check(texts[1] == "A" && texts[3] == "B", "late thinking: each text block holds its own text");
+        if (!hidden) {
+            failures += check(thinking_text[0] == "first" && thinking_text[2] == "second",
+                              "late thinking: each thinking block holds its own text");
+            continue;
+        }
+        failures += check(thinking_text.empty() && decode_thinking_signature(signatures[0]) == "first" &&
+                              decode_thinking_signature(signatures[2]) == "second",
+                          "late thinking: each hidden block's signature carries its own text");
+        Json body        = base_request();
+        body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
+        Json content     = Json::array();
+        content.push_back(Json{{"type", "thinking"}, {"thinking", ""}, {"signature", signatures[0]}});
+        content.push_back(Json{{"type", "text"}, {"text", "A"}});
+        content.push_back(Json{{"type", "thinking"}, {"thinking", ""}, {"signature", signatures[2]}});
+        content.push_back(Json{{"type", "text"}, {"text", "B"}});
+        body["messages"].push_back(Json{{"role", "assistant"}, {"content", content}});
+        body["messages"].push_back(Json{{"role", "user"}, {"content", "next"}});
+        const AnthropicMessagesRequest request = parse(body);
+        const auto assistant = std::ranges::find_if(request.generation.messages, [](const ChatTurn& turn) {
+            return turn.role == infernix::ChatRole::Assistant;
+        });
+        failures += check(assistant != request.generation.messages.end() &&
+                              assistant->reasoning_content == "firstsecond",
+                          "late thinking: the message sent back restores the turn's reasoning once");
+    }
+    return failures;
+}
+
 int test_hidden_reasoning_round_trip() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_hidden", "claude-local");
@@ -2587,6 +2669,7 @@ int main() {
     failures += test_claude_code_usage_compat_stream();
     failures += test_hidden_reasoning_signature();
     failures += test_hidden_reasoning_round_trip();
+    failures += test_late_thinking_stream();
     failures += test_auto_mode_classifier_body();
     failures += test_auto_mode_server_review_safeguards_body();
     failures += test_deferred_tool_declarations();

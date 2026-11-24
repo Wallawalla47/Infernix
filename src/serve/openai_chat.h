@@ -100,7 +100,6 @@ private:
     bool started_                           = false;
     bool admitted_                          = false;
     bool progress_started_                  = false;
-    bool content_started_                   = false;
     bool finished_                          = false;
 };
 

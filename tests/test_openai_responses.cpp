@@ -12,7 +12,9 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -696,27 +698,33 @@ int test_assistant_item_boundaries_and_errors() {
                 Json{{"model", "m"}, {"input", std::move(input)}}, limits());
         });
     };
-    const ApiError reasoning_after_content = rejected(Json::array({first, reasoning}));
-    failures +=
-        check(reasoning_after_content.status == 400 &&
-                  reasoning_after_content.type == "invalid_request_error" &&
-                  reasoning_after_content.code == "invalid_assistant_history" &&
-                  reasoning_after_content.param == "input" &&
-                  reasoning_after_content.message.find(
-                      "reasoning cannot follow assistant message content") != std::string::npos,
-              "reasoning after assistant content did not fail precisely");
+    // A model that thinks in several blocks streams reasoning Items after its message Item (and may give two in a
+    // row): the turn's reasoning joins them in order, beside the message's content.
+    const Json later =
+        Json{{"type", "reasoning"},
+             {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", " more"}}})}};
+    const OpenAIResponsesCreateRequest interleaved = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input", Json::array({reasoning, first, later, later,
+                                    Json{{"type", "message"}, {"role", "user"}, {"content", "next"}}})}},
+        limits());
+    failures += check(interleaved.prompt.input_turns.size() == 2 &&
+                          interleaved.prompt.input_turns[0].reasoning_content == "thought more more" &&
+                          interleaved.prompt.input_turns[0].content.size() == 1 &&
+                          interleaved.prompt.input_turns[0].content[0].text == "first ",
+                      "reasoning Items after assistant content were not joined into the turn's reasoning");
     const ApiError content_after_call = rejected(Json::array({call, first}));
     failures += check(content_after_call.code == "invalid_assistant_history" &&
                           content_after_call.message.find(
                               "assistant message content cannot follow function_call Items") !=
                               std::string::npos,
                       "assistant content after calls was silently reordered");
-    const ApiError duplicate_reasoning = rejected(Json::array({reasoning, reasoning}));
-    failures +=
-        check(duplicate_reasoning.code == "invalid_assistant_history" &&
-                  duplicate_reasoning.message.find(
-                      "reasoning cannot follow another reasoning Item") != std::string::npos,
-              "duplicate reasoning Items were silently overwritten");
+    const ApiError reasoning_after_call = rejected(Json::array({call, reasoning}));
+    failures += check(reasoning_after_call.status == 400 && reasoning_after_call.code == "invalid_assistant_history" &&
+                          reasoning_after_call.param == "input" &&
+                          reasoning_after_call.message.find("reasoning cannot follow function_call Items") !=
+                              std::string::npos,
+                      "reasoning after calls did not fail precisely");
     return failures;
 }
 
@@ -1943,6 +1951,95 @@ int test_sse_sequence_and_failures() {
 // zero, every event the same Response. Codex compacts its conversation on exactly this failure.
 // A quiet stream's heartbeat (UE-05) is `response.in_progress` again: the response in progress, the next sequence
 // number, between the stream's other events; nothing before the start or after the finish.
+// A model that thinks in several blocks (Inkling 2) streams reasoning, text, reasoning, text: the late reasoning is a
+// reasoning Item of its own after the message Item (never a delta for the closed first Item), closed when text follows;
+// the completed response lists exactly the streamed Items, each with its own text (the message the joined text), and
+// sent back as input it gives the turn's joined reasoning. With encrypted reasoning requested, each Item carries its
+// own text.
+int test_late_reasoning_stream() {
+    OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input", "hello"},
+             {"include", Json::array({"reasoning.encrypted_content"})},
+             {"stream", true}},
+        limits());
+    OpenAIResponsesEventStream encoder("resp_late_reasoning", 1, request, {});
+    std::vector<std::string> wire = encoder.start();
+    for (std::vector<std::string> next : {encoder.reasoning_delta("first"), encoder.content_delta("A"),
+                                          encoder.reasoning_delta("second"), encoder.content_delta("B")}) {
+        wire.insert(wire.end(), next.begin(), next.end());
+    }
+    GenerationOutcome outcome = sample_outcome();
+    outcome.reasoning         = "firstsecond";
+    outcome.text              = "AB";
+    const OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
+    wire.insert(wire.end(), finish.events_before_terminal.begin(), finish.events_before_terminal.end());
+
+    int failures = 0;
+    std::vector<std::string> added_ids;
+    std::map<std::string, int> added_index;
+    std::map<std::string, std::string> deltas, done_text;
+    std::set<std::string> done;
+    for (const std::string& event : wire) {
+        const Json payload     = parse_event(event);
+        const std::string type = payload.at("type").get<std::string>();
+        if (type == "response.output_item.added") {
+            const std::string id = payload.at("item").at("id").get<std::string>();
+            added_ids.push_back(id);
+            added_index[id] = payload.at("output_index").get<int>();
+        } else if (type == "response.reasoning_text.delta") {
+            const std::string id = payload.at("item_id").get<std::string>();
+            failures += check(!done.contains(id), "a reasoning delta was sent for an Item already done");
+            deltas[id] += payload.at("delta").get<std::string>();
+        } else if (type == "response.output_item.done") {
+            const std::string id = payload.at("item").at("id").get<std::string>();
+            done.insert(id);
+            if (payload.at("item").at("type") == "reasoning") {
+                done_text[id] = payload.at("item").at("content").at(0).at("text").get<std::string>();
+            }
+        }
+    }
+    const Json& output = finish.response.body.at("output");
+    failures += check(added_ids.size() == 3 && output.size() == 3, "late reasoning: three Items streamed and listed");
+    if (added_ids.size() == 3 && output.size() == 3) {
+        failures += check(output[0].at("type") == "reasoning" && output[1].at("type") == "message" &&
+                              output[2].at("type") == "reasoning",
+                          "late reasoning: the completed output is reasoning, message, reasoning");
+        for (std::size_t i = 0; i < 3; ++i) {
+            const std::string id = output[i].at("id").get<std::string>();
+            failures += check(added_index.contains(id) && added_index[id] == static_cast<int>(i) && done.contains(id),
+                              "late reasoning: completed Item " + std::to_string(i) + " is the streamed one, in place");
+        }
+        const std::string first_id = output[0].at("id").get<std::string>();
+        const std::string late_id  = output[2].at("id").get<std::string>();
+        failures += check(done_text[first_id] == "first" && done_text[late_id] == "second" &&
+                              deltas[first_id] == "first" && deltas[late_id] == "second" &&
+                              output[0].at("content").at(0).at("text") == "first" &&
+                              output[2].at("content").at(0).at("text") == "second" &&
+                              output[0].at("encrypted_content") == "first" &&
+                              output[2].at("encrypted_content") == "second" &&
+                              output[1].at("content").at(0).at("text") == "AB",
+                          "late reasoning: each Item holds its own text, the message the joined text");
+        Json input = output;
+        input.push_back(Json{{"type", "message"}, {"role", "user"}, {"content", "next"}});
+        const OpenAIResponsesCreateRequest next =
+            parse_openai_responses_create_request(Json{{"model", "m"}, {"input", input}}, limits());
+        failures += check(next.prompt.input_turns.size() == 2 &&
+                              next.prompt.input_turns[0].reasoning_content == "firstsecond",
+                          "late reasoning: the streamed output sent back joins the turn's reasoning");
+    }
+    // Without late reasoning the stream is unchanged: one reasoning Item, then the message.
+    OpenAIResponsesEventStream plain("resp_plain_reasoning", 1, request, {});
+    (void)plain.start();
+    (void)plain.reasoning_delta("thought");
+    (void)plain.content_delta("answer");
+    const Json& plain_output = plain.finish(sample_outcome()).response.body.at("output");
+    failures += check(plain_output.size() == 2 && plain_output[0].at("type") == "reasoning" &&
+                          plain_output[0].at("content").at(0).at("text") == "thought",
+                      "late reasoning: an ordinary stream keeps one reasoning Item before its message");
+    return failures;
+}
+
 int test_stream_keep_alive() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(Json{{"model", "m"}, {"input", "hi"}, {"stream", true}}, limits());
@@ -2186,6 +2283,7 @@ int main() try {
     failures += test_failed_before_generation_stream();
     failures += test_streamed_function_calls();
     failures += test_stream_keep_alive();
+    failures += test_late_reasoning_stream();
     failures += test_input_tokens_uses_shared_state_path();
     failures += test_input_tokens_validates_tool_choice();
     failures += test_tool_choice_kind_and_loaded_namespace();

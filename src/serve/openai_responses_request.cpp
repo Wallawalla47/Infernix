@@ -599,6 +599,9 @@ enum class AssistantInputPhase {
 struct AssistantInputRun {
     AssistantInputRun() { reset(); }
 
+    // A model that thinks in several blocks (Inkling 2) streams a reasoning Item after its message Item, and may give
+    // several: the turn's reasoning joins them in order, as the Engine's output and a whole response's one reasoning
+    // Item do.
     void append_reasoning(std::string reasoning, std::size_t index) {
         switch (phase) {
         case AssistantInputPhase::Empty:
@@ -606,9 +609,9 @@ struct AssistantInputRun {
             phase                  = AssistantInputPhase::Reasoning;
             return;
         case AssistantInputPhase::Reasoning:
-            invalid_assistant_history(index, "reasoning cannot follow another reasoning Item");
         case AssistantInputPhase::Content:
-            invalid_assistant_history(index, "reasoning cannot follow assistant message content");
+            turn.reasoning_content += reasoning;
+            return;
         case AssistantInputPhase::Calls:
             invalid_assistant_history(index, "reasoning cannot follow function_call Items");
         }

@@ -544,14 +544,21 @@ std::string AnthropicMessagesStream::start_with_cache(std::optional<int> cache_r
     return event("message_start", Json{{"type", "message_start"}, {"message", message}});
 }
 
+// Reasoning after text (a model that thinks in several blocks: Inkling 2) closes the text block and opens a new
+// thinking block, as an interleaved message's content holds them; each block's signature covers its own text, so a
+// client that sends the turn back gets each block's text once (the request joins the blocks' text into the turn's
+// reasoning, as the whole response's one thinking block holds it).
 std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::string& text) {
-    if (!started_ || finished_ || text_open_) {
-        throw std::logic_error("invalid Anthropic reasoning delta state");
-    }
+    if (!started_ || finished_) { throw std::logic_error("invalid Anthropic reasoning delta state"); }
     std::vector<std::string> events;
+    if (text_open_) {
+        append(events, flush_citations());
+        append(events, close_text());
+    }
     if (!thinking_open_) {
         thinking_index_ = next_index_++;
         thinking_open_  = true;
+        thinking_block_.clear();
         events.push_back(
             event("content_block_start",
                   Json{{"type", "content_block_start"},
@@ -560,6 +567,7 @@ std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::str
                         Json{{"type", "thinking"}, {"thinking", ""}, {"signature", ""}}}}));
     }
     reasoning_ += text;
+    thinking_block_ += text;
     if (!text.empty() && !hide_thinking_) {
         events.push_back(
             event("content_block_delta",
@@ -574,7 +582,7 @@ std::vector<std::string> AnthropicMessagesStream::close_thinking() {
     std::vector<std::string> events;
     if (!thinking_open_) { return events; }
     const std::string signature =
-        hide_thinking_ ? encode_thinking_signature(reasoning_) : identity_.message_id;
+        hide_thinking_ ? encode_thinking_signature(thinking_block_) : identity_.message_id;
     events.push_back(event("content_block_delta", Json{{"type", "content_block_delta"},
                                                        {"index", thinking_index_},
                                                        {"delta", Json{{"type", "signature_delta"},
@@ -677,12 +685,7 @@ std::vector<std::string> AnthropicMessagesStream::close_generation(const Generat
 
     std::vector<std::string> events;
     const std::string reasoning_suffix = outcome.reasoning.substr(reasoning_.size());
-    if (!reasoning_suffix.empty()) {
-        if (text_open_) {
-            throw std::logic_error("terminal Anthropic reasoning appeared after streamed text");
-        }
-        append(events, reasoning_delta(reasoning_suffix));
-    }
+    if (!reasoning_suffix.empty()) { append(events, reasoning_delta(reasoning_suffix)); }
     const std::string content_suffix = outcome.text.substr(content_.size());
     if (!content_suffix.empty()) { append(events, content_delta(content_suffix)); }
     append(events, flush_citations());
