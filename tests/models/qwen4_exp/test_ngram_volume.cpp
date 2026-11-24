@@ -123,6 +123,52 @@ void write_header(const std::filesystem::path& path, std::uint64_t rows, std::ui
     out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
 }
 
+// A P12 blockdir volume header: 256-byte decoded rows, 17 a block, W 160, 240-byte planes, the four
+// bases and the side stream's geometry.
+void write_blockdir_header(const std::filesystem::path& path, std::uint64_t rows, const std::uint8_t bases[4],
+                           std::uint64_t side_bytes = 0) {
+    const std::uint64_t blocks = (rows + 16) / 17;
+    std::vector<std::byte> header(4096);
+    std::memcpy(header.data(), "NINFERNG", 8);
+    put<std::uint32_t>(header, 8, 1);
+    put<std::uint32_t>(header, 12, 4096);
+    put<std::uint64_t>(header, 16, rows);
+    put<std::uint32_t>(header, 24, 256);
+    put<std::uint32_t>(header, 28, 17);
+    put<std::uint32_t>(header, 32, 4096);
+    put<std::uint64_t>(header, 36, blocks);
+    std::memset(header.data() + 44, 0x55, 16);
+    put<std::uint16_t>(header, 62, 7);
+    put<std::uint16_t>(header, 68, 160);
+    put<std::uint16_t>(header, 70, 240);
+    std::memcpy(header.data() + 72, bases, 4);
+    put<std::uint64_t>(header, 92, side_bytes == 0 ? 0 : 4096 + blocks * 4096);
+    put<std::uint64_t>(header, 100, side_bytes);
+    put<std::uint64_t>(header, 108, side_bytes == 0 ? 0 : 1);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+}
+
+// A row's 240 P12 data bytes for a base and one optional escape (column, exponent): every value's
+// exponent is base + j % 15, its code 0x11, and the escaped value's q nibble is 15.
+void put_blockdir_plane(std::uint8_t* block, std::uint32_t row_in_block, std::uint32_t base, int escape_column,
+                        int escape_exponent) {
+    std::uint8_t* plane = block + row_in_block * 240;
+    for (std::uint32_t j = 0; j < 160; ++j) {
+        plane[j] = 0x11;
+        const unsigned q = static_cast<int>(j) == escape_column ? 15U : (j % 15U);
+        plane[160 + j / 2] |= static_cast<std::uint8_t>(q << (4 * (j & 1)));
+    }
+    (void)base;
+    (void)escape_exponent;
+}
+
+void put_directory_bits(std::uint8_t* directory, unsigned at, unsigned count, std::uint32_t value) {
+    for (unsigned k = 0; k < count; ++k) {
+        if ((value >> k) & 1U) { directory[(at + k) / 8] |= static_cast<std::uint8_t>(1U << ((at + k) % 8)); }
+    }
+}
+
 // resolve_ngram_volume: the artifact's own volume (its format and id) keeps the artifact's table; a
 // volume of the same table geometry in any of the five formats (FP8 rows of the head width, IQ4_NL
 // blocks of 18 bytes per 32, BF16 rows of twice the width, NVFP4 codes and block scales, BF16 P12 rows
@@ -245,8 +291,33 @@ void test_resolve(const std::filesystem::path& path) {
               "a BF16 P12 volume of 256-byte rows replaces the table");
         write_header(path, rows, 320, 0x55, 0, 6, 0);
         check(refused(), "a BF16 P12 tag with BF16 row bytes is refused");
-        write_header(path, rows, 256, 0x55, 0, 7, 0);
-        check(refused(), "a format tag past BF16 P12 is refused");
+        write_header(path, rows, 256, 0x55, 0, 9, 0);
+        check(refused(), "a format tag past the known formats is refused");
+        const std::uint8_t bases[4] = {96, 120, 200, 220};
+        write_blockdir_header(path, rows, bases);
+        const q4::NgramTableConfig blockdir = q4::resolve_ngram_volume(path, ple);
+        check(blockdir.format == q4::NgramRowFormat::Bf16P12Blockdir && blockdir.row_bytes == 256 &&
+                  blockdir.rows_per_block == 17 && blockdir.blocks == (rows + 16) / 17 &&
+                  blockdir.file_bytes == 4096 + blockdir.blocks * 4096 && blockdir.block_width == 160 &&
+                  blockdir.slot_bytes == 240 && blockdir.blockdir_bases ==
+                      std::array<std::uint8_t, 4>{96, 120, 200, 220} && blockdir.side_bytes == 0,
+              "a BF16 P12 blockdir volume replaces the table");
+        write_blockdir_header(path, rows, bases, 4096);
+        const q4::NgramTableConfig spilled = q4::resolve_ngram_volume(path, ple);
+        check(spilled.side_offset == 4096 + spilled.blocks * 4096 && spilled.side_bytes == 4096 &&
+                  spilled.side_count == 1 && spilled.file_bytes == spilled.side_offset + 4096,
+              "a blockdir volume's side stream extends its file");
+        const std::uint8_t bad_bases[4] = {96, 120, 200, 241};
+        write_blockdir_header(path, rows, bad_bases);
+        check(refused(), "a blockdir base outside [0, 240] is refused");
+        write_blockdir_header(path, rows, bases); // then a wrong W
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        const std::uint16_t width = 128;
+        file.seekp(68);
+        file.write(reinterpret_cast<const char*>(&width), 2);
+        check(refused(), "a blockdir W other than 160 is refused");
+        write_header(path, rows, 320, 0x55, 0, 7, 0);
+        check(refused(), "a blockdir tag with P12 row bytes is refused");
     }
 }
 
@@ -274,6 +345,100 @@ void test_zero_row_bytes(const std::filesystem::path& path) {
                                ") is refused");
         }
     }
+}
+
+
+// A blockdir volume read: each row resolves to the canonical P12 row (its base from the directory's
+// 2-bit code, its escaped values from the five slots or, for a block past them, the side stream), and
+// the row cache holds that self-contained row, so a second call returns it without the directory.
+void test_blockdir(const std::filesystem::path& path) {
+    constexpr std::uint64_t rows = 40; // three blocks: 17, 17 and 6 rows
+    const std::uint8_t bases[4]  = {96, 120, 200, 220};
+    write_blockdir_header(path, rows, bases, 4096);
+    std::vector<std::uint8_t> blocks(3 * 4096, 0);
+    // Block 0: row 0 has one escape at column 5, exponent 120 (base 96, delta +24, in its slot).
+    for (std::uint32_t r = 0; r < 17; ++r) { put_blockdir_plane(blocks.data(), r, 96, r == 0 ? 5 : -1, 120); }
+    put_directory_bits(blocks.data() + 17 * 240, 2 * 17, 3, 1);
+    put_directory_bits(blocks.data() + 17 * 240, 2 * 17 + 3, 18, 5U | (24U << 12U));
+    // Block 1: six rows each with one escape at exponent 40 (delta -56, outside six signed bits):
+    // the whole block's escapes go to the side stream (count 7).
+    for (std::uint32_t r = 0; r < 17; ++r) { put_blockdir_plane(blocks.data() + 4096, r, 96, r < 6 ? 3 : -1, 40); }
+    put_directory_bits(blocks.data() + 4096 + 17 * 240, 2 * 17, 3, 7);
+    // Block 2: no escapes.
+    for (std::uint32_t r = 0; r < 6; ++r) { put_blockdir_plane(blocks.data() + 2 * 4096, r, 96, -1, 0); }
+    std::vector<std::uint8_t> side(4096, 0);
+    const std::uint32_t side_block = 1;
+    std::memcpy(side.data(), &side_block, 4);
+    const std::uint16_t side_count = 6;
+    std::memcpy(side.data() + 4, &side_count, 2);
+    for (std::uint32_t e = 0; e < 6; ++e) {
+        const std::uint16_t position = static_cast<std::uint16_t>(e * 160 + 3);
+        const std::uint16_t bits     = static_cast<std::uint16_t>((40 << 7) | 0x11);
+        std::memcpy(side.data() + 6 + 4 * e, &position, 2);
+        std::memcpy(side.data() + 6 + 4 * e + 2, &bits, 2);
+    }
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        out.write(reinterpret_cast<const char*>(blocks.data()), static_cast<std::streamsize>(blocks.size()));
+        out.write(reinterpret_cast<const char*>(side.data()), static_cast<std::streamsize>(side.size()));
+    }
+    q4::PleConfig ple;
+    ple.embed_dim             = 2560;
+    ple.ngram.ngram_size      = 3;
+    ple.ngram.heads_per_ngram = 8;
+    ple.table.format          = q4::NgramRowFormat::Fp8E4m3;
+    ple.table.rows            = rows;
+    ple.table.row_bytes       = 160;
+    ple.table.volume_id.fill(0xAA);
+    const q4::NgramTableConfig table = q4::resolve_ngram_volume(path, ple);
+    check(table.format == q4::NgramRowFormat::Bf16P12Blockdir && table.file_bytes == 3 * 4096 + 2 * 4096,
+          "the blockdir test volume resolves");
+    const q4::NgramVolume volume(path, table);
+    std::vector<std::uint8_t> want(rows * 256, 0);
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        const std::uint64_t block = r / 17, slot = r % 17;
+        std::memcpy(want.data() + r * 256, blocks.data() + block * 4096 + slot * 240, 240);
+        std::uint8_t* row = want.data() + r * 256;
+        row[240]          = 96;
+        const bool first  = block == 0 && slot == 0;
+        const bool spilled = block == 1 && slot < 6;
+        row[241]           = static_cast<std::uint8_t>(first || spilled ? 1 : 0);
+        if (first) {
+            row[242] = 5;
+            row[243] = static_cast<std::uint8_t>(((120 << 7) | 0x11) & 0xFF);
+            row[244] = static_cast<std::uint8_t>(((120 << 7) | 0x11) >> 8);
+        } else if (spilled) {
+            row[242] = 3;
+            row[243] = static_cast<std::uint8_t>(((40 << 7) | 0x11) & 0xFF);
+            row[244] = static_cast<std::uint8_t>(((40 << 7) | 0x11) >> 8);
+        }
+    }
+    std::vector<std::uint32_t> all(static_cast<std::size_t>(rows));
+    for (std::uint32_t r = 0; r < rows; ++r) { all[r] = r; }
+    std::vector<std::byte> got(rows * 256);
+    volume.read_rows(all, got);
+    bool same = std::memcmp(got.data(), want.data(), want.size()) == 0;
+    check(same, "every blockdir row resolves to its canonical P12 row");
+    if (!same) {
+        for (std::uint64_t r = 0; r < rows; ++r) {
+            if (std::memcmp(got.data() + r * 256, want.data() + r * 256, 256) != 0) {
+                std::fprintf(stderr, "  row %llu differs\n", static_cast<unsigned long long>(r));
+                break;
+            }
+        }
+    }
+    // The cache holds the resolved rows: the second call reads nothing and returns the same bytes.
+    const auto before     = volume.counters();
+    std::vector<std::uint32_t> again{0, 1, 17, 33, 34, 0, 1};
+    std::vector<std::byte> cached(again.size() * 256);
+    volume.read_rows(again, cached);
+    check(volume.counters().reads == before.reads && volume.counters().hits - before.hits == again.size(),
+          "the blockdir row cache serves the second call");
+    bool matched = true;
+    for (std::size_t i = 0; i < again.size(); ++i) {
+        matched = matched && std::memcmp(cached.data() + i * 256, want.data() + again[i] * 256, 256) == 0;
+    }
+    check(matched, "a cached blockdir row is its self-contained P12 row");
 }
 
 } // namespace
@@ -405,6 +570,10 @@ int main() {
         const auto headers = infernix::test::unique_temp_path("infernix_ngram_resolve_test.ngram");
         test_resolve(headers); // its own file: the volume above holds `path` without write sharing
         test_zero_row_bytes(headers);
+        const auto blockdir_path = infernix::test::unique_temp_path("infernix_ngram_blockdir_test.ngram");
+        test_blockdir(blockdir_path);
+        std::error_code ignored_blockdir;
+        std::filesystem::remove(blockdir_path, ignored_blockdir);
         std::error_code removed;
         std::filesystem::remove(headers, removed);
     } catch (const std::exception& error) {

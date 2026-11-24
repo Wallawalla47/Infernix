@@ -23,8 +23,25 @@ constexpr std::size_t kScaleOffset = kHeaderSize;
 // 2026-10-19, whose row size tells their format) and an NVFP4 table's FP32 multiplier (bits).
 constexpr std::size_t kFormatOffset      = kScaleOffset + 2;
 constexpr std::size_t kNvfp4ScaleOffset  = kFormatOffset + 2;
-constexpr std::size_t kHeaderFieldsBytes = kNvfp4ScaleOffset + 4;
+// The P12 follow-on formats' extension after the fixed fields: W, the on-disk row size, a blockdir
+// volume's four-entry base table, a qhuf volume's 16 Huffman code lengths, and the side stream's
+// offset, length and record count.
+constexpr std::size_t kWidthOffset         = kNvfp4ScaleOffset + 4; // 68
+constexpr std::size_t kSlotBytesOffset     = kWidthOffset + 2;      // 70
+constexpr std::size_t kBasesOffset         = kSlotBytesOffset + 2;  // 72
+constexpr std::size_t kCodeLengthsOffset   = kBasesOffset + 4;      // 76
+constexpr std::size_t kSideOffsetOffset    = kCodeLengthsOffset + 16; // 92
+constexpr std::size_t kSideBytesOffset     = kSideOffsetOffset + 8;   // 100
+constexpr std::size_t kSideCountOffset     = kSideBytesOffset + 8;    // 108
+constexpr std::size_t kHeaderFieldsBytes   = kSideCountOffset + 8;    // 116
 static_assert(kHeaderFieldsBytes <= 4096);
+// BF16 P12 blockdir: W values a row, 17 rows and one 16-byte directory a 4 KiB block, decoded into
+// canonical P12 rows (W + W/2 + 16 bytes).
+constexpr std::uint32_t kBlockdirWidth       = 160;
+constexpr std::uint32_t kBlockdirRows        = 17;
+constexpr std::uint32_t kBlockdirPlaneBytes  = kBlockdirWidth + kBlockdirWidth / 2;
+constexpr std::uint32_t kBlockdirRowBytes    = kBlockdirPlaneBytes + 16;
+constexpr unsigned kBlockdirMaxRowEscapes    = 4;
 
 template <class T>
 T read_le(const std::byte* p) {
@@ -89,6 +106,43 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
         throw std::runtime_error(path.string() + ": n-gram volume does not belong to this artifact");
     }
     static_assert(kHeaderSize == 60);
+    if (table_.format == NgramRowFormat::Bf16P12Blockdir) {
+        // The header's extension must equal the table resolve_ngram_volume read from it: W, the
+        // on-disk row size, the base table and the side stream.
+        if (read_le<std::uint16_t>(p + kWidthOffset) != table_.block_width ||
+            read_le<std::uint16_t>(p + kSlotBytesOffset) != table_.slot_bytes ||
+            std::memcmp(p + kBasesOffset, table_.blockdir_bases.data(), table_.blockdir_bases.size()) != 0 ||
+            read_le<std::uint64_t>(p + kSideOffsetOffset) != table_.side_offset ||
+            read_le<std::uint64_t>(p + kSideBytesOffset) != table_.side_bytes ||
+            read_le<std::uint64_t>(p + kSideCountOffset) != table_.side_count) {
+            throw std::runtime_error(path.string() + ": n-gram volume does not belong to this artifact");
+        }
+        if (table_.side_bytes != 0) {
+            side_storage_.assign(table_.side_bytes + 4096, std::byte{0});
+            const auto side_base = reinterpret_cast<std::uintptr_t>(side_storage_.data());
+            side_                = side_storage_.data() + ((4096 - side_base % 4096) % 4096);
+            if (file_.read_direct(table_.side_offset, std::span<std::byte>(side_, table_.side_bytes)) !=
+                table_.side_bytes) {
+                throw std::runtime_error(path.string() + ": short n-gram volume side stream");
+            }
+            std::uint64_t at = 0;
+            for (std::uint64_t record = 0; record < table_.side_count; ++record) {
+                if (at + 6 > table_.side_bytes) {
+                    throw std::runtime_error(path.string() + ": truncated n-gram volume side stream");
+                }
+                const std::uint32_t block = read_le<std::uint32_t>(side_ + at);
+                const std::uint32_t count = read_le<std::uint16_t>(side_ + at + 4);
+                at += 6;
+                if (at + 4ULL * count > table_.side_bytes) {
+                    throw std::runtime_error(path.string() + ": truncated n-gram volume side stream");
+                }
+                if (!side_index_.emplace(block, SideRef{.offset = at, .count = count}).second) {
+                    throw std::runtime_error(path.string() + ": a block appears twice in the n-gram side stream");
+                }
+                at += 4ULL * count;
+            }
+        }
+    }
     if (resident) {
         // The whole table in RAM: a block locked in the working set (only the CPU reads it), then 1 GiB
         // unbuffered reads (each keeps 16 reads of 8 MiB in flight on Windows) straight into it.
@@ -107,6 +161,79 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     }
 }
 
+// A blockdir block's row as the canonical P12 row the decoder reads: the 240 data bytes verbatim,
+// then the base its 2-bit code selects and that row's escaped values as P12's 3-byte entries (the
+// exponent from the directory's 6-bit signed delta, or the full BF16 word from the side stream).
+void NgramVolume::decode_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
+                                      std::byte* out) const {
+    const std::byte* directory = block + kBlockdirRows * kBlockdirPlaneBytes;
+    const auto bit = [&](unsigned at) {
+        return (static_cast<unsigned>(directory[at / 8]) >> (at % 8)) & 1U;
+    };
+    const unsigned code  = bit(2 * row_in_block) | (bit(2 * row_in_block + 1) << 1U);
+    const unsigned base  = table_.blockdir_bases[code];
+    const unsigned count = bit(2 * kBlockdirRows) | (bit(2 * kBlockdirRows + 1) << 1U) |
+                           (bit(2 * kBlockdirRows + 2) << 2U);
+    std::memcpy(out, block + static_cast<std::size_t>(row_in_block) * kBlockdirPlaneBytes, kBlockdirPlaneBytes);
+    std::uint8_t columns[kBlockdirMaxRowEscapes];
+    std::uint16_t values[kBlockdirMaxRowEscapes];
+    unsigned escapes = 0;
+    const auto add = [&](std::uint32_t position, std::uint32_t value) {
+        if (position / kBlockdirWidth != row_in_block) { return; }
+        if (escapes == kBlockdirMaxRowEscapes) {
+            throw std::runtime_error("a blockdir row holds more than four escapes");
+        }
+        columns[escapes] = static_cast<std::uint8_t>(position % kBlockdirWidth);
+        values[escapes]  = static_cast<std::uint16_t>(value);
+        ++escapes;
+    };
+    if (count == 7) {
+        const auto it = side_index_.find(row / kBlockdirRows);
+        if (it == side_index_.end()) {
+            throw std::runtime_error("a blockdir block names the side stream without a record");
+        }
+        const std::byte* entries = side_ + it->second.offset;
+        for (std::uint32_t e = 0; e < it->second.count; ++e) {
+            add(read_le<std::uint16_t>(entries + 4ULL * e), read_le<std::uint16_t>(entries + 4ULL * e + 2));
+        }
+    } else if (count <= 5) {
+        for (unsigned e = 0; e < count; ++e) {
+            std::uint32_t slot = 0;
+            const unsigned start = 2 * kBlockdirRows + 3 + 18 * e;
+            for (unsigned k = 0; k < 18; ++k) { slot |= bit(start + k) << k; }
+            const std::uint32_t position = slot & 0xFFFU;
+            int delta = static_cast<int>(slot >> 12U);
+            if ((delta & 32) != 0) { delta -= 64; }
+            const int exponent = static_cast<int>(base) + delta;
+            if (exponent < 0 || exponent > 255) {
+                throw std::runtime_error("a blockdir escape's exponent is outside BF16");
+            }
+            const auto plane = static_cast<std::uint8_t>(out[position % kBlockdirWidth]);
+            add(position, (static_cast<std::uint32_t>(plane & 0x80U) << 8U) |
+                              (static_cast<std::uint32_t>(exponent) << 7U) | (plane & 0x7FU));
+        }
+    } else {
+        throw std::runtime_error("a blockdir block records an invalid escape count");
+    }
+    out[kBlockdirPlaneBytes]       = static_cast<std::byte>(base);
+    out[kBlockdirPlaneBytes + 1]   = static_cast<std::byte>(escapes);
+    for (unsigned e = 0; e < escapes; ++e) {
+        std::byte* entry = out + kBlockdirPlaneBytes + 2 + 3 * e;
+        entry[0]         = static_cast<std::byte>(columns[e]);
+        entry[1]         = static_cast<std::byte>(values[e] & 0xFFU);
+        entry[2]         = static_cast<std::byte>(values[e] >> 8U);
+    }
+}
+
+void NgramVolume::copy_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
+                           std::byte* out) const {
+    if (table_.format == NgramRowFormat::Bf16P12Blockdir) {
+        decode_blockdir_row(block, row, row_in_block, out);
+        return;
+    }
+    std::memcpy(out, block + static_cast<std::size_t>(row_in_block) * table_.row_bytes, table_.row_bytes);
+}
+
 void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) const {
     if (out.size() != rows.size() * table_.row_bytes) {
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
@@ -120,9 +247,9 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         // One thread: gathering a prefill chunk's rows on kReadThreads threads (candidates §8.3 GX-08) measured
         // flat (prefill is compute-bound; removed 2026-10-28).
         for (std::size_t i = 0; i < rows.size(); ++i) {
-            const std::uint64_t at = static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) * table_.block_bytes +
-                                     static_cast<std::uint64_t>(rows[i] % table_.rows_per_block) * row_bytes;
-            std::memcpy(out.data() + i * row_bytes, blocks + at, row_bytes);
+            const std::uint64_t block = static_cast<std::uint64_t>(rows[i] / table_.rows_per_block);
+            copy_row(blocks + block * table_.block_bytes, rows[i], rows[i] % table_.rows_per_block,
+                     out.data() + i * row_bytes);
         }
         counters_.rows += rows.size();
         counters_.hits += rows.size();
@@ -162,8 +289,7 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         read_parallel(offsets_, [&](std::size_t b, std::span<const std::byte> block) {
             for (std::size_t m = first_miss_[b]; m < first_miss_[b + 1]; ++m) {
                 const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
-                std::memcpy(out.data() + i * row_bytes, block.data() + (rows[i] % table_.rows_per_block) * row_bytes,
-                            row_bytes);
+                copy_row(block.data(), rows[i], rows[i] % table_.rows_per_block, out.data() + i * row_bytes);
             }
         });
         for (const std::uint64_t miss : misses_) {
@@ -181,9 +307,9 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         offsets_, table_.block_bytes, std::span<std::byte>(ring_, kInFlight * table_.block_bytes),
         [&](std::size_t b, std::span<const std::byte> block) {
             for (std::size_t m = first_miss_[b]; m < first_miss_[b + 1]; ++m) {
-                const auto i         = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
-                const std::byte* row = block.data() + (rows[i] % table_.rows_per_block) * row_bytes;
-                std::memcpy(out.data() + i * row_bytes, row, row_bytes);
+                const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
+                std::byte* row = out.data() + i * row_bytes;
+                copy_row(block.data(), rows[i], rows[i] % table_.rows_per_block, row);
                 const std::size_t slot = slot_of(rows[i]);
                 tags_[slot]            = rows[i];
                 std::memcpy(cache_.data() + slot * row_bytes, row, row_bytes);
@@ -314,14 +440,16 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
         case NgramRowFormat::Nvfp4: return width % 16 == 0 ? width / 2 + width / 16 : 0;
         case NgramRowFormat::Q8_0: return width % 32 == 0 ? width / 32 * 34 : 0;
         case NgramRowFormat::Bf16P12: return width % 2 == 0 && width <= 255 ? width + width / 2 + 16 : 0;
+        case NgramRowFormat::Bf16P12Blockdir: return width == kBlockdirWidth ? kBlockdirRowBytes : 0;
         }
         return 0;
     };
     const std::uint16_t tag = read_le<std::uint16_t>(p + kFormatOffset);
     if (tag != 0) {
-        if (tag > 6) { fail("unknown n-gram row format tag " + std::to_string(tag)); }
+        if (tag > 7) { fail("unknown n-gram row format tag " + std::to_string(tag)); }
         constexpr NgramRowFormat kTagged[] = {NgramRowFormat::Fp8E4m3, NgramRowFormat::Iq4Nl, NgramRowFormat::Bf16,
-                                              NgramRowFormat::Nvfp4, NgramRowFormat::Q8_0, NgramRowFormat::Bf16P12};
+                                              NgramRowFormat::Nvfp4, NgramRowFormat::Q8_0, NgramRowFormat::Bf16P12,
+                                              NgramRowFormat::Bf16P12Blockdir};
         out.format = kTagged[tag - 1];
         if (out.row_bytes != row_bytes_of(out.format)) {
             fail("n-gram rows of " + std::to_string(out.row_bytes) + " bytes differ from its format's");
@@ -338,12 +466,38 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
     // Its own volume (the artifact's format and volume id): the artifact's table and, for FP8 and
     // NVFP4, its scale.
     if (out.format == ple.table.format && out.volume_id == ple.table.volume_id) { return ple.table; }
-    // Another table of this model, in any of the five formats: its own geometry and id, and an FP8
-    // table's scale or an NVFP4 table's multiplier from its header (a quantization's scale is a
-    // property of the volume, not of the artifact).
+    // Another table of this model, in any of the formats: its own geometry and id, and an FP8 table's
+    // scale or an NVFP4 table's multiplier from its header (a quantization's scale is a property of
+    // the volume, not of the artifact).
     out.file_bytes = static_cast<std::uint64_t>(out.header_bytes) + out.blocks * out.block_bytes;
+    if (out.format == NgramRowFormat::Bf16P12Blockdir) {
+        // The header's W, its on-disk row size, base table and side stream; 17 rows a 4 KiB block and
+        // the decoded P12 row width are the format's, not the row size's, geometry.
+        out.block_width = read_le<std::uint16_t>(p + kWidthOffset);
+        out.slot_bytes  = read_le<std::uint16_t>(p + kSlotBytesOffset);
+        std::memcpy(out.blockdir_bases.data(), p + kBasesOffset, out.blockdir_bases.size());
+        out.side_offset = read_le<std::uint64_t>(p + kSideOffsetOffset);
+        out.side_bytes  = read_le<std::uint64_t>(p + kSideBytesOffset);
+        out.side_count  = read_le<std::uint64_t>(p + kSideCountOffset);
+        if (out.block_width != kBlockdirWidth || out.slot_bytes != kBlockdirPlaneBytes ||
+            out.rows_per_block != kBlockdirRows || out.row_bytes != row_bytes_of(out.format)) {
+            fail("a blockdir volume must hold 17 rows of 160 values a 4 KiB block");
+        }
+        for (const std::uint8_t base : out.blockdir_bases) {
+            if (base > 240) { fail("a blockdir base table entry is outside [0, 240]"); }
+        }
+        if (out.side_bytes % 4096 != 0 ||
+            (out.side_bytes == 0 ? (out.side_offset != 0 || out.side_count != 0)
+                                 : (out.side_offset != out.file_bytes || out.side_count == 0))) {
+            fail("the blockdir side stream's header fields disagree");
+        }
+        out.file_bytes += out.side_bytes;
+    }
+    if (out.format != NgramRowFormat::Bf16P12Blockdir &&
+        out.rows_per_block != out.block_bytes / out.row_bytes) {
+        fail("the n-gram volume's geometry differs from this model's table");
+    }
     if (out.rows != ple.table.rows || out.block_bytes != 4096 || out.header_bytes != 4096 ||
-        out.rows_per_block != out.block_bytes / out.row_bytes ||
         out.blocks != (out.rows + out.rows_per_block - 1) / out.rows_per_block) {
         fail("the n-gram volume's geometry differs from this model's table");
     }

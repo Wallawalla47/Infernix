@@ -1079,6 +1079,9 @@ Tensor Forward::ple_embedding_impl(A& a, const PleParameters& p, const ForwardBa
         } else if (format == NgramRowFormat::Bf16P12) {
             // The rows are self-contained: their base and escapes carry every BF16 bit, with no scale.
             ops::ple_embed_bf16_p12(b.ngram_rows, e, s);
+        } else if (format == NgramRowFormat::Bf16P12Blockdir) {
+            // The reader resolved each block directory into a canonical P12 row; the same codec.
+            ops::ple_embed_bf16_p12_blockdir(b.ngram_rows, e, s);
         } else {
             // FP8 rows take their table's BF16 scale, NVFP4 rows their table's FP32 multiplier.
             const Tensor& scale = b.ngram_scale.data != nullptr ? b.ngram_scale : p.ngram_scale;

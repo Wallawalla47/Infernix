@@ -210,6 +210,18 @@ void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) 
 
     g_failures += verify_exact(label.c_str(), from_device<std::uint16_t>(d_out.data(), want.size()), want);
     g_failures += d_out.verify_guards(label);
+    if (width == 160 && heads == 16 && columns == 3) {
+        // A blockdir volume's reader hands the Op the same canonical P12 row, so the op must decode
+        // the same rows to the same BF16 words.
+        GuardedDeviceBuffer d_blockdir(static_cast<std::size_t>(elements) * columns * sizeof(std::uint16_t));
+        d_blockdir.fill(0xFF);
+        Tensor t_blockdir(d_blockdir.data(), DType::BF16, {static_cast<std::int32_t>(elements), columns});
+        ops::ple_embed_bf16_p12_blockdir(t_rows, t_blockdir, nullptr);
+        cuda_synchronize();
+        g_failures += verify_exact((label + " blockdir").c_str(),
+                                   from_device<std::uint16_t>(d_blockdir.data(), want.size()), want);
+        g_failures += d_blockdir.verify_guards(label + " blockdir");
+    }
 }
 
 struct GateReference {

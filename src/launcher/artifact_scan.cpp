@@ -21,7 +21,7 @@ constexpr char kPartMagic[8]   = {'N', 'I', 'N', 'P', 'R', 'T', '\0', '\x03'};
 constexpr char kNgramMagic[8]  = {'N', 'I', 'N', 'F', 'E', 'R', 'N', 'G'};
 constexpr std::uint64_t kPayloadAlignment = 4096;
 constexpr std::uint64_t kMaxDirectoryBytes = 512ull << 20;
-constexpr std::size_t kNgramHeaderBytes   = 68;
+constexpr std::size_t kNgramHeaderBytes   = 116;
 constexpr std::uint64_t kMaxAdapterConfigBytes = 4ull << 20; // a PEFT adapter_config.json is about 1 kB
 constexpr const char* kAdapterConfig  = "adapter_config.json";
 constexpr const char* kAdapterWeights = "adapter_model.safetensors";
@@ -96,6 +96,7 @@ std::uint32_t row_bytes_for(std::string_view format, std::uint32_t width) {
     if (format == "q8_0") { return width % 32 == 0 ? width / 32 * 34 : 0; }
     if (format == "nvfp4") { return width % 16 == 0 ? width / 2 + width / 16 : 0; }
     if (format == "bf16_p12") { return width % 2 == 0 && width <= 255 ? width + width / 2 + 16 : 0; }
+    if (format == "bf16_p12_blockdir") { return width == 160 ? 256 : 0; }
     return 0;
 }
 
@@ -502,8 +503,9 @@ std::optional<ScannedNgramVolume> parse_ngram_header(const std::filesystem::path
     volume.key       = hex_string(reinterpret_cast<const std::uint8_t*>(p + 44), 16);
     volume.fp8_scale = read_le<std::uint16_t>(p + 60);
     volume.tag       = read_le<std::uint16_t>(p + 62);
-    static constexpr const char* kTagged[] = {"fp8", "iq4_nl", "bf16", "nvfp4", "q8_0", "bf16_p12"};
-    if (volume.tag >= 1 && volume.tag <= 6) {
+    static constexpr const char* kTagged[] = {"fp8", "iq4_nl", "bf16", "nvfp4", "q8_0", "bf16_p12",
+                                              "bf16_p12_blockdir"};
+    if (volume.tag >= 1 && volume.tag <= 7) {
         volume.format = kTagged[volume.tag - 1];
     } else {
         // Untagged volumes predate NVFP4 tables; Qwen3.8-Flash-Next rows are 160 elements wide.
@@ -514,7 +516,8 @@ std::optional<ScannedNgramVolume> parse_ngram_header(const std::filesystem::path
                                                                               : "unknown";
     }
     volume.expected_bytes = std::uint64_t{read_le<std::uint32_t>(p + 12)} +
-                            read_le<std::uint64_t>(p + 36) * read_le<std::uint32_t>(p + 32);
+                            read_le<std::uint64_t>(p + 36) * read_le<std::uint32_t>(p + 32) +
+                            read_le<std::uint64_t>(p + 100); // a P12 blockdir volume's side stream
     volume.bytes    = file_size_or_zero(path);
     volume.modified = modified_ms(path);
     return volume;
@@ -545,8 +548,9 @@ std::optional<int> ngram_rank(const ScannedModel& model, const ScannedNgramVolum
     if (format == "iq4_nl") { return 3; }
     if (format == "q8_0") { return 4; }
     if (format == "bf16_p12") { return 5; }
-    if (format == "bf16") { return 6; }
-    return 6;
+    if (format == "bf16_p12_blockdir") { return 6; }
+    if (format == "bf16") { return 8; }
+    return 8;
 }
 
 LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int depth) {

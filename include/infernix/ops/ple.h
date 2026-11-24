@@ -40,6 +40,12 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
 /// out: BF16 [heads*W, T], each value its exact BF16 bits.
 void ple_embed_bf16_p12(const Tensor& rows, Tensor& out, cudaStream_t stream);
 
+/// BF16 P12 blockdir rows (a lossless run-time volume): the volume reader resolves each block's
+/// 16-byte directory into the canonical P12 row above (the row's base and its escaped values from
+/// the directory or the file's side stream), so `rows` holds P12 rows and the op decodes them like
+/// ple_embed_bf16_p12.
+void ple_embed_bf16_p12_blockdir(const Tensor& rows, Tensor& out, cudaStream_t stream);
+
 /// NVFP4 rows (NVIDIA FP4-Local's table): rows U8 [W/2 + W/16, heads, T], each row its W/2 code
 /// bytes (E2M1, element 2i in the low nibble of byte i) then its W/16 E4M3FN block scales;
 /// multiplier: FP32 [1], positive and finite. out: BF16 [heads*W, T],

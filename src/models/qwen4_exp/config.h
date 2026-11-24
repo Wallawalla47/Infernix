@@ -109,9 +109,10 @@ struct QsaConfig {
 // scale per 16 elements, with one FP32 multiplier for the table; design §12.5), or Q8_0 rows (a GGUF's
 // or a .basalt pack's, verbatim: one FP16 scale and 32 int8 codes per block), or BF16 P12 rows (a
 // lossless 12-bit row: a sign-and-mantissa byte and a 4-bit exponent offset per value from a per-row
-// base, with up to four inline escapes). Any volume of the model's table, in any of the six formats,
-// may replace the artifact's at run time (resolve_ngram_volume).
-enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16, Nvfp4, Q8_0, Bf16P12 };
+// base, with up to four inline escapes), or BF16 P12 blockdir rows (those data bytes with one 16-byte
+// base-and-escape directory a 4 KiB block). Any volume of the model's table, in any of the seven
+// formats, may replace the artifact's at run time (resolve_ngram_volume).
+enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16, Nvfp4, Q8_0, Bf16P12, Bf16P12Blockdir };
 
 struct NgramTableConfig {
     NgramRowFormat format = NgramRowFormat::Fp8E4m3;
@@ -129,6 +130,14 @@ struct NgramTableConfig {
     std::uint64_t blocks          = 0;
     std::uint64_t file_bytes      = 0;
     std::array<std::uint8_t, 16> volume_id{};
+    // BF16 P12 blockdir (a run-time volume only): W, the directory's four-entry base table, and the
+    // file-level side stream that holds a block's escapes when they do not fit its five slots.
+    std::uint16_t block_width               = 0;
+    std::uint16_t slot_bytes                = 0;
+    std::array<std::uint8_t, 4> blockdir_bases{};
+    std::uint64_t side_offset               = 0;
+    std::uint64_t side_bytes                = 0;
+    std::uint64_t side_count                = 0;
 };
 
 struct PleConfig {

@@ -21,6 +21,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace infernix::models::qwen4_exp {
@@ -94,6 +95,17 @@ private:
     // consume(i, block) runs on the thread that read block i.
     void read_parallel(std::span<const std::uint64_t> offsets,
                        const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const;
+    // One row's self-contained decode bytes from its block: the row verbatim for the formats whose
+    // on-disk row is their decode row, or the P12 row a blockdir block's directory resolves to (the
+    // base and that row's escaped values from the directory or the side stream) so a cache entry needs
+    // no other state.
+    void copy_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block, std::byte* out) const;
+    void decode_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
+                             std::byte* out) const;
+    struct SideRef {
+        std::uint64_t offset = 0; // bytes into side_
+        std::uint32_t count  = 0; // blockdir escapes, or 1 for a qhuf row
+    };
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
@@ -104,6 +116,10 @@ private:
     mutable std::byte* parallel_ring_ = nullptr;
     mutable std::vector<std::uint32_t> tags_; // row id per cache slot, UINT32_MAX when empty
     mutable std::vector<std::byte> cache_;    // row codes per slot
+    // The file-level side stream (blockdir escapes, qhuf rows) and where each block or row starts in it.
+    std::vector<std::byte> side_storage_;
+    std::byte* side_ = nullptr;
+    std::unordered_map<std::uint32_t, SideRef> side_index_;
     // One call's misses as (block << 32 | output index), sorted so each block's rows are adjacent;
     // the distinct blocks' offsets and where each block's misses begin.
     mutable std::vector<std::uint64_t> misses_;
@@ -116,7 +132,7 @@ private:
 [[nodiscard]] std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact);
 
 // The table a volume holds for this model, from its header: the artifact's own table when the volume
-// is its own (its format and volume id), else the volume's table, in any of the four formats (the
+// is its own (its format and volume id), else the volume's table, in any of the formats (the
 // header's format tag, or for a volume written before the tag, its row size), which any
 // Qwen3.8-Flash-Next artifact of this geometry accepts in place of its own. Such an FP8 volume needs its
 // per-tensor scale (NgramTableConfig::fp8_scale): the BF16 word after the header's fixed fields, which

@@ -2257,9 +2257,10 @@ and a trap names no site (#48's `cudaErrorIllegalInstruction`). The GGUF token e
 
 ### 12.5 Row formats and RAM residency (2026-10-11)
 
-Six row formats share the volume layout of §12.2 and the read paths above; the engine reads the
+Seven row formats share the volume layout of §12.2 and the read paths above; the engine reads the
 format from the volume header's format tag (byte 62, written since 2026-10-19: 1 FP8, 2 IQ4_NL,
-3 BF16, 4 NVFP4, 5 Q8_0, 6 BF16 P12) or, for a volume written before the tag, from its row size
+3 BF16, 4 NVFP4, 5 Q8_0, 6 BF16 P12, 7 BF16 P12 blockdir) or, for a volume written before the tag,
+from its row size
 (`resolve_ngram_volume`, `config.h`). NVFP4 rows have IQ4_NL's 90 bytes, so an NVFP4 volume always
 carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
 
@@ -2271,6 +2272,7 @@ carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
 | NVFP4 (80 E2M1 code bytes, 10 E4M3FN block scales; one FP32 multiplier) | 90 B | 45 | 29.1 GB | NVIDIA FP4-Local's table (recipe D, §6.1.2), byte for byte |
 | Q8_0 (blocks of 32: fp16 scale, 32 int8 codes) | 170 B | 24 | 54.6 GB | a Q8_0 GGUF's or a .basalt pack's table, byte for byte |
 | BF16 P12 (sign-and-mantissa bytes, 4-bit exponent offsets, base, up to 4 escapes) | 256 B | 16 | 81.9 GB | the BF16 volume repacked losslessly (`tools/flash_next/ngram_p12.py`); run time only |
+| BF16 P12 blockdir (P12's data bytes, one base-and-escape directory a block) | 240 B (256 B decoded) | 17 | ~77 GB | the BF16 volume repacked losslessly (`tools/flash_next/ngram_p12_ext.py --format blockdir`); run time only |
 
 - **IQ4_NL.** `ple_embed` decodes each value as `bf16_rn(fl32(d) · kvalue)`: the product is exact in
   FP32 and rounds once at the BF16 boundary the FP8 rows have. Nibble order is llama.cpp's (elements
@@ -2296,6 +2298,18 @@ carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
   and 73,263 from the P12 volume (127,168 rows requested, 1.5 % host-cache hits: since 12 or 16 rows a
   block read the same count, the reads fall short of the misses because a prompt repeats rows, not
   because rows share blocks).
+- **BF16 P12 blockdir (2026-11-24).** The P12 data planes (240 B a row: 160 sign-and-mantissa
+  bytes and 80 q-nibble bytes) with one 16-byte directory a 4 KiB block in place of 17 P12 trailers:
+  17 x 240 + 16 = 4096, so 17 rows a block and 0.94 of P12's bytes. The directory holds 17 two-bit
+  codes into a four-entry base table in the header, a 3-bit escape count and five 18-bit slots
+  (12-bit position in the block, 6-bit signed exponent delta from the row's base). A block past the
+  five slots, or an escape outside six signed bits, puts all its escapes in a file-level side stream
+  addressed by block id (`ngram_p12_ext.py`). The reader resolves a block's directory into the
+  canonical P12 row (the base code and the row's escapes from the slots or side stream) and the row
+  cache holds that self-contained row. The packer refuses a table with more than four distinct row
+  bases or a row past P12's four escapes; on Qwen's table the census has yet to be taken (the
+  synthetic slice exercises both gates). No artifact binds the format; it is a run-time volume only
+  and ranks after BF16 P12.
 - **NVFP4 (2026-10-19).** `ple_embed_nvfp4` decodes each value as `bf16_rn(e2m1 · e4m3 · m)`, the
   exact product (at most 30 significant bits) rounded once (an FMA residual decides the FP32 product's
   BF16 ties); element 2i is byte i's low nibble, ModelOpt's packing. The multiplier `m` (ModelOpt's

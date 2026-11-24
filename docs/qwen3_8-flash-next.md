@@ -666,17 +666,19 @@ about healthy drives. The probe only reports; it never changes where the table l
 
 ## N-gram table formats
 
-The PLE n-gram table has six volume formats. Five can be an artifact's own table: NVIDIA's FP8 rows
+The PLE n-gram table has seven volume formats. Five can be an artifact's own table: NVIDIA's FP8 rows
 with one scale for the whole table (recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits
 per value), the Q8_0 rows of a Q8_0 GGUF or a .basalt pack (8.5 bits per value), the BF16 rows of
 Qwen's checkpoint (the FP8 checkpoint's exact artifact binds it) and NVIDIA FP4-Local's NVFP4 rows
 (4.5 bits per value: E2M1 codes, an E4M3 scale per 16 values and one FP32 multiplier; the FP4-Local
-artifact binds it). The sixth, [BF16 P12](#bf16-p12-n-gram-table), stores the BF16 rows losslessly in
-less space and serves only at run time. **Any Qwen3.8-Flash-Next artifact runs with a volume of any
-of the six formats**: pass it with `--ngram-volume`. The engine reads the row format from the
+artifact binds it). The sixth, [BF16 P12](#bf16-p12-n-gram-table), and the seventh, [BF16 P12
+blockdir](#bf16-p12-blockdir-n-gram-table), store the BF16 rows losslessly in less space and serve
+only at run time. **Any Qwen3.8-Flash-Next artifact runs with a volume of any of the seven
+formats**: pass it with `--ngram-volume`. The engine reads the row format from the
 volume's header and logs
 `n-gram table: <format> rows from <volume> in place of the artifact's <format> table`; the PLE
-decodes the FP8, IQ4_NL, Q8_0, NVFP4 or BF16 P12 rows (or takes the BF16 rows as its embedding) as it
+decodes the FP8, IQ4_NL, Q8_0, NVFP4, BF16 P12 or BF16 P12 blockdir rows (or takes the BF16 rows as
+its embedding) as it
 does for the artifact's own table. The volumes hold the same table row for row: on 3,002 sampled rows,
 the FP8 rows' relative L2 error against the BF16 rows was 2.7 % (median; 3.1 % at the 99th
 percentile) and the IQ4_NL rows' 7.6 % (8.7 %), against 142 % for rows shifted by one; on 65,536
@@ -762,6 +764,31 @@ interleaved runs on an RTX 5090, 2026-11-21) decoded 127.0 tok/s with the BF16 P
 with the BF16 one and read prompts at 4,856 and 4,807 tok/s; the BF16 volume against itself varied
 as much (decode down to 0.973 of itself in one pair). No artifact binds a BF16 P12 table as its own (`--ngram-reuse` refuses one);
 pass it at run time.
+
+### BF16 P12 blockdir n-gram table
+
+A BF16 P12 blockdir volume holds the same BF16 values as the BF16 volume, bit for bit, in 240 data
+bytes a row and 17 rows a 4 KiB block instead of the P12 volume's 16. The data bytes are P12's
+(160 sign-and-mantissa bytes and 80 q-nibble bytes); the 17 per-row 16-byte P12 tails become one
+16-byte directory a block: 17 two-bit codes into a four-entry base table in the file header, a 3-bit
+escape count and five 18-bit slots (12-bit position in the block, 6-bit signed exponent delta). A
+block that needs more than five slots, or an escape outside six signed bits, moves its escapes to a
+file-level side stream addressed by block id. The volume is 17 x 240 + 16 = 4096 bytes a block,
+0.94 of the P12 volume's size, and the engine decodes each row to the same canonical P12 row. The
+volume reader resolves a block's directory into the row (the cache holds that self-contained row),
+so a cached row needs no second lookup. The packer refuses a table with more than four distinct
+row bases or a row past P12's four escapes:
+
+```text
+python -m tools.flash_next.ngram_p12_ext --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --format blockdir --census
+python -m tools.flash_next.ngram_p12_ext --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --format blockdir --out <fast drive>/Qwen3.8-Flash-Next-BF16-P12-Blockdir.ngram
+python -m tools.flash_next.ngram_p12_ext --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --format blockdir --out <fast drive>/Qwen3.8-Flash-Next-BF16-P12-Blockdir.ngram --verify --rows all
+infernix-serve <artifact part 1> --ngram-volume <fast drive>/Qwen3.8-Flash-Next-BF16-P12-Blockdir.ngram ...
+```
+
+The census reports the distinct bases a block, the escape histogram and the blocks that need the
+side stream. No artifact binds the format as its own; it serves at run time like BF16 P12 and ranks
+after it.
 
 ## Chat template
 
