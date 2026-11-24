@@ -15,15 +15,15 @@ bytes (160 sign-and-mantissa bytes, 80 q-nibble bytes), a base byte and up to fo
 tool replaces the 17 per-row trailers of a 4 KiB block with one 16-byte block directory:
 
     17 x 240 data bytes              (the P12 planes verbatim)
-    16-byte directory               17 x 2-bit base codes into the header's 4-entry base table,
+    16-byte directory               17 x 3-bit base codes into the header's 8-entry base table,
                                     3-bit escape count (7 = all escapes in the side stream),
-                                    5 x 18-bit escape slots (12-bit position in the block,
+                                    4 x 18-bit escape slots (12-bit position in the block,
                                     6-bit signed exponent delta from the row's base)
 
 17 x (240 + 16 / 17) = 4096 bytes: the same data as 16 P12 rows, in 17 rows a block. A block whose
-escapes do not fit five slots (more than five, or a delta outside -32..31) puts all its escapes in
+escapes do not fit four slots (more than four, or a delta outside -32..31) puts all its escapes in
 a file-level side stream, addressed by block id. A row may hold at most four escapes (the P12 row's
-trailer bound); the encoder refuses a table with a row past it or with more than four distinct
+trailer bound); the encoder refuses a table with a row past it or with more than eight distinct
 row-base values table-wide. The decoder here is independent of the engine's.
 
 Only Python 3 and numpy are used (no torch).
@@ -53,18 +53,19 @@ TAG_BF16_P12_BLOCKDIR = 7
 # Fields after the 68-byte v1 fixed header (all little-endian, zero when a format does not use one).
 EXT_WIDTH_OFFSET = 68          # u16: W, the values in a row
 EXT_SLOT_BYTES_OFFSET = 70     # u16: bytes of the format's on-disk row (240)
-EXT_BASES_OFFSET = 72          # 4 x u8: the file's base table
-EXT_CODE_LENGTHS_OFFSET = 76   # 16 x u8: a Huffman code-length table (qhuf)
+EXT_BASES_OFFSET = 116         # 8 x u8: the file's base table (the fixed fields' reserved tail)
 EXT_SIDE_OFFSET = 92           # u64: absolute file offset of the side stream (0 when empty)
 EXT_SIDE_BYTES = 100           # u64: its length in bytes (multiple of 4096)
-EXT_SIDE_COUNT = 108           # u64: records (blocks for blockdir, rows for qhuf)
-EXT_HEADER_BYTES = 116         # bytes of the header this tool reads and writes
+EXT_SIDE_COUNT = 108           # u64: the side stream's block records
+EXT_HEADER_BYTES = 124         # bytes of the header this tool reads and writes
 
 WIDTH = 160                    # a blockdir row of 160 values: 17 x 240 + 16 = 4096
 ROWS_PER_BLOCK = 17
 PLANE_BYTES = WIDTH + WIDTH // 2
 MAX_ESCAPES_PER_ROW = p12.MAX_ESCAPES
-MAX_BLOCK_ESCAPES = 5
+BASE_CODE_BITS = 3
+BASE_TABLE_SIZE = 8
+MAX_BLOCK_ESCAPES = 4
 DELTA_MIN, DELTA_MAX = -32, 31
 SIDE_SENTINEL = 7
 
@@ -98,7 +99,7 @@ class PackedVolume:
             raise ValueError(f"{self.path}: not a BF16 P12 blockdir volume (tag {self.tag})")
         (self.width,) = struct.unpack_from("<H", fields, EXT_WIDTH_OFFSET)
         (self.slot_bytes,) = struct.unpack_from("<H", fields, EXT_SLOT_BYTES_OFFSET)
-        self.bases = list(fields[EXT_BASES_OFFSET:EXT_BASES_OFFSET + 4])
+        self.bases = list(fields[EXT_BASES_OFFSET:EXT_BASES_OFFSET + BASE_TABLE_SIZE])
         (self.side_offset,) = struct.unpack_from("<Q", fields, EXT_SIDE_OFFSET)
         (self.side_bytes,) = struct.unpack_from("<Q", fields, EXT_SIDE_BYTES)
         (self.side_count,) = struct.unpack_from("<Q", fields, EXT_SIDE_COUNT)
@@ -154,9 +155,9 @@ class PackedVolume:
         def bits(at: int, count: int) -> int:
             return (directory >> at) & ((1 << count) - 1)
 
-        count = bits(2 * ROWS_PER_BLOCK, 3)
-        if count == 6:
-            raise ValueError(f"{self.path}: block {block} records an invalid escape count 6")
+        count = bits(BASE_CODE_BITS * ROWS_PER_BLOCK, 3)
+        if count not in (*range(MAX_BLOCK_ESCAPES + 1), SIDE_SENTINEL):
+            raise ValueError(f"{self.path}: block {block} records an invalid escape count {count}")
         if count == SIDE_SENTINEL and block not in self.side:
             raise ValueError(f"{self.path}: block {block} names the side stream without a record")
         rows = np.frombuffer(data[:ROWS_PER_BLOCK * PLANE_BYTES], np.uint8).reshape(ROWS_PER_BLOCK,
@@ -165,12 +166,12 @@ class PackedVolume:
         out[:, :PLANE_BYTES] = rows
         escapes: list[list[tuple[int, int]]] = [[] for _ in range(ROWS_PER_BLOCK)]
         for e in range(count if count != SIDE_SENTINEL else 0):
-            slot = bits(2 * ROWS_PER_BLOCK + 3 + 18 * e, 18)
+            slot = bits(BASE_CODE_BITS * ROWS_PER_BLOCK + 3 + 18 * e, 18)
             position, delta = slot & 0xFFF, slot >> 12
             if delta & 32:
                 delta -= 64
             row, column = divmod(position, WIDTH)
-            exponent = self.bases[bits(2 * row, 2)] + delta
+            exponent = self.bases[bits(BASE_CODE_BITS * row, BASE_CODE_BITS)] + delta
             if not 0 <= exponent <= 255:
                 raise ValueError(f"{self.path}: block {block} has an escape outside the BF16 exponent")
             plane = int(out[row, column])
@@ -182,7 +183,7 @@ class PackedVolume:
             if len(entries) > MAX_ESCAPES_PER_ROW:
                 raise ValueError(f"{self.path}: block {block} row {row} holds {len(entries)} escapes; "
                                  f"a P12 row holds {MAX_ESCAPES_PER_ROW}")
-            out[row, PLANE_BYTES] = self.bases[bits(2 * row, 2)]
+            out[row, PLANE_BYTES] = self.bases[bits(BASE_CODE_BITS * row, BASE_CODE_BITS)]
             out[row, PLANE_BYTES + 1] = len(entries)
             for e, (column, value) in enumerate(entries):
                 entry = PLANE_BYTES + 2 + 3 * e
@@ -262,15 +263,15 @@ def pack_block(analysis: dict, bases: list[int]) -> tuple[np.ndarray, list[tuple
     directory = 0
     for row in range(ROWS_PER_BLOCK):
         value = bases.index(int(base[row])) if row < rows else 0
-        directory |= value << (2 * row)
+        directory |= value << (BASE_CODE_BITS * row)
     side = analysis["side"]
     count = len(side) if side else len(analysis["slots"])
-    directory |= (SIDE_SENTINEL if side else count) << (2 * ROWS_PER_BLOCK)
+    directory |= (SIDE_SENTINEL if side else count) << (BASE_CODE_BITS * ROWS_PER_BLOCK)
     if not side:
         for e, (position, delta) in enumerate(analysis["slots"]):
             if delta < 0:
                 delta += 64
-            directory |= (position | (delta << 12)) << (2 * ROWS_PER_BLOCK + 3 + 18 * e)
+            directory |= (position | (delta << 12)) << (BASE_CODE_BITS * ROWS_PER_BLOCK + 3 + 18 * e)
     block = np.zeros(BLOCK_BYTES, np.uint8)
     block[:ROWS_PER_BLOCK * PLANE_BYTES] = plane.reshape(-1)
     block[ROWS_PER_BLOCK * PLANE_BYTES:] = np.frombuffer(directory.to_bytes(16, "little"), np.uint8)
@@ -288,7 +289,7 @@ def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
     row_escape_max = 0
     side_blocks = 0
     delta_blocks = 0
-    blocks_over_four = 0
+    blocks_over_eight = 0
     escapes_total = 0
     rows = source.rows
     begin = 0
@@ -301,8 +302,8 @@ def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
             global_bases.update(analysis["distinct"])
             distinct = len(analysis["distinct"])
             distinct_histogram[distinct] = distinct_histogram.get(distinct, 0) + 1
-            if distinct > 4:
-                blocks_over_four += 1
+            if distinct > BASE_TABLE_SIZE:
+                blocks_over_eight += 1
             escape_histogram[analysis["escapes"]] = escape_histogram.get(analysis["escapes"], 0) + 1
             escapes_total += analysis["escapes"]
             if analysis["row_escapes"].size:
@@ -321,16 +322,16 @@ def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
             "global_distinct": len(global_bases),
             "values": sorted(global_bases),
             "per_block_distinct_histogram": {str(k): v for k, v in sorted(distinct_histogram.items())},
-            "blocks_over_4": blocks_over_four,
-            "fits_4_entry_table": len(global_bases) <= 4 and blocks_over_four == 0,
+            "blocks_over_8": blocks_over_eight,
+            "fits_8_entry_table": len(global_bases) <= BASE_TABLE_SIZE and blocks_over_eight == 0,
         },
         "escapes": {
             "per_block_histogram": {str(k): v for k, v in sorted(escape_histogram.items())},
             "mean_per_block": escapes_total / total_blocks if total_blocks else 0.0,
             "max_per_block": max(escape_histogram) if escape_histogram else 0,
             "max_per_row": row_escape_max,
-            "blocks_over_5": sum(v for k, v in escape_histogram.items() if k > MAX_BLOCK_ESCAPES),
-            "p_over_5": sum(v for k, v in escape_histogram.items() if k > MAX_BLOCK_ESCAPES) / total_blocks
+            "blocks_over_4": sum(v for k, v in escape_histogram.items() if k > MAX_BLOCK_ESCAPES),
+            "p_over_4": sum(v for k, v in escape_histogram.items() if k > MAX_BLOCK_ESCAPES) / total_blocks
             if total_blocks else 0.0,
         },
         "side_stream": {
@@ -342,7 +343,7 @@ def census(source: p12.Volume, chunk_blocks: int = 256) -> dict:
 
 
 def build_bases(source: p12.Volume, chunk_blocks: int = 256) -> list[int]:
-    """The file's 4-entry base table, or a refusal: a blockdir volume needs all of a table's bases."""
+    """The file's 8-entry base table, or a refusal: a blockdir volume needs all of a table's bases."""
     bases: set[int] = set()
     rows = source.rows
     begin = 0
@@ -352,11 +353,11 @@ def build_bases(source: p12.Volume, chunk_blocks: int = 256) -> list[int]:
         for first in range(0, end - begin, ROWS_PER_BLOCK):
             analysis = analyze_block(words[first:first + ROWS_PER_BLOCK], begin + first)
             bases.update(analysis["distinct"])
-            if len(bases) > 4:
-                raise ValueError(f"{source.path}: more than four distinct row-base values; a blockdir "
-                                 f"volume's base table holds four")
+            if len(bases) > BASE_TABLE_SIZE:
+                raise ValueError(f"{source.path}: more than eight distinct row-base values; a blockdir "
+                                 f"volume's base table holds eight")
         begin = end
-    return sorted(bases) + [0] * (4 - len(bases))
+    return sorted(bases) + [0] * (BASE_TABLE_SIZE - len(bases))
 
 
 def write_volume(source: p12.Volume, out: Path, volume_id: bytes, progress=None) -> dict:
@@ -388,7 +389,7 @@ def write_volume(source: p12.Volume, out: Path, volume_id: bytes, progress=None)
     struct.pack_into("<I", header, p12.NGRAM_NVFP4_SCALE_OFFSET, 0)
     struct.pack_into("<H", header, EXT_WIDTH_OFFSET, WIDTH)
     struct.pack_into("<H", header, EXT_SLOT_BYTES_OFFSET, PLANE_BYTES)
-    header[EXT_BASES_OFFSET:EXT_BASES_OFFSET + 4] = bytes(bases)
+    header[EXT_BASES_OFFSET:EXT_BASES_OFFSET + BASE_TABLE_SIZE] = bytes(bases)
     struct.pack_into("<Q", header, EXT_SIDE_OFFSET, side_offset if side_length else 0)
     struct.pack_into("<Q", header, EXT_SIDE_BYTES, side_length)
     struct.pack_into("<Q", header, EXT_SIDE_COUNT, len(side_records))
@@ -460,10 +461,10 @@ def stats(source: p12.Volume, volume: PackedVolume) -> dict:
     for block in range(volume.blocks):
         data = volume.read_block(block)
         directory = int.from_bytes(data[ROWS_PER_BLOCK * PLANE_BYTES:], "little")
-        count = (directory >> (2 * ROWS_PER_BLOCK)) & 7
+        count = (directory >> (BASE_CODE_BITS * ROWS_PER_BLOCK)) & 7
         count = len(volume.side.get(block, [])) if count == SIDE_SENTINEL else count
         histogram[count] = histogram.get(count, 0) + 1
-        codes = {(directory >> (2 * row)) & 3 for row in range(ROWS_PER_BLOCK)}
+        codes = {(directory >> (BASE_CODE_BITS * row)) & (BASE_TABLE_SIZE - 1) for row in range(ROWS_PER_BLOCK)}
         distinct_histogram[len(codes)] = distinct_histogram.get(len(codes), 0) + 1
     return {
         "volume": str(volume.path),
@@ -513,7 +514,7 @@ def main() -> None:
         require_bf16_source(source, "--census")
         result = census(source)
         print(json.dumps(result, indent=2))
-        if not result["base"]["fits_4_entry_table"]:
+        if not result["base"]["fits_8_entry_table"]:
             sys.exit(1)
         return
     if writing:

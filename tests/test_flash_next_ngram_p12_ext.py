@@ -1,6 +1,6 @@
 """tools/flash_next/ngram_p12_ext.py: the BF16 P12 blockdir packer against the BF16 words it packs
 (the oracle: the format is lossless), its base-table and escape gates, the block directory, and the
-side stream a block with more than five escapes uses."""
+side stream a block with more than four escapes uses."""
 
 from __future__ import annotations
 
@@ -19,10 +19,9 @@ def _word(sign: int, exponent: int, mantissa: int) -> int:
     return (sign << 15) | (exponent << 7) | mantissa
 
 
-def _rows(count: int, seed: int) -> np.ndarray:
-    """Rows over four bases, with zeros, subnormals and escapes that stay inside the window."""
+def _rows(count: int, seed: int, bases=(0, 100, 120, 200)) -> np.ndarray:
+    """Rows over the given bases, with zeros, subnormals and escapes that stay inside the window."""
     rng = np.random.default_rng(seed)
-    bases = [0, 100, 120, 200]
     words = np.empty((count, WIDTH), np.uint16)
     for row in range(count):
         base = bases[row % len(bases)]
@@ -79,24 +78,24 @@ def test_round_trip_and_side_stream(tmp_path):
     assert np.array_equal(volume.words(0, len(words)), words)
 
 
-def test_five_escapes_stay_in_the_directory(tmp_path):
-    # Block 0: five rows with one escape each, each delta +20 (inside the 6-bit range): five slots.
-    words = _block_of(ext.ROWS_PER_BLOCK, 100, 115, 5)
+def test_four_escapes_stay_in_the_directory(tmp_path):
+    # Block 0: four rows with one escape each, each delta +15 (inside the 6-bit range): four slots.
+    words = _block_of(ext.ROWS_PER_BLOCK, 100, 115, 4)
     source, volume, geometry = _pack(tmp_path, words)
     assert geometry["side_blocks"] == 0 and geometry["side_bytes"] == 0
     directory = int.from_bytes(volume.read_block(0)[ext.ROWS_PER_BLOCK * ext.PLANE_BYTES:], "little")
-    assert (directory >> (2 * ext.ROWS_PER_BLOCK)) & 7 == 5
+    assert (directory >> (ext.BASE_CODE_BITS * ext.ROWS_PER_BLOCK)) & 7 == 4
     assert ext.verify(source, volume, "all")["row_mismatches"] == 0
 
 
-def test_more_than_five_escapes_use_the_side_stream(tmp_path):
-    # Six rows with one escape each: more than the five slots, so all six go to the side stream.
-    words = _block_of(ext.ROWS_PER_BLOCK, 100, 115, 6)
+def test_five_escapes_use_the_side_stream(tmp_path):
+    # Five rows with one escape each: more than the four slots, so all five go to the side stream.
+    words = _block_of(ext.ROWS_PER_BLOCK, 100, 115, 5)
     source, volume, geometry = _pack(tmp_path, words)
     assert geometry["side_blocks"] == 1 and geometry["side_bytes"] == 4096
-    assert len(volume.side[0]) == 6
+    assert len(volume.side[0]) == 5
     directory = int.from_bytes(volume.read_block(0)[ext.ROWS_PER_BLOCK * ext.PLANE_BYTES:], "little")
-    assert (directory >> (2 * ext.ROWS_PER_BLOCK)) & 7 == ext.SIDE_SENTINEL
+    assert (directory >> (ext.BASE_CODE_BITS * ext.ROWS_PER_BLOCK)) & 7 == ext.SIDE_SENTINEL
     assert ext.verify(source, volume, "all")["row_mismatches"] == 0
 
 
@@ -108,14 +107,27 @@ def test_a_delta_outside_the_slot_range_uses_the_side_stream(tmp_path):
     assert ext.verify(source, volume, "all")["row_mismatches"] == 0
 
 
-def test_more_than_four_bases_are_refused(tmp_path):
+def test_more_than_eight_bases_are_refused(tmp_path):
     words = _rows(ext.ROWS_PER_BLOCK, 6)
-    for row in range(5):  # five distinct bases, one a row
-        words[row] = ([0, 10, 20, 30, 40][row] << 7) | 0x01
+    for row in range(9):  # nine distinct bases, one a row
+        words[row] = ([0, 10, 20, 30, 40, 50, 60, 70, 80][row] << 7) | 0x01
     source_path = tmp_path / "bf16.ngram"
     _write_bf16_volume(source_path, words)
-    with pytest.raises(ValueError, match="more than four distinct row-base"):
+    with pytest.raises(ValueError, match="more than eight distinct row-base"):
         ext.write_volume(p12.Volume(source_path), tmp_path / "blockdir.ngram", bytes(16))
+
+
+def test_seven_bases_encode_and_verify(tmp_path):
+    # The real table measured seven distinct row bases (the zero row makes eight): they must pack and
+    # verify with no refusal, filling the eight-entry table exactly.
+    words = _rows(ext.ROWS_PER_BLOCK * 3, 9, bases=(53, 54, 105, 106, 107, 108, 109))
+    source, volume, geometry = _pack(tmp_path, words)
+    assert geometry["side_blocks"] == 0
+    assert volume.bases == [0, 53, 54, 105, 106, 107, 108, 109]
+    assert ext.verify(source, volume, "all")["row_mismatches"] == 0
+    assert np.array_equal(volume.words(0, len(words)), words)
+    census = ext.census(p12.Volume(source.path))
+    assert census["base"]["global_distinct"] == 8 and census["base"]["fits_8_entry_table"]
 
 
 def test_a_row_over_the_escape_budget_is_refused(tmp_path):
@@ -132,10 +144,10 @@ def test_census_reports_the_base_and_escape_shape(tmp_path):
     source_path = tmp_path / "bf16.ngram"
     _write_bf16_volume(source_path, words)
     result = ext.census(p12.Volume(source_path))
-    assert result["base"]["global_distinct"] <= 4 and result["base"]["fits_4_entry_table"]
+    assert result["base"]["global_distinct"] <= 4 and result["base"]["fits_8_entry_table"]
     assert result["escapes"]["max_per_row"] <= ext.MAX_ESCAPES_PER_ROW
     assert result["escapes"]["max_per_block"] <= ext.MAX_BLOCK_ESCAPES
-    assert result["escapes"]["blocks_over_5"] == 0
+    assert result["escapes"]["blocks_over_4"] == 0
 
 
 def test_volume_id_follows_the_source_and_a_second_pack_is_identical(tmp_path):
