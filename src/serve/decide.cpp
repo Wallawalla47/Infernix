@@ -591,6 +591,18 @@ DecideSchedule decide_schedule(const DecideQuestion& question, const DecideEncod
     if (!decide_generates(question.kind)) {
         throw std::logic_error("only generated decide questions have a schedule");
     }
+    // A generated answer spells one digit a step. A tokenizer that writes a number's digits in
+    // groups (o200k's: "10" and "008" are one token; Inkling 2) never writes a number that way, so
+    // the digits' share of the distribution collapses (a spider's legs read 60 at a mass of 5e-9
+    // on Inkling 2, 2026-11-24) and the answer would be noise: the question is refused instead.
+    if (encode("10").size() == 1) {
+        throw ApiException(ApiError{.status  = 400,
+                                    .message = "question " + question.id + ": this model's tokenizer writes a "
+                                               "number's digits as one token (\"10\" is one token), and a generated "
+                                               "answer spells one digit a step; readout questions (noul, choice, "
+                                               "score) are served",
+                                    .code    = "question_type_unsupported"});
+    }
     DecideSchedule schedule;
     for (int digit = 0; digit < 10; ++digit) {
         schedule.digit_tokens[static_cast<std::size_t>(digit)] =

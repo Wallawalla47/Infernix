@@ -423,6 +423,21 @@ void test_schedules_and_answers() {
           "more digits than the ceiling is its own error");
     check(scalar_answer("{\"value\":12").at("code") == "run_cut_short",
           "an unclosed run that did not spend its schedule is cut short");
+
+    // A tokenizer that writes a number's digits as one token (o200k's groups; Inkling 2) never
+    // writes a number one digit a step: every generated type is refused, before any prefill.
+    const DecideEncoder grouped = [](std::string_view text) {
+        if (text == "10") { return std::vector<infernix::TokenId>{6000}; }
+        return qwen_like(text);
+    };
+    for (const DecideKind kind : {DecideKind::Number, DecideKind::Scalar, DecideKind::Point, DecideKind::Box}) {
+        std::string code;
+        try {
+            (void)decide_schedule(generated(kind, 3), grouped);
+        } catch (const ApiException& error) { code = error.error().code; }
+        check(code == "question_type_unsupported",
+              "a generated question on a tokenizer that groups digits is refused as unsupported");
+    }
 }
 
 } // namespace
