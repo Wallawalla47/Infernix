@@ -388,17 +388,9 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     options.execution.readout_tokens          = request.readout_tokens;
     options.execution.constraint              = request.token_constraint;
-    if (semantics.enable_thinking != false) {
-        options.execution.thinking.budget =
-            request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
-        // The budget as set; GenerationService settles it against the answer room
-        // (settle_thinking_budget) once the prompt length, and so the room the context leaves, is known.
-        // A token constraint owns every output step, so the guard's injected close has no room.
-        if (request.token_constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
-        // A token constraint chooses every output step itself, the end of the turn included.
-        options.execution.thinking.end_turn_in_thinking =
-            server.end_turn_in_thinking || !request.token_constraint.empty();
-    }
+    // The budget as set; GenerationService settles it against the answer room (settle_thinking) once the prompt
+    // length, and so the room the context leaves, is known.
+    if (semantics.enable_thinking != false) { options.execution.thinking = thinking_controls(request, server); }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = !request.constraint && !request.constrains_tools() &&
@@ -457,6 +449,42 @@ std::optional<std::uint32_t> settle_thinking_budget(const ServeOptions& server,
         return room ? std::min(*server.default_thinking_budget, *room) : server.default_thinking_budget;
     }
     return room;
+}
+
+infernix::ThinkingControlOptions thinking_controls(const GenerationRequest& request, const ServeOptions& server) {
+    infernix::ThinkingControlOptions thinking;
+    thinking.budget = request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+    // A token constraint owns every output step, so the guard's injected close has no room.
+    if (request.token_constraint.empty()) { thinking.loop = server.reasoning_loop; }
+    // A token constraint chooses every output step itself, the end of the turn included.
+    thinking.end_turn_in_thinking = server.end_turn_in_thinking || !request.token_constraint.empty();
+    return thinking;
+}
+
+SettledThinking settle_thinking(const GenerationRequest& request, const ServeOptions& server,
+                                const ResolvedPromptSemantics& semantics, const infernix::PromptSummary& prompt,
+                                infernix::ThinkingControlOptions requested, std::uint32_t requested_output_tokens,
+                                std::uint32_t max_context) {
+    SettledThinking out{.enabled = prompt.starts_in_reasoning || prompt.opens_reasoning,
+                        .controls = requested,
+                        .effort   = semantics.reasoning_effort};
+    if (!out.enabled) {
+        out.controls.budget.reset();
+        return out;
+    }
+    if (semantics.enable_thinking == false) {
+        // Thinking off on a model that opens reasoning in its output: its lowest effort (the frontend renders `none`)
+        // may still think, so the turn takes a thinking request's controls. Otherwise nothing changes.
+        if (!prompt.opens_reasoning) { return out; }
+        out.controls = thinking_controls(request, server);
+        if (!out.effort) { out.effort = infernix::ReasoningEffort::None; }
+    }
+    // The answer room follows the limit the request actually has: a prompt that leaves less context than max_tokens
+    // would otherwise think to the end of the context.
+    out.controls.budget = settle_thinking_budget(
+        server, request.thinking_budget,
+        effective_output_limit(requested_output_tokens, max_context, prompt.prompt_tokens));
+    return out;
 }
 
 std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest& req) {

@@ -362,7 +362,10 @@ struct Frontend::Impl {
 
 PromptSummary PreparedPrompt::summary() const {
     if (!data_) { throw std::logic_error("prepared prompt is empty"); }
-    PromptSummary out{.starts_in_reasoning = false, .prompt_tokens = static_cast<std::uint32_t>(data_->token_ids.size())};
+    // The model opens its thinking blocks in its output, at every effort (none included).
+    PromptSummary out{.starts_in_reasoning = false,
+                      .opens_reasoning     = true,
+                      .prompt_tokens       = static_cast<std::uint32_t>(data_->token_ids.size())};
     out.has_media = !data_->images.empty();
     for (const PromptImage& image : data_->images) { out.media.push_back(image.image.source); }
     return out;

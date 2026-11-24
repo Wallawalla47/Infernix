@@ -98,4 +98,23 @@ std::optional<std::uint32_t> settle_thinking_budget(const ServeOptions& server,
                                                     std::optional<std::uint32_t> request_budget,
                                                     std::uint32_t output_limit);
 
+// The thinking controls a thinking request runs with (before its budget is settled): the request's budget or the
+// server's default, the reasoning-loop guard (not under a token constraint) and --end-in-thinking.
+infernix::ThinkingControlOptions thinking_controls(const GenerationRequest& req, const ServeOptions& server);
+
+// What a request's thinking is once its prompt is prepared (GenerationService): `requested` is what
+// to_request_options set. A prompt that cannot think (one that neither starts in reasoning nor lets the model open
+// it, PromptSummary) runs without a budget; a thinking request's budget is settled against its effective output
+// limit (settle_thinking_budget). A model that opens reasoning in its output (Inkling 2) thinks at its lowest effort
+// too, so a request sent with thinking off gets a thinking request's controls and runs at effort `none`.
+struct SettledThinking {
+    bool enabled = false; // the request may think (the request logs' thinking)
+    infernix::ThinkingControlOptions controls;
+    std::optional<infernix::ReasoningEffort> effort; // the effort it runs at, when known
+};
+SettledThinking settle_thinking(const GenerationRequest& req, const ServeOptions& server,
+                                const ResolvedPromptSemantics& semantics, const infernix::PromptSummary& prompt,
+                                infernix::ThinkingControlOptions requested, std::uint32_t requested_output_tokens,
+                                std::uint32_t max_context);
+
 } // namespace infernix::serve

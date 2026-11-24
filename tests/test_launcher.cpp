@@ -545,6 +545,8 @@ void test_option_support() {
     row("--ngram-volume", false, false, false, true, false);
     row("--preserve-thinking", true, true, true, true, false);
     row("--tool-parameter-names", true, true, true, true, false);
+    row("--default-thinking-budget", true, true, true, true, true);
+    row("--thinking-budget-message", true, true, true, true, true);
     row("--context-cost-presets", true, true, true, true, false);
     row("--no-cuda-graph", true, true, true, false, true);
     row("--fast-path", true, true, true, true, false);

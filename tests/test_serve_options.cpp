@@ -1327,6 +1327,53 @@ int main() {
                               settle_thinking_budget(no_room_default, 20000U, 8192) == 20000U &&
                               !settle_thinking_budget(no_room, std::nullopt, 8192),
                           "--no-thinking-answer-room changed a budget");
+        // Once the prompt is prepared (settle_thinking): a Qwen prompt that does not start in reasoning runs without a
+        // budget and one that does settles it, as before; an Inkling 2 prompt opens reasoning in the output, so every
+        // request settles one, thinking off included (it runs at effort none with a thinking request's controls).
+        const infernix::PromptSummary qwen_thinking{.starts_in_reasoning = true, .prompt_tokens = 1000};
+        const infernix::PromptSummary qwen_plain{.prompt_tokens = 1000};
+        const infernix::PromptSummary inkling{.opens_reasoning = true, .prompt_tokens = 1000};
+        const auto settle = [](const GenerationRequest& req, const ServeOptions& server,
+                               const infernix::PromptSummary& prompt) {
+            const auto semantics = resolve_prompt_semantics(req, server);
+            return settle_thinking(req, server, semantics, prompt,
+                                   to_request_options(req, server, semantics, true).execution.thinking,
+                                   static_cast<std::uint32_t>(req.max_tokens), 262144);
+        };
+        GenerationRequest turn;
+        turn.max_tokens = 8192;
+        GenerationRequest off = turn;
+        off.enable_thinking   = false;
+        SettledThinking settled = settle(turn, defaults, qwen_thinking);
+        failures += check(settled.enabled && settled.controls.budget == 6144U,
+                          "a Qwen prompt that starts in reasoning did not get the answer room");
+        settled = settle(turn, large_default, qwen_plain);
+        failures += check(!settled.enabled && !settled.controls.budget,
+                          "a Qwen prompt that cannot think kept a thinking budget");
+        settled = settle(off, defaults, qwen_thinking);
+        failures += check(settled.enabled && !settled.controls.budget && !settled.effort,
+                          "a Qwen request with thinking off took thinking controls");
+        settled = settle(turn, defaults, inkling);
+        failures += check(settled.enabled && settled.controls.budget == 6144U && !settled.effort,
+                          "an Inkling 2 request did not get the answer room");
+        settled = settle(turn, large_default, inkling);
+        failures += check(settled.controls.budget == 6144U, "--default-thinking-budget did not reach Inkling 2");
+        GenerationRequest own = turn;
+        own.thinking_budget   = 1500;
+        settled = settle(own, defaults, inkling);
+        failures += check(settled.controls.budget == 1500U, "an Inkling 2 request's own budget did not stand");
+        settled = settle(off, defaults, inkling);
+        failures += check(settled.enabled && settled.controls.budget == 6144U &&
+                              settled.effort == infernix::ReasoningEffort::None,
+                          "an Inkling 2 request with thinking off (effort none, which still thinks) took no budget");
+        const auto server_off = parse({"infernix-serve", "model.ninfer", "--no-thinking", "--end-in-thinking", "allow",
+                                       "--default-thinking-budget", "2048"});
+        settled = settle(turn, server_off, inkling);
+        failures += check(settled.controls.budget == 2048U && settled.controls.end_turn_in_thinking,
+                          "--no-thinking dropped Inkling 2's --default-thinking-budget or --end-in-thinking allow");
+        settled = settle(turn, server_off, qwen_plain);
+        failures += check(!settled.enabled && !settled.controls.budget,
+                          "--no-thinking gave a Qwen prompt that cannot think a budget");
     }
     request.enable_thinking = false;
     const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);

@@ -127,13 +127,9 @@ void test_refused_options() {
     refused({"--host-context-mib", "4096", "--ram-free-mib", "8192"}, "--ram-free-mib");
     // The server's thinking and tool options.
     refused({"--reasoning-loop", "stop"}, "--reasoning-loop");
-    refused({"--default-thinking-budget", "1024"}, "--default-thinking-budget");
-    refused({"--no-thinking-answer-room"}, "--no-thinking-answer-room");
-    refused({"--thinking-budget-message", "Time to answer."}, "--thinking-budget-message");
     refused({"--preserve-thinking"}, "--preserve-thinking");
     refused({"--tolerant-tool-calls"}, "--tolerant-tool-calls");
     refused({"--tool-parameter-names", "declared"}, "--tool-parameter-names");
-    refused({"--no-thinking", "--end-in-thinking", "allow"}, "--end-in-thinking");
 
     // Engine fields no serve flag sets alone (the API, infernix-certify).
     EngineOptions api;
@@ -190,6 +186,10 @@ void test_accepted_starts() {
     accepted({"--vision-max-merged", "32768"}); // the default, given
     accepted({"--end-in-thinking", "allow"});
     accepted({"--no-thinking"});
+    // The thinking controls apply to every Inkling 2 request (serve::settle_thinking), --no-thinking's included.
+    accepted({"--default-thinking-budget", "1024", "--thinking-budget-message", "Time to answer."});
+    accepted({"--no-thinking-answer-room"});
+    accepted({"--no-thinking", "--end-in-thinking", "allow", "--default-thinking-budget", "2048"});
     accepted({"--reasoning-loop", "off", "--draft-tree-paths", "8", "--ngram-min-match", "12"}); // the defaults, given
 
     // A scoring start with a generation configuration: what it leaves unused is reported, not refused (the launcher's

@@ -91,7 +91,7 @@ See [Sizing a start without loading](serving.md#sizing-a-start-without-loading).
 
 Each of these fails with a clear error instead of running differently, except where the table says
 otherwise. The engine refuses an option before the model loads. The options only `infernix-serve` or `infernix` reads
-(the thinking and tool options, `--expert-state FILE`, `--ram-resize`, `--kv-capacity` without the cache) are refused
+(the tool options, `--reasoning-loop`, `--expert-state FILE`, `--ram-resize`, `--kv-capacity` without the cache) are refused
 once the model has loaded; `--plan` reports them without loading.
 
 | Feature | On Inkling 2 Mini |
@@ -102,9 +102,7 @@ once the model has loaded; `--plan` reports them without loading.
 | A tool declared with `strict: true` | the request is refused, since nothing would check its arguments against the schema. Tools with `strict: false` or no `strict` field work |
 | A request ending in an assistant message (prefill) | the request is refused: only a new assistant turn is rendered |
 | `--reasoning-loop stop` or `conclude` | refused: the model has no reasoning-loop guard |
-| The server's thinking budget: `--default-thinking-budget`, `--no-thinking-answer-room`, `--thinking-budget-message` | refused: `infernix-serve` applies no thinking budget to Inkling yet (its prompts never start in reasoning). A request's own budget (Anthropic `budget_tokens`) is not applied either. The CLI's `--thinking-budget` works |
 | `--preserve-thinking`, `--tolerant-tool-calls`, `--tool-parameter-names declared` | refused: Qwen template and tool-call options. The template renders the history's reasoning as given |
-| `--end-in-thinking allow` with `--no-thinking` | refused: `--no-thinking` selects the lowest effort, which still thinks, and the server applies no thinking controls with thinking off. `allow` alone works |
 | N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens`, `--ngram-min-match`, `--ngram-tree-nodes`, `--ngram-archive-mib`, `--ngram-session-mib`, `--ngram-residency` | refused |
 | The MTP, DFlash and DFlash2 backends | `--spec mtp`, `dflash` and `dflash2` are refused: the model's drafter is DSpark. So are `--draft-model`, `--spec-min-p`, `--draft-tree-nodes` and `--draft-tree-paths` (DSpark verifies a chain) |
 | `--lm-head-draft` when no drafter runs | refused: an artifact without DSpark, `--spec off` or `--lossless` |
@@ -229,14 +227,19 @@ over HTTP) to a level; without one it uses 0.9.
 
 - `--no-thinking` selects level 0, the template's lowest. **It does not turn reasoning off**, as
   Thinking Machines' card also says.
-- `--thinking-budget` (CLI) caps the thinking tokens of the whole turn. Inkling 2 may think in several
-  blocks; they count together, and once the budget is used up (the control closes the block, or a block
-  ends at the budget) the model cannot open another thinking block in that turn. `infernix-serve` does not
-  apply thinking budgets to this model yet: it refuses `--default-thinking-budget` and ignores a request's
-  `budget_tokens`.
+- A thinking budget caps the thinking tokens of the whole turn: `--thinking-budget` (CLI), and in
+  `infernix-serve` a request's own budget (Anthropic `budget_tokens`, the Chat Completions budget fields) or
+  `--default-thinking-budget`. Inkling 2 may think in several blocks; they count together, and once the
+  budget is used up (the control closes the block, or a block ends at the budget) the model cannot open
+  another thinking block in that turn. The control is `--thinking-budget-message` (if set) and
+  `<|end_message|>`.
+- `infernix-serve` also keeps the answer room (as on every model): from an output limit of 1,024 tokens,
+  thinking closes early enough to leave a quarter of the limit for the answer (`--no-thinking-answer-room`
+  turns this off). Because the lowest effort still thinks, the budget, the answer room and
+  `--end-in-thinking` apply to every request, including those sent with thinking off.
 - The checkpoint's card warns that the model can get stuck in long reasoning loops. Infernix's
-  `--reasoning-loop` guard is not available here, so set an output limit for agent work (and with the CLI a
-  thinking budget).
+  `--reasoning-loop` guard is not available here, so set an output limit and a thinking budget for agent
+  work.
 - Tool calls work through the OpenAI and Anthropic APIs. `--preserve-thinking` and
   `--tolerant-tool-calls` are Qwen options and are refused.
 

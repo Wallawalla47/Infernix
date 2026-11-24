@@ -408,7 +408,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             whichever is less)\n"
            "  --thinking-budget-message S  message fed to the model when it hits its thinking\n"
            "                             budget, replacing the built-in end-of-thinking notice\n"
-           "                             (wrap the message in double quotes, e.g.\n"
+           "                             (Inkling 2: the message, then the <|end_message|>\n"
+           "                             that alone closes the block without it; wrap the\n"
+           "                             message in double quotes, e.g.\n"
            "                             --thinking-budget-message \"Time to stop thinking. I must "
            "act\n"
            "                             now:\")\n"
@@ -774,8 +776,10 @@ std::string serve_usage_text(const char* argv0) {
            "  Qwen3.5 applies --vram-headroom-mib only with --kv-capacity auto (the\n"
            "  default with the new prefix caching system).\n"
            "  Inkling 2 refuses each option it has nothing to apply to, the other models'\n"
-           "  expert, kernel, drafting and thinking-budget options among them\n"
-           "  (docs/inkling2-mini.md, \"Not supported yet\").\n"
+           "  expert, kernel and drafting options among them (docs/inkling2-mini.md,\n"
+           "  \"Not supported yet\"). Its thinking budgets, the answer room and the\n"
+           "  end-in-thinking mode apply to every request, also with --no-thinking: its\n"
+           "  lowest effort still thinks.\n"
            "  Options of the two prefix caching systems cannot be mixed.\n"
            "  --vision-offload on requires --vision.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
@@ -804,22 +808,12 @@ void refuse_unsupported_options(const ServeOptions& options, std::string_view ar
            "(--max-context) and nothing else");
     refuse(options.reasoning_loop != infernix::ReasoningLoopAction::Off, "--reasoning-loop",
            "stop and conclude: Inkling 2 has no reasoning-loop guard (use off)");
-    // Inkling 2's prompts never start in reasoning (its thinking opens in the output), and the server applies a
-    // thinking budget only to a prompt that does (GenerationService): these would have nothing to act on.
-    constexpr const char* kNoBudget = "sets the server's thinking budget, which infernix-serve does not apply to "
-                                      "Inkling 2 yet (its prompts never start in reasoning)";
-    refuse(options.default_thinking_budget.has_value(), "--default-thinking-budget", kNoBudget);
-    refuse(!options.thinking_answer_room, "--no-thinking-answer-room", kNoBudget);
-    refuse(!options.thinking_budget_message.empty(), "--thinking-budget-message", kNoBudget);
     refuse(options.preserve_thinking.has_value(), "--preserve-thinking",
            "is a Qwen chat template option; Inkling 2's template renders the history's reasoning as given");
     refuse(options.tolerant_tool_calls, "--tolerant-tool-calls",
            "recovers malformed Qwen tool calls; Inkling 2's tool-call parser has no tolerant mode");
     refuse(options.tool_parameter_names == ToolParameterNames::Declared, "--tool-parameter-names declared",
            "limits the constrained tool route; Inkling 2 parses tool calls unconstrained");
-    refuse(options.end_turn_in_thinking && options.enable_thinking == false, "--end-in-thinking allow",
-           "with --no-thinking: Inkling 2 still thinks (at effort none), and the server applies no thinking controls "
-           "to a request with thinking off");
 }
 
 const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {

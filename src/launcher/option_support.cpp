@@ -70,16 +70,13 @@ constexpr std::array kRules = {
     Rule{"--ngram-native-sessions", kQwen35},
     Rule{"--ngram-volume", kFlash},
     Rule{"--ngram-residency", kFlash},
-    // Thinking and tools: Inkling's template has an effort instead, a prompt never starts in reasoning (so infernix-serve
-    // applies no thinking budget), its output session has no loop guard or tolerant tool-call parsing, and it has no
-    // constrained tool route (infernix-serve refuses each: serve::refuse_unsupported_options).
+    // Thinking and tools: Inkling's template has an effort instead of preserve_thinking, its output session has no loop
+    // guard or tolerant tool-call parsing, and it has no constrained tool route (infernix-serve refuses each:
+    // serve::refuse_unsupported_options). Its thinking budgets work as every model's.
     Rule{"--preserve-thinking", kQwen},
     Rule{"--tolerant-tool-calls", kQwen},
     Rule{"--tool-parameter-names", kQwen},
     Rule{"--reasoning-loop", kQwen},
-    Rule{"--default-thinking-budget", kQwen},
-    Rule{"--no-thinking-answer-room", kQwen},
-    Rule{"--thinking-budget-message", kQwen},
     // Vision's media pipeline (the Qwen frontends'; with `needs_vision` below).
     Rule{"--media-cache-mib", kQwen},
     Rule{"--media-live-mib", kQwen},

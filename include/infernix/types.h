@@ -1543,6 +1543,11 @@ struct VisionImageBudget {
 
 struct PromptSummary {
     bool starts_in_reasoning    = false;
+    // The model may open reasoning in its output although the prompt does not start in it, whatever the request's
+    // thinking options (Inkling 2: its thinking blocks open mid-turn, and its lowest effort still thinks), so the
+    // turn's thinking controls (ThinkingControlOptions) apply to every request. False for the Qwen families, whose
+    // prompts start in reasoning exactly when they think.
+    bool opens_reasoning        = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
     // One entry per media item, in prompt order.
