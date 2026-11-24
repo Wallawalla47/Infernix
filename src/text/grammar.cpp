@@ -127,8 +127,26 @@ std::string framing_key(const ReasoningFraming& framing) {
            (framing.withheld_token ? std::to_string(*framing.withheld_token) : "-");
 }
 
+// A request's GBNF free text (ExcludeToken) beside a model's reserved protocol tokens: it excludes
+// them as well, so the content never writes the model's framing.
+class ReservedExclusion final : public xgrammar::GrammarMutator {
+public:
+    explicit ReservedExclusion(const std::vector<std::int32_t>& reserved) : reserved_(reserved) {}
+
+private:
+    int32_t VisitExcludeToken(const GrammarExpr& expression) final {
+        std::vector<int32_t> ids(expression.begin(), expression.end());
+        for (const std::int32_t id : reserved_) {
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) { ids.push_back(id); }
+        }
+        return builder_->AddExcludeTokenSet(ids);
+    }
+
+    const std::vector<std::int32_t>& reserved_;
+};
+
 void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& vocab,
-              const std::vector<std::int32_t>& eos) {
+              const std::vector<std::int32_t>& eos, const std::vector<std::int32_t>& reserved) {
     for (int i = 0; i < grammar->NumRules(); ++i) {
         const auto& rule = grammar->GetRule(i);
         if (rule.max_tokens >= 0 || rule.max_chars >= 0 || !rule.capture_name.empty() ||
@@ -147,7 +165,8 @@ void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& 
         if (expression.type == Type::kToken || expression.type == Type::kExcludeToken) {
             for (int id : expression) {
                 if (id < 0 || static_cast<std::size_t>(id) >= vocab.size() || vocab[id].empty() ||
-                    std::find(eos.begin(), eos.end(), id) != eos.end()) {
+                    std::find(eos.begin(), eos.end(), id) != eos.end() ||
+                    std::find(reserved.begin(), reserved.end(), id) != reserved.end()) {
                     throw std::invalid_argument(
                         "GBNF token references must name ordinary vocabulary tokens");
                 }
@@ -202,9 +221,10 @@ public:
     // The workers deferred compiles run on: the vendored compiler admits two cold compiles at once.
     static constexpr std::size_t kWorkers = 2;
 
-    Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes)
+    Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes,
+         std::vector<std::int32_t> reserved_)
         : vocab(std::make_shared<const std::vector<std::string>>(std::move(vocab_))),
-          eos(std::move(eos_)), tag_ends(tokens_containing(*vocab, '>')),
+          eos(std::move(eos_)), reserved(std::move(reserved_)), tag_ends(tokens_containing(*vocab, '>')),
           tokenizer(*vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab->size()), eos),
           compiler(tokenizer, grammar_compile_threads(), true, static_cast<std::int64_t>(bytes)) {}
 
@@ -255,6 +275,7 @@ public:
 
     std::shared_ptr<const std::vector<std::string>> vocab;
     std::vector<std::int32_t> eos;
+    std::vector<std::int32_t> reserved;
     std::shared_ptr<const std::vector<std::int32_t>> tag_ends;
     xgrammar::TokenizerInfo tokenizer;
     xgrammar::GrammarCompiler compiler;
@@ -353,8 +374,14 @@ public:
 };
 
 GrammarCompiler::GrammarCompiler(std::vector<std::string> vocab, std::vector<std::int32_t> eos,
-                                 std::size_t bytes)
-    : impl_(std::make_unique<Impl>(std::move(vocab), std::move(eos), bytes)) {}
+                                 std::size_t bytes, std::vector<std::int32_t> reserved)
+    : impl_(std::make_unique<Impl>(std::move(vocab), std::move(eos), bytes, std::move(reserved))) {
+    for (const std::int32_t id : impl_->reserved) {
+        if (id < 0 || static_cast<std::size_t>(id) >= impl_->vocab->size() || (*impl_->vocab)[id].empty()) {
+            throw std::invalid_argument("a reserved grammar token needs a spelling in the vocabulary");
+        }
+    }
+}
 
 GrammarCompiler::~GrammarCompiler() = default;
 
@@ -405,6 +432,27 @@ std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint&
                                                          const ReasoningFraming& reasoning,
                                                          std::string_view continuation,
                                                          Compile mode) {
+    if (!reasoning.close_token) { return compile_content(constraint, framing_key(reasoning), {}, continuation, mode); }
+    return compile_content(
+        constraint, framing_key(reasoning),
+        [&](const xgrammar::Grammar& content) {
+            return xgrammar::Grammar::Concat({reasoning_prefix(reasoning), content});
+        },
+        continuation, mode);
+}
+
+std::unique_ptr<GrammarSession> GrammarCompiler::compile_framed(const OutputConstraint& constraint,
+                                                                const ContentFraming& framing,
+                                                                Compile mode) {
+    if (!framing.wrap) { throw std::invalid_argument("a content framing needs its wrap"); }
+    // "framed:" keeps these keys apart from the reasoning framings' ("-:" or a close token's id).
+    return compile_content(constraint, "framed:" + std::string(framing.key) + ":", framing.wrap, {}, mode);
+}
+
+std::unique_ptr<GrammarSession>
+GrammarCompiler::compile_content(const OutputConstraint& constraint, std::string_view framing,
+                                 const std::function<xgrammar::Grammar(const xgrammar::Grammar&)>& frame,
+                                 std::string_view continuation, Compile mode) {
     const auto error_kind = constraint_error_kind(constraint.kind);
     try {
         auto choices = constraint.choices;
@@ -417,13 +465,14 @@ std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint&
             throw std::invalid_argument("literal alternatives require a choice constraint");
         }
         std::string key = std::to_string(static_cast<int>(constraint.kind)) + ":" +
-                          framing_key(reasoning) + constraint.source;
+                          std::string(framing) + constraint.source;
         for (const auto& value : choices) key += std::to_string(value.size()) + ":" + value;
         const auto build = [&] {
             auto grammar = [&]() -> xgrammar::Grammar {
                 if (constraint.kind == OutputConstraintKind::Grammar) {
                     auto parsed = xgrammar::Grammar::FromEBNF(constraint.source, "root");
-                    validate(parsed, *impl_->vocab, impl_->eos);
+                    validate(parsed, *impl_->vocab, impl_->eos, impl_->reserved);
+                    if (!impl_->reserved.empty()) { parsed = ReservedExclusion(impl_->reserved).Apply(parsed); }
                     return parsed;
                 } else if (constraint.kind == OutputConstraintKind::Choice) {
                     return choice_grammar(choices);
@@ -436,9 +485,7 @@ std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint&
                     return build_json_grammar(constraint);
                 }
             }();
-            if (reasoning.close_token)
-                grammar = xgrammar::Grammar::Concat({reasoning_prefix(reasoning), grammar});
-            return grammar;
+            return frame ? frame(grammar) : grammar;
         };
         const int vocabulary = static_cast<int>(impl_->vocab->size());
         if (mode == Compile::Deferred && continuation.empty() &&

@@ -33,6 +33,14 @@ struct ReasoningFraming {
     std::optional<std::int32_t> withheld_token;
 };
 
+// A model's turn around a content constraint when its framing is a token-level grammar (Inkling 2's blocks):
+// `wrap` receives the constraint's grammar and returns the whole turn's; `key` identifies the wrap in the compile
+// cache (the same key must always wrap the same way).
+struct ContentFraming {
+    std::string_view key;
+    std::function<xgrammar::Grammar(const xgrammar::Grammar&)> wrap;
+};
+
 // A request's companion to its grammar for rules the context-free grammar cannot express (Qwen
 // tool calls: a parameter name used once per call; a call token quoted in Markdown code is text).
 // It reads the tokens the matcher accepts and refuses tokens from its own state; the session keeps
@@ -97,8 +105,12 @@ public:
     enum class Compile : std::uint8_t { Now, Deferred };
 
     // Empty entries explicitly identify forbidden/special IDs. EOS is supplied separately.
+    // `reserved`: a model's protocol tokens that its own grammars name with Token() (each spelled
+    // with bytes no byte-level rule can match, as Inkling 2's markers are). A request's GBNF may not
+    // name them, and its ExcludeToken free text excludes them too, so a content constraint never
+    // writes the model's framing.
     GrammarCompiler(std::vector<std::string> vocabulary, std::vector<std::int32_t> eos,
-                    std::size_t cache_bytes);
+                    std::size_t cache_bytes, std::vector<std::int32_t> reserved = {});
     // Joins the workers after their running compiles; a queued compile fails its session.
     ~GrammarCompiler();
     // `continuation` is an assistant prefix the matcher accepts as bytes.
@@ -106,6 +118,10 @@ public:
                                                           const ReasoningFraming& reasoning,
                                                           std::string_view continuation,
                                                           Compile mode = Compile::Now);
+    // The constraint inside a model's token-level framing (no continuation).
+    [[nodiscard]] std::unique_ptr<GrammarSession> compile_framed(const OutputConstraint& constraint,
+                                                                 const ContentFraming& framing,
+                                                                 Compile mode = Compile::Now);
     // Model-owned composition, built only on a miss in the same bounded compiler cache. A model
     // grammar may hold token-level terminals, so its continuation is accepted as tokens, by the
     // companion (if any) as well.
@@ -120,6 +136,13 @@ public:
     [[nodiscard]] const std::shared_ptr<const std::vector<std::int32_t>>& tag_end_tokens() const noexcept;
 
 private:
+    // Both compile() forms: the constraint's grammar, `frame` applied to it (none: as is), cached
+    // under the constraint and `framing_key`.
+    [[nodiscard]] std::unique_ptr<GrammarSession>
+    compile_content(const OutputConstraint& constraint, std::string_view framing_key,
+                    const std::function<xgrammar::Grammar(const xgrammar::Grammar&)>& frame,
+                    std::string_view continuation, Compile mode);
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
