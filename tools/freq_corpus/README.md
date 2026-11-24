@@ -30,6 +30,11 @@ infernix_token_ranking MODEL.infernix --corpus CORPUS_DIR/train.jsonl --output O
 token on the GPU, and writes `PREFIX.counts.i64` (int64 LE; row 0 the totals, rows 1 to 5 the strata) and
 `PREFIX.manifest.json`. It saves every five minutes and resumes from `PREFIX.state.json` when run again.
 
+Where a chat template writes the reasoning block only on the last assistant turn (Qwen3.6's), the tool counts only the
+turns that open with it. The earlier turns are history in a form the model never writes, and its top token there is
+mostly the end of the turn. On six test conversations this took the Qwen3.6 35B's agreement with the text from 30 % to
+77 %, and left the counts of the Qwen3.8 27B, Flash-Next and Inkling 2 unchanged.
+
 ## 3. Build the rank order
 
 ```powershell

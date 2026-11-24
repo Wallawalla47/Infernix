@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -33,7 +34,7 @@ namespace fs = std::filesystem;
 constexpr std::array<std::string_view, 5> kStrata{"en_chat", "zh_chat", "other_chat", "code", "math"};
 
 struct Options {
-    fs::path artifact, corpus, output;
+    fs::path artifact, corpus, output, ngram_volume;
     std::int32_t vocab   = 0;
     std::uint32_t context = 4096;
 };
@@ -60,6 +61,8 @@ Options parse(int argc, char** argv) {
             out.vocab = std::stoi(value);
         } else if (key == "--context") {
             out.context = static_cast<std::uint32_t>(std::stoul(value));
+        } else if (key == "--ngram-volume") {
+            out.ngram_volume = value; // Qwen3.8-Flash-Next
         } else {
             throw std::invalid_argument("unknown option " + std::string(key));
         }
@@ -80,6 +83,29 @@ int stratum_of(const std::string& name) {
     const auto it = std::find(kStrata.begin(), kStrata.end(), name);
     if (it == kStrata.end()) { throw std::runtime_error("unknown stratum " + name); }
     return static_cast<int>(it - kStrata.begin());
+}
+
+// Some chat templates write the reasoning block only on the last assistant turn (Qwen3.6's). The earlier turns are then
+// history in a form the model never writes, and its top token there is mostly the end of the turn, so they are not
+// counted. A template that opens every assistant turn the same way keeps them all.
+void keep_turns_in_model_form(const infernix::Engine& engine, infernix::ChatTokens& chat) {
+    const std::size_t n = chat.ids.size();
+    const auto opens_turn = [&](std::size_t i) { return chat.generated[i] != 0 && (i == 0 || chat.generated[i - 1] == 0); };
+    const auto reasons    = [&](std::size_t i) { return engine.detokenize(std::span(&chat.ids[i], 1)) == "<think>"; };
+    bool any_reasoning    = false;
+    for (std::size_t i = 0; i < n && !any_reasoning; ++i) { any_reasoning = opens_turn(i) && reasons(i); }
+    if (!any_reasoning) { return; }
+    for (std::size_t i = 0; i < n;) {
+        if (!opens_turn(i)) {
+            ++i;
+            continue;
+        }
+        std::size_t end = i;
+        while (end < n && chat.generated[end] != 0) { ++end; }
+        if (!reasons(i)) { std::fill(chat.generated.begin() + static_cast<std::ptrdiff_t>(i),
+                                     chat.generated.begin() + static_cast<std::ptrdiff_t>(end), std::uint8_t{0}); }
+        i = end;
+    }
 }
 
 infernix::PromptInput prompt_of(const json& record) {
@@ -151,6 +177,7 @@ int run(const Options& o) {
     engine_options.purpose       = infernix::EnginePurpose::CausalScoring;
     engine_options.max_context   = o.context;
     engine_options.prefill_chunk = o.context / 128 * 128;
+    if (!o.ngram_volume.empty()) { engine_options.ngram_volume_path = o.ngram_volume; }
     infernix::Engine engine(std::move(engine_options));
 
     const std::size_t rows = kStrata.size() + 1, vocab = static_cast<std::size_t>(o.vocab);
@@ -183,6 +210,7 @@ int run(const Options& o) {
             ++p.skipped;
             continue;
         }
+        keep_turns_in_model_form(engine, chat);
         ++p.used;
         p.truncated += n > o.context ? 1U : 0U;
         // Each assistant position is scored once, with up to `context` tokens and at least half of them as history.
