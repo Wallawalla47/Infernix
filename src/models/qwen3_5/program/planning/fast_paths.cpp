@@ -20,7 +20,7 @@ struct Qualification {
 };
 
 // The gate/up formats the rows below were measured on: the NVFP4 27Bs' and the groupwise Q4 27B's (the 35B-A3B
-// and the offloaded 122Bs have no dense MLP: GateUpFormat::Other).
+// and the offloaded 122Bs have no dense MLP: GateUpFormat::NoDenseMlp, a row's default).
 constexpr GateUpFormat kNvfp4 = GateUpFormat::Nvfp4;
 constexpr GateUpFormat kQ4    = GateUpFormat::GroupwiseQ4;
 
@@ -332,45 +332,45 @@ constexpr std::array kQualified{
     // by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate): Ornith-1.5-122B MTP
     // decode +2.0 % (ABBA, RTX 5090, 2026-10-28, 4 of 4 pairs, worst +1.69 %). Only the experts' wide calls change,
     // so every KV format.
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::Other, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::Other, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
-    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::ExpertA4Residual, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::NoDenseMlp, true}},
     // free-cache-resume on the Qwen3.5-122B-A10B by the same rule: infernix-serve, Ornith-1.5-122B, INT8 KV, a
     // 15,027-token first turn and a short continuing one (2026-11-03, two servers an arm, ABBA): continuing-turn TTFT
     // 1.69 / 1.65 / 1.69 / 1.65 s (the 16,384-token grid holds no point below the first turn: 0 % reused) -> 0.44 /
     // 0.35 / 0.44 / 0.37 s (99.1 % reused). Where a cache resumes does not depend on the KV format, so every format.
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::Other, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::Other, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
-    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::FreeCacheResume, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::NoDenseMlp, true}},
     // preemption by the same rule: infernix-serve, Ornith-1.5-122B, INT8 KV, a 16,640-token pool, four concurrent
     // 3,027-token prompts reserving 4,096 output tokens and answering in 98-152 (2026-11-03, two servers an arm,
     // ABBA, the same replies): wall 9.25 / 9.28 s -> 8.88 / 8.95 s (+3.8 % aggregate), the third and fourth
     // requests' TTFT 5.4 / 7.0 s -> 3.1 / 4.2 s (held extents let two in at once). Where a request is admitted does
     // not depend on the KV format, so every format.
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::Other, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::Other, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
-    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::BFloat16, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8E4M3Row256, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::Preemption, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::NoDenseMlp, true}},
     // prompt-pv8 at the 122B's GQA group of 16, by the same rule: Ornith-1.5-122B, pp65536 from one expert state, two
     // rotated runs a format, every run ahead (2026-11-03): INT8 KV 6,588.0 -> 6,678.0 tok/s (+1.37 %), NVFP4 6,810.4
     // -> 6,971.6 (+2.37 %), K8V4 6,750.3 -> 6,934.2 (+2.73 %), VQ2 6,406.4 -> 6,448.7 (+0.66 %), K4V2 6,365.7 ->
     // 6,421.6 (+0.88 %); runs of one arm within 0.1 %. gdn-f16-accumulate was level there (+0.01 %): not registered.
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::Other, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::Other, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::Other, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::Other, true}},
-    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::Other, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Int8Group64, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Nvfp4Group16, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Fp8KeyNvfp4Value, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Vq2, GateUpFormat::NoDenseMlp, true}},
+    Qualification{FastPath::PromptPv8, {32, ActivationClass::A8, KvCacheStorage::Q4KeyVq2Value, GateUpFormat::NoDenseMlp, true}},
     // NVIDIA's NVFP4 Qwen3.8-27B artifacts under --a16-activations (24 heads, 16-bit activations, NVFP4 gate/up: a
     // 16-bit 27B of another gate/up format, such as the Q6 gate/up recipe or a Q8_0 GGUF import, is not this
     // configuration and none of these was measured on one), by the owner's rule of 2026-11-19 (a fast path enabled
@@ -514,11 +514,10 @@ constexpr std::array kQualified{
     // faster: +8.5 %; model-quality.md 6.7 holds the timing and that its distribution test is still to run).
     Qualification{FastPath::GumbelSampling, {24, ActivationClass::A4, KvCacheStorage::Int8Group64, kNvfp4}},
 };
-// Every resident 24-head row names the gate/up format it was measured on: an unkeyed row would match a 27B of a
-// format nobody measured (Qwen3.5's 24-head models are the dense 27Bs).
+// Every row names the gate/up format it was measured on, or that its model has no dense MLP: a row keyed Other would
+// match a dense model of a format nobody measured (a 27B, or a 16-head dense Qwen3.5 beside the 35B-A3B's rows).
 static_assert(std::none_of(kQualified.begin(), kQualified.end(), [](const Qualification& entry) {
-    return entry.configuration.query_heads == 24 && !entry.configuration.offloaded_experts &&
-           entry.configuration.gate_up == GateUpFormat::Other;
+    return entry.configuration.gate_up == GateUpFormat::Other;
 }));
 
 // The NVFP4 Qwen3.8-27B artifacts (24 heads, NVFP4 gate/up), whatever activation precision a flag gives them
@@ -605,9 +604,10 @@ FastPathConfiguration fast_path_configuration(std::span<const BoundWeight> bound
     };
     // A text layer whose dense MLP gate and up are both in the format decides it (orcarouter's NVFP4 27B keeps FP8 in
     // its last eight MLPs).
-    bool q4_gate_up = false, nvfp4_gate_up = false;
+    bool q4_gate_up = false, nvfp4_gate_up = false, dense_mlp = false;
     for (const BlockWeights& layer : text.layers) {
         if (const auto* dense = std::get_if<DenseWeights>(&layer.ffn)) {
+            dense_mlp     = true;
             q4_gate_up    = q4_gate_up || (stored_as(dense->gate, groupwise_q4) && stored_as(dense->up, groupwise_q4));
             nvfp4_gate_up = nvfp4_gate_up || (stored_as(dense->gate, nvfp4) && stored_as(dense->up, nvfp4));
         }
@@ -617,7 +617,8 @@ FastPathConfiguration fast_path_configuration(std::span<const BoundWeight> bound
             // Packed BF16 KV gives attention bf16's K and V bits: it is qualified as bf16.
             .kv                = options.kv_cache == KvCacheStorage::Bf16Packed ? KvCacheStorage::BFloat16
                                                                                  : options.kv_cache,
-            .gate_up           = q4_gate_up      ? GateUpFormat::GroupwiseQ4
+            .gate_up           = !dense_mlp      ? GateUpFormat::NoDenseMlp
+                                 : q4_gate_up    ? GateUpFormat::GroupwiseQ4
                                  : nvfp4_gate_up ? GateUpFormat::Nvfp4
                                                  : GateUpFormat::Other,
             .offloaded_experts = offloaded_experts};

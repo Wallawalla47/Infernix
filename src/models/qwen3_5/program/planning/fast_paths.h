@@ -20,7 +20,9 @@ enum class ActivationClass : std::uint8_t { A4, A8, A16 };
 // other projections may be FP8). Other: anything else (a Q6 or Q8 gate/up recipe, a Q8_0 GGUF import) and the
 // MoE models, which have no dense MLP. A layer decides it when both its gate and up are in the format; groupwise
 // Q4 first.
-enum class GateUpFormat : std::uint8_t { Other, GroupwiseQ4, Nvfp4 };
+// NoDenseMlp: no text layer has a dense MLP (the MoE 35B-A3B and the offloaded 122Bs); Other: a dense MLP whose
+// gate/up is neither RowSplit Q4_G64 nor NVFP4, which no row is measured on.
+enum class GateUpFormat : std::uint8_t { Other, GroupwiseQ4, Nvfp4, NoDenseMlp };
 
 // What a fast path is qualified by: the precision that sets the default route's noise floor
 // (activations and KV format), the attention geometry the kernels run in, and the text MLP's gate/up
@@ -30,7 +32,7 @@ struct FastPathConfiguration {
     std::uint32_t query_heads   = 0;
     ActivationClass activations = ActivationClass::A16;
     KvCacheStorage kv           = KvCacheStorage::BFloat16;
-    GateUpFormat gate_up        = GateUpFormat::Other;
+    GateUpFormat gate_up        = GateUpFormat::NoDenseMlp;
     // Routed experts held outside device memory (Qwen3.5-122B-A10B): a verified draft column brings
     // its own expert misses, which prices speculation differently.
     bool offloaded_experts = false;
