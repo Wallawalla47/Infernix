@@ -162,8 +162,8 @@ __device__ __forceinline__ void kv_prefetch(const AttentionArgs& a, const Column
 // FP16. Stores the cache row and (writes_ring) the raw input's ring row; returns the stored words (BF16 K or FP16 V
 // bits).
 // Quantized: the kernel instance for a quantized full pool (KvCodec other than Bf16); the BF16 instance carries no
-// codec code.
-template <bool Quantized>
+// codec code. Rotated: the quantized instance of a vq2 / k4v2 pool (the others carry no code for them).
+template <bool Quantized, bool Rotated = true>
 __device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& col, int kv, int which, int lane,
                                         const float (&w)[4][4], const uint2 (&hist)[3]) {
     const int ch = kv * kD + 4 * lane;
@@ -245,7 +245,7 @@ __device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& co
                 // words returned for the tile.
                 const std::size_t row = kv_row(a.kv, col.lane, kv, col.pos);
                 bool unpackable       = false;
-                const uint2 words     = detail::kv_encode(form, held, bits, lane, detail::row_codes(a.kv, which, form, row),
+                const uint2 words     = detail::kv_encode<Rotated>(form, held, bits, lane, detail::row_codes(a.kv, which, form, row),
                                                           detail::row_side(a.kv, which, form, row), which == 1, unpackable);
                 if (unpackable && lane == 0 && a.kv.unpackable != nullptr) {
                     atomicMin(a.kv.unpackable + col.lane, static_cast<unsigned>(col.pos));
@@ -302,8 +302,8 @@ __device__ __forceinline__ void qr_scales(const AttentionArgs& a, int head, int 
 }
 
 // A CTA per (column, KV head): warps 0 and 1 its new K and V rows, warps 2-4 its 3 query heads' q and r into the
-// workspace. Padding columns write zero outputs and nothing else.
-template <bool Quantized>
+// workspace. Padding columns write zero outputs and nothing else. Rotated: as new_kv's.
+template <bool Quantized, bool Rotated>
 __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const AttentionArgs a) {
     const int t = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y);
     const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31U);
@@ -339,12 +339,12 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
     }
     if (warp < 2) {
         if (!early) { kv_history(a, col, kv, warp, lane, hist); }
-        (void)new_kv<Quantized>(a, col, kv, warp, lane, w, hist);
+        (void)new_kv<Quantized, Rotated>(a, col, kv, warp, lane, w, hist);
         return;
     }
     uint2 q;
     std::uint16_t r;
-    new_qr<Quantized>(a, col, head, lane, scale, rscale, q, r);
+    new_qr<Quantized && Rotated>(a, col, head, lane, scale, rscale, q, r);
     *reinterpret_cast<uint2*>(a.ws.q + (static_cast<std::size_t>(t) * kHeads + head) * kD + 4 * lane) = q;
     if (lane < kRelDim) { a.ws.r[(static_cast<std::size_t>(t) * kHeads + head) * kRelDim + lane] = r; }
 }
@@ -405,7 +405,7 @@ __device__ __forceinline__ RowUnits row_units(bool full, int pos, int first) {
 }
 __device__ __forceinline__ int full_split_units(int n) { return (n + kFullSplits - 1) / kFullSplits; }
 
-template <bool Quantized>
+template <bool Quantized, bool Rotated>
 __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __shared__ int range[2];
@@ -461,7 +461,8 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
         if constexpr (Quantized) {
             if (full) {
                 // A quantized pool's rows decoded into the tile's represented words (synchronously).
-                detail::decode_unit(a.kv, page, s.k, s.v, [](int row, int d) { return row * kRowStride + d; }, tid, kThreads);
+                detail::decode_unit<Rotated>(a.kv, page, s.k, s.v, [](int row, int d) { return row * kRowStride + d; }, tid,
+                                             kThreads);
                 return;
             }
         }
@@ -496,7 +497,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
             qr_scales(a, head, wl, scale, rscale);
             uint2 q;
             std::uint16_t r;
-            new_qr<Quantized>(a, column_of(a.map, t), head, wl, scale, rscale, q, r);
+            new_qr<Quantized && Rotated>(a, column_of(a.map, t), head, wl, scale, rscale, q, r);
             *reinterpret_cast<uint2*>(s.q + row * kRowStride + 4 * wl) = q;
             if (wl < kRelDim) { s.r[row * kRelDim + wl] = bf16f(r); }
             if (split == 0) { // the workspace's q and r too, as the prologue kernel leaves them
@@ -541,7 +542,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
                 const Column col = column_of(a.map, t);
                 uint2 hist[3];
                 kv_history(a, col, kv, which, wl, hist);
-                const uint2 v = new_kv<Quantized>(a, col, kv, which, wl, w, hist);
+                const uint2 v = new_kv<Quantized, Rotated>(a, col, kv, which, wl, w, hist);
                 *reinterpret_cast<uint2*>((which == 0 ? s.k : s.v) + (pos - b * kKeyUnit) * kRowStride + 4 * wl) = v;
             }
             __syncthreads();
@@ -724,7 +725,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
             o4[2]          = canon::fma_rn(v.z, cs, o4[2]);
             o4[3]          = canon::fma_rn(v.w, cs, o4[3]);
         }
-        if constexpr (Quantized) {
+        if constexpr (Quantized && Rotated) {
             if (detail::rotated_pool(a)) { detail::kv_hadamard128(o4, wl, 0x1p-4F); } // back from the rotated domain
         }
         const float sink = bf16f(a.in.sink[static_cast<std::size_t>(t) * kHeads + head]);
@@ -829,8 +830,9 @@ void detail::check_attention_args(const AttentionArgs& a) {
 
 void detail::launch_attention_prologue(const AttentionArgs& a, cudaStream_t stream) {
     const pdl::LaunchConfig config{dim3(static_cast<unsigned>(a.columns), kKvHeads), dim3(kPrologueThreads), 0, stream};
-    CUDA_CHECK(quantized_pool(a) ? pdl::launch_consumer(config, prologue_kernel<true>, a)
-                                 : pdl::launch_consumer(config, prologue_kernel<false>, a));
+    CUDA_CHECK(!quantized_pool(a) ? pdl::launch_consumer(config, prologue_kernel<false, false>, a)
+               : rotated_pool(a)  ? pdl::launch_consumer(config, prologue_kernel<true, true>, a)
+                                  : pdl::launch_consumer(config, prologue_kernel<true, false>, a));
 }
 
 void attention(const AttentionArgs& a, cudaStream_t stream) {
@@ -851,7 +853,7 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     if (a.groups == 0) { return; } // every column is padding: the prologue wrote their zero outputs
     const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns);
     static const bool attribute = [] {
-        for (auto* kernel : {attention_kernel<false>, attention_kernel<true>}) {
+        for (auto* kernel : {attention_kernel<false, false>, attention_kernel<true, false>, attention_kernel<true, true>}) {
             CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(smem_bytes(kMaxRows))));
         }
@@ -860,14 +862,16 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     (void)attribute;
     const unsigned splits = l.full ? kFullSplits : kSlidingSplits;
     const bool quantized  = detail::quantized_pool(a);
+    const bool rotated    = detail::rotated_pool(a);
     const auto launch = [&](std::int32_t g0, std::int32_t count, std::int32_t base) {
         AttentionArgs b   = a;
         b.groups_columns  = a.groups_columns + 3 * g0;
         b.groups          = count;
         b.stats_base      = base;
         const pdl::LaunchConfig config{dim3(splits, kKvHeads, static_cast<unsigned>(count)), dim3(kThreads), bytes, stream};
-        CUDA_CHECK(quantized ? pdl::launch_consumer(config, attention_kernel<true>, b)
-                             : pdl::launch_consumer(config, attention_kernel<false>, b));
+        CUDA_CHECK(!quantized ? pdl::launch_consumer(config, attention_kernel<false, false>, b)
+                   : rotated  ? pdl::launch_consumer(config, attention_kernel<true, true>, b)
+                              : pdl::launch_consumer(config, attention_kernel<true, false>, b));
     };
     if (a.host_groups == nullptr) {
         launch(0, a.groups, 0);

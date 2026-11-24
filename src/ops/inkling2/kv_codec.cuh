@@ -407,7 +407,9 @@ __device__ __forceinline__ void kv_rotate_query(float (&q)[4], int lane) {
 }
 
 // `x` the lane's four values the BF16 storage holds (BF16 K, FP16 V), `bits` their BF16 source words (bf16p's input).
-// Sets *unpackable (bf16p: the row has no packed form). Returns the lane's four represented words.
+// Sets *unpackable (bf16p: the row has no packed form). Returns the lane's four represented words. Rotated false: an
+// instance that never sees vq2 or q4 (it carries no code for them).
+template <bool Rotated = true>
 __device__ __forceinline__ uint2 kv_encode(KvForm form, const float (&x)[4], const std::uint16_t (&bits)[4], int lane,
                                           std::uint8_t* codes, std::uint8_t* side, bool value, bool& unpackable) {
     unpackable = false;
@@ -415,8 +417,10 @@ __device__ __forceinline__ uint2 kv_encode(KvForm form, const float (&x)[4], con
     case KvForm::Int8: return kv_encode_int8(x, lane, codes, side, value);
     case KvForm::Fp8: return kv_encode_fp8(x, lane, codes, side, value);
     case KvForm::Nvfp4: return kv_encode_nvfp4(x, lane, codes, side, value);
-    case KvForm::Vq2: return kv_encode_vq2(x, lane, codes, side, value);
-    case KvForm::Q4: return kv_encode_q4(x, lane, codes, side, value);
+    case KvForm::Vq2:
+        if constexpr (Rotated) { return kv_encode_vq2(x, lane, codes, side, value); } else { return make_uint2(0U, 0U); }
+    case KvForm::Q4:
+        if constexpr (Rotated) { return kv_encode_q4(x, lane, codes, side, value); } else { return make_uint2(0U, 0U); }
     default: {
         unpackable = !kv_encode_bf16p(bits, lane, codes, side);
         std::uint32_t w[4];
@@ -429,7 +433,9 @@ __device__ __forceinline__ uint2 kv_encode(KvForm form, const float (&x)[4], con
 
 // ---------------------------------------------------------------------------- decoder (a thread, a 16-value chunk)
 
-// Chunk c (values 16 c .. 16 c + 15) of a row as 16 represented words: lo values 0-7, hi 8-15.
+// Chunk c (values 16 c .. 16 c + 15) of a row as 16 represented words: lo values 0-7, hi 8-15. Rotated false: as
+// kv_encode's.
+template <bool Rotated = true>
 __device__ __forceinline__ void kv_decode16(KvForm form, const std::uint8_t* codes, const std::uint8_t* side, int c,
                                             bool value, uint4& lo, uint4& hi) {
     std::uint32_t out[8];
@@ -471,7 +477,7 @@ __device__ __forceinline__ void kv_decode16(KvForm form, const std::uint8_t* cod
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) { out[i] = half[2 * i] | (half[2 * i + 1] << 16); }
-    } else if (rotated(form)) {
+    } else if (Rotated && rotated(form)) {
         // Words 2 c and 2 c + 1 (8 coordinates each) as signed INT8 levels, times S (rotated-domain words).
         uint2 levels[2];
         if (form == KvForm::Vq2) {

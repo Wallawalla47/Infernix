@@ -71,7 +71,8 @@ __device__ __forceinline__ std::uint8_t* row_side(const KvView& kv, int which, K
 
 // A unit's 64 rows of both planes (`page`: its first row's element offset) decoded into the tiles' represented words
 // (row stride `stride` words; `at(row, d)` the word offset of value d of a row), by `threads` threads from `tid`.
-template <class At>
+// Rotated false: as kv_decode16's.
+template <bool Rotated = true, class At>
 __device__ __forceinline__ void decode_unit(const KvView& kv, std::size_t page, std::uint16_t* k_tile,
                                             std::uint16_t* v_tile, At at, int tid, int threads) {
     const KvForm forms[2] = {plane_form(kv, 0), plane_form(kv, 1)};
@@ -80,7 +81,7 @@ __device__ __forceinline__ void decode_unit(const KvView& kv, std::size_t page, 
         const int row = rest / (kD / 16), chunk = rest % (kD / 16);
         const std::size_t element = page + static_cast<std::size_t>(row) * kD;
         uint4 lo, hi;
-        kv_decode16(forms[plane], row_codes(kv, plane, forms[plane], element), row_side(kv, plane, forms[plane], element),
+        kv_decode16<Rotated>(forms[plane], row_codes(kv, plane, forms[plane], element), row_side(kv, plane, forms[plane], element),
                     chunk, plane == 1, lo, hi);
         std::uint16_t* tile = plane == 0 ? k_tile : v_tile;
         *reinterpret_cast<uint4*>(tile + at(row, 16 * chunk))     = lo;
