@@ -97,6 +97,7 @@ otherwise.
 | Video input | the request is refused; images work |
 | Constrained output: `--grammar-file`, `--json-object`, `--json-schema-file`, `--choice`, `--regex` and the APIs' structured-output fields | the request is refused |
 | `tool_choice` set to required or to a named tool | the request is refused. `auto` and `none` work; tool calls are parsed from the model's free output, so no grammar protects their arguments |
+| A tool declared with `strict: true` | the request is refused, since nothing would check its arguments against the schema. Tools with `strict: false` or no `strict` field work |
 | A request ending in an assistant message (prefill) | the request is refused: only a new assistant turn is rendered |
 | `--reasoning-loop stop` or `conclude` | refused at startup |
 | N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens N` | refused at startup |

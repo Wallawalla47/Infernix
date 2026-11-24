@@ -8,7 +8,8 @@
 //    sent back as the assistant message of the history renders the prompt's ids followed by the generated ids where
 //    the model wrote the template's canonical form, and tokenize_chat marks exactly the reply's ids as generated; the
 //    first differing position is reported otherwise (it decides where a next turn's prefix reuse ends).
-// 3. Refusals: images without --vision, continuation modes, constrained output, required tool choices; context length.
+// 3. Refusals: images without --vision, continuation modes, constrained output, required tool choices, strict tools
+//    (strict false or absent accepted); context length.
 // 4. Images with --vision (tests/fixtures/inkling2/vision_golden.json's PNGs): placeholder expansion and order, a
 //    placeholder typed in client text, the summary's sizes, the expanded context check, video refused.
 //
@@ -251,6 +252,35 @@ int main() {
               }),
               "a required tool choice is refused");
         check(!throws([&] { (void)frontend.make_output_session(plain, {}); }), "the default request is accepted");
+        {
+            // A strict tool: refused as a tool constraint (nothing checks its arguments); strict false and no strict
+            // field are accepted, in the rendered form serve passes (render_tool_definition) and bare.
+            const auto with_tool = [&](const std::string& tool) {
+                PromptInput input = question;
+                input.options.tool_jsons = {tool};
+                return input;
+            };
+            const std::string schema = R"("parameters":{"type":"object","properties":{"path":{"type":"string"}}})";
+            bool refused = false;
+            try {
+                (void)frontend.prepare(
+                    with_tool(R"({"type":"function","function":{"name":"read",)" + schema + R"(,"strict":true}})"));
+            } catch (const infernix::RequestError& error) {
+                refused = error.kind() == infernix::RequestErrorKind::InvalidToolConstraint;
+            }
+            check(refused, "a strict tool is refused as a tool constraint");
+            check(throws([&] { (void)frontend.prepare(with_tool(R"({"name":"read",)" + schema + R"(,"strict":true})")); }),
+                  "a bare strict tool is refused");
+            check(!throws([&] {
+                      (void)frontend.prepare(
+                          with_tool(R"({"type":"function","function":{"name":"read",)" + schema + R"(,"strict":false}})"));
+                  }),
+                  "a tool with strict false is accepted");
+            check(!throws([&] {
+                      (void)frontend.prepare(with_tool(R"({"type":"function","function":{"name":"read",)" + schema + "}}"));
+                  }),
+                  "a tool without strict is accepted");
+        }
         const ink::Frontend small(resources, {.max_context = 8});
         bool context_error = false;
         try {
