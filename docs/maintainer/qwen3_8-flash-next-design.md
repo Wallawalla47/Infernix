@@ -12771,6 +12771,28 @@ explained); every reply identical. On the reproducible route the 8,192 limit gav
 of seven, a gated 8,192-column call with 3,039 CPU experts among them. `infernix_offloaded_moe_layer_test` covers gated
 calls of 4,100, 8,200 and 16,384 columns whose CPU jobs read columns across the whole call.
 
+**A narrower ring and a wider 4-bit assist, with every expert in RAM (2026-11-24; placement only).** Two more changes
+for short agent turns, each on only the setups where it measured faster (RTX 5090, PCIe 5.0 x8, INT8 KV, a resumed
+turn unless noted, ABBA with four samples a width; ratio of median prefill to the code before; the switches that
+measured them are removed):
+- *Ring.* A gated call's ring was sized for the blind stream (twice the most experts any layer lacks, about 830 frames
+  on Dense8 even for a 600-token call), and the frames it lends evict that many experts from the cache for the call.
+  With no SSD tier, a gated call of at most 4,096 columns now takes a quarter of that half below 2,048 columns and half
+  of it up to 4,096 (`stream_chunk`). Dense8 600-2,000 tokens 0.917-0.975x, 2,200-4,000 0.969-0.983x; FP4-Local
+  0.923-0.978x and 0.958-0.978x; IQ3_S 1,000-4,000 0.950-0.981x and 600 tokens 1.023x (its samples spread 0.91-1.15);
+  5,000 tokens, past the rule, level on all three. An earlier run that chose these widths found a quarter at 2,500
+  tokens 8 % slower on FP4-Local and a half past 4,096 4 % slower there, so wider calls keep the whole half. With 32 GiB
+  of Dense8's experts in RAM the rule showed no gain (1.005x summed, 0.977-1.018x a width within a wide spread), so an
+  SSD tier keeps the whole half.
+- *4-bit assist.* The 4-bit route (`a4_bank`: Dense8, or FP4-Local with `--expert-a4-activations`) with no SSD tier
+  CPU-assists prompt calls to 1,023 columns (`kA4AssistMaxColumns`) instead of 575. Its CPU team serves about 83K expert
+  columns a second against the exact 16-bit route's 48K, which is why assisting 576-1,023 columns wins there and lost
+  6-33 % on FP4-Local's default 16-bit route (§19.3.50's 2026-11-05 result agrees). Dense8 600-1,000 tokens resumed
+  0.891-0.971x, cold 0.860-0.923x; FP4-Local's 4-bit opt-in 0.848-0.930x; 300-575 and 1,100-1,500 tokens level
+  (0.993-1.012x). Assisting to 1,535 lost at 1,500 tokens (1.033x). An SSD tier was not measured and keeps 575.
+- Checks: `infernix_qwen4_exp_prefix_cache_real_test` and `_decide_real_test` passed on Dense8 with both on; on the
+  reproducible route the assisted limit gave the same replies (seven of seven, an 817-token call assisted among them).
+
 ### 19.3.43 NVFP4 W4A16 banks split decode misses by the share form (2026-10-30; placement only; default)
 
 **What.** Flash-Next's Program kept a decode call's host-memory misses on the link by the divisor rule, M / d with
@@ -13193,7 +13215,8 @@ Past 575 the gated stream wins on the 16-bit route (2026-11-05, the same rig, `-
 against the built boundary, three rotated pairs a point, every one behind): pp640 606.9 / 650.3 (-6.7 %), pp704 586.9
 / 643.4 (-8.8 %), pp767 582.5 / 653.7 (-10.9 %). The FP8 import's block-FP8 bank (8-bit records, about 1.8 times
 NVFP4's bytes a weight, partly on the SSD tier) keeps winning assisted to 4,096 (below); what makes the two differ was
-not measured.
+not measured. The 4-bit route, whose CPU team serves about 83K expert columns a second against the 16-bit route's 48K,
+assists to 1,023 columns with every expert in RAM since 2026-11-24 (§19.3.42).
 
 The 16-bit route's gated calls, the split planned at 0.3-10 times the rates with nothing kept, and planned at 10 times
 with the assisted share kept (the leak's form):
