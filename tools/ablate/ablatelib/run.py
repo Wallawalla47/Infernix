@@ -65,6 +65,24 @@ class Run:
         return p
 
 
+def files_stamp(value: str | None) -> list | None:
+    """The size and modification time of the file an option names, or of each file directly in the folder it names (a
+    LoRA adapter's PEFT folder): an option's string says where its file is, not what it holds, so a file replaced in
+    place is another setup. None when the value names no existing path."""
+    if not value:
+        return None
+    path = Path(value)
+    try:
+        if path.is_file():
+            st = path.stat()
+            return [path.name, st.st_size, st.st_mtime_ns]
+        if path.is_dir():
+            return sorted([f.name, f.stat().st_size, f.stat().st_mtime_ns] for f in path.iterdir() if f.is_file())
+    except OSError:
+        return None
+    return None
+
+
 def sha256_file(path: Path, limit: int | None = None) -> str:
     """sha256 of a file; with limit, of its first `limit` bytes plus its size (artifacts are tens of GB)."""
     h = hashlib.sha256()

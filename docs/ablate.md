@@ -155,7 +155,7 @@ The rows' run-to-run spreads are 0.04 to 0.84 %. A cut costs about 3 us of decod
 is a larger share of the 35B's 2.4 ms token than of the 27B's 12 ms; a sidecar cutting half the lanes costs about half.
 
 On Inkling 2 a cut launches no extra kernel (its cut instances do the dot and the cut in the kernels that write the
-residual; the direction is 9 KiB of VRAM shared, 221 KiB per layer). A synthetic sidecar cutting both lanes of all 24
+residual; the direction is 9 KiB of VRAM shared, 216 KiB per layer). A synthetic sidecar cutting both lanes of all 24
 layers cost -0.21 / -0.07 % (prefill of 2,048 tokens / plain decode of 128) on the default route, -0.15 / -0.09 % with
 `--q8-weights` and -0.31 / -0.29 % with `--a8-activations` (RTX 5090, BF16 KV, one run of three repetitions each,
 2026-11-24). With DSpark the cut changes the text and so the acceptance: decode moved -2.9, -0.7 and +4.2 % on the chat,

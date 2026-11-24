@@ -22,15 +22,19 @@ import numpy as np
 
 from . import serve_flags as SF
 from .engine import Engine
-from .run import artifact_id, replace_file, sha256_file, write_json
+from .run import artifact_id, files_stamp, replace_file, sha256_file, write_json
 
 
 def identity(run) -> dict:
     """What decides a recording's values besides its prompt."""
     prod = run.production
     template = prod.value("--chat-template")
+    carried = prod.by_kind(SF.CARRY)
     return {"artifact": prod.artifact.name, "artifact_id": artifact_id(prod.artifact),
-            "carried": [f if v is None else f"{f} {v}" for f, v in prod.by_kind(SF.CARRY)],
+            "carried": [f if v is None else f"{f} {v}" for f, v in carried],
+            # A path-valued option's file as it is now (--lora's adapter, --ngram-volume): one replaced in place
+            # records again.
+            "carried_files": {f: stamp for f, v in carried if (stamp := files_stamp(v)) is not None},
             "chat_template": sha256_file(Path(template)) if template else "the artifact's own",
             "serve_binary": sha256_file(run.serve_binary)}
 

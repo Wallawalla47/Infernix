@@ -38,10 +38,12 @@ def load_sets(run) -> dict:
 
 def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: float = 1.0, startup: int = 60,
         markers: tuple[str, ...] = M.MARKERS, max_failures: int = 3, log=print, progress=None) -> dict:
-    """Adds `trials` trials to the study. `progress`, when given, is called with {'control_refusals', 'n_harmful'} once
-    the control is measured and with each finished trial's record."""
+    """Adds `trials` completed trials to the study (a failed trial is replaced). `progress`, when given, is called with
+    {'control_refusals', 'n_harmful'} once the control is measured and with each finished trial's record."""
     import optuna
 
+    if trials < 1:
+        raise SystemExit("--trials must be at least 1")
     base = run.dir / "direction" / "sidecar.json"
     if not base.is_file():
         raise SystemExit(f"{base} is missing: run `ablate.py direction` first")
@@ -136,9 +138,20 @@ def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: 
             streak["why"] = f"{streak['n']} trials in a row failed; last: {frozen.user_attrs.get('error', '?')[:200]}"
             study_.stop()
 
+    # `trials` completed trials are added: a trial an engine failure ended does not count, and the study gets another in
+    # its place (the breaker above ends a fit whose trials keep failing, so this always ends).
+    added = {"n": 0}
+
+    def enough(study_, frozen) -> None:
+        if frozen.state == optuna.trial.TrialState.COMPLETE:
+            added["n"] += 1
+            if added["n"] >= trials:
+                study_.stop()
+
     status = "complete"
     try:
-        study.optimize(objective, n_trials=trials, catch=(EngineError,), callbacks=[breaker], gc_after_trial=True)
+        study.optimize(objective, n_trials=None, catch=(EngineError,), callbacks=[breaker, enough],
+                       gc_after_trial=True)
         if streak["why"]:
             status = "stopped"
             log(f"FIT STOPPED: {streak['why']}")
