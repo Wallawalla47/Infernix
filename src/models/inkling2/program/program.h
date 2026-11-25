@@ -3,10 +3,12 @@
 // Inkling 2's Program (design docs/maintainer/inkling2_mini-design.md §7-§8): the lanes, their state and KV, the
 // calls of the Forward (execution/forward.h), sampling and the commit of each round, behind the common EngineCore.
 //
-// Every lane's KV is reserved to the context limit at startup, so a binding never waits for pages and no request is
-// paused; the n-gram archive and next-turn prefill are off for this architecture. Prompts prefill in chunks of one
-// lane; decode rounds are B lanes x 1 column as CUDA graphs per (B, T) captured at startup, and one decoding lane drafts
-// with DSpark. A constrained row (constrained-decoding.md §4.4) samples under its matcher's masks, filled while its
+// The lanes share one KV page pool (--kv-capacity), from which each takes the pages of its next execution unit
+// (reserve_units); a shortage the prefix cache cannot cover pauses a resident (start_pause), whose resume binds the
+// deepest cached state of its ledger and replays the rest exactly (advance_replay: the prompt route below the prompt's
+// end, the decode route past it, as they first ran). The n-gram archive and next-turn prefill are off for this
+// architecture. Prompts prefill in chunks of one lane; decode rounds are B lanes x 1 column as CUDA graphs per (B, T)
+// captured at startup, and one decoding lane drafts with DSpark. A constrained row (constrained-decoding.md §4.4) samples under its matcher's masks, filled while its
 // call's forward runs (a forward-only graph, then the sample); a token-constrained row (TokenConstraint, /v1/decide)
 // decodes plainly, its logits masked to its step's tokens before the sample (ops::constrain_logits).
 
@@ -45,6 +47,7 @@ class ProgramImpl;
 struct BasePlanImpl;
 struct ContractAccess;
 struct QuoteImpl;
+struct ResumeStateImpl;
 } // namespace detail
 
 inline constexpr std::size_t kMaximumConcurrency = 8;
@@ -131,18 +134,23 @@ struct BindingReservation {
     explicit operator bool() const noexcept { return reserved; }
 };
 
-// No request is paused in this slice; the type exists for the EngineCore's signatures.
+// A paused request (Program::start_pause): its ledger and request state; its device state went to the prefix cache.
 class ResumeState {
 public:
-    ResumeState(ResumeState&&) noexcept            = default;
-    ResumeState& operator=(ResumeState&&) noexcept = default;
-    ResumeState(const ResumeState&)                = delete;
-    ResumeState& operator=(const ResumeState&)     = delete;
+    ResumeState(ResumeState&&) noexcept;
+    ResumeState& operator=(ResumeState&&) noexcept;
+    ResumeState(const ResumeState&)            = delete;
+    ResumeState& operator=(const ResumeState&) = delete;
+    ~ResumeState();
+    // The paused frontier: the positions whose state the lane held.
     [[nodiscard]] std::uint32_t frontier() const noexcept { return frontier_; }
 
 private:
-    ResumeState() = default;
+    ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl, std::uint32_t frontier) noexcept;
+    std::unique_ptr<detail::ResumeStateImpl> impl_;
     std::uint32_t frontier_ = 0;
+
+    friend struct detail::ContractAccess;
 };
 
 enum class ExecutionUnitKind : std::uint8_t { Prefill, Replay, Decode, Control, Normalize };
@@ -310,8 +318,8 @@ struct ProgramOptions {
     // --kv-dtype: the full visits' pools; --kv-window-dtype (window_codec): the sliding windows' rings.
     ops::inkling2::KvCodec kv_codec     = ops::inkling2::KvCodec::Bf16;
     ops::inkling2::KvCodec window_codec = ops::inkling2::KvCodec::Bf16;
-    // The full visits' pool: at least every lane's whole context (pages_per_lane(max_context) a lane); more holds
-    // the prefix cache's blocks. 0: every lane's whole context.
+    // The full visits' pool (--kv-capacity), shared by the lanes: at least one lane's whole context
+    // (pages_per_lane(max_context)); pages no lane holds are the prefix cache's blocks. 0: one lane's context.
     std::uint32_t kv_pages = 0;
     // The prefix cache (generation only; prefix_cache.h): its pinned Host tier, which holds every snapshot, and the
     // tap planner's limits. Off: no request reuses or publishes anything.
@@ -344,7 +352,7 @@ struct ProgramOptions {
 
 // Device memory the Program allocates, from the options and the configuration alone.
 struct ProgramDevicePlan {
-    std::uint32_t kv_pages      = 0; // the pool's pages (scratch page included): max(options.kv_pages, lanes x
+    std::uint32_t kv_pages      = 0; // the pool's pages (scratch page included): max(options.kv_pages,
                                      // pages_per_lane(max_context)) + 1
     std::uint64_t page_bytes    = 0; // one page of every full visit's K and V planes (side records included)
     std::uint64_t kv            = 0; // the full visits' K and V pools and the block table
@@ -377,7 +385,8 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
 
-    // ---- execution units ----
+    // ---- execution units: each lane takes the pages its next unit writes; a shortage the prefix cache cannot cover
+    // is reported, and the Engine reclaims (hybrid_reclaim) or pauses a resident (Scheduler::preemption_victim) ----
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     void release_units(std::span<const SequenceHandle>) noexcept {}
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
@@ -434,25 +443,31 @@ public:
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept { return std::nullopt; }
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
-    // Every lane reserves its whole context, so the cache never has to give up room for a lane (a binding evicts what
-    // it needs itself), and no prefetch, queue hold or tool-call hold is built.
+    // No prefetch or tool-call hold is built.
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&, bool = false) {
         return std::nullopt;
     }
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
-    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage) { return false; }
+    // The Engine's reclaim for a shortage: the cache's unpinned Device blocks go (and those only in-flight Host writes
+    // hold, once they land) until it is covered; whether any page was freed.
+    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const>, std::span<const ResumeState* const>) {}
+    // The snapshot each queued request would resume from now is held in queue order (hybrid-prefix-cache-spec §9.6): a
+    // paused request's over its ledger (its pause's endpoint), a fresh one's as its admission would choose it.
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue, std::span<const ResumeState* const> resumes);
     void hybrid_hold_continuation(std::chrono::steady_clock::time_point) {}
-    // Every lane's KV is reserved at startup, so no shortage ever pauses a request.
-    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle) const noexcept { return 0; }
-    [[nodiscard]] bool start_pause(SequenceHandle, runtime::ExecutionTiming* = nullptr) {
-        throw std::logic_error("Inkling 2: no request is paused (every lane's KV is reserved at startup)");
-    }
-    [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming* = nullptr) {
-        throw std::logic_error("Inkling 2: no request is replayed (every lane's KV is reserved at startup)");
-    }
+    // ---- pause and replay ----
+    // The tokens a pause of `sequence` now would recompute on its resume: none where the pause captures the lane's
+    // state at its frontier, else the frontier past the deepest cached state of its ledger.
+    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle sequence) const noexcept;
+    // Pauses a resident at its committed boundary: its blocks and its state at the frontier go to the prefix cache
+    // (decode-computed ones under a key only its resume names), the lane is released, and a Pause transaction hands the
+    // Engine the ResumeState. False while a binding or a pending batch is open.
+    [[nodiscard]] bool start_pause(SequenceHandle sequence, runtime::ExecutionTiming* = nullptr);
+    // One call of a resumed lane's ledger toward its paused frontier, without sampling: the prompt route below the
+    // prompt's end, decode-route calls of up to 16 columns past it (the bits the positions were first computed with).
+    [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence, runtime::ExecutionTiming* = nullptr);
 
 private:
     std::unique_ptr<detail::ProgramImpl> impl_;

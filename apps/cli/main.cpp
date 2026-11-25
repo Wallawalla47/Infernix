@@ -452,8 +452,8 @@ int main(int argc, char** argv) {
                                             "Inkling 2 keeps its experts in VRAM");
             }
             if (cli.kv_capacity_explicit) {
-                throw std::invalid_argument("Inkling 2: --kv-capacity sizes the prefix cache's KV pool, which the CLI "
-                                            "runs without: the lane reserves its whole context (--max-context)");
+                throw std::invalid_argument("Inkling 2: --kv-capacity sizes the KV pool infernix-serve's lanes share; "
+                                            "the CLI serves one request, whose pool is its context (--max-context)");
             }
         }
         startup_log.engine_ready(engine.load_summary());

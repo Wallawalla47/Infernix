@@ -743,7 +743,7 @@ int main() {
         }
         {
             // Engine::plan: the readings are filled, a start that fits says so with its VRAM left, and an explicit
-            // configuration that cannot fit (eight lanes of the model's whole context) is refused with an error.
+            // configuration that cannot fit (a KV pool of eight 262,144-token contexts) is refused with an error.
             infernix::EngineOptions fits = engine_options(artifact, 16, false, 1);
             const infernix::EnginePlan plan = infernix::Engine::plan(fits);
             require(plan.fits && plan.error.empty() && !plan.gpu.name.empty() && plan.gpu.free_bytes != 0 &&

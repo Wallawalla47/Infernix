@@ -588,6 +588,15 @@ under Basic protection as free.
 configurations its callers start with (the server's and the launcher's defaults, tools/ablate's engines,
 infernix_bench's, the real tests' and infernix-perplexity's options), which must start; a scoring start must report
 the generation options it leaves unused.
+`infernix_inkling2_preemption_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) runs requests that together outgrow a KV
+pool of one 4,096-token context (two 1,500-token prompts with 900-token greedy replies, plain, under DSpark and with
+INT8 KV; three sampled requests under DSpark; two with a presence penalty; the cache off, where a resume replays its
+ledger, plain, under DSpark with INT8 KV and under `--a8-activations`; a 2,600-token prompt prefilled in 512-token chunks
+beside a reply; two 12,000-token prompts with 6,000-token replies in a 32,768-token pool, DSpark and INT8 KV): there must
+be preemptions, and each request's tokens must equal its tokens alone in an Engine whose pool holds every lane. It
+reports the snapshot restores, replays, replayed tokens and time paused, and checks that the owner's launcher configuration of
+2026-11-25 (240,000 tokens, four lanes, INT8 KV, vision offloaded, the embedding on the host, DSpark with
+`--lm-head-draft`) plans, starts and serves a request (`INFERNIX_INKLING2_NO_OWNER_CONFIG` skips that).
 `infernix_inkling2_withdraw_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) reports a row as non-finite through
 `runtime::testing::set_nonfinite_fault`, as the other families' withdrawal tests do: a failed prompt's entries leave the
 prefix cache (its retry resumes from nothing and equals a cache-off run, which also reports its

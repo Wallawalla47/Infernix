@@ -59,8 +59,8 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model) {
     } else if (model.family == "qwen3.8-27b" || model.family == "qwen3.6-27b" || inkling) {
         // Every KV page stays on the GPU: infernix-serve sizes the context at startup to the largest the KV
         // cache holds beside the weights and the headroom (2026-11-14, a headless 32 GB RTX 5090 with the 22 GB
-        // NVIDIA NVFP4 artifact, INT8 KV, two lanes, DFlash2: 256,896 tokens, the whole KV pool). Inkling 2 reserves
-        // each lane's whole context, so a fixed default could exceed the card.
+        // NVIDIA NVFP4 artifact, INT8 KV, two lanes, DFlash2: 256,896 tokens, the whole KV pool). Inkling 2's lanes
+        // share its pool the same way, and a fixed default could exceed the card.
         add("--max-context", "auto");
     } else if (model.native_context != 0) {
         add("--max-context", std::to_string(std::min<std::uint64_t>(model.native_context, 262144)));

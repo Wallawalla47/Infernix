@@ -265,6 +265,9 @@ the pool) and every unit settles back to it, so no unit needs new pages and the 
 never chooses a victim. Admission waits for the extent instead. Without `free-cache-resume` the
 Program likewise splits prefill and publishes and resumes cached state only on the prefill chunk
 grid, and publishes no decode-computed endpoint ([numerical policy](model-quality.md#67-fast-path-registry)).
+Inkling 2 pauses on every route: its replay recomputes the prompt on the prompt route and the reply with decode-route
+calls of up to 16 positions, the bits each position first had, and its decode-route blocks and endpoints are cached
+under keys only resumes ask for ([Inkling 2 design §7.5](inkling2_mini-design.md#75-preemption-and-replay)).
 
 ### 3.2 Outstanding capacity
 

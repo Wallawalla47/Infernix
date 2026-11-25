@@ -59,16 +59,18 @@ hf download wallawalla47/Inkling-2-Mini-Infernix Inkling-2-Mini-Infernix.inferni
 infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft
 ```
 
-- `--max-context auto` takes the largest context the free VRAM holds for every lane. Without it
-  `infernix-serve` uses 8,192 tokens and `infernix` 2,048.
+- `--max-context auto` takes the largest context one request can hold in the free VRAM: the whole KV
+  pool. Without it `infernix-serve` uses 8,192 tokens and `infernix` 2,048.
 - `--kv-dtype int8` stores the KV cache, the sliding windows included, in 8 bits: about half the memory
   of the default `bf16`, for slightly different output ([KV formats](#kv-formats)). `--kv-window-dtype`
   chooses the sliding windows' format on its own.
 - `--spec dspark --draft-tokens auto` is what the default `--spec auto` chooses for this artifact.
 - `--lm-head-draft` is optional: it changes the speed of drafting, never the output.
 - Add `--vision` for images. Its tower and image buffers stay in VRAM and reduce the context.
-- Add `--max-concurrency N` (1 to 8) for several lanes. Each lane reserves a whole context, so
-  `--max-context auto` gives each a share of the memory.
+- Add `--max-concurrency N` (1 to 8) for several lanes. The lanes share one KV pool, and each
+  request takes pages as it grows, so any one of them can reach the full context. When the
+  lanes together outgrow the pool, one request pauses and resumes later with the same output
+  ([Context, lanes and the prefix cache](#context-lanes-and-the-prefix-cache)).
 
 A single request from the command line (`--max-concurrency` and the cache options belong to
 `infernix-serve`):
@@ -119,9 +121,9 @@ once the model has loaded; `--plan` reports them without loading.
 | The MTP, DFlash and DFlash2 backends | `--spec mtp`, `dflash` and `dflash2` are refused: the model's drafter is DSpark. So are `--draft-model`, `--spec-min-p`, `--draft-tree-nodes` and `--draft-tree-paths` (DSpark verifies a chain) |
 | `--lm-head-draft` when no drafter runs | refused: an artifact without DSpark, `--spec off` or `--lossless` |
 | Offloaded-expert options: `--expert-state`, `--expert-ram-mib`, `--expert-ram-layout`, `--expert-pin-mib`, `--expert-csf`, `--expert-stripe`, `--expert-tail-skip`, `--route-trace`, and `--ram-resize` | refused: the experts stay in VRAM and the Host tier keeps its startup size |
-| Qwen kernel, fast-path and media options: `--use-original-int8-prefill-kernel`, `--use-original-nvfp4-prefill-kernel`, `--prefill-split-workspace-mib`, `--fast-path`, `--no-fast-path`, `--media-cache-mib`, `--media-live-mib`, `--media-preprocess-threads`, `--context-cost-presets`, `--no-queue-holds` | refused: Inkling has its own prompt route and image path, registers no fast path, and its prefix cache has no cost model or queue holds |
-| Sizing options that a start would not use: `--vram-headroom-mib` and `--vram-past-budget` without `--max-context auto` or the cache's `--kv-capacity auto`; `--ram-free-mib` without the automatic Host tier; `--vision-max-merged` without `--vision` | refused |
-| `--kv-capacity N` below every lane's context, with `--max-context auto`, or without the prefix cache (`--no-prefix-reuse`, the CLI) | refused: each lane reserves its whole context |
+| Qwen kernel, fast-path and media options: `--use-original-int8-prefill-kernel`, `--use-original-nvfp4-prefill-kernel`, `--prefill-split-workspace-mib`, `--fast-path`, `--no-fast-path`, `--media-cache-mib`, `--media-live-mib`, `--media-preprocess-threads`, `--context-cost-presets` | refused: Inkling has its own prompt route and image path, registers no fast path, and its prefix cache has no cost model |
+| Sizing options that a start would not use: `--vram-headroom-mib` and `--vram-past-budget` without `--max-context auto` or `--kv-capacity auto`; `--ram-free-mib` without the automatic Host tier; `--vision-max-merged` without `--vision` | refused |
+| `--kv-capacity N` below `--max-context` | refused: the pool holds at least one request's whole context |
 | Generation options on a `--causal-scoring` start (`--prefix-cache-file`, `--host-context-mib`, `--ssd-context-gib`, `--lm-head-draft`, the sizing options) | not refused: scoring runs without them, and the start lists them as unused in its log, as the other models do |
 | `--logits-dtype bf16` | refused at startup: the logits are FP32 |
 | `--rope-yarn-factor` other than 1 | refused at startup: the model has no RoPE and reaches its full context natively |
@@ -216,15 +218,26 @@ Measured quality per format: [design §7.6](maintainer/inkling2_mini-design.md#7
 
 ## Context, lanes and the prefix cache
 
-- **No request is paused.** Every lane reserves its whole context when it starts, so Inkling does
-  not preempt requests. The price is that the context is divided between the lanes up front.
+- **One KV pool for every lane.** `--kv-capacity` sizes the pool (`auto`, the default with the
+  prefix cache, takes the VRAM the model leaves free), and it always holds at least one
+  `--max-context`. A request takes pages as its prompt and output grow, so four lanes with short
+  contexts all stay on the GPU. Pages no request holds keep cached prompt blocks.
+- **Pauses keep the output.** When the lanes together outgrow the pool, the Engine pauses a
+  request at a round's end, as it does for the Qwen models. The paused request's KV blocks and
+  its state go to the prefix cache: Host RAM, and the SSD tier when there is one. It resumes
+  from there once pages are free, or rebuilds what the cache no longer holds. The rebuild runs
+  the prompt route over the prompt and the decode route over the reply, which is how those
+  positions were first computed, so a paused request's output is bit for bit the same on every
+  route. Without the prefix cache (`--no-prefix-reuse`, the CLI) a resume rebuilds the whole
+  request. One request's context can never exceed `--max-context`, and the pool is allocated
+  once at startup.
 - **Prefill chunks** default to 4,096 tokens. `--prefill-chunk` takes multiples of 128 up to 8,064.
   Every chunk size gives the same bits.
 - **The prefix cache** is on by default in `infernix-serve` (the `infernix` CLI runs without it). It
   caches only state computed from prompts, so a continuing turn resumes at the previous prompt's end
-  and prefills the previous reply again. `--kv-capacity` then defaults to `auto`, so with a fixed
-  `--max-context` the cache also gets the VRAM beyond the lanes' contexts. An explicit `--kv-capacity N`
-  must hold every lane's whole context and needs a fixed `--max-context`. `--prefix-cache-file` keeps
+  and prefills the previous reply again. `--kv-capacity` then defaults to `auto`. An explicit
+  `--kv-capacity N` must hold `--max-context`, and caps `--max-context auto`. Queued and paused
+  requests' resume points are evicted last (`--no-queue-holds` turns that off). `--prefix-cache-file` keeps
   it across restarts, and `--ssd-context-gib` with `--ssd-context-dir` adds an SSD tier. Details:
   [Inkling 2's prefix cache](serving.md#inkling-2s-prefix-cache).
 - **`--embedding-host`** keeps the token embedding in pinned RAM and gives its VRAM to the KV and

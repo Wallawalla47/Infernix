@@ -158,8 +158,8 @@ Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
   grammars, with every model and drafter.
 - **Thinking control**: budgets with a wrap-up message, effort levels and a repetition guard
   (`--reasoning-loop`).
-- **Concurrency and resilience**: one to eight requests with preemption under memory pressure (Inkling
-  2 Mini reserves each lane's whole context instead, so it never pauses a request); the prefix cache
+- **Concurrency and resilience**: one to eight requests share one KV pool, with preemption under memory
+  pressure (on Inkling 2 Mini a paused request's output stays bit for bit the same); the prefix cache
   persists across restarts; a failed Flash-Next expert read fails only the requests running then.
 - **`/v1/decide`**: decisions from token probabilities (yes/no, choice, score, number, scalar, point
   and box).

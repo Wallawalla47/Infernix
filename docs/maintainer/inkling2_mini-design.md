@@ -605,21 +605,23 @@ form Qwen3.8-Flash-Next's binding takes:
 - **Pages.** The full visits' pools are one core `DeviceKVPagePool` of page-major planes (`[pages][8][64][row]`: a
   page is one contiguous run in each plane, so Host records copy whole pages), the lanes' block-table rows a
   `KVExecutionTablePool`. With DSpark the pool has two more planes, the drafter's full layer's K and V (BF16), read
-  and written through the same rows, so a cached page carries the drafter's context with the model's. A lane
-  reserves its whole context at its binding and maps a page when a call (or a draft's block rows) first writes into
-  it; an unmapped row names a scratch page. Every lane's context fits the pool, so a binding always gets its pages
-  (evicting cached blocks, or waiting for a Host write to land): no request is paused.
+  and written through the same rows, so a cached page carries the drafter's context with the model's. The lanes share
+  the pool (`--kv-capacity`, at least one `--max-context`): a binding reserves its first unit (a resume: through its
+  paused frontier and one round), `reserve_units` each later one (a prompt chunk, a decode round with a DSpark round's
+  block rows, forced tokens), and a lane maps a page from its reservation when a call (or a draft's block rows) first
+  writes into it; an unmapped row names a scratch page, and a write past the reservation is a logic error. A shortage
+  the cache cannot cover (cached blocks evicted, Host writes landed) goes to the Engine, which pauses a resident (§7.5).
 - **Snapshots are Host-born.** A tap copies the lane's StateImage (window rings, conv rings) and the drafter's sliding
   rings straight to reserved Host slabs, and its partial page as the tail record; the lane's next call waits for the
   copy. No Device snapshot slots. An image copied after a call ending at `end` serves every frontier in
   `[end - 29, end]` (the conv rings' 32 slots hold the 3 taps before it; 15 with DSpark, whose Markov ring keeps 16
   rows), so a tap splits a prompt call only when it lies further back; the prompt-end tap is the image after the
   prompt's last call, labelled `n - 1`.
-- **Only prompt-computed state is published**: blocks whose 64 positions were prefilled, and taps. No endpoint and no
-  decode-computed block (they would make a resumed request's output depend on what the cache held), so a resumed
-  request's output equals a cold run's, bit for bit, on every route: the prompt route is chunk-invariant. The
-  drafter's context depends on its call widths (projections_dmma at 16 columns or fewer, projections_mma above),
-  which changes drafts only.
+- **Only prompt-computed state is shared**: blocks whose 64 positions were prefilled, and taps. A decode-computed block
+  or endpoint under the shared keys would make a resumed request's output depend on what the cache held, so a resumed
+  request's output equals a cold run's, bit for bit, on every route: the prompt route is chunk-invariant. A pause's
+  decode-route blocks and endpoint take keys of their own (§7.5). The drafter's context depends on its call widths
+  (projections_dmma at 16 columns or fewer, projections_mma above), which changes drafts only.
 - **Persistence** (`--prefix-cache-file`): the common file format, Inkling's magic and geometry (slab, page record,
   the image's parts); the fingerprint adds the KV format, drafter, `--q8-weights`, `--a16-activations`, `--lossless`
   and vision.
@@ -632,7 +634,8 @@ form Qwen3.8-Flash-Next's binding takes:
   model's 2 GB/s (a modelled break-even, not timed) a default-route prompt under about 2,800 tokens is re-prefilled
   instead; the lossless route's model (about 0.27 s a call, 3.1 ms a token and 0.89 us a query-key pair) prefers the
   read at any length.
-- **Not built yet**: next-turn prefill, tool-call holds, queue holds and prefetching for waiting requests.
+- **Queue holds** (spec §9.6): the snapshot each queued request would resume from, a paused one's over its ledger.
+- **Not built yet**: next-turn prefill, tool-call holds and prefetching for waiting requests.
 
 Sizes: an image is 190 MiB with BF16 windows, 107 MiB with INT8 windows (by default every profile but `bf16` and
 `bf16p`) and 158 MiB with `bf16p` windows, plus 9 MiB of drafter rings; restoring a BF16 one takes ~8 ms over the PCIe link,
@@ -645,9 +648,34 @@ and is adopted only if M4's agentic replay shows Host-tier bytes, not hits, limi
 
 ### 7.5 Preemption and Replay
 
-As Qwen3.5: on the reproducible route a request reserves its whole extent and is never paused
-([engine architecture §3.1](engine-architecture.md#31-pause-and-resume)); otherwise Replay rebuilds from the deepest
-snapshot.
+Built 2026-11-25 (the owner's "the KV cache system should work similar to the system for Qwen 27B"; before it every
+lane reserved its whole context, and four 240,000-token INT8 lanes beside the vision tower did not fit the card). The
+Engine's pressure turns pause a resident as for the Qwen families ([engine architecture
+§3.1](engine-architecture.md#31-pause-and-resume)), on every route: Inkling's replay is exact, so no route holds a
+request's whole extent.
+
+- **What a position's bits are.** The prompt route (`CallPlan::prompt`) is chunk-invariant but not the decode route's
+  arithmetic (the forward test reports their difference); decode-route calls of up to 16 columns give single-column
+  decode's bits (decode = verify, any lanes beside). A prompt's positions were computed on the prompt route and its
+  reply's on the decode route, from the prompt's end on.
+- **Pause** (`start_pause`, at a committed boundary): the lane's full blocks through its frontier F are published, its
+  prompt's full blocks under the frontend's keys and every later block under `pause_keys`'s: the chained lookup hash
+  with an extra key of the prompt's length alone (high bit set, never an image key), which no fresh prompt carries.
+  Their bits are those of any request with the same ledger and prompt length, so the key need not name the request.
+  The endpoint at F is captured with the resume-point claim when its key is the prompt's (F within the prompt) or
+  private (a private block on its path); a frontier past the prompt inside the prompt's last block would sit on the
+  shared anchor with decode-computed rows, so it takes no endpoint and the resume replays from the deepest snapshot.
+  The lane is released (its captures stay known for a later withdrawal) and the ResumeState keeps the lane's request
+  (ledger, forced positions, sampling, constraint, counters, timings, keys).
+- **Resume** (`hybrid_sources` with the ResumeState, `start_binding`): the deepest snapshot of the ledger at or below
+  F (the queue holds keep the pause's endpoint cached last); the binding reserves through F and one round, so the
+  replay never needs pages. A resume below F replays (`advance_replay`): prompt-route calls of the prefill chunk below
+  the prompt's end, decode-route calls of up to 16 columns past it, each publishing its blocks under the same keys.
+  The penalty counts are rebuilt from the sampled output (the sampler counts every draw; forced tokens are not
+  counted). A request paused inside its prompt resumes as a prefill and reports only the prompt positions past those
+  it had reported. Without the prefix cache a resume replays the whole ledger.
+- **Sampling** is keyed by (seed, position) and verification samples every column as decoding would, so the drafter's
+  state after a resume changes the drafts only.
 
 ### 7.6 KV profiles
 
@@ -1485,7 +1513,7 @@ Transformers' dequantized path; open points are D4.
 
 Request invariance from the start: decode projections under `A16ColumnInvariant`; attention splits from fixed key chunks
 and the row's own length; experts narrow at every decode width (kMaxColumns ≥ 128); per-token quantizers; graphs per
-exact B; chunk-width-invariant prefill; no pausing.
+exact B; chunk-width-invariant prefill; pauses whose replay keeps each position's route (§7.5).
 
 ### 16.3 Op oracles
 

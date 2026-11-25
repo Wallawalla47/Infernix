@@ -74,6 +74,15 @@ infernix_add_test(infernix_inkling2_prefix_cache_real_test
 set_tests_properties(infernix_inkling2_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
   LABELS "gpu;real" TIMEOUT 1800)
 
+# The shared KV pool on a real artifact: requests that outgrow a one-context pool pause and resume, and each gives its
+# tokens alone (plain, DSpark, INT8 KV, sampled at C = 3, a presence penalty, no prefix cache, two long prompts), and the
+# owner's 240,000-token four-lane launcher configuration starts; skips without INFERNIX_INKLING2_ARTIFACT.
+infernix_add_test(infernix_inkling2_preemption_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_preemption_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_inkling2_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 3600)
+
 # Withdrawal after non-finite logits on a real artifact (hybrid-prefix-cache-spec §7.8): alone, beside a lane that
 # prefills the same prompt (it publishes at its prefill's end, so nothing is pinned), and with --prefix-cache-file; skips without INFERNIX_INKLING2_ARTIFACT.
 infernix_add_test(infernix_inkling2_withdraw_real_test

@@ -91,7 +91,6 @@ void test_refused_options() {
     refused({"--fast-path", "f16-accumulate-prefill"}, "--fast-path");
     refused({"--no-fast-path", "f16-accumulate-prefill"}, "--no-fast-path");
     refused({"--context-cost-presets", "presets.json"}, "--context-cost-presets");
-    refused({"--no-queue-holds"}, "--no-queue-holds");
     refused({"--media-cache-mib", "512"}, "--media-cache-mib");
     refused({"--media-live-mib", "512"}, "--media-live-mib");
     refused({"--media-preprocess-threads", "4"}, "--media-preprocess-threads");
@@ -120,9 +119,6 @@ void test_refused_options() {
     refused({"--lossless", "--kv-window-dtype", "int8"}, "--kv-window-dtype");
     refused({"--lossless", "--kv-window-dtype", "bf16p"}, "--kv-window-dtype");
     // What each start sizes.
-    refused({"--no-prefix-reuse", "--kv-capacity", "8192"}, "--kv-capacity");
-    refused({"--max-context", "8192", "--max-concurrency", "2", "--kv-capacity", "8192"}, "--kv-capacity");
-    refused({"--max-context", "auto", "--kv-capacity", "65536"}, "--kv-capacity");
     refused({"--no-prefix-reuse", "--vram-headroom-mib", "512"}, "--vram-headroom-mib");
     refused({"--kv-capacity", "65536", "--vram-headroom-mib", "512"}, "--vram-headroom-mib");
     refused({"--no-prefix-reuse", "--vram-past-budget"}, "--vram-past-budget");
@@ -198,6 +194,19 @@ void test_accepted_starts() {
     accepted({"--ram-free-mib", "8192"});                           // the automatic Host tier
     accepted({"--max-context", "8192", "--max-concurrency", "2", "--kv-capacity", "32768"});
     accepted({"--max-context", "8192", "--max-concurrency", "2", "--kv-capacity", "16384"});
+    // The lanes share the pool, which needs only one request's context (a resident pauses when they outgrow it), with
+    // or without the prefix cache; --max-context auto stays within an explicit capacity.
+    accepted({"--max-context", "8192", "--max-concurrency", "4", "--kv-capacity", "8192"});
+    accepted({"--no-prefix-reuse", "--max-context", "8192", "--kv-capacity", "16384"});
+    accepted({"--max-context", "auto", "--kv-capacity", "65536"});
+    accepted({"--no-queue-holds"});
+    {
+        EngineOptions small;
+        small.max_context = 8192;
+        small.kv_capacity = KvCapacityPolicy::explicit_capacity(4096);
+        check(engine_error(small).find("--kv-capacity") != std::string::npos,
+              "a KV capacity below one request's context is refused: " + engine_error(small));
+    }
     accepted({"--lm-head-draft"});
     accepted({"--vision", "--vision-max-merged", "4096"});
     accepted({"--vision-max-merged", "32768"}); // the default, given
