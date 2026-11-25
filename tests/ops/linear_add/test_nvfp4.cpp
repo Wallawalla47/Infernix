@@ -269,6 +269,20 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                                      a4 ? kA4Tolerance
                                         : (a4_residual && invocation.tokens >= 5 ? kA4ResidualTolerance
                                                                                  : kA16Tolerance));
+        // Repeat and compare with a copy streaming beside the calls (op-development.md: pipelined routes): the A4
+        // MMA tiles (16, 257) and the TMA tile from 513 columns (513, 1088). The add is in place, so each run starts
+        // from the initial residual.
+        if (a4 && (invocation.tokens == 16 || invocation.tokens == 257 || invocation.tokens == 513 ||
+                   invocation.tokens == 1088)) {
+            failures += verify_repeatable(
+                label + " repeated", 3, nullptr,
+                [&] {
+                    CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
+                                               cudaMemcpyHostToDevice, nullptr));
+                    ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr, invocation.routes);
+                },
+                {{output.data(), output.bytes()}});
+        }
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");

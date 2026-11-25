@@ -69,6 +69,14 @@ int check_negative_gate() {
         // projection precision observable in the complete nonlinear formula.
         failures += test::verify_reduction("NVFP4 SwiGLU negative gate T=" + std::to_string(tokens),
                                            got, reference, {1.0 / 256.0, 0.0, 2.0 / 256.0});
+        // Repeat and compare with a copy streaming beside the calls (op-development.md): the A4 MMA tiles (64)
+        // and the TMA tile past 256 columns (257).
+        if (tokens == 64 || tokens == 257) {
+            failures += test::verify_repeatable(
+                "NVFP4 SwiGLU A4 T=" + std::to_string(tokens) + " repeated", 3, nullptr,
+                [&] { ops::linear_swiglu(input, weight, output, ops::LinearPolicy::AllowA4, workspace, nullptr); },
+                {{y.data(), static_cast<std::size_t>(half) * tokens * 2}});
+        }
     }
     return failures;
 }

@@ -309,6 +309,17 @@ int check_linear_shape(std::int32_t n, std::int32_t k, std::span<const std::int3
             std::cerr << at << ": repeat calls differ\n";
             ++failures;
         }
+        // Repeat and compare with a copy streaming beside the calls (op-development.md: a pipelined route).
+        {
+            DeviceArena repeat_workspace(256);
+            DeviceBuffer y(static_cast<std::size_t>(w.n) * t * 2);
+            Tensor xt(x.p, DType::BF16, {w.k, t});
+            Tensor yt(y.p, DType::BF16, {w.n, t});
+            failures += verify_repeatable(
+                at + " repeated", 3, nullptr,
+                [&] { ops::linear(xt, w, yt, ops::LinearPolicy::A16Only, repeat_workspace, nullptr); },
+                {{y.p, static_cast<std::size_t>(w.n) * t * 2}});
+        }
         std::vector<double> got, want;
         for (const std::int32_t column : sampled(t, 6)) {
             for (const std::int32_t row : rows) {
