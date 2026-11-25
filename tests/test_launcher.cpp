@@ -589,8 +589,16 @@ void test_option_support() {
     Args defaults = default_args(scan, inkling);
     check(contains(defaults, {"--max-context", "auto"}), "Inkling's context is the server's to size");
     check(contains(defaults, {"--spec", "auto"}) && contains(defaults, {"--draft-tokens", "auto"}), "Inkling drafts with DSpark");
-    check(!has_flag(defaults, "--lm-head-draft"), "the ranking is offered, not defaulted");
+    check(!has_flag(defaults, "--lm-head-draft"), "no proposal head without the artifact's ranking");
     check(strip_unsupported_options(defaults, inkling).empty(), "Inkling's defaults hold only what it takes");
+    ScannedModel ranked_inkling = inkling;
+    ranked_inkling.has_proposal = true;
+    ranked_inkling.has_dspark   = true;
+    check(has_flag(default_args(scan, ranked_inkling), "--lm-head-draft"),
+          "an Inkling artifact with its ranking and DSpark drafter defaults to the proposal head");
+    ranked_inkling.has_dspark = false;
+    check(!has_flag(default_args(scan, ranked_inkling), "--lm-head-draft"),
+          "no proposal head without the DSpark drafter it shortlists for");
     Json library_row = option_support_json(inkling);
     check(library_row["context_auto"].get<bool>() && library_row["unsupported"].is_array(), "the form's view");
 }

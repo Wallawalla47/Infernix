@@ -74,9 +74,10 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model) {
     if (has_drafter_component || drafter != nullptr || inkling) {
         add("--spec", "auto");
         add("--draft-tokens", "auto");
-        // The proposal head pays off with DFlash/DFlash2 and the small-model MTP drafters, not on the
-        // 122B whose MTP rounds measured no gain from it. On Inkling 2 it is offered, not defaulted: unmeasured here.
-        if (model.has_proposal && model.family != "qwen3.5-122b-a10b" && !inkling) { add("--lm-head-draft"); }
+        // The proposal head pays off with DFlash/DFlash2, the small-model MTP drafters and Inkling 2's DSpark (its
+        // shortlist decoded 2.4-5.8 % faster on nine prompts, the output unchanged), not on the 122B whose MTP rounds
+        // measured no gain from it. On Inkling 2 the option needs the artifact's ranking and DSpark drafter.
+        if (model.has_proposal && model.family != "qwen3.5-122b-a10b") { add("--lm-head-draft"); }
     }
     if (drafter != nullptr) { add("--draft-model", path_utf8(drafter->path)); }
     if (model.family == "qwen3.8-27b" && model.has_dflash2) { add("--ngram-draft-tokens", "auto"); }

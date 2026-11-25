@@ -194,8 +194,8 @@ Inkling 2) accepts, from what the engine accepts and reads for it, and which `--
 `--max-context auto` apply. The same table builds the default arguments and filters every launch, preview and
 **Will it fit?** plan: a saved value for an option the model does not take is left out of the command line, and the
 preview names it. A model type the launcher does not know is not restricted. Inkling 2's defaults are
-`--max-context auto` and `--spec auto --draft-tokens auto` (DSpark when the artifact bundles it); `--lm-head-draft` is
-offered when the artifact holds its `proposal/token_rank` parameter, and **Sliding-window KV format**
+`--max-context auto` and `--spec auto --draft-tokens auto` (DSpark when the artifact bundles it), with `--lm-head-draft`
+when the artifact holds its `proposal/token_rank` parameter and DSpark drafter. The form offers **Sliding-window KV format**
 (`--kv-window-dtype`) beside **KV cache format** for Inkling 2 only. The **DFlash2 drafter** and **N-gram volume**
 pickers (Qwen3.8-Flash-Next) list the compatible
 files found and write `--draft-model` and `--ngram-volume`; the **LoRA adapter** picker (the dense
@@ -279,6 +279,7 @@ Defaults per family (README "Recommended settings per model"):
 | Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --max-context auto` (the context the GPU's memory holds beside the artifact, below) |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
 | Qwen3.5-122B-A10B | `--max-context 262144` |
+| Inkling 2 Mini | `--max-context auto` and, with the artifact's token ranking and DSpark drafter, `--lm-head-draft` |
 
 No family sets `--host-context-mib`: `infernix-serve`'s default (`auto`) gives the Host prefix cache all the RAM
 the model and its experts leave beyond `--ram-free-mib` ([serving guide](serving.md)).
