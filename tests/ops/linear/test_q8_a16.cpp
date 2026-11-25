@@ -39,6 +39,8 @@ constexpr std::array kGeometries{
     Geometry{2560, 12800, 383U},
     // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
     Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
+    // A DSpine drafter's attention output (n5120_k6144's schedules).
+    Geometry{5120, 4096, 389U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
     Geometry{2560, 4096, 331U}};
 
