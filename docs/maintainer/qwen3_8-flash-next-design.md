@@ -10741,7 +10741,11 @@ Also measured and rejected (2026-10-10, Dense8, against the PDL pair):
   link and the SSD tier, so nothing measured them. **The bound
   (2026-11-12, the fix sweep's FS-02):** 10 s without progress (`wait_job_count`: each change of the count
   restarts it), the host heartbeat's bound; it was 2 s of elapsed time, which fired on 11-08 under contention and
-  failed every request of a healthy Engine. ninferpro measured -0.7..-1.4 % forward time on its dp4a kernels (12 columns level,
+  failed every request of a healthy Engine. **Since 2026-11-24 (candidates JM-02)** a wait that has lasted 1 ms reads
+  the call's error word once a millisecond (mapped host memory: one PCIe read a waiting CTA a millisecond, never on a
+  wait that ends sooner) and gives up when it is set, so a failed call's later waits (other CTAs, later layers of
+  the graph) cost a millisecond each, not their own bound (`wait_job_count`, the A16 ring's down wait; the Inkling
+  2 MoE's `wait_count` the same). ninferpro measured -0.7..-1.4 % forward time on its dp4a kernels (12 columns level,
   18 grid-wide ahead). Measured here against the grid-wide wait (2026-11-08, a temporary switch since
   removed; three ABBA blocks of fresh processes, BF16 KV, the same tokens): FP4-Local with DFlash2 and
   n-gram auto conv 213.6 -> 215.4 tok/s (+0.6..+1.1 % in each block), struct 474.8 -> 477.7

@@ -405,6 +405,71 @@ LimbRow encode_a16(const std::vector<float>& v) {
     return r;
 }
 
+__global__ void empty_gate_up_kernel() {}
+
+// A lost count bounds a whole round, not each wait (candidates JM-02): the call's graph with its gate/up pass emptied, so
+// no down CTA's job count ever arrives. The first replay waits out one bound (2 s) and sets kErrorDownStalled; replays
+// that find the word already set give up after the waits' poll interval (1 ms), not a bound a CTA wave each, which is
+// how an emptied producer once spun ~12 h. The word is cleared again afterwards.
+void check_stall_bound(cudaGraph_t graph, const moe::Workspace& ws, cudaStream_t stream) {
+    static bool checked = false;
+    if (checked) { return; }
+    checked = true;
+    cuda_check(cudaFuncSetAttribute(empty_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
+               "attribute");
+    cudaGraph_t stalled = nullptr;
+    cuda_check(cudaGraphClone(&stalled, graph), "clone");
+    std::size_t count = 0;
+    cuda_check(cudaGraphGetNodes(stalled, nullptr, &count), "nodes");
+    std::vector<cudaGraphNode_t> nodes(count);
+    cuda_check(cudaGraphGetNodes(stalled, nodes.data(), &count), "nodes");
+    int emptied = 0;
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type{};
+        cuda_check(cudaGraphNodeGetType(node, &type), "type");
+        if (type != cudaGraphNodeTypeKernel) { continue; }
+        cudaKernelNodeParams params{};
+        cuda_check(cudaGraphKernelNodeGetParams(node, &params), "params");
+        const char* name = nullptr;
+        cuda_check(cudaFuncGetName(&name, params.func), "name");
+        if (name == nullptr || std::strstr(name, "gate_up") == nullptr) { continue; }
+        params.func         = reinterpret_cast<void*>(empty_gate_up_kernel);
+        params.kernelParams = nullptr;
+        params.extra        = nullptr;
+        cuda_check(cudaGraphKernelNodeSetParams(node, &params), "set params");
+        ++emptied;
+    }
+    check(emptied >= 1, "the stall check found no gate/up pass to empty");
+    cudaGraphExec_t exec = nullptr;
+    cuda_check(cudaGraphInstantiate(&exec, stalled, 0), "instantiate");
+    cudaEvent_t start, stop;
+    cuda_check(cudaEventCreate(&start), "event");
+    cuda_check(cudaEventCreate(&stop), "event");
+    const auto replay_ms = [&] {
+        cuda_check(cudaEventRecord(start, stream), "event");
+        cuda_check(cudaGraphLaunch(exec, stream), "stalled replay");
+        cuda_check(cudaEventRecord(stop, stream), "event");
+        cuda_check(cudaEventSynchronize(stop), "stalled replay");
+        float ms = 0;
+        cuda_check(cudaEventElapsedTime(&ms, start, stop), "event");
+        return ms;
+    };
+    const float first = replay_ms();
+    check(download(ws.error, 1)[0] == moe::kErrorDownStalled, "a lost count did not set kErrorDownStalled");
+    float later = 0;
+    for (int i = 0; i < 2; ++i) { later = std::max(later, replay_ms()); }
+    std::printf("stall bound: first replay %.0f ms (one 2 s bound), replays with the word set at most %.1f ms\n", first,
+                later);
+    check(first >= 1900.0F && first < 8000.0F, "the first stalled replay did not wait about one bound");
+    check(later < 200.0F, "a wait that found the error word set still waited out its bound");
+    cuda_check(cudaMemsetAsync(ws.error, 0, sizeof(std::uint32_t), stream), "clear");
+    cuda_check(cudaStreamSynchronize(stream), "clear");
+    cuda_check(cudaEventDestroy(start), "event");
+    cuda_check(cudaEventDestroy(stop), "event");
+    cuda_check(cudaGraphExecDestroy(exec), "destroy");
+    cuda_check(cudaGraphDestroy(stalled), "destroy");
+}
+
 Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* workspace,
            int capacity = moe::kMaxColumns, bool a16 = false, moe::Nvfp4Core core = moe::Nvfp4Core::Native,
            bool a8x = false) {
@@ -496,6 +561,7 @@ Result run(const HostBank& b, const DeviceBank& db, const Call& call, void* work
             cuda_check(cudaStreamSynchronize(stream), "replay");
             check(download(d_out, entries * H) == r.out, "a graph replay (programmatic down pass) differs from the eager call");
         }
+        if (call.columns > 1) { check_stall_bound(graph, ws, stream); }
         cuda_check(cudaGraphExecDestroy(exec), "destroy");
         cuda_check(cudaGraphDestroy(graph), "destroy");
         cuda_check(cudaStreamDestroy(stream), "stream");

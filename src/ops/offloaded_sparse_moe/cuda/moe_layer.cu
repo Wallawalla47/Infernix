@@ -249,28 +249,45 @@ __device__ __forceinline__ void report_error(const MoeExpertSource& source, std:
     *reinterpret_cast<volatile std::uint32_t*>(source.error) = (static_cast<std::uint32_t>(layer) << 16U) | (code & 0xFFFFU);
 }
 
+// A bounded wait that has lasted kErrorPollNs reads the call's error word once every kErrorPollNs (mapped host memory:
+// one PCIe read a millisecond a waiting CTA, never on a wait that ends sooner) and gives up at once when it is set: the
+// call has already failed, so its later waits (other CTAs, later layers of the same graph) each cost a millisecond, not
+// their own bound (candidates JM-02).
+constexpr std::uint64_t kErrorPollNs = 1'000'000ULL;
+
+__device__ __forceinline__ bool error_set(const MoeExpertSource& source) {
+    return source.error != nullptr && *reinterpret_cast<const volatile std::uint32_t*>(source.error) != 0U;
+}
+
 // A narrow down CTA's thread 0: waits until its job's count at `count` equals `ready` (reaches it with `at_least`),
 // acquiring every store the count's releases cover. The bound (MoeExpertSource::down_ready_timeout_ns) is GPU time
 // without progress: each change of the count restarts it, so a job whose gate/up CTAs are descheduled for a while (a
 // GPU shared with another process) is not failed for being slow (the fix sweep's FS-02: the former 2 s bound on
 // elapsed time fired on 11-08 under contention, and kErrorDownStalled fails every running and paused request).
-// Returns false, with kErrorDownStalled in the call's error word, once the bound passes without progress.
+// Returns false, with kErrorDownStalled in the call's error word, once the bound passes without progress, and at once
+// when a wait that has lasted kErrorPollNs finds the word already set (error_set).
 __device__ inline bool wait_job_count(const MoeExpertSource& source, const std::uint32_t* count, std::uint32_t ready,
                                       bool at_least = false) {
     const auto done = [&](std::uint32_t v) { return at_least ? v >= ready : v == ready; };
     std::uint32_t seen = load_acquire_gpu(count);
     if (done(seen)) { return true; }
     std::uint64_t entered = global_ns();
+    std::uint64_t poll    = entered + kErrorPollNs;
     for (;;) {
         __nanosleep(64);
         const std::uint32_t now = load_acquire_gpu(count);
         if (done(now)) { return true; }
+        const std::uint64_t at = global_ns();
         if (now != seen) {
             seen    = now;
-            entered = global_ns();
-        } else if (global_ns() - entered > source.down_ready_timeout_ns) {
+            entered = at;
+        } else if (at - entered > source.down_ready_timeout_ns) {
             report_error(source, offloaded_moe::kErrorDownStalled);
             return false;
+        }
+        if (at >= poll) {
+            poll = at + kErrorPollNs;
+            if (error_set(source)) { return false; }
         }
     }
 }

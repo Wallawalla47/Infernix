@@ -281,6 +281,80 @@ void check_trailing_calls(int experts, int columns, int top_k, const float* d_lo
 // `shared_input` (W4A4): every expert shares its gate and up input scales, as NVIDIA's exports do, and the source says
 // so (MoeExpertSource::a4_shared_input), so every call's narrow jobs take the tensor-core narrow kernels;
 // otherwise every third expert keeps separate scales and the one-column kernels run.
+__global__ void empty_gate_up_kernel() {}
+
+// A failed call's later waits cost a poll interval, not their bound (candidates JM-02): the call's graph with its
+// gate/up grids emptied, so no down CTA's job count ever arrives, under a 3 s down-wait bound. With the error word
+// clear the first replay waits about one bound and sets kErrorDownStalled; replays that find the word already set end
+// within 200 ms (before the fix each waited its bound per CTA wave). Once per run, on a shared-input W4A4 source: only
+// the tensor-core narrow kernels' down grid waits on its job's gate/up counts (wait_job_count); the one-column
+// kernels' down grid waits for the whole gate/up grid (programmatic dependent launch), which an emptied grid
+// satisfies at once (the first form of this check, on such a source, saw a 1 ms replay and no error word).
+bool g_failed_call_checked = false;
+
+void check_failed_call_waits(const Tensor& tx, const infernix::ops::MoeDispatch& dispatch,
+                             infernix::ops::MoeExpertSource source, int top_k, int max_jobs, void* d_workspace,
+                             Tensor& out, std::uint32_t* error_host) {
+    if (g_failed_call_checked || source.activation != infernix::ops::offloaded_moe::ExpertActivation::kA4 ||
+        !source.a4_shared_input) {
+        return;
+    }
+    g_failed_call_checked        = true;
+    source.down_ready_timeout_ns = 3'000'000'000ULL;
+    cuda_check(cudaFuncSetAttribute(empty_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
+               "attribute");
+    cuda_check(cudaDeviceSynchronize(), "before the capture");
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    cudaGraph_t graph = nullptr;
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+    infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, stream);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+    std::size_t count = 0;
+    cuda_check(cudaGraphGetNodes(graph, nullptr, &count), "nodes");
+    std::vector<cudaGraphNode_t> nodes(count);
+    cuda_check(cudaGraphGetNodes(graph, nodes.data(), &count), "nodes");
+    int emptied = 0;
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type{};
+        cuda_check(cudaGraphNodeGetType(node, &type), "type");
+        if (type != cudaGraphNodeTypeKernel) { continue; }
+        cudaKernelNodeParams params{};
+        cuda_check(cudaGraphKernelNodeGetParams(node, &params), "params");
+        const char* name = nullptr;
+        cuda_check(cudaFuncGetName(&name, params.func), "name");
+        if (name == nullptr || std::string_view(name).find("gate_up") == std::string_view::npos) { continue; }
+        params.func         = reinterpret_cast<void*>(empty_gate_up_kernel);
+        params.kernelParams = nullptr;
+        params.extra        = nullptr;
+        cuda_check(cudaGraphKernelNodeSetParams(node, &params), "set params");
+        ++emptied;
+    }
+    check(emptied >= 1, "the failed-call check found a gate/up grid to empty");
+    cudaGraphExec_t exec = nullptr;
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    const auto replay_ms = [&] {
+        const auto start = std::chrono::steady_clock::now();
+        cuda_check(cudaGraphLaunch(exec, stream), "graph launch");
+        cuda_check(cudaStreamSynchronize(stream), "replay");
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+    const double first          = replay_ms();
+    const std::uint32_t error   = *reinterpret_cast<volatile std::uint32_t*>(error_host);
+    double later                = 0;
+    for (int i = 0; i < 2; ++i) { later = std::max(later, replay_ms()); }
+    std::printf("failed-call waits: first replay %.0f ms (error word %#x), replays with the word set at most %.1f ms\n",
+                first, error, later);
+    check(error == infernix::ops::offloaded_moe::kErrorDownStalled, "an emptied gate/up pass sets kErrorDownStalled");
+    check(first >= 2900.0 && first < 20000.0, "the first replay waits about one bound");
+    check(later < 200.0, "a wait that found the error word set still waited out its bound");
+    *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+    cuda_check(cudaGraphExecDestroy(exec), "destroy");
+    cuda_check(cudaGraphDestroy(graph), "destroy");
+    cuda_check(cudaStreamDestroy(stream), "stream");
+}
+
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 moe::ExpertActivation activation = moe::ExpertActivation::kA4,
                 moe::NarrowA16 narrow = moe::NarrowA16::kExact, moe::WideA16 wide = moe::WideA16::kExact,
@@ -913,6 +987,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 ++g_down_stalls;
                 check(error == moe::kErrorDownStalled, "a down pass past its bound sets kErrorDownStalled");
             }
+            check_failed_call_waits(tx, dispatch, source, top_k, max_jobs, d_workspace, out, error_host);
             continue;
         }
         if (config.idle > 0) {
@@ -2433,6 +2508,7 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             std::printf("zero down-wait bound: kErrorDownStalled in %d layer configurations (%d calls in all)\n",
                         g_down_stalls, g_stall_calls);
             check(g_down_stalls > 0, "a zero down-wait bound reaches kErrorDownStalled");
+            check(g_failed_call_checked, "the failed-call wait check ran (a shared-input W4A4 stall configuration)");
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());

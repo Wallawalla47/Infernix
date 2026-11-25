@@ -249,18 +249,24 @@ __global__ void __launch_bounds__(kRingThreads, kRingMinBlocksPerSm) narrow_ring
                 // is: each gate/up task that finishes (job_done) restarts the bound, so a GPU time-sliced with
                 // another process stalls without failing every request, while a defect (no task finishing) still
                 // fails the call through its error word, never hangs the stream. A ready job costs one acquire
-                // load, as before.
+                // load, as before; a wait that finds the word already set gives up at once (error_set).
                 if (ctid == 0 && ring_load_acquire(&a.job_ready[t.job]) == 0U) {
                     std::uint32_t seen     = ring_load_acquire(&a.job_done[t.job]);
                     std::uint64_t entered  = global_ns();
+                    std::uint64_t poll     = entered + kErrorPollNs;
                     do {
                         const std::uint32_t done = ring_load_acquire(&a.job_done[t.job]);
+                        const std::uint64_t at   = global_ns();
                         if (done != seen) {
                             seen    = done;
-                            entered = global_ns();
-                        } else if (global_ns() - entered > a.source.down_ready_timeout_ns) {
+                            entered = at;
+                        } else if (at - entered > a.source.down_ready_timeout_ns) {
                             report_error(a.source, offloaded_moe::kErrorDownStalled);
                             break;
+                        }
+                        if (at >= poll) {
+                            poll = at + kErrorPollNs;
+                            if (error_set(a.source)) { break; }
                         }
                         __nanosleep(128);
                     } while (ring_load_acquire(&a.job_ready[t.job]) == 0U);
