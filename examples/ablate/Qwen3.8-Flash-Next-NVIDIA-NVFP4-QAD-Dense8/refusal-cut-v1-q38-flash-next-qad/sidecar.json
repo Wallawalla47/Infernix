@@ -77,7 +77,7 @@
   "47": 1.112489901707375
  },
  "generation": {
-  "source": "HarmBench standard behaviors (MIT): 160 of the 200, against 160 matched harmless counterparts written for this fit; Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8; prompts rendered with the artifact's chat template, thinking off; the hidden state after each layer (the next layer's input) at the last prompt token; the difference of the class means, orthogonalized against the harmless mean (heretic 1.4's projected abliteration); one global direction, interpolated at layer index 31.67 between the per-layer directions",
+  "source": "HarmBench standard behaviors (MIT): 160 of the 200, against 160 matched harmless counterparts written for this fit; Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8; prompts rendered with the artifact's chat template, thinking off; hidden states from an earlier capture that read the forward-pass test's position-major recordings layer by layer, so each per-layer vector mixes positions, hyper-connection streams and layers (not the last-prompt-token state); the difference of the class means, orthogonalized against the harmless mean (heretic 1.4's projected abliteration); one global direction, interpolated at layer index 31.67 between the per-layer directions",
   "notes": "alphas: heretic-style per-lane bands (attn layers 22-47, mlp layers 8-47) fitted by Optuna TPE over 300 trials on refusals of the other 40 behaviors; this trial: 1/40 refused (stock: 40/40), first-token KL 0.235 on their harmless counterparts; d.f32.bin sha256 8b68133ea1a506ba5a10ecdf190a2d51558fe3a9a349e86da7d864df68a8fc27"
  }
 }

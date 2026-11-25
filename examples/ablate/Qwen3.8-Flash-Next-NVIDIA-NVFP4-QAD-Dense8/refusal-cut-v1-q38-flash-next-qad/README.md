@@ -25,9 +25,15 @@ Remove `--ablate` and the model is the stock model again. The format and what th
 - **Prompts:** HarmBench's 200 standard behaviors (MIT), split by category and kind of request into 160 for the direction
   and 40 held out, each paired with a harmless counterpart on the same topic, written for this fit.
 - **Direction:** the method of [heretic](https://github.com/p-e-w/heretic) 1.4. The prompts are rendered with the
-  artifact's chat template (thinking off) and read at the last prompt token, after each layer. The direction is the
-  difference of the two class means, orthogonalized against the harmless mean. This sidecar uses one global direction,
-  interpolated at layer index 31.67 between the per-layer ones.
+  artifact's chat template (thinking off). The direction is the difference of the two class means, orthogonalized
+  against the harmless mean. This sidecar uses one global direction, interpolated at layer index 31.67 between the
+  per-layer ones. The hidden states came through an earlier capture that read the forward-pass test's recordings
+  layer by layer where the test writes them position by position, so each "per-layer" vector mixes positions,
+  hyper-connection streams and layers: this is not the last-prompt-token direction the method describes (on
+  two later checks, of 300 and 2,100 tokens, that reading differs from the correct one by 1.97 and 2.89 relative L2;
+  the fit's own prompts were not re-read). `tools/ablate` now
+  reads the last prompt token through `/v1/score` ([fitting guide](../../../../docs/ablate-fitting.md)). The
+  results below were measured with this `d.f32.bin` as shipped.
 - **Alphas:** heretic's per-lane band shape (peak, position, floor, width), searched by Optuna TPE over 300 trials. Each
   trial counted refusals on the 40 held-out behaviors, with the first-token KL divergence on their counterparts bounded
   at 0.4. This is trial 115: 1 of 40 refused (stock: 40 of 40), KL 0.235.
