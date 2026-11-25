@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1514,6 +1515,7 @@ public:
         out.device.state     = plan_.state + plan_.io;
         out.device.workspace = plan_.workspace;
         out.device.adapter   = p_.adapter_bytes(); // --lora's factors and --ablate's direction (0 without them)
+        out.device.cuda_graphs = graph_bytes_.load(std::memory_order_relaxed);
         out.device.kv_used   = mapped_pages() * plan_.page_bytes;
         out.host.staging   = host_.size();
         return out;
@@ -1526,6 +1528,8 @@ public:
                                                                                                           // the lanes share
         out.kv_cache         = kv_storage(o_.kv_codec);
         out.kv_payload_bytes = plan_.kv;
+        out.cuda_graph_allowance_bytes = plan_.graphs;
+        out.cuda_graph_measured_bytes  = graph_bytes_.load(std::memory_order_relaxed);
         out.adapter_bytes    = p_.adapter_bytes();
         return out;
     }
@@ -2396,7 +2400,7 @@ private:
                 drafter_->download(steps, device_.stream);
             });
             DecodeGraphExecutable exec;
-            exec.instantiate(definition);
+            instantiate_graph(exec, definition);
             found = draft_graphs_.emplace(steps, std::move(exec)).first;
         }
         return found->second;
@@ -2418,7 +2422,7 @@ private:
                 if (sample) { launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode); }
             });
             DecodeGraphExecutable exec;
-            exec.instantiate(definition);
+            instantiate_graph(exec, definition);
             found = graphs_.emplace(key, std::move(exec)).first;
         }
         return found->second;
@@ -2854,10 +2858,34 @@ private:
             if (sample) { launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode); }
         });
         DecodeGraphExecutable exec;
-        exec.instantiate(definition);
+        instantiate_graph(exec, definition);
         const std::uint64_t key = (sample ? 0ULL : kForwardOnlyGraph) | static_cast<std::uint64_t>(lanes) << 32 |
                                   static_cast<std::uint32_t>(columns);
         return graphs_.emplace(key, std::move(exec)).first;
+    }
+
+    // Instantiates and uploads a graph, adding the device memory the two took (free memory before and after, in the
+    // driver's granularity) to the measured total (MemorySummary::cuda_graph_measured_bytes, beside the plan's
+    // allowance, ProgramDevicePlan::graphs). The upload is the one its first launch would make.
+    void instantiate_graph(DecodeGraphExecutable& exec, const DecodeGraphDefinition& definition) {
+        std::size_t before = 0, after = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&before, &total));
+        exec.instantiate(definition);
+        exec.upload(device_.stream);
+        CUDA_CHECK(cudaMemGetInfo(&after, &total));
+        const std::uint64_t taken = before > after ? before - after : 0U;
+        graph_bytes_.fetch_add(taken, std::memory_order_relaxed);
+        const std::uint32_t count = graph_executables_.fetch_add(1, std::memory_order_relaxed) + 1U;
+        if (o_.diagnostics.callback) {
+            constexpr double kMiB = 1024.0 * 1024.0;
+            char text[200];
+            std::snprintf(text, sizeof(text),
+                          "Inkling 2: CUDA graph %u took %.1f MiB; %u executables %.1f MiB of the %.0f MiB allowance",
+                          count, static_cast<double>(taken) / kMiB, count,
+                          static_cast<double>(graph_bytes_.load(std::memory_order_relaxed)) / kMiB,
+                          static_cast<double>(plan_.graphs) / kMiB);
+            o_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Debug, .message = text});
+        }
     }
 
     // Every uniform decode call's graph, at startup (design §8): (lanes, columns) for 1 <= columns <= lanes <= the
@@ -3028,6 +3056,9 @@ private:
     int slot_ = 0;
     std::optional<std::uint32_t> binding_;
     std::optional<ResumeState> pause_;   // a pause the Engine has not polled yet (start_pause)
+    // The CUDA graphs instantiated so far and the device memory they took (instantiate_graph).
+    std::atomic<std::uint64_t> graph_bytes_{0};
+    std::atomic<std::uint32_t> graph_executables_{0};
     std::vector<std::int32_t> penalty_host_; // a resumed lane's penalty counts on the host (rebuild_counts)
     std::optional<std::uint64_t> pending_;
     PendingKind pending_kind_ = PendingKind::Decode;
@@ -3160,7 +3191,7 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
             executables += lanes * static_cast<std::uint64_t>(ops::inkling2::kDSparkBlock - 1) * 2 +
                            static_cast<std::uint64_t>(ops::inkling2::kMarkovSteps);
         }
-        out.graphs = executables * kGraphExecutableBytes;
+        out.graphs = kGraphDriverBytes + executables * kGraphExecutableBytes;
     }
     return out;
 }

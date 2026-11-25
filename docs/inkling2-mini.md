@@ -219,8 +219,10 @@ Measured quality per format: [design §7.6](maintainer/inkling2_mini-design.md#7
 ## Context, lanes and the prefix cache
 
 - **One KV pool for every lane.** `--kv-capacity` sizes the pool (`auto`, the default with the
-  prefix cache, takes the VRAM the model leaves free), and it always holds at least one
-  `--max-context`. A request takes pages as its prompt and output grow, so four lanes with short
+  prefix cache, takes the VRAM the model leaves free, read as the Qwen models read it: the
+  `--vram-headroom-mib` comes off free memory, a 64 MiB margin off the Windows budget, and the
+  CUDA graphs' allowance counts in the plan), and it always holds at least one `--max-context`.
+  If a start still runs out of memory, an automatic pool starts once more with 1 GiB more headroom. A request takes pages as its prompt and output grow, so four lanes with short
   contexts all stay on the GPU. Pages no request holds keep cached prompt blocks.
 - **Pauses keep the output.** When the lanes together outgrow the pool, the Engine pauses a
   request at a round's end, as it does for the Qwen models. The paused request's KV blocks and
@@ -385,8 +387,8 @@ RTX 5090, PCIe Gen5 x8, default route, `--kv-dtype bf16`, one request unless not
 | Decode, DSpark `auto` with `--lm-head-draft`, same prompts | 316 / 667 / 228 tok/s |
 | Prefill | 16,261 tok/s at 2,048 tokens, 16,184 at 10,000, 15,733 at 16,384 |
 | Decode, several requests (total) | 312 / 452 / 648 tok/s at 2 / 4 / 8 requests |
-| Largest `--max-context auto`, BF16 KV (`--plan`, about 30 GiB of VRAM for the model; 2026-11-25, with the CUDA graphs' allowance) | 299,968 tokens; 295,168 with `--lm-head-draft`; 241,024 with `--lm-head-draft --vision` |
-| The same with `--kv-dtype int8` | 522,176 tokens; 513,984 with `--lm-head-draft`; 420,288 with `--lm-head-draft --vision` |
+| Largest `--max-context auto`, BF16 KV (`--plan`, about 30 GiB of VRAM for the model; 2026-11-25, with the CUDA graphs' allowance) | 300,160 tokens; 295,360 with `--lm-head-draft`; 241,216 with `--lm-head-draft --vision` |
+| The same with `--kv-dtype int8` | 522,560 tokens; 514,304 with `--lm-head-draft`; 420,608 with `--lm-head-draft --vision` |
 
 With `--kv-dtype int8` (2026-11-25, the same bench against `bf16` in one build, two runs each): plain decode 205.6
 tok/s after a 2,048-token prompt and 194.5 after 10,000 (`bf16` 204.8 / 195.0); prefill 16,243 tok/s at 2,048 tokens

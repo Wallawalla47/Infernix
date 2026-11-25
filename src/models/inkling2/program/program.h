@@ -51,9 +51,13 @@ struct ResumeStateImpl;
 } // namespace detail
 
 inline constexpr std::size_t kMaximumConcurrency = 8;
-// Device memory one CUDA graph executable may take once instantiated (the allowance of the Qwen families' ledger,
-// expert_offload::kGraphExecutableBytes: measured at 2.2-4.1 MiB an executable).
-inline constexpr std::uint64_t kGraphExecutableBytes = 4ULL << 20;
+// The CUDA graphs' allowance, the Qwen3.5 family's for its column-invariant decode (planning/startup.cpp
+// kGraphDriverAllowance, kGraphExecutableAllowanceColumnInvariant): 16 MiB for the driver and 3 MiB an executable.
+// Measured on Inkling 2 (RTX 5090, 2026-11-25, 240,000 tokens x 4 lanes, INT8 KV, DSpark, vision offloaded): each of 40
+// executables took no device memory the driver did not already hold, and the whole Program about 30 MiB more than its
+// plan without the allowance; with --vram-past-budget a pool sized without it ran out of memory at startup.
+inline constexpr std::uint64_t kGraphDriverBytes     = 16ULL << 20;
+inline constexpr std::uint64_t kGraphExecutableBytes = 3ULL << 20;
 // The widest prefill chunk: the forward's call capacity, bounded by the routed experts' dispatch.
 inline constexpr std::int32_t kMaxPrefillChunk = 8191;
 // The default chunk: the fastest measured (every chunk gives the same bits).
@@ -364,7 +368,8 @@ struct ProgramDevicePlan {
     std::uint64_t io            = 0; // per-call inputs, logits rows and sampling arrays
     std::uint32_t graph_bound   = 0;
     // The CUDA graph executables the Program may instantiate (the decode graphs at startup; their forward-only forms,
-    // DSpark's verify and draft graphs as rounds first need them), at the allowance Qwen's ledger takes for each.
+    // DSpark's verify and draft graphs as rounds first need them), at the Qwen3.5 family's allowance (kGraphDriverBytes
+    // and kGraphExecutableBytes each).
     std::uint64_t graphs        = 0;
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept { return kv + state + workspace + io + graphs; }
 };

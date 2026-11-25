@@ -1,6 +1,7 @@
 #include "runtime/engine/engine_plan.h"
 
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/expert_offload/memory_plan.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -29,6 +30,17 @@ std::size_t free_device_bytes(const VramSnapshot& s) noexcept {
     if (!s.has_budget) { return s.device_free; }
     const std::uint64_t left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
     return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
+}
+
+std::size_t kv_sizing_bytes(const VramSnapshot& s, bool automatic, std::size_t headroom, std::size_t retry_headroom) {
+    std::optional<std::uint64_t> budget_left;
+    if (s.has_budget && s.budget_allowance == 0) {
+        budget_left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
+    } else if (s.has_budget) {
+        return free_device_bytes(s);
+    }
+    return kv_available_bytes(automatic, s.device_free, budget_left, headroom,
+                              static_cast<std::size_t>(expert_offload::kVramBudgetMarginBytes) + retry_headroom);
 }
 
 std::size_t planned_free_after_weights(std::size_t free_now, std::uint64_t weights_bytes,

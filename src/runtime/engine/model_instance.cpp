@@ -296,23 +296,6 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
 
 namespace {
 
-// What a start resolves its KV capacity in (kv_available_bytes): an automatic capacity leaves `headroom` of
-// free device memory and, of the OS budget, the expert frames' margin (size_expert_frames) with the retry's
-// extra headroom, so a budget below free memory is not stacked on the display headroom (it cost up to 960 MiB
-// of KV with a display: 24.10 GiB free against 21.88 the budget left planned 20.88, now 21.82). Past the
-// budget (--vram-past-budget) the source's free memory is already the widened budget less usage, whose
-// allowance kept its own margin (kPastBudgetMargin): the headroom alone comes off it, as before.
-std::size_t kv_sizing_bytes(const VramSnapshot& s, bool automatic, std::size_t headroom, std::size_t retry_headroom) {
-    std::optional<std::uint64_t> budget_left;
-    if (s.has_budget && s.budget_allowance == 0) {
-        budget_left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
-    } else if (s.has_budget) {
-        return free_device_bytes(s);
-    }
-    return kv_available_bytes(automatic, s.device_free, budget_left, headroom,
-                              static_cast<std::size_t>(expert_offload::kVramBudgetMarginBytes) + retry_headroom);
-}
-
 std::size_t current_free_device_bytes(int device, bool past_budget) {
     return free_device_bytes(open_vram_budget_source(device, past_budget)->query());
 }

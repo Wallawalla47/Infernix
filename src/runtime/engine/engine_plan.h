@@ -30,6 +30,16 @@ void plan_readings(EnginePlan& plan, std::string gpu_name, const VramSnapshot& v
 // demoted to system memory, which the Program's spill guard refuses at startup (candidates VR-04).
 [[nodiscard]] std::size_t free_device_bytes(const VramSnapshot& s) noexcept;
 
+// What a resident model's start resolves its KV capacity in (kv_available_bytes), the Qwen3.5 family's and Inkling
+// 2's alike: an automatic capacity leaves `headroom` of free device memory and, of the OS budget, the expert frames'
+// margin (expert_offload::kVramBudgetMarginBytes) with the retry's extra headroom, so a budget below free memory is
+// not stacked on the display headroom (it cost up to 960 MiB of KV with a display: 24.10 GiB free against 21.88 the
+// budget left planned 20.88, now 21.82). Past the budget (--vram-past-budget) the source's free memory is already the
+// widened budget less usage, whose allowance kept its own margin (kPastBudgetMargin): the headroom alone comes off
+// it. The value includes the headroom, which the capacity's resolution takes off.
+[[nodiscard]] std::size_t kv_sizing_bytes(const VramSnapshot& s, bool automatic, std::size_t headroom,
+                                          std::size_t retry_headroom);
+
 // A start's memory refusal: the plan does not fit, and the first refusal is its error.
 void plan_refuse(EnginePlan& plan, std::string refusal);
 
