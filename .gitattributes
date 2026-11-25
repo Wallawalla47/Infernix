@@ -14,6 +14,7 @@
 /eval/corpora/** eol=lf
 /tools/freq_corpus/fixtures/** eol=lf
 /tools/chat_templates/** eol=lf
+/tools/ablate/prompts/** eol=lf
 # Binary fixtures under those paths stay untouched.
 /bench/fixtures/**/*.png binary
 /tools/freq_corpus/fixtures/**/*.i64 binary

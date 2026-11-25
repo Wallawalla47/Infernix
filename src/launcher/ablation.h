@@ -8,7 +8,8 @@
 // `ablate-python` beside the launcher), installs the tool's packages (numpy and optuna, from PyPI) into
 // <data>/ablation/packages, downloads public prompt sets (the tool's `datasets fetch`, pinned files checked by
 // their SHA-256) into <data>/ablation/prompts, and runs one fit at a time: `init` with the configuration's command
-// line, then `auto`, whose sidecar lands in <data>/ablation/sidecars/<name>.
+// line, then `auto`, whose sidecar lands in <data>/ablation/sidecars/<name>. After a run, `choose` keeps another
+// trial of its study (a point of the front its progress shows) as a sidecar of its own.
 //
 // A fit starts its own infernix-serve engines on the whole card, so the launcher unloads its model first and loads
 // none until the run ends (Hooks::take_gpu, release_gpu). A run is resumable: the same configuration (its command
@@ -84,6 +85,10 @@ public:
     // anything is unloaded), then takes the GPU and runs `auto` on a thread of its own. std::invalid_argument with the
     // reason when it cannot start.
     void start(const AblationRun& run);
+    // Keeps trial `trial` of the last run's study as the sidecar `name`: the tool's `choose` grades it on the test pair
+    // and exports it, with the GPU taken as for a run. std::invalid_argument with the reason when it cannot start (a
+    // run in progress, no finished trials, a name that is taken or not a folder name).
+    void choose(int trial, const std::string& name);
     // Asks the run to stop: the tool stops its engines and keeps its finished work (ended after three minutes if it
     // has not). `now` ends it at once, its engines too: work since the last finished trial is lost.
     void stop(bool now = false);
@@ -110,9 +115,14 @@ private:
         std::int64_t started = 0;
         std::int64_t ended   = 0;
     };
+    struct Choice {
+        int trial = 0;
+        std::string name; // the sidecar's folder name
+    };
     struct Job {
         AblationRun run;
         std::filesystem::path run_dir;
+        std::optional<Choice> choice; // a `choose` job: the trial it keeps; else a fit (`auto`)
         // waiting_gpu, running, stopping, done, no_sidecar, stopped, failed
         std::string state;
         std::string message;
@@ -123,6 +133,9 @@ private:
         std::optional<std::string> exported; // the sidecar.json written
     };
 
+    // Looks for a Python if nothing has yet (state() does on its first call): a request that comes before the page's
+    // first read, from a page left open across a launcher restart say, must not act as if none were installed.
+    void ensure_detected();
     [[nodiscard]] std::vector<std::string> tool_args(std::vector<std::string> args) const;
     [[nodiscard]] EnvOverlay tool_env(const EnvOverlay& extra = {}) const;
     [[nodiscard]] bool packages_ready_locked() const;
@@ -142,6 +155,11 @@ private:
     void run_task(Task task, std::function<std::string(std::filesystem::path& executable)> prepare,
                   std::vector<std::string> args, EnvOverlay env, std::function<std::string(int code)> finish);
     void job_main();
+    // The checks start and choose share (control_mutex_ held): the launcher, the tool, Python and its packages are
+    // ready and no run or installation is under way. Returns the Python to run.
+    [[nodiscard]] Python ready_for_job();
+    // Installs `job` as the current one and starts its thread (control_mutex_ held).
+    void launch_job(Job job);
     void finish_job(const std::string& state, const std::string& message);
     // The engines a run's tool left (run/engines/<pid>.json) when it was ended: they are ended too.
     void end_leftover_engines(const std::filesystem::path& run_dir);

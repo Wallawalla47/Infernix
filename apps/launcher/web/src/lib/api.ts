@@ -193,6 +193,7 @@ export const api = {
   ablationFetch: (preset: string) => request<AblationState>("POST", `ablation/prompts/${enc(preset)}`),
   ablationStart: (body: { config: string; preset: string; trials: number; name: string }) =>
     request<AblationState>("POST", "ablation/runs", body),
+  ablationChoose: (trial: number, name: string) => request<AblationState>("POST", "ablation/choose", { trial, name }),
   ablationStop: (now = false) => request<AblationState>("POST", "ablation/stop", { now }),
 };
 

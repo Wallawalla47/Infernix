@@ -327,10 +327,11 @@ the destination becomes a model folder and is scanned. A Hugging Face token (set
 **Ablation** makes a refusal-ablation sidecar ([`--ablate`](ablate.md)) for one of the library's models
 on this computer with the fitter in `tools/ablate` ([fitting guide](ablate-fitting.md)). It records the
 model's hidden states on harmful and harmless prompts and computes the direction its activations use to
-refuse. It then searches for the layers and strengths whose cut removes the most refusals while the
-first token on harmless prompts stays close to the stock model's (first-token KL below 0.4 on 40 held-out
-prompts of each list), grades the pick on a test pair the fit never saw and exports it. The page has
-three steps:
+refuse. It then searches for the layers and strengths whose cut both removes refusals and keeps the first
+token on harmless prompts close to the stock model's (first-token KL; 40 held-out prompts of each list
+grade every trial), grades the best few cuts on a validation pair the search never scored, picks the best
+balance of the two there, grades the pick on a test pair neither saw and exports it. The page has three
+steps:
 
 1. **The tool.** A release keeps the fitter in the `ablate` folder beside the launcher (`--ablate-tool`
    names another; a build tree finds `tools/ablate` of the checkout it is in). It needs Python 3.11 or
@@ -351,13 +352,17 @@ three steps:
    licences shown beside each source. A sidecar records its sets and their licences in its
    `generation.source`.
 
-   | Set | Fit prompts | Test pair | Licences |
+   | Set | Fit prompts | Validation and test pairs | Licences |
    |---|---|---|---|
-   | AdvBench + Alpaca (heretic's defaults) | 400 AdvBench behaviors, 400 Alpaca instructions | JBB-Behaviors, harmful and benign | AdvBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 (non-commercial use; its README limits it to research) |
-   | HarmBench + Alpaca | 200 HarmBench standard behaviors, 200 Alpaca instructions | JBB-Behaviors, harmful and benign | HarmBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 |
+   | HarmBench + matched counterparts (recommended) | 200 HarmBench standard behaviors, each paired with a harmless counterpart on the same subject (shipped with the fitter) | validation: JBB-Behaviors, harmful and benign; test: XSTest, unsafe and safe | HarmBench, JBB-Behaviors: MIT; the counterparts: Apache-2.0; XSTest: CC BY 4.0 |
+   | AdvBench + Alpaca (heretic's defaults) | 400 AdvBench behaviors, 400 Alpaca instructions | the same | AdvBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 (non-commercial use; its README limits it to research); XSTest: CC BY 4.0 |
+   | HarmBench + Alpaca | 200 HarmBench standard behaviors, 200 Alpaca instructions | the same | HarmBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0; XSTest: CC BY 4.0 |
 
-   Test prompts that are also fit prompts are dropped from the test pair (11 of JBB's harmful 100 are
-   AdvBench behaviors).
+   A validation prompt that is a fit prompt, and a test prompt that is a fit or validation prompt, is
+   dropped, word for word or nearly (13 of JBB's harmful 100 are HarmBench behaviors, some reworded; 11
+   are AdvBench ones). A set downloaded before the fitter had a validation pair shows as not downloaded
+   and is downloaded again. Matched pairs make the direction the refusal rather than the topic
+   ([why](ablate-fitting.md#matched-harmless-counterparts)), and the fit is told the lists are paired.
 3. **Make a sidecar.** Choose the model (a configuration: its launch parameters and environment are
    used as they are, without its own sidecar, since a sidecar is fitted to the model as you run it), the
    prompt set, the search (**Quick** 150 trials, **Standard** 300, the fitter's default, **Thorough**
@@ -368,8 +373,8 @@ A run takes the whole GPU. The loaded model is unloaded first, and no model load
 requests for a model are refused with the reason, and **Load** and the memory plan say so. Each trial
 starts the model twice (a generating engine for the refusals, a scoring one for the KL), so a trial takes
 roughly half a minute to a minute and a half on a large model, and a standard run several hours. The
-page shows the phases, the trials, the stock model's refusals, the best trial so far, an estimate of the
-time left and the fitter's output.
+page shows the phases, the trials, the stock model's refusals, the pick so far, the trade-off table, an
+estimate of the time left and the fitter's output.
 
 **Stop** asks the fitter to stop its engines (each saves its expert-cache state) and keeps every
 finished trial; **End now**, while it stops, ends it and its engines at once and loses the trial under
@@ -378,12 +383,24 @@ way. Starting the same configuration, prompt set and name again continues the sa
 failure; a changed command line, environment or `infernix-serve` starts a fresh one. The launcher stops
 a run before it exits; a run it could not finish shows as stopped when it starts again.
 
-The pick is the trial with the fewest held-out refusals among those whose KL is below the target, then
-the lowest KL. No sidecar is written when the stock model refuses none of the held-out prompts, no
-trial is below the target, or none refuses fewer than the stock model; the page says which. A sidecar
-goes to `ablation/sidecars/<name>`, which becomes a model folder, so it is listed on **Models** and
-offered first in its model's **Ablation sidecar** field; **Use it with** sets it there. Its test-pair
-results (refusals on both halves, and the KL where the stock model answered) are shown with it.
+The search minimizes both refusals and KL ([The fit](ablate-fitting.md#the-fit)), and the **trade-off
+table** shows what it found: for each number of held-out refusals, the lowest KL a trial reached (no
+other trial is better on both; fewer refusals usually cost KL). The balance is the lowest share of the
+stock model's refusals left plus the KL, so a KL of 1 weighs as much as all of them, among the trials
+below KL 0.4 that refuse fewer prompts than the stock model. Every trial is scored on the same held-out
+prompts, so the search fits them: the six rows best by that balance are graded on the validation pair
+(about as long as grading one arm of the test pair each), the table shows their validation refusals and
+KL, and the pick is the best balance on those numbers. No sidecar is written when the stock model refuses
+none of the prompts or no trial qualifies; the page says which. A sidecar goes to `ablation/sidecars/<name>`, which becomes a model folder, so it is listed on
+**Models** and offered first in its model's **Ablation sidecar** field; **Use it with** sets it there.
+Its test-pair results (refusals on both halves, and the KL where the stock model answered) are shown
+with it.
+
+**Export** on another row of the table keeps that trial instead, as a sidecar of its own named
+`<name>-t<trial>`: the fitter's `choose` validates it (when it is not one of the six), grades it on the
+same test pair and exports it, with the GPU
+taken as for a run (a few minutes). Its results replace the pick's on the page, the table stays, and the
+pick's sidecar is kept.
 
 ## Connect coding tools
 
@@ -703,5 +720,6 @@ and import, the fit plan, keep-alive streams, routes and the pin, prompt progres
 and sign-in, chats, idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
 started on a console without a window still stops its server in order. Its `ablation` group runs the
 [Ablation](#ablation) page's backend with `tools/launcher/ablate_stub.py` in place of the fitter (Set up installs a
-local wheel, so no network): the GPU taken from a loaded model and given back, a refused configuration, stop and
-resume, End now with a tool that ignores the stop, and the last run after a restart.
+local wheel, so no network): the GPU taken from a loaded model and given back, a refused configuration, another
+trial of the front kept with `choose`, stop and resume, End now with a tool that ignores the stop, and the last run
+after a restart.

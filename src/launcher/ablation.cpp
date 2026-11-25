@@ -328,6 +328,17 @@ Ablation::Ablation(fs::path data_dir, std::optional<fs::path> tool_dir, Hooks ho
             job.run.preset     = json_or<std::string>(run, "preset", "");
             job.run.trials     = json_or<int>(run, "trials", 300);
             job.run.name       = json_or<std::string>(run, "name", "");
+            if (run.contains("env") && run["env"].is_array()) {
+                for (const Json& pair : run["env"]) {
+                    if (pair.is_array() && pair.size() == 2 && pair[0].is_string() && pair[1].is_string()) {
+                        job.run.env.emplace_back(pair[0].get<std::string>(), pair[1].get<std::string>());
+                    }
+                }
+            }
+            if (saved.contains("choice") && saved["choice"].is_object()) {
+                job.choice = Choice{json_or<int>(saved["choice"], "trial", 0),
+                                    json_or<std::string>(saved["choice"], "name", "")};
+            }
             job.run_dir        = utf8_path(json_or<std::string>(saved, "run_dir", ""));
             job.state          = json_or<std::string>(saved, "state", "stopped");
             job.message        = json_or<std::string>(saved, "message", "");
@@ -537,9 +548,12 @@ Json Ablation::fetched_presets() const {
     for (const auto& entry : fs::directory_iterator(prompts_, error)) {
         std::error_code status;
         if (!entry.is_directory(status)) { continue; }
+        // A set fetched before the tool had a validation pair counts as not fetched, so the page fetches it again.
         const std::optional<std::string> text = read_file(entry.path() / "sets.json");
         if (!text || !fs::is_regular_file(entry.path() / "harmful.txt", status) ||
-            !fs::is_regular_file(entry.path() / "harmless.txt", status)) {
+            !fs::is_regular_file(entry.path() / "harmless.txt", status) ||
+            !fs::is_regular_file(entry.path() / "validate-harmful.txt", status) ||
+            !fs::is_regular_file(entry.path() / "validate-benign.txt", status)) {
             continue;
         }
         try {
@@ -569,6 +583,7 @@ Json Ablation::job_json_locked() const {
           {"trials", job_->run.trials},
           {"name", job_->run.name}}},
         {"run_dir", path_utf8(job_->run_dir)},
+        {"choice", job_->choice ? Json{{"trial", job_->choice->trial}, {"name", job_->choice->name}} : Json(nullptr)},
         {"state", job_->state},
         {"active", job_active_},
         {"message", job_->message},
@@ -580,13 +595,17 @@ Json Ablation::job_json_locked() const {
     };
 }
 
-Json Ablation::state() {
+void Ablation::ensure_detected() {
     bool detected = false;
     {
         std::lock_guard lock(mutex_);
         detected = detected_;
     }
     if (!detected) { detect_python(); }
+}
+
+Json Ablation::state() {
+    ensure_detected();
     load_catalogue();
     Json fetched = fetched_presets();
     std::lock_guard lock(mutex_);
@@ -699,6 +718,7 @@ void Ablation::run_task(Task task, std::function<std::string(fs::path& executabl
 
 void Ablation::setup() {
     std::lock_guard control(control_mutex_);
+    ensure_detected(); // else an undetected Python would look missing, and the portable one be downloaded for nothing
     bool download_python = false;
     std::string python_text;
     {
@@ -775,6 +795,8 @@ void Ablation::setup() {
 void Ablation::fetch(const std::string& preset) {
     std::lock_guard control(control_mutex_);
     if (!valid_preset(preset)) { throw std::invalid_argument("no prompt set " + preset); }
+    ensure_detected();
+    load_catalogue();
     std::optional<Python> python;
     std::string title = preset;
     {
@@ -816,21 +838,37 @@ void Ablation::fetch(const std::string& preset) {
     publish();
 }
 
-void Ablation::start(const AblationRun& request) {
-    std::lock_guard control(control_mutex_);
-    std::optional<Python> python;
+Ablation::Python Ablation::ready_for_job() {
+    ensure_detected();
+    std::lock_guard lock(mutex_);
+    if (shutting_down_) { throw std::invalid_argument("the launcher is stopping"); }
+    if (job_active_) { throw std::invalid_argument("a run is in progress: stop it first"); }
+    if (!tool_) { throw std::invalid_argument("the ablation tool was not found"); }
+    if (!python_) { throw std::invalid_argument("no Python 3.11 or newer was found"); }
+    if (!packages_ready_locked()) { throw std::invalid_argument("install the tool's packages first (Set up)"); }
+    if (task_running_ && task_ && task_->kind == "setup") {
+        throw std::invalid_argument("the tool's packages are being installed: wait for it");
+    }
+    return *python_;
+}
+
+void Ablation::launch_job(Job job) {
+    if (job_thread_.joinable()) { job_thread_.join(); } // the last run's thread, which has ended
     {
         std::lock_guard lock(mutex_);
-        if (shutting_down_) { throw std::invalid_argument("the launcher is stopping"); }
-        if (job_active_) { throw std::invalid_argument("a run is in progress: stop it first"); }
-        if (!tool_) { throw std::invalid_argument("the ablation tool was not found"); }
-        if (!python_) { throw std::invalid_argument("no Python 3.11 or newer was found"); }
-        if (!packages_ready_locked()) { throw std::invalid_argument("install the tool's packages first (Set up)"); }
-        if (task_running_ && task_ && task_->kind == "setup") {
-            throw std::invalid_argument("the tool's packages are being installed: wait for it");
-        }
-        python = python_;
+        job_            = std::move(job);
+        job_active_     = true;
+        stop_requested_ = false;
+        stop_now_       = false;
+        save_job_locked();
     }
+    job_thread_ = std::thread([this] { job_main(); });
+    publish();
+}
+
+void Ablation::start(const AblationRun& request) {
+    std::lock_guard control(control_mutex_);
+    const std::optional<Python> python = ready_for_job();
     if (!valid_name(request.name)) {
         throw std::invalid_argument("a sidecar name is 1 to 64 letters, digits, '.', '_' or '-', starting with a "
                                     "letter or digit");
@@ -898,28 +936,61 @@ void Ablation::start(const AblationRun& request) {
             throw std::invalid_argument("the ablation tool cannot fit this configuration:\n" + said);
         }
     }
-    if (job_thread_.joinable()) { job_thread_.join(); } // the last run's thread, which has ended
-    {
-        std::lock_guard lock(mutex_);
-        Job job;
-        job.run     = request;
-        job.run_dir = run_dir;
-        job.state   = "waiting_gpu";
-        job.message = "unloading the model";
-        job.started = now_ms();
-        job_        = std::move(job);
-        job_active_     = true;
-        stop_requested_ = false;
-        stop_now_       = false;
-        save_job_locked();
-    }
+    Job job;
+    job.run     = request;
+    job.run_dir = run_dir;
+    job.state   = "waiting_gpu";
+    job.message = "unloading the model";
+    job.started = now_ms();
     if (hooks_.event) {
         hooks_.event("info", "ablation run of " + request.model_name + " started: prompt set " + request.preset + ", " +
                                  std::to_string(request.trials) + " trials, sidecar " + request.name + " (" +
                                  path_utf8(run_dir) + ")");
     }
-    job_thread_ = std::thread([this] { job_main(); });
-    publish();
+    launch_job(std::move(job));
+}
+
+void Ablation::choose(int trial, const std::string& name) {
+    std::lock_guard control(control_mutex_);
+    (void)ready_for_job();
+    Job job;
+    {
+        std::lock_guard lock(mutex_);
+        // The trials are the last run's: its progress shows the front they came from.
+        const bool has_front = job_ && job_->progress.is_object() && job_->progress.contains("front") &&
+                               job_->progress["front"].is_array() && !job_->progress["front"].empty();
+        if (!has_front || job_->run_dir.empty()) {
+            throw std::invalid_argument("the last run has no finished trials to choose from");
+        }
+        job.run      = job_->run;
+        job.run_dir  = job_->run_dir;
+        job.progress = job_->progress; // shown until the tool writes its own, as keeping `trial`
+        job.progress["command"] = "choose";
+        job.progress["grade"]   = nullptr;
+        job.progress["export"]  = nullptr;
+        for (const Json& row : job.progress["front"]) {
+            if (row.is_object() && row.value("trial", -1) == trial) { job.progress["best"] = row; }
+        }
+    }
+    if (trial < 0) { throw std::invalid_argument("choose a trial of the last run"); }
+    if (!valid_name(name)) {
+        throw std::invalid_argument("a sidecar name is 1 to 64 letters, digits, '.', '_' or '-', starting with a "
+                                    "letter or digit");
+    }
+    std::error_code error;
+    if (fs::exists(sidecars_ / utf8_path(name), error)) {
+        throw std::invalid_argument("a sidecar named " + name + " exists in " + path_utf8(sidecars_) +
+                                    ": choose another name (or delete that one on the Models page)");
+    }
+    job.choice  = Choice{trial, name};
+    job.state   = "waiting_gpu";
+    job.message = "unloading the model";
+    job.started = now_ms();
+    if (hooks_.event) {
+        hooks_.event("info", "trial " + std::to_string(trial) + " of the ablation run of " + job.run.model_name +
+                                 " is graded and exported as the sidecar " + name);
+    }
+    launch_job(std::move(job));
 }
 
 void Ablation::stop(bool now) {
@@ -958,6 +1029,10 @@ void Ablation::save_job_locked() const {
     Json saved = job_json_locked();
     saved.erase("log");
     saved.erase("active");
+    // The configuration's environment, which a `choose` after a restart runs the tool with (the page is not sent it).
+    Json env = Json::array();
+    for (const auto& [name, value] : job_->run.env) { env.push_back({name, value}); }
+    saved["run"]["env"] = std::move(env);
     std::error_code error;
     fs::create_directories(root_, error);
     try {
@@ -999,7 +1074,7 @@ void Ablation::finish_job(const std::string& state, const std::string& message) 
         if (state == "done" && job_->progress.is_object() && job_->progress.value("export", Json(nullptr)).is_string()) {
             job_->exported = job_->progress["export"].get<std::string>();
         }
-        name     = job_->run.name;
+        name     = job_->choice ? job_->choice->name : job_->run.name;
         model    = job_->run.model_name;
         exported = job_->exported;
         job_active_ = false;
@@ -1019,11 +1094,13 @@ void Ablation::finish_job(const std::string& state, const std::string& message) 
 void Ablation::job_main() {
     AblationRun run;
     fs::path run_dir;
+    std::optional<Choice> choice;
     std::optional<Python> python;
     {
         std::lock_guard lock(mutex_);
         run     = job_->run;
         run_dir = job_->run_dir;
+        choice  = job_->choice;
         python  = python_;
     }
     const auto set = [this](const std::string& state, const std::string& message) {
@@ -1044,16 +1121,25 @@ void Ablation::job_main() {
     fs::remove(run_dir / "progress.json", error); // a resumed run's last account is not this one's
 
     const fs::path prompts = prompts_ / run.preset;
-    std::vector<std::string> args = {"auto",      path_utf8(run_dir),
-                                     "--harmful", path_utf8(prompts / "harmful.txt"),
-                                     "--harmless", path_utf8(prompts / "harmless.txt"),
-                                     "--trials",  std::to_string(run.trials),
-                                     "--out",     path_utf8(sidecars_),
-                                     "--name",    run.name};
+    std::vector<std::string> args =
+        choice ? std::vector<std::string>{"choose", path_utf8(run_dir), "--trial", std::to_string(choice->trial),
+                                          "--out", path_utf8(sidecars_), "--name", choice->name}
+               : std::vector<std::string>{"auto",       path_utf8(run_dir),
+                                          "--harmful",  path_utf8(prompts / "harmful.txt"),
+                                          "--harmless", path_utf8(prompts / "harmless.txt"),
+                                          "--trials",   std::to_string(run.trials),
+                                          "--out",      path_utf8(sidecars_),
+                                          "--name",     run.name};
     const auto present = [](const fs::path& file) {
         std::error_code status;
         return fs::is_regular_file(file, status) && fs::file_size(file, status) > 0;
     };
+    // The validation pair (the pick among the fit's best trials is made on it) and the test pair (the kept trial,
+    // graded once), when the set has them.
+    if (present(prompts / "validate-harmful.txt") && present(prompts / "validate-benign.txt")) {
+        args.insert(args.end(), {"--validate-harmful", path_utf8(prompts / "validate-harmful.txt"), "--validate-benign",
+                                 path_utf8(prompts / "validate-benign.txt")});
+    }
     if (present(prompts / "test-harmful.txt")) {
         args.insert(args.end(), {"--test-harmful", path_utf8(prompts / "test-harmful.txt")});
         if (present(prompts / "test-benign.txt")) {
@@ -1062,8 +1148,11 @@ void Ablation::job_main() {
     }
     if (const std::optional<std::string> sets = read_file(prompts / "sets.json")) {
         try {
-            const std::string source = Json::parse(*sets).value("source_text", "");
+            const Json described     = Json::parse(*sets);
+            const std::string source = described.value("source_text", "");
             if (!source.empty()) { args.insert(args.end(), {"--source", source}); }
+            // A set of matched pairs (line i of each list on one subject): the tool checks and records it.
+            if (!choice && described.value("paired", false)) { args.push_back("--paired"); }
         } catch (const Json::exception&) {}
     }
 

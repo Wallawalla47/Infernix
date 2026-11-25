@@ -51,6 +51,7 @@ const PHASES: { phase: AblationPhase; label: string }[] = [
   { phase: "capture", label: "Record" },
   { phase: "direction", label: "Direction" },
   { phase: "fit", label: "Trials" },
+  { phase: "validate", label: "Validate" },
   { phase: "pick", label: "Pick" },
   { phase: "grade", label: "Test" },
   { phase: "export", label: "Export" },
@@ -295,7 +296,10 @@ function PresetRow({ preset, state }: { preset: AblationPreset; state: AblationS
     <div className="space-y-2 rounded-lg border p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0 flex-[1_1_18rem]">
-          <div className="text-sm font-medium">{preset.title}</div>
+          <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+            {preset.title}
+            {preset.paired ? <Badge variant="muted">matched pairs</Badge> : null}
+          </div>
           <div className="text-xs text-muted-foreground">{preset.description}</div>
         </div>
         <div className="flex items-center gap-2">
@@ -417,8 +421,10 @@ function RunCard({ state, library, preselect }: { state: AblationState; library:
         </CardTitle>
         <CardDescription>
           The tool records the model's hidden states on the prompts, computes the refusal direction, then searches for the
-          layers and strengths whose cut removes the most refusals while keeping the model's answers to harmless prompts
-          unchanged (first-token KL below 0.4 on held-out prompts), grades the pick on the test pair and exports it.
+          layers and strengths whose cut both removes refusals and keeps the model's answers to harmless prompts close to
+          the stock model's (first-token KL on held-out prompts). It grades the best few of those cuts on a validation pair
+          the search never scored, picks the best balance of the two there, grades it once on the test pair and exports
+          it; the run's trade-off table can export another point instead.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -524,6 +530,10 @@ function Phases({ job }: { job: AblationJob }) {
   return (
     <ol className="flex flex-wrap gap-1.5" aria-label="Phases">
       {PHASES.map(({ phase, label }) => {
+        // A run without a validation pair (a prompt set fetched before the tool had one) picks on the fit's numbers.
+        if (phase === "validate" && progress?.phases_done.includes("pick") && !progress.phases_done.includes(phase)) {
+          return null;
+        }
         const done = progress?.phases_done.includes(phase) ?? false;
         const current = progress?.phase === phase && !done;
         const Icon = done ? CheckCircle2 : current && job.active ? LoaderCircle : CircleDashed;
@@ -580,6 +590,132 @@ function Grade({ job }: { job: AblationJob }) {
   );
 }
 
+/** The sidecar name the trade-off table offers for one of the run's trials. */
+function trialSidecarName(job: AblationJob, trial: number): string {
+  return sidecarName(`${job.run.name}-t${trial}`);
+}
+
+function Front({ job, library, busy }: { job: AblationJob; library: Library; busy: boolean }) {
+  const qc = useQueryClient();
+  const choose = useMutation({
+    mutationFn: (trial: number) => api.ablationChoose(trial, trialSidecarName(job, trial)),
+    onSuccess: (next) => {
+      qc.setQueryData(["ablation"], next);
+      toast.info("The trial is graded and exported: the loaded model is unloaded first");
+    },
+  });
+  const progress = job.progress;
+  const front = progress?.front ?? [];
+  if (front.length === 0) return null;
+  const control = progress?.control;
+  const picked = progress?.pick?.trial;
+  const kept = job.choice?.trial ?? picked;
+  const names = new Set(library.sidecars.map((entry) => entry.name));
+  // The pick was exported under the run's own name (by this run, or by the run a `choose` followed).
+  const pickExported = names.has(job.run.name);
+  const validation = progress?.validation ?? null;
+  return (
+    <div className="space-y-1.5">
+      <div className="text-xs text-muted-foreground">
+        The trade-off so far: for each number of refusals, the lowest KL a trial reached (no other trial is better on
+        both). Fewer refusals usually cost KL. The pick balances them: a KL of {progress?.rule.kl_scale ?? 1} weighs as
+        much as all of the stock model's refusals, and a trial at or above KL {progress?.rule.kl_max ?? 0.4} is never
+        picked.{" "}
+        {validation
+          ? `Every trial is scored on the same held-out prompts, so the search fits them: the best trials, on the
+            front or not, were also graded on prompts it never scored (${validation.harmful} and
+            ${validation.benign}), and the pick is made on those numbers.`
+          : null}
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="text-xs text-muted-foreground">
+            <tr className="text-left">
+              <th className="py-1 pr-4 font-medium">Trial</th>
+              <th className="py-1 pr-4 font-medium">Held-out harmful refused</th>
+              <th className="py-1 pr-4 font-medium">First-token KL</th>
+              {validation ? (
+                <>
+                  <th className="py-1 pr-4 font-medium">Validation harmful refused</th>
+                  <th className="py-1 pr-4 font-medium" title="On the validation benign prompts the stock model answered">
+                    Validation KL
+                  </th>
+                </>
+              ) : null}
+              <th className="py-1 font-medium" />
+            </tr>
+          </thead>
+          <tbody>
+            {front.map((row) => {
+              const name = trialSidecarName(job, row.trial);
+              const exported =
+                names.has(name) || (row.trial === kept && job.exported !== null) || (row.trial === picked && pickExported);
+              return (
+                <tr key={row.trial} className="border-t">
+                  <td className="py-1 pr-4 tabular-nums">
+                    {row.trial}
+                    {row.off_front ? (
+                      <span
+                        className="ml-2 text-xs text-muted-foreground"
+                        title="Validated, but another trial has both fewer held-out refusals and a lower KL"
+                      >
+                        off the front
+                      </span>
+                    ) : null}
+                    {row.trial === picked ? (
+                      <Badge variant="accent" className="ml-2">
+                        the pick
+                      </Badge>
+                    ) : null}
+                  </td>
+                  <td className="py-1 pr-4 tabular-nums">
+                    {row.refusals} / {row.n}
+                    {control ? <span className="text-muted-foreground"> (stock {control.refusals})</span> : null}
+                  </td>
+                  <td className="py-1 pr-4 tabular-nums">{row.kl.toFixed(3)}</td>
+                  {validation ? (
+                    row.validation ? (
+                      <>
+                        <td className="py-1 pr-4 tabular-nums">
+                          {row.validation.refusals} / {row.validation.n}
+                          <span className="text-muted-foreground"> (stock {validation.stock.refusals})</span>
+                        </td>
+                        <td className="py-1 pr-4 tabular-nums">
+                          {(row.validation.kl_answered ?? row.validation.kl ?? 0).toFixed(3)}
+                        </td>
+                      </>
+                    ) : (
+                      <>
+                        <td className="py-1 pr-4 text-xs text-muted-foreground">not graded</td>
+                        <td className="py-1 pr-4" />
+                      </>
+                    )
+                  ) : null}
+                  <td className="py-1 text-right">
+                    {exported ? (
+                      <span className="text-xs text-muted-foreground">exported</span>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy || choose.isPending}
+                        title={`Grade this trial on the ${validation ? "validation and " : ""}test prompts and export it as ${name}`}
+                        onClick={() => choose.mutate(row.trial)}
+                      >
+                        <Scissors /> Export
+                      </Button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function UseSidecar({ job, library }: { job: AblationJob; library: Library }) {
   const qc = useQueryClient();
   const takesValue = useTakesValue();
@@ -626,9 +762,11 @@ function JobCard({ state, library }: { state: AblationState; library: Library })
   const stop = useMutation({ mutationFn: (now: boolean) => api.ablationStop(now), onSuccess: apply });
   const again = useMutation({
     mutationFn: () =>
-      job
-        ? api.ablationStart({ config: job.run.config_id, preset: job.run.preset, trials: job.run.trials, name: job.run.name })
-        : Promise.reject(new Error("no run")),
+      !job
+        ? Promise.reject(new Error("no run"))
+        : job.choice
+          ? api.ablationChoose(job.choice.trial, job.choice.name)
+          : api.ablationStart({ config: job.run.config_id, preset: job.run.preset, trials: job.run.trials, name: job.run.name }),
     onSuccess: apply,
   });
   if (!job) return null;
@@ -650,8 +788,10 @@ function JobCard({ state, library }: { state: AblationState; library: Library })
           </SectionCardTitle>
         </CardTitle>
         <CardDescription>
-          {job.run.model_name} · {state.prompts[job.run.preset]?.title ?? job.run.preset} · {job.run.trials} trials · sidecar{" "}
-          <span className="font-mono">{job.run.name}</span> · started {formatDateTime(job.started)}
+          {job.run.model_name} · {state.prompts[job.run.preset]?.title ?? job.run.preset} · {job.run.trials} trials ·{" "}
+          {job.choice ? `trial ${job.choice.trial} kept as sidecar ` : "sidecar "}
+          <span className="font-mono">{job.choice ? job.choice.name : job.run.name}</span> · started{" "}
+          {formatDateTime(job.started)}
           {job.ended ? `, ended ${formatDateTime(job.ended)}` : ""}
         </CardDescription>
       </CardHeader>
@@ -679,11 +819,25 @@ function JobCard({ state, library }: { state: AblationState; library: Library })
           ) : null}
           {progress?.best ? (
             <div>
-              <div className="text-xs text-muted-foreground">Best trial so far (KL below 0.4)</div>
-              trial {progress.best.trial}: {progress.best.refusals} refused, KL {progress.best.kl.toFixed(3)}
+              <div className="text-xs text-muted-foreground">
+                {progress.command === "choose"
+                  ? "The trial kept"
+                  : progress.picked_on === "validation"
+                    ? "The pick (the best balance on the validation prompts)"
+                    : "The pick so far (the best balance)"}
+              </div>
+              trial {progress.best.trial}: {progress.best.refusals} of {progress.best.n} held out refused, KL{" "}
+              {progress.best.kl.toFixed(3)}
+              {progress.best.validation ? (
+                <>
+                  ; validation {progress.best.validation.refusals} of {progress.best.validation.n} refused, KL{" "}
+                  {(progress.best.validation.kl_answered ?? progress.best.validation.kl ?? 0).toFixed(3)}
+                </>
+              ) : null}
             </div>
           ) : null}
         </div>
+        <Front job={job} library={library} busy={job.active || (state.job?.active ?? false)} />
         <Grade job={job} />
         {job.state === "done" ? <UseSidecar job={job} library={library} /> : null}
         {job.state === "no_sidecar" ? (
@@ -705,7 +859,7 @@ function JobCard({ state, library }: { state: AblationState; library: Library })
           ) : null}
           {resumable ? (
             <Button size="sm" disabled={again.isPending} onClick={() => again.mutate()}>
-              <Play /> Run again (continues it)
+              <Play /> {job.choice ? "Export it again" : "Run again (continues it)"}
             </Button>
           ) : null}
         </div>

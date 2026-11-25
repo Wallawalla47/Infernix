@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import measure as M
 from . import sidecar as SC
-from .engine import MODEL_ID, Engine
+from .engine import MODEL_ID, Engine, is_inkling
 from .fit import front, open_study
 from .prompts import read_prompts
 from .run import REPO_ROOT, artifact_id, sha256_file, write_json
@@ -187,18 +187,21 @@ def export(run, candidate: str, name: str, source: str | None = None, out: Path 
                                                           "--use-original-nvfp4-prefill-kernel")]
     src = source or (f"{sets['source']['harmful']['name']} against {sets['source']['harmless']['name']}; "
                      f"{base['generation']['notes'].removeprefix('direction: ')}")
+    pinned = (json.loads((sc.parent / "pinned.json").read_text(encoding="utf-8"))
+              if (sc.parent / "pinned.json").is_file() else {})
     notes = ""
     if trial:
-        notes = (f"alphas: per-lane bands fitted with tools/ablate (Optuna TPE, heretic's band and direction scope); "
-                 f"this candidate: {trial['refusals']}/{trial['n_harmful']} held-out harmful prompts refused "
-                 f"(stock: {trial['control_refusals']}), first-token KL {trial['kl']:.3f} on the held-out harmless "
-                 f"prompts; {trial['what']}")
+        which = f"trial {pinned['trial']} of study {pinned['study']}: " if pinned else ""
+        notes = (f"alphas: per-lane bands fitted with tools/ablate (heretic 1.4's band and direction scope; two-objective "
+                 f"Optuna TPE over refusals and first-token KL); this candidate, {which}{trial['refusals']}/"
+                 f"{trial['n_harmful']} held-out harmful prompts refused (stock: {trial['control_refusals']}), "
+                 f"first-token KL {trial['kl']:.3f} on the held-out harmless prompts; {trial['what']}")
     fitted_under = {
         "artifact": prod.artifact.name, "kv_dtype": prod.value("--kv-dtype") or "bf16 (default)",
         "chat_template": ({"file": Path(template).name, "sha256": hashlib.sha256(template_text.encode()).hexdigest()}
                           if template_text else "the artifact's own"),
         "numerics_options": [f if v is None else f"{f} {v}" for f, v in numerics],
-        "thinking": "off (refusals and KL)", "tool": "tools/ablate " + tool_version(),
+        "thinking": M.thinking_protocol(is_inkling(prod.artifact)), "tool": "tools/ablate " + tool_version(),
         "engine": f"{run.serve_binary.name} sha256:{sha256_file(run.serve_binary)[:16]}"}
     lora = prod.value("--lora")
     if lora:
@@ -219,6 +222,16 @@ def export(run, candidate: str, name: str, source: str | None = None, out: Path 
         raise SystemExit(f"export would carry local paths {leaks}; pass --source to describe the prompt sets")
     (dest / "sidecar.json").write_text(text, encoding="utf-8")
     return dest
+
+
+def same_cut(a: Path, b: Path) -> bool:
+    """Whether two sidecar.json files cut the same: the same alpha tables and the same direction bytes (their
+    provenance text may differ)."""
+    ca, cb = SC.read(a), SC.read(b)
+    tables = ("alpha_attn_per_layer", "alpha_mlp_per_layer", "alpha_per_layer", "default_alpha")
+    if any(ca.get(k) != cb.get(k) for k in tables):
+        return False
+    return (a.parent / ca["direction_file"]).read_bytes() == (b.parent / cb["direction_file"]).read_bytes()
 
 
 def tool_version() -> str:
