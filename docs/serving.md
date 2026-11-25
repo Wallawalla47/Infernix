@@ -2816,7 +2816,9 @@ until it finished.
 not be published), `host_image_write_refusals` and `host_block_write_refusals` (snapshots and
 blocks refused Host slabs, which then stay Device-only), `device_slot_evictions` (Device snapshot
 slots taken from another snapshot) and `device_slot_refusals` (slot requests refused);
-`free_device_snapshot_slots` is an end-of-interval gauge. `host_image_writes`, `host_block_writes`,
+`free_device_snapshot_slots` is an end-of-interval gauge. Of these, the Qwen3.8-Flash-Next prefix cache keeps
+`taps_retried` (it retries a tap refused for room at the next prefill call boundary) and reports 0 for the others,
+which count Qwen3.5's Device snapshot slots and Host refusals; Inkling 2 reports 0 for all of them. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
 Host-tier write-through and restores, and `host_write_copies` and `host_restore_copies` the copy
 calls that moved those bytes (a restore enqueues its copies in batches, one call a model layer's KV

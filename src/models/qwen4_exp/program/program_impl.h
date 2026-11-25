@@ -160,6 +160,9 @@ struct LanePrefix {
     PrefixFollow follow = PrefixFollow::Unknown;
     bool lineage_echo   = false;
     std::vector<runtime::prefix_cache::PlannedTap> taps;
+    // A tap refused for room is queued again (prefix_retry_tap); its capture at a later boundary counts in
+    // taps_retried.
+    bool retried_tap = false;
     std::vector<runtime::prefix_cache::TapHint> hints;
     std::vector<runtime::prefix_cache::TapExclusion> exclusions; // Vision spans: no snapshot inside
     // Block lookup hashes: the prompt's, extended by publication over the generated blocks; the
@@ -2362,6 +2365,7 @@ public:
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
             lane.prefix.taps.clear();
+            lane.prefix.retried_tap = false;
             lane.reservation   = std::move(*reservation);
             lane.prefix.reused = selection->frontier;
             lane.calls         = selection->plan.ends;

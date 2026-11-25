@@ -91,6 +91,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t blocks_duplicate        = 0;
     std::uint64_t taps_created            = 0;
     std::uint64_t taps_skipped            = 0;
+    std::uint64_t taps_retried            = 0; // taps refused for room, then taken at a later call boundary
     std::uint64_t endpoints_created       = 0;
     std::uint64_t host_image_writes       = 0;
     std::uint64_t host_block_writes       = 0;

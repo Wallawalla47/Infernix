@@ -45,6 +45,11 @@ infernix_add_test(infernix_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_sampling_defaults.cpp"
   LIBRARIES infernix_engine infernix_core)
 
+# The hybrid prefix cache's counters reach RuntimeStats per counter (Flash-Next's taps_retried).
+infernix_add_test(infernix_hybrid_runtime_stats_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_hybrid_runtime_stats.cpp"
+  LIBRARIES infernix_engine infernix_core infernix::json)
+
 infernix_add_test(infernix_grammar_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_grammar.cpp"
   LIBRARIES infernix_grammar)

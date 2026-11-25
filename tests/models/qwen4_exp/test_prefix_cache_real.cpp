@@ -464,6 +464,15 @@ int run_small_host_tier(const char* artifact, const char* ngram) {
         const std::vector<infernix::TokenId> next = synthetic_tokens(150, 92 + turn);
         history.insert(history.end(), next.begin(), next.end());
     }
+    // A tap this tier refuses for room is retried at the next call boundary (hybrid-prefix-cache-spec §7.4), and a
+    // retry taken there is counted in taps_retried (published since 2026-11-24; it read 0 on Flash-Next before).
+    const infernix::RuntimeStats stats = engine.runtime_stats();
+    std::printf("        taps created %llu, skipped %llu, retried %llu\n",
+                static_cast<unsigned long long>(stats.hybrid_taps_created),
+                static_cast<unsigned long long>(stats.hybrid_taps_skipped),
+                static_cast<unsigned long long>(stats.hybrid_taps_retried));
+    failures += check(stats.hybrid_taps_retried <= stats.hybrid_taps_skipped,
+                      "a retried tap was refused for room before (taps_retried <= taps_skipped)");
     return failures;
 }
 

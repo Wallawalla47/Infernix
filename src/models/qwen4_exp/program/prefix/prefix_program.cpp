@@ -903,6 +903,7 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.blocks_duplicate        = count.blocks_duplicate;
     out.taps_created            = count.taps_created;
     out.taps_skipped            = count.taps_skipped;
+    out.taps_retried            = count.taps_retried;
     out.endpoints_created       = count.endpoints_created;
     out.host_image_writes       = count.host_image_writes;
     out.host_block_writes       = count.host_block_writes;
@@ -1072,6 +1073,7 @@ void ProgramImpl::prefix_retry_tap(Lane& lane, std::uint32_t B, bool forward) {
     lane.prefix.taps.insert(lane.prefix.taps.begin(),
                             pc::PlannedTap{.position = B, .placement = pc::TapPlacement::Flexible, .boundary = false,
                                            .forward = forward});
+    lane.prefix.retried_tap = true; // its capture counts in taps_retried (prefix_after_prefill_call)
 }
 
 void ProgramImpl::prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F) {
@@ -1168,9 +1170,14 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
     const std::uint32_t B = lane.state_tokens;
     bool boundary = false, forward = false;
     if (prefix_take_taps(lane, B, lane.next_call, boundary, forward) &&
-        prefix_tap_far_enough(lane.prefix.deepest, B, forward) &&
-        !prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false)) {
-        prefix_retry_tap(lane, B, forward);
+        prefix_tap_far_enough(lane.prefix.deepest, B, forward)) {
+        if (!prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false)) {
+            prefix_retry_tap(lane, B, forward);
+        } else if (lane.prefix.retried_tap) {
+            // A tap the Host tier refused for room, taken at this later boundary (serving.md's taps_retried).
+            lane.prefix.retried_tap = false;
+            ++prefix_->counters().taps_retried;
+        }
     }
 }
 
@@ -1274,6 +1281,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.abandoned = false;
     lane.prefix.path.clear();
     lane.prefix.taps.clear();
+    lane.prefix.retried_tap = false;
     lane.prefix.exclusions.clear();
     lane.prefix.restore.reset();
     lane.prefix.resume.reset();
