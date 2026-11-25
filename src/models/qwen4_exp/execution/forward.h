@@ -206,6 +206,12 @@ struct ForwardBatch {
     // and an FP8 volume's scale (BF16 [1]) or an NVFP4 volume's multiplier (FP32 [1]) when it is not
     // the artifact's ngram_scale.
     std::optional<NgramRowFormat> ngram_format;
+    // A blockdir volume's 8-entry base table (see ForwardBatch::ngram_format).
+    std::array<std::uint8_t, 8> ngram_blockdir_bases{};
+    // The rows are canonical P12 rows: a blockdir volume read on demand (its reader resolves the
+    // packed row at cache fill). A resident table's rows stay packed and the blockdir kernel decodes
+    // them with their block's directory.
+    bool ngram_rows_are_p12 = false;
     Tensor ngram_scale;
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place

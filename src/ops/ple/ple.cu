@@ -1,10 +1,12 @@
 #include "infernix/ops/ple.h"
 
 #include "core/grid_rows.h"
+#include "infernix/ngram_blockdir.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -89,6 +91,38 @@ __global__ void embed_bf16_p12_kernel(const std::uint8_t* __restrict__ rows, int
     }
 }
 
+// BF16 P12 blockdir rows (resident mode): the 240 B data planes are P12's, read exactly as the kernel
+// above reads them. The base comes from the volume's 8-entry table through the row's 3-bit directory
+// code, and an escaped value from one of the block directory's four 18-bit slots rather than a
+// per-row trailer. A row whose block used the file's side stream arrives as a canonical P12 row
+// instead (byte 256 is the marker) and decodes through the trailer, so this kernel answers every row
+// the host reader staged. `bases` travels by value (kernel parameters sit in constant memory).
+struct BlockdirBases {
+    std::uint8_t base[8];
+};
+
+__global__ void embed_bf16_p12_blockdir_kernel(const std::uint8_t* __restrict__ rows, int row_bytes, int heads,
+                                               int width, int columns, BlockdirBases bases,
+                                               std::uint16_t* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements = heads * width;
+    if (i >= elements) { return; }
+    const int h = i / width, j = i % width;
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        const std::uint8_t* row = rows + (static_cast<std::size_t>(t) * heads + h) * row_bytes;
+        const std::uint8_t code = row[j];
+        const unsigned q        = (row[width + (j >> 1)] >> (4 * (j & 1))) & 15U;
+        const std::uint8_t* directory = row + ngram::kBlockdirDirectoryOffset;
+        std::uint16_t bits;
+        if (row[ngram::kBlockdirHeaderOffset] == ngram::kBlockdirCanonicalMarker) {
+            bits = ngram::p12_trailer_value_bits(directory, j, code, q);
+        } else {
+            bits = ngram::blockdir_value_bits(directory, bases.base, row[ngram::kBlockdirHeaderOffset],
+                                              width, j, code, q);
+        }
+        out[static_cast<std::size_t>(t) * elements + i] = bits;
+    }
+}
 // bf16_rn(p * m) of the exact product: hi = fl32(p * m) and its error lo (an FMA residual, exact)
 // round together, so lo decides only a hi that lies exactly halfway between two BF16 values.
 __device__ __forceinline__ std::uint16_t bf16_rn_product(float p, float m) {
@@ -290,6 +324,26 @@ void ple_embed_bf16_p12_blockdir(const Tensor& rows, Tensor& out, cudaStream_t s
     ple_embed_bf16_p12(rows, out, stream);
 }
 
+void ple_embed_bf16_p12_blockdir_packed(const Tensor& rows, const std::array<std::uint8_t, 8>& bases, Tensor& out,
+                                        cudaStream_t stream) {
+    require(contiguous(rows, DType::U8) && contiguous(out, DType::BF16),
+            "BF16 P12 blockdir embed requires contiguous U8 rows and BF16 output");
+    constexpr int width = 160;
+    const int row_bytes = rows.ne[0], heads = rows.ne[1], columns = rows.ne[2];
+    require(row_bytes == static_cast<int>(ngram::kBlockdirStagingRowBytes) && heads > 0 && columns > 0,
+            "BF16 P12 blockdir rows must be 272 bytes: 240 data, the block directory and the row index");
+    for (const std::uint8_t base : bases) {
+        require(base <= 240, "a blockdir base table entry is outside [0, 240]");
+    }
+    require(out.ne[0] == heads * width && out.ne[1] == columns, "BF16 P12 blockdir embed shapes disagree");
+    BlockdirBases table{};
+    for (std::size_t i = 0; i < bases.size(); ++i) { table.base[i] = bases[i]; }
+    const int elements = heads * width;
+    embed_bf16_p12_blockdir_kernel<<<dim3((elements + kThreads - 1) / kThreads, grid_rows(columns)), kThreads, 0,
+                                     stream>>>(static_cast<const std::uint8_t*>(rows.data), row_bytes, heads, width,
+                                               columns, table, static_cast<std::uint16_t*>(out.data));
+    check_launch("embed bf16 p12 blockdir packed");
+}
 void ple_embed_nvfp4(const Tensor& rows, const Tensor& multiplier, Tensor& out, cudaStream_t stream) {
     require(contiguous(rows, DType::U8) && contiguous(multiplier, DType::FP32) && contiguous(out, DType::BF16),
             "NVFP4 embed requires contiguous U8 rows, an FP32 multiplier and BF16 output");

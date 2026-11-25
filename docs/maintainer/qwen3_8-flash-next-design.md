@@ -2304,9 +2304,14 @@ carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
   codes into an eight-entry base table in the header, a 3-bit escape count and four 18-bit slots
   (12-bit position in the block, 6-bit signed exponent delta from the row's base). A block past the
   four slots, or an escape outside six signed bits, puts all its escapes in a file-level side stream
-  addressed by block id (`ngram_p12_ext.py`). The reader resolves a block's directory into the
+  addressed by block id (`ngram_p12_ext.py`). A demand read resolves a block's directory into the
   canonical P12 row (the base code and the row's escapes from the slots or side stream) and the row
-  cache holds that self-contained row. The packer refuses a table with more than eight distinct row
+  cache holds that self-contained row, so `ple_embed_bf16_p12` decodes it. A resident table stays
+  packed: the reader stages each row as its 240 data bytes, the block's 16-byte directory and the
+  row's index in the block (272 bytes), and `ple_embed_bf16_p12_blockdir_packed` reads the base from
+  the volume's eight-entry table through the row's code and its escapes from the directory's four
+  slots. A row of the 177 side-stream blocks arrives as its canonical P12 row, marked at the header
+  byte, so that rare case costs one trailer read rather than a directory scan. The packer refuses a table with more than eight distinct row
   bases or a row past P12's four escapes. The base budget came from Qwen's table (320,001,536 rows,
   measured 2026-11-24): seven distinct row bases {53, 54, 105, 106, 107, 108, 109} — a 2-bit code
   and a four-entry table cannot name them — and per-block escapes {0: 14324783, 1: 3911887,

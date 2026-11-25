@@ -7,6 +7,7 @@
 // resolve_ngram_volume accepts a volume of any format in place of the artifact's table and refuses mismatches.
 
 #include "test_temp_path.h"
+#include "infernix/ngram_blockdir.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 
 #include <algorithm>
@@ -315,6 +316,7 @@ void test_resolve(const std::filesystem::path& path) {
         const std::uint16_t width = 128;
         file.seekp(68);
         file.write(reinterpret_cast<const char*>(&width), 2);
+        file.close();
         check(refused(), "a blockdir W other than 160 is refused");
         write_header(path, rows, 320, 0x55, 0, 7, 0);
         check(refused(), "a blockdir tag with P12 row bytes is refused");
@@ -451,6 +453,221 @@ void test_blockdir(const std::filesystem::path& path) {
     check(matched, "a cached blockdir row is its self-contained P12 row");
 }
 
+
+// A blockdir plane: every value's exponent base + j % 15 with code 0x11; each escaped column takes
+// q = 15 and its exact exponent (the escape's value is (exponent << 7) | 0x11).
+void put_blockdir_row(std::uint8_t* block, std::uint32_t row_in_block, unsigned base,
+                      const std::vector<std::pair<int, int>>& escapes) {
+    std::uint8_t* plane = block + row_in_block * 240;
+    for (int j = 0; j < 160; ++j) {
+        unsigned q = static_cast<unsigned>(j % 15);
+        for (const auto& [column, exponent] : escapes) {
+            if (column == j) { q = 15; }
+        }
+        (void)base;
+        (void)escapes;
+        plane[j] = 0x11;
+        plane[160 + j / 2] |= static_cast<std::uint8_t>(q << (4 * (j & 1)));
+    }
+}
+
+// The resident-mode staging the blockdir kernel reads must decode, row for row, to the same words as
+// the host canonicalizer: the packed rows of a resident table through the volume's base table and the
+// block directory, the canonical rows of a demand read through the P12 trailer. The fixture exercises
+// all eight base-table entries, four inline slots (one row with two escapes), a block whose scan must
+// skip empty slots, and a block resolved from the side stream.
+void test_blockdir_packed(const std::filesystem::path& path) {
+    constexpr std::uint64_t rows = 51; // three blocks
+    const std::uint8_t bases[8] = {53, 54, 105, 106, 107, 108, 109, 200};
+    write_blockdir_header(path, rows, bases, 4096);
+    std::vector<std::uint8_t> blocks(3 * 4096, 0);
+    struct Escape { int row, column, exponent; };
+    // Block 0: one escape in four rows, each row's base a different table entry.
+    const std::vector<Escape> block0 = {{1, 7, 73}, {2, 9, 129}, {3, 11, 135}, {4, 13, 134}};
+    // Block 1: one row with two escapes and two empty slots (the scan must skip them).
+    const std::vector<Escape> block1 = {{5, 3, 108}, {5, 8, 109}};
+    for (std::uint32_t r = 0; r < 17; ++r) {
+        std::vector<std::pair<int, int>> collapsed0, collapsed1;
+        for (const auto& e : block0) {
+            if (e.row == static_cast<int>(r)) { collapsed0.push_back({e.column, e.exponent}); }
+        }
+        for (const auto& e : block1) {
+            if (e.row == static_cast<int>(r)) { collapsed1.push_back({e.column, e.exponent}); }
+        }
+        put_blockdir_row(blocks.data(), r, bases[r % 8], collapsed0);
+        put_blockdir_row(blocks.data() + 4096, r, bases[r % 8], collapsed1);
+        std::vector<std::pair<int, int>> collapsed2;
+        const int side_rows_at[3]    = {2, 7, 7};
+        const int side_columns_at[3] = {4, 9, 12};
+        const int side_exponents_at[3] = {77, 80, 83};
+        for (unsigned e = 0; e < 3; ++e) {
+            if (side_rows_at[e] == static_cast<int>(r)) {
+                collapsed2.push_back({side_columns_at[e], side_exponents_at[e]});
+            }
+        }
+        put_blockdir_row(blocks.data() + 2 * 4096, r, bases[r % 8], collapsed2);
+    }
+    std::uint8_t* directory0 = blocks.data() + 17 * 240;
+    std::uint8_t* directory1 = blocks.data() + 4096 + 17 * 240;
+    std::uint8_t* directory2 = blocks.data() + 2 * 4096 + 17 * 240;
+    for (std::uint32_t r = 0; r < 17; ++r) {
+        put_directory_bits(directory0, 3 * r, 3, r % 8);
+        put_directory_bits(directory1, 3 * r, 3, r % 8);
+        put_directory_bits(directory2, 3 * r, 3, r % 8);
+    }
+    const auto put_slot = [](std::uint8_t* directory, unsigned slot, int row, int column, int exponent,
+                             unsigned base) {
+        const unsigned position = static_cast<unsigned>(row) * 160U + static_cast<unsigned>(column);
+        const unsigned delta    = static_cast<unsigned>((exponent - static_cast<int>(base)) & 0x3F);
+        put_directory_bits(directory, 3 * 17 + 3 + 18 * slot, 18, position | (delta << 12));
+    };
+    put_directory_bits(directory0, 3 * 17, 3, 4);
+    for (unsigned e = 0; e < block0.size(); ++e) {
+        put_slot(directory0, e, block0[e].row, block0[e].column, block0[e].exponent, bases[block0[e].row % 8]);
+    }
+    put_directory_bits(directory1, 3 * 17, 3, 4); // two slots used, two left zero
+    for (unsigned e = 0; e < block1.size(); ++e) {
+        put_slot(directory1, e, block1[e].row, block1[e].column, block1[e].exponent, bases[block1[e].row % 8]);
+    }
+    put_directory_bits(directory2, 3 * 17, 3, 7); // the side stream
+    std::vector<std::uint8_t> side(4096, 0);
+    const std::uint32_t side_block = 2;
+    std::memcpy(side.data(), &side_block, 4);
+    const std::uint16_t side_count = 3;
+    std::memcpy(side.data() + 4, &side_count, 2);
+    const int side_rows[3]    = {2, 7, 7};
+    const int side_columns[3] = {4, 9, 12};
+    const int side_exponents[3] = {77, 80, 83};
+    for (unsigned e = 0; e < 3; ++e) {
+        const auto position = static_cast<std::uint16_t>(side_rows[e] * 160 + side_columns[e]);
+        const auto word = static_cast<std::uint16_t>((side_exponents[e] << 7) | 0x11);
+        std::memcpy(side.data() + 6 + 4 * e, &position, 2);
+        std::memcpy(side.data() + 6 + 4 * e + 2, &word, 2);
+    }
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        out.write(reinterpret_cast<const char*>(blocks.data()), static_cast<std::streamsize>(blocks.size()));
+        out.write(reinterpret_cast<const char*>(side.data()), static_cast<std::streamsize>(side.size()));
+    }
+    q4::PleConfig ple;
+    ple.embed_dim             = 2560;
+    ple.ngram.ngram_size      = 3;
+    ple.ngram.heads_per_ngram = 8;
+    ple.table.format          = q4::NgramRowFormat::Fp8E4m3;
+    ple.table.rows            = rows;
+    ple.table.row_bytes       = 160;
+    ple.table.volume_id.fill(0xAA);
+    const q4::NgramTableConfig table = q4::resolve_ngram_volume(path, ple);
+    check(table.format == q4::NgramRowFormat::Bf16P12Blockdir,
+          "the blockdir packed-test volume resolves");
+    check(q4::NgramVolume::consumer_row_bytes(table, true) == 272 &&
+              q4::NgramVolume::consumer_row_bytes(table, false) == 256,
+          "a blockdir row is packed in resident mode and canonical on demand");
+
+    std::vector<std::uint32_t> all(static_cast<std::size_t>(rows));
+    for (std::uint32_t r = 0; r < rows; ++r) { all[r] = r; }
+    const std::size_t staging = q4::NgramVolume::consumer_row_bytes(table, true);
+    std::vector<std::byte> packed(rows * staging);
+    const q4::NgramVolume resident(path, table, true);
+    resident.read_rows(all, packed);
+    std::vector<std::byte> canonical(rows * 256);
+    const q4::NgramVolume demand(path, table, false);
+    demand.read_rows(all, canonical);
+
+    // The fixture's exact words: base + j % 15, or the escape's exponent, sign 0 and mantissa 0x11.
+    std::vector<std::uint16_t> want(rows * 160);
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        const std::uint64_t block = r / 17, slot = r % 17;
+        const unsigned base = bases[slot % 8];
+        int escaped_column = -1, escaped_exponent = 0, escaped_column2 = -1, escaped_exponent2 = 0;
+        if (block == 0) {
+            for (const auto& e : block0) {
+                if (static_cast<std::uint64_t>(e.row) == slot) { escaped_column = e.column; escaped_exponent = e.exponent; }
+            }
+        } else if (block == 1) {
+            bool first = true;
+            for (const auto& e : block1) {
+                if (static_cast<std::uint64_t>(e.row) == slot && first) {
+                    escaped_column = e.column;
+                    escaped_exponent = e.exponent;
+                    first = false;
+                } else if (static_cast<std::uint64_t>(e.row) == slot) {
+                    escaped_column2 = e.column;
+                    escaped_exponent2 = e.exponent;
+                }
+            }
+        } else {
+            for (unsigned e = 0; e < 3; ++e) {
+                if (static_cast<std::uint64_t>(side_rows[e]) == slot && side_columns[e] != escaped_column) {
+                    if (escaped_column < 0) { escaped_column = side_columns[e]; escaped_exponent = side_exponents[e]; }
+                    else { escaped_column2 = side_columns[e]; escaped_exponent2 = side_exponents[e]; }
+                }
+            }
+        }
+        for (int j = 0; j < 160; ++j) {
+            unsigned exponent = base + static_cast<unsigned>(j % 15);
+            if (j == escaped_column) { exponent = static_cast<unsigned>(escaped_exponent); }
+            if (j == escaped_column2) { exponent = static_cast<unsigned>(escaped_exponent2); }
+            want[r * 160 + j] = static_cast<std::uint16_t>((exponent << 7) | 0x11);
+        }
+    }
+
+    // The staging layout the kernel reads: planes, the block directory, the row's index; a side-stream
+    // block's rows are canonical rows marked at the header byte.
+    bool layout = true;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        const std::uint64_t block = r / 17, slot = r % 17;
+        const std::uint8_t* row = reinterpret_cast<const std::uint8_t*>(packed.data() + r * staging);
+        layout = layout && std::memcmp(row, blocks.data() + block * 4096 + slot * 240, 240) == 0;
+        if (block == 2) {
+            layout = layout && row[256] == 0xFF;
+        } else {
+            layout = layout && std::memcmp(row + 240, blocks.data() + block * 4096 + 17 * 240, 16) == 0 &&
+                     row[256] == slot;
+        }
+        for (std::size_t b = 257; b < staging; ++b) { layout = layout && row[b] == 0; }
+    }
+    check(layout, "a resident blockdir row stages its planes, its block directory and its index");
+
+    // The kernel's decode (the same header functions the device kernel calls) over the staged rows.
+    bool packed_ok = true;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        const std::uint8_t* row = reinterpret_cast<const std::uint8_t*>(packed.data() + r * staging);
+        for (int j = 0; j < 160; ++j) {
+            const std::uint8_t code = row[j];
+            const unsigned q = (row[160 + (j >> 1)] >> (4 * (j & 1))) & 15U;
+            std::uint16_t bits;
+            if (row[256] == 0xFF) {
+                bits = infernix::ngram::p12_trailer_value_bits(row + 240, j, code, q);
+            } else {
+                bits = infernix::ngram::blockdir_value_bits(row + 240, bases, row[256], 160, j, code, q);
+            }
+            if (bits != want[r * 160 + j]) {
+                std::printf("  packed row %llu value %d: got 0x%04x want 0x%04x\n",
+                            static_cast<unsigned long long>(r), j, bits, want[r * 160 + j]);
+                packed_ok = false;
+                break;
+            }
+        }
+        if (!packed_ok) { break; }
+    }
+    check(packed_ok, "the packed row decode matches the fixture's words");
+
+    // The host canonicalizer's demand rows decode to the same words through the P12 trailer.
+    bool demand_ok = true;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        const std::uint8_t* row = reinterpret_cast<const std::uint8_t*>(canonical.data() + r * 256);
+        for (int j = 0; j < 160; ++j) {
+            const std::uint8_t code = row[j];
+            const unsigned q = (row[160 + (j >> 1)] >> (4 * (j & 1))) & 15U;
+            const std::uint16_t bits = infernix::ngram::p12_trailer_value_bits(row + 240, j, code, q);
+            if (bits != want[r * 160 + j]) { demand_ok = false; break; }
+        }
+        if (!demand_ok) { break; }
+    }
+    check(demand_ok, "the host canonicalizer's rows match the fixture's words");
+}
+
 } // namespace
 
 int main() {
@@ -582,6 +799,10 @@ int main() {
         test_zero_row_bytes(headers);
         const auto blockdir_path = infernix::test::unique_temp_path("infernix_ngram_blockdir_test.ngram");
         test_blockdir(blockdir_path);
+        const auto blockdir_packed_path = infernix::test::unique_temp_path("infernix_ngram_blockdir_packed.ngram");
+        test_blockdir_packed(blockdir_packed_path);
+        std::error_code ignored_packed;
+        std::filesystem::remove(blockdir_packed_path, ignored_packed);
         std::error_code ignored_blockdir;
         std::filesystem::remove(blockdir_path, ignored_blockdir);
         std::error_code removed;

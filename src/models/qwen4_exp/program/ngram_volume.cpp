@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/program/ngram_volume.h"
 
+#include "infernix/ngram_blockdir.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -23,9 +25,9 @@ constexpr std::size_t kScaleOffset = kHeaderSize;
 // 2026-10-19, whose row size tells their format) and an NVFP4 table's FP32 multiplier (bits).
 constexpr std::size_t kFormatOffset      = kScaleOffset + 2;
 constexpr std::size_t kNvfp4ScaleOffset  = kFormatOffset + 2;
-// The P12 follow-on formats' extension after the fixed fields: W, the on-disk row size, a qhuf
-// volume's 16 Huffman code lengths, the side stream's offset, length and record count, and a
-// blockdir volume's eight-entry base table in the eight bytes after those fields.
+// The P12 blockdir extension after the fixed fields: W, the on-disk row size, the side stream's
+// offset, length and record count, and the file's eight-entry base table in the eight bytes after
+// those fields.
 constexpr std::size_t kWidthOffset         = kNvfp4ScaleOffset + 4; // 68
 constexpr std::size_t kSlotBytesOffset     = kWidthOffset + 2;      // 70
 constexpr std::size_t kCodeLengthsOffset   = kSlotBytesOffset + 6;  // 76
@@ -48,6 +50,10 @@ constexpr unsigned kBlockdirCodeBits         = 3;
 constexpr unsigned kBlockdirBlockSlots       = 4;   // 17 x 3 + 3 + 4 x 18 = 126 of the 128 bits
 constexpr unsigned kBlockdirBaseTableSize    = 8;   // bytes the header's base table occupies
 static_assert(kBlockdirBaseTableSize == std::tuple_size_v<decltype(NgramTableConfig::blockdir_bases)>);
+// The device kernel's reading of the same directory (include/infernix/ngram_blockdir.h) must agree.
+static_assert(kBlockdirRows == ngram::kBlockdirRows && kBlockdirWidth == ngram::kBlockdirWidth &&
+              kBlockdirPlaneBytes == ngram::kBlockdirPlaneBytes && kBlockdirCodeBits == ngram::kBlockdirCodeBits &&
+              kBlockdirBlockSlots == ngram::kBlockdirSlots && kBlockdirBaseTableSize == ngram::kBlockdirBaseTableSize);
 
 template <class T>
 T read_le(const std::byte* p) {
@@ -237,20 +243,61 @@ void NgramVolume::decode_blockdir_row(const std::byte* block, std::uint32_t row,
     }
 }
 
+// A resident blockdir row as the packed-mode kernel reads it (include/infernix/ngram_blockdir.h):
+// the 240 data planes verbatim, the block's 16-byte directory and the row's index in the block. A
+// block whose escapes went to the side stream (count 7) or whose count is invalid is the canonical
+// P12 row instead, marked at the header byte, so the kernel decodes it through the P12 trailer that
+// decode_blockdir_row already produced.
+void NgramVolume::stage_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
+                                     std::byte* out) const {
+    const std::byte* directory = block + kBlockdirRows * kBlockdirPlaneBytes;
+    const auto bit = [&](unsigned at) {
+        return (static_cast<unsigned>(directory[at / 8]) >> (at % 8)) & 1U;
+    };
+    const unsigned count = bit(kBlockdirCodeBits * kBlockdirRows) |
+                           (bit(kBlockdirCodeBits * kBlockdirRows + 1) << 1U) |
+                           (bit(kBlockdirCodeBits * kBlockdirRows + 2) << 2U);
+    if (ngram::blockdir_row_is_canonical(count)) {
+        decode_blockdir_row(block, row, row_in_block, out); // requests the side stream, or throws
+        out[ngram::kBlockdirHeaderOffset] = std::byte{ngram::kBlockdirCanonicalMarker};
+        std::memset(out + ngram::kBlockdirHeaderOffset + 1, 0,
+                    ngram::kBlockdirStagingRowBytes - (ngram::kBlockdirHeaderOffset + 1));
+        return;
+    }
+    std::memcpy(out, block + static_cast<std::size_t>(row_in_block) * kBlockdirPlaneBytes,
+                kBlockdirPlaneBytes);
+    std::memcpy(out + ngram::kBlockdirDirectoryOffset, directory, ngram::kBlockdirDirectoryBytes);
+    out[ngram::kBlockdirHeaderOffset] = static_cast<std::byte>(row_in_block);
+    std::memset(out + ngram::kBlockdirHeaderOffset + 1, 0,
+                ngram::kBlockdirStagingRowBytes - (ngram::kBlockdirHeaderOffset + 1));
+}
+
+std::uint32_t NgramVolume::consumer_row_bytes(const NgramTableConfig& table, bool resident) noexcept {
+    // A demand read resolves a blockdir row into the canonical P12 row at cache fill; a resident table
+    // is consumed packed, as its 240 data bytes, the block directory and the row's index.
+    if (table.format == NgramRowFormat::Bf16P12Blockdir) {
+        return resident ? ngram::kBlockdirStagingRowBytes : kBlockdirRowBytes;
+    }
+    return table.row_bytes;
+}
 void NgramVolume::copy_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
                            std::byte* out) const {
     if (table_.format == NgramRowFormat::Bf16P12Blockdir) {
-        decode_blockdir_row(block, row, row_in_block, out);
+        if (resident_) {
+            stage_blockdir_row(block, row, row_in_block, out);
+        } else {
+            decode_blockdir_row(block, row, row_in_block, out);
+        }
         return;
     }
     std::memcpy(out, block + static_cast<std::size_t>(row_in_block) * table_.row_bytes, table_.row_bytes);
 }
 
 void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) const {
-    if (out.size() != rows.size() * table_.row_bytes) {
+    const std::size_t row_bytes = consumer_row_bytes();
+    if (out.size() != rows.size() * row_bytes) {
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
     }
-    const std::size_t row_bytes = table_.row_bytes;
     if (resident_) {
         const std::byte* blocks = resident_->data();
         for (std::size_t i = 0; i < rows.size(); ++i) {

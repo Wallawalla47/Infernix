@@ -389,7 +389,7 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     const auto batch = static_cast<std::int32_t>(histories.size());
     const std::int32_t columns = batch * width;
     const q4::NgramHash hash(c.ple.ngram, 0);
-    const std::size_t row_bytes = volume.table().row_bytes; // the artifact's table, or a BF16 volume's
+    const std::size_t row_bytes = volume.consumer_row_bytes(); // the artifact's table, or another volume's
     const std::size_t heads     = hash.heads();
     std::vector<std::int32_t> ids, positions, last;
     // Text prompts: RoPE positions equal the index on all three axes.
@@ -444,6 +444,9 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     call.batch.ngram_rows = Tensor(put(ngram.data(), ngram.size()), DType::U8,
                                    {static_cast<std::int32_t>(row_bytes), static_cast<std::int32_t>(heads), columns});
     call.batch.ngram_format = volume.table().format;
+    call.batch.ngram_rows_are_p12 =
+        volume.table().format == q4::NgramRowFormat::Bf16P12Blockdir && !volume.resident();
+    call.batch.ngram_blockdir_bases = volume.table().blockdir_bases;
     // An FP8 volume that is not the artifact's own carries its per-tensor scale (as the Engine passes it).
     if (const auto scale = volume.table().fp8_scale) {
         call.batch.ngram_scale = Tensor(put(&*scale, sizeof(*scale)), DType::BF16, {1});

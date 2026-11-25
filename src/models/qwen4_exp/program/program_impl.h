@@ -714,7 +714,8 @@ public:
 
         // Per-call inputs, logits and sampling counts.
         const std::size_t heads     = NgramHash(c.ple.ngram, 0).heads();
-        const std::size_t row_bytes = (o.ngram_table ? *o.ngram_table : c.ple.table).row_bytes;
+        const std::uint32_t row_bytes = NgramVolume::consumer_row_bytes(
+            o.ngram_table ? *o.ngram_table : c.ple.table, o.ngram_in_ram);
         const std::size_t columns   = static_cast<std::size_t>(d.columns);
         const std::size_t mtp_subchunks = (columns + 1 + execution::kMtpChunkColumns - 1) / execution::kMtpChunkColumns;
         d.io.ids            = 0;
@@ -6114,6 +6115,8 @@ private:
         fb.ngram_rows    = Tensor(base + io_layout_.ngram, DType::U8,
                                   {dim(ngram_table().row_bytes), dim(hash_.heads()), cols});
         fb.ngram_format  = ngram_table().format;
+        fb.ngram_rows_are_p12 = ngram_rows_are_p12();
+        fb.ngram_blockdir_bases = ngram_table().blockdir_bases;
         if (ngram_scale_.p != nullptr) {
             fb.ngram_scale = Tensor(ngram_scale_.p, ngram_table().nvfp4_scale ? DType::FP32 : DType::BF16, {1});
         }
@@ -7759,6 +7762,13 @@ private:
     // The n-gram table the volume holds: the artifact's, or another volume's (ProgramOptions::ngram_table).
     [[nodiscard]] const NgramTableConfig& ngram_table() const noexcept {
         return options_.ngram_table ? *options_.ngram_table : c_.ple.table;
+    }
+
+    // A call's decoded n-gram row bytes: a blockdir volume read on demand resolves rows to the
+    // canonical P12 row at cache fill, while a resident one stays packed.
+    [[nodiscard]] std::size_t ngram_row_bytes() const noexcept { return volume_.consumer_row_bytes(); }
+    [[nodiscard]] bool ngram_rows_are_p12() const noexcept {
+        return ngram_table().format == NgramRowFormat::Bf16P12Blockdir && !volume_.resident();
     }
 
     // ---- causal scoring (score.cpp) ----

@@ -13,6 +13,7 @@
 //     columns of (old history, this call's conv inputs), in place or into another slot; an empty
 //     destination leaves every state unchanged; untouched slots and guards stay intact.
 
+#include "infernix/ngram_blockdir.h"
 #include "infernix/ops/ple.h"
 #include "ops/op_family.h"
 
@@ -23,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +34,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace infernix;
@@ -222,6 +225,126 @@ void test_embed_bf16_p12(int width, int heads, int columns, std::uint32_t seed) 
                                    from_device<std::uint16_t>(d_blockdir.data(), want.size()), want);
         g_failures += d_blockdir.verify_guards(label + " blockdir");
     }
+}
+
+// The BF16 P12 blockdir rows a resident table stages: the block's 240 B data planes, its 16-byte
+// directory and the row's index at byte 256 (the rest zero). The fixture's values are known exactly:
+// every value's exponent is its row's base + j % 15 (sign 0, mantissa 0x11), except the escapes, whose
+// exponents the directory's slots carry. The op must reproduce those words, and agree with
+// ple_embed_bf16_p12 on the canonical rows built from the same values.
+void test_embed_bf16_p12_blockdir_packed() {
+    constexpr int kWidth = 160, kRowBytes = 272, kCanonical = 256;
+    constexpr int kHeads = 18, kColumns = 2; // 17 block rows and one side-stream (canonical) row
+    const std::array<std::uint8_t, 8> bases = {53, 54, 105, 106, 107, 108, 109, 200};
+    const std::string label = "ple_embed_bf16_p12_blockdir_packed";
+    // Row -> its escapes (column, exponent): row 1 holds two of the block's four slots, so the
+    // fixture covers every slot and a row with more than one escape.
+    std::vector<std::vector<std::pair<int, int>>> escapes(static_cast<std::size_t>(kHeads));
+    escapes[1] = {{7, 73}, {9, 79}};
+    escapes[2] = {{3, 131}};
+    escapes[3] = {{5, 135}};
+    escapes[kHeads - 1] = {{4, 77}}; // the side-stream row
+    std::vector<unsigned> codes(static_cast<std::size_t>(kHeads));
+    for (int row = 0; row < kHeads; ++row) { codes[row] = static_cast<unsigned>(row) % 8; }
+    // A row's 240 data bytes: every value's exponent is its row's base + j % 15 (sign 0, mantissa
+    // 0x11), except its escaped columns, which take q = 15 and their exact exponent.
+    const auto make_plane = [&](int row, std::uint8_t* out) {
+        std::memset(out, 0, 240);
+        for (int j = 0; j < kWidth; ++j) {
+            unsigned q = static_cast<unsigned>(j % 15);
+            for (const auto& escape : escapes[row]) {
+                if (escape.first == j) { q = 15; }
+            }
+            out[j] = 0x11;
+            out[160 + j / 2] |= static_cast<std::uint8_t>(q << (4 * (j & 1)));
+        }
+    };
+    const auto plane_value = [&](int row, int j) {
+        unsigned exponent = static_cast<unsigned>(bases[codes[row]] + j % 15);
+        for (const auto& escape : escapes[row]) {
+            if (escape.first == j) { exponent = static_cast<unsigned>(escape.second); }
+        }
+        return static_cast<std::uint16_t>((exponent << 7) | 0x11);
+    };
+    const auto set_bits = [](std::uint8_t* at, unsigned offset, unsigned count, std::uint32_t value) {
+        for (unsigned k = 0; k < count; ++k) {
+            if ((value >> k) & 1U) { at[(offset + k) / 8] |= static_cast<std::uint8_t>(1U << ((offset + k) % 8)); }
+        }
+    };
+    std::vector<std::uint8_t> block(4096, 0);
+    for (int row = 0; row < 17; ++row) { make_plane(row, block.data() + row * 240); }
+    std::uint8_t* directory = block.data() + 17 * 240;
+    for (int row = 0; row < 17; ++row) { set_bits(directory, 3 * row, 3, codes[row]); }
+    unsigned slots = 0;
+    for (int row = 0; row < 17 && slots < 4; ++row) {
+        for (const auto& escape : escapes[row]) {
+            if (slots == 4) { break; }
+            const unsigned position = static_cast<unsigned>(row) * 160U + static_cast<unsigned>(escape.first);
+            const unsigned delta = static_cast<unsigned>((escape.second - static_cast<int>(bases[codes[row]])) & 0x3F);
+            set_bits(directory, 3 * 17 + 3 + 18 * slots, 18, position | (delta << 12));
+            ++slots;
+        }
+    }
+    set_bits(directory, 3 * 17, 3, slots);
+
+    std::vector<std::uint8_t> rows(static_cast<std::size_t>(kHeads) * kColumns * kRowBytes, 0);
+    std::vector<std::uint8_t> canonical(static_cast<std::size_t>(kHeads) * kColumns * kCanonical, 0);
+    std::vector<std::uint16_t> want(static_cast<std::size_t>(kHeads) * kColumns * kWidth, 0);
+    for (int column = 0; column < kColumns; ++column) {
+        for (int row = 0; row < kHeads; ++row) {
+            std::uint8_t* staged = rows.data() + (static_cast<std::size_t>(column) * kHeads + row) * kRowBytes;
+            std::uint8_t* plain = canonical.data() + (static_cast<std::size_t>(column) * kHeads + row) * kCanonical;
+            if (row < 17) {
+                std::memcpy(staged, block.data() + row * 240, 240);
+                std::memcpy(staged + 240, directory, 16);
+            } else {
+                make_plane(row, staged);
+                std::memcpy(staged + 240, directory, 16); // overwritten by the canonical trailer below
+            }
+            staged[256] = static_cast<std::uint8_t>(row);
+            std::memcpy(plain, staged, 240);
+            plain[240] = bases[codes[row]];
+            plain[241] = static_cast<std::uint8_t>(escapes[row].size());
+            for (unsigned e = 0; e < escapes[row].size(); ++e) {
+                plain[242 + 3 * e] = static_cast<std::uint8_t>(escapes[row][e].first);
+                const auto bits = static_cast<std::uint16_t>((escapes[row][e].second << 7) | 0x11);
+                plain[243 + 3 * e] = static_cast<std::uint8_t>(bits & 0xFF);
+                plain[244 + 3 * e] = static_cast<std::uint8_t>(bits >> 8);
+            }
+            for (int j = 0; j < kWidth; ++j) {
+                want[(static_cast<std::size_t>(column) * kHeads + row) * kWidth + j] = plane_value(row, j);
+            }
+        }
+        // The last row stands for a block whose escapes went to the file's side stream: the reader
+        // staged its canonical row instead, marked at byte 256.
+        std::uint8_t* staged = rows.data() + (static_cast<std::size_t>(column) * kHeads + kHeads - 1) * kRowBytes;
+        std::memcpy(staged + 240,
+                    canonical.data() + (static_cast<std::size_t>(column) * kHeads + kHeads - 1) * kCanonical + 240,
+                    16);
+        staged[256] = 0xFF;
+    }
+
+    DeviceBuffer d_rows = to_device(rows);
+    GuardedDeviceBuffer d_packed(static_cast<std::size_t>(kHeads) * kWidth * kColumns * sizeof(std::uint16_t));
+    d_packed.fill(0xFF);
+    Tensor t_rows(d_rows.p, DType::U8, {kRowBytes, kHeads, kColumns});
+    Tensor t_packed(d_packed.data(), DType::BF16, {kHeads * kWidth, kColumns});
+    ops::ple_embed_bf16_p12_blockdir_packed(t_rows, bases, t_packed, nullptr);
+    cuda_synchronize();
+    g_failures += verify_exact(label.c_str(), from_device<std::uint16_t>(d_packed.data(), want.size()), want);
+    g_failures += d_packed.verify_guards(label);
+
+    // The same values as canonical P12 rows: the shipped kernel must give the same words.
+    DeviceBuffer d_canonical = to_device(canonical);
+    GuardedDeviceBuffer d_reference(static_cast<std::size_t>(kHeads) * kWidth * kColumns * sizeof(std::uint16_t));
+    d_reference.fill(0xFF);
+    Tensor t_canonical(d_canonical.p, DType::U8, {kCanonical, kHeads, kColumns});
+    Tensor t_reference(d_reference.data(), DType::BF16, {kHeads * kWidth, kColumns});
+    ops::ple_embed_bf16_p12(t_canonical, t_reference, nullptr);
+    cuda_synchronize();
+    g_failures += verify_exact((label + " vs canonical").c_str(),
+                               from_device<std::uint16_t>(d_reference.data(), want.size()), want);
+    g_failures += d_reference.verify_guards(label + " vs canonical");
 }
 
 struct GateReference {
@@ -415,6 +538,8 @@ INFERNIX_OP_TEST(ple) {
         test_embed_bf16_p12(160, 16, 3, 3001);
         test_embed_bf16_p12(160, 4, 5, 3002);
         test_embed_bf16_p12(254, 3, 3, 3003); // 9 rows: the seven fixed cases plus the random fill
+        // The packed blockdir rows: eight base codes, four slots and a side-stream row.
+        test_embed_bf16_p12_blockdir_packed();
         // Four streams of 2,048 and an odd geometry (H not a multiple of the 256-thread block).
         for (const int columns : {1, 4, 33}) { test_gate(4, 2048, columns, 100U + columns); }
         test_gate(2, 300, 5, 150);

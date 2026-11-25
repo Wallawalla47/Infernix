@@ -75,9 +75,17 @@ public:
     };
     [[nodiscard]] const Counters& counters() const noexcept { return counters_; }
 
-    // Bytes of the host row cache a volume of this geometry allocates.
+    // The bytes one row takes where it is consumed. A demand read resolves a blockdir row into the
+    // canonical 256-byte P12 row at cache fill; a resident table stays packed, as 240 data bytes, the
+    // block's 16-byte directory and the row's index in the block (272 bytes).
+    [[nodiscard]] static std::uint32_t consumer_row_bytes(const NgramTableConfig& table, bool resident) noexcept;
+    [[nodiscard]] std::uint32_t consumer_row_bytes() const noexcept {
+        return consumer_row_bytes(table_, resident());
+    }
+
+    // Bytes of the host row cache a volume of this geometry allocates: its demand-mode decoded rows.
     [[nodiscard]] static std::uint64_t cache_bytes(const NgramTableConfig& table) noexcept {
-        return (std::uint64_t{1} << kCacheBits) * table.row_bytes;
+        return (std::uint64_t{1} << kCacheBits) * consumer_row_bytes(table, false);
     }
 
 private:
@@ -95,16 +103,21 @@ private:
     // consume(i, block) runs on the thread that read block i.
     void read_parallel(std::span<const std::uint64_t> offsets,
                        const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const;
-    // One row's self-contained decode bytes from its block: the row verbatim for the formats whose
-    // on-disk row is their decode row, or the P12 row a blockdir block's directory resolves to (the
-    // base and that row's escaped values from the directory or the side stream) so a cache entry needs
-    // no other state.
+    // One row's bytes for its consumer: the row verbatim for the formats whose on-disk row is their
+    // decode row (a resident blockdir table's staging row is built by stage_blockdir_row), or the P12
+    // row a blockdir block's directory resolves to (the base and that row's escaped values from the
+    // directory or the side stream) so a cache entry needs no other state.
     void copy_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block, std::byte* out) const;
     void decode_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
                              std::byte* out) const;
+    // A resident blockdir row as the packed-mode kernel reads it: the 240 data planes, the block's
+    // 16-byte directory and the row's index in the block; a row the directory cannot resolve inline
+    // (its block used the side stream) is the canonical P12 row, marked at the header byte.
+    void stage_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
+                            std::byte* out) const;
     struct SideRef {
         std::uint64_t offset = 0; // bytes into side_
-        std::uint32_t count  = 0; // blockdir escapes, or 1 for a qhuf row
+        std::uint32_t count  = 0; // a block's escape entries
     };
 
     ReadOnlyFile file_;
@@ -116,7 +129,7 @@ private:
     mutable std::byte* parallel_ring_ = nullptr;
     mutable std::vector<std::uint32_t> tags_; // row id per cache slot, UINT32_MAX when empty
     mutable std::vector<std::byte> cache_;    // row codes per slot
-    // The file-level side stream (blockdir escapes, qhuf rows) and where each block or row starts in it.
+    // The file-level side stream (a block's escapes) and where each block starts in it.
     std::vector<std::byte> side_storage_;
     std::byte* side_ = nullptr;
     std::unordered_map<std::uint32_t, SideRef> side_index_;

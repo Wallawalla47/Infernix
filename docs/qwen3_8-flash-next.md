@@ -774,9 +774,12 @@ bytes a row and 17 rows a 4 KiB block instead of the P12 volume's 16. The data b
 3-bit escape count and four 18-bit slots (12-bit position in the block, 6-bit signed exponent
 delta). A block that needs more than four slots, or an escape outside six signed bits, moves its
 escapes to a file-level side stream addressed by block id. The volume is 17 x 240 + 16 = 4096 bytes
-a block, 0.94 of the P12 volume's size, and the engine decodes each row to the same canonical P12
-row. The volume reader resolves a block's directory into the row (the cache holds that
-self-contained row), so a cached row needs no second lookup. The packer refuses a table with more
+a block, 0.94 of the P12 volume's size. A demand read resolves a block's directory into the
+canonical P12 row (the cache holds that self-contained row), so a cached row needs no second
+lookup. A resident table stays packed: each row is staged as its 240 data bytes, the block's
+directory and its index in the block, and the blockdir kernel reads the base from the volume's
+eight-entry table through the row's 3-bit code and the escapes from the directory's four slots,
+so a resident gather does not expand the table. The packer refuses a table with more
 than eight distinct row bases or a row past P12's four escapes:
 
 ```text
