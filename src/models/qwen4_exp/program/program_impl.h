@@ -4796,7 +4796,7 @@ private:
     // the n-gram rows (ids, positions, slots, table rows, logit columns) and its columns' rows.
     // Prefill and forced-token calls copy the whole layout (their MTP cells follow the rows).
     std::size_t io_prefix(std::int32_t columns) const {
-        return io_layout_.ngram + static_cast<std::size_t>(columns) * hash_.heads() * ngram_table().row_bytes;
+        return io_layout_.ngram + static_cast<std::size_t>(columns) * hash_.heads() * ngram_row_bytes();
     }
 
     SequenceHandle handle(std::uint32_t lane) const noexcept {
@@ -5015,7 +5015,7 @@ private:
     // Reads the rows of the `count` positions whose tokens (with their context) are in window_ into
     // io columns from `column`.
     void read_ngram(Lane& lane, std::int32_t count, std::size_t column) {
-        read_ngram_to(lane, count, host_io() + io_layout_.ngram + column * hash_.heads() * ngram_table().row_bytes);
+        read_ngram_to(lane, count, host_io() + io_layout_.ngram + column * hash_.heads() * ngram_row_bytes());
     }
 
     // As read_ngram, into `out` (count * heads rows).
@@ -5024,7 +5024,7 @@ private:
         const std::size_t heads = hash_.heads();
         row_ids_.resize(static_cast<std::size_t>(count) * heads);
         hash_.row_ids(window_, static_cast<std::size_t>(count), row_ids_.data());
-        const std::size_t row_bytes = ngram_table().row_bytes;
+        const std::size_t row_bytes = ngram_row_bytes();
         const NgramVolume::Counters before = volume_.counters();
         volume_.read_rows(row_ids_, std::span<std::byte>(out, static_cast<std::size_t>(count) * heads * row_bytes));
         const NgramVolume::Counters& after = volume_.counters();
@@ -6113,9 +6113,8 @@ private:
         fb.table_rows    = Tensor(base + io_layout_.rows, DType::I32, {batch});
         fb.logit_columns = Tensor(base + io_layout_.columns, DType::I32, {logit_columns});
         fb.ngram_rows    = Tensor(base + io_layout_.ngram, DType::U8,
-                                  {dim(ngram_table().row_bytes), dim(hash_.heads()), cols});
+                                  {dim(ngram_row_bytes()), dim(hash_.heads()), cols});
         fb.ngram_format  = ngram_table().format;
-        fb.ngram_rows_are_p12 = ngram_rows_are_p12();
         fb.ngram_blockdir_bases = ngram_table().blockdir_bases;
         if (ngram_scale_.p != nullptr) {
             fb.ngram_scale = Tensor(ngram_scale_.p, ngram_table().nvfp4_scale ? DType::FP32 : DType::BF16, {1});
@@ -7764,12 +7763,8 @@ private:
         return options_.ngram_table ? *options_.ngram_table : c_.ple.table;
     }
 
-    // A call's decoded n-gram row bytes: a blockdir volume read on demand resolves rows to the
-    // canonical P12 row at cache fill, while a resident one stays packed.
+    // A call's decoded n-gram row bytes (a blockdir volume's are packed in both modes).
     [[nodiscard]] std::size_t ngram_row_bytes() const noexcept { return volume_.consumer_row_bytes(); }
-    [[nodiscard]] bool ngram_rows_are_p12() const noexcept {
-        return ngram_table().format == NgramRowFormat::Bf16P12Blockdir && !volume_.resident();
-    }
 
     // ---- causal scoring (score.cpp) ----
     // While a scored prompt prefills, each call's final residuals land in score_residuals_ at its

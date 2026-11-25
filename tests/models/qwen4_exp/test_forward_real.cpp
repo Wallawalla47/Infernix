@@ -444,8 +444,6 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     call.batch.ngram_rows = Tensor(put(ngram.data(), ngram.size()), DType::U8,
                                    {static_cast<std::int32_t>(row_bytes), static_cast<std::int32_t>(heads), columns});
     call.batch.ngram_format = volume.table().format;
-    call.batch.ngram_rows_are_p12 =
-        volume.table().format == q4::NgramRowFormat::Bf16P12Blockdir && !volume.resident();
     call.batch.ngram_blockdir_bases = volume.table().blockdir_bases;
     // An FP8 volume that is not the artifact's own carries its per-tensor scale (as the Engine passes it).
     if (const auto scale = volume.table().fp8_scale) {

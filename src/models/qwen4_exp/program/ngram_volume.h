@@ -75,9 +75,8 @@ public:
     };
     [[nodiscard]] const Counters& counters() const noexcept { return counters_; }
 
-    // The bytes one row takes where it is consumed. A demand read resolves a blockdir row into the
-    // canonical 256-byte P12 row at cache fill; a resident table stays packed, as 240 data bytes, the
-    // block's 16-byte directory and the row's index in the block (272 bytes).
+    // The bytes one row takes where it is consumed. A blockdir row is packed in both modes: its 240
+    // data bytes, the block's 16-byte directory and its index in the block (272 bytes).
     [[nodiscard]] static std::uint32_t consumer_row_bytes(const NgramTableConfig& table, bool resident) noexcept;
     [[nodiscard]] std::uint32_t consumer_row_bytes() const noexcept {
         return consumer_row_bytes(table_, resident());
@@ -110,9 +109,9 @@ private:
     void copy_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block, std::byte* out) const;
     void decode_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
                              std::byte* out) const;
-    // A resident blockdir row as the packed-mode kernel reads it: the 240 data planes, the block's
-    // 16-byte directory and the row's index in the block; a row the directory cannot resolve inline
-    // (its block used the side stream) is the canonical P12 row, marked at the header byte.
+    // A blockdir row as the packed-mode kernel reads it: the 240 data planes, the block's 16-byte
+    // directory and the row's index in the block; a row the directory cannot resolve inline (its
+    // block used the side stream) is the canonical P12 row, marked at the header byte.
     void stage_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
                             std::byte* out) const;
     struct SideRef {

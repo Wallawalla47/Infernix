@@ -41,18 +41,11 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
 /// out: BF16 [heads*W, T], each value its exact BF16 bits.
 void ple_embed_bf16_p12(const Tensor& rows, Tensor& out, cudaStream_t stream);
 
-/// BF16 P12 blockdir rows read on demand (a lossless run-time volume): the reader resolves each
-/// block's 16-byte directory into the canonical P12 row above (the row's base and its escaped values
-/// from the directory or the file's side stream) when it fills the row cache, so `rows` holds P12
-/// rows and the op decodes them like ple_embed_bf16_p12. A resident table's rows are packed instead;
-/// ple_embed_bf16_p12_blockdir_packed decodes those.
-void ple_embed_bf16_p12_blockdir(const Tensor& rows, Tensor& out, cudaStream_t stream);
-
-/// BF16 P12 blockdir rows as a resident table holds them: rows U8 [272, heads, T], each row the
-/// block's 240 B P12 data planes, its 16 B directory and the row's index in the block at byte 256
-/// (a row whose block used the file's side stream carries the canonical P12 row at 240..255 instead,
-/// with byte 256 = 0xFF). The base is bases[code], the row's 3-bit directory code into the volume
-/// header's 8-entry table, and an escaped value comes from the directory's four 18-bit slots.
+/// BF16 P12 blockdir rows (a lossless run-time volume), packed in both modes: rows U8 [272, heads, T],
+/// each row the block's 240 B P12 data planes, its 16 B directory and the row's index in the block at
+/// byte 256 (a row whose block used the file's side stream carries the canonical P12 row at 240..255
+/// instead, with byte 256 = 0xFF). The base is bases[code], the row's 3-bit directory code into the
+/// volume header's 8-entry table, and an escaped value comes from the directory's four 18-bit slots.
 /// out: BF16 [heads*W, T], each value its exact BF16 bits.
 void ple_embed_bf16_p12_blockdir_packed(const Tensor& rows, const std::array<std::uint8_t, 8>& bases,
                                         Tensor& out, cudaStream_t stream);

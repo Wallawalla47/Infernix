@@ -37,10 +37,12 @@ constexpr std::size_t kSideCountOffset     = kSideBytesOffset + 8;    // 108
 constexpr std::size_t kBasesOffset         = kSideCountOffset + 8;    // 116
 constexpr std::size_t kHeaderFieldsBytes   = kBasesOffset + 8;        // 124
 static_assert(kHeaderFieldsBytes <= 4096);
-// BF16 P12 blockdir: W values a row, 17 rows and one 16-byte directory a 4 KiB block, decoded into
-// canonical P12 rows (W + W/2 + 16 bytes). The directory holds a 3-bit base code per row (an index
-// into the file's eight-entry base table), a 3-bit escape count and four 18-bit escape slots; a
-// block that needs a fifth slot puts all of its escapes in the side stream (count 7).
+// BF16 P12 blockdir: W values a row, 17 rows and one 16-byte directory a 4 KiB block. The header
+// declares W + W/2 + 16 bytes a row (kBlockdirRowBytes), the canonical P12 row a side-stream block's
+// row resolves to; a consumed row is the 272-byte staging form the kernel reads. The directory holds
+// a 3-bit base code per row (an index into the file's eight-entry base table), a 3-bit escape count
+// and four 18-bit escape slots; a block that needs a fifth slot puts all of its escapes in the side
+// stream (count 7).
 constexpr std::uint32_t kBlockdirWidth       = 160;
 constexpr std::uint32_t kBlockdirRows        = 17;
 constexpr std::uint32_t kBlockdirPlaneBytes  = kBlockdirWidth + kBlockdirWidth / 2;
@@ -93,7 +95,7 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     : file_(path, FileMapping::None), table_(table) {
     if (!resident) {
         tags_.assign(std::size_t{1} << kCacheBits, 0xFFFFFFFFU);
-        cache_.assign((std::size_t{1} << kCacheBits) * table.row_bytes, std::byte{0});
+        cache_.assign(static_cast<std::size_t>(cache_bytes(table)), std::byte{0});
     }
     if (table.block_bytes < 4096 || table.block_bytes % 4096 != 0 || table.header_bytes % 4096 != 0) {
         throw std::runtime_error(path.string() + ": n-gram blocks and header must be whole 4 KiB pages");
@@ -173,9 +175,11 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     }
 }
 
-// A blockdir block's row as the canonical P12 row the decoder reads: the 240 data bytes verbatim,
-// then the base its 3-bit code selects and that row's escaped values as P12's 3-byte entries (the
-// exponent from the directory's 6-bit signed delta, or the full BF16 word from the side stream).
+// A blockdir block's row as a canonical P12 row: the 240 data bytes verbatim, then the base its 3-bit
+// code selects and that row's escaped values as P12's 3-byte entries (the exponent from the
+// directory's 6-bit signed delta, or the full BF16 word from the side stream). It is the staging form
+// of a row whose block used the side stream (stage_blockdir_row marks it for the kernel); every other
+// row is staged packed.
 void NgramVolume::decode_blockdir_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
                                       std::byte* out) const {
     const std::byte* directory = block + kBlockdirRows * kBlockdirPlaneBytes;
@@ -243,7 +247,7 @@ void NgramVolume::decode_blockdir_row(const std::byte* block, std::uint32_t row,
     }
 }
 
-// A resident blockdir row as the packed-mode kernel reads it (include/infernix/ngram_blockdir.h):
+// A blockdir row as the packed-mode kernel reads it (include/infernix/ngram_blockdir.h):
 // the 240 data planes verbatim, the block's 16-byte directory and the row's index in the block. A
 // block whose escapes went to the side stream (count 7) or whose count is invalid is the canonical
 // P12 row instead, marked at the header byte, so the kernel decodes it through the P12 trailer that
@@ -273,21 +277,18 @@ void NgramVolume::stage_blockdir_row(const std::byte* block, std::uint32_t row, 
 }
 
 std::uint32_t NgramVolume::consumer_row_bytes(const NgramTableConfig& table, bool resident) noexcept {
-    // A demand read resolves a blockdir row into the canonical P12 row at cache fill; a resident table
-    // is consumed packed, as its 240 data bytes, the block directory and the row's index.
-    if (table.format == NgramRowFormat::Bf16P12Blockdir) {
-        return resident ? ngram::kBlockdirStagingRowBytes : kBlockdirRowBytes;
-    }
+    // A blockdir row is consumed packed in both modes: its 240 data bytes, the block's directory and
+    // its index (the kernel reads the directory), so a demand fill is the resident staging copy and no
+    // mode inflates anything.
+    if (table.format == NgramRowFormat::Bf16P12Blockdir) { return ngram::kBlockdirStagingRowBytes; }
     return table.row_bytes;
 }
 void NgramVolume::copy_row(const std::byte* block, std::uint32_t row, std::uint32_t row_in_block,
                            std::byte* out) const {
     if (table_.format == NgramRowFormat::Bf16P12Blockdir) {
-        if (resident_) {
-            stage_blockdir_row(block, row, row_in_block, out);
-        } else {
-            decode_blockdir_row(block, row, row_in_block, out);
-        }
+        // Both modes consume the packed reading: a demand fill caches the same staging row the
+        // resident table reads, and the blockdir kernel decodes it.
+        stage_blockdir_row(block, row, row_in_block, out);
         return;
     }
     std::memcpy(out, block + static_cast<std::size_t>(row_in_block) * table_.row_bytes, table_.row_bytes);

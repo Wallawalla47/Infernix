@@ -350,9 +350,10 @@ void test_zero_row_bytes(const std::filesystem::path& path) {
 }
 
 
-// A blockdir volume read: each row resolves to the canonical P12 row (its base from the directory's
-// 3-bit code, its escaped values from the four slots or, for a block past them, the side stream), and
-// the row cache holds that self-contained row, so a second call returns it without the directory.
+// A blockdir volume read: both modes consume the packed staging row (the 240 data bytes, the block's
+// 16-byte directory and the row's index), a demand fill caches it, and the row decodes through the
+// directory's 3-bit base code and four 18-bit slots (or the side stream) to the canonical P12 row's
+// words.
 void test_blockdir(const std::filesystem::path& path) {
     constexpr std::uint64_t rows = 40; // three blocks: 17, 17 and 6 rows
     const std::uint8_t bases[8] = {96, 120, 200, 220, 0, 0, 0, 0};
@@ -404,7 +405,12 @@ void test_blockdir(const std::filesystem::path& path) {
     const q4::NgramTableConfig table = q4::resolve_ngram_volume(path, ple);
     check(table.format == q4::NgramRowFormat::Bf16P12Blockdir && table.file_bytes == 3 * 4096 + 2 * 4096,
           "the blockdir test volume resolves");
-    const q4::NgramVolume volume(path, table);
+    check(q4::NgramVolume::consumer_row_bytes(table, false) == 272 &&
+              q4::NgramVolume::consumer_row_bytes(table, true) == 272 &&
+              q4::NgramVolume::cache_bytes(table) == (std::uint64_t{1} << 20) * 272,
+          "a blockdir row is packed in both modes");
+    const q4::NgramVolume volume(path, table);         // demand: the staging row is cached
+    const q4::NgramVolume resident(path, table, true); // resident: the same staging row
     std::vector<std::uint8_t> want(rows * 256, 0);
     for (std::uint64_t r = 0; r < rows; ++r) {
         const std::uint64_t block = r / 17, slot = r % 17;
@@ -427,30 +433,48 @@ void test_blockdir(const std::filesystem::path& path) {
     }
     std::vector<std::uint32_t> all(static_cast<std::size_t>(rows));
     for (std::uint32_t r = 0; r < rows; ++r) { all[r] = r; }
-    std::vector<std::byte> got(rows * 256);
+    constexpr std::size_t kStaging = 272;
+    std::vector<std::byte> got(rows * kStaging);
     volume.read_rows(all, got);
-    bool same = std::memcmp(got.data(), want.data(), want.size()) == 0;
-    check(same, "every blockdir row resolves to its canonical P12 row");
-    if (!same) {
-        for (std::uint64_t r = 0; r < rows; ++r) {
-            if (std::memcmp(got.data() + r * 256, want.data() + r * 256, 256) != 0) {
-                std::fprintf(stderr, "  row %llu differs\n", static_cast<unsigned long long>(r));
+    std::vector<std::byte> packed(rows * kStaging);
+    resident.read_rows(all, packed);
+    check(std::memcmp(got.data(), packed.data(), packed.size()) == 0,
+          "a demand blockdir row is the resident staging row");
+    // The staged rows decode, through the kernel's own reading, to the canonical rows' words.
+    bool decoded = true;
+    for (std::uint64_t r = 0; r < rows && decoded; ++r) {
+        const auto* staged = reinterpret_cast<const std::uint8_t*>(got.data() + r * kStaging);
+        const auto* plain  = reinterpret_cast<const std::uint8_t*>(want.data() + r * 256);
+        for (int j = 0; j < 160; ++j) {
+            const unsigned q = (staged[160 + (j >> 1)] >> (4 * (j & 1))) & 15U;
+            const std::uint16_t a =
+                staged[256] == 0xFF
+                    ? infernix::ngram::p12_trailer_value_bits(staged + 240, j, staged[j], q)
+                    : infernix::ngram::blockdir_value_bits(staged + 240, bases, staged[256], 160, j, staged[j], q);
+            const unsigned plain_q = (plain[160 + (j >> 1)] >> (4 * (j & 1))) & 15U;
+            const std::uint16_t b = infernix::ngram::p12_trailer_value_bits(plain + 240, j, plain[j], plain_q);
+            if (a != b) {
+                std::printf("  staged row %llu value %d: 0x%04x vs canonical 0x%04x\n",
+                            static_cast<unsigned long long>(r), j, a, b);
+                decoded = false;
                 break;
             }
         }
     }
-    // The cache holds the resolved rows: the second call reads nothing and returns the same bytes.
-    const auto before     = volume.counters();
+    check(decoded, "a staged blockdir row decodes to its canonical P12 row's words");
+    // The cache holds the staging rows: the second call reads nothing and returns them.
+    const auto before = volume.counters();
     std::vector<std::uint32_t> again{0, 1, 17, 33, 34, 0, 1};
-    std::vector<std::byte> cached(again.size() * 256);
+    std::vector<std::byte> cached(again.size() * kStaging);
     volume.read_rows(again, cached);
     check(volume.counters().reads == before.reads && volume.counters().hits - before.hits == again.size(),
           "the blockdir row cache serves the second call");
     bool matched = true;
     for (std::size_t i = 0; i < again.size(); ++i) {
-        matched = matched && std::memcmp(cached.data() + i * 256, want.data() + again[i] * 256, 256) == 0;
+        matched = matched && std::memcmp(cached.data() + i * kStaging, packed.data() + again[i] * kStaging,
+                                         kStaging) == 0;
     }
-    check(matched, "a cached blockdir row is its self-contained P12 row");
+    check(matched, "a cached blockdir row is the staging row");
 }
 
 
@@ -471,11 +495,11 @@ void put_blockdir_row(std::uint8_t* block, std::uint32_t row_in_block, unsigned 
     }
 }
 
-// The resident-mode staging the blockdir kernel reads must decode, row for row, to the same words as
-// the host canonicalizer: the packed rows of a resident table through the volume's base table and the
-// block directory, the canonical rows of a demand read through the P12 trailer. The fixture exercises
-// all eight base-table entries, four inline slots (one row with two escapes), a block whose scan must
-// skip empty slots, and a block resolved from the side stream.
+// A demand fill stages exactly what a resident table does, and both decode to the fixture's words: the
+// packed rows through the volume's base table and the block directory, a side-stream block's row
+// through the P12 trailer. The fixture exercises all eight base-table entries, four inline slots (one
+// row with two escapes), a block whose scan must skip empty slots, and a block resolved from the side
+// stream.
 void test_blockdir_packed(const std::filesystem::path& path) {
     constexpr std::uint64_t rows = 51; // three blocks
     const std::uint8_t bases[8] = {53, 54, 105, 106, 107, 108, 109, 200};
@@ -561,8 +585,8 @@ void test_blockdir_packed(const std::filesystem::path& path) {
     check(table.format == q4::NgramRowFormat::Bf16P12Blockdir,
           "the blockdir packed-test volume resolves");
     check(q4::NgramVolume::consumer_row_bytes(table, true) == 272 &&
-              q4::NgramVolume::consumer_row_bytes(table, false) == 256,
-          "a blockdir row is packed in resident mode and canonical on demand");
+              q4::NgramVolume::consumer_row_bytes(table, false) == 272,
+          "a blockdir row is packed in both modes");
 
     std::vector<std::uint32_t> all(static_cast<std::size_t>(rows));
     for (std::uint32_t r = 0; r < rows; ++r) { all[r] = r; }
@@ -570,9 +594,11 @@ void test_blockdir_packed(const std::filesystem::path& path) {
     std::vector<std::byte> packed(rows * staging);
     const q4::NgramVolume resident(path, table, true);
     resident.read_rows(all, packed);
-    std::vector<std::byte> canonical(rows * 256);
+    std::vector<std::byte> demand_rows(rows * staging);
     const q4::NgramVolume demand(path, table, false);
-    demand.read_rows(all, canonical);
+    demand.read_rows(all, demand_rows);
+    check(std::memcmp(demand_rows.data(), packed.data(), packed.size()) == 0,
+          "a demand blockdir row is the resident staging row");
 
     // The fixture's exact words: base + j % 15, or the escape's exponent, sign 0 and mantissa 0x11.
     std::vector<std::uint16_t> want(rows * 160);
@@ -653,19 +679,13 @@ void test_blockdir_packed(const std::filesystem::path& path) {
     }
     check(packed_ok, "the packed row decode matches the fixture's words");
 
-    // The host canonicalizer's demand rows decode to the same words through the P12 trailer.
-    bool demand_ok = true;
-    for (std::uint64_t r = 0; r < rows; ++r) {
-        const std::uint8_t* row = reinterpret_cast<const std::uint8_t*>(canonical.data() + r * 256);
-        for (int j = 0; j < 160; ++j) {
-            const std::uint8_t code = row[j];
-            const unsigned q = (row[160 + (j >> 1)] >> (4 * (j & 1))) & 15U;
-            const std::uint16_t bits = infernix::ngram::p12_trailer_value_bits(row + 240, j, code, q);
-            if (bits != want[r * 160 + j]) { demand_ok = false; break; }
-        }
-        if (!demand_ok) { break; }
+    // A row whose block used the side stream stages the canonical P12 row and marks it, exactly as
+    // the resident table does.
+    bool marked = true;
+    for (std::uint64_t r = 2 * 17; r < rows; ++r) {
+        marked = marked && reinterpret_cast<const std::uint8_t*>(demand_rows.data() + r * staging)[256] == 0xFF;
     }
-    check(demand_ok, "the host canonicalizer's rows match the fixture's words");
+    check(marked, "a demand side-stream block's rows carry the canonical marker");
 }
 
 } // namespace

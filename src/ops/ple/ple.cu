@@ -318,12 +318,6 @@ void ple_embed_bf16_p12(const Tensor& rows, Tensor& out, cudaStream_t stream) {
     check_launch("embed bf16 p12");
 }
 
-void ple_embed_bf16_p12_blockdir(const Tensor& rows, Tensor& out, cudaStream_t stream) {
-    // The volume's block directory was resolved into the canonical P12 row when the row was read, so
-    // the rows this Op receives are P12 rows and its codec is P12's.
-    ple_embed_bf16_p12(rows, out, stream);
-}
-
 void ple_embed_bf16_p12_blockdir_packed(const Tensor& rows, const std::array<std::uint8_t, 8>& bases, Tensor& out,
                                         cudaStream_t stream) {
     require(contiguous(rows, DType::U8) && contiguous(out, DType::BF16),
