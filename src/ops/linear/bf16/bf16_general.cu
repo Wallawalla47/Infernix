@@ -61,6 +61,25 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Calls of 9 to 64 columns: the chain kernel (the tile's bits) where it applies, else the tile.
+void bf16_general_chain(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    const std::int32_t T = x.ne[1];
+    const bool chain = T <= kChainMaxTokens && out.dtype == DType::BF16 && weight.n <= kChainMaxRows && weight.k % 8 == 0 &&
+                       reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 &&
+                       reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0;
+    if (!chain) {
+        bf16_general_gemm(x, weight, out, stream);
+        return;
+    }
+    const std::int32_t shift = T <= 16 ? 4 : (T <= 32 ? 5 : 6);
+    const std::int32_t rows  = kChainThreads >> shift;
+    const dim3 grid(static_cast<unsigned>((weight.n + rows - 1) / rows));
+    bf16_general_chain_kernel<<<grid, kChainThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
+        static_cast<__nv_bfloat16*>(out.data), weight.n, weight.k, T, shift);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Decode-sized calls stream each weight row once when the rows can be read in 16-byte chunks.
 void bf16_general_small(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const bool vector = weight.k % 8 == 0 && reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 &&
@@ -75,7 +94,8 @@ void bf16_general_small(const Tensor& x, const Weight& weight, Tensor& out, cuda
 } // namespace
 
 [[nodiscard]] Bf16Launch select_bf16_general_launch(std::int32_t tokens) {
-    return tokens <= kSkinnyMaxTokens ? &bf16_general_small : &bf16_general_gemm;
+    if (tokens <= kSkinnyMaxTokens) { return &bf16_general_small; }
+    return tokens <= kChainMaxTokens ? &bf16_general_chain : &bf16_general_gemm;
 }
 
 } // namespace infernix::ops::detail

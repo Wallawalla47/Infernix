@@ -99,4 +99,58 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// Calls of 9 to 64 columns of a weight of at most kChainMaxRows rows (BF16 output, rows in 16-byte chunks): one
+// thread per output, its fmaf chain over k = 0 .. K - 1 in order with the tile's operands (x first) and the tile's
+// zero-padded tail, so every output has the tile's bits, and a column's bits stay the same at every width past the
+// skinny route. A block holds every column of 64 / Tp rows (Tp: the columns rounded up to 16, 32 or 64), so a weight
+// row's chunks are read by one block, from cache after its first thread. The 64 x 64 tile gave Flash-Next's QSA
+// indexer [640, 2560] ten CTAs at 16 columns; this gives it 160.
+constexpr std::int32_t kChainMaxTokens = 64;
+constexpr std::int32_t kChainMaxRows   = 32768;
+constexpr std::int32_t kChainThreads   = 64;
+constexpr std::int32_t kChainAhead     = 4; // 16-byte chunks loaded before their FMAs
+
+__device__ __forceinline__ float bf16_chain8(const uint4& xv, const uint4& wv, float sum) {
+    const auto* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+    const auto* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 xf = __bfloat1622float2(xp[i]);
+        const float2 wf = __bfloat1622float2(wp[i]);
+        sum             = fmaf(xf.x, wf.x, sum);
+        sum             = fmaf(xf.y, wf.y, sum);
+    }
+    return sum;
+}
+
+template <class Out>
+__global__ void __launch_bounds__(kChainThreads)
+    bf16_general_chain_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+                              Out* __restrict__ out, std::int32_t N, std::int32_t K, std::int32_t T,
+                              std::int32_t token_shift) {
+    const auto tid           = static_cast<std::int32_t>(threadIdx.x);
+    const std::int32_t token = tid & ((1 << token_shift) - 1);
+    const std::int32_t row   = static_cast<std::int32_t>(blockIdx.x) * (kChainThreads >> token_shift) + (tid >> token_shift);
+    if (row >= N || token >= T) { return; }
+    const auto* w              = reinterpret_cast<const uint4*>(weight + static_cast<std::int64_t>(row) * K);
+    const auto* xs             = reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(token) * K);
+    const std::int32_t vectors = K / 8;
+    float sum                  = 0.0f;
+    std::int32_t v             = 0;
+    for (; v + kChainAhead <= vectors; v += kChainAhead) {
+        uint4 wv[kChainAhead], xv[kChainAhead];
+#pragma unroll
+        for (int u = 0; u < kChainAhead; ++u) {
+            wv[u] = __ldg(w + v + u);
+            xv[u] = __ldg(xs + v + u);
+        }
+#pragma unroll
+        for (int u = 0; u < kChainAhead; ++u) { sum = bf16_chain8(xv[u], wv[u], sum); }
+    }
+    for (; v < vectors; ++v) { sum = bf16_chain8(__ldg(xs + v), __ldg(w + v), sum); }
+    // The tile's last K chunk is zero-padded past K: fmaf(0, 0, sum), which turns -0 into +0 once.
+    if (K % kTileK != 0) { sum = fmaf(0.0f, 0.0f, sum); }
+    bf16_linear_store(&out[static_cast<std::int64_t>(token) * N + row], sum);
+}
+
 } // namespace infernix::ops::detail

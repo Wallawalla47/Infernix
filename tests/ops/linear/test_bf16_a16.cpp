@@ -668,7 +668,14 @@ int run_new_bf16(int selected_n = 0, int selected_k = 0) {
 // columns of a call of another width, partial tiles included. Past the skinny route (T > 8), against a 4,096-column
 // call, bit for bit.
 int run_general_tile_widths() {
-    return run_width_invariance(640, 2560, 4096, {9, 33, 64, 65, 1023, 1024, 1087, 1088, 1089, 2048, 3000}, 467U);
+    // 9-64 columns take the chain kernel, past them the tile: every width gives a column the same bits.
+    if (const int failures = run_width_invariance(640, 2560, 4096, {9, 12, 16, 17, 31, 32, 33, 48, 63, 64, 65, 1023,
+                                                                     1024, 1087, 1088, 1089, 2048, 3000},
+                                                  467U)) {
+        return failures;
+    }
+    // A K that is not a multiple of the tile's 32 (the zero-padded tail) and an odd row count.
+    return run_width_invariance(203, 2568, 256, {9, 16, 40, 64, 65}, 479U);
 }
 
 // A call's columns against the same columns of a `widest`-column call of [n, k], bit for bit, at each width.
