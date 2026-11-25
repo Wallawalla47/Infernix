@@ -1,4 +1,5 @@
 #include "infernix/engine.h"
+#include "real_test_artifact.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,24 +7,33 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-int main() {
-    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "SKIP: INFERNIX_TEST_ARTIFACT is not set\n";
-        return 77;
-    }
+// Arguments: none (the dense artifact, INFERNIX_TEST_ARTIFACT) or `offloaded` (INFERNIX_TEST_OFFLOADED_ARTIFACT, the
+// 122B-A10B, whose experts are offloaded). Scoring keeps the model's own default prefill chunk: 1,024 on a dense
+// Qwen3.5 artifact, 16,384 with offloaded experts (model_instance.cpp).
+int main(int argc, char** argv) {
+    const bool offloaded = argc > 1 && std::string_view(argv[1]) == "offloaded";
+    const char* artifact = infernix::test::real_test_artifact(
+        offloaded ? infernix::test::kOffloadedArtifactVariable : infernix::test::kDenseArtifactVariable);
+    if (artifact == nullptr) { return 77; }
+    const std::uint32_t default_chunk = offloaded ? 16384U : 1024U;
 
     infernix::EngineOptions options;
     options.artifact_path = artifact;
     options.purpose       = infernix::EnginePurpose::CausalScoring;
     options.max_context   = 2048;
     options.kv_cache      = infernix::KvCacheStorage::Fp8E4M3Row256;
+    // The hidden-state checks below need column-invariant prefill kernels. The dense artifact's default route has them;
+    // the 122B's MoE default route rounds a column by the call's other columns, which its 48 layers grow from 1e-3 at
+    // layer 3 to 0.4 relative L2 (another first target token, 2026-11-24; the same request repeated is bit-identical),
+    // so the offloaded entry scores on the reproducible route, where those checks are bit-identical.
+    options.fast_paths = !offloaded;
     infernix::Engine engine(options);
     const auto& effective = engine.options();
-    if (effective.max_concurrency != 1 || effective.prefill_chunk != 1024 ||
+    if (effective.max_concurrency != 1 || effective.prefill_chunk != default_chunk ||
         effective.kv_capacity.mode != infernix::KvCapacityMode::Explicit ||
         effective.kv_capacity.explicit_tokens != effective.max_context ||
         effective.context_cache.enabled ||
@@ -115,7 +125,8 @@ int main() {
     }
 
     // Every layer's hidden state at the last prompt token (ScoreOptions::prompt_hidden_states): the scores unchanged,
-    // one row per layer. The rows are read at the prompt's last column, in the first prefill chunk and in the second:
+    // one row per layer. The rows are read at the prompt's last column, in the first prefill chunk and in the second
+    // (on the dense artifact; one 16,384-token chunk holds both with offloaded experts):
     // another token after it (the first target, or a shorter window's narrower chunk) leaves them alone within 1e-2
     // relative L2 per layer (kernels may round a column by its neighbours; a later column is off by order one), and
     // another token at it moves them by order one (an earlier column would not move: the scored prefix is causal).
@@ -149,7 +160,7 @@ int main() {
     std::vector<infernix::TokenId> other = tokens;
     other[513]                           = tokens[513] == tokens[0] ? tokens[1] : tokens[0];
     const infernix::ScoreResult changed  = engine.score_tokens(other, 513, hidden_options);
-    // Position 1499, in the second 1,024-token chunk: the 1,537-token window against a 1,501-token one.
+    // Position 1499 (the dense artifact's second 1,024-token chunk): the 1,537-token window against a 1,501-token one.
     const infernix::ScoreResult wide = engine.score_tokens(tokens, 1500, hidden_options);
     const infernix::ScoreResult narrow =
         engine.score_tokens(std::vector<infernix::TokenId>(tokens.begin(), tokens.begin() + 1501), 1500, hidden_options);

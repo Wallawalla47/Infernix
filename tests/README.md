@@ -294,7 +294,11 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
 ```
 
 The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
-score tile, overlapping target suffixes, and repeated-window State/KV isolation:
+score tile, overlapping target suffixes, and repeated-window State/KV isolation; its entry
+`infernix_qwen3_5_score_offloaded_real_test` runs the same checks on `INFERNIX_TEST_OFFLOADED_ARTIFACT`
+(the 122B-A10B, whose scoring keeps the offloaded default chunk of 16,384) on `--reproducible`: the checks that
+the prompt's hidden states do not move with the tokens after it need column-invariant kernels, which the 122B's
+MoE default route does not have (another target token moves its deep layers by up to 0.4 relative L2):
 
 ```bash
 INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \

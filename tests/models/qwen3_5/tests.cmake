@@ -176,6 +176,8 @@ set_tests_properties(infernix_qwen3_5_ablate_real_test infernix_qwen3_5_ablate_m
 infernix_add_test(infernix_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES infernix_engine)
+# The same checks on the offloaded artifact (the 122B-A10B): its scoring keeps the 16,384-token default chunk.
+add_test(NAME infernix_qwen3_5_score_offloaded_real_test COMMAND infernix_qwen3_5_score_real_test offloaded)
 
 infernix_add_test(infernix_qwen3_5_lossless_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossless_real.cpp"
@@ -348,6 +350,7 @@ set(infernix_qwen3_5_real_tests
   infernix_qwen3_5_grammar_real_test
   infernix_qwen3_5_tools_real_test
   infernix_qwen3_5_score_real_test
+  infernix_qwen3_5_score_offloaded_real_test
   infernix_qwen3_5_vision_workspace_test
   infernix_qwen3_5_dflash2_real_test
   infernix_qwen3_5_dflash_prefill_real_test
