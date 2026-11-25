@@ -30,6 +30,11 @@ ANSWER_OPENER_INKLING = "<|message_model|><|content_text|>"
 ANSWER_OPENER_TOKENS = 2
 
 
+def is_inkling(artifact: Path) -> bool:
+    """Inkling 2: thinks with thinking off, and its chat prompt ends after a closed message (see Engine)."""
+    return text_model_type(artifact) == "inkling2_loop_text"
+
+
 class EngineError(RuntimeError):
     """One engine's problem (died booting, timed out, a request failed): a trial records it and the fit goes on."""
 
@@ -46,8 +51,8 @@ class Engine:
         self.port = 0
         self.proc = None
         # Inkling 2's template has no thinking-off: enable_thinking false renders its lowest effort, and the reply may
-        # still open with a thinking channel (measure.grade_refusals grades what the model says first in either channel).
-        inkling = text_model_type(run.production.artifact) == "inkling2_loop_text"
+        # still think first (measure.grade_refusals caps that thinking and grades the answer after it).
+        inkling = is_inkling(run.production.artifact)
         self.reasons_when_off = inkling
         # Inkling 2's chat prompt ends after a closed message, so its next token is the reply header, never the answer:
         # a scored continuation starts with the answer's opener (two special tokens, which raw text encodes as tokens),
@@ -141,12 +146,16 @@ class Engine:
         except (urllib.error.URLError, OSError) as e:
             raise EngineError(f"{route}: {type(e).__name__}: {e}") from e
 
-    def chat(self, prompt: str, *, max_tokens: int, enable_thinking: bool, timeout: float = 600.0) -> dict:
-        """One fresh user turn, greedy. Returns the first choice. (Infernix: `model` must equal --model-id, the reply
-        carries reasoning_content separately, and there is no usage object.)"""
-        reply = self.post("/v1/chat/completions", {"model": MODEL_ID, "messages": [{"role": "user", "content": prompt}],
-                                                   "temperature": 0.0, "max_tokens": max_tokens,
-                                                   "enable_thinking": enable_thinking}, timeout)
+    def chat(self, prompt: str, *, max_tokens: int, enable_thinking: bool, thinking_budget: int | None = None,
+             timeout: float = 600.0) -> dict:
+        """One fresh user turn, greedy. Returns the first choice. `thinking_budget` caps the reply's thinking tokens
+        (Inkling 2 thinks even with thinking off). (Infernix: `model` must equal --model-id, the reply carries
+        reasoning_content separately, and there is no usage object.)"""
+        body = {"model": MODEL_ID, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0,
+                "max_tokens": max_tokens, "enable_thinking": enable_thinking}
+        if thinking_budget is not None:
+            body["thinking_budget"] = thinking_budget
+        reply = self.post("/v1/chat/completions", body, timeout)
         return reply["choices"][0]
 
     def score(self, prompt: str, continuation: str, *, top_k: int, enable_thinking: bool) -> list[dict[int, float]]:

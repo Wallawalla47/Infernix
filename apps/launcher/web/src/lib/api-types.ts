@@ -1097,8 +1097,13 @@ export interface AblationPreset {
   name: string;
   title: string;
   description: string;
+  /** Line i of the harmless list is the counterpart of line i of the harmful one (the fit is told so). */
+  paired: boolean;
   harmful: { source: string; count: number };
   harmless: { source: string; count: number };
+  /** The pair the fit's best trials are graded on to pick among them. */
+  validate: { harmful: string; benign: string };
+  /** The pair the kept trial is graded on once. */
   test: { harmful: string; benign: string };
   sources: AblationSource[];
 }
@@ -1130,11 +1135,46 @@ export interface AblationRefusals {
   truncated?: number;
 }
 
-export type AblationPhase = "doctor" | "prompts" | "capture" | "direction" | "fit" | "pick" | "grade" | "export";
+export type AblationPhase =
+  | "doctor"
+  | "prompts"
+  | "capture"
+  | "direction"
+  | "fit"
+  | "validate"
+  | "pick"
+  | "grade"
+  | "export";
+
+/** A trial (or the stock model) on the validation prompts: refusals of the `n` graded harmful ones, over-refusals of
+ * the benign ones, first-token KL on the benign ones (all, and where the stock model answered). */
+export interface AblationValidated {
+  refusals: number;
+  n: number;
+  benign_refusals: number;
+  benign_n: number;
+  kl: number | null;
+  kl_answered: number | null;
+}
+
+/** A trial of the fit: refusals of the `n` held-out harmful prompts, first-token KL on the held-out harmless ones,
+ * and its validation numbers once graded on the validation pair. */
+export interface AblationTrial {
+  trial: number;
+  refusals: number;
+  n: number;
+  kl: number;
+  what: string;
+  validation?: AblationValidated;
+  /** A validated trial that is not on the front (validation takes the fit's best trials, on the front or not). */
+  off_front?: boolean;
+}
 
 /** The tool's own account of the run (its run folder's progress.json). */
 export interface AblationProgress {
   state: "running" | "done" | "no_sidecar" | "stopped" | "failed";
+  /** `auto` (a fit and its pick) or `choose` (another trial of the same fit kept). */
+  command: "auto" | "choose";
   phase: AblationPhase | null;
   phases_done: AblationPhase[];
   message: string;
@@ -1142,9 +1182,22 @@ export interface AblationProgress {
   trials: { done: number; target: number; seconds?: number };
   /** The stock model on the held-out harmful prompts. */
   control: { refusals: number; n: number } | null;
-  /** The best trial so far by the pick's rule (fewest refusals with the KL below the target, then the lowest KL). */
-  best: { trial: number; refusals: number; kl: number; what: string } | null;
-  /** The test prompts' results, per arm ("stock" and the pick). */
+  /** The pick's rule: KL below `kl_max`, the lowest refusal score (refusals over the stock model's) + KL / `kl_scale`. */
+  rule: { kl_max: number; kl_scale: number };
+  /** The study's Pareto front, fewest refusals first: no trial has both fewer refusals and a lower KL. Once
+   * validated, each validated trial off the front too (`off_front`). */
+  front: AblationTrial[];
+  /** Once the fit's best trials are graded on the validation pair: the lists' names, the stock model's numbers, the
+   * validated trials. Null without a validation pair. */
+  validation: { harmful: string; benign: string; stock: AblationValidated; trials: number[] } | null;
+  /** The pick so far by the rule. */
+  pick: AblationTrial | null;
+  /** What the pick was made on: the held-out numbers (until validation, or without a validation pair) or the
+   * validation ones. */
+  picked_on: "fit" | "validation";
+  /** The trial being kept: the pick (auto), or the chosen trial (choose). */
+  best: AblationTrial | null;
+  /** The test prompts' results, per arm ("stock" and the kept trial). */
   grade: Record<
     string,
     { harmful: AblationRefusals; benign: AblationRefusals | null; kl: number | null; kl_stock_answered: number | null }
@@ -1159,6 +1212,8 @@ export type AblationJobState = "waiting_gpu" | "running" | "stopping" | "done" |
 export interface AblationJob {
   run: { config_id: string; model_name: string; preset: string; trials: number; name: string };
   run_dir: string;
+  /** A job that keeps another trial of the run (the tool's `choose`) as the sidecar `name`; null for a fit. */
+  choice: { trial: number; name: string } | null;
   state: AblationJobState;
   /** The run is taking, or holds, the GPU. */
   active: boolean;

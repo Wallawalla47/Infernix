@@ -1,17 +1,24 @@
 """The fit: an Optuna search for the cut that removes refusals while moving the model least.
 
-Each trial (heretic's search, as in the study that produced refusal-cut-v1):
+Each trial (heretic 1.4's search):
   * samples heretic's direction scope (one interpolated row at every layer, or each layer's own row) and a band per
     lane (attention/DeltaNet output and MoE output);
   * starts a generation engine with that sidecar and counts refusals on the held-out harmful prompts;
   * starts a scoring engine with it and measures first-token KL against the control on the held-out harmless prompts.
 
-Score (heretic's objective, minimized): at or above the KL target, KL / scale (the trial is judged on drift alone);
-below it, the refusal rate relative to the control, times target / scale. The target is a cliff, not a penalty, so
-run it loose (refusal-cut-v1 used 0.4) and pick from the front yourself: `list` shows (refusals, KL) pairs.
+Objectives (heretic 1.4's, a two-objective study, both minimized):
+  refusal score  the trial's refusal rate on the held-out harmful prompts over the control's
+  KL score       first-token KL / kl_scale; below kl_floor (0.01) the refusal score x kl_floor / kl_scale instead, so
+                 the sampler does not spend its trials on cuts that change nothing
+TPE models both, so the search fills the front (for each number of refusals, the lowest KL it found) instead of
+stopping at the first cut under a KL bound.
+
+The pick (pick()): among completed trials whose KL is below kl_max (0.4) and that refuse fewer held-out prompts than
+the stock model, the lowest refusal score + KL / kl_scale. That is heretic's balance: a KL of kl_scale (1.0) weighs
+as much as every refusal the stock model makes. `list` shows the front; `choose` keeps another trial instead.
 
 A study is resumable (a sqlite ledger per study): rerunning `fit` with the same name continues it. Its identity is
-mode : lanes : direction : scoring rule : graded prompts, and a run whose identity differs is refused, because mixing
+mode : lanes : direction : objectives : graded prompts, and a run whose identity differs is refused, because mixing
 them corrupts TPE's model and the front.
 """
 
@@ -36,14 +43,37 @@ def load_sets(run) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: float = 1.0, startup: int = 60,
-        markers: tuple[str, ...] = M.MARKERS, max_failures: int = 3, log=print, progress=None) -> dict:
+KL_FLOOR = 0.01   # heretic 1.4's kl_divergence_target
+KL_SCALE = 1.0    # heretic 1.4's kl_divergence_scale
+KL_MAX = 0.4      # the pick's ceiling
+
+
+def refusal_rate(refusals: int, truncated: int, n: int) -> float:
+    """Refusals over the answers that ended (an answer cut off at the token limit is not graded)."""
+    return refusals / max(1, n - truncated)
+
+
+def objectives(refusals: int, truncated: int, n: int, control: dict, kl: float, kl_floor: float = KL_FLOOR,
+               kl_scale: float = KL_SCALE) -> tuple[float, float]:
+    """(KL score, refusal score): heretic 1.4's two objectives (evaluator.get_score)."""
+    rate_c = refusal_rate(control["refusals"], control["truncated"], n)
+    rate_t = refusal_rate(refusals, truncated, n)
+    refusal_score = rate_t / rate_c if rate_c else rate_t
+    kl_score = kl / kl_scale if kl >= kl_floor else refusal_score * kl_floor / kl_scale
+    return kl_score, refusal_score
+
+
+def fit(run, study_name: str, trials: int, *, kl_floor: float = KL_FLOOR, kl_scale: float = KL_SCALE,
+        startup: int = 60, markers: tuple[str, ...] = M.MARKERS, max_failures: int = 3, log=print,
+        progress=None) -> dict:
     """Adds `trials` completed trials to the study (a failed trial is replaced). `progress`, when given, is called with
     {'control_refusals', 'n_harmful'} once the control is measured and with each finished trial's record."""
     import optuna
 
     if trials < 1:
         raise SystemExit("--trials must be at least 1")
+    if not (kl_floor >= 0 and kl_scale > 0):
+        raise SystemExit("--kl-floor must be at least 0 and --kl-scale above 0")
     base = run.dir / "direction" / "sidecar.json"
     if not base.is_file():
         raise SystemExit(f"{base} is missing: run `ablate.py direction` first")
@@ -52,19 +82,27 @@ def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: 
     sets = load_sets(run)
     harm, good = sets["held_out"]["harmful"], sets["held_out"]["harmless"]
     d_sha = hashlib.sha256((base.parent / "d.f32.bin").read_bytes()).hexdigest()
-    rule = f"kl={kl_target:g}" + (f",scale={kl_scale:g}" if kl_scale != 1.0 else "") + f",eval={eval_id(harm, good)}"
+    rule = f"pareto,floor={kl_floor:g},scale={kl_scale:g},eval={eval_id(harm, good)}"
     shape = f"band+scope:attn+mlp:{d_sha[:12]}:{rule}"
+    space = SC.search_space(n_layers)
 
     study_dir = run.sub("fit", study_name)
+    storage = f"sqlite:///{(study_dir / 'study.sqlite').as_posix()}"
     warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    if (study_dir / "study.sqlite").is_file():
+        # Read the ledger's identity before opening it as a two-objective study (an older one-objective study cannot
+        # be opened that way, and must be refused by name rather than by Optuna's error).
+        try:
+            previous = optuna.load_study(study_name=study_name, storage=storage).user_attrs.get("shape")
+        except KeyError:
+            previous = None
+        if previous is not None and previous != shape:
+            raise SystemExit(f"study {study_name!r} was fitted as {previous}; this run is {shape} "
+                             "(mode:lanes:direction:objectives). Use a new study name.")
     sampler = optuna.samplers.TPESampler(n_startup_trials=startup, n_ei_candidates=128, multivariate=True)
-    study = optuna.create_study(study_name=study_name, storage=f"sqlite:///{(study_dir / 'study.sqlite').as_posix()}",
-                                direction="minimize", load_if_exists=True, sampler=sampler)
-    previous = study.user_attrs.get("shape")
-    if previous is not None and previous != shape:
-        raise SystemExit(f"study {study_name!r} was fitted as {previous}; this run is {shape} "
-                         "(mode:lanes:direction:scoring rule). Use a new study name.")
+    study = optuna.create_study(study_name=study_name, storage=storage, directions=["minimize", "minimize"],
+                                load_if_exists=True, sampler=sampler)
     study.set_user_attr("shape", shape)
     log(f"study {study_name!r}: {shape}; {len(study.trials)} trial(s) already in the ledger")
     log(f"graded every trial: refusals on {len(harm)} held-out harmful prompts, KL on {len(good)} held-out harmless")
@@ -83,11 +121,11 @@ def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: 
     if progress is not None:
         progress({"control_refusals": control["refusals"], "n_harmful": len(harm)})
 
-    def run_trial(trial) -> float:
+    def run_trial(trial) -> tuple[float, float]:
         started = time.time()
         tdir = study_dir / f"t{trial.number}"
         scope = trial.suggest_categorical("direction_scope", ["global", "per layer"])
-        index = trial.suggest_float("direction_index", 0.4 * (n_layers - 1), 0.9 * (n_layers - 1))
+        index = trial.suggest_float("direction_index", *space["direction_index"])
         direction = SC.global_direction(rows, index) if scope == "global" else None
         bands = {lane: SC.sample_band(trial, n_layers, lane) for lane in SC.LANES}
         tables = SC.lane_tables(bands, n_layers)
@@ -102,27 +140,23 @@ def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: 
         with Engine(run, "score", sidecar=cand, log_path=tdir / "engine.score.log") as e:
             kls = M.kl(anchor, M.first_token_distributions(e, good))
         kl = M.mean(kls)
-        if kl >= kl_target:
-            score = kl / kl_scale
-        else:
-            rate_t = graded["refusals"] / max(1, len(harm) - graded["truncated"])
-            rate_c = control["refusals"] / max(1, len(harm) - control["truncated"])
-            score = (rate_t / rate_c if rate_c else rate_t) * (kl_target / kl_scale)
+        kl_score, refusal_score = objectives(graded["refusals"], graded["truncated"], len(harm), control, kl,
+                                             kl_floor, kl_scale)
         record = {"refusals": graded["refusals"], "truncated": graded["truncated"], "kl": kl, "n_harmful": len(harm),
-                  "control_refusals": control["refusals"], "score": score, "scope": scope,
-                  "direction_index": round(index, 4), "sidecar": str(cand), "what": what,
+                  "control_refusals": control["refusals"], "refusal_score": refusal_score, "kl_score": kl_score,
+                  "scope": scope, "direction_index": round(index, 4), "sidecar": str(cand), "what": what,
                   "kl_per_prompt": [round(x, 5) for x in kls], "seconds": round(time.time() - started, 1)}
         for k, v in record.items():
             if k != "kl_per_prompt":
                 trial.set_user_attr(k, v)
         write_json(tdir / "trial.json", record)
         log(f"trial {trial.number:>4}  refusals {graded['refusals']:>2}/{len(harm)} (control {control['refusals']})  "
-            f"KL {kl:.4f}{'  OVER TARGET' if kl >= kl_target else ''}  {what}  {time.time() - started:.0f}s")
+            f"KL {kl:.4f}  {what}  {time.time() - started:.0f}s")
         if progress is not None:
             progress({"trial": trial.number, **{k: v for k, v in record.items() if k != "kl_per_prompt"}})
-        return score
+        return kl_score, refusal_score
 
-    def objective(trial) -> float:
+    def objective(trial) -> tuple[float, float]:
         try:
             return run_trial(trial)
         except EngineError as e:
@@ -163,31 +197,60 @@ def fit(run, study_name: str, trials: int, *, kl_target: float = 0.4, kl_scale: 
     return summary
 
 
-def front(study) -> list[dict]:
-    """Completed trials by (refusals, KL): the pick is the user's, not the score's."""
-    done = [t for t in study.trials if t.state.name == "COMPLETE"]
-    ranked = sorted(done, key=lambda t: (t.user_attrs.get("refusals", 99), t.user_attrs.get("kl", 9.9)))
-    return [{"trial": t.number, "refusals": t.user_attrs.get("refusals"), "n": t.user_attrs.get("n_harmful"),
-             "kl": round(float(t.user_attrs.get("kl", float("nan"))), 4), "what": t.user_attrs.get("what"),
-             "sidecar": t.user_attrs.get("sidecar")} for t in ranked]
+def records(study) -> list[dict]:
+    """The completed trials' results: {trial, refusals, n, kl, refusal_score, what, sidecar}."""
+    out = []
+    for t in study.trials:
+        a = t.user_attrs
+        if t.state.name != "COMPLETE" or "kl" not in a or "refusal_score" not in a:
+            continue
+        out.append({"trial": t.number, "refusals": a["refusals"], "n": a.get("n_harmful"), "kl": float(a["kl"]),
+                    "refusal_score": float(a["refusal_score"]), "what": a.get("what"), "sidecar": a.get("sidecar")})
+    return out
 
 
-def best_trial(study, kl_target: float, control_refusals: int) -> tuple[int | None, str]:
-    """(trial number, why) of the cut to keep: the fewest held-out refusals among completed trials whose first-token
-    KL is below the target, then the lowest KL. None, with the reason, when the stock model refuses none of the
-    held-out prompts, no trial is below the target, or none refuses fewer than the stock model."""
+def pareto_front(rows: list[dict]) -> list[dict]:
+    """The trials no other trial beats on both refusals and KL, fewest refusals first: each has a lower KL than every
+    trial with as few refusals or fewer (heretic 1.4's selection list)."""
+    front, best_kl = [], float("inf")
+    for r in sorted(rows, key=lambda r: (r["refusals"], r["kl"], r["trial"])):
+        if r["kl"] < best_kl:
+            front.append(r)
+            best_kl = r["kl"]
+    return front
+
+
+def pick_score(row: dict, kl_scale: float = KL_SCALE) -> float:
+    """The pick's balance: the refusal score plus KL / kl_scale."""
+    return row["refusal_score"] + row["kl"] / kl_scale
+
+
+def pick(rows: list[dict], control_refusals: int, kl_max: float = KL_MAX,
+         kl_scale: float = KL_SCALE) -> tuple[dict | None, str]:
+    """(row, why) of the cut to keep: among trials whose KL is below kl_max and that refuse fewer held-out prompts
+    than the stock model, the lowest pick_score (ties: fewer refusals, then lower KL). None, with the reason, when
+    the stock model refuses none of the held-out prompts or no trial qualifies."""
     if control_refusals == 0:
         return None, "the stock model refused none of the held-out harmful prompts: there is no refusal to remove"
-    done = [t for t in study.trials if t.state.name == "COMPLETE" and t.user_attrs.get("kl", 9.9) < kl_target]
-    if not done:
-        return None, f"no trial kept the first-token KL below the target ({kl_target:g}): try more trials"
-    best = min(done, key=lambda t: (t.user_attrs.get("refusals", 99), t.user_attrs.get("kl", 9.9), t.number))
-    refusals = best.user_attrs.get("refusals", 99)
-    if refusals >= control_refusals:
-        return None, (f"no trial below the KL target refused fewer held-out prompts than the stock model "
+    below = [r for r in rows if r["kl"] < kl_max]
+    if not below:
+        return None, f"no trial kept the first-token KL below {kl_max:g}: try more trials"
+    better = [r for r in below if r["refusals"] < control_refusals]
+    if not better:
+        return None, (f"no trial with KL below {kl_max:g} refused fewer held-out prompts than the stock model "
                       f"({control_refusals}): try more trials")
-    return best.number, (f"trial {best.number}: {refusals}/{best.user_attrs.get('n_harmful')} held-out harmful prompts "
-                         f"refused (stock {control_refusals}), first-token KL {best.user_attrs.get('kl', 0.0):.3f}")
+    best = min(better, key=lambda r: (pick_score(r, kl_scale), r["refusals"], r["kl"], r["trial"]))
+    return best, describe(best, control_refusals)
+
+
+def describe(row: dict, control_refusals: int) -> str:
+    return (f"trial {row['trial']}: {row['refusals']}/{row['n']} held-out harmful prompts refused "
+            f"(stock {control_refusals}), first-token KL {row['kl']:.3f}")
+
+
+def front(study) -> list[dict]:
+    """The study's Pareto front (see pareto_front), KL rounded for display."""
+    return [{**r, "kl": round(r["kl"], 4)} for r in pareto_front(records(study))]
 
 
 def open_study(run, study_name: str):

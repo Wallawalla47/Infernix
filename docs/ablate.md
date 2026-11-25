@@ -5,8 +5,8 @@ behind "abliterated" models), on every architecture Infernix runs: Qwen3.5 and Q
 (the 35B-A3B, the 122B-A10B), Qwen3.8-Flash-Next and Inkling 2 Mini. The artifact is unchanged: the engine reads a small sidecar at
 startup, and without the flag nothing loads and nothing is hooked. A sidecar fitted to the refusal direction removes
 the model's refusals while the rest of its behaviour stays close to the original; [examples/ablate](../examples/ablate)
-ships one for Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8, with its measurements. No sidecar has been fitted for a
-Qwen3.5-family model yet.
+holds an example for Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8, fitted by a contributor, with its measurements. No
+sidecar has been fitted for a Qwen3.5-family model yet.
 
 ```
 infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix-00001-of-00003.infernix \
@@ -165,7 +165,7 @@ structured and prose fixtures (two runs each; the chat row spread ±6 %). No sid
 
 A direction is the difference between the mean hidden states of prompts the model refuses and of matched prompts it
 answers, at the last prompt token, orthogonalized against the harmless mean; the alphas are then searched per lane to
-minimize refusals on held-out prompts while bounding the first-token KL divergence from the original model. This
-follows [heretic](https://github.com/p-e-w/heretic) 1.4's projected abliteration.
+minimize both the refusals on held-out prompts and the first-token KL divergence from the original model. This
+follows [heretic](https://github.com/p-e-w/heretic) 1.4's projected abliteration and its two-objective search.
 [Fitting an ablation sidecar](ablate-fitting.md) covers the tool that does it on your own setup
 (`tools/ablate/ablate.py`): prompt sets, the fit, evaluation and export.

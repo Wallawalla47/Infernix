@@ -42,12 +42,22 @@ class Band:
         return self.max_weight + (distance / self.min_weight_distance) * (self.min_weight - self.max_weight)
 
 
-def sample_band(trial, n_layers: int, lane: str) -> Band:
+def search_space(n_layers: int) -> dict[str, tuple[float, float]]:
+    """heretic's ranges for every sampled parameter: the direction index and each lane's band."""
     last = n_layers - 1
-    max_weight = trial.suggest_float(f"{lane}.max_weight", 0.8, 1.5)
-    position = trial.suggest_float(f"{lane}.max_weight_position", 0.6 * last, 1.0 * last)
-    min_weight = trial.suggest_float(f"{lane}.min_weight", 0.0, 1.0) * max_weight   # a fraction: keep it so
-    reach = trial.suggest_float(f"{lane}.min_weight_distance", 1.0, 0.6 * last)
+    space = {"direction_index": (0.4 * last, 0.9 * last)}
+    for lane in LANES:
+        space.update({f"{lane}.max_weight": (0.8, 1.5), f"{lane}.max_weight_position": (0.6 * last, 1.0 * last),
+                      f"{lane}.min_weight": (0.0, 1.0), f"{lane}.min_weight_distance": (1.0, 0.6 * last)})
+    return space
+
+
+def sample_band(trial, n_layers: int, lane: str) -> Band:
+    space = search_space(n_layers)
+    max_weight = trial.suggest_float(f"{lane}.max_weight", *space[f"{lane}.max_weight"])
+    position = trial.suggest_float(f"{lane}.max_weight_position", *space[f"{lane}.max_weight_position"])
+    min_weight = trial.suggest_float(f"{lane}.min_weight", *space[f"{lane}.min_weight"]) * max_weight   # a fraction
+    reach = trial.suggest_float(f"{lane}.min_weight_distance", *space[f"{lane}.min_weight_distance"])
     return Band(max_weight, position, min_weight, reach)
 
 

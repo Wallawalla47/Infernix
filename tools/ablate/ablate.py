@@ -3,17 +3,21 @@
 
     python tools/ablate/ablate.py init RUN --production prod.txt      # your infernix-serve command line, once
     python tools/ablate/ablate.py all RUN --harmful H --harmless G --study s1
-    python tools/ablate/ablate.py list RUN --study s1                  # pick a trial from the front
+    python tools/ablate/ablate.py list RUN --study s1                  # the front by (refusals, KL), the pick marked
     python tools/ablate/ablate.py pin RUN --study s1 --trial 115 --name mine
     python tools/ablate/ablate.py grade RUN --harmful T --benign B mine
     python tools/ablate/ablate.py eval RUN mine                        # capability: the stock model vs the candidate
     python tools/ablate/ablate.py export RUN mine --name my-cut
     python tools/ablate/ablate.py datasets list                        # public prompt sets and their licences
     python tools/ablate/ablate.py datasets fetch advbench-alpaca --out prompts
-    python tools/ablate/ablate.py auto RUN --harmful H --harmless G --out sidecars --name my-cut
+    python tools/ablate/ablate.py auto RUN --harmful H --harmless G --validate-harmful VH --validate-benign VB \
+        --test-harmful TH --test-benign TB --out sidecars --name my-cut
+    python tools/ablate/ablate.py choose RUN --trial 42 --out sidecars --name my-cut-t42   # another trial of auto's study
 
-`all` is doctor, prompts, capture, direction and fit in order; each also runs on its own. `auto` runs them, picks the
-cut, grades and exports it in one resumable command (the launcher's Ablation page runs it). docs/ablate-fitting.md is
+`all` is doctor, prompts, capture, direction and fit in order; each also runs on its own. `auto` runs them, grades the
+fit's best trials on the validation pair and picks the cut on those numbers, grades it on the test pair and exports
+it in one resumable command (the launcher's Ablation page runs it); `choose` does the same with another trial of the
+same study. docs/ablate-fitting.md is
 the guide (what to install, where to get prompt sets, how long each step takes, how to read the results).
 """
 
@@ -120,20 +124,47 @@ def cmd_fit(a) -> int:
     from ablatelib import fit as F
     run = Run.load(Path(a.run))
     need_free_card(run)
-    s = F.fit(run, a.study, a.trials, kl_target=a.kl_target, startup=a.startup, markers=markers_of(a))
+    s = F.fit(run, a.study, a.trials, kl_floor=a.kl_floor, kl_scale=a.kl_scale, startup=a.startup,
+              markers=markers_of(a))
     print_front(s["front"], s["control_refusals"])
     return 0 if s["status"] in ("complete", "interrupted") else 1
 
 
-def print_front(rows, control=None) -> None:
-    print("front by (refusals, KL); the pick is yours:" + (f"  (stock refuses {control})" if control is not None else ""))
+def print_front(rows, control=None, picked=None) -> None:
+    print("front by (refusals, KL): no trial beats one of these on both" +
+          (f"  (stock refuses {control})" if control is not None else "") +
+          ("; * = the pick by the fit's numbers" if picked is not None else ""))
     for r in rows:
-        print(f"  trial {r['trial']:>4}: refusals {r['refusals']}/{r['n']}  KL {r['kl']:.4f}  {r['what']}")
+        mark = "*" if picked is not None and r["trial"] == picked else " "
+        print(f" {mark}trial {r['trial']:>4}: refusals {r['refusals']}/{r['n']}  KL {r['kl']:.4f}  {r['what']}")
 
 
 def cmd_list(a) -> int:
-    from ablatelib import candidates as CD
-    print_front(CD.list_front(Run.load(Path(a.run)), a.study, a.n))
+    from ablatelib import auto as AU
+    from ablatelib import fit as F
+    from ablatelib import validate as V
+    run = Run.load(Path(a.run))
+    rows = F.records(F.open_study(run, a.study))
+    control = AU.last_control(run, a.study)
+    best = F.pick(rows, control, a.kl_max, a.kl_scale)[0] if control is not None else None
+    print_front(F.front(F.open_study(run, a.study))[:a.n], control, best["trial"] if best else None)
+    # The rows graded on a validation pair (auto, choose), each pair's record on its own.
+    by_trial = {r["trial"]: r for r in rows}
+    for record in sorted((run.dir / "fit" / a.study / "validation").glob("*.json")):
+        kept = json.loads(record.read_text(encoding="utf-8"))
+        validated = [by_trial[int(t)] for t in kept["trials"] if int(t) in by_trial]
+        picked = V.pick(validated, kept, a.kl_scale)[0]
+        stock = kept["stock"]
+        print(f"\nvalidated on {Path(kept['harmful']).name} + {Path(kept['benign']).name} (stock refuses "
+              f"{stock['refusals']}/{stock['n']} harmful, {stock['benign_refusals']}/{stock['benign_n']} benign); "
+              "v = the pick on these numbers")
+        for r in sorted(validated, key=lambda r: V.score(kept["trials"][str(r["trial"])], stock, a.kl_scale)):
+            v = kept["trials"][str(r["trial"])]
+            kl = v["kl_answered"] if v["kl_answered"] is not None else v["kl"]
+            mark = "v" if picked is not None and r["trial"] == picked["trial"] else " "
+            print(f" {mark}trial {r['trial']:>4}: refusals {v['refusals']}/{v['n']}  benign refused "
+                  f"{v['benign_refusals']}/{v['benign_n']}  KL where stock answered {kl:.4f}  "
+                  f"(fit: {r['refusals']}/{r['n']}, KL {r['kl']:.4f})")
     return 0
 
 
@@ -183,17 +214,44 @@ def cmd_datasets(a) -> int:
     return 0
 
 
+def validation_pair(a) -> tuple[Path | None, Path | None]:
+    if bool(a.validate_harmful) != bool(a.validate_benign):
+        raise SystemExit("--validate-harmful and --validate-benign go together (refusals and KL)")
+    if a.validate_rows < 1:
+        raise SystemExit("--validate-rows must be at least 1")
+    return (Path(a.validate_harmful), Path(a.validate_benign)) if a.validate_harmful else (None, None)
+
+
 def cmd_auto(a) -> int:
     from ablatelib import auto as AU
     run = Run.load(Path(a.run))
     if a.test_benign and not a.test_harmful:
         raise SystemExit("--test-benign goes with --test-harmful")
+    validate_harmful, validate_benign = validation_pair(a)
     rc = AU.run_auto(run, harmful=Path(a.harmful), harmless=Path(a.harmless), paired=a.paired, field=a.field,
-                     held_out=a.held_out, study=a.study, trials=a.trials, kl_target=a.kl_target, startup=a.startup,
-                     markers=markers_of(a), test_harmful=Path(a.test_harmful) if a.test_harmful else None,
+                     held_out=a.held_out, study=a.study, trials=a.trials, kl_floor=a.kl_floor, kl_scale=a.kl_scale,
+                     kl_max=a.kl_max, startup=a.startup, markers=markers_of(a),
+                     validate_harmful=validate_harmful, validate_benign=validate_benign, validate_rows=a.validate_rows,
+                     test_harmful=Path(a.test_harmful) if a.test_harmful else None,
                      test_benign=Path(a.test_benign) if a.test_benign else None, out=Path(a.out), name=a.name,
                      source=a.source)
     return rc
+
+
+def cmd_choose(a) -> int:
+    from ablatelib import auto as AU
+    run = Run.load(Path(a.run))
+    if a.test_benign and not a.test_harmful:
+        raise SystemExit("--test-benign goes with --test-harmful")
+    validate_harmful, validate_benign = validation_pair(a)
+    if a.test_harmful or validate_harmful:
+        need_free_card(run)
+    return AU.run_choose(run, study=a.study, trial=a.trial,
+                         test_harmful=Path(a.test_harmful) if a.test_harmful else None,
+                         test_benign=Path(a.test_benign) if a.test_benign else None, field=a.field,
+                         markers=markers_of(a), out=Path(a.out), name=a.name, source=a.source, kl_max=a.kl_max,
+                         kl_scale=a.kl_scale, validate_harmful=validate_harmful, validate_benign=validate_benign,
+                         validate_rows=a.validate_rows)
 
 
 def cmd_eval(a) -> int:
@@ -239,14 +297,25 @@ def main() -> int:
         p.add_argument("--held-out", type=int, default=40, help="prompts held out of each list to grade trials (40)")
         p.add_argument("--paired", action="store_true", help="the lists are matched counterparts (line i with line i)")
 
+    def objective_args(p):
+        p.add_argument("--kl-floor", type=float, default=0.01,
+                       help="first-token KL below which the KL objective follows the refusals instead, so the search "
+                            "skips cuts that change nothing (heretic's 0.01)")
+        p.add_argument("--kl-scale", type=float, default=1.0,
+                       help="the KL that weighs as much as all of the stock model's refusals (heretic's 1.0): the "
+                            "objectives' and the pick's balance")
+        p.add_argument("--startup", type=int, default=60, help="random trials before TPE starts modelling (60)")
+        p.add_argument("--refusal-markers", help="extra refusal phrases, one per line")
+
+    def pick_args(p):
+        p.add_argument("--kl-max", type=float, default=0.4,
+                       help="the pick takes no trial at or above this first-token KL (0.4)")
+
     def fit_args(p):
         p.add_argument("--study", required=True, help="the study name; rerun with the same name to continue it")
         p.add_argument("--trials", type=int, default=300,
                        help="completed trials to add to the study (300; a failed trial is replaced)")
-        p.add_argument("--kl-target", type=float, default=0.4, help="first-token KL at which a trial is judged on drift "
-                                                                    "alone (0.4; a cliff, so keep it loose)")
-        p.add_argument("--startup", type=int, default=60, help="random trials before TPE starts modelling (60)")
-        p.add_argument("--refusal-markers", help="extra refusal phrases, one per line")
+        objective_args(p)
 
     p = command("init", cmd_init, "record your production setup in a new run directory")
     p.add_argument("--production", help="a text file holding your infernix-serve command line")
@@ -264,9 +333,11 @@ def main() -> int:
     p = command("direction", cmd_direction, "compute the refusal direction from the recordings")
     p.add_argument("--no-orthogonalize", action="store_true")
     fit_args(command("fit", cmd_fit, "search for the cut (needs the card; resumable)"))
-    p = command("list", cmd_list, "show a study's front by (refusals, KL)")
+    p = command("list", cmd_list, "show a study's front by (refusals, KL), the pick marked")
     p.add_argument("--study", required=True)
-    p.add_argument("-n", type=int, default=15)
+    p.add_argument("-n", type=int, default=40)
+    pick_args(p)
+    p.add_argument("--kl-scale", type=float, default=1.0, help="the pick's balance (as auto's --kl-scale)")
     p = command("pin", cmd_pin, "keep one trial as a named candidate")
     p.add_argument("--study", required=True)
     p.add_argument("--trial", type=int, required=True)
@@ -298,16 +369,35 @@ def main() -> int:
     p.add_argument("--out", help="the folder to write it in (default: the run's export/ folder)")
     p = command("auto", cmd_auto, "prompts to an exported sidecar in one resumable command (progress in RUN/progress.json)")
     prompt_args(p)
-    p.add_argument("--study", default="auto", help="the study name (auto)")
+    p.add_argument("--study", default="pareto", help="the study name (pareto)")
     p.add_argument("--trials", type=int, default=300, help="trials the study holds when the fit ends (300)")
-    p.add_argument("--kl-target", type=float, default=0.4, help="the pick keeps first-token KL below this (0.4)")
-    p.add_argument("--startup", type=int, default=60, help="random trials before TPE starts modelling (60)")
+    objective_args(p)
+    pick_args(p)
+
+    def keep_args(p):
+        p.add_argument("--validate-harmful", help="harmful prompts the fit never scored, to grade the fit's best trials "
+                                                  "on and pick by (with --validate-benign)")
+        p.add_argument("--validate-benign", help="benign prompts the fit never scored (over-refusals and KL)")
+        p.add_argument("--validate-rows", type=int, default=6,
+                       help="trials graded on the validation pair, best by the fit's rule first, on the front or "
+                            "not (6)")
+        p.add_argument("--test-harmful", help="harmful prompts neither the fit nor the validation saw, to grade the "
+                                              "kept trial once")
+        p.add_argument("--test-benign", help="benign prompts neither saw (over-refusals and KL)")
+        p.add_argument("--out", required=True, help="the folder the sidecar is exported to")
+        p.add_argument("--name", required=True, help="the exported sidecar's folder name")
+        p.add_argument("--source", help="describe the prompt sets in plain words (default: from the run)")
+
+    keep_args(p)
+    p = command("choose", cmd_choose, "keep another trial of a study: grade it on the test pair and export it, as auto "
+                                      "does with its pick (progress in RUN/progress.json)")
+    p.add_argument("--study", default="pareto", help="the study (auto's: pareto)")
+    p.add_argument("--trial", type=int, required=True, help="a completed trial of the study (see `list`)")
+    p.add_argument("--field")
     p.add_argument("--refusal-markers", help="extra refusal phrases, one per line")
-    p.add_argument("--test-harmful", help="harmful prompts the fit never saw, to grade the pick")
-    p.add_argument("--test-benign", help="benign prompts the fit never saw (over-refusals and KL)")
-    p.add_argument("--out", required=True, help="the folder the sidecar is exported to")
-    p.add_argument("--name", required=True, help="the exported sidecar's folder name")
-    p.add_argument("--source", help="describe the prompt sets in plain words (default: from the run)")
+    p.add_argument("--kl-scale", type=float, default=1.0, help=argparse.SUPPRESS)
+    pick_args(p)
+    keep_args(p)
     p = sub.add_parser("datasets", help="public prompt sets: list them, or download and convert one",
                        description="public prompt sets: list them (with their licences), or download and convert one")
     p.add_argument("action", choices=("list", "fetch"))

@@ -1117,7 +1117,7 @@ def process_alive(pid: int) -> bool:
 def ablation(launcher: Launcher, port: int, data: Path, tool: Path) -> None:
     """The Ablation page's backend against a stand-in tool: Python and packages, prompt sets, a run that takes the GPU
     (the model is unloaded, loads are refused with the reason, the gate opens at the end), a sidecar that reaches the
-    library, a refusal before anything is unloaded, stop and resume, End now with a tool that ignores the stop, the
+    library, another trial of the run's front kept with choose, a refusal before anything is unloaded, stop and resume, End now with a tool that ignores the stop, the
     outcomes without a sidecar, the last run after a restart, and a launcher killed during a run (about two
     minutes)."""
     api = "/launcher/api/ablation"
@@ -1177,6 +1177,14 @@ def ablation(launcher: Launcher, port: int, data: Path, tool: Path) -> None:
               "stub-set" in listed and listed["stub-set"]["sources"][1]["licence"] == "CC BY-NC 4.0", str(s["catalogue"]))
         status, body = call(port, "POST", f"{api}/prompts/no-such-set", {})
         check("ablation: an unknown prompt set is refused", status == 400, str(body))
+        # A set fetched before the tool had a validation pair: listed as not fetched, so the page fetches it again.
+        old = data / "ablation" / "prompts" / "stub-set"
+        old.mkdir(parents=True, exist_ok=True)
+        for part in ("harmful", "harmless", "test-harmful", "test-benign"):
+            (old / f"{part}.txt").write_text("old prompt\n", encoding="utf-8")
+        (old / "sets.json").write_text(json.dumps({"preset": "stub-set", "counts": {"harmful": 1}}), encoding="utf-8")
+        check("ablation: a set fetched without a validation pair is not listed as fetched",
+              "stub-set" not in state()["prompts"], str(state()["prompts"]))
         call(port, "POST", f"{api}/prompts/stub-set", {})
         s = wait_for(lambda: (lambda v: v if v["task"]["state"] != "running" else None)(state()), 60)
         check("ablation: a prompt set downloads into the prompts folder",
@@ -1231,10 +1239,61 @@ def ablation(launcher: Launcher, port: int, data: Path, tool: Path) -> None:
         check("ablation: the model loads again after the run", *loaded())
         status, body = start("stub-cut", 10)
         check("ablation: a run is refused a name a sidecar has", status == 400 and "exists" in json.dumps(body))
+    with section("ablation: keep another trial of the front"):
+        fitted = (job() or {}).get("progress") or {}
+        table = fitted.get("front") or []
+        front = [r for r in table if not r.get("off_front")]
+        check("ablation: the run's progress shows its trade-off front, fewest refusals first, and a validated trial "
+              "off it marked",
+              len(front) == 4 and [r["refusals"] for r in front] == [0, 1, 2, 3] and
+              [r["trial"] for r in table if r.get("off_front")] == [9], str(table))
+        # The stub's validation numbers make trial 2 the pick on them, where the fit's numbers pick the front's last row.
+        validation = fitted.get("validation") or {}
+        check("ablation: the pick is made on the set's validation pair, the validated rows shown with their numbers",
+              fitted.get("picked_on") == "validation" and validation.get("harmful") == "validate-harmful.txt" and
+              (fitted.get("best") or {}).get("trial") == 2 and
+              sum("validation" in r for r in table) == len(validation.get("trials") or []) == 4,
+              str({k: fitted.get(k) for k in ("picked_on", "validation", "best")}))
+        other = front[0]["trial"] if front else 3
+        name = f"stub-cut-t{other}"
+        status, body = call(port, "POST", f"{api}/choose", {"trial": other, "name": "stub-cut"})
+        check("ablation: choose is refused a name a sidecar has", status == 400 and "exists" in json.dumps(body),
+              f"{status} {body}")
+        status, body = call(port, "POST", f"{api}/choose", {"trial": other, "name": name})
+        check("ablation: choose starts", status == 200, f"{status} {body}")
+        done = wait_job(ended, 60)
+        exported = Path((done or {}).get("exported") or "")
+        invocations = (run_dir / "invocations.txt").read_text(encoding="utf-8").splitlines()
+        check("ablation: choose runs the tool's choose on the same run folder, the model unloaded first",
+              bool(done) and done["state"] == "done" and done["choice"] == {"trial": other, "name": name} and
+              Path(done["run_dir"]) == run_dir and invocations[-1].startswith(f"choose --trial {other} ") and
+              instance(port)["state"] in ("idle", "failed"),
+              str(done and {k: done[k] for k in ("state", "message", "choice", "run_dir")}))
+        check("ablation: a set of matched pairs is fitted as one (--paired), choose takes no prompt lists",
+              "--paired" in invocations[0] and "--paired" not in invocations[-1], f"{invocations[0]} | {invocations[-1]}")
+        check("ablation: auto and choose get the set's validation and test pairs",
+              all(f"--{flag}" in line for line in (invocations[0], invocations[-1])
+                  for flag in ("validate-harmful", "validate-benign", "test-harmful", "test-benign")),
+              f"{invocations[0]} | {invocations[-1]}")
+        check("ablation: the kept trial is exported as a sidecar of its own",
+              exported == data / "ablation" / "sidecars" / name / "sidecar.json" and exported.is_file() and
+              json.loads(exported.read_text(encoding="utf-8"))["generation"]["notes"] == f"stub trial {other}",
+              str(exported))
+        check("ablation: choose's engines are gone and the GPU free",
+              not list((run_dir / "engines").glob("*.json")) and not instance(port)["ablation_holds_gpu"])
+        status, body = call(port, "POST", f"{api}/choose", {"trial": 99, "name": "stub-cut-t99"})
+        failed = wait_job(ended, 60) if status == 200 else None
+        check("ablation: a trial the study lacks fails with the tool's reason, the front still shown",
+              bool(failed) and failed["state"] == "failed" and "did not complete" in failed["message"] and
+              len([r for r in ((failed["progress"] or {}).get("front") or []) if not r.get("off_front")]) == 4,
+              f"{status} {body if status != 200 else failed and failed['message']}")
     with section("ablation: stop and resume"):
         configure({"STUB_AUTO": "done", "STUB_TRIAL_S": "0.4"})
         status, body = start("resumed", 15)
         running = wait_job({"running"}, 30, trials=3)
+        status, body = call(port, "POST", f"{api}/choose", {"trial": 0, "name": "meanwhile"})
+        check("ablation: choose while a run is in progress is refused", status == 400 and "in progress" in
+              json.dumps(body), f"{status} {body}")
         call(port, "POST", f"{api}/stop", {})
         stopped = wait_job(ended, 60)
         run_dir = Path(running["run_dir"]) if running else data
@@ -1308,6 +1367,14 @@ def ablation(launcher: Launcher, port: int, data: Path, tool: Path) -> None:
         launcher.kill()
         check("ablation: the launcher stops in order during a run", code == 0, str(code))
         launcher.start()
+        # Before anything reads the page's state (a page left open across the restart): Set up finds the Python
+        # chosen, instead of taking it for missing and downloading the portable one.
+        status, body = call(port, "POST", f"{api}/setup", {})
+        message = ((body or {}).get("task") or {}).get("message", "")
+        check("ablation: Set up before the page's first read uses the Python chosen, no portable download",
+              status == 200 and "portable" not in message and f"Python {sys.version_info[0]}." in message,
+              f"{status} {message or body}")
+        wait_for(lambda: (lambda v: v if v["task"] and v["task"]["state"] != "running" else None)(state()), 180)
         last = job()
         check("ablation: the last run is shown after a restart, stopped, its engine gone",
               bool(last) and last["run"]["name"] == "restart" and last["state"] == "stopped" and not last["active"] and

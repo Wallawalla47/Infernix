@@ -912,6 +912,11 @@ void Launcher::register_ablation_routes(const std::string& api) {
                      ablation_->start(run);
                      send_json(s, ablation_->state());
                  }));
+    server_.Post(api + "/ablation/choose", admin([this](const Request& q, Response& s) {
+                     const Json body = body_json(q);
+                     ablation_->choose(json_or<int>(body, "trial", -1), trim(json_or<std::string>(body, "name", "")));
+                     send_json(s, ablation_->state());
+                 }));
     server_.Post(api + "/ablation/stop", admin([this](const Request& q, Response& s) {
                      ablation_->stop(json_or<bool>(body_json(q), "now", false));
                      send_json(s, ablation_->state());
