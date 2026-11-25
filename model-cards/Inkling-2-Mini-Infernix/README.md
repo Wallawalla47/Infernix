@@ -33,7 +33,8 @@ tags:
 > [!NOTE]
 > **Engine version:** this artifact needs [Infernix](https://github.com/Wallawalla47/Infernix) built from
 > GitHub `main` at commit `a487ad24f` or later, or a Windows release
-> after `windows-2026.11.20`. Older builds do not support this model.
+> after `windows-2026.11.20`. Older builds do not support this model. The recommended `--kv-dtype int8`
+> stores the sliding windows in 8 bits too from `main` at `c0e69d556`.
 
 Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), packed for
 [Infernix](https://github.com/Wallawalla47/Infernix), a C++/CUDA engine that runs it on **one RTX 5090**
@@ -103,8 +104,9 @@ The corpus comes from these datasets, with thanks to their authors:
 - **GPU:** built and tuned on an NVIDIA RTX 5090 (Blackwell, `sm_120a`, 32 GB). Other cards have not been tested.
 - **VRAM:** the weights take 17.8 GiB, 18.0 GiB with `--lm-head-draft` and 18.6 GiB with `--lm-head-draft --vision`.
   The execution workspace takes a further 1.8 GiB (3.1 GiB with `--vision`). What is left holds the KV cache: on my
-  card, one lane with BF16 KV reaches 302,528 tokens of context by default, 297,728 with `--lm-head-draft` and 243,584
-  with `--lm-head-draft --vision`. `infernix-serve --plan plan.json` reports what fits on your machine.
+  card, one lane with the recommended `--kv-dtype int8` reaches 526,656 tokens of context, 518,400 with
+  `--lm-head-draft` and 424,704 with `--lm-head-draft --vision` (with the default BF16 KV: 302,528, 297,728 and
+  243,584). `infernix-serve --plan plan.json` reports what fits on your machine.
 - **RAM:** a peak working set of 1.9 GiB for a short `infernix` run at an 8,192-token context, including the load. The
   server's prefix cache uses further RAM for its Host tier, down to `--ram-free-mib`.
 - **Disk:** about 20.3 GB.
@@ -114,11 +116,15 @@ The corpus comes from these datasets, with thanks to their authors:
 ## Run
 
 ```bat
-infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --spec dspark --draft-tokens auto --lm-head-draft
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. `--max-context auto` takes
-the largest context the free VRAM holds for every lane (without it the server uses 8,192 tokens). Add `--vision` for
+the largest context the free VRAM holds for every lane (without it the server uses 8,192 tokens). `--kv-dtype int8`
+stores the KV cache, the 40 sliding-window visits included, in 8 bits with two scales a 128-value row: about half the
+memory of the default `bf16`, so the same VRAM holds about 1.7 times the context and more of the prefix cache. It
+decodes within 0.4 % of `bf16` and prefills up to 1.5 % slower, and changes the output slightly
+([KV formats](#kv-formats)). Add `--vision` for
 images and `--max-concurrency N` (1 to 8) for several lanes; each lane reserves a whole context. DSpark drafts while
 one request is decoding, and rounds of several requests decode plainly. The
 [Inkling 2 Mini guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/inkling2-mini.md) covers the KV formats,
@@ -132,14 +138,39 @@ every route but `--ablate` with `--lossless`. The launcher offers both. See
 costs. No adapter or sidecar for this model has been published yet, so the adapter module names Infernix accepts follow
 the Transformers implementation and have not been checked against a real adapter's files.
 
+From `main` at `f9c2e42cb`, constrained output works on this model: JSON object and JSON Schema answers, GBNF, regex and
+choice (`--json-schema-file`, `--grammar-file`, `--regex`, `--choice` and the APIs' structured-output fields), and tool
+constraints: `tool_choice` required or a named tool, `strict: true` tools, `parallel_tool_calls: false`, and every call
+checked against its declared tool by default. The model still thinks first; the answer, or the call, follows the
+constraint. DSpark keeps drafting under a constraint, and on one request a text turn with a tool declared decoded
+within 0.5 % of the same turn free. `/v1/decide` answers its readout questions (`noul`, `choice`, `score`). See
+[constrained output and tool calls](https://github.com/Wallawalla47/Infernix/blob/main/docs/inkling2-mini.md#constrained-output-and-tool-calls).
+
+## KV formats
+
+`--kv-dtype` selects how the 8 full-attention visits store their keys and values, and with it the 40 sliding
+visits' windows: `bf16` and `bf16p` keep their windows in their own format, and every other format stores its
+windows as `int8`.
+
+| Format | Stored as | Output against `bf16` |
+|---|---|---|
+| `bf16` (default) | BF16 keys, FP16 values | the reference |
+| `bf16p` | the same values packed losslessly to 12 bits | identical; a request with a row that has no packed form fails |
+| `int8` (recommended) | 8 bits, two scales a row | changes slightly |
+| `fp8`, `nvfp4`, `k8v4` | E4M3 / NVFP4 / both, with INT8 windows | changes slightly |
+| `k4v2`, `vq2` | Hadamard-rotated 2-4 bit codes, with INT8 windows | changes the most |
+
+On Infernix's perplexity quick set, `int8` pools read a KL of 0.0094 from `bf16` (with BF16 windows), and its INT8
+windows add 0.0013 of KL against BF16 windows over the same pools (perplexity 4.0317 → 4.0322). Measured quality of
+every format: the [design](https://github.com/Wallawalla47/Infernix/blob/main/docs/maintainer/inkling2_mini-design.md#76-kv-profiles).
+
 ## Limits
 
 Not supported on this model yet:
 
 - video input (images work);
-- constrained output: grammars, JSON schemas, choices and regex;
-- `tool_choice` set to required or to a named tool (`auto` and `none` work, without a grammar protecting the
-  arguments);
+- `/v1/decide`'s generated types (`number`, `scalar`, `point`, `box`): they spell a number one digit at a time, and this
+  model's tokenizer writes digits in groups of up to three, so they are refused;
 - a request ending in an assistant message (prefill);
 - the `--reasoning-loop` guard, n-gram drafting, and `--logits-dtype bf16`.
 
@@ -191,6 +222,11 @@ Measured with `infernix_bench` on this artifact (2026-11-24). Plain decode, pref
 three runs after a warmup. The DSpark rows are two runs each of a chat and a prose prompt (1,200 tokens, temperature
 0.6) and a greedy structured prompt, with 52 %, 94 % and 37 % of the shortlist's drafts accepted; other text accepts
 more or fewer.
+
+With `--kv-dtype int8` (2026-11-25, `main` at `c0e69d556`, against `bf16` in the same build, two runs each): plain
+decode 205.6 tok/s after a 2,048-token prompt and 194.5 after 10,000 (`bf16` 204.8 / 195.0); prefill 16,243 tok/s at
+2,048 tokens and 16,003 at 10,000 (`bf16` 16,344 / 16,243). Compare each pair with each other rather than with the
+table, which comes from another day's runs.
 
 ## Provenance
 
