@@ -1571,6 +1571,8 @@ void Launcher::register_routes() {
     const Settings settings = store_.settings();
     server_.new_task_queue  = [] { return new httplib::ThreadPool(16, 512); };
     server_.set_payload_max_length(512ull << 20);
+    // As infernix-serve: every proxied stream event is sent at once, not held behind the client's delayed ACK.
+    server_.set_tcp_nodelay(true);
     server_.set_read_timeout(std::chrono::minutes(5));
     server_.set_write_timeout(std::chrono::minutes(10));
     server_.set_keep_alive_max_count(1000);

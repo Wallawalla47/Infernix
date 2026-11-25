@@ -255,6 +255,10 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                                      options_.speculative.ngram_draft_tokens_auto);
     server_.new_task_queue = [this] { return new_http_worker_pool(options_); };
     server_.set_socket_options(configure_http_server_socket);
+    // Every accepted connection sends at once (TCP_NODELAY): a stream writes one small event at a time, and with
+    // Nagle's rule an event behind one the client has not yet acknowledged waits for the client's delayed ACK (up to
+    // ~40 ms on Linux, 200 ms on Windows) on any real network path, a reverse proxy or the launcher's hop.
+    server_.set_tcp_nodelay(true);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }

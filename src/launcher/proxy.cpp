@@ -114,6 +114,9 @@ std::shared_ptr<Bridge> start_bridge(httplib::Request upstream, int port, std::s
     bridge->client->set_read_timeout(std::chrono::hours(2));
     bridge->client->set_write_timeout(std::chrono::minutes(10));
     bridge->client->set_keep_alive(false);
+    // The request goes out as a header write then a body write: with Nagle's rule the body would wait for
+    // infernix-serve's delayed ACK of the header.
+    bridge->client->set_tcp_nodelay(true);
     // The target is the client's raw (already encoded) path and query: forward it unchanged.
     bridge->client->set_path_encode(false);
     Bridge* raw               = bridge.get();
