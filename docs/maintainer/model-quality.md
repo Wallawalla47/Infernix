@@ -369,7 +369,8 @@ standard a path is certified against is under revision and is not published here
   accepts a draft exactly when it is the verify column's argmax, which is the decode column's; a
   sampled request draws every token by Gumbel-max (`SamplingConfig::gumbel_max`: the truncated
   support's token maximizing log p + g, with g a Gumbel variate keyed by the seed, the produced
-  token's position and the token id), so a verify column returns the token plain decoding draws
+  token's position and the token id, finite since 2026-11-24: the top 24-bit draw had made it infinite, about
+  one draw in 800,000 over a 20-entry support), so a verify column returns the token plain decoding draws
   there and a draft is accepted exactly when it equals it. The default route keeps speculative
   rejection sampling (same distribution, other text for a seed). The real test
   `infernix_qwen3_5_speculation_invariance_real_test` checks MTP, DFlash2 and DFlash2 with n-gram

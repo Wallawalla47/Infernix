@@ -452,11 +452,14 @@ __device__ inline void sampling_build_truncated_block_fast(
 
 // Gumbel-max (SamplingConfig::gumbel_max): a support entry's score log p + g, g = -log(-log u) with u
 // from (seed, the produced token's position, kSamplePurposeGumbel, token) moved into (0, 1). Fixed
-// intrinsics, so every kernel scores an entry the same.
+// intrinsics, so every kernel scores an entry the same. The top 24-bit draw plus 2^-25 rounds to 1.0f,
+// whose noise would be infinite (the entry would win whatever its probability, 2^-24 an entry): u is held
+// at the float below 1 (noise <= ~16.6); every other draw keeps its value (2026-11-24).
 __device__ __forceinline__ float sampling_gumbel_score(float p, unsigned long long seed, int position,
                                                        int token) {
-    const float u = sampling_uniform(seed, position, kSamplePurposeGumbel, static_cast<unsigned int>(token)) +
-                    (1.0f / 33554432.0f);
+    const float u = fminf(sampling_uniform(seed, position, kSamplePurposeGumbel, static_cast<unsigned int>(token)) +
+                              (1.0f / 33554432.0f),
+                          0x1.fffffep-1f);
     return __fadd_rn(__logf(p), -__logf(-__logf(u)));
 }
 

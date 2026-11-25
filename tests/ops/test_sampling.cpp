@@ -958,6 +958,24 @@ int fp32_gumbel_route_contract() {
     return failures;
 }
 
+// Gumbel-max draws (SamplingConfig::gumbel_max, the reproducible and lossless routes) never take a token the noise
+// cannot reach: one token holds all the mass, nineteen more of the support sit 40 below it (probability e^-40 each),
+// more than any finite noise difference can make up. A noise mapping that reached u = 1 gave such a token infinite noise
+// whenever its key drew the top 24-bit value (19 x 2^-24 a draw: about 4.8 times in these 2^22 draws).
+int gumbel_bounded_noise_contract() {
+    std::vector<float> column(32, -1000.0f);
+    column[0] = 0.0f;
+    for (int t = 1; t < 20; ++t) { column[static_cast<std::size_t>(t)] = -40.0f; }
+    ops::SamplingConfig config;
+    config.temperature = 1.0f;
+    config.gumbel_max  = true;
+    config.seed        = 99;
+    const RunResult r  = run_repeated(column, 32, 1 << 22, 1024, config, 0, ops::kSamplePurposeDecode);
+    const auto taken   = std::count_if(r.tokens.begin(), r.tokens.end(), [](int token) { return token != 0; });
+    std::cout << "    Gumbel-max: " << taken << " of " << r.tokens.size() << " draws took an e^-40 token\n";
+    return r.integrity_failures + (taken == 0 ? 0 : 1);
+}
+
 // The FP64 law of a full_vocabulary row: the softmax of every legal token's value / temperature.
 Distribution full_vocabulary_oracle(const std::vector<float>& column, int token_domain, float temperature,
                                     const std::vector<std::uint32_t>* mask = nullptr) {
@@ -1226,6 +1244,7 @@ INFERNIX_OP_TEST(sampling) {
     failures += workspace_route_rng_contract();
     failures += fp32_gumbel_route_contract();
     failures += full_vocabulary_contract();
+    failures += gumbel_bounded_noise_contract();
     failures += increment_counts_contract();
     failures += increment_licensed_counts_contract();
     failures += grammar_mask_contract();

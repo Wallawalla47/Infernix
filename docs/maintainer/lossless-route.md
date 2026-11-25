@@ -327,7 +327,11 @@ destination slot (`lossless_causal_conv_slots`, `lossless_gated_delta_rule_slots
 layouts). Every operation is the window form's operation on the same values, so a token's logits do not
 depend on the prefill chunk, on prefill or decode, on the other requests, on the prefix cache (a resumed
 state is an exact copy; the Host tier must keep FP32 state) or on preemption and replay. Sampling and
-the grammar constraints read the FP32 logits; sampled requests draw by Gumbel-max. The prefix cache's
+the grammar constraints read the FP32 logits; sampled requests draw by Gumbel-max. **One bit change, the
+owner's call of 2026-11-24:** the Gumbel noise's uniform u (24 bits, plus 2^-25) rounded to exactly 1.0f at
+the top draw, which made that support entry's noise infinite, so it won whatever its probability (2^-24 an
+entry: about one draw in 800,000 over a 20-entry support); u is now held at the float below 1, so that one
+draw changes and every other keeps its bits. The prefix cache's
 file records the route, so a lossless Engine never resumes another route's state.
 
 Attention's key ranges: a call with few CTAs (decode) splits each query's keys into ranges over more
