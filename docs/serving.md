@@ -2708,7 +2708,7 @@ request: `enabled` when the server has one (`--ngram-archive-mib`), `bound` when
 bound to a draft session, `published` when its input and output were published into it,
 `generation` as the session's latest completed generation, `sources` and `session_bytes` as the
 bound session's retained source count and bytes, `total_bytes` as the whole archive's bytes, and
-`sampling_seed` as the effective seed after request-domain separation for a request that named a
+`sampling_seed` as the effective seed after request-domain separation (the default route only: `--reproducible` keeps the caller's seed) for a request that named a
 session, otherwise `null`.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.

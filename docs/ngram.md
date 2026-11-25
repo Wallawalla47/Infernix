@@ -289,11 +289,14 @@ and Engine capacities, including indexes, metadata, staging and still-pinned sou
 pressure can evict sources or bypass retention without failing inference. It allocates
 no VRAM and creates no archive files. The existing per-request index is additional.
 
-Retention-enabled requests mix the supplied sampling seed with fresh request entropy.
-This prevents retained generated proposals from depending on the same random draws
-used to accept them during a retry. A seed alone does not reproduce an archived
-conversation; disable retention for deterministic same-seed replay. Greedy target
-selection is unaffected by this random-domain separation. The generation result
+On the default route, retention-enabled requests mix the supplied sampling seed with
+fresh request entropy. This prevents retained generated proposals from depending on
+the same random draws used to accept them during a retry. A seed alone does not
+reproduce an archived conversation there; use `--reproducible` (or disable retention)
+for deterministic same-seed replay. The reproducible and lossless routes keep the
+caller's seed: they verify drafts by equality with the seed's Gumbel-max draws, so a
+retained proposal changes only how many tokens a round accepts, never the output.
+Greedy target selection is unaffected by this random-domain separation. The generation result
 and structured request log expose the effective seed as `ngram_archive.sampling_seed`;
 the ordinary request seed remains the caller's input. Reconstructing the same
 proposal path additionally requires the same archive snapshot and model geometry.
@@ -337,8 +340,10 @@ bit-identical fresh-prefill and cached output. That separate diagnostic may retu
 remain mandatory. It skips without the artifact environment variable.
 
 `infernix_ngram_archive_real` uses `INFERNIX_NGRAM_TEST_WEIGHTS` and takes the backend
-(`mtp`, `dflash` or `dflash2`), optional graph mode (`0` or `1`) and optional
-concurrency (`1..8`). It exercises NG63/K5 source-absent regeneration, isolated and
+(`mtp`, `dflash` or `dflash2`), optional graph mode (`0` or `1`), optional
+concurrency (`1..8`) and an optional route (`default` or `reproducible`; the latter
+also requires the caller's seed on every bound request and a sampled bound request
+to replay token for token). It exercises NG63/K5 source-absent regeneration, isolated and
 explicitly forked sessions, reset, cancellation/retry and publication generations with
 prefix reuse disabled. With concurrency above one it also runs concurrent requests on
 distinct sessions, two concurrent forks of one source, a same-identity concurrent pair

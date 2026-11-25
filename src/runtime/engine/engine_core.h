@@ -121,6 +121,7 @@ public:
             ngram_archive_ = std::make_unique<NgramArchive>(typename NgramArchive::Limits{
                 .session_bytes = options.speculative.ngram_session_bytes,
                 .total_bytes   = options.speculative.ngram_archive_bytes});
+            separate_ngram_seed_ = options.fast_paths && !options.lossless;
         }
         diagnostics_ = options.diagnostic_observer;
         if (options.context_cache.enabled &&
@@ -331,7 +332,7 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            if (ngram_archive_ && !options.ngram_session.key.empty()) {
+            if (separate_ngram_seed_ && !options.ngram_session.key.empty()) {
                 std::random_device entropy;
                 options.execution.sampling.seed ^=
                     (static_cast<std::uint64_t>(entropy()) << 32) ^ entropy();
@@ -3313,6 +3314,10 @@ private:
     Clock::time_point next_prefix_save_{};
     ResourceManagement resources_;
     std::unique_ptr<NgramArchive> ngram_archive_;
+    // The default route mixes a request bound to an n-gram session with fresh entropy, so retained proposals
+    // never depend on the draws that accept them; the reproducible and lossless routes keep the caller's
+    // seed (they verify drafts by equality with the seed's Gumbel-max draws, so no proposal can bias them).
+    bool separate_ngram_seed_ = false;
     DiagnosticObserver diagnostics_;
 
     mutable std::mutex execution_mutex_;

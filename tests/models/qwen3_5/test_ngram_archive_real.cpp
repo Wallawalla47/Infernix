@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -94,11 +95,15 @@ int main(int argc, char** argv) {
     if (!artifact || !*artifact) { return 77; }
     try {
         const std::string backend = argc > 1 ? argv[1] : "mtp";
-        require(argc <= 4, "expected backend, optional graph mode (0/1) and concurrency");
+        require(argc <= 5,
+                "expected backend, optional graph mode (0/1), concurrency and route (default/reproducible)");
         require(argc < 3 || std::string(argv[2]) == "0" || std::string(argv[2]) == "1",
                 "graph mode must be 0 or 1");
         const unsigned concurrency = argc > 3 ? static_cast<unsigned>(std::stoul(argv[3])) : 1U;
         require(concurrency >= 1 && concurrency <= 8, "concurrency must be in 1..8");
+        require(argc < 5 || std::string(argv[4]) == "default" || std::string(argv[4]) == "reproducible",
+                "route must be default or reproducible");
+        const bool reproducible = argc > 4 && std::string(argv[4]) == "reproducible";
         infernix::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 4096;
@@ -126,6 +131,7 @@ int main(int argc, char** argv) {
         options.speculative.proposal_head       = infernix::ProposalHead::Optimized;
         options.speculative.ngram_archive_bytes = 16ULL << 20;
         options.speculative.ngram_session_bytes = 4ULL << 20;
+        options.fast_paths                      = !reproducible;
         infernix::Engine engine(options);
         infernix::RequestOptions request;
         request.execution.requested_output_tokens    = 1024;
@@ -134,6 +140,7 @@ int main(int argc, char** argv) {
         request.execution.sampling.frequency_penalty = 0.0f;
         request.execution.allow_prefix_reuse         = false;
         request.ngram_session.key                    = "parent";
+        if (reproducible) { request.execution.sampling.seed = 7; }
         auto run                                     = [&] {
             // Every request contains only the formula, never the old file text.
             auto result = engine.generate(engine.prepare(prompt()), request);
@@ -147,10 +154,36 @@ int main(int argc, char** argv) {
         for (unsigned depth = 1; depth <= 3; ++depth) {
             auto result = run();
             require(result.speculative.ngram_archive_accepted_tokens > 0 &&
-                        result.ngram_archive.generation > previous.ngram_archive.generation &&
-                        result.ngram_archive.sampling_seed != previous.ngram_archive.sampling_seed,
-                    "retained draft, generation or random domain did not advance");
+                        result.ngram_archive.generation > previous.ngram_archive.generation,
+                    "retained draft or generation did not advance");
+            // The default route separates each bound request's random domain; the reproducible route
+            // keeps the caller's seed (docs/ngram.md).
+            require(reproducible
+                        ? result.ngram_archive.sampling_seed == std::uint64_t{7}
+                        : result.ngram_archive.sampling_seed != previous.ngram_archive.sampling_seed,
+                    reproducible ? "the reproducible route changed a bound request's seed"
+                                 : "random domain did not advance");
             previous = std::move(result);
+        }
+        if (reproducible) {
+            // A sampled request bound to a session replays exactly on the reproducible route: the
+            // second and third runs draft from the first one's retained output and still give its
+            // tokens.
+            auto sampled                              = request;
+            sampled.execution.sampling.temperature    = 1.0f;
+            sampled.execution.sampling.seed           = 1234;
+            sampled.ngram_session                     = {.key = "sampled"};
+            sampled.execution.requested_output_tokens = 256;
+            const auto first = engine.generate(engine.prepare(prompt()), sampled);
+            for (unsigned replay = 0; replay < 2; ++replay) {
+                const auto again = engine.generate(engine.prepare(prompt()), sampled);
+                require(again.ngram_archive.bound && again.ngram_archive.sampling_seed == 1234U,
+                        "a sampled bound request lost its seed on the reproducible route");
+                require(again.generated_token_ids == first.generated_token_ids,
+                        "a sampled bound request did not replay on the reproducible route");
+            }
+            std::cout << "reproducible route: sampled bound request replayed exactly ("
+                      << first.generated_token_ids.size() << " tokens)\n";
         }
         request.ngram_session = {.key               = "child",
                                  .parent            = "parent",
