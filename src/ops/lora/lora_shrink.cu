@@ -1142,10 +1142,12 @@ constexpr auto stream_kernel() {
 template <int MTiles, int Slices>
 void launch_stream(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cudaStream_t stream) {
     constexpr auto kernel = stream_kernel<MTiles, Slices>();
+    // The lambda names the kernel itself: MSVC 14.44 refuses an uncaptured local there (C2326), constexpr or not.
     static bool configured = [] {
         const std::size_t most = std::min(stream_bytes<MTiles>(kMaxGroupsPerRank),
                                           static_cast<std::size_t>(shared_optin_bytes()));
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(most)));
+        CUDA_CHECK(cudaFuncSetAttribute(stream_kernel<MTiles, Slices>(), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(most)));
         return true;
     }();
     (void)configured;
@@ -1182,8 +1184,9 @@ void launch_split_as(const Tensor& x, const LoraShrinkWeight& a, Tensor& u, cuda
     constexpr auto kernel = lora_shrink_split_kernel<NT, G>;
     // The largest K (kMaxRanks * kMaxGroupsPerRank groups) sets the attribute once.
     constexpr int kMaxBytes = (G * 4 + kMaxRanks * kMaxGroupsPerRank) * NT * 32 * 16;
-    static bool configured  = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxBytes));
+    static bool configured  = [] { // names the kernel itself, as launch_stream's (MSVC 14.44 C2326)
+        CUDA_CHECK(cudaFuncSetAttribute(lora_shrink_split_kernel<NT, G>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        kMaxBytes));
         return true;
     }();
     (void)configured;
