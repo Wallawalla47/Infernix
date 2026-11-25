@@ -72,10 +72,12 @@ inline constexpr std::int32_t kMaxAttentionGroups =
 //   full: a page-major page pool [pool_pages][kKvHeads][64][128] (a page contiguous in each plane) and each lane's
 //            block table row table[lane * table_stride + p / 64].
 //
-// A full visit's pool may hold a quantized form instead (`codec`, the K and V planes each in one of the forms below;
-// sliding rings are always BF16 K / FP16 V). A row is one position's 128 values of one KV head, row r the one at
-// element offset 128 r of the BF16 layout; its codes at byte offset r * code bytes of k (v) and its side record at
-// byte offset r * side bytes of k_side (v_side). x is the value the BF16 storage holds (the BF16 key, the FP16 value);
+// A full visit's pool may hold a quantized form instead (`codec`, the K and V planes each in one of the forms below);
+// a sliding visit's ring may hold bf16p or int8 (`codec`; design §7.6). A row is one position's 128 values of one
+// KV head, row r the one at element offset 128 r of the BF16 layout; its codes at byte offset r * code bytes of k (v)
+// and its side record at byte offset r * side bytes of k_side (v_side). A quantized ring's lane_stride is in those
+// elements too, so its codes and side records are dense per plane: [lanes][...][the ring's rows][bytes], each plane's
+// k (v, k_side, v_side) the start of lane 0's rows. x is the value the BF16 storage holds (the BF16 key, the FP16 value);
 // every division is IEEE (a host encoder forms the same bytes).
 //
 //   form   code  side  encoding
@@ -128,12 +130,19 @@ struct KvView {
     const std::int32_t* table    = nullptr;
     std::int32_t table_stride    = 0;
     std::int64_t pool_pages      = 0;
-    KvCodec codec                = KvCodec::Bf16; // full pools (table set) only
+    KvCodec codec                = KvCodec::Bf16; // the pool's or the window ring's storage
     std::uint8_t* k_side         = nullptr;       // a quantized pool's side records [pool_pages][heads][64][side bytes]
     std::uint8_t* v_side         = nullptr;
     // bf16p: [lanes] device words, each lowered (atomicMin) to the position of a row its lane appends with no packed
     // form; the caller sets them to 0xFFFFFFFF (none) and reads them.
     std::uint32_t* unpackable    = nullptr;
+    // A BF16 view standing in for a quantized window ring (a prompt call's staging ring, design §7.6): each new row is
+    // stored as the represented words of `encode` (a window codec; Bf16: none), the words a ring of that codec decodes
+    // to, and its codes and side records at encode_codes / encode_side ([K, V]; laid out as that codec's ring of this
+    // view's rows and lane_stride), encoded once from the row's own values.
+    KvCodec encode                  = KvCodec::Bf16;
+    std::uint8_t* encode_codes[2]   = {nullptr, nullptr};
+    std::uint8_t* encode_side[2]    = {nullptr, nullptr};
 };
 
 // A quantized row's code and side bytes in each plane (0, 0: BF16 words).
@@ -154,8 +163,14 @@ struct KvRowBytes {
     return {};
 }
 
+// The codecs a sliding visit's window ring may hold.
+[[nodiscard]] constexpr bool window_codec_supported(KvCodec c) noexcept {
+    return c == KvCodec::Bf16 || c == KvCodec::Bf16Packed || c == KvCodec::Int8G64;
+}
+
 // Copies positions [from, to) of a lane's sliding K and V from one ring view to another (by position: the views'
-// page counts may differ).
+// page counts may differ), byte for byte: BF16 / FP16 words, or a quantized ring's codes and side records (both views
+// of one codec); or a quantized ring into a BF16 view as its represented words (dst.codec Bf16).
 struct WindowCopyArgs {
     KvView src, dst;
     std::int32_t src_lane = 0, dst_lane = 0;

@@ -26,19 +26,29 @@ namespace infernix::models::inkling2 {
 inline constexpr std::int32_t kMaxForwardColumns = ops::w4a4_moe::kMaxColumns;
 
 // One lane's state image (design §7.2): each visit's four conv rings ([kRingPositions][width] BF16: K and V inputs
-// 1024 wide, the post-attention and post-MLP inputs 2304) and each sliding visit's window K (BF16) and V (FP16)
-// ([kKvHeads][kWindowRingPages][64][128] each). Offsets are 16-bit words from the image's start.
+// 1024 wide, the post-attention and post-MLP inputs 2304) and, with BF16 windows, each sliding visit's window K (BF16)
+// and V (FP16) ([kKvHeads][kWindowRingPages][64][128] each). Offsets are 16-bit words from the image's start. Quantized
+// windows (design §7.6) live outside the image instead (StateView::window_codes).
 struct VisitState {
     std::int64_t key_ring = 0, value_ring = 0, attention_ring = 0, mlp_ring = 0;
-    std::int64_t window_k = -1, window_v = -1; // sliding visits
+    std::int64_t window_k = -1, window_v = -1; // sliding visits with BF16 windows
+    std::int32_t window    = -1;               // sliding visits: their window's index, in visit order
     std::int32_t full_slot = -1;               // full visits: their K/V pool, in visit order
 };
 struct StateLayout {
     std::vector<VisitState> visits;
-    std::int64_t lane_words  = 0;
-    std::int32_t full_visits = 0;
+    std::int64_t lane_words     = 0;
+    std::int32_t full_visits    = 0;
+    std::int32_t sliding_visits = 0;
 };
-[[nodiscard]] StateLayout state_layout(const TextConfig& config);
+[[nodiscard]] StateLayout state_layout(const TextConfig& config, ops::inkling2::KvCodec window_codec);
+
+// A quantized window ring's rows in one plane (one visit's K or V of one lane): kKvHeads x kWindowRingPages x 64.
+inline constexpr std::int64_t kWindowRows = std::int64_t{ops::inkling2::kKvHeads} * ops::inkling2::kWindowRingPages *
+                                            ops::inkling2::kKeyUnit;
+// A lane's quantized window bytes: the codes, and the side records, of every sliding visit's two planes.
+[[nodiscard]] std::int64_t window_code_bytes(const StateLayout& layout, ops::inkling2::KvCodec window_codec);
+[[nodiscard]] std::int64_t window_side_bytes(const StateLayout& layout, ops::inkling2::KvCodec window_codec);
 
 // The state a call runs against: the lanes' images and the full visits' paged K/V, every full visit reading the
 // lanes' block table rows (they append the same positions).
@@ -53,6 +63,12 @@ struct StateView {
     ops::inkling2::KvCodec codec = ops::inkling2::KvCodec::Bf16;
     std::vector<std::uint8_t*> side_k, side_v; // per full slot: [pool_pages][kKvHeads][64][the form's side bytes]
     std::uint32_t* unpackable = nullptr;       // bf16p: [lanes] flags of rows with no packed form
+    // The sliding windows' storage (design §7.6): BF16 words in the images, or a quantized codec's codes and side
+    // records, each [lanes][2 * sliding visits][kWindowRows][its bytes] (plane 2 w + 0 window w's K, + 1 its V).
+    ops::inkling2::KvCodec window_codec = ops::inkling2::KvCodec::Bf16;
+    std::uint8_t* window_codes          = nullptr;
+    std::uint8_t* window_side           = nullptr;
+    std::int32_t window_planes          = 0;
 };
 
 // One call: each column's token, lane and position (a lane's columns consecutive, positions ascending by 1; lane -1
@@ -81,6 +97,9 @@ struct ForwardBuffers {
     // and V), with the {ring, history, width} descriptors conv_history reads.
     std::uint16_t* history = nullptr;
     std::uint16_t *staging_k = nullptr, *staging_v = nullptr;
+    // A quantized window codec's staging codes and side records ([lanes][kKvHeads][staging pages][64][bytes], K and
+    // V): the prompt call's new rows, encoded once from their own values, copied back to the state's ring after.
+    std::uint8_t *staging_codes[2] = {}, *staging_side[2] = {};
     std::int64_t* history_rings = nullptr;
     std::uint16_t *e = nullptr, *h6 = nullptr, *hp = nullptr, *h12[3] = {}, *h18[3] = {};
     float* cand = nullptr;
@@ -136,9 +155,11 @@ public:
     // `activation`: the routed experts' (--a16-activations: ExpertActivation::A16; A8 with `a8`). `a8`
     // (--a8-activations, LOSSY): the attention input and output projections (K2, W_o) and the head, whose 8-bit
     // weights it needs, take 8-bit activations (projections_mma's x8) in every call, prompt or decode; the message
-    // gates and the router keep 16-bit ones (as Basalt runs them).
+    // gates and the router keep 16-bit ones (as Basalt runs them). `window_codec`: the sliding windows' storage
+    // (StateView::window_codec; its layout()).
     Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity = kMaxForwardColumns,
-            ops::w4a4_moe::ExpertActivation activation = ops::w4a4_moe::ExpertActivation::Checkpoint, bool a8 = false);
+            ops::w4a4_moe::ExpertActivation activation = ops::w4a4_moe::ExpertActivation::Checkpoint, bool a8 = false,
+            ops::inkling2::KvCodec window_codec = ops::inkling2::KvCodec::Bf16);
 
     // Uploads the call's tokens and column map (synchronous copies) and fixes the call's width.
     void prepare(const CallPlan& call);
@@ -154,7 +175,8 @@ public:
                                                   bool features = false,
                                                   ops::w4a4_moe::ExpertActivation activation =
                                                       ops::w4a4_moe::ExpertActivation::Checkpoint,
-                                                  bool a8 = false);
+                                                  bool a8 = false,
+                                                  ops::inkling2::KvCodec window_codec = ops::inkling2::KvCodec::Bf16);
     void embed(cudaStream_t stream);
     void visit(std::uint32_t visit, const StateView& state, const VisitInputs& in, cudaStream_t stream);
     void visit(std::uint32_t v, const StateView& state, cudaStream_t stream) { visit(v, state, inputs(v), stream); }
@@ -236,6 +258,7 @@ private:
     std::int32_t capacity_  = 0;
     ops::w4a4_moe::ExpertActivation activation_ = ops::w4a4_moe::ExpertActivation::Checkpoint;
     bool a8_                 = false;
+    ops::inkling2::KvCodec window_codec_ = ops::inkling2::KvCodec::Bf16;
     std::int32_t max_groups_ = 0;
     std::int32_t staging_pages_ = 0;
     std::int32_t columns_   = 0;

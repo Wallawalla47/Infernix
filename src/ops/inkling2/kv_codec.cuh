@@ -6,6 +6,7 @@
 
 #include "infernix/ops/inkling2_attention.h"
 #include "ops/common/canonical_math.h"
+#include "ops/inkling2/kv_int8_piece.cuh"
 #include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"

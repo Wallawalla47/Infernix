@@ -649,6 +649,12 @@ infernix_add_family_op_test(infernix_inkling2_attention_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_attention.cu"
   LIBRARIES infernix_ops)
 
+# Inkling 2's int8 piece decoder (the int8 attention instances') bit for bit the generic decoder, exhaustively over
+# every code byte and FP16 scale bit pattern, keys and values.
+infernix_add_family_op_test(infernix_inkling2_kv_decode_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_kv_decode.cu"
+  LIBRARIES infernix_ops)
+
 # Inkling 2's DSpark drafter Ops against FP64 oracles of the reference arithmetic (its BF16 rounding points as
 # semantic boundaries): the context mix and norm, the head norm with RoPE into a cache ring and a dense buffer, the
 # block attention (sliding with the window cut, full), the residual norm, SwiGLU, and the Markov head's drafts.

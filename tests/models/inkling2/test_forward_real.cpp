@@ -185,6 +185,14 @@ std::vector<double> f32_values(const float* p, std::size_t n) {
     return {host.begin(), host.end()};
 }
 
+// INFERNIX_INKLING2_WINDOW (profiles only): the sliding windows' storage, int8 (unset: BF16).
+ik::KvCodec window_from_env() {
+    const char* w = std::getenv("INFERNIX_INKLING2_WINDOW");
+    if (w == nullptr) { return ik::KvCodec::Bf16; }
+    if (std::string(w) == "int8") { return ik::KvCodec::Int8G64; }
+    throw std::invalid_argument("INFERNIX_INKLING2_WINDOW: int8");
+}
+
 // ---------------------------------------------------------------------------- state
 
 // Lanes' images and the full visits' pools: `pages` 64-position pages a lane (lane l's page b at l * pages + b).
@@ -194,10 +202,22 @@ struct State {
     std::vector<std::uint16_t*> pools;
     int* table = nullptr;
     std::size_t image_bytes = 0, pool_bytes = 0;
+    std::uint8_t *window_codes = nullptr, *window_side = nullptr; // quantized windows (StateView)
+    std::size_t window_code_bytes = 0, window_side_bytes = 0;
     std::vector<std::vector<std::uint8_t>> saved;
-    explicit State(const m::StateLayout& layout, int lanes = 1, int pages = 1) {
+    explicit State(const m::StateLayout& layout, int lanes = 1, int pages = 1, ik::KvCodec window = ik::KvCodec::Bf16) {
         image_bytes = static_cast<std::size_t>(layout.lane_words) * 2 * lanes;
         cuda(cudaMalloc(&images, image_bytes), "state");
+        if (window != ik::KvCodec::Bf16) {
+            window_code_bytes = static_cast<std::size_t>(m::window_code_bytes(layout, window)) * lanes;
+            window_side_bytes = static_cast<std::size_t>(m::window_side_bytes(layout, window)) * lanes;
+            cuda(cudaMalloc(&window_codes, window_code_bytes), "window codes");
+            cuda(cudaMalloc(&window_side, window_side_bytes), "window side");
+            view.window_codes  = window_codes;
+            view.window_side   = window_side;
+            view.window_planes = 2 * layout.sliding_visits;
+        }
+        view.window_codec = window;
         pool_bytes = std::size_t{ik::kKvHeads} * lanes * pages * ik::kKeyUnit * ik::kHeadDim * 2;
         for (int s = 0; s < 2 * layout.full_visits; ++s) {
             std::uint16_t* p = nullptr;
@@ -221,6 +241,10 @@ struct State {
     }
     void reset() {
         cuda(cudaMemset(images, 0, image_bytes), "reset");
+        if (window_codes != nullptr) {
+            cuda(cudaMemset(window_codes, 0, window_code_bytes), "reset");
+            cuda(cudaMemset(window_side, 0, window_side_bytes), "reset");
+        }
         for (auto* p : pools) { cuda(cudaMemset(p, 0, pool_bytes), "reset"); }
     }
     // A host copy of every byte of the state, and its return (both synchronous).
@@ -241,6 +265,8 @@ struct State {
     }
     ~State() {
         cudaFree(images);
+        cudaFree(window_codes);
+        cudaFree(window_side);
         for (auto* p : pools) { cudaFree(p); }
         cudaFree(table);
     }
@@ -758,8 +784,9 @@ void profile_prefill(const m::Parameters& p, int width) {
     // experts' 8-bit activations.
     const bool a8 = std::getenv("INFERNIX_INKLING2_A8") != nullptr;
     m::Forward fw(p, 1, std::max(width, m::kMaxForwardColumns),
-                  a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
-    State state(fw.layout(), 1, width / ik::kKeyUnit + 2);
+                  a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8,
+                  window_from_env());
+    State state(fw.layout(), 1, width / ik::kKeyUnit + 2, window_from_env());
     m::CallPlan plan;
     std::uint64_t lcg = 12345;
     for (int t = 0; t < width; ++t) {
@@ -894,6 +921,12 @@ int main() {
         return 77;
     }
     try {
+        // The checks read BF16 windows and hold the BF16 windows' criteria.
+        if (window_from_env() != ik::KvCodec::Bf16 && std::getenv("INFERNIX_INKLING2_PROFILE") == nullptr &&
+            std::getenv("INFERNIX_INKLING2_PREFILL_PROFILE") == nullptr) {
+            std::printf("FAIL: INFERNIX_INKLING2_WINDOW is for the profiles (INFERNIX_INKLING2_PROFILE, _PREFILL_PROFILE) only\n");
+            return 1;
+        }
         DeviceContext device(0);
         const Reference ref(reference);
         artifact::Reader reader(artifact_path);
@@ -931,13 +964,14 @@ int main() {
         // INFERNIX_INKLING2_A8 (profiles only: the reference criteria are the default route's).
         const bool a8 = std::getenv("INFERNIX_INKLING2_A8") != nullptr;
         m::Forward forward(parameters, 1, m::kMaxForwardColumns,
-                           a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
-        State state(forward.layout());
+                           a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8,
+                           window_from_env());
+        State state(forward.layout(), 1, 1, window_from_env());
         const auto& c = model->config().text;
         if (const char* width = std::getenv("INFERNIX_INKLING2_PROFILE"); width != nullptr) {
             const char* ctx   = std::getenv("INFERNIX_INKLING2_CONTEXT");
             const int context = ctx != nullptr ? std::max(1, std::atoi(ctx)) : kT;
-            State big(forward.layout(), 1, (context + 64) / ik::kKeyUnit + 1);
+            State big(forward.layout(), 1, (context + 64) / ik::kKeyUnit + 1, window_from_env());
             profile_rounds(parameters, forward, big, ref, std::max(1, std::atoi(width)), context);
             std::printf("profiled 50 rounds\n");
             return 0;

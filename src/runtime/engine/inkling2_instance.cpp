@@ -75,6 +75,8 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options, s
             .vision            = options.enable_vision,
             .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
             .kv_codec          = models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
+            .window_codec      = models::inkling2::window_codec(
+                models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16)),
             .prefix_cache      = options.context_cache.enabled && options.purpose == EnginePurpose::Generation,
             .prefix_host_bytes = options.context_cache.host_capacity_bytes.value_or(0U),
             .prefix_max_new_taps   = options.context_cache.hybrid.max_new_taps.value_or(8U),
@@ -233,15 +235,16 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     if (options.kv_cache == KvCacheStorage::Vq2 || options.kv_cache == KvCacheStorage::Q4KeyVq2Value) {
         report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
                             " stores the full visits' keys and values as Hadamard-rotated vector codes (2-4 bits a "
-                            "value, no exact recent window; the sliding windows stay BF16 keys, FP16 values; the output "
-                            "differs from bf16's)");
+                            "value, no exact recent window) and the sliding windows' as int8 (the output differs from "
+                            "bf16's)");
     } else if (options.kv_cache == KvCacheStorage::Bf16Packed) {
-        report(options, "Inkling 2: --kv-dtype bf16p packs the full visits' BF16 keys and values losslessly to 12 bits "
+        report(options, "Inkling 2: --kv-dtype bf16p packs the BF16 keys and values (full visits and sliding windows) "
+                        "losslessly to 12 bits "
                         "(the output is bf16's; a request with a row that has no packed form fails)");
     } else if (options.kv_cache != KvCacheStorage::BFloat16) {
         report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
-                            " stores the full visits' keys and values quantized (the sliding windows stay BF16 keys, "
-                            "FP16 values; the output differs from bf16's)");
+                            " stores the full visits' keys and values quantized and the sliding windows' as int8 (the "
+                            "output differs from bf16's)");
     }
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
     refuse(options.rope_yarn_factor != 1.0F, "--rope-yarn does not apply: the model has no RoPE (its relative attention "
@@ -577,6 +580,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         signature += ";q8=" + std::to_string(options.q8_weights ? 1 : 0);
         signature += ";a16=" + std::to_string(options.expert_a16_activations ? 1 : 0);
         signature += ";vision=" + std::to_string(options.enable_vision ? 1 : 0);
+        signature += ";window=" + std::to_string(static_cast<int>(program.window_codec)); // the windows' storage
         const runtime::prefix_cache::PersistResult loaded = instance->program->attach_prefix_cache_file(
             options.context_cache.hybrid.persistent_file, hybrid_cache_fingerprint(options, signature, device.props),
             options.startup_observer);

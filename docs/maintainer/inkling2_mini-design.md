@@ -583,10 +583,11 @@ so a rejected draft never overwrites a position a later query needs and rollback
 A window ring is whole pages, so a 64-key unit of attention is one contiguous page (position p in page (p / 64) mod 17,
 at row p mod 64); 1088 = 1024 + 64 lets a call append up to 65 positions a lane before a write reaches a key the call's
 first query reads. A conv ring of 32 slots (p at slot p mod 32) holds 3 taps of history plus the call's columns, up to
-29 a lane. Each lane's image is contiguous (the kernels take a lane stride), so a snapshot is one copy. The ring holds
-BF16 K and FP16 V in every KV profile ([§7.6](#76-kv-profiles): `--kv-dtype` selects the full visits' pools only; the
-INT8 column above was the plan's, not built). The size is close to the 27B's StateImage (186.8 MiB), so the prefix
-cache's slot and Host-tier policies apply as they are.
+29 a lane. Each lane's image is contiguous (the kernels take a lane stride), so a snapshot is one copy. The window
+rings take the KV profile's window codec ([§7.6](#76-kv-profiles)): BF16 K and FP16 V under `bf16`, the packed form
+under `bf16p`, INT8-G64 under every other profile (the column above); a quantized ring's codes and side records sit
+beside the image in their own per-lane planes, copied with it. The BF16 size is close to the 27B's StateImage
+(186.8 MiB), so the prefix cache's slot and Host-tier policies apply as they are.
 
 ### 7.3 Speculative rollback
 
@@ -623,7 +624,7 @@ form Qwen3.8-Flash-Next's binding takes:
   the image's parts); the fingerprint adds the KV format, drafter, `--q8-weights`, `--a16-activations`, `--lossless`
   and vision.
 - **SSD tier** (`--ssd-context-gib`; [spec §5.7](hybrid-prefix-cache-spec.md)): the shared `SsdTier` over whole Host
-  slabs. An image is many times a prompt's blocks (190 MiB against 2 MiB per 64 tokens), so a small Host tier holds few
+  slabs. An image is many times a prompt's blocks (107-190 MiB against 1-2 MiB per 64 tokens), so a small Host tier holds few
   snapshots: a capture counts its image, tail and path blocks in the room it needs, and when that room is short lands
   the captures and block writes in flight (write-back takes a snapshot only once it and its path are on the Host),
   then starts and waits for the write-backs, so the last request's snapshot is written rather than displaced. A
@@ -633,7 +634,8 @@ form Qwen3.8-Flash-Next's binding takes:
   read at any length.
 - **Not built yet**: next-turn prefill, tool-call holds, queue holds and prefetching for waiting requests.
 
-Sizes: an image is 190 MiB (BF16 rings) plus 9 MiB of drafter rings; restoring one takes ~8 ms over the PCIe link,
+Sizes: an image is 190 MiB with BF16 windows, 107 MiB with INT8 windows (every profile but `bf16` and `bf16p`) and
+158 MiB with `bf16p` windows, plus 9 MiB of drafter rings; restoring a BF16 one takes ~8 ms over the PCIe link,
 against ~0.25 s to recompute 4K tokens.
 
 The alternative (TokenSpeed's): window K/V in a paged pool whose pages behind the window are freed unless a cached
@@ -649,9 +651,12 @@ snapshot.
 
 ### 7.6 KV profiles
 
-`--kv-dtype` selects the full visits' paged pools only: the 40 sliding visits' window rings in the StateImage stay BF16
-K / FP16 V in every profile (they are a fixed ~170 MiB a lane, independent of context, while the full pools grow with
-it). Every profile decodes into the attention kernels' existing tiles (K as BF16 words, V as FP16), so the decode route's
+`--kv-dtype` selects the full visits' paged pools and, with them, the window codec of the 40 sliding visits' rings
+(`window_codec()`, owner's mapping 2026-11-24): `bf16` keeps BF16 K / FP16 V windows, `bf16p` packs its windows as its
+pools, and every other profile stores its windows as `int8` (the coarser formats' own codecs would quantize the recent
+keys every query reads; `nvfp4` windows measured 3.5 times `int8`'s KL). The windows are a fixed share a lane,
+independent of context: 170 MiB as BF16, 88 MiB as INT8-G64, 138 MiB as `bf16p`. The lossless route takes `bf16`
+only, so its windows stay BF16. Every profile decodes into the attention kernels' existing tiles (K as BF16 words, V as FP16), so the decode route's
 pinned score chain and the prompt route's MMAs are unchanged; the append (the prologue, or the fused prologue inside
 the attention launch) encodes each new row with a warp and returns its represented words. The contract and byte layouts
 are `inkling2_attention.h`'s `KvCodec`; the codecs are `src/ops/inkling2/kv_codec.cuh`, each the shared codec's
@@ -698,6 +703,29 @@ Measured quality (2026-11-22, RTX 5090, inkling2-mini, `infernix-perplexity` on 
 `bf16p` reading exactly 0 shows the statistic and the reference are sound. The 8-bit profiles and `nvfp4` sit
 within 9.4–10.7 × 10⁻³ of each other, about the level `--q8-weights` reads as well: that is this model's response to
 any small perturbation on this corpus (a floor), not a ranking among them. `k4v2` and `vq2` are clearly above it.
+
+The table above has BF16 windows under every profile. The windows' own effect (2026-11-24, the same quick set, BF16
+references per route; the real INT8 ring gave the emulated ring's total NLL exactly), as each profile now runs it:
+
+| Profile | PPL, BF16 windows → its windows | KL from the same pools with BF16 windows |
+|---|---:|---:|
+| `bf16p` (`bf16p` windows) | 4.03144 → 4.03144 (= `bf16`, no request failed) | 0 |
+| `int8` | 4.0317 → 4.0322 | 1.27 × 10⁻³ |
+| `fp8` | 4.0350 → 4.0333 | 1.19 × 10⁻³ |
+| `k8v4` | 4.0342 → 4.0349 | 1.11 × 10⁻³ |
+| `nvfp4` | 4.0364 → 4.0340 | 0.90 × 10⁻³ |
+| `k4v2` | 4.0462 → 4.0486 | 0.77 × 10⁻³ |
+| `vq2` | 4.0950 → 4.0934 | 0.75 × 10⁻³ |
+
+INT8 windows add about a tenth of the 8-bit pools' own KL, and top-1 agreement drops 0.04–0.27 points; the PPL moves
+both ways by at most 0.0024. Rejected window codecs: `fp8` windows (+1.34 × 10⁻³ under `fp8`), `nvfp4` windows
+(+4.42 × 10⁻³, 3.5 times INT8's). Speed (2026-11-25, RTX 5090, INT8 against BF16 windows over the same pools in one
+binary, 2 runs an arm): plain decode +0.1 to +0.7 % after 2,048 and 10,000 prompt tokens on `int8`, `fp8` and `nvfp4`
+pools, 4 lanes −0.3 to +0.7 %, prefill −0.1 to −0.5 % (the new rows' encode). DSpark speeds move with the text the
+windows' rounding leads to (−4.1 to +12 % over 3 prompts × 3 pools, acceptance −0.025 to +0.038); a round's verify
+time, fitted post hoc against the tokens a round over those 9 cells, is about +0.2 % at an equal count. Against `bf16`
+KV, `int8` (windows included) decodes +0.4 % after 2,048 prompt tokens and −0.2 % after 10,000 and prefills 0.6 % and
+1.5 % slower.
 
 ---
 
@@ -1539,7 +1567,7 @@ component, kept byte for byte after the converter checks it names the processor 
 |---|---|
 | `--spec` | `off`, `dspark`, `auto` (= `dspark` when the artifact carries the drafter) |
 | `--draft-tokens` | `auto` (calibrated), 1-7 |
-| `--kv-dtype` | the full visits' pools ([§7.6](#76-kv-profiles)): `bf16` (default), `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`; the sliding windows stay BF16 K / FP16 V |
+| `--kv-dtype` | the full visits' pools ([§7.6](#76-kv-profiles)): `bf16` (default), `bf16p`, `int8` (recommended), `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`; the sliding windows `bf16` under `bf16`, `bf16p` under `bf16p`, `int8` under every other |
 | `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` streams the tower from pinned host memory |
 | `--prefill-chunk` | default 4,096; a multiple of 128 up to 8,064 ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |

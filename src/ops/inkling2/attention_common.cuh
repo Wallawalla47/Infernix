@@ -46,9 +46,9 @@ __device__ __forceinline__ std::size_t kv_row(const KvView& kv, int lane, int he
 
 // ---------------------------------------------------------------------------- quantized pools (kv_codec.cuh)
 
-// Whether a call's visit runs the kernels' quantized-pool instances (a full visit whose pool is not BF16 words): the
-// BF16 instances carry no codec code.
-inline bool quantized_pool(const AttentionArgs& a) { return a.layer.full && a.kv.codec != KvCodec::Bf16; }
+// Whether a call's visit runs the kernels' quantized instances (its pool, or a sliding visit's window ring, is not BF16
+// words): the BF16 instances carry no codec code.
+inline bool quantized_pool(const AttentionArgs& a) { return a.kv.codec != KvCodec::Bf16; }
 
 // Whether a visit's pool holds rotated codes (vq2, k4v2): its scores and P x V run in the rotated domain (the rows'
 // q' = kv_rotate_query(q), the cached S c), and its output is o = 2^-4 H128 o'.
@@ -56,12 +56,12 @@ __host__ __device__ __forceinline__ bool rotated_pool(const AttentionArgs& a) {
     return a.layer.full && rotated(a.kv.codec);
 }
 
-// The form of a visit's plane (which 0 K, 1 V): a sliding ring's is always BF16 / FP16 words.
+// The form of a visit's plane (which 0 K, 1 V): its pool's or its window ring's codec (KvView::codec).
 __device__ __forceinline__ KvForm plane_form(const KvView& kv, int which) {
-    if (kv.table == nullptr) { return KvForm::Words; }
     return which == 0 ? key_form(kv.codec) : value_form(kv.codec);
 }
-// A quantized row's codes and side record in plane `which`, by its element offset in the BF16 layout.
+// A quantized row's codes and side record in plane `which`, by its element offset in the BF16 layout. A quantized
+// window ring's codes and side records are dense per plane in their own buffers (KvView), so the same offsets hold.
 __device__ __forceinline__ std::uint8_t* row_codes(const KvView& kv, int which, KvForm form, std::size_t element) {
     return reinterpret_cast<std::uint8_t*>(which == 0 ? kv.k : kv.v) + element / kD * code_bytes(form);
 }
@@ -87,6 +87,25 @@ __device__ __forceinline__ void decode_unit(const KvView& kv, std::size_t page, 
         *reinterpret_cast<uint4*>(tile + at(row, 16 * chunk))     = lo;
         *reinterpret_cast<uint4*>(tile + at(row, 16 * chunk + 8)) = hi;
     }
+}
+
+// decode_unit for an int8 G64 pool or window ring (both planes int8): a thread decodes 8-value pieces (kv_decode8_int8),
+// consecutive threads consecutive 16-byte pieces of a row (unit stores without bank conflicts), each plane in its own
+// loop (the word form fixed). The same words as decode_unit.
+template <class At>
+__device__ __forceinline__ void decode_unit_int8(const KvView& kv, std::size_t page, std::uint16_t* k_tile,
+                                                 std::uint16_t* v_tile, At at, int tid, int threads) {
+    constexpr int kPieces = kD / 8; // a row's 8-value pieces
+    const auto plane = [&]<bool Value>(const std::uint8_t* codes, const std::uint8_t* side, std::uint16_t* tile) {
+        for (int i = tid; i < kKeyUnit * kPieces; i += threads) {
+            const int row = i / kPieces, piece = i % kPieces;
+            const uint2 c = *reinterpret_cast<const uint2*>(codes + row * kD + 8 * piece);
+            const std::uint16_t s = reinterpret_cast<const std::uint16_t*>(side + row * 4)[piece / 8];
+            *reinterpret_cast<uint4*>(tile + at(row, 8 * piece)) = kv_decode8_int8<Value>(c, s);
+        }
+    };
+    plane.template operator()<false>(row_codes(kv, 0, KvForm::Int8, page), row_side(kv, 0, KvForm::Int8, page), k_tile);
+    plane.template operator()<true>(row_codes(kv, 1, KvForm::Int8, page), row_side(kv, 1, KvForm::Int8, page), v_tile);
 }
 
 // The argument checks both routes share, and the prologue over every column of the call (attention.cu).

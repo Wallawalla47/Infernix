@@ -108,6 +108,10 @@ double ulp_f16(double r) {
     const double a = std::fabs(r);
     return a < 0x1p-14 ? 0x1p-24 : std::ldexp(1.0, std::ilogb(a) - 10);
 }
+double ulp_f32(double r) {
+    const double a = std::fabs(r);
+    return a < 0x1p-126 ? 0x1p-149 : std::ldexp(1.0, std::ilogb(a) - 23);
+}
 
 struct Tally {
     const char* name;
@@ -703,7 +707,7 @@ Problem make_problem(bool full, const Call& call, std::uint32_t seed, ik::KvCode
         }
         check(next <= kPoolPages, "the test's pool holds its lanes");
     }
-    p.codec = full ? codec : ik::KvCodec::Bf16;
+    p.codec = codec; // a sliding visit's window ring may be quantized too (int8, bf16p)
     if (p.codec == ik::KvCodec::Bf16Packed) {
         // Escapes (exponents below a row's 14-binade window; normal rows span fewer binades, so they have none): every
         // fifth pool row holds 1 + row % 6 values far below the rest (K +-2^-40, V +-2^-20: an FP16 subnormal), so the
@@ -1008,8 +1012,11 @@ void prologue_check(const Problem& p, const Call& call, const Outputs& got, cons
                 want[e] = b16(y);
                 // A rotated pool's kernel stores q' (checked below): its FP64 stage check is the emulation's (q' is
                 // bit for bit the rotation of this q).
+                // The clip factor and the product are formed in FP32: their rounding (|s| |fq - f64| and half an FP32
+                // step) can move a product across a BF16 tie, so the criterion carries it.
+                const double factor = std::fabs(double{s[e]}) * std::fabs(double{fq} - f64) + 0.5 * ulp_f32(y64);
                 tally.ratio(std::fabs((rot ? y : f(got.q[(std::size_t(t) * NH + h) * D + e])) - y64) /
-                            (0.5 * ulp_bf16(y64) + (p.full ? ulp_bf16(y64) : 0.0) + 1e-30));
+                            (0.5 * ulp_bf16(y64) + (p.full ? ulp_bf16(y64) : 0.0) + factor + 1e-30));
             }
             if (rot) {
                 float qv[D];
@@ -1038,8 +1045,11 @@ void prologue_check(const Problem& p, const Call& call, const Outputs& got, cons
                 float y = bf(canon::mul_rn(rs[i], fr));
                 if (p.full) { y = bf(canon::mul_rn(y, tau_of(p, pos))); }
                 rwant[i] = b16(y);
-                const double y64 = rs[i] * std::min(1.0, 8.0 / (std::sqrt(r64) + 1e-6));
-                if (!p.full) { tally.ratio(std::fabs(f(got.r[(std::size_t(t) * NH + h) * RD + i]) - y64) / (0.5 * ulp_bf16(y64) + 1e-30)); }
+                const double fr64    = std::min(1.0, 8.0 / (std::sqrt(r64) + 1e-6));
+                const double y64     = rs[i] * fr64;
+                const double factor  = std::fabs(double{rs[i]}) * std::fabs(double{fr} - fr64) + 0.5 * ulp_f32(y64); // as q's
+                const double got_r   = f(got.r[(std::size_t(t) * NH + h) * RD + i]);
+                if (!p.full) { tally.ratio(std::fabs(got_r - y64) / (0.5 * ulp_bf16(y64) + factor + 1e-30)); }
             }
             tally.exact(got.r.data() + (std::size_t(t) * NH + h) * RD, rwant, RD);
         }
@@ -1358,7 +1368,6 @@ void prompt_case(bool full, std::uint32_t seed, ik::KvCodec codec = ik::KvCodec:
         block_table.assign(kTableStride, -1);
         for (int b = 0; b <= (P0 + T - 1) / U; ++b) { block_table[b] = order[b]; }
     }
-    if (!full) { codec = ik::KvCodec::Bf16; }
     const bool quantized = codec != ik::KvCodec::Bf16;
     const Form kform = key_form(codec), vform = value_form(codec);
     std::vector<std::uint8_t> k_side, v_side;
@@ -1562,8 +1571,12 @@ INFERNIX_OP_TEST(inkling2_attention) {
     run_case(true, 8);
     prompt_case(false, 17);
     prompt_case(true, 18);
-    // The quantized full pools (each form in both planes; k8v4 mixes them).
+    // The quantized full pools (each form in both planes; k8v4 mixes them), and the quantized window rings.
     std::uint32_t seed = 30;
+    for (const ik::KvCodec codec : {ik::KvCodec::Int8G64, ik::KvCodec::Bf16Packed}) {
+        run_case(false, seed++, codec);
+        prompt_case(false, seed++, codec);
+    }
     for (const ik::KvCodec codec : {ik::KvCodec::Int8G64, ik::KvCodec::Fp8Row, ik::KvCodec::Nvfp4G16,
                                     ik::KvCodec::Fp8KeyNvfp4V, ik::KvCodec::Bf16Packed, ik::KvCodec::Vq2,
                                     ik::KvCodec::Q4KeyVq2V}) {

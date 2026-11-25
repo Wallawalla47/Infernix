@@ -119,7 +119,7 @@ __device__ __forceinline__ void unrotate_rows(float (&acc)[16][4], int t4) {
     }
 }
 
-// Quantized: the instance for a quantized full pool (attention.cu's split): the BF16 instance has no decoders.
+// Quantized: the instance for a quantized pool or window ring (attention.cu's split): the BF16 instance has no decoders.
 template <bool Quantized>
 __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const AttentionArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -181,22 +181,20 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
     const auto load_unit = [&](int stage, int unit) {
         const std::size_t page = kv_row(a.kv, lane, kv, unit * kKeyUnit);
         if constexpr (Quantized) {
-            if (a.layer.full) {
-                // A quantized pool's rows decoded into the stage's represented words (synchronous: the other stage is
-                // the one being read).
-                detail::decode_unit(a.kv, page, sm.k[stage], sm.v[stage], [](int row, int d) { return swz(row, d); }, tid,
-                                    kThreads);
-                return;
+            // A quantized pool's or window ring's rows decoded into the stage's represented words (synchronous: the other
+            // stage is the one being read).
+            detail::decode_unit(a.kv, page, sm.k[stage], sm.v[stage], [](int row, int d) { return swz(row, d); }, tid,
+                                kThreads);
+        } else {
+            for (int i = tid; i < 2 * kKeyUnit * (kD / 8); i += kThreads) {
+                const int plane = i / (kKeyUnit * (kD / 8)), rest = i % (kKeyUnit * (kD / 8));
+                const int row = rest / (kD / 8), chunk = rest % (kD / 8);
+                const std::uint16_t* src = (plane == 0 ? a.kv.k : a.kv.v) + page + row * kD + 8 * chunk;
+                std::uint16_t* dst = (plane == 0 ? sm.k[stage] : sm.v[stage]) + swz(row, 8 * chunk);
+                ops::cp_async<16, Cache::cg>(dst, src);
             }
+            ops::cp_commit();
         }
-        for (int i = tid; i < 2 * kKeyUnit * (kD / 8); i += kThreads) {
-            const int plane = i / (kKeyUnit * (kD / 8)), rest = i % (kKeyUnit * (kD / 8));
-            const int row = rest / (kD / 8), chunk = rest % (kD / 8);
-            const std::uint16_t* src = (plane == 0 ? a.kv.k : a.kv.v) + page + row * kD + 8 * chunk;
-            std::uint16_t* dst = (plane == 0 ? sm.k[stage] : sm.v[stage]) + swz(row, 8 * chunk);
-            ops::cp_async<16, Cache::cg>(dst, src);
-        }
-        ops::cp_commit();
     };
 
     if (lo <= hi) { load_unit(0, lo); }

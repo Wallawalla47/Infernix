@@ -139,9 +139,10 @@ Thinking Machines' looped 24-layer model (48 layer visits a token), resident in 
 - **DSpark drafting** with the model's own drafter, and an optional shortlist (`--lm-head-draft`) built
   from a token ranking I measured with Inkling itself. Verification decides every token, so the output
   does not change.
-- **Images, one to eight lanes, every KV format, the prefix cache** and the lossless route.
-- **Not yet**: `--lora`, `--ablate`, video, constrained output, required or named tool choices, assistant
-  prefill and n-gram drafting.
+- **Images, one to eight lanes, every KV format, the prefix cache** and the lossless route. With
+  `--kv-dtype int8` (recommended) the 40 sliding-window visits store their windows in 8 bits as well.
+- **Not yet**: video, assistant prefill, n-gram drafting and `/v1/decide`'s generated number types
+  ([the full list](docs/inkling2-mini.md#not-supported-yet)).
 
 Download: [wallawalla47/Inkling-2-Mini-Infernix](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix).
 Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
@@ -640,10 +641,10 @@ options.
 Inkling 2 Mini ([guide](docs/inkling2-mini.md#run); add `--vision` for images):
 
 ```bat
-infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --spec dspark --draft-tokens auto --lm-head-draft
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft
 ```
 
-That runs the checkpoint's own arithmetic. Add `--a8-activations` for 8-bit activations, or `--q8-weights` for 8-bit
+That runs the checkpoint's own arithmetic, with an 8-bit KV cache. Add `--a8-activations` for 8-bit activations, or `--q8-weights` for 8-bit
 attention and head weights alone ([what each changes](docs/inkling2-mini.md#routes-and-precision)).
 
 **Recommended settings per model** (each with `--kv-dtype int8` unless its row says otherwise; the
@@ -657,7 +658,7 @@ drafter flags are the fastest measured overall, and `auto` picks the draft lengt
 | Qwen3.6-35B-A3B | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length, 1-5 (DFlash `auto` is faster only on code at one request) |
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
-| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft`, with the default `--kv-dtype bf16` | the calibrated number of drafts, up to 7, while one request decodes; rounds of several requests decode plainly |
+| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft` | the calibrated number of drafts, up to 7, while one request decodes; rounds of several requests decode plainly |
 
 For long conversations on the 27Bs, whose KV cache two long conversations outgrow, add `--embedding-host`:
 the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes

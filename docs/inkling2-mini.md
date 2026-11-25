@@ -56,11 +56,13 @@ hf download wallawalla47/Inkling-2-Mini-Infernix Inkling-2-Mini-Infernix.inferni
 ## Run
 
 ```bat
-infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --spec dspark --draft-tokens auto --lm-head-draft
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft
 ```
 
 - `--max-context auto` takes the largest context the free VRAM holds for every lane. Without it
   `infernix-serve` uses 8,192 tokens and `infernix` 2,048.
+- `--kv-dtype int8` stores the KV cache, the sliding windows included, in 8 bits: about half the memory
+  of the default `bf16`, for slightly different output ([KV formats](#kv-formats)).
 - `--spec dspark --draft-tokens auto` is what the default `--spec auto` chooses for this artifact.
 - `--lm-head-draft` is optional: it changes the speed of drafting, never the output.
 - Add `--vision` for images. Its tower and image buffers stay in VRAM and reduce the context.
@@ -71,7 +73,7 @@ A single request from the command line (`--max-concurrency` and the cache option
 `infernix-serve`):
 
 ```bat
-infernix.exe Inkling-2-Mini-Infernix.infernix --prompt "Explain what a looped transformer is." --max-context 32768 --max-new 2048 --spec dspark --draft-tokens auto --lm-head-draft
+infernix.exe Inkling-2-Mini-Infernix.infernix --prompt "Explain what a looped transformer is." --max-context 32768 --max-new 2048 --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft
 ```
 
 When a request sets no sampling options the engine uses temperature 1.0, top-p 1.0 and top-k 20: the
@@ -92,7 +94,7 @@ times, DSpark auto, one request) decode went from 222.0 to 213.7 tokens/s (-3.7 
 exits `0` (fits), `3` (does not fit) or `1` (no plan):
 
 ```bat
-infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --max-concurrency 2 --spec dspark --draft-tokens auto --lm-head-draft --vision --plan plan.json
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --max-concurrency 2 --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft --vision --plan plan.json
 ```
 
 See [Sizing a start without loading](serving.md#sizing-a-start-without-loading).
@@ -186,14 +188,17 @@ speeds. Measured effects of the options are in the [CLI options](cli.md#common-o
 
 ## KV formats
 
-`--kv-dtype` selects how the eight full-attention visits store their keys and values. The 40 sliding
-visits' windows stay BF16 keys and FP16 values in every format.
+`--kv-dtype` selects how the eight full-attention visits store their keys and values, and with it the
+40 sliding visits' windows: `bf16` and `bf16p` keep their windows in the same format, and every other
+format stores its windows as `int8`. `int8` is recommended: its windows and pools take about half the
+memory of `bf16`'s, so the same VRAM holds more context and more of the prefix cache. It decodes within
+0.4 % of `bf16` and prefills up to 1.5 % slower ([performance](#performance)).
 
 | Format | Stored as | Output against `bf16` |
 |---|---|---|
 | `bf16` (default) | BF16 keys, FP16 values | the reference |
 | `bf16p` | the same values packed losslessly to 12 bits | identical; a request with a row that has no packed form fails |
-| `int8` | 8-bit, two scales a row | changes |
+| `int8` (recommended) | 8-bit, two scales a row | changes |
 | `fp8` | E4M3, one scale a row | changes |
 | `nvfp4` | NVFP4 | changes |
 | `k8v4` | `fp8` keys, `nvfp4` values | changes |
@@ -360,6 +365,11 @@ RTX 5090, PCIe Gen5 x8, default route, `--kv-dtype bf16`, one request unless not
 | Prefill | 16,261 tok/s at 2,048 tokens, 16,184 at 10,000, 15,733 at 16,384 |
 | Decode, several requests (total) | 312 / 452 / 648 tok/s at 2 / 4 / 8 requests |
 | Largest `--max-context auto`, one lane, BF16 KV (`--plan`, about 30 GiB of VRAM for the model) | 302,528 tokens; 297,728 with `--lm-head-draft`; 243,584 with `--lm-head-draft --vision` |
+| The same with `--kv-dtype int8` | 526,656 tokens; 518,400 with `--lm-head-draft`; 424,704 with `--lm-head-draft --vision` |
+
+With `--kv-dtype int8` (2026-11-25, the same bench against `bf16` in one build, two runs each): plain decode 205.6
+tok/s after a 2,048-token prompt and 194.5 after 10,000 (`bf16` 204.8 / 195.0); prefill 16,243 tok/s at 2,048 tokens
+and 16,003 at 10,000 (`bf16` 16,344 / 16,243).
 
 Measured with `infernix_bench` on the published artifact (2026-11-24). Plain decode, prefill and several requests are
 means of three runs after a warmup. The DSpark rows are two runs each of a chat and a prose prompt (1,200 tokens,

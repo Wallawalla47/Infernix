@@ -85,7 +85,7 @@ struct LaneState {
     std::size_t image_bytes = 0, pool_bytes = 0;
     std::vector<std::vector<std::uint8_t>> saved;
     static constexpr int kPoolPages = 23; // prime: page b of the sequence at (5 b + 3) % 23
-    explicit LaneState(const m::TextConfig& c) : layout(m::state_layout(c)) {
+    explicit LaneState(const m::TextConfig& c) : layout(m::state_layout(c, ik::KvCodec::Bf16)) {
         image_bytes = static_cast<std::size_t>(layout.lane_words) * 2;
         cuda(cudaMalloc(&image, image_bytes), "image");
         pool_bytes = static_cast<std::size_t>(kPoolPages) * ik::kKvHeads * ik::kKeyUnit * ik::kHeadDim * 2;

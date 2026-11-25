@@ -1,6 +1,7 @@
 #include "models/inkling2/execution/forward.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "core/tensor.h"
 #include "infernix/ops/inkling2_projections.h"
 #include "infernix/ops/inkling2_visit.h"
@@ -115,7 +116,7 @@ std::size_t a8_column_words() {
 
 template <class Add>
 void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capacity, bool features,
-                  moe::ExpertActivation activation, bool a8, ForwardBuffers& b, std::uint8_t*& moe_base,
+                  moe::ExpertActivation activation, bool a8, ik::KvCodec window, ForwardBuffers& b, std::uint8_t*& moe_base,
                   std::uint8_t*& attention_base, std::uint8_t*& guess_base, Add&& add) {
     const std::size_t T = static_cast<std::size_t>(capacity);
     const std::size_t V = c.vocab_size, rank = c.loop.message_rank, lanes = static_cast<std::size_t>(max_lanes);
@@ -127,6 +128,11 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
     add(b.groups, 3 * static_cast<std::size_t>(max_groups(max_lanes, capacity)) * 4);
     add(b.history, lanes * history_words * 2);
     add(b.staging_k, lanes * staging_words * 2), add(b.staging_v, lanes * staging_words * 2);
+    if (window != ik::KvCodec::Bf16) {
+        const ik::KvRowBytes row = ik::kv_row_bytes(window);
+        const std::size_t rows   = lanes * staging_words / kD;
+        for (int p = 0; p < 2; ++p) { add(b.staging_codes[p], rows * row.key_code), add(b.staging_side[p], rows * row.key_side); }
+    }
     add(b.history_rings, static_cast<std::size_t>(c.visits()) * 4 * 3 * 8);
     add(b.e, row16), add(b.h6, row16), add(b.hp, row16);
     for (auto*& h : b.h12) { add(h, row16); }
@@ -162,17 +168,20 @@ void walk_buffers(const TextConfig& c, std::int32_t max_lanes, std::int32_t capa
 } // namespace
 
 std::size_t Forward::device_bytes(const TextConfig& config, std::int32_t max_lanes, std::int32_t capacity, bool features,
-                                  moe::ExpertActivation activation, bool a8) {
+                                  moe::ExpertActivation activation, bool a8, ik::KvCodec window_codec) {
     ForwardBuffers b;
     std::uint8_t *moe_base = nullptr, *attention_base = nullptr, *guess_base = nullptr;
     std::size_t at = 0;
-    walk_buffers(config, max_lanes, capacity, features, activation, a8, b, moe_base, attention_base, guess_base,
+    walk_buffers(config, max_lanes, capacity, features, activation, a8, window_codec, b, moe_base, attention_base, guess_base,
                  [&](auto*&, std::size_t bytes) { at = align(at + bytes); });
     return at;
 }
 
-StateLayout state_layout(const TextConfig& c) {
+StateLayout state_layout(const TextConfig& c, ik::KvCodec window_codec) {
     check_schedule(c);
+    if (!ik::window_codec_supported(window_codec)) {
+        throw std::invalid_argument("inkling2 state: the windows hold bf16, bf16p or int8");
+    }
     StateLayout out;
     std::int64_t at = 0;
     for (std::uint32_t v = 0; v < c.visits(); ++v) {
@@ -184,8 +193,11 @@ StateLayout state_layout(const TextConfig& c) {
         if (c.layer_types[c.visit_layer(v)] == AttentionKind::Full) {
             s.full_slot = out.full_visits++;
         } else {
-            s.window_k = at, at += kWindowWords;
-            s.window_v = at, at += kWindowWords;
+            s.window = out.sliding_visits++;
+            if (window_codec == ik::KvCodec::Bf16) {
+                s.window_k = at, at += kWindowWords;
+                s.window_v = at, at += kWindowWords;
+            }
         }
         out.visits.push_back(s);
     }
@@ -193,9 +205,18 @@ StateLayout state_layout(const TextConfig& c) {
     return out;
 }
 
+// The window codecs' K and V rows have the same sizes, so every plane of a lane's window storage has one size.
+std::int64_t window_code_bytes(const StateLayout& layout, ik::KvCodec window_codec) {
+    return std::int64_t{2} * layout.sliding_visits * kWindowRows * ik::kv_row_bytes(window_codec).key_code;
+}
+
+std::int64_t window_side_bytes(const StateLayout& layout, ik::KvCodec window_codec) {
+    return std::int64_t{2} * layout.sliding_visits * kWindowRows * ik::kv_row_bytes(window_codec).key_side;
+}
+
 Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int32_t capacity,
-                 moe::ExpertActivation activation, bool a8)
-    : p_(parameters), c_(parameters.model.config().text), layout_(state_layout(c_)), max_lanes_(max_lanes),
+                 moe::ExpertActivation activation, bool a8, ik::KvCodec window_codec)
+    : p_(parameters), c_(parameters.model.config().text), layout_(state_layout(c_, window_codec)), max_lanes_(max_lanes),
       capacity_(capacity), activation_(activation), a8_(a8), max_groups_(max_groups(max_lanes, capacity)),
       staging_pages_(ik::staging_ring_pages(capacity)) {
     if (max_lanes <= 0 || max_lanes > ik::kMaxAttentionLanes) {
@@ -204,13 +225,14 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     if (capacity < kMaxForwardColumns || capacity > moe::kMaxCapacity) {
         throw std::invalid_argument("inkling2 forward: a call capacity of 128-8191 columns");
     }
+    window_codec_ = window_codec;
     history_words_ = static_cast<std::int64_t>(c_.visits()) * history_offset(1, 0);
     std::size_t at = 0;
     std::vector<std::pair<void**, std::size_t>> slots;
     std::uint8_t* moe_base       = nullptr;
     std::uint8_t* attention_base = nullptr;
     std::uint8_t* guess_base     = nullptr;
-    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, a8, b_, moe_base, attention_base, guess_base,
+    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, a8, window_codec, b_, moe_base, attention_base, guess_base,
                  [&](auto*& pointer, std::size_t bytes) {
         slots.emplace_back(reinterpret_cast<void**>(&pointer), at);
         at = align(at + bytes);
@@ -351,31 +373,74 @@ void Forward::snapshot_history(const StateView& s, cudaStream_t stream) const {
 }
 
 namespace {
-ik::KvView staging_view(const ForwardBuffers& b, std::int32_t pages) {
+// The staging ring a prompt call's sliding visits run over: BF16 words. Under a quantized window codec its new rows
+// are stored as that codec's represented words (the words the state's ring decodes to), their codes and side records
+// in the staging code planes: so the call runs the BF16 prompt kernels, and the window decodes once, at copy-in.
+ik::KvView staging_view(const ForwardBuffers& b, std::int32_t pages, ik::KvCodec window, std::uint32_t* unpackable) {
     ik::KvView v;
     v.k           = b.staging_k;
     v.v           = b.staging_v;
     v.ring_pages  = pages;
     v.lane_stride = std::int64_t{ik::kKvHeads} * pages * ik::kKeyUnit * kD;
+    if (window != ik::KvCodec::Bf16) {
+        v.encode = window;
+        for (int p = 0; p < 2; ++p) { v.encode_codes[p] = b.staging_codes[p], v.encode_side[p] = b.staging_side[p]; }
+        if (window == ik::KvCodec::Bf16Packed) { v.unpackable = unpackable; }
+    }
+    return v;
+}
+
+// The staging code planes as a quantized ring of the same rows (the copy back to the state's ring).
+ik::KvView staging_codes_view(const ForwardBuffers& b, std::int32_t pages, ik::KvCodec window) {
+    ik::KvView v;
+    v.k           = reinterpret_cast<std::uint16_t*>(b.staging_codes[0]);
+    v.v           = reinterpret_cast<std::uint16_t*>(b.staging_codes[1]);
+    v.k_side      = b.staging_side[0];
+    v.v_side      = b.staging_side[1];
+    v.ring_pages  = pages;
+    v.lane_stride = std::int64_t{ik::kKvHeads} * pages * ik::kKeyUnit * kD;
+    v.codec       = window;
+    return v;
+}
+
+// A sliding visit's window ring in the state (StateView's window storage).
+ik::KvView window_view(const StateView& s, const VisitState& vs) {
+    ik::KvView v;
+    v.codec = s.window_codec;
+    if (s.window_codec == ik::KvCodec::Bf16) {
+        v.k           = s.images + vs.window_k;
+        v.v           = s.images + vs.window_v;
+        v.lane_stride = s.lane_words;
+        return v;
+    }
+    // Plane p of lane l: its rows at window_codes + (l * planes + p) * kWindowRows * code bytes, so a lane stride of
+    // planes * kWindowRows rows (in elements) and per-plane starts put every row where row_codes / row_side look.
+    const ik::KvRowBytes row = ik::kv_row_bytes(s.window_codec);
+    const std::int64_t k_plane = 2 * std::int64_t{vs.window}, v_plane = k_plane + 1;
+    v.k           = reinterpret_cast<std::uint16_t*>(s.window_codes + k_plane * kWindowRows * row.key_code);
+    v.v           = reinterpret_cast<std::uint16_t*>(s.window_codes + v_plane * kWindowRows * row.value_code);
+    v.k_side      = s.window_side + k_plane * kWindowRows * row.key_side;
+    v.v_side      = s.window_side + v_plane * kWindowRows * row.value_side;
+    v.lane_stride = std::int64_t{s.window_planes} * kWindowRows * kD;
+    if (s.window_codec == ik::KvCodec::Bf16Packed) { v.unpackable = s.unpackable; }
     return v;
 }
 } // namespace
 
 void Forward::stage_window(const StateView& s, const VisitState& vs, bool in, cudaStream_t stream) const {
-    ik::KvView state;
-    state.k           = s.images + vs.window_k;
-    state.v           = s.images + vs.window_v;
-    state.lane_stride = s.lane_words;
-    const ik::KvView staging = staging_view(b_, staging_pages_);
+    const ik::KvView state = window_view(s, vs);
+    const ik::KvView words = staging_view(b_, staging_pages_, s.window_codec, s.unpackable);
+    const ik::KvView codes =
+        s.window_codec == ik::KvCodec::Bf16 ? words : staging_codes_view(b_, staging_pages_, s.window_codec);
     for (const CallLane& l : call_lanes_) {
         ik::WindowCopyArgs w;
         w.src_lane = w.dst_lane = l.lane;
         if (in) { // the window before the call's first column
-            w.src = state, w.dst = staging;
+            w.src = state, w.dst = words; // a quantized ring decodes into the words
             w.from = std::max(l.first, l.position - (ik::kWindow - 1)), w.to = l.position;
         } else { // the call's own positions the state ring keeps (the window before them came from it unchanged)
             const std::int32_t end = l.position + l.count;
-            w.src = staging, w.dst = state;
+            w.src = codes, w.dst = state; // the call's codes, as encoded
             w.from = std::max(l.position, end - ik::kWindowRingPages * ik::kKeyUnit), w.to = end;
         }
         ik::window_copy(w, stream);
@@ -680,11 +745,9 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
         // returned to it after.
         stage_window(s, vs, true, stream);
         mark("window_copy");
-        at.kv = staging_view(b_, staging_pages_);
+        at.kv = staging_view(b_, staging_pages_, s.window_codec, s.unpackable);
     } else {
-        at.kv.k           = s.images + vs.window_k;
-        at.kv.v           = s.images + vs.window_v;
-        at.kv.lane_stride = s.lane_words;
+        at.kv = window_view(s, vs);
     }
     at.ws  = b_.attention_ws;
     at.out = b_.attention;
@@ -696,7 +759,7 @@ void Forward::visit(std::uint32_t v, const StateView& s, const VisitInputs& in, 
     // prologue kernel: the decode round at 4K -0.44 % at one column, -0.17 % at two, -0.09 % at four, +0.25 % at eight;
     // infernix_bench C = 4 -0.8 %, C = 8 -1.3 %). Padding columns need the prologue's zeros, and a lane in two groups
     // its keys before the second group reads them.
-    at.fused = !padding_ && one_group_lanes_ && call_lanes_.size() == 1 && T <= 4;
+    at.fused = !padding_ && one_group_lanes_ && call_lanes_.size() == 1 && T <= 4 && at.kv.encode == ik::KvCodec::Bf16;
     // W_o in Q8 storage loads all its weights before its PDL wait: attention lets its CTAs launch at once, beside it
     // (2026-11-23, rounds at context 512 / 4096: --q8-weights -0.3 to -1.6 %, --a8-activations -0.03 to -1.4 % at one to
     // eight columns; a BF16 W_o (the default route) was +0.07 / +0.25 % slower at one column, so it waits as before).
