@@ -282,8 +282,14 @@ void parse_components(Directory& out, const Json& values) {
         throw ArtifactError("components must be a nonempty object");
     }
     // A companion artifact has no text: each of its components targets the text of the main
-    // artifact it is loaded beside.
-    out.companion = !values.contains("text");
+    // artifact it is loaded beside. A standalone artifact (NInfer's DSpine drafter: its only
+    // component dspine) has no text either and no component declares a target: it binds every
+    // parameter it uses, so it is checked as a main artifact is.
+    const bool standalone =
+        !values.contains("text") && std::none_of(values.begin(), values.end(), [](const Json& value) {
+            return value.is_object() && value.contains("target");
+        });
+    out.companion = !values.contains("text") && !standalone;
     for (const auto& [name, value] : values.items()) {
         (void)require_id(Json(name), "component id");
         require_members(value, {"config"}, {"target", "resources", "proposal"}, name);

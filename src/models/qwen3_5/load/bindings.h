@@ -23,9 +23,10 @@ struct PendingWeight {
 class Bindings {
 public:
     // The lossless route binds every Use A16Only (LoadOptions::lossless); `a8_only` (LoadOptions::a8_dense) binds
-    // the text Uses that permit 4- or 8-bit activations A8Only.
-    Bindings(artifact::Binder& binder, bool a16_only, bool a8_only = false)
-        : binder(binder), a16_only(a16_only), a8_only(a8_only) {}
+    // the text Uses that permit 4- or 8-bit activations A8Only. `index_base`: the index of this binder's first weight
+    // in the Model's weight array, where a second artifact's weights (a DSpine drafter's) follow the main artifact's.
+    Bindings(artifact::Binder& binder, bool a16_only, bool a8_only = false, std::size_t index_base = 0)
+        : binder(binder), a16_only(a16_only), a8_only(a8_only), index_base(index_base) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
@@ -35,13 +36,14 @@ public:
                                   QType format = QType::BF16,
                                   artifact::Residency residency = artifact::Residency::Device);
 
-    [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
+    [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index - index_base); }
 
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;
 
     artifact::Binder& binder;
     bool a16_only = false;
     bool a8_only  = false;
+    std::size_t index_base = 0;
     std::vector<PendingWeight> weights;
 
 private:
@@ -75,6 +77,12 @@ private:
                                       const std::string& component);
 void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& config,
                   const TextConfig& target);
+// The DSpine drafter's code bridge, from the drafter artifact's binder (`bindings`).
+void bind_dspine(Bindings& bindings, DraftWeights& weights, const DraftConfig& config,
+                 const TextConfig& target);
+// The input through which a DSpine drafter reads the target's head: the artifact's DFlash2 drafter's
+// use of it where declared, else the text's (the drafter artifact declares no use of the target's head).
+[[nodiscard]] std::string dspine_head_input(const artifact::Directory& target);
 [[nodiscard]] ProposalWeights bind_proposal(Bindings& bindings, const artifact::Proposal& proposal,
                                             const TextConfig& target, const LoadOptions& options,
                                             std::uint32_t public_tokens);

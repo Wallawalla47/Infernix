@@ -126,7 +126,7 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  *
  * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
  * overload; lanes[b] selects the destination lane. The registered profiles have fixed geometry
- * D=128, Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity.
+ * D=128, Hkv=8 and capacity 2048, 4096 or 8192. Absolute position p maps to slot p mod capacity.
  * For a nonempty prefix, the caller guarantees that the row's existing live interval ends
  * immediately before positions[0,b]. Advancing it by counts[b] makes every overwritten old slot
  * dead, and one row commits at most the ring capacity. A zero count reads no positions or K/V

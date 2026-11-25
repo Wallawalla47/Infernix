@@ -393,6 +393,9 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
     DFlash2,
     DSpark, // Inkling 2's DFlash-style block drafter with its Markov head (the artifact's dspark component)
+    // A DSpine drafter (Tencent DSpine): a standalone artifact (SpeculativeOptions::draft_model) beside a
+    // Qwen3.5-family model, verified as DFlash2's proposals are (docs/maintainer/dspine.md).
+    DSpine,
 };
 
 // Automatic tree verification considers, besides the chain, trees of these many columns
@@ -429,7 +432,8 @@ struct SpeculativeOptions {
     ProposalHead proposal_head = ProposalHead::Full;
     // Qwen3.8-Flash-Next DFlash2 (--draft-model): the companion artifact holding the drafter
     // (tools.convert --components dflash2), loaded beside the main artifact. Qwen3.5/3.6 artifacts
-    // bundle their DFlash and DFlash2 drafters and refuse it.
+    // bundle their DFlash and DFlash2 drafters and refuse it for those. DSpine (Qwen3.5 family): the
+    // standalone drafter artifact (component dspine), which --spec dspine requires.
     std::filesystem::path draft_model;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.

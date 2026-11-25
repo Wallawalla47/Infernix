@@ -228,6 +228,11 @@ infernix_add_family_op_test(infernix_candidate_selector_test FAMILY sampling
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES infernix_ops)
 
+# The DSpine code bridge and refinement Ops against FP64 oracles of their formulas.
+infernix_add_family_op_test(infernix_dspine_test FAMILY sampling
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dspine.cpp"
+  LIBRARIES infernix_ops)
+
 infernix_add_family_op_test(infernix_softmax_attention_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"

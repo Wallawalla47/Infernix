@@ -27,6 +27,9 @@ public:
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    // --spec dspine: the drafter artifact's device bytes (its own materialization beside the model's); 0
+    // otherwise.
+    [[nodiscard]] std::uint64_t draft_device_bytes() const;
     // The Host memory the pinned block (an offloaded vision tower, offloaded experts) must leave
     // free, and the pinned bytes Infernix's later allocations need (the RAM ledger's).
     void set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later_pinned_bytes = 0);

@@ -18,7 +18,9 @@ constexpr std::int32_t kQHeads  = 32;
 constexpr std::int32_t kKVHeads = 8;
 constexpr float kExpectedScale  = 0.08838834764831844055f;
 
-bool registered_window(std::uint32_t window) { return window == 2048 || window == 4096; }
+bool registered_window(std::uint32_t window) {
+    return window == 2048 || window == 4096 || window == 8192;
+}
 
 void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
@@ -26,7 +28,8 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
     if (!registered_window(window)) {
-        throw std::invalid_argument(std::string(op) + ": supported windows are 2048 and 4096");
+        throw std::invalid_argument(std::string(op) +
+                                    ": supported windows are 2048, 4096 and 8192");
     }
 }
 
@@ -100,8 +103,9 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
     // largest allocation (for example, a wider block can use fewer splits).
     std::size_t capacity = 0;
     for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
-        const auto plan =
-            detail::sliding_window_attention_resolve_plan(window, tokens, batch_size, envelope);
+        // The mask changes no plan field that sizes the workspace.
+        const auto plan = detail::sliding_window_attention_resolve_plan(
+            window, SlidingWindowMask::Symmetric, tokens, batch_size, envelope);
         if (plan.route == detail::SlidingWindowAttentionRoute::Direct) continue;
         WorkspaceLayoutBuilder layout;
         (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
@@ -113,7 +117,7 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& lanes, AttentionHeadGeometry geometry,
-                              std::uint32_t window, float scale,
+                              std::uint32_t window, SlidingWindowMask mask, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
@@ -160,9 +164,12 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         throw std::invalid_argument("sliding_window_attention: scale must be 1/sqrt(128)");
     }
 
+    if (mask != SlidingWindowMask::Symmetric && mask != SlidingWindowMask::Causal) {
+        throw std::invalid_argument("sliding_window_attention: unknown mask");
+    }
     auto scope = workspace.scope();
     const auto plan =
-        detail::sliding_window_attention_resolve_plan(window, tokens, batch, envelope);
+        detail::sliding_window_attention_resolve_plan(window, mask, tokens, batch, envelope);
     PartialWorkspace partial{};
     if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
         partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);

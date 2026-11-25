@@ -556,7 +556,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         // Sparse acceptance (DFlash2, sampled MTP drafts) reads counts but leaves them to the
         // commit. Publish only the prefix licensed by the Frontend.
         const bool sparse_mtp = speculative_backend == SpeculativeBackend::Mtp && execution_schedule.sampled_mtp_drafts;
-        if (speculative_backend == SpeculativeBackend::DFlash2 || sparse_mtp) {
+        if (is_sparse_draft_backend(speculative_backend) || sparse_mtp) {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (discarded[row] || !requests[lanes[row]].sampling_host.token_counts) {
                     continue;

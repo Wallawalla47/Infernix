@@ -28,6 +28,7 @@ struct DeviceLayerView {
     __nv_bfloat16* cache_k;
     __half* cache_v;
     std::int32_t padded_capacity;
+    std::int32_t capacity_mask; // ring capacity - 1 (a power of two)
 };
 
 struct DeviceLayers {
@@ -63,7 +64,7 @@ __device__ __forceinline__ void store_key_head(const float* input, const DeviceL
     float sin0, cos0, sin1, cos1;
     rope_sincos(layers, positions, column, j, &sin0, &cos0);
     rope_sincos(layers, positions, column, j + 1, &sin1, &cos1);
-    const auto dst = 128LL * ((positions[column] & 2047) + (long long)layer.padded_capacity *
+    const auto dst = 128LL * ((positions[column] & layer.capacity_mask) + (long long)layer.padded_capacity *
                                                                (head + 8 * slots[column / width]));
     auto* out      = reinterpret_cast<__nv_bfloat162*>(layer.cache_k + dst);
     out[lane]      = __floats2bfloat162_rn(x0 * cos0 - y0 * sin0, x1 * cos1 - y1 * sin1);
@@ -303,7 +304,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 key_scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] =
                     result;
             } else {
-                const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
+                const auto dst     = row % 128 + 128LL * ((positions[column] & layer.capacity_mask) +
                                                       (long long)layer.padded_capacity *
                                                           (row / 128 + 8 * slots[request]));
                 layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
@@ -347,7 +348,7 @@ struct MaterializeProjectionEpilogue {
         if (!value)
             scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] = result;
         else {
-            const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
+            const auto dst     = row % 128 + 128LL * ((positions[column] & layer.capacity_mask) +
                                                   (long long)layer.padded_capacity *
                                                       (row / 128 + 8 * slots[request]));
             layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
@@ -455,6 +456,7 @@ DeviceLayers make_device_layers(std::span<const ContextKVMaterializeLayerView> l
             static_cast<__nv_bfloat16*>(source.cache.k.data),
             static_cast<__half*>(source.cache.v.data),
             static_cast<std::int32_t>(source.cache.padded_capacity),
+            static_cast<std::int32_t>(source.cache.capacity) - 1,
         };
     }
     return result;

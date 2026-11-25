@@ -28,7 +28,10 @@
 // boundaries); the artifact must hold them. One Engine
 // decodes plainly, then one per drafter decodes the same requests (one plain run serves every drafter).
 // The requests include a raw one-token prompt, which must also verify drafts. The mtp, dflash2 and
-// dflash2-ngram drafters also decode every prompt with presence penalty 1.5 (the non-thinking default
+// dspine and dspine-ngram: the DSpine drafter artifact that INFERNIX_TEST_DSPINE_DRAFTER names (a drafter
+// for the artifact's target), 15 drafts a round, the second with n-gram copies of 16. The mtp, dflash2,
+// dflash2-ngram, dspine and dspine-ngram drafters also decode every prompt with presence penalty 1.5 (the
+// non-thinking default
 // of every Qwen3.5-family model) and frequency penalty 0.3, greedy and sampled: a verified draft
 // changes the next position's penalties, which speculation must apply as plain decoding does (SGLang
 // #46752 shipped DFlash outputs that ignored the penalty).
@@ -85,7 +88,8 @@ infernix::RequestOptions request(float temperature, std::uint64_t seed, bool pen
 }
 
 bool penalised_drafter(std::string_view drafter) {
-    return drafter == "mtp" || drafter == "dflash2" || drafter == "dflash2-ngram";
+    return drafter == "mtp" || drafter == "dflash2" || drafter == "dflash2-ngram" || drafter == "dspine" ||
+           drafter == "dspine-ngram";
 }
 
 infernix::EngineOptions reproducible_options(const std::filesystem::path& artifact, std::string_view drafter) {
@@ -124,9 +128,18 @@ infernix::EngineOptions reproducible_options(const std::filesystem::path& artifa
                 static_cast<std::uint32_t>(std::stoul(std::string(drafter.substr(std::string_view("dflash2-ngram").size()))));
             options.speculative.ngram_min_match = 4;
         }
+    } else if (drafter == "dspine" || drafter == "dspine-ngram") {
+        const char* drafter_artifact = std::getenv("INFERNIX_TEST_DSPINE_DRAFTER");
+        if (drafter_artifact == nullptr || *drafter_artifact == '\0') {
+            throw std::invalid_argument("dspine needs INFERNIX_TEST_DSPINE_DRAFTER (a DSpine drafter artifact)");
+        }
+        options.speculative.backend      = infernix::SpeculativeBackend::DSpine;
+        options.speculative.draft_model  = drafter_artifact;
+        options.speculative.draft_tokens = 15;
+        if (drafter == "dspine-ngram") { options.speculative.ngram_draft_tokens = 16; }
     } else if (drafter != "none") {
-        throw std::invalid_argument(
-            "the drafter must be mtp, mtp-cut, mtp-sampled, dflash, dflash2, dflash2-ngram or dflash2-ngramN");
+        throw std::invalid_argument("the drafter must be mtp, mtp-cut, mtp-sampled, dflash, dflash2, dflash2-ngram, "
+                                    "dflash2-ngramN, dspine or dspine-ngram");
     }
     return options;
 }

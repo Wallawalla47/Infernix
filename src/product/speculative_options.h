@@ -18,7 +18,8 @@ namespace infernix::product {
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
     if (value == "dspark") { return SpeculativeBackend::DSpark; }
-    throw std::invalid_argument("invalid speculative backend (auto, off, mtp, dflash, dflash2 or dspark): " +
+    if (value == "dspine") { return SpeculativeBackend::DSpine; }
+    throw std::invalid_argument("invalid speculative backend (auto, off, mtp, dflash, dflash2, dspark or dspine): " +
                                 std::string(value));
 }
 
@@ -62,6 +63,8 @@ inline void apply_default_speculation(SpeculativeOptions& options) {
         return "dflash2";
     case SpeculativeBackend::DSpark:
         return "dspark";
+    case SpeculativeBackend::DSpine:
+        return "dspine";
     }
     return "unknown";
 }
@@ -223,9 +226,25 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     if (options.draft_tokens_auto && !speculation_requested(options)) {
         throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash, dflash2 or auto");
     }
-    // With --spec auto it makes Qwen3.8-Flash-Next draft with DFlash2.
-    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2 && !options.backend_auto) {
-        throw std::invalid_argument("--draft-model is a DFlash2 drafter: it requires --spec dflash2 or auto");
+    // With --spec auto it makes Qwen3.8-Flash-Next draft with DFlash2. --spec dspine names its drafter
+    // artifact here, which auto never chooses.
+    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2 &&
+        options.backend != SpeculativeBackend::DSpine && !options.backend_auto) {
+        throw std::invalid_argument("--draft-model is a DFlash2 or DSpine drafter: it requires --spec dflash2, dspine "
+                                    "or auto");
+    }
+    if (options.backend == SpeculativeBackend::DSpine && !options.backend_auto) {
+        if (options.draft_model.empty()) {
+            throw std::invalid_argument("--spec dspine requires --draft-model FILE (a DSpine drafter artifact)");
+        }
+        // The drafter ranks the full head's candidates (its proposal shortlist cost acceptance) and drafts
+        // chains: the serial refinement draws each draft from the one before it.
+        if (options.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument("--spec dspine drafts from the full head: it takes no --lm-head-draft");
+        }
+        if (draft_tree_enabled(options)) {
+            throw std::invalid_argument("--spec dspine verifies chains: it takes no --draft-tree-nodes");
+        }
     }
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");
@@ -270,6 +289,13 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         if (options.draft_tokens_auto) { return; }
         if (options.draft_tokens == 0 || options.draft_tokens > 7) {
             throw std::invalid_argument("--spec dspark requires --draft-tokens in [1,7] or auto");
+        }
+        return;
+    case SpeculativeBackend::DSpine:
+        // At most the drafter's block less the anchor, which startup checks against the drafter.
+        if (options.draft_tokens_auto) { return; }
+        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
+            throw std::invalid_argument("--spec dspine requires --draft-tokens in [1,15] or auto");
         }
         return;
     }

@@ -223,7 +223,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, p_.rope, q, k, s);
             Tensor attention = work_.alloc(DType::BF16, {D, Hq, W, B});
             ops::sliding_window_attention(q, k, v, positions, call.valid_columns, call.slots, {D, Hq, Hk},
-                                          config_.window, scale, ring_[l], envelope, work_, attention, s);
+                                          config_.window, ops::SlidingWindowMask::Symmetric, scale, ring_[l],
+                                          envelope, work_, attention, s);
             WorkspaceArena scratch(work_.alloc_bytes(
                 ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(H, D * Hq, W, W, B, B)));
             ops::linear_dynamic_grouped_conv_add(attention.view({D * Hq, W, B}), layer.output.weight,

@@ -198,12 +198,26 @@ struct SelectorParameters {
     Tensor predecessor_codebook, successor_codebook;
 };
 
+// A DSpine drafter's code bridge (docs/maintainer/dspine.md): each layer's read [C, H] and write
+// [H, R], the projection [3R, C], the gate's bias BF16 [R], the last write's columns BF16 [H, R]
+// (column r is write[:, r]) and every token's sender rows BF16 [2R, V].
+struct DSpineBridgeLayerParameters {
+    LinearParameters read, write;
+};
+
+struct DSpineBridgeParameters {
+    LinearParameters projection;
+    Tensor gate_bias, head_write_columns, sender_table;
+    std::vector<DSpineBridgeLayerParameters> layers;
+};
+
 struct DraftParameters {
     ops::PreparedRope rope;
     LinearParameters feature_projection;
     Tensor context_norm, final_norm;
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
+    std::optional<DSpineBridgeParameters> dspine;
     LinearParameters output_head;
 };
 
@@ -310,6 +324,11 @@ public:
     // BF16 planes and FP32 B); the text layers' sites point into it. A plan-only model allocates nothing and counts
     // the bytes in planned_lora_bytes.
     DeviceBuffer lora_factors;
+    // --spec dspine: the head-write table BF16 [R, V] (dspine_head_write), column v of which is the target
+    // head's row v through the drafter's last write scaled by its final norm's weight; derived once here
+    // from the target's head (243 MiB for the Qwen3.8-27B drafter). Empty otherwise.
+    DeviceBuffer dspine_head_write_storage;
+    Tensor dspine_head_write;
     // A plan-only model's (Model::weights_resident false) device bytes these parameters would allocate at a start
     // and did not: the draft screen's and the adapter's. Engine::plan counts them beside the weights.
     std::uint64_t planned_draft_screen_bytes = 0;
@@ -320,6 +339,11 @@ public:
         return draft_screen.bytes + planned_draft_screen_bytes;
     }
     [[nodiscard]] std::uint64_t lora_bytes() const noexcept { return lora_factors.bytes + planned_lora_bytes; }
+    // --spec dspine: the head-write table, allocated or (a plan-only model) planned.
+    std::uint64_t planned_dspine_head_write_bytes = 0;
+    [[nodiscard]] std::uint64_t dspine_head_write_bytes() const noexcept {
+        return dspine_head_write_storage.bytes + planned_dspine_head_write_bytes;
+    }
     // --ablate (docs/ablate.md): the sidecar's direction on the device and each layer's two cuts; nullopt without one
     // (and on a plan-only model, which counts the direction's bytes in planned_ablate_bytes).
     std::optional<models::AblateParameters> ablate;

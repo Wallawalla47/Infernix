@@ -351,18 +351,26 @@ __device__ __forceinline__ void context_query_split_partial_body(
             const int col1       = col0 + 1;
             const bool row0_live = row0 < RowCount && row0 / kContextQueryGroup < valid;
             const bool row1_live = row1 < RowCount && row1 / kContextQueryGroup < valid;
+            // A query tile's key is the query row of its column: the policy decides which query
+            // rows a row sees (all of them, or those at or before it).
+            const int token0 = row0 / kContextQueryGroup;
+            const int token1 = row1 / kContextQueryGroup;
             const bool allow00 =
                 row0_live && col0 < current_valid &&
-                (current_is_query || policy.allow_context(q_position0, current_key0 + col0));
+                (current_is_query ? policy.allow_query(token0, col0)
+                                  : policy.allow_context(q_position0, current_key0 + col0));
             const bool allow01 =
                 row0_live && col1 < current_valid &&
-                (current_is_query || policy.allow_context(q_position0, current_key0 + col1));
+                (current_is_query ? policy.allow_query(token0, col1)
+                                  : policy.allow_context(q_position0, current_key0 + col1));
             const bool allow10 =
                 row1_live && col0 < current_valid &&
-                (current_is_query || policy.allow_context(q_position1, current_key0 + col0));
+                (current_is_query ? policy.allow_query(token1, col0)
+                                  : policy.allow_context(q_position1, current_key0 + col0));
             const bool allow11 =
                 row1_live && col1 < current_valid &&
-                (current_is_query || policy.allow_context(q_position1, current_key0 + col1));
+                (current_is_query ? policy.allow_query(token1, col1)
+                                  : policy.allow_context(q_position1, current_key0 + col1));
             score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
             score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
             score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;

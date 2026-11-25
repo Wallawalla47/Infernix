@@ -275,6 +275,12 @@ hidden_size, vocab_size, num_hidden_layers), which the loader compares with the 
 A companion is materialized in its own device allocation; its objects never alias the main
 artifact's.
 
+A standalone artifact has no text either, and none of its components declares a target: today
+NInfer's DSpine drafter (`components` is `{"dspine": ...}`, loaded beside a Qwen3.5-family model with
+`--spec dspine --draft-model`, [DSpine](dspine.md)). It binds every parameter its Uses name, so the
+reader checks it as it checks a main artifact; the loader compares the drafter's config with the main
+artifact's text. An artifact without text whose components mix targets and none is refused.
+
 ## 5. Physical objects
 
 ### 5.1 Tensor object

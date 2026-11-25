@@ -24,6 +24,8 @@ struct InstanceInfo {
     std::string metadata_json;
     std::string provenance_json;
     artifact::ArtifactId artifact_id{};
+    // --spec dspine: the drafter artifact's identity, which every stored image of its ring depends on.
+    std::optional<artifact::ArtifactId> draft_artifact_id;
 };
 
 class LoadPlan;
@@ -58,6 +60,11 @@ public:
 
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
+    }
+
+    // --spec dspine: the drafter artifact's device bytes (its own materialization); 0 otherwise.
+    [[nodiscard]] std::uint64_t draft_artifact_device_bytes() const noexcept {
+        return draft_backing_ ? draft_backing_->stats().device_capacity_bytes : 0;
     }
 
     // Overlay vision assets (evictable pool + pinned block + layout); present only when the
@@ -104,11 +111,14 @@ private:
           std::vector<runtime::expert_offload::ExpertBank> shared_expert_banks,
           std::vector<std::vector<float>> shared_expert_multipliers,
           std::optional<runtime::expert_offload::ExpertStore> expert_store,
-          runtime::expert_offload::CsfTables csf_tables, std::optional<LoraBinding> lora);
+          runtime::expert_offload::CsfTables csf_tables, std::optional<LoraBinding> lora,
+          std::optional<artifact::MaterializedArtifact> draft_backing = std::nullopt);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     std::optional<VisionOverlayAssets> overlay_vision_;
     artifact::MaterializedArtifact backing_;
+    // --spec dspine: the drafter artifact's weights (bound_ views into it from its first weight on).
+    std::optional<artifact::MaterializedArtifact> draft_backing_;
     Config config_;
     LoadOptions options_;
     ModelWeights weights_;

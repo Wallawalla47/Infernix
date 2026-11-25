@@ -114,6 +114,19 @@ struct DFlash2Config {
     std::uint32_t selector_top_k   = 0;
 };
 
+// A DSpine drafter's code bridge (docs/maintainer/dspine.md): code width C, message rank R, the
+// head's candidates a draft row chains (16) and the bridge's epsilon; the trained block (the anchor
+// and block_size - 1 masks) and window. Its layers are the DraftConfig's: every one sliding at the
+// trained window, causal inside the drafted block.
+struct DSpineConfig {
+    std::uint32_t block_size     = 0;
+    std::uint32_t trained_window = 0;
+    std::uint32_t code_size      = 0;
+    std::uint32_t rank           = 0;
+    std::uint32_t head_top_k     = 0;
+    float bridge_eps             = 0;
+};
+
 struct DraftConfig {
     AttentionConfig attention;
     std::uint32_t intermediate_size       = 0;
@@ -127,6 +140,9 @@ struct DraftConfig {
     std::vector<std::uint32_t> target_layer_ids;
     std::uint32_t mask_token_id = 0;
     std::optional<DFlash2Config> dflash2;
+    // --spec dspine: the standalone drafter artifact's bridge (LoadOptions::draft_model). Its layers bind
+    // as a DFlash drafter's, under the component dspine; sliding_window is its ring and attention window.
+    std::optional<DSpineConfig> dspine;
 
     [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
         return static_cast<std::uint32_t>(std::count(layer_types.begin(), layer_types.end(),
@@ -162,5 +178,11 @@ struct Config {
 [[nodiscard]] std::uint32_t rope_context_ceiling(std::uint32_t native_positions, float factor);
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
+
+// The DraftConfig of the standalone DSpine drafter whose artifact directory is `drafter` (its only
+// component dspine, architecture DSpineDraftModel), checked against the target it drafts for: its
+// hidden width, vocabulary and layer count. Throws artifact::ArtifactError naming the field that is
+// missing, malformed or outside what the engine implements.
+[[nodiscard]] DraftConfig parse_dspine_config(const artifact::Directory& drafter, const TextConfig& target);
 
 } // namespace infernix::models::qwen3_5

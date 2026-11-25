@@ -32,9 +32,10 @@ int g_hidden                      = 0;
 constexpr int kRows               = 1024;
 constexpr int kHeadDim            = 128;
 constexpr int kHeads              = 8;
-constexpr int kCapacity           = 2048;
+// The ring under test (run_geometry): DFlash2's 2048, or a DSpine drafter's 8192.
+int g_capacity                    = 2048;
 constexpr int kLaneCapacity       = 8;
-constexpr int kPaddedCapacity     = 2056;
+int g_padded                      = 2056;
 constexpr std::uint16_t kSentinel = 0xa5a5U;
 constexpr double kEpsilon         = 1.0e-6;
 double g_theta                    = 0.0;
@@ -52,14 +53,14 @@ constexpr ReductionCriterion kValueCriterion{
 };
 
 std::size_t cache_elements() {
-    return static_cast<std::size_t>(kHeadDim) * kPaddedCapacity * kHeads * kLaneCapacity;
+    return static_cast<std::size_t>(kHeadDim) * g_padded * kHeads * kLaneCapacity;
 }
 
 std::size_t cache_index(int lane, int head, int slot, int dim) {
     return static_cast<std::size_t>(dim) +
            static_cast<std::size_t>(kHeadDim) *
                (static_cast<std::size_t>(slot) +
-                static_cast<std::size_t>(kPaddedCapacity) *
+                static_cast<std::size_t>(g_padded) *
                     (static_cast<std::size_t>(head) + static_cast<std::size_t>(kHeads) * lane));
 }
 
@@ -170,11 +171,11 @@ struct Fixture {
                 Tensor(target.norm_device.p, DType::BF16, {kHeadDim}),
                 CyclicKVCacheLayerView{
                     .k               = Tensor(target.cache_k.data(), DType::BF16,
-                                              {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
+                                              {kHeadDim, g_padded, kHeads, kLaneCapacity}),
                     .v               = Tensor(target.cache_v.data(), DType::FP16,
-                                              {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
-                    .capacity        = kCapacity,
-                    .padded_capacity = kPaddedCapacity,
+                                              {kHeadDim, g_padded, kHeads, kLaneCapacity}),
+                    .capacity        = static_cast<std::uint32_t>(g_capacity),
+                    .padded_capacity = static_cast<std::uint32_t>(g_padded),
                     .num_kv_heads    = kHeads,
                     .head_dim        = kHeadDim,
                     .lane_capacity   = kLaneCapacity,
@@ -234,7 +235,7 @@ struct CacheSnapshot {
     std::array<std::vector<std::uint8_t>, kMaxLayers> flags;
 };
 
-constexpr std::int64_t kRingSlotRows = static_cast<std::int64_t>(kPaddedCapacity) * kHeads * kLaneCapacity;
+std::int64_t ring_slot_rows() { return static_cast<std::int64_t>(g_padded) * kHeads * kLaneCapacity; }
 
 std::int64_t slot_row(int lane, int head, int slot) {
     return static_cast<std::int64_t>(cache_index(lane, head, slot, 0) / kHeadDim);
@@ -247,7 +248,7 @@ CacheSnapshot read_caches(const Fixture& fixture) {
         const auto at              = static_cast<std::size_t>(layer);
         snapshot.k[at]             = source.cache_k.data();
         snapshot.v[at]             = source.cache_v.data();
-        snapshot.flags[at] = ring_row_flags(source.cache_k.data(), source.cache_v.data(), kHeadDim, kRingSlotRows, kSentinel);
+        snapshot.flags[at] = ring_row_flags(source.cache_k.data(), source.cache_v.data(), kHeadDim, ring_slot_rows(), kSentinel);
     }
     return snapshot;
 }
@@ -259,7 +260,7 @@ int verify_state_effect(const std::string& label, const CacheSnapshot& snapshot,
     for (std::size_t batch = 0; batch < counts.size(); ++batch) {
         for (int index = 0; index < counts[batch]; ++index) {
             written_slots[static_cast<std::size_t>(state_slots[batch])].insert(
-                positions[batch * static_cast<std::size_t>(width) + index] & (kCapacity - 1));
+                positions[batch * static_cast<std::size_t>(width) + index] & (g_capacity - 1));
         }
     }
 
@@ -273,7 +274,7 @@ int verify_state_effect(const std::string& label, const CacheSnapshot& snapshot,
         for (int ring = 0; ring < kLaneCapacity * kHeads && first_bad < 0; ++ring) {
             const int lane = ring / kHeads;
             const int head = ring % kHeads;
-            for (int slot = 0; slot < kPaddedCapacity; ++slot) {
+            for (int slot = 0; slot < g_padded; ++slot) {
                 const bool written = written_slots[static_cast<std::size_t>(lane)].contains(slot);
                 const std::int64_t row = slot_row(lane, head, slot);
                 const std::uint8_t f   = flags[static_cast<std::size_t>(row)];
@@ -347,7 +348,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
     const auto sample_slot_row = [&](std::size_t sample, int head) {
         const auto [batch, local] = samples[sample];
         const int position        = positions[static_cast<std::size_t>(batch * width + local)];
-        return slot_row(state_slots[static_cast<std::size_t>(batch)], head, position & (kCapacity - 1));
+        return slot_row(state_slots[static_cast<std::size_t>(batch)], head, position & (g_capacity - 1));
     };
     std::vector<std::int64_t> key_rows, value_slot_rows;
     for (std::size_t sample = 0; sample < samples.size(); ++sample) {
@@ -578,6 +579,44 @@ int run_geometry(int layers, int hidden, double theta) {
     return failures;
 }
 
+// The DSpine drafter's 8192 ring (Qwen3.8-27B's: 5 layers, H 5120, theta 1e7): positions address
+// slots modulo 8192, so a block that crosses 8192, a wrapped context, a full prefill block and the
+// widest batched append each land where the oracle puts them, and no other slot changes. A reduced
+// set: every case compares the whole ring.
+int run_dspine_ring() {
+    g_layers   = 5;
+    g_hidden   = 5120;
+    g_theta    = 1.0e7;
+    g_capacity = 8192;
+    g_padded   = 8200;
+    int failures = 0;
+    {
+        Fixture fixture;
+        for (int width : {1, 16, 64})
+            for (int batch : {1, 8}) {
+                std::vector<int> counts(batch), slots(batch), positions(width * batch, -12345);
+                for (int b = 0; b < batch; ++b) {
+                    counts[b] = b == batch - 1 || b % 3 == 2 ? width : b % 3 == 1 ? std::max(1, width / 2) : 0;
+                    slots[b]  = counts[b] ? (b * 3 + 2) % 8 : -1;
+                    for (int i = 0; i < counts[b]; ++i) positions[b * width + i] = 8190 + b * 16384 + i;
+                }
+                fixture.reset_cache();
+                failures += run_case(fixture, "ring 8192 W=" + std::to_string(width) + " B=" + std::to_string(batch),
+                                     width, batch, counts, slots, positions, 0x711U + width);
+            }
+        for (int width : {257, 2048}) {
+            fixture.reset_cache();
+            std::vector<int> positions(width);
+            for (int i = 0; i < width; ++i) positions[i] = 262140 - 4096 + i;
+            failures += run_case(fixture, "ring 8192 prefill W=" + std::to_string(width), width, 1, {width}, {5},
+                                 positions, 0x712U);
+        }
+    }
+    g_capacity = 2048;
+    g_padded   = 2056;
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(context_kv_materialize) {
@@ -588,8 +627,8 @@ INFERNIX_OP_TEST(context_kv_materialize) {
         }
         // Qwen3.8-27B's drafter (5 layers, H 5120, theta 1e7), Qwen3.8-Flash-Next's (5, H 2560,
         // theta 1e4) and Qwen3.5-122B-A10B's (6, H 3072, theta 1e7).
-        const int failures =
-            run_geometry(5, 5120, 1.0e7) + run_geometry(5, 2560, 1.0e4) + run_geometry(6, 3072, 1.0e7);
+        const int failures = run_geometry(5, 5120, 1.0e7) + run_geometry(5, 2560, 1.0e4) +
+                             run_geometry(6, 3072, 1.0e7) + run_dspine_ring();
         if (failures != 0) {
             std::cerr << "context_kv_materialize failures=" << failures << '\n';
             return 1;

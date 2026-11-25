@@ -49,9 +49,10 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 } // namespace
 
 SlidingWindowAttentionPlan
-sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens, std::int32_t batch,
+sliding_window_attention_resolve_plan(std::uint32_t window, SlidingWindowMask mask,
+                                      std::int32_t tokens, std::int32_t batch,
                                       SlidingWindowAttentionExecutionEnvelope envelope) {
-    if (window != 2048 && window != 4096) {
+    if (window != 2048 && window != 4096 && window != 8192) {
         throw std::invalid_argument("sliding_window_attention plan: unsupported window");
     }
     if (tokens < 1 || tokens > 16 || batch < 1 || batch > 8) {
@@ -94,6 +95,7 @@ sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens,
         .split_capacity = direct ? 1 : std::min(split_limit, std::max(1, context_tiles)),
         .max_context    = static_cast<std::int32_t>(envelope.max_context),
         .window         = static_cast<std::int32_t>(window),
+        .causal         = mask == SlidingWindowMask::Causal,
     };
 }
 
@@ -115,7 +117,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream) {
     const bool direct = plan.route == SlidingWindowAttentionRoute::Direct;
-    if ((plan.window != 2048 && plan.window != 4096) ||
+    if ((plan.window != 2048 && plan.window != 4096 && plan.window != 8192) ||
         context.capacity != static_cast<std::uint32_t>(plan.window) ||
         plan.key_block != 32 || plan.reduce_warps != (plan.window == 2048 ? 4 : 1) ||
         plan.split_capacity < 1 || plan.split_capacity > kSlidingWindowMaxSplits ||
@@ -141,8 +143,9 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                 static_cast<const std::int32_t*>(lanes.data),
                 static_cast<const __nv_bfloat16*>(context.k.data),
                 static_cast<const __half*>(context.v.data),
-                static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context,
-                Direct ? 1 : plan.split_capacity, scale, static_cast<float*>(partial_acc.data),
+                static_cast<int>(context.padded_capacity), plan.window - 1, plan.causal,
+                plan.max_context, Direct ? 1 : plan.split_capacity, scale,
+                static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 static_cast<__nv_bfloat16*>(out.data)));
             CUDA_CHECK(cudaGetLastError());

@@ -304,6 +304,93 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
 
 } // namespace
 
+DraftConfig parse_dspine_config(const artifact::Directory& drafter, const TextConfig& target) {
+    try {
+        if (drafter.components.size() != 1 || !drafter.components.contains("dspine")) {
+            throw ArtifactError("not a DSpine drafter artifact (its only component must be dspine)");
+        }
+        const Json& value = drafter.component("dspine").config;
+        require_members(value,
+                        {"architectures", "model_type", "hidden_size", "intermediate_size",
+                         "num_attention_heads", "num_key_value_heads", "head_dim", "num_hidden_layers",
+                         "max_position_embeddings", "vocab_size", "num_target_layers", "block_size",
+                         "sliding_window", "rms_norm_eps", "rope_parameters", "layer_types", "dspine_config"},
+                        {}, "DSpine config");
+        if (architecture(value) != "DSpineDraftModel" || value.at("model_type") != "qwen3") {
+            throw ArtifactError("DSpine architecture/model_type mismatch");
+        }
+        // A drafter is trained for one target: its features, vocabulary and taps are that target's.
+        if (dimension(value, "hidden_size") != target.hidden_size ||
+            dimension(value, "vocab_size") != target.vocab_size ||
+            dimension(value, "num_target_layers") != target.num_hidden_layers) {
+            throw ArtifactError("the DSpine drafter was trained for another target (hidden width, vocabulary or "
+                                "layer count differs from this model's)");
+        }
+        DraftConfig out;
+        out.attention               = attention(value);
+        out.intermediate_size       = dimension(value, "intermediate_size");
+        out.num_hidden_layers       = dimension(value, "num_hidden_layers");
+        out.max_position_embeddings = dimension(value, "max_position_embeddings");
+        out.rms_norm_eps            = positive_float(value, "rms_norm_eps");
+        require_members(value.at("rope_parameters"), {"rope_theta"}, {}, "DSpine RoPE");
+        out.rope_theta     = positive_float(value.at("rope_parameters"), "rope_theta");
+        const auto& layers = value.at("layer_types");
+        if (!layers.is_array() || layers.size() != out.num_hidden_layers ||
+            !std::all_of(layers.begin(), layers.end(), [](const Json& kind) { return kind == "sliding_attention"; })) {
+            throw ArtifactError("every DSpine layer must be sliding_attention");
+        }
+        out.layer_types.assign(out.num_hidden_layers, DraftAttentionKind::SlidingAttention);
+        const auto& bridge = value.at("dspine_config");
+        require_members(bridge, {"target_layer_ids", "mask_token_id", "code_size", "rank", "head_top_k", "bridge_eps"},
+                        {}, "DSpine bridge config");
+        const auto& taps = bridge.at("target_layer_ids");
+        if (!taps.is_array() || taps.empty()) { throw ArtifactError("target_layer_ids must be nonempty"); }
+        std::set<std::uint32_t> unique;
+        for (const auto& tap : taps) {
+            const auto index = integer(tap, "target layer index", false);
+            if (index >= target.num_hidden_layers || !unique.insert(index).second) {
+                throw ArtifactError("invalid target layer index");
+            }
+            out.target_layer_ids.push_back(index);
+        }
+        out.mask_token_id = integer(bridge.at("mask_token_id"), "mask token", false);
+        if (out.mask_token_id >= target.vocab_size) { throw ArtifactError("mask token exceeds target embedding rows"); }
+        DSpineConfig extra{.block_size     = dimension(value, "block_size"),
+                           .trained_window = dimension(value, "sliding_window"),
+                           .code_size      = dimension(bridge, "code_size"),
+                           .rank           = dimension(bridge, "rank"),
+                           .head_top_k     = dimension(bridge, "head_top_k"),
+                           .bridge_eps     = positive_float(bridge, "bridge_eps")};
+        // What the engine implements: the attention profile (32 query and 8 KV heads of 128), the
+        // fused context materialization (5 or 6 layers, epsilon 1e-6, theta 1e7), the bridge Ops'
+        // rank and widths, a block the verification frame takes, and the ring's windows.
+        if (out.attention.head_dim != 128 || out.attention.num_attention_heads != 32 ||
+            out.attention.num_key_value_heads != 8) {
+            throw ArtifactError("the DSpine drafter's attention must be 32 query and 8 KV heads of 128");
+        }
+        if (out.rms_norm_eps != 1e-6F || out.rope_theta != 1e7F ||
+            !ops::context_kv_materialize_layer_count(out.num_hidden_layers)) {
+            throw ArtifactError("the DSpine drafter needs 5 or 6 layers, rms_norm_eps 1e-6 and rope_theta 1e7");
+        }
+        if (target.hidden_size % 8 != 0 || extra.code_size % 8 != 0 || extra.rank % 32 != 0 || extra.rank > 512) {
+            throw ArtifactError("the DSpine bridge needs widths in multiples of 8 and a rank in multiples of 32 up to 512");
+        }
+        if (extra.head_top_k != 16) { throw ArtifactError("the DSpine refinement chains the head's top 16"); }
+        if (extra.block_size < 2 || extra.block_size > 16) { throw ArtifactError("the DSpine block must be 2..16 wide"); }
+        if (extra.trained_window != 2048 && extra.trained_window != 4096 && extra.trained_window != 8192) {
+            throw ArtifactError("the DSpine sliding window must be 2048, 4096 or 8192");
+        }
+        // The ring holds the trained window: the drafter's attention sees exactly what it was trained on.
+        out.sliding_window = extra.trained_window;
+        out.dspine         = extra;
+        // The drafter keeps its own unscaled RoPE under target YaRN, as DFlash's does.
+        out.yarn_factor = 1.0F;
+        return out;
+    } catch (const std::exception& error) {
+        throw ArtifactError(std::string("DSpine drafter config: ") + error.what());
+    }
+}
+
 std::uint64_t GdnConfig::conv_channels() const {
     return artifact::checked_add(artifact::checked_mul(2, key_width(), "GDN key width"),
                                  value_width(), "GDN convolution channels");
@@ -338,9 +425,13 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             (options.vision || options.speculative != SpeculativeBackend::None)) {
             throw ArtifactError("CausalScoring loads the Text backbone only");
         }
-        if (!options.draft_model.empty()) {
-            throw ArtifactError("--draft-model loads a Qwen3.8-Flash-Next DFlash2 companion; Qwen3.5/3.6 "
-                                "artifacts bundle their DFlash and DFlash2 drafters");
+        // A DSpine drafter is its own artifact (plan_load reads it); any other drafter is bundled.
+        if (!options.draft_model.empty() && !options.dspine()) {
+            throw ArtifactError("--draft-model loads a Qwen3.8-Flash-Next DFlash2 companion or a DSpine drafter "
+                                "(--spec dspine); Qwen3.5/3.6 artifacts bundle their DFlash and DFlash2 drafters");
+        }
+        if (options.dspine() && options.draft_model.empty()) {
+            throw ArtifactError("--spec dspine requires --draft-model FILE (a DSpine drafter artifact)");
         }
         if (options.speculative != SpeculativeBackend::None &&
             options.speculative_component().empty()) {
