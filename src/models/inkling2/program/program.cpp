@@ -336,8 +336,9 @@ public:
         moe_error_  = reinterpret_cast<std::uint32_t*>(base);
         *moe_error_ = 0;
         forward_.set_moe_error_word(moe_error_);
-        if (o_.kv_codec == ops::inkling2::KvCodec::Bf16Packed) {
-            // bf16p: each lane's lowest appended position with no packed form (atomicMin; 0xFFFFFFFF: none).
+        if (o_.kv_codec == ops::inkling2::KvCodec::Bf16Packed || o_.window_codec == ops::inkling2::KvCodec::Bf16Packed) {
+            // bf16p pools or rings: each lane's lowest appended position with no packed form (atomicMin; 0xFFFFFFFF:
+            // none).
             unpackable_ = DeviceBuffer(4 * kMaximumConcurrency);
             CUDA_CHECK(cudaMemset(unpackable_.p, 0xFF, 4 * kMaximumConcurrency));
             view_.unpackable = static_cast<std::uint32_t*>(unpackable_.p);
@@ -2622,8 +2623,16 @@ std::optional<ops::inkling2::KvCodec> kv_codec(KvCacheStorage storage) {
     return std::nullopt;
 }
 
-ops::inkling2::KvCodec window_codec(ops::inkling2::KvCodec pool) {
+std::optional<ops::inkling2::KvCodec> window_codec(ops::inkling2::KvCodec pool, std::optional<KvCacheStorage> window) {
     using ops::inkling2::KvCodec;
+    if (window) {
+        switch (*window) {
+        case KvCacheStorage::BFloat16: return KvCodec::Bf16;
+        case KvCacheStorage::Bf16Packed: return KvCodec::Bf16Packed;
+        case KvCacheStorage::Int8Group64: return KvCodec::Int8G64;
+        default: return std::nullopt;
+        }
+    }
     switch (pool) {
     case KvCodec::Bf16: return KvCodec::Bf16;
     case KvCodec::Bf16Packed: return KvCodec::Bf16Packed;

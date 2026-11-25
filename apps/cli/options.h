@@ -55,6 +55,7 @@ struct Options {
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    std::optional<KvCacheStorage> kv_window_cache; // EngineOptions::kv_window_cache (--kv-window-dtype; empty: auto)
     LogitsDtype logits_dtype = LogitsDtype::FP32;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
     bool original_int8_prefill_kernel = false;

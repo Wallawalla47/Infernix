@@ -26,6 +26,10 @@
 // 8. --kv-dtype (the full visits' pools quantized): each format as a variant of 6 (accepted with --reproducible),
 //    DSpark (auto, graphs) giving its plain tokens, and a 10,000-token prompt's greedy continuation the same in chunks
 //    of 4,096 and 1,000; bf16p (lossless) gives bf16's tokens throughout, the others' agreement with BF16's is reported.
+//    8b. --kv-window-dtype apart from the pools' format: bf16p windows over bf16 pools and bf16 windows over bf16p pools
+//    give bf16's tokens, bf16p and bf16 windows over int8 and vq2 pools each other's (the golden continuation, C = 4,
+//    a 160-token reply plain and under DSpark, the 10,000-token prompt in chunks of 4,096 and 1,000); int8 windows over
+//    bf16 pools run 6's checks.
 // 9. A stalled MoE call (INFERNIX_INKLING2_STALL_ONLY runs it alone): the request fails with the stall, the next one
 //    gives its solo tokens.
 // Reported, not judged: a chat turn's channels, a turn whose thinking budget (6) injects the control (the mixed-width
@@ -578,7 +582,7 @@ int main() {
             // implies --q8-weights): request-invariant like the others, refused with --reproducible.
             variant("a8", "--a8-activations", false, [](infernix::EngineOptions& o) { o.a8_activations = true; });
 
-            // 8. --kv-dtype: the full visits' pools in a quantized format (the sliding windows stay BF16 K / FP16 V),
+            // 8. --kv-dtype: the full visits' pools in a quantized format (the sliding windows INT8, bf16p's packed),
             // deterministic and request-invariant, so accepted with --reproducible: the variant's checks above; DSpark
             // (auto, graphs) gives the format's plain tokens; a 10,000-token prompt's greedy continuation is the same in
             // chunks of 4,096 and 1,000. Reported: how long the format's tokens agree with BF16's.
@@ -650,6 +654,92 @@ int main() {
                     }
                 }
             }
+
+            // 8b. --kv-window-dtype: the sliding windows' format apart from the pools'. A run gives the golden prompt's
+            // continuation, the four sampled requests at once in reverse order (C = 4, graphs), a 160-token greedy reply
+            // plain and under DSpark (auto, graphs: the same), and the 10,000-token prompt's greedy continuation in
+            // chunks of 4,096 and 1,000 (the same). bf16 and bf16p windows hold the same values, so the two over one
+            // pool give the same tokens: bf16's over bf16 and bf16p pools, each other's over int8 and vq2 pools. int8
+            // windows over bf16 pools (other bits) run the variant's checks (6) and a run of their own.
+            struct WindowRun {
+                Tokens golden;
+                std::vector<Tokens> sampled;
+                Tokens reply;
+                Tokens ten_k;
+            };
+            const auto window_run = [&](infernix::KvCacheStorage pool, infernix::KvCacheStorage window) {
+                const std::string name = std::string("kv ") + infernix::kv_cache_cli_name(pool) + " with " +
+                                         infernix::kv_cache_cli_name(window) + " windows";
+                const auto set = [&](infernix::EngineOptions& o) {
+                    o.kv_cache        = pool;
+                    o.kv_window_cache = window;
+                };
+                WindowRun out;
+                infernix::EngineOptions plain = engine_options(artifact, 0, true, 4);
+                set(plain);
+                {
+                    infernix::Engine engine(plain);
+                    out.golden = engine.generate(engine.prepare_tokens(prompt), greedy(8)).generated_token_ids;
+                    std::vector<infernix::GenerationHandle> handles;
+                    for (std::size_t i = texts().size(); i-- > 0;) {
+                        handles.push_back(engine.submit(engine.prepare(chat(texts()[i])), sampled(i)));
+                    }
+                    out.sampled.resize(texts().size());
+                    for (std::size_t j = 0; j < handles.size(); ++j) {
+                        out.sampled[texts().size() - 1 - j] = handles[j].wait().generated_token_ids;
+                    }
+                    out.reply = engine.generate(engine.prepare(chat(texts()[1])), greedy(160)).generated_token_ids;
+                }
+                infernix::EngineOptions spec          = engine_options(artifact, 0, true, 1);
+                set(spec);
+                spec.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                spec.speculative.draft_tokens_auto = true;
+                spec.speculative.draft_tokens      = 7;
+                {
+                    infernix::Engine engine(spec);
+                    const auto result = engine.generate(engine.prepare(chat(texts()[1])), greedy(160));
+                    require_same(name + ", dspark (auto, graphs): a 160-token greedy reply", out.reply,
+                                 result.generated_token_ids);
+                    std::cout << name << ", dspark (auto, graphs): " << result.speculative.accepted_tokens << " of "
+                              << result.speculative.drafted_tokens << " drafts accepted\n";
+                }
+                for (const std::uint32_t chunk : {4096U, 1000U}) {
+                    infernix::EngineOptions options = engine_options(artifact, chunk, true, 1, kTenThousandContext);
+                    set(options);
+                    infernix::Engine engine(options);
+                    const Tokens reply = engine.generate(engine.prepare_tokens(ten_k), greedy(32)).generated_token_ids;
+                    if (chunk == 4096U) {
+                        out.ten_k = reply;
+                    } else {
+                        require_same(name + ": the 10,000-token prompt in chunks of 1,000 = 4,096", out.ten_k, reply);
+                    }
+                }
+                return out;
+            };
+            const auto same_run = [&](const std::string& label, const WindowRun& a, const WindowRun& b) {
+                require_same(label + ": the golden continuation", a.golden, b.golden);
+                for (std::size_t i = 0; i < a.sampled.size(); ++i) {
+                    require_same(label + ": C = 4, request " + std::to_string(i), a.sampled[i], b.sampled[i]);
+                }
+                require_same(label + ": a 160-token greedy reply", a.reply, b.reply);
+                require_same(label + ": the 10,000-token prompt's greedy continuation", a.ten_k, b.ten_k);
+            };
+            using infernix::KvCacheStorage;
+            const WindowRun bf16_run{continuation, reference_tokens, bf16_long_reply, bf16_ten_k};
+            same_run("kv bf16 with bf16p windows = bf16", window_run(KvCacheStorage::BFloat16, KvCacheStorage::Bf16Packed),
+                     bf16_run);
+            same_run("kv bf16p with bf16 windows = bf16", window_run(KvCacheStorage::Bf16Packed, KvCacheStorage::BFloat16),
+                     bf16_run);
+            same_run("kv int8: bf16p windows = bf16 windows",
+                     window_run(KvCacheStorage::Int8Group64, KvCacheStorage::Bf16Packed),
+                     window_run(KvCacheStorage::Int8Group64, KvCacheStorage::BFloat16));
+            same_run("kv vq2: bf16p windows = bf16 windows", window_run(KvCacheStorage::Vq2, KvCacheStorage::Bf16Packed),
+                     window_run(KvCacheStorage::Vq2, KvCacheStorage::BFloat16));
+            variant("kv bf16 with int8 windows", "--kv-window-dtype", true,
+                    [](infernix::EngineOptions& o) { o.kv_window_cache = infernix::KvCacheStorage::Int8Group64; });
+            const WindowRun int8_windows = window_run(KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64);
+            std::cout << "kv bf16 with int8 windows: a 160-token greedy reply agrees with BF16's for "
+                      << agree(int8_windows.reply, bf16_long_reply) << " tokens (reported)\n";
         }
         {
             // Engine::plan: the readings are filled, a start that fits says so with its VRAM left, and an explicit

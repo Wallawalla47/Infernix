@@ -55,6 +55,9 @@ constexpr int kStatWords       = 132;
 constexpr int kAccOffset       = 4;
 constexpr float kClipQK        = kQkClipThreshold;
 constexpr float kClipR         = kRelativeClipThreshold;
+// The lean quantized instances' forms (new_kv's Form).
+constexpr int kInt8            = static_cast<int>(detail::KvForm::Int8);
+constexpr int kBf16p           = static_cast<int>(detail::KvForm::Bf16p);
 
 __device__ __forceinline__ float bf16f(std::uint16_t v) { return canon::bf16_to_f32(v); }
 
@@ -168,7 +171,7 @@ __device__ __forceinline__ uint2 encode_window_row(const KvView& kv, int which, 
     std::uint8_t* codes = kv.encode_codes[which] + row_element / kD * detail::code_bytes(form);
     std::uint8_t* side  = kv.encode_side[which] + row_element / kD * detail::side_bytes(form);
     bool unpackable     = false;
-    const uint2 words   = detail::kv_encode<false>(form, held, bits, lane, codes, side, which == 1, unpackable);
+    const uint2 words   = detail::kv_encode<false, Form == kBf16p>(form, held, bits, lane, codes, side, which == 1, unpackable);
     if (unpackable && lane == 0 && kv.unpackable != nullptr) { atomicMin(kv.unpackable + col_lane, static_cast<unsigned>(pos)); }
     return words;
 }
@@ -180,7 +183,9 @@ __device__ __forceinline__ uint2 encode_window_row(const KvView& kv, int which, 
 // Quantized: the kernel instance for a quantized pool or window ring (KvCodec other than Bf16); the BF16 instance
 // carries no codec code. Encode: the BF16 prologue instance of a view with KvView::encode (a staging ring), the window
 // codec's detail::KvForm (0: none). Rotated: the quantized instance of a vq2 / k4v2 pool (the others carry no code for them).
-template <bool Quantized, int Encode = 0, bool Rotated = true, bool Int8 = false>
+// Form: a lean quantized instance's detail::KvForm (Int8 or Bf16p: both planes of that form, one encoder and decoder;
+// 0: the planes' forms read from the view).
+template <bool Quantized, int Encode = 0, bool Rotated = true, int Form = 0>
 __device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& col, int kv, int which, int lane,
                                         const float (&w)[4][4], const uint2 (&hist)[3]) {
     const int ch = kv * kD + 4 * lane;
@@ -223,7 +228,7 @@ __device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& co
         round4(c);
         const float sum = head_sum(c, c);
         const std::size_t at = kv_row(a.kv, col.lane, kv, col.pos) + 4 * lane;
-        const detail::KvForm form = Int8 ? detail::KvForm::Int8
+        const detail::KvForm form = Form != 0 ? static_cast<detail::KvForm>(Form)
                                     : Quantized ? detail::plane_form(a.kv, which) : detail::KvForm::Words;
         const bool quantized      = Quantized && form != detail::KvForm::Words;
         uint2 stored;
@@ -264,7 +269,7 @@ __device__ __forceinline__ uint2 new_kv(const AttentionArgs& a, const Column& co
                 // words returned for the tile.
                 const std::size_t row = kv_row(a.kv, col.lane, kv, col.pos);
                 bool unpackable       = false;
-                const uint2 words     = detail::kv_encode<Rotated>(form, held, bits, lane, detail::row_codes(a.kv, which, form, row),
+                const uint2 words     = detail::kv_encode<Rotated, Form == kBf16p>(form, held, bits, lane, detail::row_codes(a.kv, which, form, row),
                                                           detail::row_side(a.kv, which, form, row), which == 1, unpackable);
                 if (unpackable && lane == 0 && a.kv.unpackable != nullptr) {
                     atomicMin(a.kv.unpackable + col.lane, static_cast<unsigned>(col.pos));
@@ -322,8 +327,8 @@ __device__ __forceinline__ void qr_scales(const AttentionArgs& a, int head, int 
 
 // A CTA per (column, KV head): warps 0 and 1 its new K and V rows, warps 2-4 its 3 query heads' q and r into the
 // workspace. Padding columns write zero outputs and nothing else. Encode: a staging ring's view (KvView::encode).
-// Rotated: as new_kv's.
-template <bool Quantized, int Encode, bool Rotated, bool Int8 = false>
+// Rotated, Form: as new_kv's.
+template <bool Quantized, int Encode, bool Rotated, int Form = 0>
 __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const AttentionArgs a) {
     const int t = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y);
     const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31U);
@@ -359,7 +364,7 @@ __global__ void __launch_bounds__(kPrologueThreads) prologue_kernel(const Attent
     }
     if (warp < 2) {
         if (!early) { kv_history(a, col, kv, warp, lane, hist); }
-        (void)new_kv<Quantized, Encode, Rotated, Int8>(a, col, kv, warp, lane, w, hist);
+        (void)new_kv<Quantized, Encode, Rotated, Form>(a, col, kv, warp, lane, w, hist);
         return;
     }
     uint2 q;
@@ -426,8 +431,9 @@ __device__ __forceinline__ RowUnits row_units(bool full, int pos, int first) {
 }
 __device__ __forceinline__ int full_split_units(int n) { return (n + kFullSplits - 1) / kFullSplits; }
 
-// Int8: the instance of an int8 G64 pool or window ring (both planes int8: the lean piece decoder, the int8 encoder).
-template <bool Quantized, bool Rotated, bool Int8 = false>
+// Form: the lean instance of an int8 G64 or a bf16p pool or window ring (new_kv's: both planes of that form, its piece
+// decoder and its encoder).
+template <bool Quantized, bool Rotated, int Form = 0>
 __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __shared__ int range[2];
@@ -482,9 +488,12 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     // off the SM).
     const auto issue_unit = [&](int b) {
         const std::size_t page = kv_row(a.kv, lane, kv, b * kKeyUnit);
-        if constexpr (Int8) {
+        if constexpr (Form == static_cast<int>(detail::KvForm::Int8)) {
             detail::decode_unit_int8(a.kv, page, s.k, s.v, [](int row, int d) { return row * kRowStride + d; }, tid,
                                      kThreads);
+        } else if constexpr (Form == static_cast<int>(detail::KvForm::Bf16p)) {
+            detail::decode_unit_bf16p(a.kv, page, s.k, s.v, [](int row, int d) { return row * kRowStride + d; }, tid,
+                                      kThreads);
         } else if constexpr (Quantized) {
             detail::decode_unit<Rotated>(a.kv, page, s.k, s.v, [](int row, int d) { return row * kRowStride + d; }, tid,
                                          kThreads);
@@ -566,7 +575,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
                 const Column col = column_of(a.map, t);
                 uint2 hist[3];
                 kv_history(a, col, kv, which, wl, hist);
-                const uint2 v = new_kv<Quantized, 0, Rotated, Int8>(a, col, kv, which, wl, w, hist);
+                const uint2 v = new_kv<Quantized, 0, Rotated, Form>(a, col, kv, which, wl, w, hist);
                 *reinterpret_cast<uint2*>((which == 0 ? s.k : s.v) + (pos - b * kKeyUnit) * kRowStride + 4 * wl) = v;
             }
             __syncthreads();
@@ -847,7 +856,7 @@ void detail::check_attention_args(const AttentionArgs& a) {
     if (!l.full && !window_codec_supported(a.kv.codec)) {
         throw std::invalid_argument("inkling2 attention: a window ring holds bf16, bf16p or int8");
     }
-    if (a.kv.codec == KvCodec::Bf16Packed && a.kv.unpackable == nullptr) {
+    if ((a.kv.codec == KvCodec::Bf16Packed || a.kv.encode == KvCodec::Bf16Packed) && a.kv.unpackable == nullptr) {
         throw std::invalid_argument("inkling2 attention: a bf16p pool or ring needs its lanes' unpackable flags");
     }
     if (a.ws.q == nullptr || a.ws.stats == nullptr || a.out == nullptr) {
@@ -862,16 +871,16 @@ void detail::launch_attention_prologue(const AttentionArgs& a, cudaStream_t stre
         throw std::invalid_argument("inkling2 attention: an encoding view needs its code and side planes");
     }
     if (quantized_pool(a)) {
-        CUDA_CHECK(rotated_pool(a)                 ? pdl::launch_consumer(config, prologue_kernel<true, 0, true>, a)
-                   : a.kv.codec == KvCodec::Int8G64 ? pdl::launch_consumer(config, prologue_kernel<true, 0, false, true>, a)
-                                                    : pdl::launch_consumer(config, prologue_kernel<true, 0, false>, a));
+        CUDA_CHECK(rotated_pool(a)                    ? pdl::launch_consumer(config, prologue_kernel<true, 0, true>, a)
+                   : a.kv.codec == KvCodec::Int8G64    ? pdl::launch_consumer(config, prologue_kernel<true, 0, false, kInt8>, a)
+                   : a.kv.codec == KvCodec::Bf16Packed ? pdl::launch_consumer(config, prologue_kernel<true, 0, false, kBf16p>, a)
+                                                       : pdl::launch_consumer(config, prologue_kernel<true, 0, false>, a));
         return;
     }
-    constexpr int int8 = static_cast<int>(KvForm::Int8), bf16p = static_cast<int>(KvForm::Bf16p);
     switch (a.kv.encode) { // a staging ring's window codec: one encoder an instance
     case KvCodec::Bf16: CUDA_CHECK(pdl::launch_consumer(config, prologue_kernel<false, 0, false>, a)); return;
-    case KvCodec::Int8G64: CUDA_CHECK(pdl::launch_consumer(config, prologue_kernel<false, int8, false>, a)); return;
-    case KvCodec::Bf16Packed: CUDA_CHECK(pdl::launch_consumer(config, prologue_kernel<false, bf16p, false>, a)); return;
+    case KvCodec::Int8G64: CUDA_CHECK(pdl::launch_consumer(config, prologue_kernel<false, kInt8, false>, a)); return;
+    case KvCodec::Bf16Packed: CUDA_CHECK(pdl::launch_consumer(config, prologue_kernel<false, kBf16p, false>, a)); return;
     default: throw std::invalid_argument("inkling2 attention: a staging ring encodes bf16p or int8");
     }
 }
@@ -898,7 +907,7 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns);
     static const bool attribute = [] {
         for (auto* kernel : {attention_kernel<false, false>, attention_kernel<true, false>, attention_kernel<true, true>,
-                             attention_kernel<true, false, true>}) {
+                             attention_kernel<true, false, kInt8>, attention_kernel<true, false, kBf16p>}) {
             CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(smem_bytes(kMaxRows))));
         }
@@ -909,6 +918,7 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     const bool quantized  = detail::quantized_pool(a);
     const bool rotated    = detail::rotated_pool(a);
     const bool int8       = a.kv.codec == KvCodec::Int8G64;
+    const bool bf16p      = a.kv.codec == KvCodec::Bf16Packed;
     const auto launch = [&](std::int32_t g0, std::int32_t count, std::int32_t base) {
         AttentionArgs b   = a;
         b.groups_columns  = a.groups_columns + 3 * g0;
@@ -917,7 +927,8 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
         const pdl::LaunchConfig config{dim3(splits, kKvHeads, static_cast<unsigned>(count)), dim3(kThreads), bytes, stream};
         CUDA_CHECK(!quantized ? pdl::launch_consumer(config, attention_kernel<false, false>, b)
                    : rotated  ? pdl::launch_consumer(config, attention_kernel<true, true>, b)
-                   : int8     ? pdl::launch_consumer(config, attention_kernel<true, false, true>, b)
+                   : int8     ? pdl::launch_consumer(config, attention_kernel<true, false, kInt8>, b)
+                   : bf16p    ? pdl::launch_consumer(config, attention_kernel<true, false, kBf16p>, b)
                               : pdl::launch_consumer(config, attention_kernel<true, false>, b));
     };
     if (a.host_groups == nullptr) {

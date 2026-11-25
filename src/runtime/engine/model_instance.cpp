@@ -731,6 +731,9 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     // Inkling 2's options are normalized apart (inkling2_instance.cpp): every artifact reaching here refuses it.
     if (options.q8_weights) { throw std::invalid_argument("--q8-weights applies to Inkling 2 artifacts only"); }
+    if (options.kv_window_cache) {
+        throw std::invalid_argument("--kv-window-dtype applies to Inkling 2 artifacts only (their sliding windows)");
+    }
     // An automatic draft length chooses up to the model's most drafts unless given a ceiling: MTP on
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5. The
     // block drafters propose their whole block: Qwen3.8-Flash-Next's DFlash2 7; the Qwen3.5 planner

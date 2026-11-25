@@ -62,7 +62,8 @@ infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtyp
 - `--max-context auto` takes the largest context the free VRAM holds for every lane. Without it
   `infernix-serve` uses 8,192 tokens and `infernix` 2,048.
 - `--kv-dtype int8` stores the KV cache, the sliding windows included, in 8 bits: about half the memory
-  of the default `bf16`, for slightly different output ([KV formats](#kv-formats)).
+  of the default `bf16`, for slightly different output ([KV formats](#kv-formats)). `--kv-window-dtype`
+  chooses the sliding windows' format on its own.
 - `--spec dspark --draft-tokens auto` is what the default `--spec auto` chooses for this artifact.
 - `--lm-head-draft` is optional: it changes the speed of drafting, never the output.
 - Add `--vision` for images. Its tower and image buffers stay in VRAM and reduce the context.
@@ -193,6 +194,13 @@ speeds. Measured effects of the options are in the [CLI options](cli.md#common-o
 format stores its windows as `int8`. `int8` is recommended: its windows and pools take about half the
 memory of `bf16`'s, so the same VRAM holds more context and more of the prefix cache. It decodes within
 0.4 % of `bf16` and prefills up to 1.5 % slower ([performance](#performance)).
+
+`--kv-window-dtype bf16|bf16p|int8` sets the windows' format apart from the pools' (`auto`, the default, is the
+mapping above). The windows are a fixed share of each lane whatever its context: 170 MiB as `bf16`, 138 MiB as `bf16p`
+(the same values, so `bf16`'s output) and 88 MiB as `int8`. On an RTX 5090 (2026-11-25), over `bf16p` pools, `bf16p`
+windows decode 0.6 % slower than `bf16` windows with one request and 1.8 % slower with four, and prefill 0.3 % slower;
+`int8` windows over `int8`, `fp8` and `nvfp4` pools decode 0.1 to 0.7 % faster than `bf16` windows with one request and
+prefill up to 0.5 % slower. `--lossless` keeps its windows `bf16`.
 
 | Format | Stored as | Output against `bf16` |
 |---|---|---|

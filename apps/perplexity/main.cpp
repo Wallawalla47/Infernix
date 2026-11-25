@@ -3,6 +3,7 @@
 #include "distribution.h"
 #include "evaluation.h"
 
+#include "product/kv_window_options.h"
 #include "product/logits_options.h"
 #include "product/rope_yarn_options.h"
 #include "infernix/engine.h"
@@ -62,6 +63,7 @@ struct Options {
     std::optional<std::uint32_t> prefill_chunk;
     int device                          = 0;
     infernix::KvCacheStorage kv           = infernix::KvCacheStorage::Fp8E4M3Row256;
+    std::optional<infernix::KvCacheStorage> kv_window; // EngineOptions::kv_window_cache (empty: auto)
     infernix::LogitsDtype logits_dtype    = infernix::LogitsDtype::FP32;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
@@ -87,6 +89,8 @@ std::string usage_text() {
            "        default the Engine's 1024)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
+           "       [--kv-window-dtype auto|bf16|bf16p|int8] (Inkling 2's sliding windows; default auto:\n"
+           "        bf16 under --kv-dtype bf16, bf16p under bf16p, int8 under every other)\n"
            "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, bf16\n"
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -232,6 +236,10 @@ Options parse_options(int argc, char** argv) {
             } else {
                 usage_error("--kv-dtype must be bf16, bf16p, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
             }
+        } else if (option == "--kv-window-dtype") {
+            try {
+                out.kv_window = infernix::product::parse_kv_window_dtype(value("--kv-window-dtype"));
+            } catch (const std::invalid_argument& error) { usage_error(error.what()); }
         } else if (option == "--logits-dtype") {
             try {
                 out.logits_dtype = infernix::product::parse_logits_dtype(value("--logits-dtype"));
@@ -357,6 +365,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     if (options.prefill_chunk) { engine_options.prefill_chunk = *options.prefill_chunk; }
     engine_options.kv_cache         = options.kv;
+    engine_options.kv_window_cache  = options.kv_window;
     engine_options.logits_dtype     = options.logits_dtype;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
@@ -668,6 +677,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefill_chunk_tokens", engine.options().prefill_chunk},
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)},
+          {"kv_window_dtype", infernix::product::kv_window_dtype_name(options.kv_window)},
           {"logits_dtype", infernix::product::logits_dtype_name(options.logits_dtype)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

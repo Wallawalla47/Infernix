@@ -1,6 +1,7 @@
 #include "infernix_bench_support.h"
 #include "product/constraint_observation.h"
 #include "product/speculative_options.h"
+#include "product/kv_window_options.h"
 #include "product/logits_options.h"
 #include "product/rope_yarn_options.h"
 
@@ -546,6 +547,8 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
         << "  --kv-dtype <bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2>  KV cache storage (default: bf16)\n"
+        << "  --kv-window-dtype <auto|bf16|bf16p|int8>  Inkling 2's sliding windows (default auto:\n"
+        << "                              bf16 under --kv-dtype bf16, bf16p under bf16p, else int8)\n"
         << "  --logits-dtype <fp32|bf16>  the head's logits (default: fp32; bf16 rounds each once,\n"
         << "                              as Transformers returns them, for comparisons)\n"
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
@@ -775,6 +778,8 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (arg == "--kv-window-dtype") {
+            options.kv_window_cache = product::parse_kv_window_dtype(value("--kv-window-dtype"));
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(value("--logits-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
@@ -1146,6 +1151,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " expert_pin_mib=" << mib_or_auto(env.expert_pin_bytes)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
+        << " kv_window_cache=" << product::kv_window_dtype_name(env.kv_window_cache)
         << " logits_dtype=" << product::logits_dtype_name(env.logits_dtype)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
@@ -1317,6 +1323,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"expert_pin_mib\": "
         << (env.expert_pin_bytes ? std::to_string(*env.expert_pin_bytes >> 20) : "null") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+        << "    \"kv_window_cache\": \"" << product::kv_window_dtype_name(env.kv_window_cache) << "\",\n"
         << "    \"logits_dtype\": \"" << product::logits_dtype_name(env.logits_dtype) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"

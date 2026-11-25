@@ -201,6 +201,7 @@ int main() {
                       "server thinking budget missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
     failures += check(server.at("engine").at("logits_dtype") == "fp32", "logits dtype missing");
+    failures += check(server.at("engine").at("kv_window_cache") == "auto", "the windows' KV format missing");
     failures +=
         check(server.at("engine").at("draft_tree_nodes") == Json::array({0, 0, 0, 0, 0, 0, 0, 0}) &&
                   server.at("engine").at("draft_tree_auto") == false &&

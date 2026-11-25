@@ -506,7 +506,22 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--kv-dtype", "bf16p"}).kv_cache ==
                           infernix::KvCacheStorage::Bf16Packed,
                       "--kv-dtype bf16p did not select packed BF16 KV");
+    failures += check(!parse({"infernix-serve", "model.ninfer"}).kv_window_cache &&
+                          !parse({"infernix-serve", "model.ninfer", "--kv-window-dtype", "auto"}).kv_window_cache &&
+                          parse({"infernix-serve", "model.ninfer", "--kv-window-dtype", "bf16"}).kv_window_cache ==
+                              infernix::KvCacheStorage::BFloat16 &&
+                          parse({"infernix-serve", "model.ninfer", "--kv-window-dtype", "int8"}).kv_window_cache ==
+                              infernix::KvCacheStorage::Int8Group64,
+                      "--kv-window-dtype did not parse (default auto)");
+    {
+        bool threw = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--kv-window-dtype", "nvfp4"});
+        } catch (const std::invalid_argument&) { threw = true; }
+        failures += check(threw, "--kv-window-dtype nvfp4 was accepted");
+    }
     const std::string kv_help = serve_usage_text("infernix-serve");
+    failures += check(kv_help.find("--kv-window-dtype") != std::string::npos, "serve help omits --kv-window-dtype");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos &&
                           kv_help.find("vq2") != std::string::npos &&

@@ -195,7 +195,8 @@ Inkling 2) accepts, from what the engine accepts and reads for it, and which `--
 **Will it fit?** plan: a saved value for an option the model does not take is left out of the command line, and the
 preview names it. A model type the launcher does not know is not restricted. Inkling 2's defaults are
 `--max-context auto` and `--spec auto --draft-tokens auto` (DSpark when the artifact bundles it); `--lm-head-draft` is
-offered when the artifact holds its `proposal/token_rank` parameter. The **DFlash2 drafter** and **N-gram volume**
+offered when the artifact holds its `proposal/token_rank` parameter, and **Sliding-window KV format**
+(`--kv-window-dtype`) beside **KV cache format** for Inkling 2 only. The **DFlash2 drafter** and **N-gram volume**
 pickers (Qwen3.8-Flash-Next) list the compatible
 files found and write `--draft-model` and `--ngram-volume`; the **LoRA adapter** picker (the dense
 27Bs and Inkling 2) lists the adapters found, those of the model's base first (another base's is marked, and

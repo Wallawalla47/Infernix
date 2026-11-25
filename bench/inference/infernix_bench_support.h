@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 28;
+inline constexpr int kSchemaVersion                   = 29;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -115,6 +115,7 @@ struct BenchOptions {
     std::vector<FastPath> fast_path_exclusions; // --no-fast-path
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    std::optional<KvCacheStorage> kv_window_cache; // --kv-window-dtype (empty: auto)
     LogitsDtype logits_dtype    = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     int device            = 0;
@@ -216,6 +217,7 @@ struct BenchEnvironment {
     bool expert_csf = false;
     std::optional<std::uint64_t> expert_pin_bytes;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
+    std::optional<KvCacheStorage> kv_window_cache; // --kv-window-dtype (empty: auto)
     LogitsDtype logits_dtype          = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;

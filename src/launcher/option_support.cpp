@@ -39,6 +39,7 @@ constexpr std::array kRules = {
     Rule{"--expert-tail-skip", kOffload},   // refused without offloaded experts
     Rule{"--route-trace", kOffload},
     // Memory.
+    Rule{"--kv-window-dtype", kInkling},    // Inkling's sliding windows; normalize_engine_options refuses it elsewhere
     Rule{"--ram-resize", kQwen},            // Inkling's Program has no resizable RAM tiers
     Rule{"--embedding-host", kDense | kMoe | kInkling}, // Flash-Next does not read it; offloaded Qwen pins it anyway
     Rule{"--prefill-split-workspace-mib", kQwen35},

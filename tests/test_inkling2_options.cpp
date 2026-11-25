@@ -116,6 +116,9 @@ void test_refused_options() {
     refused({"--ngram-session-mib", "64"}, "--ngram-session-mib");
     refused({"--lm-head-draft"}, "--lm-head-draft", false); // --spec auto finds no bundled drafter
     refused({"--lossless", "--lm-head-draft"}, "--lm-head-draft");
+    // The lossless route keeps its sliding windows BF16.
+    refused({"--lossless", "--kv-window-dtype", "int8"}, "--kv-window-dtype");
+    refused({"--lossless", "--kv-window-dtype", "bf16p"}, "--kv-window-dtype");
     // What each start sizes.
     refused({"--no-prefix-reuse", "--kv-capacity", "8192"}, "--kv-capacity");
     refused({"--max-context", "8192", "--max-concurrency", "2", "--kv-capacity", "8192"}, "--kv-capacity");
@@ -133,6 +136,10 @@ void test_refused_options() {
 
     // Engine fields no serve flag sets alone (the API, infernix-certify).
     EngineOptions api;
+    // The windows hold bf16, bf16p or int8 only (the serve and CLI parsers refuse another name before this).
+    api.kv_window_cache = KvCacheStorage::Fp8E4M3Row256;
+    check(engine_error(api).find("--kv-window-dtype") != std::string::npos, "an fp8 window format is refused");
+    api = {};
     api.speculative.draft_min_p = 0.1F;
     check(engine_error(api).find("--spec-min-p") != std::string::npos, "the API's draft_min_p is refused");
     api = {};
@@ -180,6 +187,10 @@ void test_accepted_starts() {
     accepted(ablate);
     for (const char* kv : {"bf16", "bf16p", "int8", "fp8", "nvfp4", "k8v4", "vq2", "k4v2"}) {
         accepted({"--kv-dtype", kv});
+        // Every pool takes every window format.
+        for (const char* window : {"auto", "bf16", "bf16p", "int8"}) {
+            accepted({"--kv-dtype", kv, "--kv-window-dtype", window});
+        }
     }
     accepted({"--no-prefix-reuse"});
     accepted({"--no-prefix-reuse", "--max-context", "auto", "--vram-headroom-mib", "512", "--vram-past-budget"});

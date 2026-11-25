@@ -883,6 +883,10 @@ struct EngineOptions {
     // them.
     std::vector<FastPath> fast_path_exclusions;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Inkling 2's sliding-window rings (--kv-window-dtype): BFloat16, Bf16Packed or Int8Group64. Empty (auto): BFloat16
+    // under kv_cache BFloat16, Bf16Packed under Bf16Packed, Int8Group64 under every other format. Other artifacts
+    // refuse a value.
+    std::optional<KvCacheStorage> kv_window_cache;
     // The head's logits on every route (--logits-dtype): FP32, or BF16 for comparisons with engines and
     // references that round them; a startup choice (the round buffers and CUDA Graphs are planned for it).
     LogitsDtype logits_dtype           = LogitsDtype::FP32;

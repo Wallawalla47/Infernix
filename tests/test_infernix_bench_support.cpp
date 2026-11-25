@@ -358,6 +358,15 @@ int test_cli_contract() {
                        "packed BF16 KV");
     failures += expect_string(qb::kv_cache_name(infernix::KvCacheStorage::Bf16Packed), "bf16p",
                               "packed BF16 report name");
+    failures += expect(!parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).kv_window_cache &&
+                           parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--kv-window-dtype", "bf16p"})
+                                   .kv_window_cache == infernix::KvCacheStorage::Bf16Packed,
+                       "--kv-window-dtype (default auto)");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--kv-window-dtype", "fp8"});
+        },
+        "unsupported window storage");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
@@ -551,7 +560,8 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 28, "report schema v28");
+    failures += expect(report.at("schema_version") == 29, "report schema v29");
+    failures += expect(report.at("config").at("kv_window_cache") == "auto", "report records the windows' KV format");
     failures += expect(report.at("config").at("lora") == "" && report.at("load").at("lora_adapter") == "" &&
                            report.at("memory").at("adapter_bytes") == 0 &&
                            report.at("memory").at("draft_screen_bytes") == 0,

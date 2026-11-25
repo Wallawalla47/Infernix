@@ -161,6 +161,13 @@ int main() {
     failures += check(q8_invalid && q8_text.find("--q8-weights applies to Inkling 2") != std::string::npos,
                       "--q8-weights was accepted for an artifact other than Inkling 2");
     options.q8_weights = false;
+    // --kv-window-dtype stores Inkling 2's sliding windows: every other artifact refuses it.
+    options.kv_window_cache = infernix::KvCacheStorage::Int8Group64;
+    bool window_invalid     = false;
+    const std::string window_text = construction_error(options, window_invalid);
+    failures += check(window_invalid && window_text.find("--kv-window-dtype applies to Inkling 2") != std::string::npos,
+                      "--kv-window-dtype was accepted for an artifact other than Inkling 2");
+    options.kv_window_cache.reset();
     // --no-fast-path leaves a path out of the default route's selection: the reproducible route refuses it.
     options.fast_path_exclusions = {infernix::FastPath::PromptPv8};
     bool excluded_invalid        = false;

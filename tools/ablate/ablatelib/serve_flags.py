@@ -91,6 +91,7 @@ RULES: dict[str, Rule] = {
     "--vram-past-budget": Rule(CARRY, _MEMORY),
     "--expert-tail-skip": Rule(CARRY, _NUMERICS),
     "--kv-dtype": Rule(CARRY, _NUMERICS, capture="--kv"),
+    "--kv-window-dtype": Rule(CARRY, _NUMERICS),  # Inkling 2's sliding windows
     "--logits-dtype": Rule(CARRY, _NUMERICS),
     "--no-prefix-reuse": Rule(CARRY, "how requests reuse the cache"),
     # PREFIX CACHE
