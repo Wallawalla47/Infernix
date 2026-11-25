@@ -185,6 +185,8 @@ std::vector<TokenId> cat(std::initializer_list<std::vector<TokenId>> parts) {
     return out;
 }
 
+void notation_cases(const Harness& h);
+
 void rule_cases(const Harness& h) {
     const auto& k = h.markers;
     const std::vector<TokenId> M{k.message_model}, CT{k.thinking}, CX{k.content[0]}, CJ{k.tool_call},
@@ -302,6 +304,120 @@ void rule_cases(const Harness& h) {
                   infernix::ToolCallParseFallbackReason::MalformedStructure,
               "limit in a call: diagnostics");
     }
+    { // Calls that leave out a property their tool requires are published as written and counted (JJ-03).
+        auto s     = h.settings(nullptr);
+        auto names = std::make_shared<ink::ToolNames>();
+        names->declared = {"write_file", "list_dir"};
+        names->tools    = {ink::DeclaredTool{.name = "write_file", .required = {"path", "content"}},
+                           ink::DeclaredTool{.name = "list_dir"}};
+        s.tools         = std::move(names);
+        ink::OutputSession session(std::move(s));
+        const auto ids = cat({M, CJ, h.encode(R"({"name":"write_file","args":{"path":"a.txt"}})"), E,
+                              M, CJ, h.encode(R"({"name":"write_file","args":{"path":"b","content":"x"}})"), E,
+                              M, CJ, h.encode(R"({"name":"list_dir","args":{}})"), E, EOS});
+        const Turn turn = Harness::run(session, ids, 3, true);
+        check(turn.calls.size() == 3 && turn.calls.front().arguments_json == R"({"path":"a.txt"})" &&
+                  session.tool_call_parse_diagnostics().required_arguments_missing == 1,
+              "required: a call without a required property was changed or not counted once");
+    }
+    notation_cases(h);
+}
+
+// Calls written in the XML notation the model drifts into (JC-01): a <|content_text|> block of nothing but closed
+// invokes of the turn's notation tools, followed by a call block or the end of the turn, is calls; everything else
+// publishes exactly the text it would have, in every round split.
+void notation_cases(const Harness& h) {
+    const auto& k = h.markers;
+    const std::vector<TokenId> M{k.message_model}, CT{k.thinking}, CX{k.content[0]}, CJ{k.tool_call},
+        E{k.end_message}, EOS{k.end_of_turn};
+    const auto settings = [&](bool parallel) {
+        auto s           = h.settings(Json::array({"edit_file", "lookup", "strict_tool"}));
+        s.notation_tools = {
+            ink::DeclaredTool{.name       = "edit_file",
+                              .parameters = R"({"type":"object","properties":{"path":{"type":"string"},)"
+                                            R"("count":{"type":"integer"},"flags":{"type":"array"}},"required":["path"]})",
+                              .required   = {"path"}},
+            ink::DeclaredTool{.name = "lookup", .parameters = R"({"type":"object","properties":{"q":{"type":"string"}}})"}};
+        s.parallel_calls = parallel;
+        return s;
+    };
+    struct Case {
+        std::string name;
+        std::vector<TokenId> ids;
+        bool parallel = true;
+        std::vector<infernix::StopString> stops;
+        Json calls;              // expected calls ({name, arguments})
+        std::string content;     // expected content
+        std::string reasoning;   // expected reasoning
+        FinishReason finish = FinishReason::StopToken;
+    };
+    const std::string bare = "<invoke name=\"edit_file\">\n<parameter name=\"path\">007</parameter>\n"
+                             "<parameter name=\"count\">7</parameter>\n<parameter name=\"extra\">true</parameter>\n</invoke>";
+    const Json bare_args = {{"path", "007"}, {"count", 7}, {"extra", true}};
+    const std::string wrapped =
+        "<tool_call>\n<function_calls>\n<invoke name=\"edit_file\">\n<parameter name=\"path\" string=\"true\">"
+        "x</parameter> y</parameter>\n<parameter name=\"flags\">[\"a\", 2]</parameter>\n</invoke>\n</function_calls>\n"
+        "</tool_call>";
+    const Json wrapped_args = {{"path", "x</parameter> y"}, {"flags", Json::array({"a", 2})}};
+    const std::string lookup = "<function_calls>\n<invoke name=\"lookup\">\n<parameter name=\"q\">a && b <div></parameter>\n"
+                               "</invoke>\n</function_calls>";
+    const std::string two = "<invoke name=\"lookup\">\n<parameter name=\"q\">a</parameter>\n</invoke>\n"
+                            "<invoke name=\"lookup\">\n<parameter name=\"q\">b</parameter>\n</invoke>";
+    const std::vector<Case> cases = {
+        {"bare invoke, typed by schema", cat({M, CX, h.encode(bare), E, EOS}), true, {},
+         Json::array({{{"name", "edit_file"}, {"arguments", bare_args}}}), "", ""},
+        {"wrapped, string=\"true\", a quoted closer", cat({M, CX, h.encode("\n" + wrapped + "\n"), E, EOS}), true, {},
+         Json::array({{{"name", "edit_file"}, {"arguments", wrapped_args}}}), "", ""},
+        {"raw <, & and > kept as written", cat({M, CX, h.encode(lookup), E, EOS}), true, {},
+         Json::array({{{"name", "lookup"}, {"arguments", {{"q", "a && b <div>"}}}}}), "", ""},
+        {"a call block after it: both calls, in order",
+         cat({M, CX, h.encode(lookup), E, M, CJ, h.encode(R"({"name":"edit_file","args":{"path":"b"}})"), E, EOS}), true,
+         {}, Json::array({{{"name", "lookup"}, {"arguments", {{"q", "a && b <div>"}}}},
+                          {{"name", "edit_file"}, {"arguments", {{"path", "b"}}}}}),
+         "", ""},
+        {"two invokes, parallel calls", cat({M, CX, h.encode(two), E, EOS}), true, {},
+         Json::array({{{"name", "lookup"}, {"arguments", {{"q", "a"}}}}, {{"name", "lookup"}, {"arguments", {{"q", "b"}}}}}),
+         "", ""},
+        {"two invokes, parallel false: text", cat({M, CX, h.encode(two), E, EOS}), false, {}, Json::array(), two, ""},
+        {"text before the notation: text", cat({M, CX, h.encode("Calling it: " + bare), E, EOS}), true, {},
+         Json::array(), "Calling it: " + bare, ""},
+        {"text after the notation in the block: text", cat({M, CX, h.encode(bare + "\nDone."), E, EOS}), true, {},
+         Json::array(), bare + "\nDone.", ""},
+        {"a text block after it: text", cat({M, CX, h.encode(bare), E, M, CX, h.encode("Done."), E, EOS}), true, {},
+         Json::array(), bare + "Done.", ""},
+        {"an undeclared tool: text",
+         cat({M, CX, h.encode("<invoke name=\"other\">\n<parameter name=\"q\">a</parameter>\n</invoke>"), E, EOS}), true,
+         {}, Json::array(), "<invoke name=\"other\">\n<parameter name=\"q\">a</parameter>\n</invoke>", ""},
+        {"a strict tool (not a notation tool): text",
+         cat({M, CX, h.encode("<invoke name=\"strict_tool\">\n</invoke>"), E, EOS}), true, {}, Json::array(),
+         "<invoke name=\"strict_tool\">\n</invoke>", ""},
+        {"inside thinking: reasoning", cat({M, CT, h.encode(bare), E, M, CX, h.encode("ok"), E, EOS}), true, {},
+         Json::array(), "ok", bare},
+        {"cut by the output limit inside: text", cat({M, CX, h.encode(bare.substr(0, 60))}), true, {}, Json::array(),
+         bare.substr(0, 60), "", FinishReason::OutputLimit},
+        {"closed, then the output limit: text", cat({M, CX, h.encode(bare), E}), true, {}, Json::array(), bare, "",
+         FinishReason::OutputLimit},
+        {"a stop string inside it: matched as unheld", cat({M, CX, h.encode(bare), E, EOS}), true,
+         {{.text = "007", .channel = OutputChannel::Content}}, Json::array(),
+         "<invoke name=\"edit_file\">\n<parameter name=\"path\">", "", FinishReason::StopString},
+    };
+    for (const Case& c : cases) {
+        for (const std::size_t round : {std::size_t{1}, std::size_t{3}, std::size_t{16}}) {
+            auto s           = settings(c.parallel);
+            s.policy.strings = c.stops;
+            ink::OutputSession session(std::move(s));
+            const Turn turn         = Harness::run(session, c.ids, round, round == 3);
+            const std::string where = "notation: " + c.name + " (rounds of " + std::to_string(round) + ")";
+            check(same_calls(turn.calls, c.calls), where + ": calls differ (" + std::to_string(turn.calls.size()) + ")");
+            check(turn.content == c.content, where + ": content " + Json(turn.content).dump());
+            check(turn.reasoning == c.reasoning, where + ": reasoning " + Json(turn.reasoning).dump());
+            check(turn.finish == c.finish, where + ": finish reason");
+            check(session.tool_call_parse_diagnostics().notation_calls ==
+                      (c.calls.size() - (c.name.starts_with("a call block") ? 1 : 0)),
+                  where + ": notation_calls");
+        }
+    }
+    std::cout << cases.size() << " notation cases\n";
 }
 
 } // namespace

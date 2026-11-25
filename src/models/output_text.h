@@ -5,9 +5,13 @@
 
 #include "infernix/types.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace infernix::models {
 
@@ -22,5 +26,15 @@ inline constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 
 // The bytes at the end of `text` that could start one of the policy's stop strings on `channel`.
 [[nodiscard]] std::size_t stop_hold_size(std::string_view text, OutputChannel channel, const StopPolicy& policy);
+
+// The properties a tool's parameter schema requires at its root (`"required": [names]`), in order; empty when it
+// requires none or is not an object.
+[[nodiscard]] std::vector<std::string> required_properties(const nlohmann::ordered_json& schema);
+
+// Whether a published call's argument object (its JSON text) leaves out a property of `required`. Basic protection
+// keeps a call's form, not its schema, so such a call is only counted for the operator
+// (ToolCallParseDiagnostics::required_arguments_missing), never completed: a value the model did not write would be
+// invented.
+[[nodiscard]] bool omits_required(std::string_view arguments_json, std::span<const std::string> required);
 
 } // namespace infernix::models

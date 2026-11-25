@@ -61,7 +61,117 @@ struct State {
     // A constrained turn's branch (ConstraintObservation::branch): it opened a content block, or a call block.
     bool opened_content = false;
     bool opened_call    = false;
+    // A <|content_text|> block that may be calls in an XML notation (Settings::notation_tools): Open while the block's
+    // text begins (or may still begin) with a notation opener, its output held in notation_output and its text kept;
+    // Closed once the closed block parsed as calls (notation_calls), until what follows decides. A block that is not
+    // one publishes what it held, as it would have unheld (stop strings matched it as it came).
+    enum class Notation : std::uint8_t { None, Open, Closed };
+    Notation notation = Notation::None;
+    std::string notation_text;
+    PublishedOutput notation_output;
+    std::vector<GeneratedToolCall> notation_calls;
 };
+
+// The block openers of the XML notation (JC-01).
+constexpr std::string_view kNotationOpeners[] = {"<tool_call>", "<function_calls>", "<invoke "};
+
+std::size_t skip_space(std::string_view s, std::size_t at) {
+    while (at < s.size() && (s[at] == ' ' || s[at] == '\t' || s[at] == '\n' || s[at] == '\r')) { ++at; }
+    return at;
+}
+
+// Whether a text block's text so far may still be, or begins with, a notation opener after its leading whitespace.
+bool notation_candidate(std::string_view text) {
+    const std::string_view t = text.substr(skip_space(text, 0));
+    for (const std::string_view opener : kNotationOpeners) {
+        if (t.starts_with(opener) || opener.starts_with(t)) { return true; }
+    }
+    return false;
+}
+
+// One `<invoke>` of the notation: the tool's name and its parameters (name, value text, the string="..." attribute or
+// empty).
+struct NotationInvoke {
+    std::string name;
+    struct Parameter {
+        std::string name, value, string_flag;
+    };
+    std::vector<Parameter> parameters;
+};
+
+// A quoted attribute `KEY="VALUE"` (or single-quoted) at `at` after whitespace; VALUE has no quote, `<` or `>`.
+bool notation_attribute(std::string_view s, std::size_t& at, std::string_view key, std::string& value) {
+    std::size_t i = skip_space(s, at);
+    if (i == at || !s.substr(i).starts_with(key) || i + key.size() >= s.size() || s[i + key.size()] != '=') { return false; }
+    i += key.size() + 1;
+    if (i >= s.size() || (s[i] != '"' && s[i] != '\'')) { return false; }
+    const char quote = s[i++];
+    const std::size_t end = s.find(quote, i);
+    if (end == std::string_view::npos) { return false; }
+    value = std::string(s.substr(i, end - i));
+    if (value.find_first_of("\"'<>") != std::string::npos) { return false; }
+    at = end + 1;
+    return true;
+}
+
+// The whole of `s` as notation calls: optional `<tool_call>` and `<function_calls>` wrappers (each closed if opened), one
+// or more closed invokes, whitespace between; anything else (text, an unclosed tag, a tag left open) is not. A value
+// ends at the `</parameter>` that whitespace and then `<parameter ` or `</invoke>` follow (one quoted inside it is the
+// value's), as Qwen's parser and Basalt's read a raw value.
+bool parse_notation(std::string_view s, std::vector<NotationInvoke>& calls) {
+    std::size_t at = skip_space(s, 0);
+    const auto take = [&](std::string_view tag) {
+        if (!s.substr(at).starts_with(tag)) { return false; }
+        at = skip_space(s, at + tag.size());
+        return true;
+    };
+    const bool tool_call      = take("<tool_call>");
+    const bool function_calls = take("<function_calls>");
+    while (s.substr(at).starts_with("<invoke")) {
+        NotationInvoke call;
+        at += std::string_view("<invoke").size();
+        if (!notation_attribute(s, at, "name", call.name) || call.name.empty()) { return false; }
+        at = skip_space(s, at);
+        if (at >= s.size() || s[at] != '>') { return false; }
+        at = skip_space(s, at + 1);
+        for (;;) {
+            if (take("</invoke>")) { break; }
+            if (!s.substr(at).starts_with("<parameter")) { return false; }
+            NotationInvoke::Parameter p;
+            at += std::string_view("<parameter").size();
+            if (!notation_attribute(s, at, "name", p.name) || p.name.empty()) { return false; }
+            std::size_t after = at;
+            if (notation_attribute(s, after, "string", p.string_flag)) {
+                if (p.string_flag != "true" && p.string_flag != "false") { return false; }
+                at = after;
+            }
+            at = skip_space(s, at);
+            if (at >= s.size() || s[at] != '>') { return false; }
+            const std::size_t start = ++at;
+            for (std::size_t from = start;;) {
+                const std::size_t close = s.find("</parameter>", from);
+                if (close == std::string_view::npos) { return false; }
+                const std::size_t next = skip_space(s, close + std::string_view("</parameter>").size());
+                const std::string_view rest = s.substr(next);
+                if (rest.starts_with("<parameter ") || rest.starts_with("</invoke>")) {
+                    p.value = std::string(s.substr(start, close - start));
+                    at      = next;
+                    break;
+                }
+                from = close + 1;
+            }
+            for (const NotationInvoke::Parameter& seen : call.parameters) {
+                if (seen.name == p.name) { return false; } // a repeated parameter: not one call's arguments
+            }
+            call.parameters.push_back(std::move(p));
+        }
+        calls.push_back(std::move(call));
+    }
+    if (calls.empty()) { return false; }
+    if (function_calls && !take("</function_calls>")) { return false; }
+    if (tool_call && !take("</tool_call>")) { return false; }
+    return at == s.size();
+}
 
 void feed_channel(State& state, OutputChannel channel, std::string_view text, const StopPolicy& policy,
                   PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best) {
@@ -135,6 +245,14 @@ public:
                 return false;
             }
         }
+        ws();
+        return i_ == s_.size();
+    }
+
+    // Whether the text is one JSON value (whitespace around it allowed).
+    bool whole_value() {
+        ws();
+        if (!value(0)) { return false; }
         ws();
         return i_ == s_.size();
     }
@@ -221,6 +339,83 @@ private:
     std::size_t i_ = 0;
 };
 
+// The JSON types a property of `schema` (the tool's parameter schema, JSON text) declares: its "type" (a name or an
+// array of names), else the types of its enum / const values; empty when it declares none.
+std::vector<std::string> declared_types(const nlohmann::ordered_json& schema, const std::string& property) {
+    std::vector<std::string> types;
+    if (!schema.is_object() || !schema.contains("properties") || !schema["properties"].is_object() ||
+        !schema["properties"].contains(property) || !schema["properties"][property].is_object()) {
+        return types;
+    }
+    const auto& p = schema["properties"][property];
+    const auto add_value_type = [&](const nlohmann::ordered_json& v) {
+        types.push_back(v.is_string() ? "string" : v.is_boolean() ? "boolean" : v.is_number() ? "number"
+                        : v.is_null() ? "null" : v.is_array() ? "array" : "object");
+    };
+    if (p.contains("type") && p["type"].is_string()) {
+        types.push_back(p["type"].get<std::string>());
+    } else if (p.contains("type") && p["type"].is_array()) {
+        for (const auto& t : p["type"]) {
+            if (t.is_string()) { types.push_back(t.get<std::string>()); }
+        }
+    } else if (p.contains("enum") && p["enum"].is_array()) {
+        for (const auto& v : p["enum"]) { add_value_type(v); }
+    } else if (p.contains("const")) {
+        add_value_type(p["const"]);
+    }
+    return types;
+}
+
+// The JSON type of a value text CallJson accepted.
+std::string value_type(std::string_view text) {
+    const std::size_t at = skip_space(text, 0);
+    const char c         = at < text.size() ? text[at] : '\0';
+    if (c == '{') { return "object"; }
+    if (c == '[') { return "array"; }
+    if (c == '"') { return "string"; }
+    if (c == 't' || c == 'f') { return "boolean"; }
+    if (c == 'n') { return "null"; }
+    return "number";
+}
+
+// A notation call's arguments as JSON text: a value marked string="true" is its text; one marked string="false" is
+// the JSON it holds (its text when it holds none); otherwise the value is the JSON it holds when that is a type its
+// property declares (any type when it declares none, a string never: a string value is its text) and its text
+// otherwise. JSON values keep their text as written (CallJson), so a number keeps its digits. No entity is decoded:
+// the value is the model's text. False when a value is not valid UTF-8 text.
+bool notation_arguments(const NotationInvoke& call, const DeclaredTool& tool, std::string& out) {
+    const nlohmann::ordered_json schema = nlohmann::ordered_json::parse(tool.parameters, nullptr, false);
+    out = "{";
+    try {
+        for (const NotationInvoke::Parameter& p : call.parameters) {
+            if (out.size() > 1) { out.push_back(','); }
+            out += nlohmann::json(p.name).dump();
+            out.push_back(':');
+            const bool json = p.string_flag != "true" && CallJson(p.value).whole_value();
+            const std::vector<std::string> types =
+                p.string_flag.empty() ? declared_types(schema, p.name) : std::vector<std::string>{};
+            const std::string type = json ? value_type(p.value) : std::string();
+            const bool admitted    = json && (type != "string" || p.string_flag == "false") &&
+                                  (types.empty() || std::find(types.begin(), types.end(), type) != types.end() ||
+                                   (type == "number" && std::find(types.begin(), types.end(), "integer") != types.end()));
+            if (admitted) {
+                const std::size_t first = skip_space(p.value, 0);
+                std::size_t last        = p.value.size();
+                while (last > first && std::string_view(" \t\n\r").find(p.value[last - 1]) != std::string_view::npos) {
+                    --last;
+                }
+                out.append(p.value, first, last - first);
+            } else {
+                out += nlohmann::json(p.value).dump();
+            }
+        }
+    } catch (const nlohmann::json::exception&) {
+        return false; // not valid UTF-8
+    }
+    out.push_back('}');
+    return true;
+}
+
 } // namespace
 
 void PublishedOutput::append(OutputChannel channel, std::string_view text) {
@@ -249,6 +444,7 @@ public:
         raw            = s.output.raw;
         preserve       = s.output.raw || s.output.preserve_special_tokens;
         parse_calls    = !raw && s.tools != nullptr;
+        notation       = parse_calls && !s.notation_tools.empty();
         // An opened answer: the turn starts inside its text block.
         if (s.answer_opened && !raw) {
             committed.phase          = Phase::Content;
@@ -325,8 +521,89 @@ public:
             fall_back(state, std::move(body), ToolCallParseFallbackReason::UndeclaredTool, emitted);
             return;
         }
+        const auto declared = std::find_if(s.tools->tools.begin(), s.tools->tools.end(),
+                                           [&](const DeclaredTool& entry) { return entry.name == tool; });
+        if (declared != s.tools->tools.end() && omits_required(args, declared->required)) {
+            ++state.diagnostics.required_arguments_missing;
+        }
         state.calls.push_back(GeneratedToolCall{.name = std::move(tool), .arguments_json = std::string(args)});
         ++state.diagnostics.structured_call_count;
+    }
+
+    // A notation candidate's text (State::Notation::Open): its output goes to the hold, its text is kept, and a stop
+    // string still matches it as it comes (the match's output is what was published before the hold, then the held
+    // text to the stop). `close`: the block's close (an incomplete code point becomes U+FFFD, the stop hold flushes).
+    void feed_held(State& state, std::string_view bytes, bool close, PublishedOutput& emitted, std::uint32_t committed,
+                   StopMatch* best) const {
+        StopMatch local;
+        StopMatch* const match = best != nullptr ? &local : nullptr;
+        if (close) {
+            if (!state.utf8_pending.empty()) { state.notation_text.append(kUtf8Replacement); }
+            close_text(state, OutputChannel::Content, state.notation_output, committed, match);
+        } else {
+            state.utf8_pending.append(bytes);
+            const std::string text = consume_generated_utf8(state.utf8_pending);
+            state.notation_text += text;
+            feed_channel(state, OutputChannel::Content, text, s.policy, state.notation_output, committed, match);
+        }
+        if (match != nullptr && local.found &&
+            precedes(local.committed_tokens, local.byte_cut, local.declaration_order, *best)) {
+            PublishedOutput output = emitted;
+            for (const OutputDelta& delta : local.output) { output.append(delta.channel, delta.text); }
+            local.output = std::move(output);
+            *best        = std::move(local);
+        }
+    }
+
+    // A held block that is not calls publishes what it held, where it would have.
+    void release_notation(State& state, PublishedOutput& emitted) const {
+        for (const OutputDelta& delta : state.notation_output) { emitted.append(delta.channel, delta.text); }
+        state.notation = State::Notation::None;
+        state.notation_text.clear();
+        state.notation_output.clear();
+        state.notation_calls.clear();
+    }
+
+    // A closed held block followed by a call block or the turn's end: its calls are the turn's.
+    void accept_notation(State& state) const {
+        for (GeneratedToolCall& call : state.notation_calls) {
+            const auto declared = std::find_if(s.notation_tools.begin(), s.notation_tools.end(),
+                                               [&](const DeclaredTool& tool) { return tool.name == call.name; });
+            if (declared != s.notation_tools.end() && omits_required(call.arguments_json, declared->required)) {
+                ++state.diagnostics.required_arguments_missing;
+            }
+            state.calls.push_back(std::move(call));
+            ++state.diagnostics.structured_call_count;
+            ++state.diagnostics.notation_calls;
+        }
+        state.diagnostics.marker_seen = true;
+        state.notation                = State::Notation::None;
+        state.notation_text.clear();
+        state.notation_output.clear();
+        state.notation_calls.clear();
+    }
+
+    // A held block's close: whole notation calls of the turn's notation tools wait for what follows (Closed); anything
+    // else is text.
+    void close_notation(State& state, PublishedOutput& emitted) const {
+        std::vector<NotationInvoke> invokes;
+        std::vector<GeneratedToolCall> calls;
+        bool ok = parse_notation(state.notation_text, invokes);
+        for (std::size_t i = 0; ok && i < invokes.size(); ++i) {
+            const auto declared = std::find_if(s.notation_tools.begin(), s.notation_tools.end(),
+                                               [&](const DeclaredTool& tool) { return tool.name == invokes[i].name; });
+            std::string arguments;
+            ok = declared != s.notation_tools.end() && notation_arguments(invokes[i], *declared, arguments);
+            if (ok) { calls.push_back(GeneratedToolCall{.name = invokes[i].name, .arguments_json = std::move(arguments)}); }
+        }
+        if (ok && !s.parallel_calls && state.calls.size() + calls.size() > 1) { ok = false; }
+        if (!ok) {
+            release_notation(state, emitted);
+            return;
+        }
+        state.notation       = State::Notation::Closed;
+        state.notation_calls = std::move(calls);
+        state.notation_text.clear();
     }
 
     // One generated (or injected) token.
@@ -337,6 +614,19 @@ public:
             feed_text(state, OutputChannel::Content, decoded.bytes, emitted, committed, best);
             return;
         }
+        if (state.phase == Phase::Between && state.notation == State::Notation::Closed) {
+            // What follows a closed notation block decides it: a call block (when the turn may make several calls)
+            // keeps it calls; a thinking or text block makes it text. Headers between blocks decide nothing.
+            if (token == s.markers.tool_call && parse_calls) {
+                if (s.parallel_calls) {
+                    accept_notation(state);
+                } else {
+                    release_notation(state, emitted);
+                }
+            } else if (token == s.markers.thinking || content_opener(token)) {
+                release_notation(state, emitted);
+            }
+        }
         switch (state.phase) {
         case Phase::Between:
             if (token == s.markers.thinking) {
@@ -344,6 +634,11 @@ public:
             } else if (content_opener(token)) {
                 state.phase          = Phase::Content;
                 state.opened_content = true;
+                if (notation && token == s.markers.content[0]) { // a <|content_text|> block
+                    state.notation = State::Notation::Open;
+                    state.notation_text.clear();
+                    state.notation_output.clear();
+                }
             } else if (token == s.markers.tool_call) {
                 state.phase                   = Phase::Call;
                 state.opened_call             = true;
@@ -354,12 +649,24 @@ public:
         case Phase::Content: {
             const OutputChannel channel =
                 state.phase == Phase::Reasoning ? OutputChannel::Reasoning : OutputChannel::Content;
+            const bool held = state.phase == Phase::Content && state.notation == State::Notation::Open;
             if (token == s.markers.end_message) {
-                close_text(state, channel, emitted, committed, best);
+                if (held) {
+                    feed_held(state, {}, true, emitted, committed, best);
+                    close_notation(state, emitted);
+                } else {
+                    close_text(state, channel, emitted, committed, best);
+                }
                 state.phase = Phase::Between;
                 return;
             }
             if (decoded.special && !preserve) { return; }
+            if (held) {
+                feed_held(state, decoded.bytes, false, emitted, committed, best);
+                // Text that can no longer begin with an opener publishes what was held and goes on unheld.
+                if (!notation_candidate(state.notation_text)) { release_notation(state, emitted); }
+                return;
+            }
             feed_text(state, channel, decoded.bytes, emitted, committed, best);
             return;
         }
@@ -376,8 +683,19 @@ public:
     }
 
     // The turn ends with a block open (a limit, a cancellation, a stop token): its text publishes; an open call is
-    // text.
-    void terminalize(State& state, PublishedOutput& emitted) const {
+    // text. `turn_ended`: a stop token ended the turn, which keeps a closed notation block calls; a limit or a
+    // cancellation leaves it text (the turn did not end after it), as a notation block it cut.
+    void terminalize(State& state, PublishedOutput& emitted, bool turn_ended = false) const {
+        if (state.notation == State::Notation::Open && state.phase == Phase::Content) {
+            feed_held(state, {}, true, emitted, 0, nullptr);
+            release_notation(state, emitted);
+        } else if (state.notation == State::Notation::Closed) {
+            if (turn_ended) {
+                accept_notation(state);
+            } else {
+                release_notation(state, emitted);
+            }
+        }
         if (state.phase == Phase::Reasoning || raw) {
             close_text(state, raw ? OutputChannel::Content : OutputChannel::Reasoning, emitted, 0, nullptr);
         } else if (state.phase == Phase::Content) {
@@ -416,6 +734,7 @@ public:
     bool raw         = false;
     bool preserve    = false;
     bool parse_calls = false;
+    bool notation    = false; // Settings::notation_tools applies
     State committed;
     State preview;
     PublishedOutput preview_output;
@@ -471,7 +790,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
         if (m.stop_token(token)) {
             if (m.s.policy.publish_stop_token) { m.feed_token(state, token, m.preview_output, count, nullptr); }
-            m.terminalize(state, m.preview_output);
+            m.terminalize(state, m.preview_output, true);
             return complete(count, FinishReason::StopToken);
         }
         StopMatch match;

@@ -534,7 +534,11 @@ remains a structured call: valid JSON retains its represented type and other tex
 the tool consumer can report the validation error and continue the agent loop. Schemas that name no
 type this way (no type keyword, an invalid type name, a remote, missing or circular reference)
 retain untyped inference. Infernix does not apply defaults, enforce required
-properties, or perform recursive JSON Schema validation on this route.
+properties, or perform recursive JSON Schema validation on this route. A call that leaves out a
+property its tool's schema lists under `required` is published as the model wrote it (a value it
+did not write would be invented); `tool_call_parse.required_arguments_missing` and
+`infernix_tool_call_required_arguments_missing_total` count such calls on every route and model,
+Basic protection's included (it keeps a call's form, not its schema; a strict tool cannot omit one).
 
 On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
@@ -2427,6 +2431,8 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `infernix_chat_reasoning_missing_total{message}`, `infernix_chat_reasoning_restored_total{message}` | Chat Completions assistant messages received without reasoning (`tool_call`: every tool-call message; `answer`: answers whose response from this server had reasoning), and those `--restore-reasoning` restored |
 | `infernix_tool_call_arguments_unwrapped_total` | Generated tool calls whose only parameter, an `arguments` their tool does not declare, held the whole argument object and was unwrapped (see the tool-parameter conversion above) |
+| `infernix_tool_call_required_arguments_missing_total` | Generated tool calls whose arguments leave out a property their declared tool's schema requires, published as written (strict tools cannot) |
+| `infernix_tool_call_notation_total` | Inkling 2 tool calls read from the XML notation the model drifts into (a text block of `<invoke name=...>` calls; [Inkling 2 Mini](inkling2-mini.md#constrained-output-and-tool-calls)) |
 | `infernix_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `infernix_request_duration_seconds`, `infernix_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 
@@ -2632,7 +2638,10 @@ counts; anything else is ignored, and the request itself is unaffected.
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, `duplicate_parameters_repaired`, `arguments_unwrapped` (calls
-whose lone undeclared `arguments` object became their arguments), and a stable fallback reason.
+whose lone undeclared `arguments` object became their arguments), `required_arguments_missing`
+(calls that leave out a property their tool's schema requires, published as written),
+`notation_calls` (Inkling 2 calls read from the XML notation the model drifts into; see
+[Inkling 2 Mini](inkling2-mini.md#constrained-output-and-tool-calls)), and a stable fallback reason.
 On the unconstrained route a parameter named more than once in one call keeps its last value, as in
 JSON object syntax, and counts once in `duplicate_parameters_repaired` for each repeat instead of
 demoting the call to text (a constrained call cannot repeat a name).

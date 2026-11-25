@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/output_text.h"
 #include "text/json_input.h"
 
 #include <nlohmann/json.hpp>
@@ -1240,6 +1241,17 @@ std::size_t next_call_marker(GeneratedText output, const Contract& contract, std
     return std::min(token, bare);
 }
 
+// The published calls whose arguments leave out a property their declared tool requires (undeclared names under
+// open_names have no schema to read).
+std::uint32_t calls_missing_required(const Contract& contract, const std::vector<GeneratedToolCall>& calls) {
+    std::uint32_t missing = 0;
+    for (const GeneratedToolCall& call : calls) {
+        const Contract::Tool* tool = find_tool_contract(contract, call.name);
+        if (tool != nullptr && omits_required(call.arguments_json, tool->required)) { ++missing; }
+    }
+    return missing;
+}
+
 // Normalizes an accepted region's calls into the structured turn.
 void publish_structured_calls(ParsedToolCallOutput& out, const std::vector<RawToolCall>& raw_calls,
                               std::uint32_t duplicate_repairs, const Contract& contract) {
@@ -1248,6 +1260,7 @@ void publish_structured_calls(ParsedToolCallOutput& out, const std::vector<RawTo
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
     }
     out.diagnostics.duplicate_parameters_repaired = duplicate_repairs;
+    out.diagnostics.required_arguments_missing    = calls_missing_required(contract, out.tool_calls);
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response             = true;
 }
@@ -2033,6 +2046,7 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
         result.diagnostics             = stream_->diagnostics();
         result.diagnostics.marker_seen = true;
         result.tool_calls              = std::move(stream_->calls());
+        result.diagnostics.required_arguments_missing = calls_missing_required(*contract_, result.tool_calls);
         return result;
     }
     if (contract_->constrained && contract_->required && reason == FinishReason::StopToken)

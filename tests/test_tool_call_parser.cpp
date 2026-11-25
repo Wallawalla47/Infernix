@@ -174,6 +174,42 @@ int test_multiple_calls() {
     return failures;
 }
 
+// A call that leaves out a property its tool's schema requires is published as the model wrote it and counted
+// (JJ-03): on the whole-text route, the free streamed route and Basic protection's constrained route, which keeps the
+// call's form but not its schema. A tool that requires nothing and a complete call count nothing.
+int test_required_arguments_missing() {
+    const Json file_properties{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}};
+    const auto declarations = contract_from_definitions(
+        {tool_definition("write_file", file_properties, Json::array({"path", "content"})),
+         tool_definition("list_dir", Json{{"path", Json{{"type", "string"}}}})});
+    const std::string text = tool_call("write_file", {{"path", "a.txt"}}) + "\n" +
+                             tool_call("write_file", {{"path", "b.txt"}, {"content", "x"}}) + "\n" +
+                             tool_call("list_dir");
+    int failures = 0;
+    const auto parsed = parse(text, 64, *declarations);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 3 &&
+                          parsed.tool_calls.front().arguments_json == R"({"path":"a.txt"})" &&
+                          parsed.diagnostics.required_arguments_missing == 1,
+                      "whole text: a call without a required property was changed or not counted once");
+    const auto constrained = fi::select_tool_call_contract(declarations, infernix::ToolChoice{});
+    failures += check(constrained && constrained->constrained, "default tool choice did not constrain the calls");
+    for (const auto& contract : {declarations, constrained}) {
+        if (!contract) { continue; }
+        const std::string route = contract->constrained ? "constrained" : "free";
+        fi::ToolCallOutputDecoder decoder(contract, 64);
+        for (std::size_t at = 0; at < text.size(); at += 5) { (void)feed(decoder, text, at, 5); }
+        const auto terminal = decoder.finish();
+        failures += check(terminal.tool_calls.size() == 3 &&
+                              terminal.tool_calls.front().arguments_json == R"({"path":"a.txt"})" &&
+                              terminal.diagnostics.required_arguments_missing == 1,
+                          route + " stream: a call without a required property was changed or not counted once");
+    }
+    const auto complete = parse(tool_call("write_file", {{"path", "b.txt"}, {"content", "x"}}), 64, *declarations);
+    failures += check(complete.tool_calls.size() == 1 && complete.diagnostics.required_arguments_missing == 0,
+                      "a call with every required property was counted");
+    return failures;
+}
+
 // Several functions inside one `<tool_call>` wrapper are each a call, strict and tolerant (candidates WD-43; vLLM
 // #43713); a malformed later function still fails a strict region as a whole.
 int test_functions_in_one_wrapper() {
@@ -2737,6 +2773,7 @@ int run_tests() {
     failures += test_invalid_utf8_parameter_value();
     failures += test_duplicate_parameter_keeps_last_value();
     failures += test_multiple_calls();
+    failures += test_required_arguments_missing();
     failures += test_functions_in_one_wrapper();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
@@ -2805,7 +2842,7 @@ int probe_parse() {
                 definitions.push_back(tool_definition(name, std::move(properties)));
             }
             const auto contract = contract_from_definitions(definitions);
-            const auto parsed   = parse(input.at("text").get<std::string>(), 64, *contract);
+            const auto parsed   = parse(input.at("text").get<std::string>(), 64, *contract, input.value("tolerant", false));
             Json calls          = Json::array();
             for (const auto& call : parsed.tool_calls) {
                 calls.push_back(Json{{"name", call.name}, {"arguments", Json::parse(call.arguments_json)}});

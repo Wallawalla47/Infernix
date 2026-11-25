@@ -271,6 +271,21 @@ declared with `strict: true`, `parallel_tool_calls: false`, and the protection o
   tools (`auto`) is either the answer or the calls.
 - Calls arrive whole when they close, not streamed argument by argument as Qwen's constrained calls are. A call's
   arguments are its `args` object as the model wrote it (with or without a constraint).
+- The model sometimes writes a call in an XML notation it was never shown, as a text block:
+  `<invoke name="NAME"><parameter name="KEY">VALUE</parameter>...</invoke>`, bare or inside
+  `<tool_call><function_calls>`, a parameter with or without `string="true"` (18 of 50 replies on Basalt #540's
+  one-tool edit probe, temperature 0, here as on Basalt; 2026-11-24). Such a block is the calls it holds, on every route
+  (Basic protection included, unlike Qwen, whose constrained content keeps these spellings as text), when all of these
+  hold: it begins with `<tool_call>`, `<function_calls>` or `<invoke ` after whitespace; it holds nothing but closed
+  invokes of the turn's callable tools (wrappers closed); a call block or the turn's end follows it. A strict tool's
+  call stays text (its arguments were never held to its schema), as do more than one call under `parallel_tool_calls:
+  false`, any XML in thinking, `tool_choice: none`, a block cut by the output limit or followed by the limit, and a
+  block a stop string ends (matched as if never held). A value ends at the `</parameter>` that a parameter or
+  `</invoke>` follows (one quoted inside the value is the value's); it is the model's text, entities undecoded;
+  `string="true"` keeps it as a string; otherwise it is the JSON it holds when that is a type its property declares
+  (any when it declares none) and a string otherwise. Such a block publishes nothing until it is decided; text then
+  publishes exactly as unheld. `tool_call_parse.notation_calls` and `infernix_tool_call_notation_total` count these
+  calls.
 - A constrained request needs the model's own end of turn: custom stop strings and raw output are refused beside a
   constraint. `--tool-parameter-names declared` remains a Qwen option and is refused.
 - DSpark keeps drafting under a constraint: each verified position samples under its own mask, so the output is the

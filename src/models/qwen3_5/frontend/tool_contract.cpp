@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/tool_contract.h"
+#include "models/output_text.h"
 #include "text/json_schema.h"
 #include "text/json_input.h"
 
@@ -459,6 +460,7 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons,
             const Json schema = function.value(
                 "parameters", Json{{"type", "object"}, {"properties", Json::object()}});
             tool.schema_json       = schema.dump();
+            tool.required          = required_properties(schema);
             tool.declaration_index = i;
             // Non-strict output keeps the established best-effort normalization contract: the
             // types its schema names, through local references and enum / const values, guide

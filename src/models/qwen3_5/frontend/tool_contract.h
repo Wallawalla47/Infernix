@@ -51,6 +51,8 @@ struct ToolCallOutputContract {
         // as its string branches and members with the text `null` (its value is raw text; `null` reads
         // back as JSON null). Empty otherwise.
         std::string grammar_schema_json;
+        // The properties the schema's root requires (a published call that leaves one out is counted, not refused).
+        std::vector<std::string> required;
         std::size_t declaration_index = 0;
         bool strict                   = false;
     };

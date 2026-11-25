@@ -51,6 +51,8 @@ private:
         std::uint64_t response_failures = 0;
         ReasoningRestore reasoning;
         std::uint64_t tool_arguments_unwrapped = 0;
+        std::uint64_t tool_required_arguments_missing = 0;
+        std::uint64_t tool_notation_calls             = 0;
         std::array<std::uint64_t, 3> constraint_outcomes{};
         std::array<std::uint64_t, 3> constraint_cache{};
         double constraint_prepare_seconds     = 0;

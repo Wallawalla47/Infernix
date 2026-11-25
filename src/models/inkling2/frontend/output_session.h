@@ -50,6 +50,8 @@ struct OutputMarkers {
 struct DeclaredTool {
     std::string name;
     std::string parameters = "{}";
+    // The properties the schema's root requires (a published call that leaves one out is counted, not refused).
+    std::vector<std::string> required;
     bool strict            = false;
     std::size_t declaration_index = 0;
 };
@@ -108,6 +110,13 @@ public:
         std::shared_ptr<text::GrammarSession> grammar;
         // The prompt ended with the answer's opener (PromptOptions::open_answer): the first token is the answer's.
         bool answer_opened = false;
+        // The tools a call written in an XML notation the model was not given may name (candidates JC-01): a
+        // <|content_text|> block that begins with `<tool_call>`, `<function_calls>` or `<invoke ` and holds nothing but
+        // closed `<invoke name="NAME">` calls of these tools, followed by a call block or the end of the turn, is those
+        // calls. Empty: such a block is text. The frontend gives the turn's callable non-strict tools (a strict tool's
+        // arguments must be its schema's, which only its call block's grammar guarantees).
+        std::vector<DeclaredTool> notation_tools;
+        bool parallel_calls = true; // ToolChoice::parallel: false, a turn of more than one call keeps such a block text
     };
 
     OutputSession() noexcept;

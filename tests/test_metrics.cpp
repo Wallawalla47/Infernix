@@ -214,5 +214,16 @@ int main() {
     check(metrics.render(running, false).find("infernix_tool_call_arguments_unwrapped_total 4\n") !=
               std::string::npos,
           "unwrapped tool-call arguments must reach the metrics");
+    // Calls that leave out a required property (JJ-03) are counted per call the same way.
+    check(constrained.find("infernix_tool_call_required_arguments_missing_total 0\n") != std::string::npos,
+          "the required-arguments counter must start at zero");
+    outcome.tool_call_parse.required_arguments_missing = 3;
+    outcome.tool_call_parse.notation_calls             = 2;
+    metrics.done(outcome);
+    check(metrics.render(running, false).find("infernix_tool_call_required_arguments_missing_total 3\n") !=
+              std::string::npos,
+          "calls missing a required property must reach the metrics");
+    check(metrics.render(running, false).find("infernix_tool_call_notation_total 2\n") != std::string::npos,
+          "calls read from the XML notation must reach the metrics");
     return failures == 0 ? 0 : 1;
 }

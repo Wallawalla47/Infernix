@@ -1,5 +1,7 @@
 #include "models/output_text.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <vector>
 
@@ -93,6 +95,25 @@ std::size_t stop_hold_size(std::string_view text, OutputChannel channel, const S
         hold = std::max(hold, longest_suffix_prefix(text, stop.text));
     }
     return hold;
+}
+
+std::vector<std::string> required_properties(const nlohmann::ordered_json& schema) {
+    std::vector<std::string> names;
+    if (!schema.is_object()) { return names; }
+    const auto required = schema.find("required");
+    if (required == schema.end() || !required->is_array()) { return names; }
+    for (const auto& name : *required) {
+        if (name.is_string()) { names.push_back(name.get<std::string>()); }
+    }
+    return names;
+}
+
+bool omits_required(std::string_view arguments_json, std::span<const std::string> required) {
+    if (required.empty()) { return false; }
+    const nlohmann::json arguments = nlohmann::json::parse(arguments_json, nullptr, false);
+    if (!arguments.is_object()) { return false; } // published arguments are always an object
+    return std::any_of(required.begin(), required.end(),
+                       [&](const std::string& name) { return !arguments.contains(name); });
 }
 
 } // namespace infernix::models

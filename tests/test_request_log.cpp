@@ -818,9 +818,11 @@ int main() {
         .structured_call_count     = 1,
         .empty_arguments_omitted   = 1,
         .schema_mismatch_arguments = 2,
-        .arguments_unwrapped       = 1,
-        .fallback_reason           = infernix::ToolCallParseFallbackReason::None,
-        .tolerant_recovered        = true,
+        .arguments_unwrapped        = 1,
+        .required_arguments_missing = 1,
+        .notation_calls             = 1,
+        .fallback_reason            = infernix::ToolCallParseFallbackReason::None,
+        .tolerant_recovered         = true,
     };
     const Json normalized_tool_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, normalized_tool_outcome));
@@ -834,6 +836,8 @@ int main() {
                     .at("tool_call_parse")
                     .at("schema_mismatch_arguments") == 2 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("arguments_unwrapped") == 1 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("required_arguments_missing") == 1 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("notation_calls") == 1 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
                 "none" &&
             normalized_tool_done.at("result").at("tool_call_parse").at("tolerant_recovered") ==

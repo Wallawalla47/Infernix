@@ -93,6 +93,8 @@ void Metrics::done(const GenerationOutcome& outcome) {
         requests_.constraint_upload_bytes += c.mask_upload_bytes;
     }
     requests_.tool_arguments_unwrapped += outcome.tool_call_parse.arguments_unwrapped;
+    requests_.tool_required_arguments_missing += outcome.tool_call_parse.required_arguments_missing;
+    requests_.tool_notation_calls += outcome.tool_call_parse.notation_calls;
     requests_.duration.observe(outcome.timings.total_seconds);
     requests_.queue.observe(outcome.engine_timing.queue_wait_seconds);
 }
@@ -376,6 +378,12 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     counter("tool_call_arguments_unwrapped_total", requests.tool_arguments_unwrapped, 0U,
             "Generated tool calls whose only parameter, an undeclared `arguments`, held the whole argument "
             "object and was unwrapped.");
+    counter("tool_call_required_arguments_missing_total", requests.tool_required_arguments_missing, 0U,
+            "Generated tool calls whose arguments leave out a property their declared tool's schema requires "
+            "(published as written; strict tools cannot).");
+    counter("tool_call_notation_total", requests.tool_notation_calls, 0U,
+            "Generated tool calls read from an XML notation the model was not given (Inkling 2: a text block of "
+            "<invoke name=...> calls).");
     const auto histogram = [&](std::string_view name, const Histogram& value,
                                std::string_view help) {
         header(name, "histogram", help);

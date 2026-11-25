@@ -1239,6 +1239,12 @@ struct ToolCallParseDiagnostics {
     // Calls whose only parameter, `arguments`, which their tool does not declare, held the whole argument
     // object and was unwrapped.
     std::uint32_t arguments_unwrapped             = 0;
+    // Published calls whose arguments leave out a property their declared tool's schema requires (counted, never
+    // completed: Basic protection keeps a call's form, not its schema).
+    std::uint32_t required_arguments_missing      = 0;
+    // Calls read from an XML notation the model was not given (Inkling 2: `<invoke name="NAME">` calls that make up a
+    // whole text block).
+    std::uint32_t notation_calls                  = 0;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
     // Tolerant tool-call mode turned output the strict parser rejects into structured calls.
     bool tolerant_recovered = false;
