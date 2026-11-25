@@ -6,6 +6,7 @@
 
 #include "infernix/ops/inkling2_attention.h"
 #include "ops/common/canonical_math.h"
+#include "ops/inkling2/kv_bf16p_piece.cuh"
 #include "ops/inkling2/kv_int8_piece.cuh"
 #include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
@@ -59,10 +60,6 @@ __host__ __device__ constexpr int side_bytes(KvForm f) {
            : f == KvForm::Bf16p                       ? 16
                                                       : 0;
 }
-
-// bf16p at 128: a 16-byte record (base, count | zero flag, up to 14 escapes): Inkling's rows need more than the D256
-// form's 6 (its position-0 key rows reach 7).
-inline constexpr unsigned kBf16p128Escapes = 14;
 
 // A represented word: K bf16_rn(x), V fp16_rn(x) of an exact product x.
 __device__ __forceinline__ std::uint32_t kv_word(float x, bool value) {
@@ -168,106 +165,6 @@ __device__ __forceinline__ uint2 kv_encode_nvfp4(const float (&x)[4], int lane, 
     const float2 b    = ops::detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(mine >> 8));
     return make_uint2(kv_word(a.x * scale, value) | (kv_word(a.y * scale, value) << 16),
                       kv_word(b.x * scale, value) | (kv_word(b.y * scale, value) << 16));
-}
-
-// bf16p (ops/kv_cache/bf16p_codec.cuh's form at 128): `bits` the lane's four BF16 words (a V row's BF16 source, which
-// its FP16 storage rounds). Codes [0, 128): sign << 7 | the seven fraction bits; nibbles [128, 192) (value d's in
-// byte 128 + d / 2, d even the low nibble): 0..13 exponent base + nibble, 14 exponent 0, 15 an escape; the 16-byte side
-// record: base, min(escapes, 14) | 0x80 when some exponent is 0, the escapes' exponents in column order. The base: a
-// row whose normal exponents span at most 14 binades takes clamp(lowest, 1, 240) (1 with none); a wider one the lowest
-// base of the 14-binade windows holding most of them. Returns whether the row has a packed form (at most 14 escapes,
-// kBf16p128Escapes; otherwise the record keeps the first 14 and the request fails). Uniform over the warp.
-__device__ __forceinline__ bool kv_encode_bf16p(const std::uint16_t (&bits)[4], int lane, std::uint8_t* row,
-                                                std::uint8_t* side) {
-    constexpr unsigned kAll = 0xFFFFFFFFU;
-    unsigned e[4];
-    unsigned lowest = 255, highest = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        e[i] = (bits[i] >> 7) & 0xFFU;
-        if (e[i] != 0 && e[i] != 255) {
-            lowest  = min(lowest, e[i]);
-            highest = max(highest, e[i]);
-        }
-    }
-    lowest  = __reduce_min_sync(kAll, lowest);
-    highest = __reduce_max_sync(kAll, highest);
-    unsigned base;
-    if (highest < lowest || highest - lowest < kBf16pWindow) {
-        base = highest < lowest ? 1U : min(max(lowest, 1U), 240U);
-    } else {
-        // window(b) = the normal exponents in [b, b + 13] for b in 1..240: lane l counts b = 8 l + 1 .. 8 l + 8 over the
-        // row's 128 exponents (read by shuffles); the most, ties to the lowest b.
-        unsigned count[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-#pragma unroll 1
-        for (int src = 0; src < 32; ++src) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const unsigned x = __shfl_sync(kAll, e[i], src);
-                if (x != 0 && x != 255) {
-#pragma unroll
-                    for (int k = 0; k < 8; ++k) { count[k] += x - static_cast<unsigned>(8 * lane + 1 + k) < kBf16pWindow ? 1U : 0U; }
-                }
-            }
-        }
-        unsigned best = 0;
-#pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const unsigned b = static_cast<unsigned>(8 * lane + 1 + k);
-            if (b <= 240) { best = max(best, count[k] << 8 | (255U - b)); }
-        }
-        best = __reduce_max_sync(kAll, best);
-        base = 255U - (best & 0xFFU);
-    }
-    unsigned nibbles = 0, escaped = 0, zero = 0, code = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const unsigned offset = e[i] - base; // wraps for e < base
-        const bool inside     = e[i] != 0 && e[i] != 255 && offset < kBf16pWindow;
-        const unsigned nibble = e[i] == 0 ? kBf16pZeroCode : inside ? offset : kBf16pEscapeCode;
-        nibbles |= nibble << (4 * i);
-        escaped |= (nibble == kBf16pEscapeCode ? 1U : 0U) << i;
-        zero |= e[i] == 0 ? 1U : 0U;
-        code |= (((bits[i] >> 8) & 0x80U) | (bits[i] & 0x7FU)) << (8 * i);
-    }
-    const unsigned mine  = __popc(escaped);
-    const unsigned total = __reduce_add_sync(kAll, mine);
-    const bool zeros     = __any_sync(kAll, zero != 0);
-    *reinterpret_cast<std::uint32_t*>(row + 4 * lane)       = code;
-    *reinterpret_cast<std::uint16_t*>(row + 128 + 2 * lane) = static_cast<std::uint16_t>(nibbles);
-    unsigned before = mine;
-#pragma unroll
-    for (int d = 1; d < 32; d <<= 1) {
-        const unsigned n = __shfl_up_sync(kAll, before, d);
-        if (lane >= d) { before += n; }
-    }
-    before -= mine;
-    // The record's bytes 2 + k hold escape k (k < 14), gathered as its low and high 8 bytes (shifts, not an array a run
-    // time index would put in local memory).
-    std::uint64_t low = 0, high = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        if ((escaped >> i) & 1U) {
-            if (before < kBf16p128Escapes) {
-                const unsigned byte    = 2 + before;
-                const std::uint64_t at = std::uint64_t{e[i]} << (8 * (byte & 7U));
-                if (byte < 8) {
-                    low |= at;
-                } else {
-                    high |= at;
-                }
-            }
-            ++before;
-        }
-    }
-    const unsigned count = min(total, kBf16p128Escapes) | (zeros ? 0x80U : 0U);
-    uint4 record;
-    record.x = __reduce_or_sync(kAll, static_cast<unsigned>(low)) | base | count << 8;
-    record.y = __reduce_or_sync(kAll, static_cast<unsigned>(low >> 32));
-    record.z = __reduce_or_sync(kAll, static_cast<unsigned>(high));
-    record.w = __reduce_or_sync(kAll, static_cast<unsigned>(high >> 32));
-    if (lane == 0) { *reinterpret_cast<uint4*>(side) = record; }
-    return total <= kBf16p128Escapes;
 }
 
 // ---------------------------------------------------------------------------- rotated forms (vq2, q4)
@@ -409,8 +306,9 @@ __device__ __forceinline__ void kv_rotate_query(float (&q)[4], int lane) {
 
 // `x` the lane's four values the BF16 storage holds (BF16 K, FP16 V), `bits` their BF16 source words (bf16p's input).
 // Sets *unpackable (bf16p: the row has no packed form). Returns the lane's four represented words. Rotated false: an
-// instance that never sees vq2 or q4 (it carries no code for them).
-template <bool Rotated = true>
+// instance that never sees vq2 or q4 (it carries no code for them); Packed false: one that never encodes bf16p (the
+// bf16p instances' own).
+template <bool Rotated = true, bool Packed = true>
 __device__ __forceinline__ uint2 kv_encode(KvForm form, const float (&x)[4], const std::uint16_t (&bits)[4], int lane,
                                           std::uint8_t* codes, std::uint8_t* side, bool value, bool& unpackable) {
     unpackable = false;
@@ -422,13 +320,16 @@ __device__ __forceinline__ uint2 kv_encode(KvForm form, const float (&x)[4], con
         if constexpr (Rotated) { return kv_encode_vq2(x, lane, codes, side, value); } else { return make_uint2(0U, 0U); }
     case KvForm::Q4:
         if constexpr (Rotated) { return kv_encode_q4(x, lane, codes, side, value); } else { return make_uint2(0U, 0U); }
-    default: {
-        unpackable = !kv_encode_bf16p(bits, lane, codes, side);
-        std::uint32_t w[4];
+    default:
+        if constexpr (Packed) {
+            unpackable = !kv_encode_bf16p(bits, lane, codes, side);
+            std::uint32_t w[4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) { w[j] = value ? kv_word(canon::bf16_to_f32(bits[j]), true) : std::uint32_t{bits[j]}; }
-        return make_uint2(w[0] | (w[1] << 16), w[2] | (w[3] << 16));
-    }
+            for (int j = 0; j < 4; ++j) { w[j] = value ? kv_word(canon::bf16_to_f32(bits[j]), true) : std::uint32_t{bits[j]}; }
+            return make_uint2(w[0] | (w[1] << 16), w[2] | (w[3] << 16));
+        } else {
+            return make_uint2(0U, 0U);
+        }
     }
 }
 

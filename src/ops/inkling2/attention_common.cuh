@@ -108,6 +108,24 @@ __device__ __forceinline__ void decode_unit_int8(const KvView& kv, std::size_t p
     plane.template operator()<true>(row_codes(kv, 1, KvForm::Int8, page), row_side(kv, 1, KvForm::Int8, page), v_tile);
 }
 
+// decode_unit for a bf16p pool or window ring (both planes bf16p): a thread decodes 8-value pieces (kv_decode8_bf16p),
+// consecutive threads consecutive pieces of a row, each plane in its own loop. The same words as decode_unit.
+template <class At>
+__device__ __forceinline__ void decode_unit_bf16p(const KvView& kv, std::size_t page, std::uint16_t* k_tile,
+                                                  std::uint16_t* v_tile, At at, int tid, int threads) {
+    constexpr int kPieces = kD / 8;
+    constexpr int kCode = code_bytes(KvForm::Bf16p), kSide = side_bytes(KvForm::Bf16p);
+    const auto plane = [&]<bool Value>(const std::uint8_t* codes, const std::uint8_t* side, std::uint16_t* tile) {
+        for (int i = tid; i < kKeyUnit * kPieces; i += threads) {
+            const int row = i / kPieces, piece = i % kPieces;
+            *reinterpret_cast<uint4*>(tile + at(row, 8 * piece)) =
+                kv_decode8_bf16p<Value>(codes + row * kCode, side + row * kSide, piece);
+        }
+    };
+    plane.template operator()<false>(row_codes(kv, 0, KvForm::Bf16p, page), row_side(kv, 0, KvForm::Bf16p, page), k_tile);
+    plane.template operator()<true>(row_codes(kv, 1, KvForm::Bf16p, page), row_side(kv, 1, KvForm::Bf16p, page), v_tile);
+}
+
 // The argument checks both routes share, and the prologue over every column of the call (attention.cu).
 void check_attention_args(const AttentionArgs& a);
 void launch_attention_prologue(const AttentionArgs& a, cudaStream_t stream);
