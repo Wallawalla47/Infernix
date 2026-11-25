@@ -365,7 +365,7 @@ from the first implementation.
 | L21 | On MoE models verifying all drafts every round lost to MTP; a per-request length calibrated by confidence deciles won +8-11 %; device-side IF nodes stopping drafting past the confidence cut +2.2 %; trees and copies lost on the Flash-Next MoE (FN §19.2, [DFlash](dflash.md), [tree verification](tree-verification.md)) | calibrated length from day one; IF nodes for the Markov steps; trees deferred ([§13.4](#134-draft-length-and-verification)) |
 | L22 | Capturing every graph at startup: first request +5.1 % (1.0-1.5 MiB each); idle graphs cost (90 tree graphs, 1.3 %) (FN §19.3.37) | all (B, T) graphs at startup; no graph per unused width |
 | L23 | Flash-Next's prefill is bit-identical across chunk widths, so it defaults to 16K chunks (pp32768 5,567 → 11,211 tok/s from 1K to 16K); wider steps while no lane decodes +9.3 %; merging the prompt's last two calls saves 9-12 ms of TTFT (FN §19.3.24, §19.3.45, §19.3.56) | prefill Ops are chunk-width invariant per column ([§14.1](#141-chunk-width-invariance)) |
-| L24 | 8-bit activations for dense decode projections lost 15-27 % end to end (FN §19.3.31) | decode projections stay A16 (also under D7) |
+| L24 | 8-bit activations for dense decode projections lost 15-27 % end to end (FN §19.3.31) | the default's decode projections stay A16 (also under D7); the opt-in `--a8-activations` gives every dense Q8 projection 8-bit inputs at every width ([§11](#11-dense-projections-and-the-head), 2026-11-23) |
 | L25 | Exact BF16 KV packed as `bf16p` (784 of 1,024 B per token per head) holds 1.31× the tokens at level speed (FN §19.3.48) | `bf16p` is a second-wave KV profile ([§7.6](#76-kv-profiles)) |
 | L26 | Op timing: CUDA events quantize at 2.048 µs, eager benches overstate narrow kernels 1.5×, nsys node tracing inflates graph launch, the first bench run reads 0.5-1.5 % slow, clocks after a faster decode slow the next prefill 6 % | op timing by nsys kernel spans in graph replay with PDL; interleaved A/B, first run discarded |
 | L27 | Measure an op-level prototype before quoting an end-to-end gain (a split-K last wave estimated at -6..-9 % measured +5..+13 % slower) | every fusion choice left open below names its op benchmark ([§21](#21-implementation-plan)) |
@@ -1650,7 +1650,7 @@ margin) qualify M3-M5 without it, and its kernels run inside the Program M4 buil
 | Shared KV across loop passes | changes the model (the research checkpoint's option) |
 | A persistent decode kernel from the start | Infernix's measured losses (L17); kept as the M8 experiment |
 | Split-K decode GEMVs and split-K last waves | measured losses (L27) |
-| 8-bit activations for dense decode projections | measured losses (L24) |
+| 8-bit activations for dense decode projections on the default route | measured losses (L24); the opt-in `--a8-activations` takes them on purpose ([§11](#11-dense-projections-and-the-head)) |
 
 ---
 
