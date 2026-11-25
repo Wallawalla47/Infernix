@@ -270,7 +270,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--config FILE` | read options, and the model path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
+| `--config FILE` | read options, and the model path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it, except that a repeatable option's values add to the file's and a flag the file sets stays set | unset |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`, for the target model (DFlash and DFlash2 drafters keep their own RoPE); extends allowed ceiling only. Inkling 2 refuses it: it has no RoPE (relative attention with log-scaled scores reaches its 1,048,576 positions natively) | `1` |
 | `--max-context N\|auto` | per-sequence logical context ceiling; `auto` sizes it at startup to the largest the KV cache holds beside the weights (Qwen3.5-family models whose experts stay in VRAM; the KV capacity then defaults to `auto`; Inkling 2: the largest context every one of the `--max-concurrency` lanes holds, since each lane reserves its whole context, on the 64-token page grid, up to 1,048,576) | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory (with offloaded experts, as on Qwen3.8-Flash-Next and Qwen3.5-122B-A10B, `auto` is `--max-context`, the one generation's context, and the expert cache takes the rest); omitted means `--max-context` | `2048` |

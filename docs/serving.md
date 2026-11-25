@@ -2110,7 +2110,7 @@ The table lists executable defaults. The startup example selects a long-context 
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--config FILE` | read options, and the artifact path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
+| `--config FILE` | read options, and the artifact path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it, except that a repeatable option's values add to the file's and a flag the file sets stays set | unset |
 | `--plan FILE` | size a start with the other options on this machine without loading the model, write the plan to `FILE` as JSON and exit `0` (fits), `3` (does not fit) or `1` (no plan) ([Sizing a start without loading](#sizing-a-start-without-loading)) | unset: start the server |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
