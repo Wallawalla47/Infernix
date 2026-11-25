@@ -26,4 +26,5 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n4608_k4608.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k4608.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k4608.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/dspine_bridge.cu"
 )
