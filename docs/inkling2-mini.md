@@ -385,8 +385,8 @@ RTX 5090, PCIe Gen5 x8, default route, `--kv-dtype bf16`, one request unless not
 | Decode, DSpark `auto` with `--lm-head-draft`, same prompts | 316 / 667 / 228 tok/s |
 | Prefill | 16,261 tok/s at 2,048 tokens, 16,184 at 10,000, 15,733 at 16,384 |
 | Decode, several requests (total) | 312 / 452 / 648 tok/s at 2 / 4 / 8 requests |
-| Largest `--max-context auto`, one lane, BF16 KV (`--plan`, about 30 GiB of VRAM for the model) | 302,528 tokens; 297,728 with `--lm-head-draft`; 243,584 with `--lm-head-draft --vision` |
-| The same with `--kv-dtype int8` | 526,656 tokens; 518,400 with `--lm-head-draft`; 424,704 with `--lm-head-draft --vision` |
+| Largest `--max-context auto`, BF16 KV (`--plan`, about 30 GiB of VRAM for the model; 2026-11-25, with the CUDA graphs' allowance) | 299,968 tokens; 295,168 with `--lm-head-draft`; 241,024 with `--lm-head-draft --vision` |
+| The same with `--kv-dtype int8` | 522,176 tokens; 513,984 with `--lm-head-draft`; 420,288 with `--lm-head-draft --vision` |
 
 With `--kv-dtype int8` (2026-11-25, the same bench against `bf16` in one build, two runs each): plain decode 205.6
 tok/s after a 2,048-token prompt and 194.5 after 10,000 (`bf16` 204.8 / 195.0); prefill 16,243 tok/s at 2,048 tokens

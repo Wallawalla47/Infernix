@@ -3152,6 +3152,16 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
         out.workspace += detail::align_256(std::uint64_t{config.text.num_hidden_layers} * config.text.hidden_size * 2);
     }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
+    if (options.use_cuda_graph && !options.causal_scoring && !options.lossless) {
+        // The decode graphs and their forward-only forms; with DSpark a verify graph per (lane, 2-8 columns, sampled or
+        // forward-only) and a draft graph per step count.
+        std::uint64_t executables = 2ULL * out.graph_bound;
+        if (dspark) {
+            executables += lanes * static_cast<std::uint64_t>(ops::inkling2::kDSparkBlock - 1) * 2 +
+                           static_cast<std::uint64_t>(ops::inkling2::kMarkovSteps);
+        }
+        out.graphs = executables * kGraphExecutableBytes;
+    }
     return out;
 }
 

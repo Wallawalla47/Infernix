@@ -12,6 +12,8 @@
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/prefix_cache/persist_file.h"
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -128,7 +130,8 @@ std::uint32_t pool_pages(const EngineOptions& options, models::inkling2::Program
     }
     program.kv_pages                                = 0;
     const models::inkling2::ProgramDevicePlan plan = models::inkling2::Program::plan_device(program, config);
-    const std::uint64_t used                       = plan.fixed_bytes() + headroom;
+    // The margin the other models' automatic sizing keeps below the OS budget (kv_sizing_bytes), beside the headroom.
+    const std::uint64_t used = plan.fixed_bytes() + headroom + expert_offload::kVramBudgetMarginBytes;
     const std::uint64_t extra = free_bytes > used && plan.page_bytes != 0 ? (free_bytes - used) / plan.page_bytes : 0U;
     return static_cast<std::uint32_t>(std::min<std::uint64_t>(lane + extra, 0x7FFFFFF0U));
 }
@@ -614,7 +617,30 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         resources.chat_template_jinja                 = template_override;
         instance->frontend = models::inkling2::Frontend(resources, frontend_options(*instance->model, options));
     }
-    instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
+    try {
+        instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
+    } catch (const std::exception& error) {
+        // An automatic pool that met device memory the plan does not count (the driver's own, a graph's) starts once
+        // more with 1 GiB more headroom, so fewer KV pages, as the Qwen families' startup retries; an explicit size
+        // cannot shrink.
+        const std::string what = error.what();
+        const bool memory = what.find("out of memory") != std::string::npos ||
+                            what.find("cudaErrorMemoryAllocation") != std::string::npos;
+        if (!memory || program.causal_scoring || options.kv_capacity.mode != KvCapacityMode::Automatic) { throw; }
+        (void)cudaGetLastError(); // an allocation failure is not sticky; clear its record
+        constexpr std::uint64_t kRetryHeadroom = 1ULL << 30U;
+        const VramSnapshot now       = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+        const std::uint64_t free_now = free_device_bytes(now) > adapter_bytes ? free_device_bytes(now) - adapter_bytes : 0;
+        program.kv_pages = pool_pages(options, program, instance->model->config(), free_now, headroom + kRetryHeadroom);
+        const models::inkling2::ProgramDevicePlan retried =
+            models::inkling2::Program::plan_device(program, instance->model->config());
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                           "Inkling 2: %s at startup; retrying with %llu MiB more VRAM headroom (a smaller automatic KV "
+                           "pool: %llu tokens)",
+                           what.c_str(), static_cast<unsigned long long>(kRetryHeadroom >> 20U),
+                           static_cast<unsigned long long>(pool_tokens(retried.kv_pages)));
+        instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
+    }
     // --prefix-cache-file: the Host tier restored from a file written for this artifact and these options (the KV
     // format, the drafter, the 8-bit weights and 16-bit expert activations change what the cache holds).
     LoadSummary::PrefixCacheRestore restore;
