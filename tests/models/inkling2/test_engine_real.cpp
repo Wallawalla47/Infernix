@@ -578,7 +578,7 @@ int main() {
             // implies --q8-weights): request-invariant like the others, refused with --reproducible.
             variant("a8", "--a8-activations", false, [](infernix::EngineOptions& o) { o.a8_activations = true; });
 
-            // 8. --kv-dtype: the full visits' pools in a quantized format (the sliding windows stay BF16 K / FP16 V),
+            // 8. --kv-dtype: the full visits' pools in a quantized format (the sliding windows INT8, bf16p's packed),
             // deterministic and request-invariant, so accepted with --reproducible: the variant's checks above; DSpark
             // (auto, graphs) gives the format's plain tokens; a 10,000-token prompt's greedy continuation is the same in
             // chunks of 4,096 and 1,000. Reported: how long the format's tokens agree with BF16's.
