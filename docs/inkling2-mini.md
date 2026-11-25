@@ -75,7 +75,16 @@ infernix.exe Inkling-2-Mini-Infernix.infernix --prompt "Explain what a looped tr
 ```
 
 When a request sets no sampling options the engine uses temperature 1.0, top-p 1.0 and top-k 20: the
-checkpoint's generation config sets the temperature, and 20 is the sampler's candidate limit.
+checkpoint's generation config sets the temperature (over the whole vocabulary), and top-k 20 is the shipped
+default. `top_k: 0` (`--top-k 0`) with top-p 1 and min-p 0 samples the whole vocabulary, as the generation config
+asks, by Gumbel-max (each verify column of DSpark draws the same way, so drafting changes nothing). At temperature 1
+the top-20 cap leaves out 2.5 % of the probability on average on prose answers (median 0.34 %, 90th percentile 8.1 %,
+99th 22 %; 2,182 sampled positions of eight answers, 2026-11-24). With top-p below 1 or min-p above 0, top-k 0 keeps
+the 20-candidate domain, and `--lossless` always keeps it (its bits do not change). The whole-vocabulary draw is the
+cheaper sampler call (an RTX 5090 op bench: 14 against 19 us at one row, 17-18 against 44 us at eight), but DSpark
+accepts fewer drafts, since more draws leave the drafter's top token: on four seeded prose prompts (each run three
+times, DSpark auto, one request) decode went from 222.0 to 213.7 tokens/s (-3.7 %) and acceptance from 0.364 to
+0.340, with different texts in the two settings (2026-11-24).
 
 ### Check a configuration first
 

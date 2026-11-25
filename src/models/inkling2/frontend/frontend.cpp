@@ -214,9 +214,11 @@ struct Frontend::Impl {
             defaults.token_ids.end()) {
             throw std::invalid_argument("inkling2 generation_config.json must stop at <|content_model_end_sampling|>");
         }
-        // generation_config.json sets temperature 1 alone; the sampler takes at most 20 candidates.
+        // generation_config.json sets temperature 1 alone (the whole vocabulary). The preset keeps top-k 20 (the
+        // shipped default); top_k 0 samples the whole vocabulary (ModelSamplingDefaults::full_vocabulary: every draw,
+        // DSpark's verify columns included, goes through ops::sample).
         const SamplingPreset preset{.temperature = 1.0F, .top_k = 20, .top_p = 1.0F};
-        sampling = {.thinking = preset, .non_thinking = preset};
+        sampling = {.thinking = preset, .non_thinking = preset, .full_vocabulary = true};
         std::vector<TokenId> control;
         if (!options.thinking_budget_message.empty()) {
             for (const int token : tokenizer->encode(options.thinking_budget_message, {.parse_added_tokens = false})) {

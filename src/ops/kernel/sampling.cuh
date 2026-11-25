@@ -11,7 +11,9 @@
 
 namespace infernix::ops {
 
-template <class Logit>
+// Full: the launch declares full_vocabulary rows (sample()'s full_vocabulary_rows); otherwise such a row samples its
+// 20-candidate domain.
+template <class Logit, bool Full>
 __launch_bounds__(kSamplerBlock) __global__
     void sample_row_kernel(const Logit* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
@@ -25,12 +27,24 @@ __launch_bounds__(kSamplerBlock) __global__
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
 
-    // With penalties disabled this remains the exact raw-logit argmax route.
-    if (!(cfg.temperature > 0.0f)) {
+    // With penalties disabled this remains the exact raw-logit argmax route. A full_vocabulary row is the argmax of
+    // its Gumbel-perturbed keys (sampling_full_score).
+    const bool full = Full && sampling_full(cfg);
+    if (!(cfg.temperature > 0.0f) || full) {
         float bv             = -CUDART_INF_F;
         int bi               = INT_MAX;
         const bool penalties = sampling_adjusts(cfg);
-        if (!penalties && cfg.mask.words == nullptr) {
+        if (full) {
+            const int produced = sampling_produced_position(logical_positions[row], purpose);
+            for (int v = tid; v < token_domain; v += blockDim.x) {
+                const float x = sampling_full_score(
+                    sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg), cfg, produced, v);
+                if (sampling_better(x, v, bv, bi)) {
+                    bv = x;
+                    bi = v;
+                }
+            }
+        } else if (!penalties && cfg.mask.words == nullptr) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
                 const float x = sampling_logit(logits[base + v]);
                 if (sampling_better(x, v, bv, bi)) {
@@ -109,11 +123,16 @@ __launch_bounds__(kSamplerBlock) __global__
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
-template <class Logit>
-__launch_bounds__(kSamplerBlock) __global__
-    void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
-                                      std::int32_t token_domain, std::int32_t physical_rows,
-                                      SamplingWorkspace workspace) {
+// The multi-block partial pass. Full = false is the pass without the full_vocabulary route, which every launch takes
+// unless its caller declares full_vocabulary rows (sample()'s full_vocabulary_rows): any code for that route in this
+// kernel cost the top-20 rows (2026-11-24, real vocabulary: +1.6 us at four columns inline, +0.9 us hoisted).
+// Full = true takes such rows first, in their own early-exit block: greedy's single key over their Gumbel-perturbed
+// keys, under a 28-register cap (main's count for the rest).
+template <class Logit, bool Full>
+__device__ __forceinline__ void sampling_partial_topk_body(const Logit* logits, const SamplingConfig* cfg_ptr,
+                                                           const std::int32_t* logical_positions, std::int32_t purpose,
+                                                           std::int32_t token_domain, std::int32_t physical_rows,
+                                                           SamplingWorkspace workspace) {
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = cfg_ptr[col];
@@ -128,6 +147,27 @@ __launch_bounds__(kSamplerBlock) __global__
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tile_start    = partial * kSamplerPartialTileItems;
+    if constexpr (Full) {
+        if (sampling_full(cfg)) {
+            const int produced      = sampling_produced_position(logical_positions[col], purpose);
+            unsigned long long best = 0ull;
+            for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+                const int v = tile_start + item * blockDim.x + threadIdx.x;
+                if (v < token_domain) {
+                    const float raw = sampling_logit(logits[base + v]);
+                    const float x   = (penalties || cfg.mask.words) ? sampling_adjusted_logit(raw, v, cfg) : raw;
+                    const unsigned long long key = sampling_sort_key(sampling_full_score(x, cfg, produced, v), v);
+                    if (key > best) { best = key; }
+                }
+            }
+            best = sampling_block_max_key(best, greedy_warp_keys);
+            if (threadIdx.x == 0) { workspace.partial_keys[sampling_partial_offset(workspace, col, partial, 0)] = best; }
+            return;
+        }
+    } else {
+        (void)logical_positions;
+        (void)purpose;
+    }
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
@@ -165,6 +205,25 @@ __launch_bounds__(kSamplerBlock) __global__
     }
 }
 
+template <class Logit>
+__launch_bounds__(kSamplerBlock) __global__
+    void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
+                                      std::int32_t token_domain, std::int32_t physical_rows,
+                                      SamplingWorkspace workspace) {
+    sampling_partial_topk_body<Logit, false>(logits, cfg_ptr, nullptr, 0, token_domain, physical_rows, workspace);
+}
+
+template <class Logit>
+__launch_bounds__(kSamplerBlock, 9) __global__
+    void sampling_partial_topk_full_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
+                                           const std::int32_t* logical_positions, std::int32_t purpose,
+                                           std::int32_t token_domain, std::int32_t physical_rows,
+                                           SamplingWorkspace workspace) {
+    sampling_partial_topk_body<Logit, true>(logits, cfg_ptr, logical_positions, purpose, token_domain,
+                                            physical_rows, workspace);
+}
+
+template <bool Full>
 __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
@@ -182,7 +241,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     __shared__ unsigned long long greedy_warp_keys[kSamplerGroupBlock / 32];
     unsigned long long keys[kSamplerGroupItemsPerThread];
 
-    const bool greedy = !(cfg.temperature > 0.0f);
+    const bool greedy = !(cfg.temperature > 0.0f) || (Full && sampling_full(cfg)); // full rows: perturbed keys
     const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes group_done[col], so caller-owned
     // workspace does not rely on prior contents or a separate memset launch.

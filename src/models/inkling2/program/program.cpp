@@ -2162,6 +2162,9 @@ private:
             config.seed              = s.seed;
             // The lossless route draws by Gumbel-max (lossless-route.md §3a).
             config.gumbel_max        = o_.lossless;
+            // top_k 0 (no limit) with top_p 1 and min_p 0: the whole vocabulary (JM-40), except on the lossless route,
+            // which keeps the 20-candidate cap and its bits.
+            config.full_vocabulary = s.top_k == 0 && s.top_p >= 1.0F && s.min_p <= 0.0F && !o_.lossless;
             config.token_counts      = lane.penalties ? lane_counts(lanes[row]) : nullptr;
             nonfinite_[row]          = 0;
             config.nonfinite         = &nonfinite_[row];
@@ -2226,8 +2229,10 @@ private:
         const Tensor in(const_cast<float*>(logits), DType::FP32, {vocab_, static_cast<std::int32_t>(rows)});
         Tensor out(sampled_.p, DType::I32, {static_cast<std::int32_t>(rows)});
         const Tensor positions(positions_.p, DType::I32, {static_cast<std::int32_t>(rows)});
+        // Any lane may sample the whole vocabulary (top_k 0, JM-40) and the call is in captured graphs, so every call
+        // but the lossless route's (which never does) declares such rows.
         ops::sample(in, out, vocab_, static_cast<const ops::SamplingConfig*>(configs_.p), positions, purpose, sampling_,
-                    device_.stream);
+                    device_.stream, !o_.lossless);
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_, sampled_.p, 4 * rows, cudaMemcpyDeviceToHost, device_.stream));
     }
 

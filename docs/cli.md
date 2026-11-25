@@ -327,7 +327,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | registered model/mode default |
+| `--top-k N` | top-k-threshold override (`0..20`; zero is no limit: the whole vocabulary on Inkling 2 with top-p 1 and min-p 0, the top-20 cap otherwise) | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
 | `--presence-penalty F` | presence-penalty override | registered model/mode default; `0` with an output constraint |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |

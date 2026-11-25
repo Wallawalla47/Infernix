@@ -413,6 +413,49 @@ int main() {
                 require_same("token constraint C = 4: " + all[0].name, reference[0], handles.back().wait().generated_token_ids);
             }
         }
+        // Full-vocabulary sampling (top_k 0, candidates JM-40): the eager Engine's tokens are the reference; graphs at
+        // C = 4 beside top-k 20 requests, and DSpark (auto, graphs; each verify column draws as plain decoding), give
+        // them, and the top-k 20 requests keep theirs.
+        {
+            const auto whole = [](std::size_t i) {
+                infernix::RequestOptions options        = unconstrained(i);
+                options.execution.sampling.top_k        = 0;
+                return options;
+            };
+            std::vector<Tokens> full;
+            {
+                infernix::Engine engine(engine_options(artifact, false, 1));
+                for (std::size_t i = 0; i < kTexts.size(); ++i) {
+                    full.push_back(engine.generate(engine.prepare(chat(kTexts[i])), whole(i)).generated_token_ids);
+                }
+            }
+            std::size_t same = 0;
+            while (same < full[0].size() && same < plain[0].size() && full[0][same] == plain[0][same]) { ++same; }
+            std::cout << "full vocabulary against top-k 20 (same seed): the first " << same << " of " << full[0].size()
+                      << " tokens agree\n";
+            {
+                infernix::Engine engine(engine_options(artifact, true, 4));
+                std::vector<infernix::GenerationHandle> handles;
+                for (std::size_t i = 0; i < kTexts.size(); ++i) {
+                    handles.push_back(engine.submit(engine.prepare(chat(kTexts[i])), whole(i)));
+                    handles.push_back(engine.submit(engine.prepare(chat(kTexts[i])), unconstrained(i)));
+                }
+                for (std::size_t i = 0; i < kTexts.size(); ++i) {
+                    require_same("full vocabulary, graphs C = 4: " + std::to_string(i), full[i],
+                                 handles[2 * i].wait().generated_token_ids);
+                    require_same("top-k 20 beside full vocabulary, C = 4: " + std::to_string(i), plain[i],
+                                 handles[2 * i + 1].wait().generated_token_ids);
+                }
+            }
+            {
+                infernix::Engine engine(engine_options(artifact, true, 1, true, true));
+                for (std::size_t i = 0; i < kTexts.size(); ++i) {
+                    const auto result = engine.generate(engine.prepare(chat(kTexts[i])), whole(i));
+                    report("full vocabulary, dspark " + std::to_string(i), result);
+                    require_same("full vocabulary, dspark: " + std::to_string(i), full[i], result.generated_token_ids);
+                }
+            }
+        }
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

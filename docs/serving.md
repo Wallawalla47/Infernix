@@ -366,7 +366,9 @@ The endpoint supports:
   processing without generation. As an extension (OpenAI rejects it), `-1` means no explicit limit:
   the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
-- the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
+- the compatible `top_k` (`0..20`; 0 is no limit: the whole vocabulary on Inkling 2 with `top_p` 1 and `min_p` 0
+  ([Inkling 2 Mini](inkling2-mini.md)), the 20-candidate cap otherwise and on the other models) and `min_p` (`0..1`)
+  sampler extensions;
 - up to four non-empty stop strings, applied to the answer only: not to reasoning, and not inside a
   tool call the model opened with its `<tool_call>` token (between it and `</tool_call>`), whose
   arguments are the tool's data (as on the Responses and Messages endpoints);
@@ -2217,7 +2219,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--claude-code-usage-compat` | Anthropic streaming only: report a provisional `0` as `message_start`'s `input_tokens` (its cache-read split stays exact, terminal usage unchanged), so a Claude Code version that keeps the start value when the terminal `message_delta` corrects it to `0` cannot count the prompt twice (see [Anthropic Messages](#anthropic-messages)) | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
-| `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
+| `--top-k N` | process-level top-k override (`0..20`; zero is no limit: the whole vocabulary on Inkling 2 with top-p 1 and min-p 0, the top-20 cap otherwise) | unset |
 | `--min-p F` | process-level min-p override | unset |
 | `--presence-penalty F` | process-level presence-penalty override | unset |
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |

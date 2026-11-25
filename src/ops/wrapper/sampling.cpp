@@ -22,7 +22,7 @@ std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::in
 
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream) {
+            WorkspaceArena& workspace, cudaStream_t stream, bool full_vocabulary_rows) {
     if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
         throw std::invalid_argument("sample: logits must be BF16 or FP32");
     }
@@ -61,7 +61,7 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
         sampling_workspace_capacity_bytes(token_domain, logits.ne[1], logits.ne[1]);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::sample_batch_launch(logits, out, token_domain, configs, logical_positions, purpose,
-                                scratch, stream);
+                                scratch, stream, full_vocabulary_rows);
 }
 
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream) {

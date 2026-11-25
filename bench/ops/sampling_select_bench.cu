@@ -55,13 +55,15 @@ struct Options {
     int repeat         = 60;
     int graph_calls    = 1;
     int top_k          = 20;
+    bool full_vocabulary = false; // --full-vocabulary: --sample rows draw from the whole vocabulary (T 1, top-p 1)
+    bool declare_full    = false; // --declare-full: the call declares full_vocabulary rows (Inkling 2's calls)
 };
 
 void usage(const char* argv0) {
     std::printf("usage: %s [--sample|--mtp|--dflash2|--matrix] [--mode greedy|stochastic] "
                 "[--batch 1..8] [--mtp-k 1..5] [--drafts 1..15] [--extent 0..K] [--top-k 1..20] "
                 "[--no-counts] [--general] [--mixed] [--reject-at J] [--warmup N] [--repeat N] "
-                "[--graph-calls N]\n",
+                "[--graph-calls N] [--full-vocabulary] [--declare-full]\n",
                 argv0);
 }
 
@@ -128,6 +130,10 @@ Options parse_args(int argc, char** argv) {
             options.top_k = parse_int(need_value("--top-k"), "--top-k");
         } else if (arg == "--no-counts") {
             options.counts_active = false;
+        } else if (arg == "--full-vocabulary") {
+            options.full_vocabulary = true;
+        } else if (arg == "--declare-full") {
+            options.declare_full = true;
         } else if (arg == "-h" || arg == "--help") {
             usage(argc > 0 ? argv[0] : "infernix_sampling_select_bench");
             std::exit(0);
@@ -206,13 +212,14 @@ DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, in
 }
 
 DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool counts_active,
-                                int top_k, bool mixed = false) {
+                                int top_k, bool mixed = false, bool full_vocabulary = false) {
     std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
     for (int row = 0; row < batch; ++row) {
         ops::SamplingConfig& config = configs[static_cast<std::size_t>(row)];
-        config.temperature          = mode == Mode::Greedy ? 0.0f : 0.6f;
+        config.temperature          = mode == Mode::Greedy ? 0.0f : full_vocabulary ? 1.0f : 0.6f;
         config.top_k                = top_k;
-        config.top_p                = 0.95f;
+        config.top_p                = full_vocabulary ? 1.0f : 0.95f;
+        config.full_vocabulary      = full_vocabulary && mode == Mode::Stochastic;
         config.presence_penalty     = mode == Mode::Stochastic && counts_active ? 1.0f : 0.0f;
         config.seed                 = 20260716ull + static_cast<unsigned long long>(row);
         config.token_counts         = mode == Mode::Stochastic && counts_active
@@ -239,9 +246,9 @@ double stochastic_payload_bytes(int cols, bool counts_active) {
 }
 
 void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode,
-                bool counts_active, int top_k) {
+                bool counts_active, int top_k, bool full_vocabulary = false, bool declare_full = false) {
     fill_bytes(counts.p, 0, counts.bytes);
-    DeviceBuffer configs = make_batch_configs(counts, batch, mode, counts_active, top_k);
+    DeviceBuffer configs = make_batch_configs(counts, batch, mode, counts_active, top_k, false, full_vocabulary);
     DeviceBuffer out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
     std::vector<std::int32_t> positions(static_cast<std::size_t>(batch));
     for (int row = 0; row < batch; ++row) { positions[static_cast<std::size_t>(row)] = 4096 + row; }
@@ -257,13 +264,14 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
             ops::sample(tlogits, tout, kTokenDomain, config_ptr, tpositions,
-                        ops::kSamplePurposeDecode, workspace, stream);
+                        ops::kSamplePurposeDecode, workspace, stream, full_vocabulary || declare_full);
         },
         bytes);
     const std::string label = std::string("G2 B=") + std::to_string(batch) + " " +
                               (mode == Mode::Greedy ? "greedy" : "stochastic") +
                               (counts_active && mode == Mode::Stochastic ? " counts" : "") +
-                              " top_k=" + std::to_string(top_k);
+                              (full_vocabulary && mode == Mode::Stochastic ? std::string(" full-vocabulary")
+                                                                           : " top_k=" + std::to_string(top_k));
     print_result(label.c_str(), result);
 }
 
@@ -478,7 +486,7 @@ int main(int argc, char** argv) {
         } else {
             if (options.sample) {
                 run_sample(logits, counts, options.batch, options.mode, options.counts_active,
-                           options.top_k);
+                           options.top_k, options.full_vocabulary, options.declare_full);
             }
             if (options.mtp) {
                 run_mtp(logits, counts, options.mtp_k, options.mode, options.counts_active,

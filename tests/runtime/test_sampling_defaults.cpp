@@ -104,12 +104,25 @@ int main() {
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
                       "explicit zero sampling overrides were not normalized to the target cap");
 
+    // A family whose sampler takes the whole vocabulary (ModelSamplingDefaults::full_vocabulary, Inkling 2) keeps
+    // zero: no limit.
+    infernix::ModelSamplingDefaults whole = dense;
+    whole.full_vocabulary                 = true;
+    failures += check(infernix::runtime::resolve_sampling(whole, infernix::SamplingMode::NonThinking, overrides, false)
+                              .top_k == 0,
+                      "a full-vocabulary family's top_k 0 was capped");
+
     overrides.top_k = 21;
     failures += check(throws_invalid([&] {
                           (void)infernix::runtime::resolve_sampling(
                               dense, infernix::SamplingMode::Thinking, overrides, false);
                       }),
                       "top_k beyond the executable candidate domain was accepted");
+    failures += check(throws_invalid([&] {
+                          (void)infernix::runtime::resolve_sampling(
+                              whole, infernix::SamplingMode::Thinking, overrides, false);
+                      }),
+                      "a full-vocabulary family accepted top_k beyond 20");
     overrides.top_k = 0;
 
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();

@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <utility>
@@ -164,12 +165,18 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
     return out;
 }
 
+// sample()'s full_vocabulary_rows: declared when a row sets full_vocabulary, unless `declare_full` says otherwise.
+bool any_full_vocabulary(const std::vector<ops::SamplingConfig>& configs) {
+    return std::any_of(configs.begin(), configs.end(), [](const ops::SamplingConfig& c) { return c.full_vocabulary; });
+}
+
 RunResult run_batch(const std::vector<float>& logits, int physical_rows, int token_domain,
                     std::vector<ops::SamplingConfig> configs,
                     const std::vector<int>& logical_positions, int purpose,
                     const std::vector<std::vector<int>>& initial_counts = {},
-                    DType logits_dtype = DType::BF16) {
+                    DType logits_dtype = DType::BF16, std::optional<bool> declare_full = std::nullopt) {
     const int batch = static_cast<int>(configs.size());
+    const bool full = declare_full.value_or(any_full_vocabulary(configs));
     if (batch <= 0 || logical_positions.size() != configs.size() ||
         logits.size() != static_cast<std::size_t>(physical_rows) * configs.size() ||
         (!initial_counts.empty() && initial_counts.size() != configs.size())) {
@@ -208,7 +215,7 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::sample(logits_tensor, out_tensor, token_domain,
                 static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                purpose, workspace, nullptr);
+                purpose, workspace, nullptr, full);
     cuda_synchronize();
 
     RunResult result;
@@ -291,7 +298,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
         Tensor positions_tensor(pos, DType::I32, {batch});
         ops::sample(logits_tensor, out_tensor, token_domain,
                     static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                    purpose, workspace, nullptr);
+                    purpose, workspace, nullptr, config.full_vocabulary);
     }
     cuda_synchronize();
 
@@ -951,6 +958,171 @@ int fp32_gumbel_route_contract() {
     return failures;
 }
 
+// The FP64 law of a full_vocabulary row: the softmax of every legal token's value / temperature.
+Distribution full_vocabulary_oracle(const std::vector<float>& column, int token_domain, float temperature,
+                                    const std::vector<std::uint32_t>* mask = nullptr) {
+    Distribution out;
+    double max_scaled = -std::numeric_limits<double>::infinity();
+    for (int token = 0; token < token_domain; ++token) {
+        if (mask && !((*mask)[token / 32] & (1u << (token % 32)))) { continue; }
+        max_scaled = std::max(max_scaled, static_cast<double>(column[static_cast<std::size_t>(token)]) / temperature);
+    }
+    double total = 0.0;
+    for (int token = 0; token < token_domain; ++token) {
+        if (mask && !((*mask)[token / 32] & (1u << (token % 32)))) { continue; }
+        const double w =
+            std::exp(static_cast<double>(column[static_cast<std::size_t>(token)]) / temperature - max_scaled);
+        out.tokens.push_back(token);
+        out.probabilities.push_back(w);
+        total += w;
+    }
+    for (double& p : out.probabilities) { p /= total; }
+    return out;
+}
+
+// SamplingConfig::full_vocabulary (candidates JM-40): a positive-temperature row draws from the whole token domain,
+// against the FP64 softmax of every token with most of the mass outside the top 20, on the single-block route (64
+// tokens) and the multi-block route (4,096), and through a mask that removes the most probable tokens; its draws are
+// the same token at each position on one column, sixteen (multi-block) and seventeen (single-block); in a launch
+// beside greedy and top-20 rows every row draws what it draws alone; a NaN logit sets the row's non-finite flag.
+int full_vocabulary_contract() {
+    int failures = 0;
+    for (const int domain : {64, 4096}) {
+        std::vector<float> column(static_cast<std::size_t>(domain), -2.0f);
+        for (int t = 0; t < std::min(domain, 256); ++t) {
+            column[static_cast<std::size_t>(t)] = 0.0625f * static_cast<float>((t * 37) % 24);
+        }
+        round_to_bf16(column);
+        ops::SamplingConfig config;
+        config.temperature     = 1.0f;
+        config.full_vocabulary = true;
+        config.seed            = 20261124;
+        const Distribution oracle = full_vocabulary_oracle(column, domain, config.temperature);
+        std::vector<double> sorted = oracle.probabilities;
+        std::sort(sorted.rbegin(), sorted.rend());
+        double top20 = 0.0;
+        for (std::size_t i = 0; i < 20 && i < sorted.size(); ++i) { top20 += sorted[i]; }
+        if (top20 > 0.6) {
+            std::cerr << "full-vocabulary fixture keeps too much mass in the top 20: " << top20 << '\n';
+            ++failures;
+        }
+        const RunResult sampled = run_repeated(column, domain, 16384, 8, config, 300, ops::kSamplePurposeDecode);
+        failures += sampled.integrity_failures;
+        failures += verify_distribution(domain == 64 ? "full vocabulary (single-block)" : "full vocabulary (multi-block)",
+                                        sampled.tokens, oracle);
+        if (domain == 4096) {
+            // The eight most probable tokens masked out.
+            std::vector<std::uint32_t> mask((static_cast<std::size_t>(domain) + 31) / 32, 0xffffffffu);
+            std::vector<int> order(static_cast<std::size_t>(domain));
+            for (int t = 0; t < domain; ++t) { order[static_cast<std::size_t>(t)] = t; }
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                return column[static_cast<std::size_t>(a)] > column[static_cast<std::size_t>(b)];
+            });
+            for (int i = 0; i < 8; ++i) { mask[order[i] / 32] &= ~(1u << (order[i] % 32)); }
+            auto device_mask   = to_device(mask);
+            ops::SamplingConfig masked = config;
+            masked.mask = {static_cast<const std::uint32_t*>(device_mask.p), static_cast<int>(mask.size())};
+            const RunResult m = run_repeated(column, domain, 16384, 8, masked, 700, ops::kSamplePurposeDecode);
+            failures += m.integrity_failures;
+            failures += verify_distribution("full vocabulary through a mask", m.tokens,
+                                            full_vocabulary_oracle(column, domain, config.temperature, &mask));
+            // Column invariance: 1, 16 (multi-block) and 17 (single-block) columns.
+            const RunResult one    = run_repeated(column, domain, 16 * 17, 1, config, 900, ops::kSamplePurposeDecode);
+            const RunResult multi  = run_repeated(column, domain, 16 * 17, 16, config, 900, ops::kSamplePurposeDecode);
+            const RunResult single = run_repeated(column, domain, 16 * 17, 17, config, 900, ops::kSamplePurposeDecode);
+            failures += one.integrity_failures + multi.integrity_failures + single.integrity_failures;
+            failures += verify_exact("full vocabulary: 16 columns", multi.tokens, one.tokens);
+            failures += verify_exact("full vocabulary: 17 columns (single-block)", single.tokens, one.tokens);
+            // A mixed launch: greedy, top-20 at T 1, full at T 1 and at T 0.7; each row as alone.
+            std::vector<ops::SamplingConfig> mixed(4);
+            mixed[1].temperature = 1.0f;
+            mixed[1].seed        = 5;
+            mixed[2]             = config;
+            mixed[3]             = config;
+            mixed[3].temperature = 0.7f;
+            const std::vector<int> positions{40, 41, 42, 43};
+            const RunResult together = run_batch(repeat_column(column, 4), domain, domain, mixed, positions,
+                                                 ops::kSamplePurposeDecode);
+            failures += together.integrity_failures;
+            for (std::size_t row = 0; row < mixed.size(); ++row) {
+                const RunResult alone = run_batch(column, domain, domain, {mixed[row]}, {positions[row]},
+                                                  ops::kSamplePurposeDecode);
+                failures += alone.integrity_failures;
+                failures += verify_exact("full vocabulary: a mixed launch's row as alone",
+                                         std::vector<int>{together.tokens[row]}, alone.tokens);
+            }
+        }
+    }
+    {
+        // The real vocabulary: no draw is ever non-finite (a noise mapping that reached u = 1 flagged about one draw
+        // in 84 there), and the draws spread.
+        constexpr int physical_rows = 248320;
+        constexpr int token_domain  = 248077;
+        std::vector<float> column(physical_rows, 0.0f);
+        for (int v = 0; v < token_domain; ++v) {
+            column[static_cast<std::size_t>(v)] = -4.0f + 0.25f * static_cast<float>(v % 13);
+        }
+        round_to_bf16(column);
+        GuardedDeviceBuffer flag(sizeof(std::int32_t));
+        const int zero = 0;
+        flag.copy_from_host(&zero, sizeof(zero));
+        ops::SamplingConfig config;
+        config.temperature     = 1.0f;
+        config.full_vocabulary = true;
+        config.seed            = 77;
+        config.nonfinite       = static_cast<std::int32_t*>(flag.data());
+        const RunResult r = run_repeated(column, token_domain, 4096, 16, config, 1000, ops::kSamplePurposeDecode);
+        failures += r.integrity_failures;
+        failures += verify_exact("full vocabulary: no real-vocabulary draw is non-finite",
+                                 from_device<int>(flag.data(), 1), std::vector<int>{0});
+        std::vector<int> distinct = r.tokens;
+        std::sort(distinct.begin(), distinct.end());
+        if (std::unique(distinct.begin(), distinct.end()) - distinct.begin() < 1000) {
+            std::cerr << "full vocabulary: the real-vocabulary draws do not spread\n";
+            ++failures;
+        }
+    }
+    {
+        std::vector<float> column(4096, 0.0f);
+        column[17] = std::numeric_limits<float>::quiet_NaN();
+        GuardedDeviceBuffer flag(sizeof(std::int32_t));
+        const int zero = 0;
+        flag.copy_from_host(&zero, sizeof(zero));
+        ops::SamplingConfig config;
+        config.temperature     = 1.0f;
+        config.full_vocabulary = true;
+        config.nonfinite       = static_cast<std::int32_t*>(flag.data());
+        const RunResult r = run_batch(column, 4096, 4096, {config}, {5}, ops::kSamplePurposeDecode);
+        failures += r.integrity_failures;
+        failures += verify_exact("full vocabulary: a NaN logit publishes token 0", r.tokens, std::vector<int>{0});
+        failures += verify_exact("full vocabulary: a NaN logit sets the flag", from_device<int>(flag.data(), 1),
+                                 std::vector<int>{1});
+    }
+    {
+        // A call that does not declare full_vocabulary rows runs the kernels without that route: such a row draws
+        // exactly what it draws with the flag unset, on the multi-block (4,096) and single-block (64) routes.
+        for (const int domain : {4096, 64}) {
+            std::vector<float> column(static_cast<std::size_t>(domain));
+            for (int v = 0; v < domain; ++v) { column[static_cast<std::size_t>(v)] = 0.125f * static_cast<float>(v % 17); }
+            round_to_bf16(column);
+            ops::SamplingConfig plain;
+            plain.temperature = 1.0f;
+            plain.seed        = 4242;
+            ops::SamplingConfig flagged = plain;
+            flagged.full_vocabulary     = true;
+            const std::vector<int> positions{11, 12, 13, 14};
+            const std::vector<float> logits = repeat_column(column, 4);
+            const RunResult a = run_batch(logits, domain, domain, std::vector<ops::SamplingConfig>(4, plain), positions,
+                                          ops::kSamplePurposeDecode);
+            const RunResult b = run_batch(logits, domain, domain, std::vector<ops::SamplingConfig>(4, flagged), positions,
+                                          ops::kSamplePurposeDecode, {}, DType::BF16, false);
+            failures += a.integrity_failures + b.integrity_failures;
+            failures += verify_exact("an undeclared full_vocabulary row samples as top-20", b.tokens, a.tokens);
+        }
+    }
+    return failures;
+}
+
 int increment_counts_contract() {
     const std::vector<std::int32_t> ids{1, 3, 1, 7};
     const std::vector<std::int32_t> initial{0, 2, 0, 4, 0, 0, 0, 1};
@@ -1053,6 +1225,7 @@ INFERNIX_OP_TEST(sampling) {
     failures += workspace_route_boundary_contract();
     failures += workspace_route_rng_contract();
     failures += fp32_gumbel_route_contract();
+    failures += full_vocabulary_contract();
     failures += increment_counts_contract();
     failures += increment_licensed_counts_contract();
     failures += grammar_mask_contract();

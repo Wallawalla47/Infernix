@@ -54,6 +54,13 @@ struct SamplingConfig {
     // produced token's position, v). Speculative verification then compares each draft with that
     // token as greedy verification does, so speculation returns plain sampling's text.
     bool gumbel_max = false;
+    // A positive-temperature row drawn from the whole token domain (candidates JM-40): the token maximizing
+    // adjusted_v / temperature + g_v, g_v the gumbel_max noise (keyed by seed, the produced token's position and v),
+    // whatever gumbel_max says; top_k, top_p and min_p do not apply, so a caller sets it only when all three are
+    // unlimited. Only sample() reads it, and only on a call that passes full_vocabulary_rows: speculative acceptance
+    // keeps its 20-candidate supports, so only a family that verifies drafts by sampling each column with sample()
+    // sets it.
+    bool full_vocabulary = false;
     // A row whose reasoning is open at the call's first position (the frontend's thinking not yet closed):
     // reasoning_close is the close token and reasoning_ends the end-of-turn tokens (-1: none), which take no
     // probability at a position before which the row has not written reasoning_close (sample(): the call's one
@@ -104,8 +111,11 @@ struct SamplingConfig {
  * compact row index. A gumbel_max row instead takes the Gumbel-max token of the support with noise
  * keyed by (seed, P, v) for the produced token's position P: logical_positions[b] under
  * kSamplePurposePrefill (the prompt's next position), logical_positions[b] + 1 otherwise (the
- * input token's position). In every mode the selected token atomically increments
- * configs[b].token_counts when it is non-null.
+ * input token's position). On a call with full_vocabulary_rows, a full_vocabulary row with positive temperature
+ * takes the token maximizing adjusted_v/temperature + g_v over the whole token domain (the same key, a finite noise,
+ * lower id on ties), with no top_k, top_p or min_p; without it the call runs the kernels that have no such route
+ * (they cost the top-20 rows nothing) and such a row samples as if the flag were unset. In every mode the selected
+ * token atomically increments configs[b].token_counts when it is non-null.
  *
  * A row has no finite selection when its greedy winner's adjusted value, or its best
  * positive-temperature candidate, is NaN or infinite, or when no finite candidate remains (model
@@ -120,7 +130,7 @@ struct SamplingConfig {
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream, bool full_vocabulary_rows = false);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).

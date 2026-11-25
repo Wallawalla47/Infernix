@@ -34,13 +34,15 @@ std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32
 
 namespace {
 
-template <class Logit>
+// Full: the call's rows may set SamplingConfig::full_vocabulary (sample()'s full_vocabulary_rows); every other call
+// takes the kernels without that route.
+template <class Logit, bool Full>
 void sample_batch(const Logit* logits, Tensor& out, std::int32_t token_domain, std::int32_t physical_rows,
                   std::int32_t batch, const SamplingConfig* configs, const std::int32_t* positions,
                   std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch);
     if (!layout.multiblock) {
-        sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
+        sample_row_kernel<Logit, Full><<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
             logits, static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
             physical_rows);
         CUDA_CHECK(cudaGetLastError());
@@ -51,30 +53,49 @@ void sample_batch(const Logit* logits, Tensor& out, std::int32_t token_domain, s
     const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(batch));
-    sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(logits, configs, token_domain,
-                                                                             physical_rows, scratch);
+    if constexpr (Full) {
+        sampling_partial_topk_full_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
+            logits, configs, positions, purpose, token_domain, physical_rows, scratch);
+    } else {
+        sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(logits, configs, token_domain,
+                                                                                 physical_rows, scratch);
+    }
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
-    sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
+    sampling_group_finalize_sample_kernel<Full><<<group_grid, kSamplerGroupBlock, 0, stream>>>(
         static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
         partial_blocks, groups, scratch);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Logit>
+void sample_batch(const Logit* logits, Tensor& out, std::int32_t token_domain, std::int32_t physical_rows,
+                  std::int32_t batch, const SamplingConfig* configs, const std::int32_t* positions,
+                  std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream, bool full_vocabulary_rows) {
+    if (full_vocabulary_rows) {
+        sample_batch<Logit, true>(logits, out, token_domain, physical_rows, batch, configs, positions, purpose,
+                                  workspace, stream);
+    } else {
+        sample_batch<Logit, false>(logits, out, token_domain, physical_rows, batch, configs, positions, purpose,
+                                   workspace, stream);
+    }
 }
 
 } // namespace
 
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
+                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream,
+                         bool full_vocabulary_rows) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t batch         = logits.ne[1];
     const auto* positions            = static_cast<const std::int32_t*>(logical_positions.data);
     if (logits.dtype == DType::FP32) {
         sample_batch(static_cast<const float*>(logits.data), out, token_domain, physical_rows, batch, configs,
-                     positions, purpose, workspace, stream);
+                     positions, purpose, workspace, stream, full_vocabulary_rows);
     } else {
         sample_batch(static_cast<const __nv_bfloat16*>(logits.data), out, token_domain, physical_rows, batch,
-                     configs, positions, purpose, workspace, stream);
+                     configs, positions, purpose, workspace, stream, full_vocabulary_rows);
     }
 }
 

@@ -954,6 +954,10 @@ struct SamplingPreset {
 struct ModelSamplingDefaults {
     SamplingPreset thinking;
     SamplingPreset non_thinking;
+    // The family samples the whole vocabulary for top_k 0 (with top_p 1 and min_p 0; candidates JM-40): its draws,
+    // speculative ones included, all go through a sampler that takes the whole domain. Otherwise top_k 0 means the
+    // sampler's 20-candidate cap.
+    bool full_vocabulary = false;
 
     [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
         return mode == SamplingMode::Thinking ? thinking : non_thinking;
@@ -975,7 +979,7 @@ struct SamplingOverrides {
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
 struct ResolvedSamplingParameters {
     float temperature       = 0.0F;
-    std::int32_t top_k      = 20;
+    std::int32_t top_k      = 20; // [1,20]; 0 (no limit) only on a family whose defaults declare full_vocabulary
     float top_p             = 1.0F;
     float min_p             = 0.0F;
     float presence_penalty  = 0.0F;

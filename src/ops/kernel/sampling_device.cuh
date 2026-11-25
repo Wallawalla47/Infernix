@@ -460,6 +460,31 @@ __device__ __forceinline__ float sampling_gumbel_score(float p, unsigned long lo
     return __fadd_rn(__logf(p), -__logf(-__logf(u)));
 }
 
+// SamplingConfig::full_vocabulary: a token's key adjusted / temperature + g, g the noise sampling_gumbel_score adds.
+// g is finite, so the key is finite exactly when the adjusted value is (and its quotient by the temperature does not
+// overflow): the winner's key judges the row's finiteness as greedy's does.
+__device__ __forceinline__ bool sampling_full(const SamplingConfig& c) {
+    return c.full_vocabulary && c.temperature > 0.0f;
+}
+
+// The noise draws on sampling_uniform's key (seed, position, kSamplePurposeGumbel, token) but takes 32 of its bits as
+// w = 1 - u (half a step in from either end, at most the float below 1) and -log u as -log1p(-w), so it stays finite
+// and keeps its precision near u = 1: sampling_gumbel_score's u + 2^-25 rounds to 1 at the top 24-bit draw (noise
+// +inf), which over a whole vocabulary's 200K tokens is about one draw in 84. The largest noise, -log(-log1p(-2^-33)),
+// is about 22.9, so a token below e^-22.9 of the top token's probability is never drawn.
+__device__ __forceinline__ float sampling_full_score(float adjusted, const SamplingConfig& c, int position,
+                                                     int token) {
+    unsigned long long key = sampling_splitmix64(
+        c.seed ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) * 0xD1B54A32D192ED03ull));
+    key = sampling_splitmix64(key ^ (static_cast<unsigned long long>(kSamplePurposeGumbel) << 21) ^
+                              (static_cast<unsigned long long>(static_cast<unsigned int>(token)) *
+                               0x2545F4914F6CDD1Dull));
+    const float w = fminf((static_cast<float>(static_cast<unsigned int>(key >> 32)) + 0.5f) * 0x1p-32f,
+                          0x1.fffffep-1f);
+    const float e = -log1pf(-w); // -log u, u = 1 - w
+    return __fadd_rn(__fdiv_rn(adjusted, c.temperature), -__logf(e));
+}
+
 // thread-local: the Gumbel-max token over support entries 0..n-1 (idx_at(j), prob_at(j)); ties to
 // the lower entry (the higher-probability one).
 template <class IdxAt, class ProbAt>
