@@ -461,6 +461,13 @@ int main(int argc, char** argv) {
         engine.reset_memory_peaks();
 
         infernix::PreparedPrompt prompt = engine.prepare(std::move(input));
+        // A budget caps thinking; with --no-thinking only a model whose output opens its reasoning (Inkling 2) still
+        // thinks (serve's settle_thinking takes the same rule).
+        if (cli.thinking_budget && cli.enable_thinking == false && !prompt.summary().opens_reasoning &&
+            !prompt.summary().starts_in_reasoning) {
+            throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking on this model: "
+                                        "thinking is off");
+        }
 
         StreamingSink sink;
         infernix::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),

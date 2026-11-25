@@ -36,6 +36,7 @@
 namespace infernix::ops::inkling2 {
 
 inline constexpr std::int32_t kHidden         = 2304; // the geometry the kernels are built for
+inline constexpr float kRmsEps                = 1e-6F; // the norms' epsilon the kernels are built for
 inline constexpr std::int32_t kHeadDim        = 128;
 inline constexpr std::int32_t kRelDim         = 16;
 inline constexpr std::int32_t kRingPositions  = 32;

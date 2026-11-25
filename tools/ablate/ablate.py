@@ -241,7 +241,8 @@ def main() -> int:
 
     def fit_args(p):
         p.add_argument("--study", required=True, help="the study name; rerun with the same name to continue it")
-        p.add_argument("--trials", type=int, default=300, help="trials to add to the study (300)")
+        p.add_argument("--trials", type=int, default=300,
+                       help="completed trials to add to the study (300; a failed trial is replaced)")
         p.add_argument("--kl-target", type=float, default=0.4, help="first-token KL at which a trial is judged on drift "
                                                                     "alone (0.4; a cliff, so keep it loose)")
         p.add_argument("--startup", type=int, default=60, help="random trials before TPE starts modelling (60)")

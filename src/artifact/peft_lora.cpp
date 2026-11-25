@@ -13,6 +13,10 @@
 namespace infernix::artifact {
 namespace {
 
+// adapter_config.json in its file order: PEFT takes the first rank_pattern / alpha_pattern key that matches a module in
+// the order the file lists them, where a sorted map would try them alphabetically.
+using ConfigJson = nlohmann::ordered_json;
+
 constexpr std::string_view kPrefix  = "base_model.model.";
 constexpr std::string_view kASuffix = ".lora_A.weight";
 constexpr std::string_view kBSuffix = ".lora_B.weight";
@@ -28,9 +32,9 @@ std::string lower(std::string text) {
 
 // A configuration value that turns on a feature this route does not implement: a true boolean, or a non-null value
 // that is not an empty list, object or string.
-bool feature_set(const Json& config, const char* key) {
+bool feature_set(const ConfigJson& config, const char* key) {
     if (!config.contains(key)) { return false; }
-    const Json& value = config.at(key);
+    const ConfigJson& value = config.at(key);
     if (value.is_null()) { return false; }
     if (value.is_boolean()) { return value.get<bool>(); }
     if (value.is_array() || value.is_object() || value.is_string()) { return !value.empty(); }
@@ -39,7 +43,7 @@ bool feature_set(const Json& config, const char* key) {
 
 // PEFT's pattern lookup (peft.utils.other.get_pattern_key): the first key of rank_pattern / alpha_pattern that matches
 // the module path as `(.*\.)?(key)$`. `adapter` names the adapter in a refusal.
-const Json* pattern_value(const Json& patterns, const std::string& module, const std::string& adapter) {
+const ConfigJson* pattern_value(const ConfigJson& patterns, const std::string& module, const std::string& adapter) {
     if (!patterns.is_object()) { return nullptr; }
     for (const auto& [key, value] : patterns.items()) {
         try {
@@ -86,13 +90,13 @@ PeftLoraAdapter::PeftLoraAdapter(const std::filesystem::path& path) {
         throw ArtifactError("LoRA adapter " + path.string() + " is refused: " + config_path_.string() +
                             " is missing, and the adapter's rank, alpha and options come from it");
     }
-    Json config;
+    ConfigJson config;
     {
         std::ifstream in(config_path_, std::ios::binary);
         std::stringstream text;
         text << in.rdbuf();
         try {
-            config = Json::parse(text.str());
+            config = ConfigJson::parse(text.str());
         } catch (const Json::exception& error) {
             throw ArtifactError("LoRA adapter " + config_path_.parent_path().string() + " is refused: " +
                                 config_path_.string() + " is not JSON (" + error.what() + ")");
@@ -147,12 +151,12 @@ PeftLoraAdapter::PeftLoraAdapter(const std::filesystem::path& path) {
     peft_version_ = config.value("peft_version", std::string{});
     const double default_alpha = config.contains("lora_alpha") ? config.at("lora_alpha").get<double>() : 8.0;
     const std::uint64_t default_rank = config.contains("r") ? config.at("r").get<std::uint64_t>() : 8;
-    const Json rank_pattern  = config.contains("rank_pattern") && config.at("rank_pattern").is_object()
+    const ConfigJson rank_pattern  = config.contains("rank_pattern") && config.at("rank_pattern").is_object()
                                    ? config.at("rank_pattern")
-                                   : Json::object();
-    const Json alpha_pattern = config.contains("alpha_pattern") && config.at("alpha_pattern").is_object()
+                                   : ConfigJson::object();
+    const ConfigJson alpha_pattern = config.contains("alpha_pattern") && config.at("alpha_pattern").is_object()
                                    ? config.at("alpha_pattern")
-                                   : Json::object();
+                                   : ConfigJson::object();
 
     file_ = std::make_unique<SafetensorsFile>(weights);
     {
@@ -217,8 +221,8 @@ PeftLoraAdapter::PeftLoraAdapter(const std::filesystem::path& path) {
         m.in       = a.shape[1];
         m.out      = b.shape[0];
         // PEFT's per-module rank and alpha: the pattern's when one matches the module path, else r and lora_alpha.
-        const Json* rank_value  = pattern_value(rank_pattern, module, config_path_.parent_path().string());
-        const Json* alpha_value = pattern_value(alpha_pattern, module, config_path_.parent_path().string());
+        const ConfigJson* rank_value  = pattern_value(rank_pattern, module, config_path_.parent_path().string());
+        const ConfigJson* alpha_value = pattern_value(alpha_pattern, module, config_path_.parent_path().string());
         const std::uint64_t rank = rank_value != nullptr ? rank_value->get<std::uint64_t>() : default_rank;
         if (rank != m.rank) {
             throw ArtifactError("LoRA adapter " + weights.string() + " is refused: adapter_config.json gives module '" +

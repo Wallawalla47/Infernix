@@ -41,6 +41,13 @@ inline constexpr std::int32_t kKvHeads                = 8;
 inline constexpr std::int32_t kGroupHeads             = kHeads / kKvHeads;
 inline constexpr std::int32_t kRelativeExtent         = 1024;
 inline constexpr std::int32_t kWindow                 = 1024;
+// The attention's scalars as Inkling 2 Mini's config states them, which the kernels are built for (Parameters refuses
+// a config with others): the q / k and relative L2 clips' thresholds, and the full layers' log scaling
+// 1 + alpha ln(max(1, (pos + 1) / floor)).
+inline constexpr float kQkClipThreshold       = static_cast<float>(22.627416997969522);
+inline constexpr float kRelativeClipThreshold = 8.0F;
+inline constexpr float kLogScalingAlpha       = 0.1F;
+inline constexpr float kLogScalingFloor       = 8192.0F;
 inline constexpr std::int32_t kKeyUnit                = 64;  // a unit of keys: one KV page
 inline constexpr std::int32_t kWindowRingPages        = 17;  // a sliding visit's ring: 17 pages, 1088 positions
 inline constexpr std::int32_t kSlidingSplits          = 18;  // the units a group's columns can touch

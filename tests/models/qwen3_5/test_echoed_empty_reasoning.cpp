@@ -342,6 +342,33 @@ int main() {
                 empty_reasoning_case(name, renderer, ids, opener, tail, echoed);
             }
         }
+
+        // A tool result that loads a definition (MessagePartKind::LoadedTools, from a tool search or an Anthropic tool
+        // addition) renders in Qwen's tool-section wording, after a blank line when the message has text: the ids
+        // the serve layer's text rendering of it gave.
+        {
+            const std::string declaration =
+                R"({"type":"function","function":{"name":"get_forecast","parameters":{"type":"object"},"strict":false}})";
+            const std::string wording =
+                "You now also have access to the following functions:\n\n<tools>\n" + declaration + "\n</tools>";
+            for (const bool with_text : {true, false}) {
+                infernix::PromptInput loaded, as_text;
+                for (infernix::PromptInput* input : {&loaded, &as_text}) {
+                    input->messages = {message(ChatRole::User, question)};
+                    infernix::ChatMessage result;
+                    result.role = ChatRole::Tool;
+                    if (with_text) { result.parts.push_back({.kind = infernix::MessagePartKind::Text, .text = "Found one."}); }
+                    input->messages.push_back(std::move(result));
+                }
+                loaded.messages.back().parts.push_back(
+                    {.kind = infernix::MessagePartKind::LoadedTools, .tool_jsons = {declaration}});
+                as_text.messages.back().parts.push_back(
+                    {.kind = infernix::MessagePartKind::Text, .text = (with_text ? "\n\n" : "") + wording});
+                check(prompt_ids(frontend, loaded) == prompt_ids(frontend, as_text),
+                      std::string("loaded tools ") + (with_text ? "after text" : "alone") +
+                          ": the ids differ from the tool-section wording's");
+            }
+        }
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

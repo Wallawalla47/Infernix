@@ -286,6 +286,41 @@ def test_the_independent_verifier_accepts_the_artifact(tmp_path):
     assert (result["nvfp4_banks"], result["mxfp8_banks"], result["derived"]) == (4, 2, 2)
 
 
+def test_the_independent_verifier_refuses_what_differs(tmp_path):
+    # A checkpoint word changed after the conversion, and a checkpoint tensor the artifact does not hold: each fails.
+    from safetensors.torch import load_file
+
+    from tools.convert.verify_inkling2 import verify
+
+    source, _, _, out = _convert(tmp_path)
+    original = load_file(str(source / "model.safetensors"))
+    changed = dict(original)
+    name = next(n for n in sorted(changed) if n.endswith("norm.weight"))
+    changed[name] = changed[name].clone()
+    changed[name].view(-1)[0] += 1
+    save_file(changed, str(source / "model.safetensors"))
+    with pytest.raises(AssertionError, match="differ"):
+        verify(source, out)
+    extra = dict(original)
+    extra["model.llm.unused_probe.weight"] = torch.zeros(4, dtype=torch.bfloat16)
+    save_file(extra, str(source / "model.safetensors"))
+    with pytest.raises(AssertionError, match="not in the artifact"):
+        verify(source, out)
+
+
+def test_the_independent_verifier_accepts_a_text_only_artifact(tmp_path):
+    from tools.convert.verify_inkling2 import verify
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _checkpoint(source)
+    out = tmp_path / "model.infernix"
+    main(["--model", str(source), "--recipe", "inkling2_mini", "--components", "text", "--out", str(out),
+          "--device", "cpu"])
+    result = verify(source, out)
+    assert "unconverted_drafter" in result and result["derived"] == 0
+
+
 def test_a_nonpositive_amax_is_refused(tmp_path):
     with pytest.raises(ValueError, match="finite and positive"):
         _convert(tmp_path, zero_amax=True)

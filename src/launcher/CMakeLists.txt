@@ -25,6 +25,7 @@ add_library(infernix_launcher STATIC
   args.cpp
   artifact_scan.cpp
   chats.cpp
+  data_lock.cpp
   downloads.cpp
   event_log.cpp
   events.cpp

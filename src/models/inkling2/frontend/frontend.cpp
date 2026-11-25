@@ -53,6 +53,30 @@ Json parse_object(std::string_view json, std::string_view what) {
     return value;
 }
 
+// A text part's text; a LoadedTools part's declarations in Inkling's own declaration form: the template's tool_declare
+// specs ({description, name, parameters, type}, sorted keys, compact), after a line that says they are now available.
+// The official template emits its tool_declare block only before the conversation, so tools that arrive later are
+// declared in the message that brings them.
+std::string part_text(const MessagePart& part) {
+    if (part.kind != MessagePartKind::LoadedTools) { return part.text; }
+    nlohmann::json specs = nlohmann::json::array();
+    for (const std::string& tool : part.tool_jsons) {
+        const Json declaration = parse_object(tool, "a loaded tool declaration");
+        const Json& fn         = declaration.contains("function") ? declaration.at("function") : declaration;
+        nlohmann::json spec    = nlohmann::json::object();
+        spec["description"]    = fn.contains("description") && fn.at("description").is_string()
+                                     ? fn.at("description").get<std::string>()
+                                     : std::string();
+        spec["name"]           = fn.value("name", std::string());
+        spec["parameters"]     = fn.contains("parameters") && !fn.at("parameters").is_null()
+                                     ? nlohmann::json::parse(fn.at("parameters").dump())
+                                     : nlohmann::json::object();
+        spec["type"]           = declaration.value("type", std::string("function"));
+        specs.push_back(std::move(spec));
+    }
+    return "These tools are now also available:\n" + specs.dump();
+}
+
 // One message as the template reads it (its OpenAI-shaped fields); its images, in order, appended to `media` (null:
 // images are refused, the Engine runs without --vision).
 Json message_json(const ChatMessage& message, std::vector<const OwnedMedia*>* media) {
@@ -71,7 +95,7 @@ Json message_json(const ChatMessage& message, std::vector<const OwnedMedia*>* me
         images = true;
     }
     if (message.parts.size() == 1 && !images) {
-        out["content"] = message.parts.front().text;
+        out["content"] = part_text(message.parts.front());
     } else if (message.parts.empty()) {
         out["content"] = "";
     } else {
@@ -81,7 +105,7 @@ Json message_json(const ChatMessage& message, std::vector<const OwnedMedia*>* me
                 parts.push_back({{"type", "image"}});
                 media->push_back(&part.media);
             } else {
-                parts.push_back({{"type", "text"}, {"text", part.text}});
+                parts.push_back({{"type", "text"}, {"text", part_text(part)}});
             }
         }
         out["content"] = std::move(parts);
@@ -316,8 +340,12 @@ struct Frontend::Impl {
             throw std::invalid_argument(std::string("chat template: ") + error.what());
         }
         Rendered out;
+        // The answer's opener's two tokens follow the rendered text: its encoding takes the rest of `max_tokens`.
+        const std::size_t opener = input.options.open_answer ? 2U : 0U;
         out.ids = tokenizer
-                      ->encode_with_boundaries(rendered.text, {}, {.parse_added_tokens = true, .max_tokens = max_tokens},
+                      ->encode_with_boundaries(rendered.text, {},
+                                               {.parse_added_tokens = true,
+                                                .max_tokens         = max_tokens > opener ? max_tokens - opener : 0U},
                                                rendered.literal_spans)
                       .input_ids;
         out.text = std::move(rendered.text);
@@ -331,22 +359,26 @@ struct Frontend::Impl {
         return out;
     }
 
-    // The calls a turn may make: the declared and deferred tools, less the withdrawn ones; any name when the client
-    // keeps its own.
+    // The calls a turn may make: the listed tools the conversation did not withdraw, then the deferred ones; any name
+    // when the client keeps its own. withdrawn_tool_names names listed declarations only (PromptOptions): a tool the
+    // conversation redefined is withdrawn as listed and callable through its newer declaration among the deferred
+    // ones, so the withdrawal never reaches them (as Qwen's tool contract).
     [[nodiscard]] std::shared_ptr<const ToolNames> tool_names(const PromptOptions& options) const {
         auto names  = std::make_shared<ToolNames>();
         names->open = options.open_tool_names;
+        const auto withdrawn = [&](const std::string& name) {
+            return std::find(options.withdrawn_tool_names.begin(), options.withdrawn_tool_names.end(), name) !=
+                   options.withdrawn_tool_names.end();
+        };
         std::size_t index = 0;
         for (const auto* list : {&options.tool_jsons, &options.deferred_tool_jsons}) {
+            const bool listed = list == &options.tool_jsons;
             for (const std::string& tool : *list) {
                 DeclaredTool declared = declared_tool(parse_object(tool, "a tool declaration"), index++);
+                if (listed && withdrawn(declared.name)) { continue; }
                 names->declared.insert(declared.name);
                 names->tools.push_back(std::move(declared));
             }
-        }
-        for (const std::string& withdrawn : options.withdrawn_tool_names) {
-            names->declared.erase(withdrawn);
-            std::erase_if(names->tools, [&](const DeclaredTool& tool) { return tool.name == withdrawn; });
         }
         if (names->declared.empty() && !names->open) { return nullptr; }
         return names;
@@ -551,7 +583,9 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
 }
 
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
-    const std::vector<int> ids = impl_->tokenizer->encode(text, {.parse_added_tokens = false});
+    // A marker's text encodes as the marker (Engine::tokenize_text, as Qwen's frontend): a /v1/score continuation can
+    // spell Inkling's answer opener.
+    const std::vector<int> ids = impl_->tokenizer->encode(text);
     return {ids.begin(), ids.end()};
 }
 

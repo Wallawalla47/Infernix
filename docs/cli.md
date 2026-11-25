@@ -103,7 +103,9 @@ boundary, Engine appends [Qwen's canonical early-close guidance](https://github.
 and `</think>` to the same resident sequence without sampling, publishes the guidance through the
 reasoning stream, then resumes ordinary generation from the updated context. A natural thinking
 close, stop condition, cancellation, or total output/context limit at the boundary takes priority
-and suppresses this insertion. The option cannot be combined with `--no-thinking`, but it can be
+and suppresses this insertion. On a Qwen model the option cannot be combined with `--no-thinking`
+(refused once the prompt is prepared); on Inkling 2, whose `--no-thinking` renders its lowest effort
+and may still think, the budget caps that thinking ([Inkling 2 Mini](inkling2-mini.md)). It can be
 combined with `--reasoning-effort`.
 
 `--reasoning-loop off|stop|conclude` (default `off`) ends the reply (`stop`) or closes the thinking

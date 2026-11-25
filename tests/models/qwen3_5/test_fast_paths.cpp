@@ -279,7 +279,7 @@ int main() {
                                     KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value}) {
-        const q::FastPathConfiguration offloaded{32, ActivationClass::A8, kv, GateUpFormat::Other, true};
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A8, kv, GateUpFormat::NoDenseMlp, true};
         for (const FastPath path : {FastPath::ExpertA4Residual, FastPath::ExpertA4Residual3}) {
             failures += check(q::fast_path_applies(path, offloaded, options),
                               "expert-a4-residual applies to the 122B's offloaded experts");
@@ -296,7 +296,7 @@ int main() {
     }
     for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {32, ActivationClass::A8, kv, GateUpFormat::Other, true}),
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {32, ActivationClass::A8, kv, GateUpFormat::NoDenseMlp, true}),
                           "prompt-pv8 is registered on the 122B on every format its kernel serves (measured faster)");
     }
     failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, int8_24, options) &&
@@ -348,7 +348,7 @@ int main() {
     // Offloaded experts (the 122B-A10B) price a verified draft by its expert misses, keyed on the
     // offload, not on its 32 query heads.
     {
-        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, KvCacheStorage::BFloat16, GateUpFormat::Other, true};
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, KvCacheStorage::BFloat16, GateUpFormat::NoDenseMlp, true};
         const q::FastPathConfiguration resident32{32, ActivationClass::A16, KvCacheStorage::BFloat16};
         failures += check(q::auto_fixed_draft_tokens(offloaded, SpeculativeBackend::DFlash2) == 1 &&
                               q::auto_fixed_draft_tokens(resident32, SpeculativeBackend::DFlash2) == 3,
@@ -687,6 +687,19 @@ int main() {
                           "the NVFP4 27Bs are configurations of NVFP4 gate/up");
         failures += check(q6_recipe == other_16 && gguf_q8_0 == other_16,
                           "a 16-bit 27B of a Q6 or Q8 gate/up is not the NVFP4 27B's configuration");
+        // The 35B-A3B (16 heads, no dense MLP) against a dense 16-head model of an unmeasured gate/up format: the
+        // 35B's rows match only the model without a dense MLP.
+        {
+            const FastPathConfiguration moe_35b{16, ActivationClass::A16, KvCacheStorage::Int8Group64,
+                                                GateUpFormat::NoDenseMlp};
+            const FastPathConfiguration dense_16{16, ActivationClass::A16, KvCacheStorage::Int8Group64,
+                                                 GateUpFormat::Other};
+            for (const FastPath path : {FastPath::IdleWidePrefill, FastPath::PromptPv8, FastPath::AdaptiveSpeculation,
+                                        FastPath::FreeCacheResume, FastPath::Preemption}) {
+                failures += check(q::fast_path_qualified(path, moe_35b) && !q::fast_path_qualified(path, dense_16),
+                                  "a 35B-A3B row matches the MoE model and not a dense 16-head one");
+            }
+        }
         failures += check(groupwise_recipe == FastPathConfiguration{24, ActivationClass::A16, KvCacheStorage::Int8Group64,
                                                                     GateUpFormat::GroupwiseQ4},
                           "the groupwise recipe is a configuration of Q4 gate/up");

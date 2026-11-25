@@ -202,6 +202,24 @@ def test_capture_records_again_when_the_setup_changes(rig, capsys: pytest.Captur
     assert "48 prompt(s) to record" in capsys.readouterr().out
 
 
+def test_a_carried_file_replaced_in_place_is_another_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # --lora names a folder: an adapter retrained into the same folder must not reuse the old one's recordings.
+    from ablatelib import capture as CA
+    from ablatelib import run as RU
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_model.safetensors").write_bytes(b"old")
+    (tmp_path / "infernix-serve.exe").write_bytes(b"serve")
+    prod = P.parse_tokens(["m.infernix", "--lora", str(adapter)], source_arities(), tmp_path, "test")
+    monkeypatch.setattr(CA, "artifact_id", lambda artifact: "id")
+    run = SimpleNamespace(production=prod, serve_binary=tmp_path / "infernix-serve.exe")
+    before = CA.identity(run)
+    (adapter / "adapter_model.safetensors").write_bytes(b"the retrained adapter")
+    after = CA.identity(run)
+    assert before["carried"] == after["carried"] and before != after
+    assert RU.files_stamp(str(tmp_path / "missing")) is None
+
+
 def test_every_serve_option_has_a_rule() -> None:
     arity = source_arities()
     assert [f for f in arity if f not in SF.RULES] == [], "classify new infernix-serve options in serve_flags.py"
@@ -291,6 +309,31 @@ def test_kl_measure() -> None:
         M.kl([ref], [{}])
     with pytest.raises(EN.EngineError):
         M.kl([ref, ref], [ref])
+
+
+def test_inkling_kl_reads_the_answer_position() -> None:
+    # Inkling 2's chat prompt ends after a closed message: position 0 of a plain continuation is the reply header's
+    # distribution on every model state, so the KL scores the continuation after the answer opener and reads the
+    # answer's first token (position 2).
+    posted = []
+
+    def top(first):  # a position's top-256: `first` most probable, then filler ids
+        return [{"token_id": first, "logprob": -0.1}] + [{"token_id": 1000 + i, "logprob": -9.0} for i in range(M.TOP_K - 1)]
+
+    def fake_post(path, body):
+        posted.append(body)
+        return {"object": "score", "chat_template_applied": True, "enable_thinking": False,
+                "positions": [{"token_id": t, "top_logprobs": top(t)} for t in (7, 8, 42)]}
+
+    for inkling, first in ((True, 42), (False, 7)):
+        engine = EN.Engine.__new__(EN.Engine)
+        engine.answer_opener = EN.ANSWER_OPENER_INKLING if inkling else ""
+        engine.answer_offset = EN.ANSWER_OPENER_TOKENS if inkling else 0
+        engine.post = fake_post
+        posted.clear()
+        [dist] = M.first_token_distributions(engine, ["p"])
+        assert max(dist, key=lambda t: dist[t]) == first
+        assert posted[0]["continuation"] == (EN.ANSWER_OPENER_INKLING if inkling else "") + M.CONTINUATION
 
 
 def test_prompt_files_checks_and_split(tmp_path: Path) -> None:

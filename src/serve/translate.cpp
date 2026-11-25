@@ -100,24 +100,15 @@ std::string render_tool_definition(const ToolDefinition& tool) {
     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
-bool has_rendered_content(const infernix::ChatMessage& message) {
-    return std::any_of(message.parts.begin(), message.parts.end(), [](const auto& part) {
-        return part.kind != infernix::MessagePartKind::Text || !part.text.empty();
-    });
-}
-
 } // namespace
 
-std::string render_loaded_tools(std::span<const ToolDefinition> tools) {
-    // The Qwen tool section's own wording and framing, so a loaded definition reads like a listed
-    // one; the definitions use the same function form the listed tools are rendered from.
-    std::string text = "You now also have access to the following functions:\n\n<tools>";
-    for (const ToolDefinition& tool : tools) {
-        text += '\n';
-        text += render_tool_definition(tool);
-    }
-    text += "\n</tools>";
-    return text;
+infernix::MessagePart loaded_tools_part(std::span<const ToolDefinition> tools) {
+    // The declarations in the function form the listed tools are rendered from; the model's frontend words them.
+    infernix::MessagePart part;
+    part.kind = infernix::MessagePartKind::LoadedTools;
+    part.tool_jsons.reserve(tools.size());
+    for (const ToolDefinition& tool : tools) { part.tool_jsons.push_back(render_tool_definition(tool)); }
+    return part;
 }
 
 ContractDeclarations contract_declarations(const GenerationRequest& request) {
@@ -324,12 +315,7 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
                 }
             }
         }
-        if (!turn.loaded_tools.empty()) {
-            infernix::MessagePart loaded;
-            loaded.text = (has_rendered_content(message) ? "\n\n" : "") +
-                          render_loaded_tools(turn.loaded_tools);
-            message.parts.push_back(std::move(loaded));
-        }
+        if (!turn.loaded_tools.empty()) { message.parts.push_back(loaded_tools_part(turn.loaded_tools)); }
         input.messages.push_back(std::move(message));
         if (turn.cache_boundary_after) {
             if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {

@@ -210,6 +210,7 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_snapshot(NodeRef anchor, st
     snapshot.priority_base    = inflation_;
     snapshot.superseded       = superseded;
     snapshot.superseded_tick  = superseded ? ++tick_ : 0;
+    snapshot.passed_by        = kNoId;
     snapshot.hold             = kNoHold;
     ++snapshot_epoch_;
     anchored.push_back(index);

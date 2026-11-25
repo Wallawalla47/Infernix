@@ -9,6 +9,7 @@
 #include "launcher/ablation.h"
 #include "launcher/artifact_scan.h"
 #include "launcher/chats.h"
+#include "launcher/data_lock.h"
 #include "launcher/downloads.h"
 #include "launcher/event_log.h"
 #include "launcher/events.h"
@@ -291,6 +292,7 @@ private:
     static constexpr std::size_t kBodyCaptureLimit = 16u << 20;
 
     LauncherOptions options_;
+    DataDirLock data_lock_; // before anything reads or changes the data folder
     Store store_;
     EventLog event_log_;
     LogBuffer logs_;

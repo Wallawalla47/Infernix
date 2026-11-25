@@ -53,8 +53,8 @@ using detail::neg_inf;
 constexpr unsigned kAll        = 0xFFFFFFFFU;
 constexpr int kStatWords       = 132;
 constexpr int kAccOffset       = 4;
-constexpr float kClipQK        = static_cast<float>(22.627416997969522);
-constexpr float kClipR         = 8.0F;
+constexpr float kClipQK        = kQkClipThreshold;
+constexpr float kClipR         = kRelativeClipThreshold;
 
 __device__ __forceinline__ float bf16f(std::uint16_t v) { return canon::bf16_to_f32(v); }
 
@@ -603,11 +603,11 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
             }
             float t0 = s.p[row * kKeyUnit + wl], t1 = s.p[row * kKeyUnit + wl + 32];
             float mu = t0 > t1 ? t0 : t1;
+            // fmaxf ignores a NaN in either operand, so every lane ends on the same maximum and the branch below is
+            // warp-uniform (a NaN score cannot leave lanes behind at the full-mask shuffles that follow); on finite
+            // scores it is the select's maximum (a zero's sign aside, which no later value sees).
 #pragma unroll
-            for (int offset = 16; offset >= 1; offset >>= 1) {
-                const float o = __shfl_xor_sync(kAll, mu, offset);
-                mu            = o > mu ? o : mu;
-            }
+            for (int offset = 16; offset >= 1; offset >>= 1) { mu = fmaxf(mu, __shfl_xor_sync(kAll, mu, offset)); }
             if (mu == neg_inf()) {
                 if (wl == 0) { r.act = 0; }
                 continue;

@@ -459,6 +459,11 @@ std::uint16_t* Forward::tail_out(std::uint32_t visit) const {
     return b_.hp;
 }
 
+void Forward::clear_moe_counters(cudaStream_t stream) const {
+    moe::moe_clear_counters(b_.moe, stream);
+    moe::moe_clear_counters(b_.guess, stream);
+}
+
 const std::uint16_t* Forward::mlp_input(std::uint32_t visit) const {
     return !prompt_ && columns_ <= kGuessColumns ? b_.guess_x + static_cast<std::size_t>(visit) * kGuessColumns * kH : b_.xm;
 }

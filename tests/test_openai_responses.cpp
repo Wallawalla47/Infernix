@@ -1496,8 +1496,10 @@ int test_client_tool_search_and_additional_tools() {
                           resolved.generation.tools[1].deferred &&
                           prompt.options.tool_jsons.size() == 1 &&
                           prompt.options.deferred_tool_jsons.size() == 1 &&
-                          prompt.messages[2].parts.back().text ==
-                              render_loaded_tools(resolved.generation.messages[2].loaded_tools) &&
+                          prompt.messages[2].parts.back().kind == infernix::MessagePartKind::LoadedTools &&
+                          prompt.messages[2].parts.back().tool_jsons.size() == 1 &&
+                          prompt.messages[2].parts.back().tool_jsons[0].find("\"get_shipping_eta\"") !=
+                              std::string::npos &&
                           answered_request.tool_identities.contains("get_shipping_eta"),
                       "a client tool_search_output did not load its function");
 
@@ -1956,6 +1958,47 @@ int test_sse_sequence_and_failures() {
 // the completed response lists exactly the streamed Items, each with its own text (the message the joined text), and
 // sent back as input it gives the turn's joined reasoning. With encrypted reasoning requested, each Item carries its
 // own text.
+// A cut turn that reopened thinking (reasoning, text, reasoning, text, reasoning, then the output limit): each
+// reasoning Item's status in the terminal response is the one its output_item.done carried: completed for the late
+// Item that text followed, incomplete for the one the limit cut.
+int test_late_reasoning_incomplete() {
+    OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(Json{{"model", "m"}, {"input", "hello"}, {"stream", true}}, limits());
+    OpenAIResponsesEventStream encoder("resp_late_incomplete", 1, request, {});
+    std::vector<std::string> wire = encoder.start();
+    for (std::vector<std::string> next : {encoder.reasoning_delta("first"), encoder.content_delta("A"),
+                                          encoder.reasoning_delta("second"), encoder.content_delta("B"),
+                                          encoder.reasoning_delta("third")}) {
+        wire.insert(wire.end(), next.begin(), next.end());
+    }
+    GenerationOutcome outcome = sample_outcome();
+    outcome.reasoning         = "firstsecondthird";
+    outcome.text              = "AB";
+    outcome.finish_reason     = infernix::FinishReason::OutputLimit;
+    const OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
+    wire.insert(wire.end(), finish.events_before_terminal.begin(), finish.events_before_terminal.end());
+    std::map<std::string, std::string> done_status;
+    for (const std::string& event : wire) {
+        const Json payload = parse_event(event);
+        if (payload.at("type") == "response.output_item.done" && payload.at("item").at("type") == "reasoning") {
+            done_status[payload.at("item").at("id").get<std::string>()] = payload.at("item").at("status").get<std::string>();
+        }
+    }
+    int failures       = 0;
+    const Json& output = finish.response.body.at("output");
+    std::vector<std::string> listed;
+    for (const Json& item : output) {
+        if (item.at("type") != "reasoning") { continue; }
+        const std::string id = item.at("id").get<std::string>();
+        listed.push_back(item.at("status").get<std::string>());
+        failures += check(done_status.contains(id) && done_status[id] == item.at("status").get<std::string>(),
+                          "late reasoning, cut turn: Item " + id + "'s terminal status is its output_item.done's");
+    }
+    failures += check(listed == std::vector<std::string>{"completed", "completed", "incomplete"},
+                      "late reasoning, cut turn: completed, completed, then the cut Item incomplete");
+    return failures;
+}
+
 int test_late_reasoning_stream() {
     OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
         Json{{"model", "m"},
@@ -2284,6 +2327,7 @@ int main() try {
     failures += test_streamed_function_calls();
     failures += test_stream_keep_alive();
     failures += test_late_reasoning_stream();
+    failures += test_late_reasoning_incomplete();
     failures += test_input_tokens_uses_shared_state_path();
     failures += test_input_tokens_validates_tool_choice();
     failures += test_tool_choice_kind_and_loaded_namespace();

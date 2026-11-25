@@ -26,10 +26,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace infernix::models::inkling2 {
@@ -576,6 +578,7 @@ public:
                                        device_.stream));
         }
         lane.prefix.reuse  = b.reuse;
+        lane.prefix.saves  = prefix_saves_;
         lane.prefix.hashes = b.block_hashes;
         lane.prefix.extras = b.block_extras;
         if (quote == nullptr) {
@@ -906,6 +909,14 @@ public:
         speculative_of(lanes_[index], stats);
         out.speculative = std::move(stats.speculative);
         report_rounds(lanes_[index]);
+        // The prompt tokens past the reused prefix that this request's accepted captures made reusable for a later
+        // request (Anthropic's cache_creation_input_tokens), as the other families report them.
+        if (const Lane& lane = lanes_[index]; prefix_ && lane.prefix.reuse) {
+            const std::uint32_t deepest =
+                std::min<std::uint32_t>(std::max(lane.prefix.base, lane.prefix.deepest_capture),
+                                        static_cast<std::uint32_t>(lane.prompt_tokens));
+            out.cache_created_prompt_tokens = deepest > lane.prefix.base ? deepest - lane.prefix.base : 0U;
+        }
         release(index);
         return out;
     }
@@ -1021,6 +1032,11 @@ public:
             throw std::invalid_argument("Inkling 2: hidden states need a scoring Program off the lossless route");
         }
         bool hidden_captured = false;
+        // A failed forward leaves no capture armed for the calls that follow (as Flash-Next's scoring).
+        struct Disarm {
+            Forward& forward;
+            ~Disarm() { forward.clear_hidden_capture(); }
+        } disarm{forward_};
         for (std::uint32_t at = 0; at < n - 1;) {
             const std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, n - 1 - at);
             CallPlan call;
@@ -1081,6 +1097,9 @@ public:
         }
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
         release_pages(0);
+        // A stalled MoE call (under --a16-activations the prompt route runs the waiting kernels) left wrong expert
+        // output in the window: the scores fail, as a sampled call does (finish_sample).
+        check_moe_error();
         if (options.prompt_hidden_states) {
             if (!hidden_captured) { throw std::logic_error("Inkling 2: the scored prompt's last position was not captured"); }
             // [layers][H], the BF16 values widened exactly.
@@ -1178,6 +1197,8 @@ private:
             std::optional<prefix::RestoreTicket> restore;
             std::uint64_t capture = 0;
             bool withdraw = false;
+            std::uint64_t saves = 0; // the cache file's saves at the binding (prefix_saves_)
+            std::uint32_t deepest_capture = 0; // the deepest frontier the lane's own accepted captures took
         } prefix;
     };
     // A DSpark round's row awaiting its commit: the lane, the anchor's position and the tokens it licenses.
@@ -1348,9 +1369,14 @@ public:
         }
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
         prefix_->drain();
+        // Withdrawn entries another lane pinned until now never reach the file (hybrid-prefix-cache-spec §7.8).
+        if (!prefix_withdrawal_.empty()) { (void)prefix_->index().withdraw(prefix_withdrawal_); }
         const std::uint64_t written                 = prefix_->counters().host_write_bytes;
         runtime::prefix_cache::PersistResult saved = prefix_->save(prefix_file_, prefix_fingerprint_, abandoned);
-        if (saved.ok) { prefix_saved_writes_ = written; }
+        if (saved.ok) {
+            prefix_saved_writes_ = written;
+            ++prefix_saves_;
+        }
         return saved;
     }
 
@@ -1360,6 +1386,7 @@ public:
         try {
             CUDA_CHECK(cudaStreamSynchronize(device_.stream));
             prefix_->drain();
+            if (!prefix_withdrawal_.empty()) { (void)prefix_->index().withdraw(prefix_withdrawal_); }
             const PrefixCacheSaveControl& control = o_.prefix_save;
             if (!control.begin()) {
                 prefix_shutdown_save_ = runtime::prefix_cache::PersistResult{.message = "abandoned before it began"};
@@ -1536,6 +1563,7 @@ private:
             p.capture = id;
             p.captures.push_back(id);
             p.frontiers.push_back(F);
+            p.deepest_capture = std::max(p.deepest_capture, F);
         }
     }
 
@@ -1544,7 +1572,6 @@ private:
     void release_prefix(std::uint32_t idx) noexcept {
         Lane& lane = lanes_[idx];
         if (!prefix_) { return; }
-        namespace pc    = runtime::prefix_cache;
         Lane::Prefix& p = lane.prefix;
         try {
             // Only the lane's next call waits for its copies (order_after_cache), and a lane released before one (a
@@ -1558,14 +1585,40 @@ private:
                 CUDA_CHECK(cudaStreamWaitEvent(device_.stream, event, 0));
             }
             if (!p.path.empty()) { prefix_->index().release_path(p.path); }
+            // A lane released (cancelled) after a stalled MoE call and before the next check: what it published may
+            // hold the incomplete expert output, so it goes too (the word stays set for check_moe_error, which fails
+            // the other lanes the call may have reached).
+            if (moe_error_ != nullptr && *static_cast<volatile std::uint32_t*>(moe_error_) != 0) { p.withdraw = true; }
             if (p.withdraw && (!p.published.empty() || !p.captures.empty())) {
+                // What another lane still maps stays in prefix_withdrawal_ and goes at a later release or save; the
+                // cache file is rewritten at its next save, and deleted now when a save since the binding may hold
+                // what the request published (as Flash-Next's and Qwen3.5's withdrawals).
                 prefix_->drain();
-                pc::Withdrawal w;
-                w.nodes = p.published;
+                prefix_withdrawal_.nodes.insert(prefix_withdrawal_.nodes.end(), p.published.begin(), p.published.end());
                 for (const std::uint64_t id : p.captures) {
-                    if (const auto r = prefix_->capture_result(id); r && r->created) { w.snapshots.push_back(r->snapshot); }
+                    if (const auto r = prefix_->capture_result(id); r && r->created) {
+                        prefix_withdrawal_.snapshots.push_back(r->snapshot);
+                    }
                 }
-                (void)prefix_->index().withdraw(w);
+                if (!prefix_file_.empty()) {
+                    prefix_saved_writes_ = ~std::uint64_t{0};
+                    if (prefix_saves_ != p.saves) {
+                        std::error_code ignored;
+                        std::filesystem::remove(prefix_file_, ignored);
+                    }
+                }
+            }
+            const bool withdrew = p.withdraw && (!p.published.empty() || !p.captures.empty());
+            const std::uint32_t removed =
+                prefix_withdrawal_.empty() ? 0U : prefix_->index().withdraw(prefix_withdrawal_);
+            if (withdrew && o_.diagnostics.callback) {
+                const std::size_t waiting = prefix_withdrawal_.nodes.size() + prefix_withdrawal_.snapshots.size();
+                o_.diagnostics.callback(Diagnostic{
+                    .level   = DiagnosticLevel::Warning,
+                    .message = "Inkling 2: withdrew " + std::to_string(removed) +
+                               " prefix-cache entries a failed request published" +
+                               (waiting != 0 ? "; " + std::to_string(waiting) + " go once other requests release them"
+                                             : std::string())});
             }
             for (const std::uint64_t id : p.captures) { prefix_->forget_capture(id); }
         } catch (...) {
@@ -1582,7 +1635,8 @@ private:
             return;
         }
         prefix_->clear();
-        prefix_failed_ = false;
+        prefix_withdrawal_ = {}; // its references would name the rebuilt index's entries
+        prefix_failed_     = false;
     }
 
     // The Forward over the uploaded call, its head over columns [head_first, head_first + head_columns); `after_embed`
@@ -2247,14 +2301,20 @@ private:
     // A down CTA of the MoE that waited past its bound for its job's h set the error word and wrote nothing, so a call
     // since the last check (this round's, or a prefill chunk that sampled nothing) may have left wrong expert output
     // in any bound lane's state: the requests holding lanes fail with a RecoverableExecutionError (the Engine keeps
-    // serving: recover() releases them, queued requests wait) and what every bound lane published is withdrawn.
+    // serving: recover() releases them, queued requests wait) and what every bound lane published is withdrawn. The
+    // CTA that gave up never counted itself, so the workspaces' cross-call counters are cleared before any later call
+    // (the caller has synchronized the stream: every CTA of the stalled call has returned).
     void check_moe_error() {
         if (inkling2::testing::take_forced_stall()) {
+            // A real stall's aftermath: the error word and the counters the stalled call left.
+            ops::w4a4_moe::testing::leave_stalled_single_counters(forward_.buffers().moe, device_.stream);
             *forward_.buffers().moe.error |= ops::w4a4_moe::kErrorDownStalled; // through the kernels' own pointer
         }
         const std::uint32_t word = *static_cast<volatile std::uint32_t*>(moe_error_);
         if (word == 0) { return; }
         *moe_error_ = 0;
+        forward_.clear_moe_counters(device_.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device_.stream));
         for (Lane& lane : lanes_) {
             if (lane.bound) { lane.prefix.withdraw = true; }
         }
@@ -2279,7 +2339,9 @@ private:
             // A plain row's one position with no legal token (its sampler drew the filler) fails it; a verify call's
             // dead positions count only where they are accepted (decode_dspark).
             const bool dead       = !verify && (mask_dead_[row] & 1U) != 0;
-            failures_[row]        = nonfinite_[row] != 0 ? runtime::PendingRowFailure::NonFiniteLogits
+            // runtime::testing's fault injection reports a plain row as non-finite, as the other families do.
+            const bool nonfinite  = nonfinite_[row] != 0 || (!verify && runtime::testing::take_nonfinite_fault());
+            failures_[row]        = nonfinite            ? runtime::PendingRowFailure::NonFiniteLogits
                                     : unpackable         ? runtime::PendingRowFailure::UnpackableKv
                                     : dead               ? runtime::PendingRowFailure::ConstraintDeadEnd
                                                          : runtime::PendingRowFailure::None;
@@ -2441,6 +2503,9 @@ private:
     std::filesystem::path prefix_file_;
     std::string prefix_fingerprint_;
     std::uint64_t prefix_saved_writes_ = 0;
+    std::uint64_t prefix_saves_        = 0; // saves of the cache file that succeeded
+    // Entries a withdrawal found pinned by another lane: withdrawn at a later release or before a save.
+    runtime::prefix_cache::Withdrawal prefix_withdrawal_;
     std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save_;
     // bf16p: device [kMaximumConcurrency], each lane's lowest appended position with no packed form, and its last
     // reading.

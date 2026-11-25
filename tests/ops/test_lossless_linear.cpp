@@ -1409,6 +1409,13 @@ INFERNIX_OP_TEST(lossless_linear) {
         suite(make_rg16_dense(192, 640, rng, 0.0123F), rng);
         suite(make_bf16(70, 640, rng, true), rng);
         suite(make_bf16(200, 640, rng, false), rng);
+        {
+            // A BF16 matrix of 8,192 rows or more at one column: the narrow route without a K split (a BF16 LM head).
+            const HostWeight head = make_bf16(8448, 256, rng, false);
+            const auto x          = make_columns(head.k, 1, rng, 5);
+            run("bf16 k=256 rows=8448 T=1 bf16 (no split)", head, x, 1, 0, head.n, head.n, 0, true);
+            run("bf16 k=256 rows=8448 T=1 fp32 (no split)", head, x, 1, 0, head.n, head.n, 0, false);
+        }
         // Real projection depths, wide scale exponents (terms far below the largest), across the
         // 512-column chunk.
         {
@@ -1506,6 +1513,8 @@ INFERNIX_OP_TEST(lossless_linear) {
             }
             run_tiles("nvfp4 rg16 bank tiles bf16", rg, 9, 40, true, rng);
             run_tiles("nvfp4 rg16 bank tiles fp32", rg, 3, 70, false, rng);
+            run_tiles("nvfp4 rg16 bank one tile (narrow) bf16", rg, 1, 40, true, rng);
+            run_tiles("nvfp4 rg16 bank one tile (narrow) fp32", rg, 1, 70, false, rng);
             // The design reference's expert input scales g (gate rows even, up rows odd), exactly with the
             // weights' multipliers.
             std::vector<std::array<std::uint32_t, 2>> g;
@@ -1530,6 +1539,10 @@ INFERNIX_OP_TEST(lossless_linear) {
                                     [&](int) { return gen_mxfp8_rg16(64, 640, rng); });
             run_tiles("mxfp8 rg16 bank tiles bf16", mx, 9, 40, true, rng);
             run_tiles("mxfp8 rg16 bank tiles fp32", mx, 3, 70, false, rng);
+            // One tile (64 columns): the narrow kernel's tile mode, with padding columns (in -1, out -1) inside it, for
+            // both record formats (Inkling's MXFP8 and NVFP4 expert passes, Flash-Next's single-tile passes).
+            run_tiles("mxfp8 rg16 bank one tile (narrow) bf16", mx, 1, 40, true, rng);
+            run_tiles("mxfp8 rg16 bank one tile (narrow) fp32", mx, 1, 70, false, rng);
             HostBank fp8 = make_bank("fp8 b128 bank", QType::FP8_E4M3FN_B128, 128, 640, 3, 4096,
                                      [&](int) { return gen_fp8b128(128, 640, rng); });
             run_tiles("fp8 b128 bank tiles bf16", fp8, 9, 40, true, rng);

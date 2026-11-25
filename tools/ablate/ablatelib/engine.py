@@ -25,6 +25,9 @@ from . import serve_flags as SF
 from .run import text_model_type, write_json
 
 MODEL_ID = "ablate"
+# Inkling 2's answer opener: the reply header and its text channel (/v1/decide opens the answer the same way).
+ANSWER_OPENER_INKLING = "<|message_model|><|content_text|>"
+ANSWER_OPENER_TOKENS = 2
 
 
 class EngineError(RuntimeError):
@@ -46,6 +49,11 @@ class Engine:
         # still open with a thinking channel (measure.grade_refusals grades what the model says first in either channel).
         inkling = text_model_type(run.production.artifact) == "inkling2_loop_text"
         self.reasons_when_off = inkling
+        # Inkling 2's chat prompt ends after a closed message, so its next token is the reply header, never the answer:
+        # a scored continuation starts with the answer's opener (two special tokens, which raw text encodes as tokens),
+        # and its positions are read from the answer's first token on.
+        self.answer_opener = ANSWER_OPENER_INKLING if inkling else ""
+        self.answer_offset = ANSWER_OPENER_TOKENS if inkling else 0
         # Inkling 2 keeps its experts in VRAM and refuses --expert-state: there is no expert-cache state to keep.
         self.keeps_expert_state = not inkling
 
@@ -147,11 +155,13 @@ class Engine:
         that would quietly change what KL means."""
         out = self.post("/v1/score", {"model": MODEL_ID, "apply_chat_template": True,
                                       "messages": [{"role": "user", "content": prompt}],
-                                      "enable_thinking": enable_thinking, "continuation": continuation, "top_k": top_k})
+                                      "enable_thinking": enable_thinking,
+                                      "continuation": self.answer_opener + continuation, "top_k": top_k})
         self._check_rendering(out, enable_thinking)
-        positions = out.get("positions") or []
+        positions = (out.get("positions") or [])[self.answer_offset:]
         if not positions or len(positions[0].get("top_logprobs") or []) != top_k:
-            raise EngineError(f"/v1/score returned {len(positions)} position(s) / a top_logprobs width other than {top_k}")
+            raise EngineError(f"/v1/score returned {len(positions)} answer position(s) / a top_logprobs width other "
+                              f"than {top_k}")
         return [{int(t["token_id"]): float(t["logprob"]) for t in p["top_logprobs"]} for p in positions]
 
     def hidden_states(self, prompt: str):

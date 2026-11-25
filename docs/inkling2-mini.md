@@ -109,6 +109,7 @@ once the model has loaded; `--plan` reports them without loading.
 | Video input | the request is refused; images work |
 | `/v1/decide`'s generated types (`number`, `scalar`, `point`, `box`) | the request is refused (`question_type_unsupported`): they spell a number one digit a step, and Inkling's tokenizer writes digits in groups of up to three, so the answer would be noise. `noul`, `choice` and `score` work |
 | A request ending in an assistant message (prefill) | the request is refused: only a new assistant turn is rendered |
+| The lossless route's noise twin (`infernix-certify --noise-seed`) | refused: Inkling 2's own lossless kernels round to nearest only |
 | `--reasoning-loop stop` or `conclude` | refused: the model has no reasoning-loop guard |
 | `--preserve-thinking`, `--tolerant-tool-calls`, `--tool-parameter-names declared` | refused: Qwen template and tool-call options. The template renders the history's reasoning as given |
 | N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens`, `--ngram-min-match`, `--ngram-tree-nodes`, `--ngram-archive-mib`, `--ngram-session-mib`, `--ngram-residency` | refused |

@@ -409,6 +409,12 @@ void Ablation::detect_python() {
 
 void Ablation::choose_python(const std::string& executable) {
     const std::string path = trim(executable);
+    {
+        // Set up installs the packages for the Python it started with: another one now would record its version over
+        // packages built for the first.
+        std::lock_guard lock(mutex_);
+        if (task_running_) { throw std::invalid_argument("an installation or a download is running: choose the Python after it"); }
+    }
     std::error_code error;
     if (!path.empty() && !fs::exists(utf8_path(path), error)) { throw std::invalid_argument(path + " does not exist"); }
     fs::create_directories(root_, error);
@@ -726,13 +732,16 @@ void Ablation::setup() {
     task.started = now_ms();
     const fs::path requirements = *tool_ / "requirements.txt";
     // The portable Python first when no Python was found; then pip with the Python found.
-    const auto prepare = [this, download_python](fs::path& executable) -> std::string {
+    // The Python pip runs with: the setup file records it, whatever the page chooses meanwhile.
+    const auto used = std::make_shared<std::optional<Python>>();
+    const auto prepare = [this, download_python, used](fs::path& executable) -> std::string {
         if (download_python) {
             if (std::string failure = install_portable(); !failure.empty()) { return failure; }
             detect_python();
         }
         std::lock_guard lock(mutex_);
         if (!python_) { return "the portable Python does not start (the log of the Pythons tried says why)"; }
+        *used      = python_;
         executable = python_->executable;
         if (task_) { task_->message = "installing numpy and optuna for Python " + python_->version; }
         return "";
@@ -741,13 +750,9 @@ void Ablation::setup() {
              {"-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--no-warn-script-location",
               "--target", path_utf8(staging), "-r", path_utf8(requirements)},
              {{"PYTHONUTF8", "1"}},
-             [this, staging, requirements](int code) -> std::string {
+             [this, staging, requirements, used](int code) -> std::string {
                  if (code != 0) { return "pip ended with exit code " + std::to_string(code) + " (the log says why)"; }
-                 std::optional<Python> python;
-                 {
-                     std::lock_guard lock(mutex_);
-                     python = python_;
-                 }
+                 const std::optional<Python> python = *used;
                  if (!python) { return "no Python"; }
                  std::error_code failure;
                  fs::remove_all(packages_, failure);
@@ -850,9 +855,29 @@ void Ablation::start(const AblationRun& request) {
     for (const auto& [name, value] : request.env) { env.push_back({name, value}); }
     std::uintmax_t serve_bytes = fs::file_size(utf8_path(request.argv[0]), error);
     if (error) { serve_bytes = 0; }
+    // The files the command line names as they are now (a LoRA adapter's folder: each file in it): one replaced in
+    // place is another production setup, as tools/ablate's own identity counts it.
+    Json files = Json::array();
+    for (std::size_t i = 1; i < request.argv.size(); ++i) {
+        const fs::path path = utf8_path(request.argv[i]);
+        std::error_code status;
+        if (fs::is_regular_file(path, status)) {
+            files.push_back({i, fs::file_size(path, status), modified_ms(path)});
+        } else if (fs::is_directory(path, status)) {
+            std::vector<fs::path> inside;
+            for (const auto& entry : fs::directory_iterator(path, status)) {
+                if (entry.is_regular_file(status)) { inside.push_back(entry.path()); }
+            }
+            std::sort(inside.begin(), inside.end()); // the listing's order is the file system's
+            for (const fs::path& file : inside) {
+                files.push_back({i, path_utf8(file.filename()), fs::file_size(file, status), modified_ms(file)});
+            }
+        }
+    }
     const Json identity = {{"argv", request.argv},
                            {"env", env},
                            {"serve", {serve_bytes, modified_ms(utf8_path(request.argv[0]))}},
+                           {"files", files},
                            {"preset", request.preset},
                            {"name", request.name}};
     const fs::path run_dir = runs_ / utf8_path(request.name + "-" + sha256_hex(identity.dump()).substr(0, 10));

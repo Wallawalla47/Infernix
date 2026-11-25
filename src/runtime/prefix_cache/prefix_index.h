@@ -367,8 +367,9 @@ public:
     // Boundary).
     bool supersede(SnapshotRef snapshot, std::span<const TokenId> continuation = {});
     // Undoes a supersede() that returned true when the deeper snapshot was not published after
-    // all (no Device slot, or the publication failed): `snapshot` is its lineage's resume point
-    // again. Endpoints that supersede() superseded as passed stay superseded.
+    // all (no Device slot, the publication failed, or a capture was refused or abandoned): `snapshot`
+    // is its lineage's resume point again, and the Endpoints that supersede() superseded as passed
+    // (and that are still superseded and present) are retained again with it.
     void unsupersede(SnapshotRef snapshot);
 
     // ---- queue holds (§9.6) --------------------------------------------------------------------
@@ -756,6 +757,10 @@ private:
         std::uint64_t last_hit_tick   = 0;
         bool superseded               = false;
         std::uint64_t superseded_tick = 0;
+        // An Endpoint superseded as passed by a supersede() of snapshot `passed_by` (kNoId: none) whose superseded_tick
+        // was `passed_tick`: an unsupersede() of that supersession retains it again.
+        std::uint32_t passed_by   = kNoId;
+        std::uint64_t passed_tick = 0;
         // Nearest snapshot above this one on its path (kNoId: none), whatever its state, and the
         // snapshots whose nearest one this is.
         std::uint32_t ancestor = kNoId;

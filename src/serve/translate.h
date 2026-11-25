@@ -46,10 +46,10 @@ inline constexpr std::string_view kToolImageOmittedNote = "[image omitted: this 
 inline constexpr std::string_view kToolVideoOmittedNote = "[video omitted: this server has no vision input]";
 std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest& req);
 
-// The text a turn that loads tools ends with: the definitions in the function form of the listed
-// tools, framed like the prompt's tool section. It depends on the definitions alone, so a history
-// replayed by a later request renders the same tokens.
-std::string render_loaded_tools(std::span<const ToolDefinition> tools);
+// The part a turn that loads tools ends with (MessagePartKind::LoadedTools): the definitions in the function form of
+// the listed tools, which the model's frontend words as its own declarations. It depends on the definitions alone, so
+// a history replayed by a later request renders the same tokens.
+infernix::MessagePart loaded_tools_part(std::span<const ToolDefinition> tools);
 
 // The output contract's declarations in Engine declaration order: the listed tools in request order (each also
 // renders in the prompt's tool section; `withdrawn` names those the conversation withdrew or redefined, which the

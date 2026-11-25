@@ -310,8 +310,8 @@ harnesses first (the rank-32 specialists for Pi, OpenCode and Hermes, and the ra
 for all three), then the 60 most downloaded, with a search by name. Gated
 ones need a token. **Download** reads the adapter's config first and shows its base model, rank and
 modules (an adapter above rank 128, which `infernix-serve` refuses, is flagged) and selects its two
-files; an adapter always gets a folder of its own, named after the repository, since every
-adapter's files have the same names. Once it is scanned, pick it on a 27B's Configure page; **Will
+files; an adapter always gets a folder of its own, named `owner--name` after the repository, since
+every adapter's files have the same names (two owners' adapters of one name stay apart). Once it is scanned, pick it on a 27B's Configure page; **Will
 it fit?** then asks the server whether it applies it and what it takes.
 
 Downloads run one repository at a time, each file in 64 MiB pieces over several connections

@@ -8,7 +8,7 @@ divergence from the original model. The repository ships no prompts: `ablate.py 
 public sets ([Prompt sets](#prompt-sets)), which also says where to get others and how to build the harmless half.
 The launcher's Ablation page runs all of it from the browser ([In the launcher](#in-the-launcher)).
 
-It runs on every model `--ablate` does (the Qwen3.5 family and Qwen3.8-Flash-Next): every step drives
+It runs on every model `--ablate` does (the Qwen3.5 family, Qwen3.8-Flash-Next and Inkling 2 Mini): every step drives
 `infernix-serve` with your production options, and the capture reads each prompt's hidden states from a scoring
 engine (`POST /v1/score` with `hidden_states`).
 
@@ -34,7 +34,7 @@ engine (`POST /v1/score` with `hidden_states`).
 
 | | |
 |---|---|
-| Model | an Infernix artifact of the Qwen3.5 family (the 27Bs, the 35B-A3B, the 122B-A10B) or Qwen3.8-Flash-Next ([Model coverage](#model-coverage)) |
+| Model | an Infernix artifact of the Qwen3.5 family (the 27Bs, the 35B-A3B, the 122B-A10B), Qwen3.8-Flash-Next or Inkling 2 Mini ([Model coverage](#model-coverage)) |
 | Infernix | the `infernix-serve` you serve with |
 | Python | 3.11 or newer, then `pip install -r tools/ablate/requirements.txt` (numpy, optuna; the launcher's Ablation page installs them into its own folder). `eval` also needs `pip install -r tools/ablate/requirements-eval.txt` (lm-eval) |
 | GPU | the whole card. Every step starts its own engine, so stop your production server first; each step refuses while another program holds the card (a compute process with 1 GiB or more, or, where Windows reports no memory per process, 4 GiB of the card in use: the desktop's own small share does not count) |
@@ -357,10 +357,11 @@ log with an earlier one.
 ## Model coverage
 
 - **Every model `--ablate` runs on**: the Qwen3.5 family (the 27Bs, the 35B-A3B, the 122B-A10B with offloaded
-  experts) and Qwen3.8-Flash-Next. The direction is measured from the hidden state each layer hands on: on the
-  Qwen3.5 family the residual after the layer; on Qwen3.8-Flash-Next, whose residual is four hyper-connection
-  streams, the next layer's mixer input (and the last layer's MoE input) ([Teacher-forced
-  scoring](serving.md#teacher-forced-scoring)).
+  experts), Qwen3.8-Flash-Next and Inkling 2 Mini. The direction is measured from the hidden state each layer hands
+  on: on the Qwen3.5 family and Inkling 2 the residual after the layer; on Qwen3.8-Flash-Next, whose residual is four
+  hyper-connection streams, the next layer's mixer input (and the last layer's MoE input) ([Teacher-forced
+  scoring](serving.md#teacher-forced-scoring)). On Inkling 2, whose chat prompt ends after a closed message, the KL
+  reads the answer's first token after the answer opener (`<|message_model|><|content_text|>`), not the reply header.
 - The method's full fit, grading and evaluation were measured on Qwen3.8-Flash-Next NVIDIA NVFP4 QAD Dense8
   (refusal-cut-v1, the example), through an earlier capture whose reader took the forward-pass test's recordings
   layer by layer where the test writes them position by position: the example's direction is not the last-token

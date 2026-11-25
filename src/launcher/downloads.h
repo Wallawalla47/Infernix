@@ -24,6 +24,14 @@
 
 namespace infernix::launcher {
 
+// The folder a LoRA adapter repository downloads into: "owner--name". Every adapter's files have the same names and
+// adapters of one rank and module set the same sizes, so two owners' adapters of the same name need folders of their
+// own (a second would otherwise be taken as the first's files already there).
+[[nodiscard]] inline std::string adapter_folder_name(const std::string& repo) {
+    const std::size_t slash = repo.find('/');
+    return slash == std::string::npos ? repo : repo.substr(0, slash) + "--" + repo.substr(slash + 1);
+}
+
 struct DownloadFile {
     std::string path;
     std::uint64_t bytes = 0;

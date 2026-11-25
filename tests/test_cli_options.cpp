@@ -269,11 +269,14 @@ int run_tests() {
                                        "--thinking-budget", "0"});
                       }),
                       "zero --thinking-budget was accepted");
-    failures += check(rejects([] {
-                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello",
-                                       "--thinking-budget", "8", "--no-thinking"});
-                      }),
-                      "--thinking-budget was accepted with --no-thinking");
+    // Beside --no-thinking the budget is decided with the model (Inkling 2's lowest effort still thinks, and the budget
+    // caps it; a Qwen prompt with thinking off is refused once prepared), so the options parse.
+    {
+        const infernix::cli::Options both = parse({"infernix-cli", "model.ninfer", "--prompt", "hello",
+                                                   "--thinking-budget", "8", "--no-thinking"});
+        failures += check(both.thinking_budget == 8 && both.enable_thinking == false,
+                          "--thinking-budget beside --no-thinking did not parse");
+    }
     const infernix::cli::Options with_effort =
         parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "8",
                "--reasoning-effort", "medium"});
