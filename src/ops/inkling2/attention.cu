@@ -856,7 +856,7 @@ void detail::check_attention_args(const AttentionArgs& a) {
     if (!l.full && !window_codec_supported(a.kv.codec)) {
         throw std::invalid_argument("inkling2 attention: a window ring holds bf16, bf16p or int8");
     }
-    if (a.kv.codec == KvCodec::Bf16Packed && a.kv.unpackable == nullptr) {
+    if ((a.kv.codec == KvCodec::Bf16Packed || a.kv.encode == KvCodec::Bf16Packed) && a.kv.unpackable == nullptr) {
         throw std::invalid_argument("inkling2 attention: a bf16p pool or ring needs its lanes' unpackable flags");
     }
     if (a.ws.q == nullptr || a.ws.stats == nullptr || a.out == nullptr) {

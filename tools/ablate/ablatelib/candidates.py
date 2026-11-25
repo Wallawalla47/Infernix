@@ -178,7 +178,8 @@ def export(run, candidate: str, name: str, source: str | None = None, out: Path 
     prod = run.production
     template = prod.value("--chat-template")
     template_text = Path(template).read_text(encoding="utf-8") if template else None
-    numerics = [(f, v) for f, v in prod.options if f in ("--kv-dtype", "--a8-activations", "--a16-activations",
+    numerics = [(f, v) for f, v in prod.options if f in ("--kv-dtype", "--kv-window-dtype", "--a8-activations",
+                                                          "--a16-activations",
                                                           "--expert-a4-activations", "--reproducible", "--lossless",
                                                           "--fast-path", "--no-fast-path", "--rope-yarn-factor",
                                                           "--logits-dtype", "--expert-tail-skip",

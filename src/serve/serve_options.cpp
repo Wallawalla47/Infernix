@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/config/config_file.h"
+#include "product/kv_window_options.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
 
@@ -101,6 +102,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--expert-csf", false},
     ServeOptionArity{"--kv-dtype"},
+    ServeOptionArity{"--kv-window-dtype"},
     ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
@@ -540,6 +542,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             BF16; bf16p stores bf16's values in 23 % fewer bytes (12\n"
            "                             bits a value; same output as bf16; a request with a KV\n"
            "                             row it cannot pack fails)\n"
+           "  --kv-window-dtype T        Inkling 2's sliding windows (the last 1,088 positions of\n"
+           "                             its 40 sliding visits, 170 MiB a lane as bf16): auto\n"
+           "                             (default: bf16 under --kv-dtype bf16, bf16p under bf16p,\n"
+           "                             int8 under every other) | bf16 | bf16p (138 MiB, bf16's\n"
+           "                             values) | int8 (88 MiB)\n"
            "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
            "                             greedy choice, draft acceptance and constraints read;\n"
            "                             bf16 rounds each once, as Transformers returns them\n"
@@ -1239,6 +1246,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kv-window-dtype") {
+            options.kv_window_cache = product::parse_kv_window_dtype(require_value("--kv-window-dtype"));
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {

@@ -367,7 +367,22 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "bf16p"})
                               .kv_cache == infernix::KvCacheStorage::Bf16Packed,
                       "--kv-dtype bf16p did not select packed BF16 KV");
+    failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "hello"}).kv_window_cache &&
+                          !parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-window-dtype", "auto"})
+                               .kv_window_cache &&
+                          parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "int8",
+                                 "--kv-window-dtype", "bf16p"})
+                                  .kv_window_cache == infernix::KvCacheStorage::Bf16Packed,
+                      "--kv-window-dtype did not parse (default auto)");
+    {
+        bool threw = false;
+        try {
+            (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-window-dtype", "fp8"});
+        } catch (const std::invalid_argument&) { threw = true; }
+        failures += check(threw, "--kv-window-dtype fp8 was accepted");
+    }
     const std::string help = infernix::cli::usage_text("infernix-cli");
+    failures += check(help.find("--kv-window-dtype") != std::string::npos, "CLI help omits --kv-window-dtype");
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos &&
                   help.find("vq2") != std::string::npos && help.find("k4v2") != std::string::npos &&

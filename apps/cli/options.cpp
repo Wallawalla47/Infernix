@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/config/config_file.h"
+#include "product/kv_window_options.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
 
@@ -109,6 +110,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-pin-mib"},
     CliOption{"--expert-csf", false},
     CliOption{"--kv-dtype"},
+    CliOption{"--kv-window-dtype"},
     CliOption{"--logits-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
@@ -189,6 +191,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
+           "       [--kv-window-dtype auto|bf16|bf16p|int8]\n"
            "       [--spec auto|off|mtp|dflash|dflash2|dspark --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
@@ -292,6 +295,11 @@ std::string usage_text(const char* argv0) {
            "                           stores bf16's values in 23 % fewer bytes (12 bits a\n"
            "                           value; same output as bf16; a request with a KV row it\n"
            "                           cannot pack fails)\n"
+           "  --kv-window-dtype T      Inkling 2's sliding windows (the last 1,088 positions\n"
+           "                           of its 40 sliding visits, 170 MiB a lane as bf16):\n"
+           "                           auto (default: bf16 under --kv-dtype bf16, bf16p\n"
+           "                           under bf16p, int8 under every other) | bf16 | bf16p\n"
+           "                           (138 MiB, bf16's values) | int8 (88 MiB)\n"
            "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
            "                           greedy choice, draft acceptance and scoring read;\n"
            "                           bf16 rounds each once, as Transformers returns them\n"
@@ -577,6 +585,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
+        } else if (arg == "--kv-window-dtype") {
+            options.kv_window_cache = product::parse_kv_window_dtype(value(arg));
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {

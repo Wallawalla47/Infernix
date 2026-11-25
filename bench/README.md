@@ -98,7 +98,8 @@ infernix_bench --weights <artifact.ninfer>
           [--grammar-file <path> | --json-schema-file <path> | --json-object | --regex <pattern> | --choice <text> ...]
           [--mixed-constraints]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
+          [--kv-dtype <bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--kv-window-dtype <auto|bf16|bf16p|int8>]
+          [--use-original-int8-prefill-kernel]
           [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
           [--reproducible] [--fast-path <name>]... [--no-fast-path <name>]...
           [--spec <mtp|dflash|dflash2|auto> --draft-tokens <n|auto>] [--lm-head-draft]
@@ -189,7 +190,8 @@ empty without an adapter), `lora_adapter` to `load` (the adapter the Engine appl
 and to `memory` `draft_screen_bytes` and `adapter_bytes` (the DFlash2 head screen and a LoRA adapter's factors,
 beside the weights' arena) and `cuda_graph_measured_bytes` (what CUDA Graph preparation took). Schema v28 adds `ablate`
 to `config` (`--ablate`, empty without a sidecar) and `ablate_sidecar` to `load` (the sidecar the Engine applied, as
-its startup log names it); `memory.adapter_bytes` then counts the sidecar's direction.
+its startup log names it); `memory.adapter_bytes` then counts the sidecar's direction. Schema v29 adds
+`kv_window_cache` to `config` (`--kv-window-dtype`, Inkling 2's sliding windows; `auto` without it).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.

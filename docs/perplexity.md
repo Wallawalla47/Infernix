@@ -128,7 +128,9 @@ same route as generation; `--ngram-volume FILE` names their n-gram volume when i
 16-bit activations at every text projection, and `--a8-activations` scores infernix-serve's
 8-bit route, which the reproducible and lossless routes refuse; `report.json` records them as
 `expert_a16_activations` and `a8_activations`. `--q8-weights` scores Inkling 2 with infernix-serve's 8-bit weights
-(the same refusals), recorded as `q8_weights`. `--lora PATH` scores the model with a LoRA adapter applied
+(the same refusals), recorded as `q8_weights`. `--kv-window-dtype auto|bf16|bf16p|int8` scores Inkling 2 with its
+sliding windows in that format, as in `infernix-serve` (`auto`, the default, follows `--kv-dtype`: `int8` under the
+default `fp8`), recorded as `kv_window_dtype`. `--lora PATH` scores the model with a LoRA adapter applied
 ([LoRA adapters](lora.md)); `report.json` names it in `execution.lora_adapter` (`null` without one). `--ablate FILE`
 scores the model with an ablation sidecar applied ([Ablation sidecars](ablate.md)); `report.json` names it in
 `execution.ablate_sidecar` (`null` without one). The

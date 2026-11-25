@@ -37,6 +37,13 @@ export const KV_OPTIONS = [
   { value: "bf16p", label: "BF16 packed (exact, 23 % smaller)" },
 ];
 
+// Inkling 2's sliding windows (--kv-window-dtype; unset: auto).
+export const WINDOW_KV_OPTIONS = [
+  { value: "bf16", label: "BF16" },
+  { value: "bf16p", label: "BF16 packed (exact, 19 % smaller)" },
+  { value: "int8", label: "INT8 (48 % smaller)" },
+];
+
 export interface FormSection {
   /** Names the section's remembered open state. */
   id: string;
@@ -65,6 +72,14 @@ const CONTEXT: FormSection = {
       help: "Storage of the attention KV cache. INT8 holds twice BF16's context at the measured quality; vq2 and k4v2 hold three to four times INT8's. BF16 packed keeps BF16's exact values in 23 % less memory (a request whose KV row cannot be packed fails).",
       options: KV_OPTIONS,
       unsetLabel: "BF16 (default)",
+    },
+    {
+      kind: "select",
+      flag: "--kv-window-dtype",
+      label: "Sliding-window KV format",
+      help: "Inkling 2: storage of the 40 sliding visits' windows (their last 1,088 positions, 170 MiB a lane as BF16). Automatic follows the KV cache format: BF16 under BF16, BF16 packed under BF16 packed, INT8 under every other. BF16 packed keeps BF16's output in 138 MiB (on BF16 packed KV it decoded 0.6-1.8 % slower than BF16 windows); INT8 takes 88 MiB and changes the output slightly.",
+      options: WINDOW_KV_OPTIONS,
+      unsetLabel: "Automatic (default)",
     },
     {
       kind: "auto",

@@ -531,6 +531,7 @@ void test_option_support() {
     row("--lora", true, false, false, false, true);
     row("--ablate", true, true, true, true, true);
     row("--q8-weights", false, false, false, false, true);
+    row("--kv-window-dtype", false, false, false, false, true);
     row("--expert-state", false, false, true, true, false);
     row("--expert-tail-skip", false, false, true, true, false);
     row("--embedding-host", true, true, false, false, true);

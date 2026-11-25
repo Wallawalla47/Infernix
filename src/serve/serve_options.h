@@ -144,6 +144,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    std::optional<KvCacheStorage> kv_window_cache; // EngineOptions::kv_window_cache (--kv-window-dtype; empty: auto)
     LogitsDtype logits_dtype               = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;

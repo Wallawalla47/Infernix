@@ -307,7 +307,7 @@ struct ProgramOptions {
     // --vision-offload on: the tower's pinned groups (the model's vision_host(), or the load plan's when planning),
     // whose device staging the plan counts; the Program's tower streams through it.
     const VisionHostWeights* vision_host = nullptr;
-    // --kv-dtype: the full visits' pools, and (window_codec(kv_codec)) the sliding windows' rings.
+    // --kv-dtype: the full visits' pools; --kv-window-dtype (window_codec): the sliding windows' rings.
     ops::inkling2::KvCodec kv_codec     = ops::inkling2::KvCodec::Bf16;
     ops::inkling2::KvCodec window_codec = ops::inkling2::KvCodec::Bf16;
     // The full visits' pool: at least every lane's whole context (pages_per_lane(max_context) a lane); more holds
@@ -335,9 +335,11 @@ struct ProgramOptions {
 
 // --kv-dtype's forms of the full visits' pools: the KvCodec of a storage (none: not built for Inkling 2), and back.
 [[nodiscard]] std::optional<ops::inkling2::KvCodec> kv_codec(KvCacheStorage storage);
-// The sliding windows' storage under a full pool's codec (design §7.6; owner 2026-11-24): BF16 words under bf16, bf16p
-// under bf16p, int8 under every other codec.
-[[nodiscard]] ops::inkling2::KvCodec window_codec(ops::inkling2::KvCodec pool);
+// The sliding windows' storage (design §7.6): --kv-window-dtype's `window` (bf16, bf16p or int8; none for a storage that
+// is not a window codec), or by default (owner 2026-11-24) BF16 words under a bf16 pool, bf16p under bf16p and int8
+// under every other codec.
+[[nodiscard]] std::optional<ops::inkling2::KvCodec> window_codec(ops::inkling2::KvCodec pool,
+                                                                 std::optional<KvCacheStorage> window);
 [[nodiscard]] KvCacheStorage kv_storage(ops::inkling2::KvCodec codec);
 
 // Device memory the Program allocates, from the options and the configuration alone.

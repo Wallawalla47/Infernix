@@ -57,6 +57,23 @@ models::inkling2::FrontendOptions frontend_options(const models::inkling2::Model
             .grammar_cache_bytes     = options.grammar_cache_bytes};
 }
 
+// The sliding windows' storage: --kv-window-dtype's, or --kv-dtype's default (normalize_inkling2_options refuses a
+// format the windows do not take).
+ops::inkling2::KvCodec window_codec(const EngineOptions& options) {
+    return models::inkling2::window_codec(
+               models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
+               options.kv_window_cache)
+        .value_or(ops::inkling2::KvCodec::Bf16);
+}
+
+const char* window_name(ops::inkling2::KvCodec codec) {
+    switch (codec) {
+    case ops::inkling2::KvCodec::Bf16Packed: return "bf16p (packed losslessly to 12 bits)";
+    case ops::inkling2::KvCodec::Int8G64: return "int8";
+    default: return "bf16 (BF16 keys, FP16 values)";
+    }
+}
+
 models::inkling2::ProgramOptions program_options(const EngineOptions& options, std::uint32_t lora_rank) {
     return {.max_context     = options.max_context,
             .max_concurrency = options.max_concurrency,
@@ -75,8 +92,7 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options, s
             .vision            = options.enable_vision,
             .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
             .kv_codec          = models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
-            .window_codec      = models::inkling2::window_codec(
-                models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16)),
+            .window_codec      = window_codec(options),
             .prefix_cache      = options.context_cache.enabled && options.purpose == EnginePurpose::Generation,
             .prefix_host_bytes = options.context_cache.host_capacity_bytes.value_or(0U),
             .prefix_max_new_taps   = options.context_cache.hybrid.max_new_taps.value_or(8U),
@@ -155,6 +171,8 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
         refuse(options.q8_weights, "--lossless takes the artifact's exact weights (no --q8-weights)");
         refuse(options.kv_cache != KvCacheStorage::BFloat16,
                "--lossless keeps K and V exactly (--kv-dtype bf16; V stored as BF16 on this route)");
+        refuse(options.kv_window_cache.has_value() && *options.kv_window_cache != KvCacheStorage::BFloat16,
+               "--lossless keeps the sliding windows' K and V exactly (--kv-window-dtype bf16 or auto)");
         refuse(options.fast_paths, "--lossless has no fast paths");
     }
     refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
@@ -232,19 +250,27 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     }
     refuse(!models::inkling2::kv_codec(options.kv_cache).has_value(),
            "--kv-dtype: bf16 (BF16 keys, FP16 values), bf16p, int8, fp8, nvfp4, k8v4, vq2 or k4v2");
-    if (options.kv_cache == KvCacheStorage::Vq2 || options.kv_cache == KvCacheStorage::Q4KeyVq2Value) {
-        report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
-                            " stores the full visits' keys and values as Hadamard-rotated vector codes (2-4 bits a "
-                            "value, no exact recent window) and the sliding windows' as int8 (the output differs from "
-                            "bf16's)");
-    } else if (options.kv_cache == KvCacheStorage::Bf16Packed) {
-        report(options, "Inkling 2: --kv-dtype bf16p packs the BF16 keys and values (full visits and sliding windows) "
-                        "losslessly to 12 bits "
-                        "(the output is bf16's; a request with a row that has no packed form fails)");
-    } else if (options.kv_cache != KvCacheStorage::BFloat16) {
-        report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
-                            " stores the full visits' keys and values quantized and the sliding windows' as int8 (the "
-                            "output differs from bf16's)");
+    refuse(!models::inkling2::window_codec(ops::inkling2::KvCodec::Bf16, options.kv_window_cache).has_value(),
+           "--kv-window-dtype: auto (the --kv-dtype's default), bf16 (BF16 keys, FP16 values), bf16p or int8");
+    {
+        using ops::inkling2::KvCodec;
+        const KvCodec pool   = models::inkling2::kv_codec(options.kv_cache).value_or(KvCodec::Bf16);
+        const KvCodec window = window_codec(options);
+        if (pool != KvCodec::Bf16 || window != KvCodec::Bf16) {
+            // Both lossless forms give bf16's output; int8 windows or a quantized pool change it.
+            const bool exact  = (pool == KvCodec::Bf16 || pool == KvCodec::Bf16Packed) && window != KvCodec::Int8G64;
+            const bool packed = pool == KvCodec::Bf16Packed || window == KvCodec::Bf16Packed;
+            const char* full  = pool == KvCodec::Bf16         ? "as BF16 keys and FP16 values"
+                                : pool == KvCodec::Bf16Packed ? "packed losslessly to 12 bits"
+                                : pool == KvCodec::Vq2 || pool == KvCodec::Q4KeyVq2V
+                                    ? "as Hadamard-rotated vector codes (2-4 bits a value, no exact recent window)"
+                                    : "quantized";
+            report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
+                                " stores the full visits' keys and values " + full + ", and the sliding windows' as " +
+                                window_name(window) + (options.kv_window_cache ? " (--kv-window-dtype)" : "") +
+                                (exact ? "; the output is bf16's" : "; the output differs from bf16's") +
+                                (packed ? "; a request with a row that has no packed form fails" : ""));
+        }
     }
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
     refuse(options.rope_yarn_factor != 1.0F, "--rope-yarn does not apply: the model has no RoPE (its relative attention "
