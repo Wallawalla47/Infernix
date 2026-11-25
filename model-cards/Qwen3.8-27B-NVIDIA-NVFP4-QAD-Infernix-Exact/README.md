@@ -106,7 +106,7 @@ The two options are for precision comparisons: they read prompts about 4x and 5x
 ## Run
 
 ```bat
-infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --prefill-chunk 4096 --tolerant-tool-calls
+infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --tolerant-tool-calls
 ```
 
 It runs DFlash2 drafting with `--draft-tokens auto` (each round verifies the width its probabilities favour), the

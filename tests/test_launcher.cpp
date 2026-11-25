@@ -491,8 +491,9 @@ void test_library() {
     dense.family       = "qwen3.8-27b";
     dense.bytes        = 23719715844; // neroued/Qwen3.8-27B-nvfp4-NInfer
     const Args dense_args = default_args(scan, dense);
-    check(contains(dense_args, {"--ngram-draft-tokens", "auto"}) && contains(dense_args, {"--prefill-chunk", "4096"}),
-          "Qwen3.8-27B defaults follow the README's recommended settings");
+    check(contains(dense_args, {"--ngram-draft-tokens", "auto"}), "Qwen3.8-27B defaults follow the README's recommended settings");
+    // The default chunk: 4096 slowed decoding beside a long prompt about 3x and continuing turns' TTFT 1.8x (VK-01).
+    check(!has_flag(dense_args, "--prefill-chunk"), "the 27B prefills at the server's default chunk");
     check(!has_flag(dense_args, "--host-context-mib"), "the Engine sizes every model's Host tier (auto)");
     check(!has_flag(dense_args, "--draft-model"), "bundled drafters take no --draft-model");
     // Every KV page stays on the GPU: the server sizes the context to what its KV cache holds.

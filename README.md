@@ -625,7 +625,7 @@ infernix-serve.exe Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-0000
 Qwen3.8-27B on a 32 GB RTX 5090:
 
 ```bat
-infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --prefill-chunk 4096 --tolerant-tool-calls
+infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --tolerant-tool-calls
 ```
 
 Ornith-1.5-122B (experts in about 70 GiB of RAM; [guide](docs/qwen3_5-122b.md)):

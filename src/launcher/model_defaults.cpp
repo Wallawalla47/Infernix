@@ -87,10 +87,6 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model) {
         }
     }
 
-    // The Host prefix cache: infernix-serve's default (--host-context-mib auto) sizes it from the RAM the model
-    // leaves: most of the idle RAM for models whose weights sit in VRAM, a share of what the experts leave otherwise.
-    if (model.family == "qwen3.8-27b") { add("--prefill-chunk", "4096"); }
-
     add("--preserve-thinking");
     add("--tolerant-tool-calls");
     // Agent clients queue several requests; let them wait for a lane instead of failing.
