@@ -308,9 +308,14 @@ VramControl::Decision VramControl::decide(const VramSnapshot& snapshot, std::uin
     }
     if (grow_since_ < 0.0) { grow_since_ = now_seconds; }
     if (now_seconds - grow_since_ < grow_delay_) { return out; }
-    std::uint64_t grown = goal_bytes;
-    if (!idle) { grown = std::min<std::uint64_t>(grown, (pool_bytes / chunk_ + 4) * chunk_); }
-    out.frames = static_cast<std::uint32_t>(std::max<std::uint64_t>(frames, grown / demand_.frame_bytes));
+    // During rounds at most four chunks' worth of frames a boundary, counted on the frames the pool holds: a pool whose
+    // layers hold uneven shares maps fewer bytes than frames x frame_bytes, so a cap on its bytes divided by the average
+    // frame never rose above `frames` and the pool never grew until the engine went idle (GitHub #92).
+    std::uint64_t grown = goal;
+    if (!idle) {
+        grown = std::min<std::uint64_t>(grown, std::uint64_t{frames} + std::max<std::uint64_t>(1, 4 * chunk_ / demand_.frame_bytes));
+    }
+    out.frames = static_cast<std::uint32_t>(std::max<std::uint64_t>(frames, grown));
     // The timer keeps running until the pool reaches the target, so the engine's boundaries and the
     // monitor's readings see the same decision.
     out.grow = out.frames > frames;

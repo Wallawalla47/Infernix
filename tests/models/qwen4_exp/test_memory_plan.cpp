@@ -661,8 +661,19 @@ void test_control_law() {
         require(!wait.grow && wait.frames == shrink.frames, "no growth before 30 s");
     }
     const auto grow = control.decide(freed, new_pool, shrink.frames, t + 30.0, false);
-    require(grow.grow && grow.frames == frames_in(new_pool + 4 * kChunk),
-            "during rounds the pool grows by at most four chunks per boundary");
+    require(grow.grow && grow.frames == shrink.frames + frames_in(4 * kChunk),
+            "during rounds the pool grows by at most four chunks' worth of frames per boundary");
+    // A pool whose layers hold uneven shares maps fewer bytes than its frames at the average frame (GitHub #92: 11,415
+    // frames in 17,792 MiB against 19,060 MiB): growth during rounds still adds four chunks' frames.
+    {
+        VramControl uneven(d, kChunk, pool + other, pool);
+        const std::uint64_t mapped = (static_cast<std::uint64_t>(shrink.frames) * kRecord * 93 / 100) / kChunk * kChunk;
+        const VramSnapshot room    = wddm(mapped, other);
+        (void)uneven.decide(room, mapped, shrink.frames, 0.0, false); // starts the delay
+        const auto busy = uneven.decide(room, mapped, shrink.frames, 30.0, false);
+        require(busy.grow && busy.frames == shrink.frames + frames_in(4 * kChunk),
+                "an unevenly mapped pool grows during rounds");
+    }
     const auto idle_grow = control.decide(freed, new_pool, shrink.frames, t + 30.5, true);
     require(idle_grow.grow && idle_grow.frames >= frames - frames_in(kChunk) && idle_grow.frames <= frames,
             "an idle engine grows to the target at once");
