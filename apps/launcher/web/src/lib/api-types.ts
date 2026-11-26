@@ -732,6 +732,7 @@ export type MemoryPartKey =
   | "prefix_cache"
   | "workspace"
   | "cuda_graphs"
+  | "reserved"
   | "staging"
   | "ngram"
   | "ngram_archive";
@@ -739,7 +740,8 @@ export type MemoryPartKey =
 /** One category of what the server holds in a pool. Parts never overlap. */
 export interface MemoryPart {
   key: MemoryPartKey | (string & {});
-  /** Allocated (reserved): what the operating system counts as used. */
+  /** Allocated (reserved): what the operating system counts as used. The `reserved` part alone is
+   * not allocated: VRAM the server's plan keeps for later allocations, still free on the card. */
   bytes: number;
   /** The occupied share inside the part (KV pages holding tokens, prefix-cache slabs holding
    * entries); at most `bytes`. */

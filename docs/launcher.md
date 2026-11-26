@@ -121,7 +121,10 @@ One page, top to bottom:
   **Infernix other** (its memory no
   part names: the CUDA context, the driver, heaps), **Other processes** and **Free**, beside which
   VRAM shows what the server keeps free for the display (its headroom). The KV cache and the prefix
-  cache are drawn faint, with the share holding tokens or entries solid. While the server uses an SSD
+  cache are drawn faint, with the share holding tokens or entries solid. **Reserved** (Inkling 2) is
+  VRAM the server's plan keeps for what it allocates later, such as CUDA graphs not yet captured: it is
+  still free on the card, so it is drawn faint, counts towards the server's figure and comes out of
+  **Free**, which then sits near the headroom. While the server uses an SSD
   tier (an SSD prefix cache, or experts read from the artifact on the SSD), each part on the SSD is
   listed with its size. A part keeps its colour in every bar; hovering one gives its exact size and
   what it is. The parts come from `memory` in the server's `/metrics?format=json`
@@ -134,8 +137,10 @@ One page, top to bottom:
   round, n-gram acceptance, and the VRAM expert-cache hit rate (Qwen3.8-Flash-Next and the
   Qwen3.5-122B-A10B). They come from `session_stats` in the server's `/metrics?format=json`
   ([serving](serving.md#json-representation)); with an older `infernix-serve` the UI derives them
-  from its last 128 requests. Once they are not zero, the session's preemptions, replayed tokens and
-  healed stalls are listed too, and **Now** names paused and replaying requests.
+  from its last 128 requests. The drafter's cells read **no drafts** when none of the requests'
+  rounds drafted. Once they are not zero, the session's preemptions, replayed tokens and
+  healed stalls are listed too, and **Now** names paused and replaying requests. The columns keep
+  their widths while the figures and **Now** change.
 - **Requests**: per-request TTFT and decode speed, and the coding tools' requests as the launcher
   routed them (by pin, route, name or as the loaded model), with the client and API key and, while
   a long prompt is processed, its progress (tokens processed of the prompt, from the cache and

@@ -25,6 +25,9 @@ interface KeySpec {
   slot: number;
   /** Staging and the n-gram parts borrow a slot's hue, striped. */
   striped?: boolean;
+  /** Not allocated (the server's plan keeps it for later allocations): drawn faint, outside the process's
+   * memory, and taken out of the free space. */
+  unallocated?: boolean;
   /** One sentence per pool the key appears in. */
   what: Partial<Record<Pool, string>>;
 }
@@ -94,6 +97,18 @@ const KEYS: Record<MemoryPartKey, KeySpec> = {
   },
   workspace: { label: "Workspace", slot: 2, what: { device: "Scratch memory for activations while a step runs." } },
   cuda_graphs: { label: "CUDA graphs", slot: 1, what: { device: "Captured CUDA Graphs, which launch a whole step at once." } },
+  // Free on the card, but the server's: its plan keeps it for what it allocates later. Drawn in the CUDA graphs' hue,
+  // striped and faint, beside the free space it is taken from.
+  reserved: {
+    label: "Reserved",
+    slot: 1,
+    striped: true,
+    unallocated: true,
+    what: {
+      device:
+        "VRAM the server's plan keeps for what it allocates later: CUDA graphs it captures as rounds first need them, and the driver's own. Free on the card until then.",
+    },
+  },
   staging: {
     label: "Staging",
     slot: 2,
@@ -118,7 +133,7 @@ const KEY_ORDER = Object.keys(KEYS);
 
 type SegmentKind = "part" | "infernix" | "others" | "free";
 
-interface Segment {
+export interface Segment {
   id: string;
   kind: SegmentKind;
   label: string;
@@ -127,6 +142,8 @@ interface Segment {
   count?: number;
   color: string;
   striped: boolean;
+  /** KeySpec.unallocated. */
+  unallocated?: boolean;
   what: string;
 }
 
@@ -171,6 +188,7 @@ function partSegments(parts: readonly MemoryPart[], pool: Pool, palette: readonl
         count: part.count,
         color: spec ? palette[spec.slot] : OTHER_COLOR,
         striped: spec ? spec.striped === true : true,
+        unallocated: spec?.unallocated === true,
         what: spec?.what[pool] ?? "A part this launcher does not know yet; a newer launcher names it.",
       };
     });
@@ -179,29 +197,38 @@ function partSegments(parts: readonly MemoryPart[], pool: Pool, palette: readonl
 const OTHERS_COLOR = "color-mix(in oklab, var(--muted-foreground) 35%, transparent)";
 const FREE_COLOR = "var(--muted)";
 
-interface PoolView {
+export interface PoolView {
   segments: Segment[];
   total: number;
   /** In use on the device or in RAM, all programs. */
   used: number;
-  /** The server's own share (its process, else its parts). */
+  /** The server's own share (its process, else its parts), with what its plan keeps unallocated. */
   infernix: number;
 }
 
 /** Parts, then the server's unnamed memory, other programs and the free rest, summing to `total`. */
-function poolView(
+export function poolView(
   parts: Segment[],
   total: number,
   used: number,
   process: number | null,
   text: { infernix: string; others: string; free: string },
 ): PoolView {
-  const sum = parts.reduce((acc, part) => acc + part.bytes, 0);
+  // A part the server's plan keeps but has not allocated (`reserved`) is free on the card: it is no part of the
+  // process's memory or of what the card counts as used, and it comes out of the free space.
+  const sum = parts.reduce((acc, part) => acc + (part.unallocated ? 0 : part.bytes), 0);
+  const kept = parts.reduce((acc, part) => acc + (part.unallocated ? part.bytes : 0), 0);
   const infernixOther = process === null ? 0 : Math.max(0, process - sum);
   // The parts never exceed the process (the contract); should a reading lag, the parts win.
-  const infernix = sum + infernixOther;
-  const others = Math.max(0, used - infernix);
-  const free = Math.max(0, total - infernix - others);
+  const resident = sum + infernixOther;
+  const others = Math.max(0, used - resident);
+  // The server caps what it keeps at the free space less its headroom; should a reading lag, the free space wins.
+  const room = Math.max(0, total - resident - others);
+  const scale = kept > room ? room / kept : 1;
+  const shown = parts.map((part) => (part.unallocated && scale < 1 ? { ...part, bytes: Math.floor(part.bytes * scale) } : part));
+  const keptShown = Math.min(kept, room);
+  const free = room - keptShown;
+  const infernix = resident + keptShown;
   const derived = (id: string, kind: SegmentKind, label: string, bytes: number, color: string, what: string): Segment => ({
     id,
     kind,
@@ -213,13 +240,13 @@ function poolView(
   });
   return {
     segments: [
-      ...parts,
+      ...shown,
       derived("infernix-other", "infernix", "Infernix other", infernixOther, OTHER_COLOR, text.infernix),
       derived("other-processes", "others", "Other processes", others, OTHERS_COLOR, text.others),
       derived("free", "free", "Free", free, FREE_COLOR, text.free),
     ],
     total,
-    used: Math.max(used, infernix),
+    used: Math.max(used, resident),
     infernix,
   };
 }
@@ -267,7 +294,7 @@ function Swatch({ segment }: { segment: Segment }) {
   return (
     <span
       className={cn("size-2.5 shrink-0 rounded-[3px]", segment.kind === "free" && "ring-1 ring-border ring-inset")}
-      style={{ background: fill(segment.color, segment.striped) }}
+      style={{ background: fill(segment.color, segment.striped, segment.unallocated === true) }}
       aria-hidden="true"
     />
   );
@@ -288,7 +315,7 @@ function StackedBar({ label, view }: { label: string; view: PoolView }) {
               style={{
                 flexGrow: grow(segment.bytes),
                 flexBasis: 0,
-                background: fill(segment.color, segment.striped, partial),
+                background: fill(segment.color, segment.striped, partial || segment.unallocated === true),
               }}
             >
               {partial && segment.used! > 0 ? (

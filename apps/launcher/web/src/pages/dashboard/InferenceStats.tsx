@@ -20,6 +20,11 @@ function fixed(value: number | null, digits = 2): string {
   return value === null ? "—" : value.toFixed(digits);
 }
 
+/** A drafting cell: "no drafts" where the window's requests drafted nothing, the dash where it has no requests. */
+function drafting(row: StatsRow, value: string): string {
+  return row.requests > 0 && row.drafted === 0 ? "no drafts" : value;
+}
+
 export function InferenceStats({ className }: { className?: string }) {
   const metrics = useLive((live) => live.metrics);
   const instance = useLive((live) => live.instance);
@@ -81,14 +86,14 @@ export function InferenceStats({ className }: { className?: string }) {
   if (session.drafted > 0) {
     rows.push({
       label: `${drafter} acceptance`,
-      hint: "Accepted / drafted tokens of the model drafter (n-gram rounds excluded)",
-      cell: (row) => formatRatio(row.acceptance),
+      hint: `Accepted / drafted tokens of the model drafter (n-gram rounds excluded); "no drafts" when none of these requests' rounds drafted`,
+      cell: (row) => drafting(row, formatRatio(row.acceptance)),
     });
     if (stats.exact) {
       rows.push({
         label: "Accepted per round",
-        hint: "Accepted draft tokens per model-drafted round",
-        cell: (row) => fixed(row.accepted_per_round),
+        hint: `Accepted draft tokens per model-drafted round; "no drafts" when none of these requests' rounds drafted`,
+        cell: (row) => drafting(row, fixed(row.accepted_per_round)),
       });
     }
   }
@@ -154,7 +159,14 @@ export function InferenceStats({ className }: { className?: string }) {
         <CardDescription>Requests of this run of the server: {outcome.join(" · ")}</CardDescription>
       </CardHeader>
       <CardContent className="px-0">
-        <Table>
+        {/* Fixed column widths: cells that change while requests run (the Now row's state, a rate's digits) never move
+            the columns. */}
+        <Table className="table-fixed">
+          <colgroup>
+            <col className="w-[44%]" />
+            <col className="w-[28%]" />
+            <col className="w-[28%]" />
+          </colgroup>
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <TableHead className="pl-4">Metric</TableHead>
@@ -165,7 +177,7 @@ export function InferenceStats({ className }: { className?: string }) {
           <TableBody>
             {rows.map((row) => (
               <TableRow key={row.label}>
-                <TableCell className="pl-4">
+                <TableCell className="truncate pl-4">
                   <Hint label={row.hint} side="right">
                     <span className="cursor-default text-muted-foreground decoration-dotted underline-offset-4 hover:underline">
                       {row.label}
@@ -178,7 +190,7 @@ export function InferenceStats({ className }: { className?: string }) {
             ))}
             {sessionOnly.map((row) => (
               <TableRow key={row.label}>
-                <TableCell className="pl-4">
+                <TableCell className="truncate pl-4">
                   <Hint label={row.hint} side="right">
                     <span className="cursor-default text-muted-foreground decoration-dotted underline-offset-4 hover:underline">
                       {row.label}
@@ -191,7 +203,7 @@ export function InferenceStats({ className }: { className?: string }) {
             ))}
             <TableRow className="hover:bg-transparent">
               <TableCell className="pl-4 text-muted-foreground">Now</TableCell>
-              <TableCell colSpan={2} className="pr-4 text-right tabular-nums">
+              <TableCell colSpan={2} className="pr-4 text-right whitespace-normal tabular-nums">
                 {busy ? (
                   <span className="font-medium">
                     {formatTokS(live.tok_s)}

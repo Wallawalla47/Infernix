@@ -421,7 +421,9 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         keys = [part.get("key") for part in parts]
         check("/launcher/api/metrics carries the server's memory by part",
               {"weights", "kv_cache", "mtp_kv", "workspace", "cuda_graphs"} <= set(keys) and device.get("total_bytes", 0) > 0
-              and (device.get("process_bytes") or 0) >= sum(part.get("bytes", 0) for part in parts)
+              # `reserved` is free on the card (the plan's unallocated share), outside the process's memory.
+              and (device.get("process_bytes") or 0) >= sum(part.get("bytes", 0) for part in parts
+                                                            if part.get("key") != "reserved")
               and bool((held.get("host") or {}).get("parts")) and "ssd" in held and held["ssd"] is None, str(keys))
 
     with section("Script export and import, both shells"):
