@@ -83,8 +83,10 @@ VmmRange::VmmRange(int device, std::size_t reserve_bytes, std::size_t chunk_byte
     }
     reserved_ = (reserve_bytes + chunk_ - 1) / chunk_ * chunk_;
     if (reserved_ == 0) { throw std::invalid_argument("VMM range: nothing to reserve"); }
-    vmm::check(cuMemAddressReserve(&base_, reserved_, chunk_, 0, 0), "cuMemAddressReserve");
+    // The handle table first: a failed allocation then leaves no address range reserved (a throwing constructor runs
+    // no destructor to free it).
     handles_.assign(reserved_ / chunk_, 0);
+    vmm::check(cuMemAddressReserve(&base_, reserved_, chunk_, 0, 0), "cuMemAddressReserve");
 }
 
 VmmRange::~VmmRange() {
