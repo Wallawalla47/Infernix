@@ -313,6 +313,14 @@ infernix_add_test(infernix_qwen3_5_tokenizer_golden_real_test
   NEEDS_SOURCE_DIR)
 set_tests_properties(infernix_qwen3_5_tokenizer_golden_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Video messages against the reference processor's whole prompt ids (candidates VK-03): skips without
+# INFERNIX_TEST_VIDEO_RESOURCES_DIR (generate_video_golden.py writes the directory from an artifact); CPU only.
+infernix_add_test(infernix_qwen3_5_video_golden_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_video_golden_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json
+  NEEDS_SOURCE_DIR)
+set_tests_properties(infernix_qwen3_5_video_golden_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # A reply sent back as history against its generated ids (candidates ZH-03): empty reasoning keeps 198 198,
 # through the real Frontend on the same INFERNIX_TEST_TOKENIZER_DIR; CPU only.
 infernix_add_test(infernix_qwen3_5_echoed_empty_reasoning_test

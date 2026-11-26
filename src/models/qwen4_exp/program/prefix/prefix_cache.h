@@ -261,6 +261,8 @@ public:
     // The publication of a landed capture (absent while it is in flight); forget it when done.
     [[nodiscard]] std::optional<runtime::prefix_cache::PublishResult> capture_result(std::uint64_t id) const;
     void forget_capture(std::uint64_t id) noexcept;
+    // The capture results kept (testing::known_captures).
+    [[nodiscard]] std::size_t known_captures() const noexcept { return published_.size(); }
 
     // ---- restores (one admission staged at a time) --------------------------------------------
     void open_restore(cudaStream_t producer);

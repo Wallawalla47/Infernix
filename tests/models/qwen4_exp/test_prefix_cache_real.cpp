@@ -989,6 +989,56 @@ int run_ssd_scale(const char* artifact, const char* ngram) {
     return failures;
 }
 
+// The prefix cache's capture results (PrefixCache::published_, which the release and the slots' next admission
+// forget) do not grow with the number of requests: their count after the 17th request is at most its count after the
+// 5th, with pairs cancelled 400 ms after submission among them (whether a cancel lands mid-decode with a capture still
+// copying is not observed).
+int run_capture_growth(const char* artifact, const char* ngram) {
+    std::printf("== capture results across requests (C = 2, cancels mid-decode)\n");
+    infernix::EngineOptions options  = base_options(artifact, ngram);
+    options.max_concurrency          = 2;
+    options.max_pending_requests     = 4;
+    options.kv_capacity              = infernix::KvCapacityPolicy::explicit_capacity(2 * 4096);
+    infernix::Engine engine(std::move(options), infernix::test::engine_host());
+    const auto input = [](int variant) {
+        infernix::PromptInput in;
+        infernix::ChatMessage user;
+        user.role = infernix::ChatRole::User;
+        user.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text,
+            .text = rules_text() + "Question " + std::to_string(variant) + ": which shelf takes colour " +
+                    std::to_string(variant % 9) + ", and why?",
+            .media = {}});
+        in.messages.push_back(user);
+        in.options.enable_thinking = false;
+        return in;
+    };
+    const auto pair = [&](int first, bool cancel) {
+        std::vector<infernix::GenerationHandle> handles;
+        for (int i = 0; i < 2; ++i) {
+            handles.push_back(engine.submit(engine.prepare(input(first + i)), greedy(cancel ? 400 : 48, true)));
+        }
+        if (cancel) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            handles.clear(); // an unconsumed handle cancels its request
+        } else {
+            for (auto& handle : handles) { (void)handle.wait(); }
+        }
+    };
+    for (int round = 0; round < 2; ++round) { pair(2 * round, false); }
+    // A request that reaches its release: the count is read after it.
+    (void)engine.generate(engine.prepare(input(100)), greedy(8, true));
+    const std::uint64_t after_four = infernix::models::qwen4_exp::testing::known_captures();
+    for (int round = 2; round < 8; ++round) { pair(2 * round, round % 2 == 1); }
+    (void)engine.generate(engine.prepare(input(101)), greedy(8, true));
+    const std::uint64_t after_sixteen = infernix::models::qwen4_exp::testing::known_captures();
+    std::printf("  capture results kept: %llu after the 5th request, %llu after the 17th\n",
+                static_cast<unsigned long long>(after_four), static_cast<unsigned long long>(after_sixteen));
+    return check(after_sixteen <= after_four, "the capture results kept do not grow with the requests (" +
+                                                  std::to_string(after_four) + " then " +
+                                                  std::to_string(after_sixteen) + ")");
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
@@ -998,8 +1048,14 @@ int main(int argc, char** argv) {
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
     bool plain = true, mtp = true, next_turn = true, ssd = true, ssd_scale = false, small_tier = true;
+    bool growth = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--capture-growth") {
+            plain = mtp = next_turn = ssd = small_tier = false;
+            continue;
+        }
+        growth = false;
         if (arg == "--mtp") { plain = false; next_turn = false; ssd = false; small_tier = false; }
         if (arg == "--plain") { mtp = false; next_turn = false; ssd = false; small_tier = false; }
         if (arg == "--next-turn") { plain = false; mtp = false; ssd = false; small_tier = false; }
@@ -1009,6 +1065,7 @@ int main(int argc, char** argv) {
     }
     try {
         int failures = 0;
+        if (growth) { failures += run_capture_growth(artifact, ngram); }
         if (small_tier) { failures += run_small_host_tier(artifact, ngram); }
         if (ssd) { failures += run_ssd_tier(artifact, ngram); }
         if (const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2"); ssd && drafter != nullptr) {

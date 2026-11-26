@@ -102,7 +102,9 @@ The run scores the reference's tokens at every position and reports KL(reference
 over those tokens plus one bucket for all other tokens. Merging the other tokens can only lower the
 divergence, so the result is a lower bound of the full KL divergence; `mean_reference_top_mass`
 shows how much probability they cover (95 % for 32 tokens on Qwen3.8-27B; references written
-before 2026-10-12 hold 32). It also reports top-1 agreement (the same most probable token) and the
+before 2026-10-12 hold 32). It also reports top-1 agreement (the same most probable token: the two
+runs' top token ids are equal, an exact tie in either broken by token id, as llama-perplexity's "Same top p"
+compares them; `infernix-certify`'s arms count a tie at the top as agreement instead) and the
 mean target-token NLL change. `report.json` gains a `kl_divergence`
 object: overall mean, standard deviation and quantiles, and the same statistics by context length,
 the number of tokens before the predicted one, in buckets `[0,1K)`, `[1K,2K)`, `[2K,4K)` and so on.

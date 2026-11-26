@@ -506,6 +506,15 @@ the tokenizer files the golden was made from, not an artifact: `py -3.11 -I
 tests/models/qwen3_5/generate_tokenizer_golden.py <artifact> <golden.json> <dir>` writes them from any
 Qwen3.5-family artifact (and regenerates the golden), and `INFERNIX_TEST_TOKENIZER_DIR=<dir>` runs the
 test (skipped without it, and for a tokenizer.json of another size).
+`infernix_qwen3_5_video_golden_real_test` (CPU) sends video messages through the real Frontend (its FFmpeg decode,
+frame sampling, resize and chat template) and compares the whole prompt with the reference processor's ids: lossless
+FFV1 videos of 2, 3 and 9 frames and 8 frames sampled to 4 (`tests/fixtures/qwen3_5/video_golden.json`). The
+reference is Qwen3VLProcessor as transformers up to 5.9 expands the template's video wrapper (the Qwen3.5-family
+checkpoints' versions; 5.10 and later keep the template's outer `<|vision_start|>`/`<|vision_end|>`, which the golden
+stores as `ids_token_only` for the record). `python -I -B tests/models/qwen3_5/generate_video_golden.py <artifact>
+<golden.json> <dir>` regenerates it with transformers 5.10 or later, torchvision and the ffmpeg command line, and
+writes the resource directory; `INFERNIX_TEST_VIDEO_RESOURCES_DIR=<dir>` runs the test (skipped without it, and for
+a tokenizer.json of another size).
 `infernix_inkling2_tokenizer_golden_real_test` does the same for Inkling 2's pipeline (no normalizer, the
 o200k-style split with case classes, `ignore_merges`): `py -3.11 -I tests/models/inkling2/generate_tokenizer_golden.py
 <checkpoint or artifact> <golden.json> <dir>` writes the fixture (`tests/fixtures/inkling2/tokenizer_golden.json`:

@@ -184,7 +184,9 @@ infernix_add_test(infernix_qwen4_exp_prefix_state_test
 set_tests_properties(infernix_qwen4_exp_prefix_state_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # The prefix cache through the public Engine on the real artifact (INFERNIX_QWEN4_ARTIFACT): tap,
-# Host-block and endpoint resumes against cold and lane-resident runs, plain and MTP.
+# Host-block and endpoint resumes against cold and lane-resident runs, plain and MTP; and the capture results it keeps
+# do not grow over 17 requests, pairs cancelled 400 ms after submission among them (--capture-growth runs that case
+# alone).
 infernix_add_test(infernix_qwen4_exp_prefix_cache_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_cache_real.cpp"
   LIBRARIES infernix_engine)
