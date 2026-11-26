@@ -29,6 +29,13 @@ void report_engine(const EngineOptions& options, DiagnosticLevel level, const st
     report_diagnostic(options.diagnostic_observer, level, text);
 }
 
+void report_kernel_images(const EngineOptions& options, double seconds) {
+    if (seconds <= 0.0) { return; }
+    char line[128];
+    std::snprintf(line, sizeof(line), "CUDA kernel images: read in %.2f s beside the weights", seconds);
+    report_engine(options, DiagnosticLevel::Debug, line);
+}
+
 expert_offload::HostMemoryDemand expert_ram_demand(const EngineOptions& options, const ExpertPinnedTerms& pinned,
                                                    std::uint64_t prefix_cache_bytes, const VramSnapshot& vram) {
     expert_offload::HostMemoryDemand demand;

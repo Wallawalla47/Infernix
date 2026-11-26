@@ -71,6 +71,9 @@ constexpr Registration kSwitches[] = {
     // Diagnostic (2026-10-29): =<MB/s>; the artifact read queues (core/direct_read_queue.cpp) hold each finished read
     // until a device of that rate would have delivered it, to measure the SSD tier on a slower drive. Same bits.
     {"INFERNIX_TMP_SSD_MBPS", Scope::All, Kind::Value},
+    // Startup (2026-11-20): =0 reads the kernel images in the CUDA initialization, before the RAM plan (the order
+    // before ops::KernelImagesLoad), instead of on a thread beside the weight read. Same bits.
+    {"INFERNIX_TMP_KERNEL_PREWARM", Scope::All, Kind::Value},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 

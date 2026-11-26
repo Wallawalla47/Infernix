@@ -22,6 +22,7 @@
 #include "models/registry.h"
 #include "runtime/engine/engine_plan.h"
 #include "runtime/engine/expert_memory.h"
+#include "infernix/ops/kernel_images.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/prefix_cache/persist_file.h"
 
@@ -710,11 +711,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                             device_plan.graph_bound, device_plan.expert_frame_bytes, device_plan.max_frames,
                             device_contributors(dense, device_plan));
 
+    // The kernel images load beside the weights: the RAM plan above counted them as the process's growth.
+    ops::KernelImagesLoad kernel_images(device.device);
     // The dense arena must land in device memory (WDDM can place it in system memory silently).
     SpillGuard guard(*vram);
     guard.begin();
     auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
+    report_kernel_images(options, kernel_images.finish());
     // What the weights hold once loaded: packed projections replace the estimate with their size.
     const std::uint64_t loaded = model->device_weight_bytes();
     // The load page-locks tens of GiB inside the guarded step (the pinned block with the expert banks, a packed

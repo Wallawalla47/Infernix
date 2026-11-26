@@ -132,6 +132,8 @@ struct ExpertVramCheck {
 
 // An Engine diagnostic, or stderr (Info and above) without an observer.
 void report_engine(const EngineOptions& options, DiagnosticLevel level, const std::string& text);
+// A start's KernelImagesLoad, finished: how long the kernel images took beside the weight read (nothing when 0).
+void report_kernel_images(const EngineOptions& options, double seconds);
 void report_diagnostic(const DiagnosticObserver& observer, DiagnosticLevel level, const std::string& text);
 
 } // namespace infernix::runtime
