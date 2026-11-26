@@ -51,7 +51,8 @@ The token embedding and the output head stay the model's. The drafter reads the 
 model artifact's DFlash2 Use of it (`dflash2/final_hidden`) where the artifact declares one, else
 through the text's.
 
-Tencent's Qwen3.8-27B drafter (revision `5f54174d`): hidden 5120, vocabulary 248320, 5 layers at a
+Tencent's Qwen3.8-27B drafter (revision `260a6c23`, the first whose config names `DSpineDraftModel`, which the
+converter keys on; earlier revisions say `DFlashDraftModel` over the same weights): hidden 5120, vocabulary 248320, 5 layers at a
 sliding window of 8192, intermediate 17408, 32 query and 8 KV heads of 128, taps `[1,16,31,46,61]`
 of 64, a block of 16 (the anchor and 15 masks), mask token 248070, code width 1024, rank 512, norm
 epsilon `1e-6`, RoPE theta `1e7`. WaveCut's `dspine_q8` file stores the layers' projections Q8 (groups
