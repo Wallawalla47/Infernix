@@ -95,8 +95,11 @@ void SsdWriteBudget::save(Clock::time_point now) const noexcept {
             out << kStateTag << ' ' << static_cast<long long>(level) << ' ' << static_cast<long long>(millis) << '\n';
             if (!out) { return; }
         }
-        std::error_code ignored;
-        std::filesystem::rename(temporary, state_file_, ignored);
+        std::error_code error;
+        std::filesystem::rename(temporary, state_file_, error);
+        // A rename that failed (the state file held open elsewhere, say) leaves no temporary file behind; the budget
+        // then restarts from its next save, as it does without a file.
+        if (error) { std::filesystem::remove(temporary, error); }
     } catch (...) {
     }
 }
