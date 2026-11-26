@@ -727,4 +727,6 @@ started on a console without a window still stops its server in order. Its `abla
 [Ablation](#ablation) page's backend with `tools/launcher/ablate_stub.py` in place of the fitter (Set up installs a
 local wheel, so no network): the GPU taken from a loaded model and given back, a refused configuration, another
 trial of the front kept with `choose`, stop and resume, End now with a tool that ignores the stop, and the last run
-after a restart.
+after a restart. Its groups configure the first Qwen3.8-27B in `--models`, for which every check was written, else the
+first supported model; a check of an option that model does not take (`--lora` on a Qwen MoE model, the n-gram archive
+off Qwen3.5) or that needs two models is then skipped by name in its summary.

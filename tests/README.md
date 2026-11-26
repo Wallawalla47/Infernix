@@ -605,7 +605,10 @@ beside a reply; two 12,000-token prompts with 6,000-token replies in a 32,768-to
 be preemptions, and each request's tokens must equal its tokens alone in an Engine whose pool holds every lane. It
 reports the snapshot restores, replays, replayed tokens and time paused, and checks that the owner's launcher configuration of
 2026-11-25 (240,000 tokens, four lanes, INT8 KV, vision offloaded, the embedding on the host, DSpark with
-`--lm-head-draft`) plans, starts and serves a request (`INFERNIX_INKLING2_NO_OWNER_CONFIG` skips that).
+`--lm-head-draft`) plans, starts and serves a request (`INFERNIX_INKLING2_NO_OWNER_CONFIG` skips that). Its first case
+cancels two requests once one is paused and serves a third: the Program must keep no capture result once idle (neither
+the cancelled pause's nor a released lane's last capture landing after its release; `INFERNIX_INKLING2_ONLY_CANCEL_CASE`
+runs that case alone).
 `infernix_inkling2_withdraw_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) reports a row as non-finite through
 `runtime::testing::set_nonfinite_fault`, as the other families' withdrawal tests do: a failed prompt's entries leave the
 prefix cache (its retry resumes from nothing and equals a cache-off run, which also reports its

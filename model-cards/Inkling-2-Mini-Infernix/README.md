@@ -120,15 +120,16 @@ infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtyp
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. `--max-context auto` takes
-the largest context one request can hold in the free VRAM, the whole KV pool (without it the server uses 8,192
-tokens). `--kv-dtype int8`
+the largest context the free VRAM holds (without it the server uses 8,192 tokens). `--kv-dtype int8`
 stores the KV cache, the 40 sliding-window visits included, in 8 bits with two scales a 128-value row: about half the
 memory of the default `bf16`, so the same VRAM holds about 1.7 times the context and more of the prefix cache. It
 decodes within 0.4 % of `bf16` and prefills up to 1.5 % slower, and changes the output slightly
 ([KV formats](#kv-formats)). Add `--vision` for
-images and `--max-concurrency N` (1 to 8) for several lanes. The lanes share one KV pool: each request takes pages as
-it grows, and when the lanes together outgrow the pool one request pauses and resumes later with the same output.
-Requests decoding together draft with DSpark together, one verify call checking the round's drafts. The
+images and `--max-concurrency N` (1 to 8) for several lanes. From `main` at `8dfb51c69` the lanes share one KV pool:
+each request takes pages as it grows, so any one of them can reach the whole pool, and when the lanes together outgrow
+it one request pauses and resumes later with the same output (earlier builds reserve a whole context for each lane).
+From `main` at `84c82ac45`, requests decoding together draft with DSpark together, one verify call checking the
+round's drafts (earlier builds draft while one request decodes, and rounds of several decode plainly). The
 [Inkling 2 Mini guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/inkling2-mini.md) covers the KV formats,
 the prefix cache, images, reasoning effort and conversion.
 
