@@ -94,9 +94,10 @@ void dspark_inv_freq(double theta, float (&inv_freq)[kDSparkHeadDim / 2]);
 // The block's attention: the 8 query rows (positions F .. F + 7) against one layer's cached keys at positions
 // [lo, F + 8) of the round's lane (the context before the block and the block's own 8, written there by dspark_rotate;
 // every row sees all of them: the block is non-causal), lo = max(0, F - 1024) for a sliding layer, 0 for the full one.
-// Query head h reads KV head h / 3. Scores q.k / sqrt(128) in FP32, softmax in FP32 (online over key splits of 128,
-// merged in split order), P x V in FP32, out = bf16 [8][24 * 128]. `splits` bounds the launch: (max_context + 8) / 128
-// rounded up for the full layer, kDSparkRing / 128 for a sliding one.
+// Query head h reads KV head h / 3. Scores q.k / sqrt(128) in FP32, softmax in FP32 (online over key splits of whole
+// 32-key tiles, at least 128 keys, at most `splits` of them, merged in split order), P x V in FP32, out = bf16
+// [8][24 * 128]. `splits` is the launch's (dspark_attention_splits): the split boundaries follow the context, so only
+// the drafts' last bits depend on it.
 struct DSparkAttentionArgs {
     const std::uint16_t* q = nullptr; // BF16 [8][24][128] (normed, rotated)
     const std::uint16_t *cache_k = nullptr, *cache_v = nullptr;
@@ -111,6 +112,9 @@ struct DSparkAttentionArgs {
 };
 void dspark_attention(const DSparkAttentionArgs& args, cudaStream_t stream);
 [[nodiscard]] std::size_t dspark_attention_scratch_bytes(std::int32_t splits);
+// The `splits` a layer's launch takes (and its scratch is sized for): a sliding layer's, or the full layer's at
+// `max_context`.
+[[nodiscard]] std::int32_t dspark_attention_splits(bool sliding, std::uint32_t max_context);
 
 // The pre-norm block boundary: s = fp32(x) + fp32(residual) (x null: s = residual), residual = bf16(s) (unless x is
 // null), normed = bf16(s * rsqrt(sum(s^2) * (1 / H) + eps) * w): the norm reads the FP32 sum.

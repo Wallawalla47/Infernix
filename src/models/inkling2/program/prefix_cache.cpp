@@ -20,6 +20,8 @@ namespace {
 
 std::atomic<std::uint32_t> forced_stalls{0};
 std::atomic<std::uint64_t> rows_drafted{0};
+std::atomic<std::uint64_t> unequal_rounds{0}, empty_rows{0}, full_rows{0};
+std::atomic<bool> skewed{false};
 std::mutex ram_mutex;
 std::function<std::uint64_t()> ram_reader; // ram_mutex
 
@@ -39,6 +41,24 @@ void force_moe_stall(std::uint32_t rounds) noexcept { forced_stalls.store(rounds
 
 void count_rows_drafted(std::uint64_t rows) noexcept { rows_drafted.fetch_add(rows, std::memory_order_relaxed); }
 std::uint64_t rows_drafted_together() noexcept { return rows_drafted.load(std::memory_order_relaxed); }
+
+void count_dealing(std::span<const std::int32_t> drafts, std::int32_t steps) noexcept {
+    if (drafts.empty()) { return; }
+    const auto [lo, hi] = std::minmax_element(drafts.begin(), drafts.end());
+    if (*lo != *hi) { unequal_rounds.fetch_add(1, std::memory_order_relaxed); }
+    for (const std::int32_t d : drafts) {
+        if (d == 0) { empty_rows.fetch_add(1, std::memory_order_relaxed); }
+        if (d == steps) { full_rows.fetch_add(1, std::memory_order_relaxed); }
+    }
+}
+
+Dealing dealing() noexcept {
+    return {unequal_rounds.load(std::memory_order_relaxed), empty_rows.load(std::memory_order_relaxed),
+            full_rows.load(std::memory_order_relaxed)};
+}
+
+void set_skewed_dealing(bool on) noexcept { skewed.store(on, std::memory_order_relaxed); }
+bool skewed_dealing() noexcept { return skewed.load(std::memory_order_relaxed); }
 
 bool take_forced_stall() noexcept {
     std::uint32_t left = forced_stalls.load();

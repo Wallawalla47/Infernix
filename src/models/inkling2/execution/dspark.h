@@ -12,8 +12,8 @@
 //   embedding) through the 3 layers and the final norm, the target head over rows 1 .. steps (FP32, no softcap), and
 //   the Markov head's steps: `steps` greedy drafts and their probabilities, in device memory. The round's words
 //   (DSparkRound: F, the anchor, the lane) are copied from pinned memory first, so a captured draft replays per round.
-//   A round of several rows (lanes decoding together) stages each row's words and drafts the rows one after another
-//   on the same buffers (each row's drafts and probabilities into its own slot).
+//   A round of several rows (lanes decoding together) stages each row's words and drafts the rows concurrently, each on
+//   a workspace of its own and a stream of its own (their drafts and probabilities into their own slots).
 //
 // Every BF16 projection runs projections_dmma (at most 16 columns) or projections_mma (wider: a prefill chunk's
 // context rows). The drafter decides only proposals; verification decides every output.
@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace infernix::models::inkling2 {
 
@@ -55,6 +56,7 @@ public:
     // `capacity`: the widest forward call whose context rows are appended at once (the forward's capacity).
     Drafter(const Parameters& parameters, const Forward& forward, std::int32_t lanes, std::uint32_t max_context,
             std::int32_t capacity, const DSparkPagedContext& full);
+    ~Drafter();
     Drafter(const Drafter&)            = delete;
     Drafter& operator=(const Drafter&) = delete;
 
@@ -110,23 +112,31 @@ private:
     std::uint16_t* mixed_[3] = {};
     std::uint16_t* ctx_k_[3] = {};
     std::uint16_t* ctx_v_[3] = {};
-    // Draft workspace (the round words, drafts and probabilities a row each, [lanes]; the rest one row's, reused).
+    // A row's draft workspace (a lane's each, so rows of one round draft concurrently: draft()).
+    struct Workspace {
+        std::uint16_t *block_in = nullptr, *residual = nullptr, *normed = nullptr; // [8][H]
+        std::uint16_t *q = nullptr, *k = nullptr, *v = nullptr, *qr = nullptr;     // [8][3072], [8][1024] x 2, [8][3072]
+        std::uint16_t *attention = nullptr, *a = nullptr, *y = nullptr;            // [8][3072], [8][H], [8][H]
+        std::uint16_t *gate = nullptr, *up = nullptr, *h = nullptr;                // [8][9216]
+        std::uint16_t* final_rows = nullptr;                                       // [8][H]
+        float* base = nullptr;                                                     // [7][V]
+        float* attention_scratch = nullptr;
+        float* markov_scratch = nullptr;
+        std::int32_t* head_x8 = nullptr; // [8] 8-bit head input rows (Forward::project_head)
+    };
+    std::vector<Workspace> rows_;
+    // The round words, drafts and probabilities a row each [lanes].
     ops::inkling2::DSparkRound* round_ = nullptr;
-    std::uint16_t *block_in_ = nullptr, *residual_ = nullptr, *normed_ = nullptr; // [8][H]
-    std::uint16_t *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *qr_ = nullptr;   // [8][3072], [8][1024] x 2, [8][3072]
-    std::uint16_t *attention_ = nullptr, *a_ = nullptr, *y_ = nullptr;           // [8][3072], [8][H], [8][H]
-    std::uint16_t *gate_ = nullptr, *up_ = nullptr, *h_ = nullptr;               // [8][9216]
-    std::uint16_t* final_ = nullptr;                                             // [8][H]
-    float* base_ = nullptr;                                                      // [7][V]
-    float* attention_scratch_ = nullptr;
-    float* markov_scratch_ = nullptr;
     std::int32_t* tokens_ = nullptr;
     float* probabilities_ = nullptr;
     float* inv_freq_ = nullptr; // the RoPE table [64]
-    std::int32_t* head_x8_ = nullptr; // [8] 8-bit head input rows (Forward::project_head)
     ops::inkling2::DSparkRound* host_round_ = nullptr;
     std::int32_t* host_tokens_ = nullptr;
     float* host_probabilities_ = nullptr;
+    // Rows 1 .. of a round draft on streams of their own, forked from and joined to the caller's (in a captured graph,
+    // parallel branches); row 0 on the caller's.
+    std::vector<cudaStream_t> streams_;
+    std::vector<cudaEvent_t> fork_, join_;
 };
 
 } // namespace infernix::models::inkling2

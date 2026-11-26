@@ -7,8 +7,9 @@
 // 3. Beside unconstrained requests (C = 4, graphs): each constrained request gives its solo tokens, and each
 //    unconstrained one its own.
 // 4. --lm-head-draft (the drafter's shortlist) beside DSpark gives the reference's tokens.
-// 4b. DSpark rounds of several rows (graphs, C = 4, auto and 7 drafts): constrained requests drafting beside an
-//    unconstrained one, each row's verify columns under its own masks, give their solo tokens.
+// 4b. DSpark rounds of several rows (graphs, C = 4, auto, auto with a skewed deal and 7 drafts): constrained requests
+//    drafting beside an unconstrained one, each row's verify columns under its own masks, give their solo tokens; under
+//    the skewed deal rows verified none and all of their drafts.
 // 5. Token constraints (TokenConstraint, /v1/decide's generated primitives) on a prompt that opens the answer: every
 //    token in its step's set, forced steps exact, one draw a step; step 0's restricted probabilities, mass, observed
 //    log-probabilities and captured logits against an unconstrained readout of the same position; graphs, C = 4
@@ -22,6 +23,7 @@
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (its DSpark drafter included)
 
 #include "infernix/engine.h"
+#include "models/inkling2/program/test_taps.h"
 
 #include <nlohmann/json.hpp>
 
@@ -359,11 +361,18 @@ int main() {
                 require_same(label + ": " + all[i].name, reference[i], result.generated_token_ids);
             }
         }
-        for (const bool automatic : {true, false}) {
+        for (const int mode : {0, 1, 2}) {
             // Rounds of several rows draft together (graphs, C = 4): three constrained requests beside an unconstrained
-            // one, then the rest beside the other; each row's verify columns sample under its own masks.
+            // one, then the rest beside the other; each row's verify columns sample under its own masks. Auto, auto
+            // with the skewed deal (testing::set_skewed_dealing: rows, constrained ones too, verify none and all of
+            // their drafts; it must have dealt both) and 7 drafts.
+            const bool automatic = mode != 2;
+            const bool skewed    = mode == 1;
+            infernix::models::inkling2::testing::set_skewed_dealing(skewed);
+            const infernix::models::inkling2::testing::Dealing dealt = infernix::models::inkling2::testing::dealing();
             infernix::Engine engine(engine_options(artifact, true, 4, true, automatic));
-            const std::string label = automatic ? "dspark rows (auto)" : "dspark rows (7 drafts)";
+            const std::string label =
+                skewed ? "dspark rows (auto, skewed deal)" : automatic ? "dspark rows (auto)" : "dspark rows (7 drafts)";
             std::vector<infernix::GenerationHandle> handles;
             handles.push_back(engine.submit(engine.prepare(chat(kTexts[0])), unconstrained(0)));
             for (std::size_t i = 0; i < 3; ++i) { handles.push_back(engine.submit(engine.prepare(all[i].prompt), all[i].options)); }
@@ -382,6 +391,15 @@ int main() {
                 require_same(label + ", C = 4: " + all[i].name, reference[i], result.generated_token_ids);
             }
             require_same(label + ", C = 4: unconstrained 1", plain[1], handles.back().wait().generated_token_ids);
+            const infernix::models::inkling2::testing::Dealing after = infernix::models::inkling2::testing::dealing();
+            std::cout << label << ": " << after.unequal_rounds - dealt.unequal_rounds << " rounds of unequal widths, "
+                      << after.empty_rows - dealt.empty_rows << " rows verified none of their drafts, "
+                      << after.full_rows - dealt.full_rows << " all of them\n";
+            if (skewed) {
+                require(after.empty_rows > dealt.empty_rows && after.full_rows > dealt.full_rows,
+                        label + ": no row verified none or all of its drafts");
+            }
+            infernix::models::inkling2::testing::set_skewed_dealing(false);
         }
         {
             // --lm-head-draft shortlists the drafter's proposals only: the masks read the target's whole head.

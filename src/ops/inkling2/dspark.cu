@@ -2,9 +2,10 @@
 //
 // dspark_mix: a CTA per (column, consumer) of 288 threads, 8 of H each.
 // dspark_rotate: a warp per (row, head), lane l holding elements 4l .. 4l + 3 (RoPE partners 16 lanes apart).
-// dspark_attention: a CTA per (key split of 128, KV head) over the head's 24 query rows (8 block rows x 3 heads),
-//   tiles of 32 keys (K transposed in shared memory), an online softmax per row; then a CTA per KV head merges the
-//   active splits in order.
+// dspark_attention: a CTA per (key split, KV head) over the head's 24 query rows (8 block rows x 3 heads): splits of
+//   whole 32-key tiles, at least 128 keys, at most `splits` of them (the full layer's 42: two CTAs an SM however long
+//   the context), the tiles streamed through a two-stage cp.async ring as BF16, each warp's 3 rows scored a lane a key
+//   with their online softmax in registers; then a CTA per (KV head, row) merges the active splits in order.
 // dspark_add_norm: a CTA per row; dspark_swiglu: elementwise.
 // dspark_markov: the step-invariant projection (a warp per row of 768), then per step a gate kernel (a warp per row,
 //   the last CTA applying the gates) and a logits kernel (a warp per vocabulary row, the last CTA merging the CTAs'
@@ -19,6 +20,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -204,19 +206,27 @@ __global__ void __launch_bounds__(32) rotate_kernel(const DSparkRotateArgs a) {
 
 // ---------------------------------------------------------------------------- attention
 
-constexpr int kSplitKeys    = 128;
+// A KV head's keys [lo, hi) go to at most a.splits splits of whole 32-key tiles, at least kMinSplitKeys each: a long
+// context takes few long CTAs (two an SM for the full layer, so its partials are few to merge) and a short one many
+// short ones. The tiles stream through a two-stage cp.async ring as BF16; each warp scores its 3 query rows against the
+// tile (a lane a key) and keeps their online softmax in registers; P x V runs a thread per (4 rows, 4 dims).
+constexpr int kMinSplitKeys = 128;
 constexpr int kTileKeys     = 32;
 constexpr int kGroupRows    = kDSparkBlock * (kDSparkHeads / kDSparkKvHeads); // 24 query rows a KV head
 constexpr int kAttnThreads  = 256;
-constexpr int kPartialWords = kD + 2; // m, l, acc[128]
+constexpr int kPartialWords = kD + 2;     // m, l, acc[128]
+constexpr int kKeyRowWords  = kD / 2 + 4; // a key's BF16 row padded by 16 bytes: 8 keys a bank cycle
+constexpr int kProbRow      = 28;         // a key's 24 probabilities, padded to 16-byte rows
+constexpr int kPvThreads    = 192;        // 6 groups of 4 rows x 32 lanes of 4 dims
+// The full layer's splits a KV head at most: 8 x 42 = 336 CTAs, two an SM of an RTX 5090's 170.
+constexpr int kTargetSplits = 42;
 
 struct AttnSmem {
-    float q[kGroupRows][kD];
-    float kt[kD][kTileKeys + 1]; // K transposed: [dim][key]
-    float v[kTileKeys][kD];
-    float p[kGroupRows][kTileKeys];
-    float m[kGroupRows], l[kGroupRows], scale[kGroupRows];
-    std::uint32_t rows[kTileKeys]; // the tile's keys' rows (of 128 values) in the cache
+    std::uint32_t q[kGroupRows][kD / 2];          // BF16 pairs
+    std::uint32_t k[2][kTileKeys][kKeyRowWords];  // two stages, BF16 pairs
+    std::uint32_t v[2][kTileKeys][kD / 2];
+    float p[kTileKeys][kProbRow];                 // the tile's probabilities, [key][row]
+    float scale[kGroupRows];                      // the tile's rescale of each row's accumulator
 };
 
 __device__ __forceinline__ void key_range(const DSparkAttentionArgs& a, int& lo, int& hi) {
@@ -225,46 +235,34 @@ __device__ __forceinline__ void key_range(const DSparkAttentionArgs& a, int& lo,
     lo              = a.ring > 0 ? max(0, first - kDSparkWindow) : 0;
 }
 
-__global__ void __launch_bounds__(kAttnThreads, 1) attention_split_kernel(const DSparkAttentionArgs a) {
+// The keys a split takes: whole tiles, at least kMinSplitKeys, enough that a.splits splits cover [lo, hi).
+__device__ __forceinline__ int split_keys(const DSparkAttentionArgs& a, int lo, int hi) {
+    const int per = (hi - lo + a.splits - 1) / a.splits;
+    return max(kMinSplitKeys, (per + kTileKeys - 1) / kTileKeys * kTileKeys);
+}
+
+__device__ __forceinline__ void cp_async16(void* smem, const void* global) {
+    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(global) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+}
+
+__global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const DSparkAttentionArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto& sm       = *reinterpret_cast<AttnSmem*>(smem_raw);
+    auto& sm        = *reinterpret_cast<AttnSmem*>(smem_raw);
     const int split = static_cast<int>(blockIdx.x), g = static_cast<int>(blockIdx.y), tid = static_cast<int>(threadIdx.x);
     const int lane = tid % 32, warp = tid / 32;
     pdl::enter();
     int lo = 0, hi = 0;
     key_range(a, lo, hi);
-    const int k0 = lo + split * kSplitKeys, k1 = min(hi, k0 + kSplitKeys);
+    const int per = split_keys(a, lo, hi);
+    const int k0 = lo + split * per, k1 = min(hi, k0 + per);
     float* partial = a.scratch + (static_cast<std::size_t>(g) * a.splits + split) * kGroupRows * kPartialWords;
     if (k0 >= k1) { return; } // an inactive split (the merge reads only the active ones)
-    // The group's query rows: row q = block row i * 3 + head j (query head 3 g + j), as 16-byte pieces all issued first.
-    {
-        constexpr int kQPieces = (kGroupRows * kD / 8 + kAttnThreads - 1) / kAttnThreads; // 2
-        uint4 qp[kQPieces];
-#pragma unroll
-        for (int j = 0; j < kQPieces; ++j) {
-            const int i = tid + j * kAttnThreads, q = i / (kD / 8), c = i % (kD / 8);
-            qp[j] = make_uint4(0U, 0U, 0U, 0U);
-            if (q < kGroupRows) {
-                const int row = q / 3, head = 3 * g + q % 3;
-                qp[j]         = *reinterpret_cast<const uint4*>(a.q + (static_cast<std::size_t>(row) * kDSparkHeads + head) * kD + 8 * c);
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < kQPieces; ++j) {
-            const int i = tid + j * kAttnThreads, q = i / (kD / 8), c = i % (kD / 8);
-            if (q >= kGroupRows) { continue; }
-            const std::uint32_t w[4] = {qp[j].x, qp[j].y, qp[j].z, qp[j].w};
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                sm.q[q][8 * c + 2 * e]     = bf(static_cast<std::uint16_t>(w[e] & 0xFFFFU));
-                sm.q[q][8 * c + 2 * e + 1] = bf(static_cast<std::uint16_t>(w[e] >> 16));
-            }
-        }
-    }
-    if (tid < kGroupRows) {
-        sm.m[tid] = -INFINITY;
-        sm.l[tid] = 0.0F;
-    }
     const int lane_index = a.round->lane;
     // A key's row of 128 values: a sliding layer's ring slot, or the full layer's page row (the lane's block-table row).
     // Rows fit 32 bits (a pool of 2^32 / 512 pages), offsets do not.
@@ -277,108 +275,126 @@ __global__ void __launch_bounds__(kAttnThreads, 1) attention_split_kernel(const 
             a.table[static_cast<std::int64_t>(lane_index) * a.table_stride + position / 64]);
         return (page * kDSparkKvHeads + static_cast<std::uint32_t>(g)) * 64U + static_cast<std::uint32_t>(position % 64);
     };
-    // P x V: thread t < 192 owns row t / 8 and dims 16 (t % 8) .. + 15.
-    const int pv_row = tid / 8, pv_d = 16 * (tid % 8);
-    float acc[16] = {};
-    const float score_scale = static_cast<float>(0.088388347648318440550); // fl32(128^-0.5)
-    for (int t0 = k0; t0 < k1; t0 += kTileKeys) {
+    // A tile's K and V rows into `buffer`, 16 bytes a piece: thread t copies pieces t and t + 256 of each (key = piece /
+    // 16), one commit group a tile. Keys past the split are left as they are: their scores are masked and P x V stops
+    // at the tile's keys.
+    const auto stage = [&](int t0, int buffer) {
         const int n = min(kTileKeys, k1 - t0);
-        __syncthreads(); // the previous tile's readers are done
-        if (tid < n) { sm.rows[tid] = row_of(t0 + tid); } // each key's row, looked up once a tile
-        __syncthreads();
-        {
-            // The tile's K and V rows as 16-byte pieces (8 values), every piece issued before any is stored, so the
-            // tile costs one round trip (element loads stored one at a time cost one each).
-            constexpr int kPieces = kTileKeys * kD / 8 / kAttnThreads; // 2 a thread
-            uint4 kp[kPieces], vp[kPieces];
 #pragma unroll
-            for (int j = 0; j < kPieces; ++j) {
-                const int i = tid + j * kAttnThreads, k = i / (kD / 8), c = i % (kD / 8);
-                kp[j] = vp[j] = make_uint4(0U, 0U, 0U, 0U);
-                if (k < n) {
-                    const std::size_t at = static_cast<std::size_t>(sm.rows[k]) * kD + 8 * c;
-                    kp[j]                = *reinterpret_cast<const uint4*>(a.cache_k + at);
-                    vp[j]                = *reinterpret_cast<const uint4*>(a.cache_v + at);
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < kPieces; ++j) {
-                const int i = tid + j * kAttnThreads, k = i / (kD / 8), c = i % (kD / 8);
-                const std::uint32_t kw[4] = {kp[j].x, kp[j].y, kp[j].z, kp[j].w};
-                const std::uint32_t vw[4] = {vp[j].x, vp[j].y, vp[j].z, vp[j].w};
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    sm.kt[8 * c + 2 * e][k]     = bf(static_cast<std::uint16_t>(kw[e] & 0xFFFFU));
-                    sm.kt[8 * c + 2 * e + 1][k] = bf(static_cast<std::uint16_t>(kw[e] >> 16));
-                    sm.v[k][8 * c + 2 * e]      = bf(static_cast<std::uint16_t>(vw[e] & 0xFFFFU));
-                    sm.v[k][8 * c + 2 * e + 1]  = bf(static_cast<std::uint16_t>(vw[e] >> 16));
-                }
+        for (int j = 0; j < 2; ++j) {
+            const int piece = tid + j * kAttnThreads, key = piece / 16, c = piece % 16;
+            if (key < n) {
+                const std::size_t at = static_cast<std::size_t>(row_of(t0 + key)) * kD + 8 * c;
+                cp_async16(&sm.k[buffer][key][4 * c], a.cache_k + at);
+                cp_async16(&sm.v[buffer][key][4 * c], a.cache_v + at);
             }
         }
-        __syncthreads();
-        // Scores: thread t: key t % 32, rows 3 (t / 32) .. + 2.
+        cp_async_commit();
+    };
+    // The group's query rows as BF16, row q = block row i * 3 + head j (query head 3 g + j), with the first tile.
+    for (int i = tid; i < kGroupRows * kD / 8; i += kAttnThreads) {
+        const int q = i / (kD / 8), c = i % (kD / 8), row = q / 3, head = 3 * g + q % 3;
+        cp_async16(&sm.q[q][4 * c], a.q + (static_cast<std::size_t>(row) * kDSparkHeads + head) * kD + 8 * c);
+    }
+    stage(k0, 0);
+    // The warp's rows 3 warp .. + 2: their running max and sum, in every lane.
+    float m[3] = {-INFINITY, -INFINITY, -INFINITY}, l[3] = {0.0F, 0.0F, 0.0F};
+    // P x V: thread t < 192 owns rows 4 (t / 32) .. + 3 and dims 4 (t % 32) .. + 3.
+    const int pv_rows = 4 * (tid / 32), pv_d = 4 * (tid % 32);
+    float acc[4][4] = {};
+    const float score_scale = static_cast<float>(0.088388347648318440550); // fl32(128^-0.5)
+    int buffer = 0;
+    for (int t0 = k0; t0 < k1; t0 += kTileKeys, buffer ^= 1) {
+        const int n = min(kTileKeys, k1 - t0);
+        __syncthreads(); // the last tile's readers are done with the other stage and the probabilities
+        if (t0 + kTileKeys < k1) {
+            stage(t0 + kTileKeys, buffer ^ 1);
+            cp_async_wait<1>(); // this tile's group has landed (the next one may still fly)
+        } else {
+            cp_async_wait<0>();
+        }
+        __syncthreads(); // every thread's pieces of this tile are visible
+        // Scores, a lane a key: s = q . k over 128 dims in order, FP32 products of the BF16 values.
         {
-            const int k = lane, q0 = 3 * warp;
             float s[3] = {0.0F, 0.0F, 0.0F};
-            for (int d = 0; d < kD; ++d) {
-                const float kv = sm.kt[d][k];
+            const std::uint32_t* krow = sm.k[buffer][lane];
+#pragma unroll 4
+            for (int c = 0; c < kD / 8; ++c) {
+                float kv[8];
+                unpack8(*reinterpret_cast<const uint4*>(krow + 4 * c), kv);
 #pragma unroll
-                for (int j = 0; j < 3; ++j) { s[j] = __fmaf_rn(sm.q[q0 + j][d], kv, s[j]); }
+                for (int j = 0; j < 3; ++j) {
+                    float qv[8];
+                    unpack8(*reinterpret_cast<const uint4*>(&sm.q[3 * warp + j][4 * c]), qv);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) { s[j] = __fmaf_rn(qv[e], kv[e], s[j]); }
+                }
             }
+            // The online softmax of each row over the tile, in registers (lane = key).
 #pragma unroll
-            for (int j = 0; j < 3; ++j) { sm.p[q0 + j][k] = k < n ? canon::mul_rn(s[j], score_scale) : -INFINITY; }
+            for (int j = 0; j < 3; ++j) {
+                const float x = lane < n ? canon::mul_rn(s[j], score_scale) : -INFINITY;
+                float top     = x;
+#pragma unroll
+                for (int o = 16; o >= 1; o /= 2) { top = fmaxf(top, __shfl_xor_sync(kAll, top, o)); }
+                const float m_new = fmaxf(m[j], top);
+                const float p     = lane < n ? canon::exp_c(__fsub_rn(x, m_new)) : 0.0F;
+                const float psum  = warp_sum(p);
+                const float scale = m[j] == -INFINITY ? 0.0F : canon::exp_c(__fsub_rn(m[j], m_new));
+                l[j]              = canon::add_rn(canon::mul_rn(l[j], scale), psum);
+                m[j]              = m_new;
+                sm.p[lane][3 * warp + j] = p;
+                if (lane == 0) { sm.scale[3 * warp + j] = scale; }
+            }
         }
         __syncthreads();
-        // The online softmax: a warp per 3 rows, lane = key.
-        for (int j = 0; j < 3; ++j) {
-            const int q = 3 * warp + j;
-            const float s = sm.p[q][lane];
-            float top     = s;
+        if (tid < kPvThreads) {
 #pragma unroll
-            for (int o = 16; o >= 1; o /= 2) { top = fmaxf(top, __shfl_xor_sync(kAll, top, o)); }
-            const float m_old = sm.m[q], m_new = fmaxf(m_old, top);
-            const float p     = lane < n ? canon::exp_c(__fsub_rn(s, m_new)) : 0.0F;
-            const float psum  = warp_sum(p);
-            sm.p[q][lane]     = p;
-            __syncwarp();
-            if (lane == 0) {
-                const float scale = m_old == -INFINITY ? 0.0F : canon::exp_c(__fsub_rn(m_old, m_new));
-                sm.scale[q]       = scale;
-                sm.l[q]           = canon::add_rn(canon::mul_rn(sm.l[q], scale), psum);
-                sm.m[q]           = m_new;
+            for (int r = 0; r < 4; ++r) {
+                const float scale = sm.scale[pv_rows + r];
+#pragma unroll
+                for (int d = 0; d < 4; ++d) { acc[r][d] = canon::mul_rn(acc[r][d], scale); }
             }
-        }
-        __syncthreads();
-        if (tid < kGroupRows * 8) {
-            const float scale = sm.scale[pv_row];
-#pragma unroll
-            for (int d = 0; d < 16; ++d) { acc[d] = canon::mul_rn(acc[d], scale); }
             for (int k = 0; k < n; ++k) {
-                const float p = sm.p[pv_row][k];
+                const uint2 vw   = *reinterpret_cast<const uint2*>(&sm.v[buffer][k][pv_d / 2]);
+                const float v[4] = {canon::f32_from_bits(vw.x << 16), canon::f32_from_bits(vw.x & 0xFFFF0000U),
+                                    canon::f32_from_bits(vw.y << 16), canon::f32_from_bits(vw.y & 0xFFFF0000U)};
+                const float4 pp  = *reinterpret_cast<const float4*>(&sm.p[k][pv_rows]);
+                const float pr[4] = {pp.x, pp.y, pp.z, pp.w};
 #pragma unroll
-                for (int d = 0; d < 16; ++d) { acc[d] = __fmaf_rn(p, sm.v[k][pv_d + d], acc[d]); }
+                for (int r = 0; r < 4; ++r) {
+#pragma unroll
+                    for (int d = 0; d < 4; ++d) { acc[r][d] = __fmaf_rn(pr[r], v[d], acc[r][d]); }
+                }
             }
         }
     }
-    __syncthreads();
-    if (tid < kGroupRows * 8) {
-        float* out = partial + static_cast<std::size_t>(pv_row) * kPartialWords;
-        if (tid % 8 == 0) {
-            out[0] = sm.m[pv_row];
-            out[1] = sm.l[pv_row];
-        }
+    if (lane == 0) {
 #pragma unroll
-        for (int d = 0; d < 16; ++d) { out[2 + pv_d + d] = acc[d]; }
+        for (int j = 0; j < 3; ++j) {
+            float* out = partial + static_cast<std::size_t>(3 * warp + j) * kPartialWords;
+            out[0]     = m[j];
+            out[1]     = l[j];
+        }
+    }
+    if (tid < kPvThreads) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            float* out = partial + static_cast<std::size_t>(pv_rows + r) * kPartialWords + 2 + pv_d;
+#pragma unroll
+            for (int d = 0; d < 4; ++d) { out[d] = acc[r][d]; }
+        }
     }
 }
 
-// The splits' merge in split order: a CTA per KV head, a thread per (row, dim).
+// The splits' merge in split order: a CTA per (KV head, row), a thread per dim.
 __global__ void __launch_bounds__(kD) attention_merge_kernel(const DSparkAttentionArgs a) {
     const int g = static_cast<int>(blockIdx.x), q = static_cast<int>(blockIdx.y), d = static_cast<int>(threadIdx.x);
     pdl::enter();
     int lo = 0, hi = 0;
     key_range(a, lo, hi);
-    const int active = (hi - lo + kSplitKeys - 1) / kSplitKeys;
+    const int per    = split_keys(a, lo, hi);
+    const int active = (hi - lo + per - 1) / per;
     const float* base = a.scratch + static_cast<std::size_t>(g) * a.splits * kGroupRows * kPartialWords +
                         static_cast<std::size_t>(q) * kPartialWords;
     float top = -INFINITY;
@@ -800,6 +816,13 @@ void dspark_inv_freq(double theta, float (&inv_freq)[kDSparkHeadDim / 2]) {
     for (int i = 0; i < kDSparkHeadDim / 2; ++i) {
         inv_freq[i] = static_cast<float>(std::pow(theta, -static_cast<double>(i) / (kDSparkHeadDim / 2)));
     }
+}
+
+std::int32_t dspark_attention_splits(bool sliding, std::uint32_t max_context) {
+    // A sliding layer's at most 1,032 keys in splits of 128 (9); the full layer's in at most kTargetSplits.
+    const std::uint64_t keys = sliding ? std::uint64_t{kDSparkWindow} + kDSparkBlock : std::uint64_t{max_context} + kDSparkBlock;
+    const auto splits = static_cast<std::int32_t>((keys + kMinSplitKeys - 1) / kMinSplitKeys);
+    return sliding ? splits : std::min(splits, kTargetSplits);
 }
 
 std::size_t dspark_attention_scratch_bytes(std::int32_t splits) {

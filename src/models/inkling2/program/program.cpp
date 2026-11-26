@@ -2672,9 +2672,13 @@ private:
         std::array<double, ops::inkling2::kDSparkBlock> verify_ms{}; // [k]: the verify call of 1 + k columns a row
         double plain_wall = 0, draft_wall = 0, draft_tokens = 0;     // host ms of a round; a drafted round's tokens
         std::uint64_t rounds = 0, skipped = 0;                       // drafted rounds; plain ones since the last draft
-        // What the policy did since the last report (report_rows): the widths it chose and the rounds it left plain.
+        // What the policy did since the last report (report_rows): the widths it chose, the rounds it left plain, the
+        // dealt rounds' expected tokens over K each's at the same columns, and the rounds that dealt a row every draft
+        // it had while it could have drafted more.
         std::array<std::uint64_t, ops::inkling2::kDSparkBlock> widths{};
         std::uint64_t plain_rounds = 0;
+        double own_ratio = 0;
+        std::uint64_t own_rounds = 0, saturated = 0;
     };
     static constexpr std::uint64_t kRowsReport = 256; // drafted rounds between a batch size's Debug reports
     // The cost line moves with the context (attention reads every key of each lane, the drafter's full layer too; the
@@ -2754,23 +2758,29 @@ private:
         for (std::size_t k = 0; k < cost.widths.size(); ++k) {
             if (cost.widths[k] != 0) { widths += " K" + std::to_string(k) + ":" + std::to_string(cost.widths[k]); }
         }
-        char text[512];
+        char text[768];
         std::snprintf(text, sizeof(text),
                       "Inkling 2 DSpark rounds of %zu rows, contexts up to %lluK: widths%s; %llu rounds plain by the "
                       "rates; plain round %.2f "
                       "ms (device), %.2f ms (host), %.3f tok/ms; drafted round %.2f ms (host), %.2f tokens, %.3f tok/ms; "
                       "verify ms by width %.2f %.2f %.2f %.2f %.2f %.2f %.2f; graphs of these rounds %llu captured, "
-                      "%llu evicted",
+                      "%llu evicted; the drafts dealt by row expect %+.1f %% more tokens than K each at the same "
+                      "columns; %llu rounds dealt a row every draft it had",
                       rows, static_cast<unsigned long long>(2ULL << bucket), widths.c_str(),
                       static_cast<unsigned long long>(cost.plain_rounds), cost.plain_ms,
                       cost.plain_wall, cost.plain_wall > 0.0 ? static_cast<double>(rows) / cost.plain_wall : 0.0,
                       cost.draft_wall, cost.draft_tokens, cost.draft_wall > 0.0 ? cost.draft_tokens / cost.draft_wall : 0.0,
                       cost.verify_ms[1], cost.verify_ms[2], cost.verify_ms[3], cost.verify_ms[4], cost.verify_ms[5],
                       cost.verify_ms[6], cost.verify_ms[7], static_cast<unsigned long long>(rows_captures_),
-                      static_cast<unsigned long long>(rows_evictions_));
+                      static_cast<unsigned long long>(rows_evictions_),
+                      cost.own_rounds != 0 ? 100.0 * (cost.own_ratio / static_cast<double>(cost.own_rounds) - 1.0) : 0.0,
+                      static_cast<unsigned long long>(cost.saturated));
         report(DiagnosticLevel::Debug, text);
         cost.widths       = {};
         cost.plain_rounds = 0;
+        cost.own_ratio    = 0.0;
+        cost.own_rounds   = 0;
+        cost.saturated    = 0;
     }
 
     // The verify call's device time at width k for rows of `cost`: measured, else interpolated between measured widths
@@ -2852,43 +2862,100 @@ private:
                 probabilities[b][static_cast<std::size_t>(i)] = drafter_->host_probabilities(static_cast<std::int32_t>(b))[i];
             }
         }
-        // The width: every row verifies K drafts (a fixed --draft-tokens: all it drafted).
+        // The round's columns, n (K + 1), and each row's share of its n x K drafts (a fixed --draft-tokens: K = all it
+        // drafted, each row).
+        //
+        // The n x K drafts are dealt one at a time to the row whose expected tokens the next one raises most
+        // (draft_length.h, each row at most the drafts it has, capped by its budget), not K each: the same columns, so
+        // the same verify cost and graph (CallPlan::group_width), more tokens where the rows' confidences differ
+        // (2026-11-26, the owner's configuration: +3.5 to +6.6 % expected tokens at 2K, +7.6 to +12.3 % at 100K). Every
+        // row's expected gain falls draft by draft (each draft's reach is the one before it times an acceptance), so a
+        // greedy deal is the best at each count, and one pass to n x steps gives them all: K maximizes the dealt tokens
+        // at n x K over the verify call's device time at K.
         std::int32_t K = steps;
+        std::array<std::int32_t, kMaximumConcurrency> own{};
+        for (std::size_t b = 0; b < n; ++b) { own[b] = K; }
         if (o_.draft_tokens_auto) {
+            const auto row_tokens = [&](std::size_t b, std::int32_t k) {
+                const std::size_t r = order[b];
+                const auto licensed = static_cast<std::int32_t>(budgets[r].generated_tokens_remaining);
+                return runtime::speculative::expected_draft_tokens(
+                    lanes_[index[r]].calibration,
+                    std::span<const float>(probabilities[b].data(), static_cast<std::size_t>(steps)),
+                    std::min(k, licensed - 1));
+            };
+            // [k]: the expected tokens at n x k drafts and each row's share of them.
+            std::array<double, ik::kDSparkBlock> tokens{};
+            std::array<std::array<std::int32_t, kMaximumConcurrency>, ik::kDSparkBlock> share{};
+            std::array<std::int32_t, kMaximumConcurrency> held{};
+            for (std::size_t b = 0; b < n; ++b) { tokens[0] += row_tokens(b, 0); }
+            for (std::int32_t k = 1; k <= steps; ++k) {
+                tokens[static_cast<std::size_t>(k)] = tokens[static_cast<std::size_t>(k) - 1];
+                for (std::size_t d = 0; d < n; ++d) {
+                    double gain      = -1.0;
+                    std::size_t pick = 0;
+                    for (std::size_t b = 0; b < n; ++b) {
+                        if (held[b] >= steps) { continue; }
+                        if (const double g = row_tokens(b, held[b] + 1) - row_tokens(b, held[b]); g > gain) {
+                            gain = g;
+                            pick = b;
+                        }
+                    }
+                    ++held[pick]; // n x k <= n x steps: a row always has room
+                    tokens[static_cast<std::size_t>(k)] += gain;
+                }
+                share[static_cast<std::size_t>(k)] = held;
+            }
             double best = -1.0;
             for (std::int32_t k = 0; k <= steps; ++k) {
-                double tokens = 0.0;
-                for (std::size_t b = 0; b < n; ++b) {
-                    const std::size_t r    = order[b];
-                    const auto licensed    = static_cast<std::int32_t>(budgets[r].generated_tokens_remaining);
-                    const std::int32_t own = std::min(k, licensed - 1);
-                    tokens += runtime::speculative::expected_draft_tokens(
-                        lanes_[index[r]].calibration,
-                        std::span<const float>(probabilities[b].data(), static_cast<std::size_t>(steps)), own);
-                }
-                const double score = tokens / verify_estimate(cost, k);
-                if (score > best) {
+                if (const double score = tokens[static_cast<std::size_t>(k)] / verify_estimate(cost, k); score > best) {
                     best = score;
                     K    = k;
                 }
             }
-            // One width more every kProbeInterval rounds keeps the longer widths' cost and acceptance measured.
-            if (++cost.rounds % kProbeInterval == 0) { K = std::min(K + 1, steps); }
-            for (std::size_t b = 0; b < n; ++b) {
-                Lane& lane     = lanes_[index[order[b]]];
-                lane.step_cap  = std::clamp(K + 2, std::min(2, window), window);
-                ++lane.policy_rounds;
+            // One width more every kProbeInterval rounds, K each, keeps the longer widths' cost and acceptance measured
+            // and every row's acceptance (a row dealt no drafts observes none).
+            if (++cost.rounds % kProbeInterval == 0) {
+                K = std::min(K + 1, steps);
+                for (std::size_t b = 0; b < n; ++b) { own[b] = K; }
+            } else {
+                own = share[static_cast<std::size_t>(K)];
+                double uniform = 0.0;
+                for (std::size_t b = 0; b < n; ++b) { uniform += row_tokens(b, K); }
+                if (K != 0 && uniform > 0.0) {
+                    cost.own_ratio += tokens[static_cast<std::size_t>(K)] / uniform;
+                    ++cost.own_rounds;
+                }
             }
+            if (K != 0 && inkling2::testing::skewed_dealing()) {
+                // The test seam: the n x K drafts from a rotating row on, each row all it drafted until none are left.
+                std::int32_t left = static_cast<std::int32_t>(n) * K;
+                for (std::size_t i = 0; i < n; ++i) {
+                    const std::size_t b = (cost.rounds + i) % n;
+                    own[b]              = std::min(steps, left);
+                    left -= own[b];
+                }
+            }
+            // A row's next draft: 2 past what it verified, as a one-row round's.
+            std::int32_t widest = 0;
+            for (std::size_t b = 0; b < n; ++b) {
+                Lane& lane    = lanes_[index[order[b]]];
+                lane.step_cap = std::clamp(own[b] + 2, std::min(2, window), window);
+                ++lane.policy_rounds;
+                widest = std::max(widest, own[b]);
+            }
+            if (K != 0 && widest == steps && steps < window) { ++cost.saturated; }
         } else {
             ++cost.rounds;
         }
         ++cost.widths[static_cast<std::size_t>(K)];
         report_rows(n, context_bucket(longest_context(sequences)), cost);
         if (K == 0) { return std::nullopt; }
-        // The verify call: each row's pending input and its K drafts at F .. F + K, in lane order.
-        const std::int32_t width = K + 1;
+        inkling2::testing::count_dealing(std::span<const std::int32_t>(own.data(), n), steps);
+        // The verify call: each row's pending input and its drafts at F .. F + own, in lane order, n (K + 1) columns.
         CallPlan call;
         call.first.assign(lanes_.size(), 0); // every lane's entry: the call's graph is the same whichever lanes it has
+        call.group_width = ik::kDSparkBlock; // a row's widest: one graph for every dealing of the round's columns
         std::array<std::uint32_t, kMaxSampleRows> sample_lanes{}, providers{};
         std::array<std::int32_t, kMaxSampleRows> logit_rows{}, positions{};
         std::array<std::int32_t, kMaximumConcurrency> offset{};
@@ -2897,7 +2964,7 @@ private:
             const std::uint32_t lane = index[r];
             const auto F             = static_cast<std::int32_t>(lanes_[lane].processed);
             offset[r]                = static_cast<std::int32_t>(call.tokens.size());
-            for (std::int32_t i = 0; i < width; ++i) {
+            for (std::int32_t i = 0; i < own[b] + 1; ++i) {
                 const auto column = static_cast<std::size_t>(offset[r] + i);
                 call.tokens.push_back(i == 0 ? lanes_[lane].tokens[static_cast<std::size_t>(F)]
                                              : drafts[b][static_cast<std::size_t>(i - 1)]);
@@ -2921,7 +2988,7 @@ private:
         }
         stage_sample({sample_lanes.data(), T}, {logit_rows.data(), T}, ops::kSamplePurposeDecode, masks,
                      {positions.data(), T}, false, {providers.data(), T});
-        DecodeGraphExecutable& verify = rows_verify_graph(static_cast<std::int32_t>(n), width);
+        DecodeGraphExecutable& verify = rows_verify_graph(static_cast<std::int32_t>(n), K + 1); // n (K + 1) columns
         CUDA_CHECK(cudaEventRecord(round_events_[2], device_.stream));
         // The forward's graph, then (a constrained row's masks filled while it runs: column i samples under the mask of
         // its position after its drafts 0 .. i - 1) the sample of every column.
@@ -2931,7 +2998,7 @@ private:
             const std::size_t r = order[b];
             if (!masks->constrained(r)) { continue; }
             fill_masks(*masks, r, static_cast<std::size_t>(offset[r]),
-                       std::span<const TokenId>(drafts[b].data(), static_cast<std::size_t>(K)));
+                       std::span<const TokenId>(drafts[b].data(), static_cast<std::size_t>(own[b])));
             dead[r] = mask_dead_[r];
         }
         launch_sample(T, {logit_rows.data(), T}, ops::kSamplePurposeDecode);
@@ -2954,12 +3021,12 @@ private:
             const auto o              = static_cast<std::size_t>(offset[r]);
             const auto licensed       = static_cast<std::int32_t>(budgets[r].generated_tokens_remaining);
             std::int32_t a            = 0;
-            while (a < K && drafts[b][static_cast<std::size_t>(a)] == sampled_tokens_[o + static_cast<std::size_t>(a)] &&
+            while (a < own[b] && drafts[b][static_cast<std::size_t>(a)] == sampled_tokens_[o + static_cast<std::size_t>(a)] &&
                    failures_[o + static_cast<std::size_t>(a)] == runtime::PendingRowFailure::None) {
                 ++a;
             }
             lane.calibration.observe(std::span<const float>(probabilities[b].data(), static_cast<std::size_t>(steps)),
-                                     static_cast<std::uint32_t>(K), static_cast<std::uint32_t>(a), kAcceptanceWeight);
+                                     static_cast<std::uint32_t>(own[b]), static_cast<std::uint32_t>(a), kAcceptanceWeight);
             // The row's round ends at the first reasoning close it draws, and at its budget.
             if (const runtime::ReasoningBan& ban = bans[r]; ban.active()) {
                 for (std::int32_t i = 0; i < a; ++i) {
@@ -2992,7 +3059,7 @@ private:
             }
             row_failures[r] = failure;
             ++lane.rounds;
-            lane.drafted += static_cast<std::uint64_t>(K);
+            lane.drafted += static_cast<std::uint64_t>(own[b]);
             lane.accepted += static_cast<std::uint64_t>(kept);
             for (std::int32_t i = 0; i < kept; ++i) { ++lane.accepted_at[static_cast<std::size_t>(i)]; }
             lane.draft_ms += draft_ms, lane.gap_ms += gap_ms, lane.verify_ms += verify_ms;

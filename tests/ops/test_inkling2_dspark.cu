@@ -4,7 +4,7 @@
 // oracle applies too; everything else is FP64. Criteria (stated before the run):
 //   mix, rotate, add_norm, swiglu: |gpu - ref| <= 2^-8 |ref| + 2^-10 max|ref| (half a BF16 ulp, the FP32 sums, a
 //     boundary flip one ulp upstream);
-//   attention: |gpu - ref| <= 2^-8 |ref| + 2^-12 max|v|;
+//   attention: |gpu - ref| <= 2^-8 |ref| + 2^-12 max|v| (sliding with the ring wrapped, full up to 20,008 keys);
 //   rotate's values and the residual copy: bit for bit;
 //   Markov: each draft equals the oracle's argmax (lowest id on ties) until the oracle's top two capped logits lie
 //     within 2 BF16 ulps (a near tie either side may take; later drafts then follow another path), each probability
@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <type_traits>
 #include <vector>
@@ -383,10 +384,9 @@ void rotate_case() {
 
 // ---------------------------------------------------------------------------- attention
 
-void attention_case(bool sliding, int first) {
+void attention_case(bool sliding, int first, int kMaxContext = 2048) {
     std::mt19937 rng(sliding ? 13 : 14);
-    constexpr int kMaxContext = 2048;
-    const int splits = sliding ? (ik::kDSparkWindow + 8 + 127) / 128 : (kMaxContext + 8 + 127) / 128;
+    const int splits = ik::dspark_attention_splits(sliding, static_cast<std::uint32_t>(kMaxContext));
     // Sliding: each lane's ring [8][ring][128]. Full: a page-major pool [pages][8][64][128] and two lanes' block-table
     // rows, lane 1's pages a shuffled set (so a key's page comes from the table, not its position).
     const int stride = (kMaxContext + 8 + 63) / 64, pages = 2 * stride + 3;
@@ -451,6 +451,46 @@ void attention_case(bool sliding, int first) {
     std::printf("dspark_attention (%s, F = %d: keys %d-%d): worst %.3f of the bound\n", sliding ? "sliding" : "full", first,
                 lo, hi - 1, worst.ratio);
     check(worst.ratio <= 1.0, "dspark_attention outside its bound");
+}
+
+// INFERNIX_DSPARK_BENCH (a measurement, not a check): the full layer's attention of one row's block at contexts of 2K to
+// 200K with the launch sized for a 240,000-token context (the owner's), 100 launches after 20 warm-ups, timed by events.
+void attention_bench() {
+    constexpr int kMaxContext = 240000;
+    const int splits = ik::dspark_attention_splits(false, kMaxContext);
+    const int stride = (kMaxContext + 8 + 63) / 64;
+    std::vector<std::int32_t> table(static_cast<std::size_t>(stride));
+    for (std::size_t i = 0; i < table.size(); ++i) { table[i] = static_cast<std::int32_t>(i); }
+    std::mt19937 rng(21);
+    const std::size_t words = static_cast<std::size_t>(stride) * 8 * 64 * D;
+    ik::DSparkAttentionArgs a;
+    a.q            = upload(random_bf16(8ULL * 24 * D, rng, 0.35));
+    a.cache_k      = upload(random_bf16(words, rng, 1.0));
+    a.cache_v      = upload(random_bf16(words, rng, 1.0));
+    a.table        = upload(table);
+    a.table_stride = stride;
+    a.splits       = splits;
+    a.scratch      = zeros<float>(ik::dspark_attention_scratch_bytes(splits) / 4);
+    a.out          = zeros<std::uint16_t>(8ULL * 24 * D);
+    cudaEvent_t start = nullptr, stop = nullptr;
+    cuda_check(cudaEventCreate(&start), "event");
+    cuda_check(cudaEventCreate(&stop), "event");
+    for (const int first : {2048, 8192, 32768, 100000, 160000, 200000}) {
+        ik::DSparkRound* round = upload(std::vector<ik::DSparkRound>{{first, 0, 0}});
+        a.round                = round;
+        for (int i = 0; i < 20; ++i) { ik::dspark_attention(a, nullptr); }
+        cuda_check(cudaEventRecord(start, nullptr), "event");
+        constexpr int kRuns = 100;
+        for (int i = 0; i < kRuns; ++i) { ik::dspark_attention(a, nullptr); }
+        cuda_check(cudaEventRecord(stop, nullptr), "event");
+        cuda_check(cudaEventSynchronize(stop), "event");
+        float ms = 0;
+        cuda_check(cudaEventElapsedTime(&ms, start, stop), "event");
+        const double bytes = 2.0 * (first + 8) * 8 * D * 2; // the keys and values read
+        std::printf("bench: full-layer attention at F = %d (launch for %d): %.4f ms (%.0f GB/s of keys and values)\n", first,
+                    kMaxContext, ms / kRuns, bytes / (ms / kRuns * 1e-3) / 1e9);
+        cudaFree(round);
+    }
 }
 
 // ---------------------------------------------------------------------------- add_norm, swiglu
@@ -665,12 +705,19 @@ void markov_case(bool q8, bool list) {
 } // namespace
 
 INFERNIX_OP_TEST(inkling2_dspark) {
+    if (std::getenv("INFERNIX_DSPARK_BENCH") != nullptr) {
+        attention_bench();
+        return 0;
+    }
     mix_case();
     rotate_case();
     attention_case(true, 1500);
     attention_case(true, 40);
+    attention_case(true, 70001); // the ring's slots wrapped many times, tiles across the wrap
     attention_case(false, 1500);
     attention_case(false, 3);
+    // A long context: 42 splits of 15 tiles (the last one partial), the merge over all of them.
+    attention_case(false, 20000, 24000);
     add_norm_case();
     swiglu_case();
     markov_case(false, false);

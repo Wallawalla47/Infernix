@@ -84,6 +84,9 @@ struct CallPlan {
     std::vector<std::int32_t> tokens, lane, position;
     std::vector<std::int32_t> first;
     bool prompt = false;
+    // Attention's CTAs are sized for groups of at least this many columns (at most 16): a graph captured from this call
+    // then replays for any other split of its columns among its lanes, no lane wider (a DSpark round's per-row widths).
+    std::int32_t group_width = 0;
     [[nodiscard]] std::int32_t columns() const noexcept { return static_cast<std::int32_t>(tokens.size()); }
     [[nodiscard]] std::int32_t lanes() const noexcept { return static_cast<std::int32_t>(first.size()); }
 };

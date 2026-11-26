@@ -23,8 +23,9 @@
 //    samples under its reasoning ban, the four sampled requests alone
 //    and C = 2; under --a16-activations and under --a8-activations the greedy reply equals that route's plain tokens);
 //    the acceptance is reported. 7b. Rounds of several rows drafting together: the four sampled requests at C = 4 and
-//    the greedy and parsed replies at C = 2 give their plain tokens (auto and 7 drafts), and rounds of several rows
-//    drafted (also under each --kv-dtype, 8; under int8 also C = 8 with 7 drafts: 64 verify columns).
+//    the greedy and parsed replies at C = 2 give their plain tokens (auto, auto with a skewed deal and 7 drafts), and
+//    rounds of several rows drafted, auto's at unequal widths and the skewed deal's with rows verifying none and all of
+//    their drafts (also under each --kv-dtype, 8; under int8 also C = 8 with 7 drafts: 64 verify columns).
 // 8. --kv-dtype (the full visits' pools quantized): each format as a variant of 6 (accepted with --reproducible),
 //    DSpark (auto, graphs) giving its plain tokens, and a 10,000-token prompt's greedy continuation the same in chunks
 //    of 4,096 and 1,000; bf16p (lossless) gives bf16's tokens throughout, the others' agreement with BF16's is reported.
@@ -368,16 +369,23 @@ int main() {
                 }
             }
             // 7b. Rounds of several rows draft together (decode_dspark_rows): four sampled requests at once, and the
-            // 160-token greedy reply beside the parsed one (its reasoning ban, a row of its own), auto and 7 drafts,
-            // give their plain tokens; rounds of several rows must have drafted (testing::rows_drafted_together).
-            for (const bool automatic : {true, false}) {
+            // 160-token greedy reply beside the parsed one (its reasoning ban, a row of its own), auto, auto with the
+            // skewed deal (testing::set_skewed_dealing: rows verify none and all their drafts) and 7 drafts, give their
+            // plain tokens; rounds of several rows must have drafted (testing::rows_drafted_together), auto's rows at
+            // unequal widths and the skewed deal's rows empty and full (testing::dealing).
+            for (const int mode : {0, 1, 2}) {
+                const bool automatic = mode != 2;
+                const bool skewed    = mode == 1;
                 infernix::EngineOptions options = engine_options(artifact, 0, true, 4);
                 options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
                 options.speculative.draft_tokens_auto = automatic;
                 options.speculative.draft_tokens      = 7;
+                infernix::models::inkling2::testing::set_skewed_dealing(skewed);
                 infernix::Engine engine(options);
-                const std::string label = std::string("dspark rows (") + (automatic ? "auto" : "7 drafts") + ")";
+                const std::string label =
+                    std::string("dspark rows (") + (skewed ? "auto, skewed deal" : automatic ? "auto" : "7 drafts") + ")";
                 const std::uint64_t together = infernix::models::inkling2::testing::rows_drafted_together();
+                const infernix::models::inkling2::testing::Dealing dealt = infernix::models::inkling2::testing::dealing();
                 std::vector<infernix::GenerationHandle> handles;
                 for (std::size_t i = 0; i < texts().size(); ++i) {
                     handles.push_back(engine.submit(engine.prepare(chat(texts()[i])), sampled(i)));
@@ -408,6 +416,15 @@ int main() {
                           << reply_result.speculative.drafted_tokens << " drafts accepted, parsed reply "
                           << parsed_result.speculative.accepted_tokens << " of "
                           << parsed_result.speculative.drafted_tokens << "\n";
+                const infernix::models::inkling2::testing::Dealing after = infernix::models::inkling2::testing::dealing();
+                const std::uint64_t unequal = after.unequal_rounds - dealt.unequal_rounds;
+                const std::uint64_t empty   = after.empty_rows - dealt.empty_rows;
+                const std::uint64_t full    = after.full_rows - dealt.full_rows;
+                std::cout << label << ": " << unequal << " rounds of unequal widths, " << empty << " rows verified none of "
+                          << "their drafts, " << full << " all of them\n";
+                if (automatic) { require(unequal > 0, label + ": no round dealt its rows unequal widths"); }
+                if (skewed) { require(empty > 0 && full > 0, label + ": no row verified none or all of its drafts"); }
+                infernix::models::inkling2::testing::set_skewed_dealing(false);
             }
             {
                 // --lm-head-draft: the drafter reads a shortlist, and verification still decides every output. On an

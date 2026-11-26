@@ -144,11 +144,12 @@ for token.
   plainly.
 - `--draft-tokens auto` uses the calibrated number of drafts each round, up to 7. With `--spec dspark`
   a fixed count from 1 to 7 also works.
-- Requests decoding together draft together: each request's block is drafted, and one verify call
-  takes the same number of drafts from each, the number their calibrated drafts make fastest on the
-  verify times the rounds measure (a batch size whose drafted rounds turn out slower than its plain
-  ones decodes plainly, trying drafts again now and then). Each request's tokens are still its plain
-  decoding's. A request with presence or frequency penalties, a token constraint, forced tokens
+- Requests decoding together draft together: their blocks are drafted at the same time, and one
+  verify call checks the round's drafts, shared out so that the requests whose drafts are likelier to
+  be accepted verify more of theirs. How many drafts a round verifies is the number their calibrated
+  drafts make fastest on the verify times the rounds measure (a batch size whose drafted rounds turn
+  out slower than its plain ones decodes plainly, trying drafts again now and then). Each request's
+  tokens are still its plain decoding's. A request with presence or frequency penalties, a token constraint, forced tokens
   pending or less than a block of context left decodes plainly, and so does every request beside it
   in that round; so does a round under `--no-cuda-graph`.
 - `--lossless` runs without a drafter.

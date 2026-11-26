@@ -32,6 +32,8 @@
 //    argmax elsewhere and its largest logit difference from the reference and from the decode route.
 // 8. Batched verification widths: eight lanes in calls of 64, 64 and 36 columns give each lane's single-column decode
 //    logits bit for bit.
+// 9. One graph for every split: a 4-lane 16-column call captured at (8, 6, 1, 1) replays at (4, 4, 4, 4) and
+//    (7, 5, 3, 1) with each split's eager logits bit for bit.
 //
 // Timing (environment): INFERNIX_INKLING2_PROFILE = width (the captured decode round, INFERNIX_INKLING2_CONTEXT
 // positions before it; INFERNIX_INKLING2_SKELETON = serial or trigger also times the same graph with every kernel
@@ -61,6 +63,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -968,8 +971,71 @@ bool wide_lanes(const m::Parameters& p, m::Forward& solo, State& solo_state, con
     return ok;
 }
 
+// 9. One graph for every split of a call's columns: a 4-lane call of 16 columns captured at (8, 6, 1, 1) with
+//    attention sized for groups of 8 (CallPlan::group_width) and replayed with the tokens, lanes and positions of
+//    (4, 4, 4, 4) and (7, 5, 3, 1) gives each split's eager logits bit for bit, from the same state (the eager calls
+//    sized for their own widest group: the allowance changes no bit).
+bool split_replay(const m::Parameters& p, const Reference& ref, bool a8) {
+    const auto& c = p.model.config().text;
+    const std::int32_t* ids = ref.get<std::int32_t>("ids");
+    constexpr int kLanes = 4, kContext = 8;
+    const auto token = [&](int lane, int position) { return ids[(position + 7 * lane) % kPositions]; };
+    m::Forward fw(p, kLanes, m::kMaxForwardColumns,
+                  a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
+    State state(fw.layout(), kLanes);
+    const auto plan = [&](const std::array<int, kLanes>& counts, int from) {
+        m::CallPlan out;
+        out.first.assign(kLanes, 0);
+        out.group_width = 8;
+        for (int l = 0; l < kLanes; ++l) {
+            for (int i = 0; i < counts[static_cast<std::size_t>(l)]; ++i) {
+                out.tokens.push_back(token(l, from + i));
+                out.lane.push_back(l);
+                out.position.push_back(from + i);
+            }
+        }
+        return out;
+    };
+    (void)run_call(p, fw, state, plan({kContext, kContext, kContext, kContext}, 0), nullptr); // each lane's context
+    state.save();
+    cudaStream_t stream = nullptr;
+    cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    const std::array<std::array<int, kLanes>, 3> splits = {{{8, 6, 1, 1}, {4, 4, 4, 4}, {7, 5, 3, 1}}};
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    fw.prepare(plan(splits[0], kContext));
+    cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    fw.embed(stream);
+    for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+    fw.finish(state.view, stream);
+    cuda(cudaStreamEndCapture(stream, &graph), "capture");
+    cuda(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    bool ok = true;
+    for (const auto& split : splits) {
+        const m::CallPlan call = plan(split, kContext);
+        m::CallPlan sized      = call; // the eager reference sized for its own widest group, as a call without one is
+        sized.group_width      = 0;
+        state.restore();
+        const auto eager = run_call(p, fw, state, sized, nullptr);
+        state.restore();
+        fw.prepare(call);
+        cuda(cudaGraphLaunch(exec, stream), "replay");
+        cuda(cudaStreamSynchronize(stream), "replay");
+        const auto got  = download(fw.buffers().logits, static_cast<std::size_t>(call.columns()) * c.vocab_size);
+        const bool same = std::memcmp(got.data(), eager.data(), got.size() * 4) == 0;
+        ok              = ok && same;
+        std::printf("a 16-column call captured at (8, 6, 1, 1), replayed at (%d, %d, %d, %d): %s\n", split[0], split[1],
+                    split[2], split[3], same ? "the eager logits bit for bit" : "DIFFERENT");
+    }
+    cuda(cudaGraphExecDestroy(exec), "destroy");
+    cuda(cudaGraphDestroy(graph), "destroy");
+    cuda(cudaStreamDestroy(stream), "stream");
+    return ok;
+}
+
 // Timing (INFERNIX_INKLING2_LANES_PROFILE = n lanes, INFERNIX_INKLING2_CONTEXT = each lane's positions before the
-// round, default 4096): each lane's context prefilled by prompt-route calls of 128 columns of the reference's ids
+// round, default 4096; INFERNIX_INKLING2_GROUP_WIDTH = the rounds' CallPlan::group_width, default 0): each lane's
+// context prefilled by prompt-route calls of 128 columns of the reference's ids
 // repeated, then a decode-route round of n lanes x K columns (K = 1 .. 8, a batched verification's shape) captured
 // and replayed 100 times (after 20 warm-up replays), timed by events. Prints each round's time, its cost per extra
 // column in plain n-lane rounds ((t_K / t_1 - 1) / (n (K - 1)): the draft-length policy's per-draft cost at that
@@ -1011,9 +1077,11 @@ void profile_lanes(const m::Parameters& p, const Reference& ref, int lanes, int 
     cuda(cudaEventCreate(&start), "event");
     cuda(cudaEventCreate(&stop), "event");
     double one = 0;
+    const char* group_width = std::getenv("INFERNIX_INKLING2_GROUP_WIDTH");
     for (int K = 1; K <= ik::kDSparkBlock; ++K) {
         m::CallPlan plan;
         plan.first.assign(static_cast<std::size_t>(lanes), 0);
+        plan.group_width = group_width != nullptr ? std::atoi(group_width) : 0;
         for (int l = 0; l < lanes; ++l) {
             for (int i = 0; i < K; ++i) {
                 plan.tokens.push_back(token(l, context + i));
@@ -1331,6 +1399,7 @@ int main() {
         ok = graph_replay(parameters, forward, state, ref) && ok;
         ok = lanes_alone(parameters, forward, state, ref, a8) && ok;
         ok = wide_lanes(parameters, forward, state, ref, a8) && ok;
+        ok = split_replay(parameters, ref, a8) && ok;
         std::printf(ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& error) {

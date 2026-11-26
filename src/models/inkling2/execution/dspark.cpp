@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace infernix::models::inkling2 {
 namespace {
@@ -17,14 +19,11 @@ constexpr std::int32_t kKv     = ik::kDSparkKvHeads * ik::kDSparkHeadDim; // 102
 constexpr std::int32_t kI      = ik::kDSparkIntermediate;
 constexpr std::int32_t kB      = ik::kDSparkBlock;
 constexpr std::int32_t kFRing  = 16; // the Markov context ring's rows a lane (> a verify call's columns)
-constexpr std::int32_t kSplitKeys = 128;
 
 std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 
-std::int32_t full_splits(std::uint32_t max_context) {
-    return static_cast<std::int32_t>((static_cast<std::uint64_t>(max_context) + kB + kSplitKeys - 1) / kSplitKeys);
-}
-constexpr std::int32_t kSlidingSplits = (ik::kDSparkWindow + kB + kSplitKeys - 1) / kSplitKeys; // 9
+std::int32_t full_splits(std::uint32_t max_context) { return ik::dspark_attention_splits(false, max_context); }
+const std::int32_t kSlidingSplits = ik::dspark_attention_splits(true, 0); // 9
 
 // The drafter's device buffers in order, each through add(pointer, bytes).
 struct Layout {
@@ -40,6 +39,23 @@ struct Layout {
     float* inv_freq       = nullptr;
     std::int32_t* head_x8 = nullptr; // the block's final rows as 8-bit head inputs (Forward::project_head)
 };
+
+// A row's draft workspace: each buffer and its bytes (a slice a row, in this order).
+std::vector<std::pair<void**, std::size_t>> workspace_items(Layout& b, std::uint32_t max_context, std::uint32_t vocab) {
+    const auto item = [](auto*& pointer, std::size_t bytes) {
+        return std::pair<void**, std::size_t>{reinterpret_cast<void**>(&pointer), bytes};
+    };
+    return {item(b.block_in, kB * kH * 2),    item(b.residual, kB * kH * 2),   item(b.normed, kB * kH * 2),
+            item(b.q, kB * kQ * 2),           item(b.k, kB * kKv * 2),         item(b.v, kB * kKv * 2),
+            item(b.qr, kB * kQ * 2),          item(b.attention, kB * kQ * 2),  item(b.a, kB * kH * 2),
+            item(b.y, kB * kH * 2),           item(b.gate, kB * kI * 2),       item(b.up, kB * kI * 2),
+            item(b.h, kB * kI * 2),           item(b.final_rows, kB * kH * 2),
+            item(b.base, static_cast<std::size_t>(ik::kMarkovSteps) * vocab * 4),
+            item(b.attention_scratch,
+                 ik::dspark_attention_scratch_bytes(std::max(full_splits(max_context), kSlidingSplits))),
+            item(b.markov_scratch, ik::dspark_markov_scratch_bytes(static_cast<std::int32_t>(vocab))),
+            item(b.head_x8, static_cast<std::size_t>(kB) * ik::projection_a8_column_words(kH) * 4)};
+}
 
 template <class Add>
 void walk(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity, std::uint32_t vocab, Layout& b,
@@ -59,15 +75,9 @@ void walk(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity, 
         add(b.ctx_v[l], T * kKv * 2);
     }
     add(b.round, L * sizeof(ik::DSparkRound));
-    add(b.block_in, kB * kH * 2), add(b.residual, kB * kH * 2), add(b.normed, kB * kH * 2);
-    add(b.q, kB * kQ * 2), add(b.k, kB * kKv * 2), add(b.v, kB * kKv * 2), add(b.qr, kB * kQ * 2);
-    add(b.attention, kB * kQ * 2), add(b.a, kB * kH * 2), add(b.y, kB * kH * 2);
-    add(b.gate, kB * kI * 2), add(b.up, kB * kI * 2), add(b.h, kB * kI * 2), add(b.final_rows, kB * kH * 2);
-    add(b.base, static_cast<std::size_t>(ik::kMarkovSteps) * vocab * 4);
-    add(b.attention_scratch, ik::dspark_attention_scratch_bytes(std::max(full_splits(max_context), kSlidingSplits)));
-    add(b.markov_scratch, ik::dspark_markov_scratch_bytes(static_cast<std::int32_t>(vocab)));
+    // A row's workspace, a lane's each (Layout's pointers are row 0's; row r's is r slices past: workspace_bytes).
+    for (const auto& [pointer, bytes] : workspace_items(b, max_context, vocab)) { add(*pointer, L * align(bytes)); }
     add(b.tokens, L * kB * 4), add(b.probabilities, L * kB * 4), add(b.inv_freq, ik::kDSparkHeadDim / 2 * 4);
-    add(b.head_x8, static_cast<std::size_t>(kB) * ik::projection_a8_column_words(kH) * 4);
 }
 
 // A BF16 or 8-bit (Q8_G32_FP16 RowSplit, converted at load: plan_load's drafter_q8_objects) matrix as one segment of
@@ -145,20 +155,40 @@ Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int3
     full_       = full;
     cache_k_[1] = full.k; // the full layer's cache: the pool's planes, through the lanes' block-table rows
     cache_v_[1] = full.v;
-    f_ring_ = b.f_ring, round_ = b.round, block_in_ = b.block_in, residual_ = b.residual, normed_ = b.normed;
-    q_ = b.q, k_ = b.k, v_ = b.v, qr_ = b.qr, attention_ = b.attention, a_ = b.a, y_ = b.y;
-    gate_ = b.gate, up_ = b.up, h_ = b.h, final_ = b.final_rows, base_ = b.base;
-    attention_scratch_ = b.attention_scratch, markov_scratch_ = b.markov_scratch;
-    tokens_ = b.tokens, probabilities_ = b.probabilities, inv_freq_ = b.inv_freq, head_x8_ = b.head_x8;
+    f_ring_ = b.f_ring, round_ = b.round;
+    tokens_ = b.tokens, probabilities_ = b.probabilities, inv_freq_ = b.inv_freq;
+    // Each row's workspace: its slice of every workspace buffer.
+    rows_.resize(static_cast<std::size_t>(lanes));
+    for (std::int32_t r = 0; r < lanes; ++r) {
+        Layout row = b;
+        for (const auto& [pointer, bytes] : workspace_items(row, max_context, vocab_)) {
+            *pointer = static_cast<std::uint8_t*>(*pointer) + static_cast<std::size_t>(r) * align(bytes);
+        }
+        rows_[static_cast<std::size_t>(r)] = {row.block_in, row.residual,   row.normed, row.q,    row.k,  row.v,
+                                              row.qr,       row.attention, row.a,      row.y,    row.gate, row.up,
+                                              row.h,        row.final_rows, row.base,  row.attention_scratch,
+                                              row.markov_scratch, row.head_x8};
+        // The block's rows 1 .. 7: the mask embedding, once (row 0, the anchor's, is rewritten each round).
+        for (int i = 1; i < kB; ++i) {
+            CUDA_CHECK(cudaMemcpy(row.block_in + static_cast<std::size_t>(i) * kH, d_.mask_embedding, kH * 2,
+                                  cudaMemcpyDeviceToDevice));
+        }
+    }
     {
         float table[ik::kDSparkHeadDim / 2];
         ik::dspark_inv_freq(static_cast<double>(parameters.model.config().dspark->rope_theta), table);
         CUDA_CHECK(cudaMemcpy(inv_freq_, table, sizeof(table), cudaMemcpyHostToDevice));
     }
-    // The block's rows 1 .. 7: the mask embedding, once (row 0, the anchor's, is rewritten each round).
-    for (int r = 1; r < kB; ++r) {
-        CUDA_CHECK(cudaMemcpy(block_in_ + static_cast<std::size_t>(r) * kH, d_.mask_embedding, kH * 2,
-                              cudaMemcpyDeviceToDevice));
+    // Rows 1 .. lanes - 1 draft on streams of their own.
+    for (std::int32_t r = 1; r < lanes; ++r) {
+        cudaStream_t stream = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        streams_.push_back(stream);
+        cudaEvent_t fork = nullptr, join = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&join, cudaEventDisableTiming));
+        fork_.push_back(fork);
+        join_.push_back(join);
     }
     auto* host                = static_cast<std::uint8_t*>(pinned_.data());
     const std::size_t rounds  = align(static_cast<std::size_t>(lanes) * sizeof(ik::DSparkRound));
@@ -167,6 +197,12 @@ Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int3
     host_tokens_              = reinterpret_cast<std::int32_t*>(host + rounds);
     host_probabilities_       = reinterpret_cast<float*>(host + rounds + drafts);
     std::fill_n(host_round_, lanes, ik::DSparkRound{});
+}
+
+Drafter::~Drafter() {
+    for (cudaStream_t stream : streams_) { (void)cudaStreamDestroy(stream); }
+    for (cudaEvent_t event : fork_) { (void)cudaEventDestroy(event); }
+    for (cudaEvent_t event : join_) { (void)cudaEventDestroy(event); }
 }
 
 void Drafter::stage(std::span<const ik::DSparkRound> rounds) {
@@ -247,49 +283,67 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream, std::int32_t rows) 
     if (rows < 1 || rows > lanes_) { throw std::invalid_argument("inkling2 dspark: a round drafts 1 .. lanes rows"); }
     CUDA_CHECK(cudaMemcpyAsync(round_, host_round_, static_cast<std::size_t>(rows) * sizeof(ik::DSparkRound),
                                cudaMemcpyHostToDevice, stream));
-    for (std::int32_t row = 0; row < rows; ++row) { draft_row(row, steps, stream); }
+    if (rows == 1) {
+        draft_row(0, steps, stream);
+        return;
+    }
+    // Rows 1 .. on their own streams after the round words, row 0 on the caller's, then the caller's waits for all:
+    // the rows' launch chains (each mostly small kernels in sequence: the Markov steps above all) overlap (2026-11-26,
+    // four rows of the owner's configuration: a round's draft 2.7 -> 2.0 ms at 100K, +1.9 % tok/s, +2.1 % at 2K).
+    for (std::int32_t row = 1; row < rows; ++row) {
+        const auto r = static_cast<std::size_t>(row - 1);
+        CUDA_CHECK(cudaEventRecord(fork_[r], stream));
+        CUDA_CHECK(cudaStreamWaitEvent(streams_[r], fork_[r], 0));
+        draft_row(row, steps, streams_[r]);
+        CUDA_CHECK(cudaEventRecord(join_[r], streams_[r]));
+    }
+    draft_row(0, steps, stream);
+    for (std::int32_t row = 1; row < rows; ++row) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, join_[static_cast<std::size_t>(row - 1)], 0));
+    }
 }
 
-// One row's block (its round words at round_ + row; its lane's caches; its drafts into the row's slot) on the shared
-// workspace: rows run one after another on the stream.
+// One row's block (its round words at round_ + row; its lane's caches; its drafts into the row's slot) on the row's
+// workspace.
 void Drafter::draft_row(std::int32_t row, std::int32_t steps, cudaStream_t stream) {
     ik::DSparkRound* const round = round_ + row;
+    const Workspace& w           = rows_[static_cast<std::size_t>(row)];
     // The block's input: the anchor's normed target embedding, then the mask rows; the residual stream starts there.
-    ik::embed(&round->anchor, 1, p_.embedding, p_.embedding_norm, block_in_, stream);
-    CUDA_CHECK(cudaMemcpyAsync(residual_, block_in_, static_cast<std::size_t>(kB) * kH * 2, cudaMemcpyDeviceToDevice,
+    ik::embed(&round->anchor, 1, p_.embedding, p_.embedding_norm, w.block_in, stream);
+    CUDA_CHECK(cudaMemcpyAsync(w.residual, w.block_in, static_cast<std::size_t>(kB) * kH * 2, cudaMemcpyDeviceToDevice,
                                stream));
     for (int l = 0; l < 3; ++l) {
         const DSparkLayerOperands& o = d_.layers[l];
         ik::DSparkAddNormArgs n;
-        n.residual = residual_;
-        n.x        = l == 0 ? nullptr : y_;
+        n.residual = w.residual;
+        n.x        = l == 0 ? nullptr : w.y;
         n.norm     = o.input_norm;
-        n.normed   = normed_;
+        n.normed   = w.normed;
         n.rows     = kB;
         ik::dspark_add_norm(n, stream);
         ik::ProjectionArgs qkv{};
         qkv.columns = kB;
         qkv.k       = kH;
-        qkv.x[0]    = normed_;
-        add_segment(qkv, o.query, 0, q_);
-        add_segment(qkv, o.key, 0, k_);
-        add_segment(qkv, o.value, 0, v_);
+        qkv.x[0]    = w.normed;
+        add_segment(qkv, o.query, 0, w.q);
+        add_segment(qkv, o.key, 0, w.k);
+        add_segment(qkv, o.value, 0, w.v);
         project(qkv, stream);
         ik::DSparkRotateArgs rq;
-        rq.x        = q_;
+        rq.x        = w.q;
         rq.x_stride = kQ;
         rq.rows     = kB;
         rq.heads    = ik::kDSparkHeads;
         rq.norm     = o.query_norm;
         rq.round    = round;
-        rq.dense    = qr_;
+        rq.dense    = w.qr;
         rq.inv_freq = inv_freq_;
         ik::dspark_rotate(rq, stream);
         // The block's own keys and values into the cache at F .. F + 7 (transient: the next rows overwrite them).
         ik::DSparkRotateArgs rk;
-        rk.x             = k_;
+        rk.x             = w.k;
         rk.x_stride      = kKv;
-        rk.values        = v_;
+        rk.values        = w.v;
         rk.values_stride = kKv;
         rk.rows          = kB;
         rk.heads         = ik::kDSparkKvHeads;
@@ -304,60 +358,60 @@ void Drafter::draft_row(std::int32_t row, std::int32_t steps, cudaStream_t strea
         rk.inv_freq      = inv_freq_;
         ik::dspark_rotate(rk, stream);
         ik::DSparkAttentionArgs at;
-        at.q           = qr_;
-        at.cache_k     = cache_k_[l];
-        at.cache_v     = cache_v_[l];
-        at.lane_stride = lane_words_[l];
-        at.ring        = o.sliding ? ik::kDSparkRing : 0;
-        at.table       = full_.table;
+        at.q            = w.qr;
+        at.cache_k      = cache_k_[l];
+        at.cache_v      = cache_v_[l];
+        at.lane_stride  = lane_words_[l];
+        at.ring         = o.sliding ? ik::kDSparkRing : 0;
+        at.table        = full_.table;
         at.table_stride = full_.table_stride;
-        at.splits      = o.sliding ? kSlidingSplits : full_splits_;
-        at.round       = round;
-        at.scratch     = attention_scratch_;
-        at.out         = attention_;
+        at.splits       = o.sliding ? kSlidingSplits : full_splits_;
+        at.round        = round;
+        at.scratch      = w.attention_scratch;
+        at.out          = w.attention;
         ik::dspark_attention(at, stream);
         ik::ProjectionArgs wo{};
         wo.columns = kB;
         wo.k       = kQ;
-        wo.x[0]    = attention_;
-        add_segment(wo, o.output, 0, a_);
+        wo.x[0]    = w.attention;
+        add_segment(wo, o.output, 0, w.a);
         project(wo, stream);
         ik::DSparkAddNormArgs post;
-        post.residual = residual_;
-        post.x        = a_;
+        post.residual = w.residual;
+        post.x        = w.a;
         post.norm     = o.post_attention_norm;
-        post.normed   = normed_;
+        post.normed   = w.normed;
         post.rows     = kB;
         ik::dspark_add_norm(post, stream);
         ik::ProjectionArgs gu{};
         gu.columns = kB;
         gu.k       = kH;
-        gu.x[0]    = normed_;
-        add_segment(gu, o.gate, 0, gate_);
-        add_segment(gu, o.up, 0, up_);
+        gu.x[0]    = w.normed;
+        add_segment(gu, o.gate, 0, w.gate);
+        add_segment(gu, o.up, 0, w.up);
         project(gu, stream);
-        ik::dspark_swiglu(gate_, up_, kB, kI, h_, stream);
+        ik::dspark_swiglu(w.gate, w.up, kB, kI, w.h, stream);
         ik::ProjectionArgs down{};
         down.columns = kB;
         down.k       = kI;
-        down.x[0]    = h_;
-        add_segment(down, o.down, 0, y_);
+        down.x[0]    = w.h;
+        add_segment(down, o.down, 0, w.y);
         project(down, stream);
     }
     ik::DSparkAddNormArgs fin;
-    fin.residual = residual_;
-    fin.x        = y_;
+    fin.residual = w.residual;
+    fin.x        = w.y;
     fin.norm     = d_.final_norm;
-    fin.normed   = final_;
+    fin.normed   = w.final_rows;
     fin.rows     = kB;
     ik::dspark_add_norm(fin, stream);
     // The target head over the block's rows 1 .. steps (the anchor's row predicts nothing); a Q8 head on 8-bit inputs.
     const std::optional<DraftHead>& shortlist = p_.model.draft_head(); // --lm-head-draft
-    forward_.project_head(final_ + kH, steps, base_, stream, head_x8_, shortlist ? &shortlist->head : nullptr);
+    forward_.project_head(w.final_rows + kH, steps, w.base, stream, w.head_x8, shortlist ? &shortlist->head : nullptr);
     ik::DSparkMarkovArgs mk;
     mk.projection    = bf16_words(d_.markov_projection);
     mk.bias          = d_.markov_projection_bias;
-    mk.block         = final_;
+    mk.block         = w.final_rows;
     mk.f_ring        = f_ring_;
     mk.f_ring_rows   = kFRing;
     mk.f_lane_stride = static_cast<std::int64_t>(kFRing) * kH;
@@ -372,7 +426,7 @@ void Drafter::draft_row(std::int32_t row, std::int32_t steps, cudaStream_t strea
         mk.fold = bf16_words(d_.fold);
     }
     mk.fold_bias     = d_.fold_bias;
-    mk.base          = base_;
+    mk.base          = w.base;
     mk.vocab         = static_cast<std::int32_t>(vocab_);
     if (shortlist) {
         mk.fold        = nullptr;
@@ -386,7 +440,7 @@ void Drafter::draft_row(std::int32_t row, std::int32_t steps, cudaStream_t strea
     mk.round         = round;
     mk.tokens        = tokens_ + static_cast<std::size_t>(row) * kB;
     mk.probabilities = probabilities_ + static_cast<std::size_t>(row) * kB;
-    mk.scratch       = markov_scratch_;
+    mk.scratch       = w.markov_scratch;
     ik::dspark_markov(mk, steps, stream);
 }
 

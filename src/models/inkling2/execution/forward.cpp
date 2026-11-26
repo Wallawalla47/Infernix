@@ -320,7 +320,7 @@ std::vector<std::int32_t> Forward::layout_call(const CallPlan& call) {
     columns_           = T;
     lanes_             = B;
     groups_            = static_cast<std::int32_t>(groups.size() / 3);
-    max_group_columns_ = widest;
+    max_group_columns_ = std::max(widest, std::min(call.group_width, ik::kMaxAttentionLaneColumns));
     wide_conv_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kMaxLaneColumns; });
     wide_window_ = std::any_of(lanes.begin(), lanes.end(), [](const CallLane& l) { return l.count > ik::kKeyUnit; });
     prompt_      = call.prompt;
