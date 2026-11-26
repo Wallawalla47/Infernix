@@ -808,6 +808,78 @@ private:
     std::atomic<bool> requested_{false};
 };
 
+class DiscardOutput final : public infernix::OutputSink {
+public:
+    void start(infernix::GenerationStart) override {}
+    void progress(infernix::PromptProgress) override {}
+    void timing(infernix::GenerationTimingObservation) override {}
+    void tool_call(infernix::ToolCallDelta) override {}
+    void publish(infernix::OutputDelta) override {}
+};
+
+// Decision lanes (resource-scheduling §5.4): two generating requests hold both general lanes of three. An ordinary
+// request stays queued beside the free decision lane; a decision takes that lane and answers while the ordinary
+// request is still queued (so both generations still held their lanes), and it publishes no endpoint snapshot. An
+// ordinary request of the same shape afterwards publishes one, so the endpoint check is engaged. Both generate four
+// tokens: a request that ends at its first token ends inside its prompt, where its finish is a tap, not an endpoint.
+int exercise_decision_lanes(const char* artifact) {
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+    options.max_concurrency      = 3;
+    options.decision_lanes       = 1;
+    options.max_pending_requests = 4;
+    infernix::Engine engine(options);
+    DiscardOutput sink;
+    std::atomic<bool> stop{false};
+    const infernix::CancellationView stopped([&stop] { return stop.load(); });
+    const auto stream = [&](std::uint32_t seed, std::uint32_t outputs) {
+        return engine.submit(engine.prepare_tokens(synthetic_tokens(300, seed)), greedy(outputs),
+                             infernix::OutputConsumerMode::Streaming);
+    };
+    const auto soon = [](double seconds) {
+        return std::chrono::steady_clock::now() +
+               std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+    };
+    int failures = 0;
+    const auto fail = [&](const char* message) {
+        std::cerr << "decision-lanes: " << message << '\n';
+        ++failures;
+    };
+    infernix::GenerationHandle a = stream(21, 2048);
+    infernix::GenerationHandle b = stream(22, 2048);
+    if (!a.await_admission({}, soon(60)) || !b.await_admission({}, soon(60))) {
+        fail("the generating requests were not admitted");
+    }
+    infernix::GenerationHandle queued = stream(23, 4);
+    if (queued.await_admission({}, soon(1))) { fail("an ordinary request took the decision lane"); }
+
+    infernix::RequestOptions asked = greedy(4);
+    asked.execution.decision       = true;
+    const std::uint64_t endpoints  = engine.runtime_stats().hybrid_endpoints_created;
+    const infernix::GenerationResult decided =
+        engine.generate(engine.prepare_tokens(synthetic_tokens(500, 24)), asked);
+    if (decided.generated_token_ids.size() != 4) { fail("the decision did not answer"); }
+    if (queued.await_admission({}, soon(0))) {
+        fail("a generation finished before the decision answered, so the decision lane was not shown");
+    }
+    if (engine.runtime_stats().hybrid_endpoints_created != endpoints) {
+        fail("the decision published an endpoint snapshot");
+    }
+
+    stop = true;
+    (void)a.wait(&sink, stopped);
+    (void)b.wait(&sink, stopped);
+    (void)queued.wait(&sink);
+    const std::uint64_t before = engine.runtime_stats().hybrid_endpoints_created;
+    (void)engine.generate(engine.prepare_tokens(synthetic_tokens(500, 25)), greedy(4));
+    if (engine.runtime_stats().hybrid_endpoints_created == before) {
+        fail("an ordinary request of the decision's shape published no endpoint either (the check is not engaged)");
+    }
+    std::cout << "decision-lanes: queue wait " << decided.engine_timing.queue_wait_seconds << " s, "
+              << (failures == 0 ? "passed" : "FAILED") << '\n';
+    return failures;
+}
+
 // A request cancelled mid-prefill frees its lane and publishes its committed prefix. The lane's
 // next request, on an unrelated prompt, must generate what it generates on an Engine that never
 // saw the cancellation, and a request extending the cancelled prompt must resume from that prefix
@@ -1866,7 +1938,8 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 27> kScenarios{"all",
+    constexpr std::array<std::string_view, 28> kScenarios{"all",
+                                                          "decision-lanes",
                                                           "pair-window",
                                                           "pair-window-restore",
                                                           "pair-window-dflash2",
@@ -1947,6 +2020,7 @@ int main() {
             failures += exercise_coalesce_vision(artifact);
         }
         if (all || scenario == "nonfinite-withdraw") { failures += exercise_nonfinite_withdraw(artifact); }
+        if (all || scenario == "decision-lanes") { failures += exercise_decision_lanes(artifact); }
         if (all || scenario == "next-turn") { failures += exercise_next_turn(artifact, false); }
         if (all || scenario == "next-turn-reproducible") { failures += exercise_next_turn(artifact, true); }
         if (all || scenario == "turns-protocol") {

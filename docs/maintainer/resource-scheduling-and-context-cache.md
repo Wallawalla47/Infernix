@@ -179,8 +179,9 @@ pass ran cold) the 4,096-token steps are -0.1..+1.3 %. The decode share cost the
 and the prompt's TTFT 47 %, so it is not kept.
 
 The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C
-younger requests. Each scan checks the queue head and at most C following candidates; failed checks do
-not consume the allowance, and an incomplete scan continues in ticket order. Queue changes, actual
+younger requests; a decision queued ahead of it (§5.4) is one of them. Each scan checks the queue head and
+at most C following candidates (the decisions among them first, in queue order); failed checks do not
+consume the allowance, and an incomplete scan continues in ticket order. Queue changes, actual
 capacity releases and completed transactions trigger a scan; a request that already failed under the
 same event is not quoted again, and ordinary decode does not reopen a scan. While the FIFO head
 waits, the Engine prefetches its Host-only path into spare Device cache. Under pressure fresh requests
@@ -314,32 +315,43 @@ A decision (`ExecutionOptions::decision`, set on every `/v1/decide` question) is
 one prefill and a staged token, or a few constrained digits. Without help it waits like any fresh
 request for a lane to free, and with every lane held by a generating request that wait is a whole
 generation: two lanes and two generating agents measured a decision p50 of 8.5 s. Decisions
-therefore get four rules, all in the Engine and Scheduler; the Program sees an ordinary request.
+therefore get four rules, all in the Engine and Scheduler; the Program sees an ordinary request with one
+option, `ResolvedExecutionOptions::publish_endpoint` (below). The priority is bounded: a stream of
+decisions never starves another request.
 
-- **Queue.** A decision enters the fresh queue ahead of every waiting request that is not a
-  decision, in arrival order among decisions (`Scheduler::enqueue`). Admitting it never bypasses a
-  waiting request, so the FIFO bypass allowance is untouched, and a blocked decision keeps the head's
-  protection.
+- **Queue.** A decision enters the fresh queue ahead of the waiting requests that are not decisions,
+  in arrival order among decisions (`Scheduler::enqueue`), and each request it passes is charged one
+  bypass of its FIFO allowance (§5.1). A decision stops behind a request whose allowance is spent, so
+  every waiting request is still admitted after at most C requests that arrived after it, decisions
+  included. Admitting a decision from the queue's head charges nobody again, and the admission scan
+  tries the decisions behind the head before the other candidates, in queue order (their ids need not
+  follow it).
 - **Lanes.** `EngineOptions::decision_lanes` (`--decision-lanes`, which the server adds beside
   `--max-concurrency`) reserves the last lanes for decisions (`Scheduler::free_lane`). A decision
   takes a decision lane first and a general lane when they are all busy; no other request takes a
   decision lane. A decision lane is an ordinary lane: its StateImage, buffers and Graph rows come
-  out of the Device budget like any lane's, and startup logs what they cost in KV tokens. The default
-  Device snapshot slots count only the general lanes, since a decision publishes no endpoint.
-- **Prefill turn.** A prefilling or replaying decision takes the next prefill turn ahead of the
-  rotation (`Scheduler::next_prefill`), oldest decision first, without moving the rotation cursor.
-  A decision therefore waits at most for the prefill step already running (one chunk, or one
-  `idle-wide-prefill` step) and one decode round per unit of its own.
+  out of the Device budget like any lane's; on the Qwen3.5 family startup logs the sequence planner's
+  estimate of their cost in KV tokens. The default Device snapshot slots count only the general lanes,
+  since a decision publishes no endpoint.
+- **Prefill turn.** A prefilling or replaying decision takes the next prefill turn ahead of the aged
+  order (`Scheduler::next_prefill`), oldest decision first, without moving the rotation cursor; a
+  prefill group it leads (Inkling 2) leaves the cursor too. The exception is a lane that is not a decision
+  and has waited past the aged order's bound (its key below zero: other lanes, decisions included,
+  prefilled more than twice its remaining prompt while it waited, or a Replay waited at all): the aged
+  order then chooses, so that bound holds however many decisions arrive. Otherwise a decision waits for
+  the prefill step already running (one chunk, or one `idle-wide-prefill` step) and one decode round per
+  unit of its own.
 - **Pressure.** Permits are requested for the progress owner (or a protected recovery) first, then
   for decisions, then in ticket order. A decision is a preemption victim only when no other
   resident can be one (`Scheduler::preemption_victim`); a blocked decision takes a turn like any
   request (§5.1) and is never paused for its own shortage; and a paused owner that is not a
   decision does not pause a decision to take its lane, which could not seat it.
 
-On the Qwen3.5 family a decision publishes its prompt blocks and taps (the evidence prefix its
-sibling questions reuse) but no endpoint snapshot (`RequestPlanSummary::publish_endpoint`): its
-finished state is no conversation's next turn, and an endpoint would take a Device snapshot slot
-from one.
+The Engine plans a decision with `ResolvedExecutionOptions::publish_endpoint` false: its finished state
+is no conversation's next turn. On the Qwen3.5 family the decision then publishes its prompt blocks and
+taps (the evidence prefix its sibling questions reuse) but no endpoint snapshot, which would take a
+Device snapshot slot from a conversation. Inkling 2 publishes no endpoint at a finish in any case;
+Qwen3.8-Flash-Next keeps its snapshots in its Host tier and publishes the endpoint as for any request.
 
 <a id="transfers"></a>
 ## 6. Context transactions and cancellation

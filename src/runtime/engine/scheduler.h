@@ -120,17 +120,21 @@ public:
         return membership;
     }
 
-    // Decisions (Request::is_decision) enter the fresh queue ahead of every waiting request that is
-    // not one, in arrival order among themselves. Admitting a decision therefore never bypasses a
-    // waiting request, and a blocked decision keeps the FIFO head's bypass protection.
-    static void enqueue(std::deque<RequestPtr>& fresh, RequestPtr request) {
-        if (request->is_decision()) {
-            fresh.insert(std::find_if(fresh.begin(), fresh.end(),
-                                      [](const RequestPtr& waiting) { return !waiting->is_decision(); }),
-                         std::move(request));
-        } else {
+    // Decisions (Request::is_decision) enter the fresh queue ahead of the waiting requests that are not
+    // decisions, in arrival order among themselves, and each request a decision passes is charged one
+    // bypass of its FIFO allowance (`concurrency`, as fresh_candidates and admitted charge a younger
+    // admission): a decision stops behind a request whose allowance is spent. So every waiting request is
+    // still admitted after at most `concurrency` requests that arrived after it, decisions included
+    // (resource-scheduling §5.1 and §5.4), however many decisions arrive.
+    static void enqueue(std::deque<RequestPtr>& fresh, RequestPtr request, std::uint32_t concurrency) {
+        if (!request->is_decision()) {
             fresh.push_back(std::move(request));
+            return;
         }
+        std::size_t at = fresh.size();
+        while (at > 0 && !fresh[at - 1]->is_decision() && fresh[at - 1]->admission_bypasses < concurrency) { --at; }
+        for (std::size_t i = at; i < fresh.size(); ++i) { ++fresh[i]->admission_bypasses; }
+        fresh.insert(fresh.begin() + static_cast<std::ptrdiff_t>(at), std::move(request));
     }
 
     // The lane a request may bind. The last `decision_lanes` lanes take only decisions; a decision
@@ -161,20 +165,25 @@ public:
     // its remaining prompt, which bounds its wait. Ties go to the rotation order after the last lane
     // served. Each unit keeps the request's own chunk grid: only the order of units changes. A
     // prefilling or replaying decision (the oldest one) goes ahead of that order, so a decision waits
-    // at most one prefill unit of another request.
+    // at most one prefill unit of another request, unless a lane that is not a decision has waited past
+    // its bound (its key below 0: other lanes, decisions included, prefilled more than twice its remaining
+    // prompt while it waited, or a Replay waited at all): the aged order then serves it first, so the
+    // bound holds however many decisions arrive.
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {
         std::optional<std::uint32_t> decision;
+        bool overdue = false;
         for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
             const auto& request = slots[lane];
-            if (request && request->is_decision() &&
-                (request->is_prefilling() || request->is_replaying()) &&
-                (!decision || request->id < slots[*decision]->id)) {
+            if (!request || !(request->is_prefilling() || request->is_replaying())) { continue; }
+            if (!request->is_decision()) {
+                overdue = overdue || prefill_key(*request, lane) < 0;
+            } else if (!decision || request->id < slots[*decision]->id) {
                 decision = lane;
             }
         }
-        if (decision) { return decision; }
+        if (decision && !overdue) { return decision; }
         std::optional<std::uint32_t> best;
         std::int64_t best_key = 0;
         for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
@@ -286,11 +295,13 @@ public:
         }
         if (admission_scan_remaining_.empty()) { return candidates; }
         candidates.push_back(fresh.front());
-        std::vector<RequestPtr> younger;
+        // Behind the head: the decisions first, in queue order (their place is their priority, and ids no
+        // longer follow it), then the other requests in the rotation after the last one checked.
+        std::vector<RequestPtr> decisions, younger;
         for (std::size_t i = 1; i < limit; ++i) {
             if (std::find(admission_scan_remaining_.begin(), admission_scan_remaining_.end(),
                           fresh[i]->id) != admission_scan_remaining_.end()) {
-                younger.push_back(fresh[i]);
+                (fresh[i]->is_decision() ? decisions : younger).push_back(fresh[i]);
             }
         }
         std::sort(younger.begin(), younger.end(),
@@ -299,8 +310,9 @@ public:
             return request->id > scan_after_;
         });
         std::rotate(younger.begin(), next, younger.end());
-        const auto count = std::min<std::size_t>(concurrency, younger.size());
-        candidates.insert(candidates.end(), younger.begin(), younger.begin() + count);
+        decisions.insert(decisions.end(), younger.begin(), younger.end());
+        const auto count = std::min<std::size_t>(concurrency, decisions.size());
+        candidates.insert(candidates.end(), decisions.begin(), decisions.begin() + count);
         return candidates;
     }
 

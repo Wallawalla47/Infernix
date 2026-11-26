@@ -2015,13 +2015,19 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   question failed returns the first question's error status instead.
 - Each question is one engine request in the request log and metrics (`protocol: "decide"`): a
   readout with one staged output token that is never returned, a generated primitive with its run.
-- **Scheduling.** Every question is a decision to the Engine: it is queued ahead of other waiting
-  requests, takes the next prefill turn ahead of other prefilling requests, and is paused under
-  resource pressure only when nothing else can be. `--decision-lanes N` also reserves `N` lanes
-  that only questions take, so a question never waits for a generating request to finish; without
-  it a question still needs a free lane. On Qwen3.5-family models a question publishes its evidence
-  prefix to the prefix cache but no endpoint snapshot of its own, so questions do not displace a
-  conversation's cached state ([resource scheduling §5.4](maintainer/resource-scheduling-and-context-cache.md#decisions)).
+- **Scheduling.** Every question is a decision to the Engine. It is queued ahead of the waiting
+  requests that are not questions, takes the next prefill turn ahead of other prefilling requests,
+  and is paused under resource pressure only when nothing else can be. The priority is bounded, so
+  a stream of questions cannot starve other requests: each waiting request is still admitted after
+  at most `--max-concurrency` later arrivals (questions included), and a prefilling request waits
+  for questions only until others have prefilled twice its remaining prompt. `--decision-lanes N`
+  also reserves `N` more lanes that only questions take, so a question does not wait for a
+  generating request to finish (it can still wait for other questions, or for capacity); without it
+  a question needs a free lane like any request. On the Qwen3.5 family (the 27B, 35B and 122B) a
+  question publishes its evidence prefix to the prefix cache but no endpoint snapshot of its own, so
+  questions do not displace a conversation's cached state; Inkling 2 publishes no endpoint at a
+  finish in any case, and Qwen3.8-Flash-Next keeps its snapshots in RAM
+  ([resource scheduling §5.4](maintainer/resource-scheduling-and-context-cache.md#decisions)).
 
 ## Teacher-forced scoring
 
@@ -2146,7 +2152,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--expert-stripe FILE` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive; each record not in RAM is then read in two parts, its head from the artifact and its tail from the stripe, at the same time. The stripe must belong to the artifact. Unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--causal-scoring` | start the engine for teacher-forced scoring (the `CausalScoring` purpose `perplexity` and `certify` use): `POST /v1/score` answers and nothing generates, so there is no warm-up ([Teacher-forced scoring](#teacher-forced-scoring)) | off |
-| `--decision-lanes N` | `N` more lanes that only `/v1/decide` questions take, so a decision never waits for a generating request to finish ([Decisions](#decisions)); `--max-concurrency` plus `N` is at most 8. Each costs Device memory like any lane (a StateImage, buffers, Graph rows): an automatic `--kv-capacity` pool is that much smaller, an explicit one needs that much more free memory, and startup logs the cost (`decision lanes: ...`) | `0` |
+| `--decision-lanes N` | `N` more lanes that only `/v1/decide` questions take, so a question does not wait for a generating request to finish ([Decisions](#decisions)); `--max-concurrency` plus `N` is at most 8, and the `max_concurrency` metric counts both. Each costs Device memory like any lane (a StateImage, buffers, Graph rows): an automatic `--kv-capacity` pool is that much smaller, an explicit one needs that much more free memory. On the Qwen3.5 family startup logs the planner's estimate of the cost (`decision lanes: ...`) | `0` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission, 1 to 1024 (the HTTP pool starts a worker for each admitted or waiting request) | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--keep-alive-timeout-sec N` | how long an HTTP connection stays open after its response finishes, for the client's next request on the same connection (valid range `1..3600`). The server advertises it as `Keep-Alive: timeout=N` and closes an idle connection 10 s later. Client pools reuse connections between turns; when the server closes a connection first, a client can write its next request onto it (even one that checks a pooled socket before reusing it, if the close is in flight between the check and the write) and loses that request: Bun's `fetch` and the AI SDK do not retry a POST. The timeout close is graceful (a FIN first, then a short drain of anything the client sent), and a request that does arrive re-arms the window on both sides. Two kinds of client pool meet it: one that reads `Keep-Alive: timeout` retires the connection by the advertised deadline, before the server's close; one that ignores the header keeps its own idle timeout, which the window must exceed. Bun's `fetch` (opencode's client) is of the second kind, with a 5-minute idle timeout that fires 4-5 minutes after the last response, so the default outlasts it. Set the window above the longest idle timeout of the header-blind client pools you serve. Each open connection holds a request worker (an idle one wakes every 10 ms) for its whole idle window; the pool ceiling (`--max-http-clients`) bounds how many | `360` |
@@ -2901,7 +2907,8 @@ does not occur in time; a Messages or Responses streaming request still queued 5
 has started its stream by then and gets the timeout as the stream's error event instead.
 Once admitted, a request may pause for resource pressure without restarting this initial-admission
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
-cannot fit; `/v1/decide` questions enter ahead of every other waiting request ([Decisions](#decisions)).
+cannot fit; `/v1/decide` questions enter ahead of the waiting requests that are not questions, within the
+same allowance ([Decisions](#decisions)).
 There is no admission ETA or unbounded overflow queue.
 
 Input memory is bounded by the outstanding-request count and the per-request

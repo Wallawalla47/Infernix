@@ -19,7 +19,10 @@ struct ResolvedExecutionOptions {
     // The Engine's idle-time pass over a finished turn (hybrid-prefix-cache-spec §7.9), which no client
     // waits for: it yields to a request at its next unit boundary, so a Program keeps its units short.
     bool background = false;
-    bool decision = false;
+    // Whether the finished request publishes its endpoint snapshot (the resume point of the conversation's
+    // next turn). False when its finished state is no conversation's next turn (a decision, set by the
+    // Engine): the snapshot would only take a Device snapshot slot from a conversation that has one.
+    bool publish_endpoint = true;
 };
 
 // A row whose thinking is open at a call's first position: its end-of-turn tokens, and the tool-call opener when it
@@ -39,6 +42,9 @@ struct ResolvedRequestOptions {
     StopPolicy stop;
     OutputOptions output;
     NgramSessionHints ngram_session;
+    // A decision (ExecutionOptions::decision): a scheduling property the Engine reads (RequestRecord::
+    // is_decision); the Program sees only its consequence, execution.publish_endpoint.
+    bool decision = false;
 };
 
 enum class ContinuationAction : std::uint8_t {
@@ -74,8 +80,9 @@ struct RequestPlanSummary {
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;
     bool publish_continuation             = true;
-    // False for a decision: its finished state is no conversation's next turn, so it publishes no
-    // endpoint snapshot (which would take a Device snapshot slot from another conversation).
+    // ResolvedExecutionOptions::publish_endpoint, as the Program plans it. Qwen3.5's Program reads it;
+    // Inkling 2's publishes no endpoint at a finish anyway, and Qwen3.8-Flash-Next's (whose snapshots
+    // live in its Host tier, no Device slot) publishes one regardless.
     bool publish_endpoint                 = true;
 };
 

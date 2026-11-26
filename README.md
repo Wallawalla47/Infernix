@@ -162,7 +162,8 @@ Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
   pressure (on Inkling 2 Mini a paused request's output stays bit for bit the same); the prefix cache
   persists across restarts; a failed Flash-Next expert read fails only the requests running then.
 - **`/v1/decide`**: decisions from token probabilities (yes/no, choice, score, number, scalar, point
-  and box).
+  and box). Questions queue and prefill ahead of generating requests, within a bound, and
+  `--decision-lanes N` reserves lanes for them so they need not wait for a generation to finish.
 
 ### And also
 

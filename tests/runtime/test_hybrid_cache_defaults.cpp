@@ -60,6 +60,10 @@ int main() {
                       out.hybrid.max_new_taps == 2U && out.hybrid.tap_ladder_tokens == 16384U &&
                       out.hybrid.tap_min_gap_tokens == 8192U,
                   "Device-only prefix cache defaults are wrong");
+        // Decision lanes hold no conversation (a decision publishes no endpoint): they add no slot.
+        options.decision_lanes = 2;
+        failures += check(normalize_engine_options(options).context_cache.hybrid.device_snapshot_slots == 8U,
+                          "decision lanes changed the Device-only snapshot slots");
     }
 
     // Explicit overrides are kept verbatim.

@@ -42,6 +42,7 @@ RULES: dict[str, Rule] = {
     # MODEL & CONTEXT
     "--max-context": Rule(OWNED, "the tool runs 16384 (raise it for eval/chat with --context)"),
     "--max-concurrency": Rule(OWNED, "the tool runs one sequence"),
+    "--decision-lanes": Rule(DROP, "lanes for /v1/decide questions: " + _TRAFFIC),
     "--prefill-chunk": Rule(CARRY, _MEMORY),
     "--use-original-int8-prefill-kernel": Rule(CARRY, _NUMERICS),
     "--use-original-nvfp4-prefill-kernel": Rule(CARRY, _NUMERICS),

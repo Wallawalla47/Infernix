@@ -1879,8 +1879,8 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
             const bool far_enough = pausing || replaces_resume
                                         ? frontier > lane_state.deepest_snapshot
                                         : frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation;
-            // A decision (publish_endpoint false) publishes no endpoint: it holds no conversation, so it
-            // takes no Device snapshot slot from one; only its own pause keeps a resume point.
+            // A request planned without its endpoint (ResolvedExecutionOptions::publish_endpoint false) takes no
+            // Device snapshot slot at its finish; only its own pause keeps a resume point.
             if (endpoint && (lane_state.publish_endpoint || pausing) &&
                 (!execution_schedule.grid_cache || grid_state) && backend_caught_up &&
                 frontier != 0 && far_enough &&

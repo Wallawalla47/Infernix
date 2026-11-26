@@ -47,12 +47,13 @@ the SSD behind a VRAM expert cache, and `Inkling2LoopForCausalLM` (Inkling 2 Min
 NVIDIA GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, one to eight resident execution lanes fixed at startup,
-bounded FIFO ingress with finite bypass, resource-pressure preemption with Replay recovery,
-one content-addressed prefix cache, and one compact decode batch per round.
+bounded FIFO ingress with finite bypass, one bounded priority class (`/v1/decide` decisions, which
+queue and prefill first within that bound and may have reserved lanes), resource-pressure preemption
+with Replay recovery, one content-addressed prefix cache, and one compact decode batch per round.
 Generation and offline CausalScoring use the same public `.infernix` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale continuous
-batching, and priority/QoS require an explicit product change. Another training instance or mixture
+batching, and further priority/QoS classes require an explicit product change. Another training instance or mixture
 of existing representations does not require a checkpoint-specific execution registration.
 
 This is a local, single-owner project with trusted local models, generated artifacts, and

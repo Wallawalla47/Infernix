@@ -378,8 +378,9 @@ public:
                                                 std::move(observation), pending_deadline, ready);
             ++next_request_id_;
             ++next_publication_order_;
-            // A decision enters ahead of every waiting request that is not one (Scheduler::enqueue).
-            Scheduling::enqueue(pending_, request);
+            // A decision enters ahead of the waiting requests that are not decisions and can still be
+            // passed (Scheduler::enqueue).
+            Scheduling::enqueue(pending_, request, max_concurrency_);
         } catch (...) {
             release_reserved_capacity();
             throw;

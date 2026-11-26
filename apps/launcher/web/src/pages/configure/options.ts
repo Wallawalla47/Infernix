@@ -647,6 +647,16 @@ const CLIENTS: FormSection = {
       min: 0,
     },
     {
+      kind: "number",
+      flag: "--decision-lanes",
+      label: "Decision lanes",
+      help: "Lanes beside the concurrency that only /v1/decide questions take, so a question does not wait for a generating request to finish. Each costs GPU memory like any lane, taken from the KV pool; concurrency plus decision lanes is at most 8.",
+      placeholder: "0 (default)",
+      min: 0,
+      max: 7,
+      more: true,
+    },
+    {
       kind: "select",
       flag: "--claude-code-prompt",
       label: "Claude Code system prompt",
