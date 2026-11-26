@@ -1,6 +1,7 @@
 #include "models/inkling2/config.h"
 
 #include "artifact/schema.h"
+#include "infernix/ops/inkling2_dspark.h"
 
 #include <cmath>
 #include <limits>
@@ -222,7 +223,10 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         // A stored drafter must fit the model even when it is not bound.
         if (directory.components.contains("dspark")) {
             DSparkConfig drafter = dspark(directory.component("dspark").config, out.text);
-            if (options.speculative == SpeculativeBackend::DSpark) { out.dspark = std::move(drafter); }
+            if (options.speculative == SpeculativeBackend::DSpark) {
+                require_dspark_kernel_geometry(drafter);
+                out.dspark = std::move(drafter);
+            }
         } else if (options.speculative == SpeculativeBackend::DSpark) {
             throw ArtifactError("--spec dspark: the artifact has no dspark component (convert with --components "
                                 "text,dspark)");
@@ -232,6 +236,22 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         throw;
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Inkling2Loop config: ") + error.what());
+    }
+}
+
+void require_dspark_kernel_geometry(const DSparkConfig& d) {
+    namespace k   = ops::inkling2;
+    const auto is = [](std::uint32_t value, std::int32_t want) { return value == static_cast<std::uint32_t>(want); };
+    const bool layers = d.layer_types.size() == 3 && d.layer_types[0] == AttentionKind::Sliding &&
+                        d.layer_types[1] == AttentionKind::Full && d.layer_types[2] == AttentionKind::Sliding;
+    if (!layers || !is(d.heads, k::kDSparkHeads) || !is(d.kv_heads, k::kDSparkKvHeads) ||
+        !is(d.head_dim, k::kDSparkHeadDim) || !is(d.intermediate, k::kDSparkIntermediate) ||
+        !is(d.sliding_window, k::kDSparkWindow) || !is(d.block_size, k::kDSparkBlock) ||
+        !is(d.markov_rank, k::kMarkovRank) || d.target_layer_ids.size() != static_cast<std::size_t>(k::kDSparkFeatures) ||
+        d.rms_norm_eps != k::DSparkRotateArgs{}.eps) {
+        throw ArtifactError("the DSpark drafter's kernels are built for Inkling 2 Mini's drafter (3 layers sliding, "
+                            "full, sliding; 24 query and 8 KV heads of 128; MLP 9216; window 1024; block 8; Markov "
+                            "rank 256; 4 features; rms_norm_eps 1e-6); the artifact's dspark config states another");
     }
 }
 

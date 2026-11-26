@@ -136,4 +136,10 @@ struct Config {
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
 
+// Refuses (ArtifactError) a drafter the DSpark kernels and buffers are not built for: they are fixed to Inkling 2 Mini's
+// (include/infernix/ops/inkling2_dspark.h; execution/dspark.cpp sizes its buffers by those constants and its kernels
+// take the norm epsilon as a constant), while the binder would bind another drafter's weights at their own shapes.
+// parse_config applies it where the drafter is bound (--spec dspark), so a load without the drafter is unaffected.
+void require_dspark_kernel_geometry(const DSparkConfig& drafter);
+
 } // namespace infernix::models::inkling2

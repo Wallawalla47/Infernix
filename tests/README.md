@@ -122,6 +122,8 @@ included), ranks to 128 and its refusals (a rank above 128 by its wording). On I
 (K2's, W_o, the gates' down and their FP32 forget and message rows, a partial 16-row group for the sink) at ranks 16, 64
 and 128: a zero `B` keeps `y`'s bits, rows outside a target stay, and a column equals the column computed alone;
 `infernix_inkling2_lora_binding_test` the PEFT module binding and its refusals (host only);
+`infernix_inkling2_dspark_config_test` (host only) that a DSpark drafter of any geometry or norm epsilon but Inkling 2
+Mini's, which its kernels are built for, is refused at load;
 `infernix_lossless_lora_test` also the FP32 output form against its exact oracle; and
 `infernix_inkling2_adapters_real_test` (a real artifact, generated adapter and sidecar) that a zero adapter keeps the
 logits' bits on the default, reproducible and lossless routes.

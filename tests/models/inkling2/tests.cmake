@@ -132,6 +132,11 @@ infernix_add_test(infernix_inkling2_chat_template_test
   LIBRARIES infernix_jinja infernix::json
   NEEDS_SOURCE_DIR)
 
+# --spec dspark: the drafter's configuration against the geometry its kernels are built for (host only).
+infernix_add_test(infernix_inkling2_dspark_config_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dspark_config.cpp"
+  LIBRARIES infernix_model_loading)
+
 # --lora: a PEFT adapter's modules bound to the text configuration, and every refusal (host only).
 infernix_add_test(infernix_inkling2_lora_binding_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_binding.cpp"

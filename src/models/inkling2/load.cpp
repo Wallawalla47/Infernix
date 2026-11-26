@@ -477,7 +477,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             binder.values(bindings.weights.at(rank.index).reference.binding, QType::INT32).integers();
         out->draft_ids   = draft_head_ids(order);
         out->draft_bytes = draft_head_bytes(static_cast<std::int32_t>(out->draft_ids.size()),
-                                            static_cast<std::int32_t>(out->config.text.hidden_size), 256);
+                                            static_cast<std::int32_t>(out->config.text.hidden_size),
+                                            static_cast<std::int32_t>(out->config.dspark->markov_rank));
     }
     if (out->config.vision) {
         // --vision-offload on: the tower in pinned host memory, staged through the tower's device slots per encode.
