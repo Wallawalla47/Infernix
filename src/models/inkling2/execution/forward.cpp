@@ -976,6 +976,27 @@ void Forward::head(std::int32_t first, std::int32_t count, cudaStream_t stream) 
     mark("head");
 }
 
+void Forward::head_rows(std::span<const std::int32_t> columns, cudaStream_t stream) {
+    const auto count = static_cast<std::int32_t>(columns.size());
+    if (count == 0 || count > kMaxForwardColumns) {
+        throw std::invalid_argument("inkling2 forward: the head takes 1-128 of the call's columns at a time");
+    }
+    for (std::int32_t r = 0; r < count; ++r) {
+        if (columns[r] < r || columns[r] >= columns_ || (r > 0 && columns[r] <= columns[r - 1])) {
+            throw std::invalid_argument("inkling2 forward: head rows are ascending columns of the last call");
+        }
+    }
+    // Row r takes column columns[r]'s final hidden row (ascending, so a source is never a row already written), and
+    // the head runs over rows 0 .. count - 1: the head is column-invariant, so each row's logits are its column's.
+    for (std::int32_t r = 0; r < count; ++r) {
+        if (columns[r] == r) { continue; }
+        CUDA_CHECK(cudaMemcpyAsync(b_.final_hidden + static_cast<std::size_t>(r) * kH,
+                                   b_.final_hidden + static_cast<std::size_t>(columns[r]) * kH, kH * 2,
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+    head(0, count, stream);
+}
+
 void Forward::project_head(const std::uint16_t* x, std::int32_t count, float* out, cudaStream_t stream,
                            std::int32_t* x8, const Weight* head) const {
     if (count <= 0 || count > kMaxForwardColumns) { throw std::invalid_argument("inkling2 forward: 1-128 head rows"); }

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace infernix::models::inkling2 {
@@ -191,6 +192,10 @@ public:
     // The head again over columns [first, first + count) (at most kMaxForwardColumns) of the last finish's final
     // hidden rows, into logits rows 0..: a wide call's logits a slice at a time.
     void head(std::int32_t first, std::int32_t count, cudaStream_t stream);
+    // The head over the last finish's columns `columns` (ascending, at most kMaxForwardColumns), each column's logits
+    // in row r of buffers().logits for columns[r]: a prompt call of several lanes, each lane's last column. It moves
+    // those columns' final hidden rows to rows 0.., overwriting the rows before them.
+    void head_rows(std::span<const std::int32_t> columns, cudaStream_t stream);
     // The head's raw products W_head x (FP32, no softcap) of `count` BF16 rows x [count][H] (at most
     // kMaxForwardColumns) into out [count][V]: the DSpark drafter's base logits. With x8 (count 8-bit input rows of
     // ops::inkling2::projection_a8_column_words(H) words) a Q8 head runs on 8-bit inputs: tensor cores at the block's

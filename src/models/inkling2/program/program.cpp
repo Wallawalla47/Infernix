@@ -1250,20 +1250,191 @@ public:
     }
 
     // ---------------------------------------------------------------- execution
+    // A lane's next prefill unit: the prefill chunk, ended at an exact tap the image after the call would not reach
+    // (every chunk gives the same bits).
+    [[nodiscard]] std::uint32_t prefill_unit(const Lane& lane) const {
+        std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, lane.prompt_tokens - lane.processed);
+        for (const runtime::prefix_cache::PlannedTap& tap : lane.prefix.taps) {
+            if (tap.placement != runtime::prefix_cache::TapPlacement::Exact || tap.position <= lane.processed) { continue; }
+            if (tap.position + capture_reach() < lane.processed + chunk) { chunk = tap.position - lane.processed; }
+            break;
+        }
+        return chunk;
+    }
+
+    // The prefilling lane of `sequence` (its prompt not done, not replaying), or null.
+    [[nodiscard]] const Lane* prefilling(SequenceHandle sequence) const noexcept {
+        if (!valid(sequence)) { return nullptr; }
+        const Lane& lane = lanes_[ContractAccess::lane(sequence)];
+        return lane.processed < lane.prompt_tokens && !lane.replay ? &lane : nullptr;
+    }
+
+    // Program::prefill_joins.
+    [[nodiscard]] bool prefill_joins(std::span<const SequenceHandle> units, SequenceHandle companion) const {
+        if (lossless_ || units.empty() || units.size() >= lanes_.size()) { return false; }
+        const Lane* joining = prefilling(companion);
+        if (joining == nullptr) { return false; }
+        const std::uint32_t unit = prefill_unit(*joining);
+        if (joining->processed + unit != joining->prompt_tokens || unit > Program::kPrefillCompanionTokens) { return false; }
+        std::uint64_t columns = unit;
+        for (const SequenceHandle& s : units) {
+            const Lane* lane = prefilling(s);
+            if (lane == nullptr || lane == joining) { return false; }
+            columns += prefill_unit(*lane);
+        }
+        return columns <= static_cast<std::uint64_t>(forward_.capacity());
+    }
+
+    // A provider's rows rows[r] as its rows r: a prefill group's sampling lanes (their positions in the group).
+    class RowSubset final : public runtime::TokenMaskProvider {
+    public:
+        RowSubset(runtime::TokenMaskProvider& base, std::span<const std::uint32_t> rows) noexcept : base_(base), rows_(rows) {}
+        [[nodiscard]] bool constrained(std::size_t row) const noexcept override { return base_.constrained(rows_[row]); }
+        [[nodiscard]] runtime::ReasoningBan reasoning_ban(std::size_t row) const noexcept override {
+            return base_.reasoning_ban(rows_[row]);
+        }
+        std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts, std::span<std::uint32_t> words) override {
+            return base_.fill(rows_[row], drafts, words);
+        }
+        void uploaded(std::size_t row, std::size_t bytes) noexcept override { base_.uploaded(rows_[row], bytes); }
+
+    private:
+        runtime::TokenMaskProvider& base_;
+        std::span<const std::uint32_t> rows_;
+    };
+
+    // Program::advance_prefill_group: each lane's unit as advance_prefill runs it, the lanes' columns in the call's
+    // order, the head over the completing lanes' last columns at once (Forward::head_rows) and one sample of them.
+    PrefillGroupProgress advance_prefill_group(std::span<const SequenceHandle> sequences, runtime::TokenMaskProvider* masks) {
+        const auto start = Clock::now();
+        if (pending_) { throw std::logic_error("Inkling 2: a pending batch awaits its commit"); }
+        if (lossless_ || sequences.empty() || sequences.size() > lanes_.size()) {
+            throw std::invalid_argument("Inkling 2: a prefill group is 1-8 prefilling lanes, not on --lossless");
+        }
+        struct Unit {
+            std::uint32_t index = 0, chunk = 0, column = 0;
+            bool last = false, timed = false;
+            std::array<cudaEvent_t, 2> events{};
+        };
+        std::vector<Unit> units;
+        CallPlan call;
+        call.prompt = true;
+        std::uint32_t call_lanes = 0;
+        for (const SequenceHandle& s : sequences) {
+            Unit u;
+            u.index = lane_of(s);
+            if (prefilling(s) == nullptr) { throw std::logic_error("Inkling 2: a prefill group's lane is not prefilling"); }
+            for (const Unit& other : units) {
+                if (other.index == u.index) { throw std::logic_error("Inkling 2: a lane twice in a prefill group"); }
+            }
+            const Lane& lane = lanes_[u.index];
+            u.chunk          = prefill_unit(lane);
+            u.last           = lane.processed + u.chunk == lane.prompt_tokens;
+            u.column         = static_cast<std::uint32_t>(call.tokens.size());
+            for (std::uint32_t i = 0; i < u.chunk; ++i) {
+                call.tokens.push_back(lane.tokens[lane.processed + i]);
+                call.lane.push_back(static_cast<std::int32_t>(u.index));
+                call.position.push_back(static_cast<std::int32_t>(lane.processed + i));
+            }
+            call_lanes = std::max(call_lanes, u.index + 1);
+            units.push_back(u);
+        }
+        if (call.tokens.size() > static_cast<std::size_t>(forward_.capacity())) {
+            throw std::logic_error("Inkling 2: a prefill group wider than the prefill chunk");
+        }
+        // first: each sequence's first position (every lane's sequence starts at 0).
+        call.first.assign(call_lanes, 0);
+        // Each lane's device prefill time is the whole call's (its unit took that long): a pair of events a timed lane,
+        // as advance_prefill's.
+        for (Unit& u : units) {
+            Lane& lane = lanes_[u.index];
+            settle_prefill_events(lane, false);
+            u.timed = lane.processed + u.chunk > lane.counted;
+            if (u.timed) {
+                u.events = take_timing_pair();
+                lane.prefill_events.push_back(u.events);
+            }
+        }
+        upload(call);
+        for (const Unit& u : units) {
+            if (u.timed) { CUDA_CHECK(cudaEventRecord(u.events[0], device_.stream)); }
+        }
+        run_forward(0, 0, [&] {
+            for (const Unit& u : units) {
+                const Lane& lane = lanes_[u.index];
+                overlay_images(lane.images, lane.processed, u.chunk, u.column);
+            }
+        });
+        if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(call.tokens.size()), device_.stream); }
+        PrefillGroupProgress out;
+        std::vector<std::int32_t> heads;
+        for (std::uint32_t i = 0; i < units.size(); ++i) {
+            if (!units[i].last) { continue; }
+            heads.push_back(static_cast<std::int32_t>(units[i].column + units[i].chunk - 1));
+            out.completed.push_back(i);
+        }
+        if (!heads.empty()) { forward_.head_rows(heads, device_.stream); }
+        for (const Unit& u : units) {
+            if (u.timed) { CUDA_CHECK(cudaEventRecord(u.events[1], device_.stream)); }
+        }
+        for (const Unit& u : units) {
+            Lane& lane = lanes_[u.index];
+            lane.processed += u.chunk;
+            const std::size_t captured = lane.prefix.captures.size();
+            publish_prefill(u.index);
+            PrefillProgress p;
+            p.snapshot_published = lane.prefix.captures.size() != captured;
+            p.summary = {.prompt_tokens        = lane.prompt_tokens,
+                         .reused_prompt_tokens = lane.reused_prompt,
+                         .prefix_reuse_path = lane.reused_prompt != 0 ? PrefixReusePath::HybridSnapshot : PrefixReusePath::Root};
+            p.processed_prompt_tokens = lane.processed > lane.counted ? lane.processed - lane.counted : 0U;
+            lane.counted              = std::max(lane.counted, lane.processed);
+            p.complete                = u.last;
+            out.lanes.push_back(std::move(p));
+        }
+        if (!out.completed.empty()) {
+            const std::uint64_t transaction = ++transaction_;
+            std::vector<SequenceHandle> rows;
+            std::vector<std::uint32_t> indices;
+            std::vector<std::int32_t> logit_rows;
+            for (std::size_t r = 0; r < out.completed.size(); ++r) {
+                const std::uint32_t index = units[out.completed[r]].index;
+                rows.push_back(handle(index));
+                indices.push_back(index);
+                logit_rows.push_back(static_cast<std::int32_t>(r)); // head_rows' row r
+                // A readout reads its logits before a token constraint masks them in place for the sampler.
+                const Lane& lane = lanes_[index];
+                if (!lane.options.readout_tokens.empty()) {
+                    out.lanes[out.completed[r]].readout = readout(lane, static_cast<std::int32_t>(r));
+                }
+            }
+            std::optional<RowSubset> subset;
+            if (masks != nullptr) { subset.emplace(*masks, out.completed); }
+            sample(rows, indices, logit_rows, ops::kSamplePurposePrefill, subset ? &*subset : nullptr);
+            for (const Unit& u : units) { settle_prefill_events(lanes_[u.index], true); } // the sample synchronized
+            out.timing = timing_since(start);
+            out.pending.emplace(ContractAccess::batch(this, transaction, rows, {sampled_tokens_.data(), rows.size()},
+                                                      out.timing, {failures_.data(), rows.size()}));
+            pending_      = transaction;
+            pending_kind_ = PendingKind::Prefill;
+        } else {
+            out.timing = timing_since(start);
+        }
+        for (std::size_t i = 0; i < units.size(); ++i) {
+            lanes_[units[i].index].prefill_ns += elapsed_ns(start);
+            out.lanes[i].timing = out.timing;
+        }
+        return out;
+    }
+
     PrefillProgress advance_prefill(SequenceHandle sequence, runtime::TokenMaskProvider* masks) {
         const auto start = Clock::now();
         if (pending_) { throw std::logic_error("Inkling 2: a pending batch awaits its commit"); }
         const std::uint32_t index = lane_of(sequence);
         Lane& lane                = lanes_[index];
         if (lane.processed >= lane.prompt_tokens) { throw std::logic_error("Inkling 2: the prompt is already prefilled"); }
-        std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, lane.prompt_tokens - lane.processed);
-        // An exact tap the image after this call would not reach ends the call there (every chunk gives the same bits).
-        for (const runtime::prefix_cache::PlannedTap& tap : lane.prefix.taps) {
-            if (tap.placement != runtime::prefix_cache::TapPlacement::Exact || tap.position <= lane.processed) { continue; }
-            if (tap.position + capture_reach() < lane.processed + chunk) { chunk = tap.position - lane.processed; }
-            break;
-        }
-        const bool last = lane.processed + chunk == lane.prompt_tokens;
+        const std::uint32_t chunk = prefill_unit(lane);
+        const bool last           = lane.processed + chunk == lane.prompt_tokens;
         CallPlan call;
         // first: the sequence's first position (every lane's sequence starts at 0), not the call's first column.
         call.first.assign(index + 1, 0);
@@ -2535,11 +2706,11 @@ private:
     }
 
     // The image rows of a prompt chunk [first, first + count) over its embedding columns (after the embedding norm,
-    // as the reference scatters them): each overlapping image encoded, unless the tower still holds its rows (an
-    // image across chunks encodes once), and its overlapping rows copied. `encoded_set_` keeps the encoded image's
-    // prompt alive, so its address names it until another image is encoded.
+    // as the reference scatters them; the chunk's first column `column` of the call): each overlapping image encoded,
+    // unless the tower still holds its rows (an image across chunks encodes once), and its overlapping rows copied.
+    // `encoded_set_` keeps the encoded image's prompt alive, so its address names it until another image is encoded.
     void overlay_images(const std::shared_ptr<const std::vector<PromptImage>>& images, std::uint32_t first,
-                        std::uint32_t count) {
+                        std::uint32_t count, std::uint32_t column = 0) {
         if (!images) { return; }
         const std::size_t width = c_.hidden_size;
         for (std::size_t i = 0; i < images->size(); ++i) {
@@ -2555,7 +2726,7 @@ private:
                 encoded_index_ = i;
             }
             const std::uint32_t lo = std::max(begin, first), hi = std::min(end, first + count);
-            CUDA_CHECK(cudaMemcpyAsync(forward_.buffers().e + (lo - first) * width, encoded_rows_ + (lo - begin) * width,
+            CUDA_CHECK(cudaMemcpyAsync(forward_.buffers().e + (column + lo - first) * width, encoded_rows_ + (lo - begin) * width,
                                        (hi - lo) * width * 2, cudaMemcpyDeviceToDevice, device_.stream));
         }
     }
@@ -4222,6 +4393,15 @@ runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUni
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*, runtime::TokenMaskProvider* masks) {
     return impl_->advance_prefill(sequence, masks);
+}
+
+bool Program::prefill_joins(std::span<const SequenceHandle> units, SequenceHandle companion) const {
+    return impl_->prefill_joins(units, companion);
+}
+
+PrefillGroupProgress Program::advance_prefill_group(std::span<const SequenceHandle> sequences, runtime::ExecutionTiming*,
+                                                    runtime::TokenMaskProvider* masks) {
+    return impl_->advance_prefill_group(sequences, masks);
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,

@@ -1622,6 +1622,34 @@ fills 120 of the prompt kernel's CTAs, under one wave on 170 SMs; §9.3's grid i
 heads). Slower overall for a fairer share, so not adopted (candidates PF-01); a prompt kernel that splits a row's keys
 (the narrow call's own fix) would remove the reason.
 
+### 14.6 Prompts that arrive together (prefill groups)
+
+Built 2026-11-26. The Engine gave one prompt unit a cycle, so prompts admitted together reached their first tokens one
+call apart: four ~30-token chats at once 29-30 / 53-70 / 85-114 / 127-153 ms (each call 28 ms), four ~56-token
+questions on a cached ~122K-token document 153-180 / 316-328 / 450-498 / 647-662 ms (each call 150 ms), where one
+alone took 29 and 151-176 ms (the owner's configuration, seeded). A narrow call's time is mostly its fixed part (each
+lane's keys, the weights), so the Engine's prefill groups (engine-architecture "Prefill order") now run a cycle's
+permit with every other lane whose whole remaining prompt is one unit of at most 64 tokens
+(`Program::kPrefillCompanionTokens`) that keeps the call within the prefill chunk, in one prompt call
+(`Program::advance_prefill_group`): each lane's columns in tiles of its own (`attention_prompt`'s tile table, at most
+160 tiles of 64; a call of one lane keeps its implicit tiles), the head over the completing lanes' last columns at once
+(`Forward::head_rows`), one sample and one pending batch. Every prompt-route Op computes a column from its own inputs,
+so a lane's bits are its unit alone's: the forward test's prompt lanes case (three lanes after 0, 300 and 2,100
+positions, 200, 37 and 1 columns, every pool format and the INT8 and bf16p windows) compares the final hidden rows,
+the last columns' logits and each lane's state bit for bit. Not on `--lossless` (its calls are one lane's).
+
+Measured (2026-11-26, RTX 5090, INT8 KV). The forward test's prompt lanes profile: a lane joins a narrow call for
+1.3-2.1 ms against its call alone's 33.6 ms at 2K and 142.6 ms at 122K (four lanes of 32 columns at 2K 37.5 ms against
+134.8 one after another, four of 56 at 122K 148.6 against 570.3). Served (the owner's configuration, seeded, two servers
+an arm, two repetitions, against the groups off): four questions on a cached ~122K-token document, one of them
+recomputing 7.5K tokens, first tokens 1,347-1,376 ms against 1,358-1,896 (mean 1,363-1,374 against 1,624-1,625; the
+narrow ones wait for their sibling's blocks and now take its last call); with the document cached 174-353 against
+155-678 ms (mean 303-305 against 415-416; the off arm's 155 ms first request reused a deeper snapshot); four ~2K chats
+30-77 against 29-153 ms (mean 44-63 against 82-90). Tokens a second over the four requests level to +7 %. One request
+alone: level (decode -0.5 % to +0.5 % across two runs, the second with three servers an arm interleaved; first
+tokens equal). At a fixed 3 drafts every request drafted and accepted the same counts in both arms, so the drafter's
+context rows are unchanged.
+
 ---
 
 ## 15. Vision

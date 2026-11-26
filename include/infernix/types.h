@@ -2384,6 +2384,9 @@ struct RuntimeHostWorkStats {
 
     std::uint64_t stats_publication_ns          = 0;
     std::uint64_t stats_publication_invocations = 0;
+    // Prefill units (of prefill_units) that ran in another lane's prompt call: a prefill group's companions
+    // (engine-architecture "Prefill order"; Inkling 2).
+    std::uint64_t prefill_shared_units = 0;
 };
 
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last

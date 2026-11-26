@@ -6,7 +6,10 @@
 // 2. Graphs: the Engine with CUDA graphs gives the reference's tokens.
 // 3. Request invariance: four sampled requests (temperature 1, a seed each, 24-48 tokens so lanes drop out mid-run in a
 //    known order) give their solo tokens two at once (C = 2), all at once in reverse order (C = 4) and twice over at
-//    once (C = 8).
+//    once (C = 8), prompts admitted together prefilling their last units in one prompt call (prefill groups: how many
+//    did is reported). 3b. Prefill groups at the default chunk: three prompts queued behind a 900-token prompt give
+//    their solo tokens, and at least one prefills in another lane's prompt call (7c: the same under DSpark, with the
+//    parsed reply's reasoning ban in the group).
 // 4. Prefill chunk width: an Engine prefilling 7 columns a call gives the reference's tokens; on a 2,300-token prompt
 //    at context 4,096, chunks of 128, 4,096 (the prompt in one call) and 100 (beside a decoding request) give the
 //    greedy continuation, and chunks of 128, 100, 1,000 and 4,096 the scoring logits (19 positions across the
@@ -297,6 +300,10 @@ int main() {
                 require_same("C = 8, request " + std::to_string(j), reference_tokens[j % texts().size()],
                              handles[j].wait().generated_token_ids);
             }
+            // Reported: how many of those prompts' last units joined another lane's prompt call (prefill groups: the
+            // tokens above are judged; whether lanes arrive in one admission cycle is timing).
+            std::cout << "prefill groups (C = 2, 4 and 8): " << engine.runtime_stats().host_work.prefill_shared_units
+                      << " prefill units ran in another lane's prompt call\n";
             // Reported: a chat turn's channels, and a thinking budget's control.
             infernix::RequestOptions turn;
             turn.execution.requested_output_tokens = 64;
@@ -316,6 +323,28 @@ int main() {
         {
             infernix::Engine engine(engine_options(artifact, 7, true, 8));
             require_alone("prefill chunks of 7", engine, reference_tokens);
+        }
+        {
+            // 3b. Prefill groups at the default chunk: three chat prompts, prepared first and submitted right after a
+            //     900-token prompt (whose unit runs while they queue), are admitted together and prefill in one prompt
+            //     call. Judged: each gives its solo tokens, and at least one unit ran in another lane's call.
+            infernix::Engine engine(engine_options(artifact, 0, true, 4));
+            const Tokens blocker = long_prompt(engine, 900);
+            std::vector<decltype(engine.prepare(chat(texts()[0])))> prompts;
+            for (std::size_t i = 0; i < 3; ++i) { prompts.push_back(engine.prepare(chat(texts()[i]))); }
+            const std::uint64_t before = engine.runtime_stats().host_work.prefill_shared_units;
+            auto first = engine.submit(engine.prepare_tokens(blocker), greedy(2));
+            std::vector<infernix::GenerationHandle> handles;
+            for (std::size_t i = 0; i < 3; ++i) { handles.push_back(engine.submit(std::move(prompts[i]), sampled(i))); }
+            for (std::size_t i = 0; i < 3; ++i) {
+                require_same("prefill group, request " + std::to_string(i), reference_tokens[i],
+                             handles[i].wait().generated_token_ids);
+            }
+            (void)first.wait();
+            const std::uint64_t shared = engine.runtime_stats().host_work.prefill_shared_units - before;
+            std::cout << "prefill groups (three prompts behind a 900-token prompt): " << shared
+                      << " prefill units ran in another lane's prompt call\n";
+            require(shared > 0, "prefill groups: no prompt joined another lane's prompt call");
         }
         if (std::getenv("INFERNIX_INKLING2_NO_DSPARK") == nullptr) {
             // 7. DSpark: verification keeps a draft only when it equals the target's own draw at its position, so
@@ -425,6 +454,33 @@ int main() {
                 if (automatic) { require(unequal > 0, label + ": no round dealt its rows unequal widths"); }
                 if (skewed) { require(empty > 0 && full > 0, label + ": no row verified none or all of its drafts"); }
                 infernix::models::inkling2::testing::set_skewed_dealing(false);
+            }
+            {
+                // 7c. Prefill groups under DSpark (auto, graphs): two sampled prompts and the parsed reply (sampling its
+                //     first token under its reasoning ban) queued behind a 900-token prompt prefill in one prompt call
+                //     (the drafter's context rows appended for every lane in it). Judged: each gives its plain tokens, and
+                //     at least one unit ran in another lane's call.
+                infernix::EngineOptions options = engine_options(artifact, 0, true, 4);
+                options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                options.speculative.draft_tokens_auto = true;
+                infernix::Engine engine(options);
+                const Tokens blocker = long_prompt(engine, 900);
+                auto p0 = engine.prepare(chat(texts()[0])), p1 = engine.prepare(chat(texts()[1]));
+                auto p2 = engine.prepare(chat(texts()[0]));
+                const std::uint64_t before = engine.runtime_stats().host_work.prefill_shared_units;
+                auto first  = engine.submit(engine.prepare_tokens(blocker), greedy(2));
+                auto zero   = engine.submit(std::move(p0), sampled(0));
+                auto one    = engine.submit(std::move(p1), sampled(1));
+                auto parsed = engine.submit(std::move(p2), reasoning);
+                require_same("dspark prefill group, request 0", reference_tokens[0], zero.wait().generated_token_ids);
+                require_same("dspark prefill group, request 1", reference_tokens[1], one.wait().generated_token_ids);
+                require_same("dspark prefill group: a 160-token parsed greedy reply (reasoning ban)", plain_reasoning,
+                             parsed.wait().generated_token_ids);
+                (void)first.wait();
+                const std::uint64_t shared = engine.runtime_stats().host_work.prefill_shared_units - before;
+                std::cout << "dspark prefill groups (three prompts behind a 900-token prompt): " << shared
+                          << " prefill units ran in another lane's prompt call\n";
+                require(shared > 0, "dspark prefill groups: no prompt joined another lane's prompt call");
             }
             {
                 // --lm-head-draft: the drafter reads a shortlist, and verification still decides every output. On an

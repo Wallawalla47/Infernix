@@ -315,6 +315,17 @@ goes first. A waiting lane outranks any newcomer once other lanes have prefilled
 prompt, which bounds its wait. Only the order of chunks changes: each request keeps its own chunk grid,
 so no output bit depends on it.
 
+**Prefill groups.** A Program whose prompt calls take several lanes (Inkling 2: `prefill_joins`,
+`advance_prefill_group`) runs the permit's unit with companions: each other prefilling lane whose whole
+remaining prompt is one unit the Program admits (Inkling 2: at most 64 tokens, the call within the prefill
+chunk) joins the permit's prompt call, on a unit reservation of its own taken after the cycle's other
+rows'. A companion never reclaims, pauses or waits for capacity, and none joins during a service turn or
+a hand-over; a Replay, the next-turn pass and a lane waiting for its grammar never join. The lanes that
+complete sample together and commit as one pending batch; each lane's prefill time is the whole call's.
+The prompt route computes every column from its own inputs, so each lane's bits are its unit alone's (the
+forward test's prompt lanes case), and prompts admitted in one cycle reach their first tokens together
+instead of one call apart: a narrow call's time is mostly its fixed part.
+
 The Program's `reserve_units` atomically acquires the typed incremental demand of one call set; the
 Engine calls it row by row to form the runnable subset. One row lacking resources does not stop other
 permitted rows from executing. Ordinary unit settlement releases unused reservations and provisional

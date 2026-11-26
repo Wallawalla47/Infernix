@@ -34,6 +34,9 @@
 //    logits bit for bit.
 // 9. One graph for every split: a 4-lane 16-column call captured at (8, 6, 1, 1) replays at (4, 4, 4, 4) and
 //    (7, 5, 3, 1) with each split's eager logits bit for bit.
+// 10. Prompt lanes: three lanes with different histories (none, 300, 2,100 positions) prefilling 200, 37 and 1 columns
+//    (and 56, 30 and 1) in one prompt call give each lane's call alone bit for bit (final hidden rows, last-column logits through
+//    Forward::head_rows, the lane's state), under every pool format and the INT8 and bf16p windows.
 //
 // Timing (environment): INFERNIX_INKLING2_PROFILE = width (the captured decode round, INFERNIX_INKLING2_CONTEXT
 // positions before it; INFERNIX_INKLING2_SKELETON = serial or trigger also times the same graph with every kernel
@@ -41,8 +44,10 @@
 // INFERNIX_INKLING2_PREFILL_PROFILE = width (one prompt call, each Op's time, after INFERNIX_INKLING2_CONTEXT
 // positions, default 0, and a hash of its bits; INFERNIX_INKLING2_PREFILL_DECODE runs it on the decode route instead,
 // for comparison); INFERNIX_INKLING2_LANES_PROFILE = n (captured rounds of n lanes x 1-8 columns after
-// INFERNIX_INKLING2_CONTEXT positions a lane, default 4096: the cost of a batched verification's columns). The
-// profiles' pools are BF16, or INT8 with INFERNIX_INKLING2_KV = int8.
+// INFERNIX_INKLING2_CONTEXT positions a lane, default 4096: the cost of a batched verification's columns);
+// INFERNIX_INKLING2_PROMPT_LANES_PROFILE = n (one prompt call of n lanes x INFERNIX_INKLING2_PROMPT_WIDTH columns,
+// default 32, after INFERNIX_INKLING2_CONTEXT positions a lane, default 2048, against each lane's call alone: what
+// joining the Engine's prefill companions saves). The profiles' pools are BF16, or INT8 with INFERNIX_INKLING2_KV = int8.
 //
 // Diagnostics (environment): INFERNIX_INKLING2_DRIFT prints the free-running drift per visit and the NLL detail;
 // INFERNIX_INKLING2_HYBRID = blocks | input | perturb runs a hybrid (the reference's blocks and message sources, or its
@@ -71,6 +76,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -222,10 +228,17 @@ struct State {
     std::size_t image_bytes = 0;
     std::uint8_t *window_codes = nullptr, *window_side = nullptr; // quantized windows (StateView)
     std::size_t window_code_bytes = 0, window_side_bytes = 0;
+    std::uint32_t* unpackable = nullptr; // bf16p pools or windows: each lane's first row with no packed form
+    int lanes = 1;
     std::vector<std::vector<std::uint8_t>> saved;
     explicit State(const m::StateLayout& layout, int lanes = 1, int pages = 1, ik::KvCodec window = ik::KvCodec::Bf16,
-                   ik::KvCodec pool = ik::KvCodec::Bf16) {
+                   ik::KvCodec pool = ik::KvCodec::Bf16)
+        : lanes(lanes) {
         image_bytes = static_cast<std::size_t>(layout.lane_words) * 2 * lanes;
+        if (window == ik::KvCodec::Bf16Packed || pool == ik::KvCodec::Bf16Packed) {
+            cuda(cudaMalloc(&unpackable, 4 * static_cast<std::size_t>(lanes)), "unpackable");
+            view.unpackable = unpackable;
+        }
         cuda(cudaMalloc(&images, image_bytes), "state");
         if (window != ik::KvCodec::Bf16) {
             window_code_bytes = static_cast<std::size_t>(m::window_code_bytes(layout, window)) * lanes;
@@ -280,27 +293,57 @@ struct State {
             cuda(cudaMemset(window_side, 0, window_side_bytes), "reset");
         }
         for (const auto& [p, bytes] : pools) { cuda(cudaMemset(p, 0, bytes), "reset"); }
+        if (unpackable != nullptr) { cuda(cudaMemset(unpackable, 0xFF, 4 * static_cast<std::size_t>(lanes)), "reset"); }
+    }
+    // Every byte of the state's planes: the images, the quantized windows' codes and side records (if any), then each
+    // pool plane. Each plane is [lanes][...] (a pool's pages lane by lane: State's table maps them in order), so
+    // lane_slice gives one lane's bytes of a plane.
+    [[nodiscard]] std::vector<std::pair<std::uint8_t*, std::size_t>> planes() const {
+        std::vector<std::pair<std::uint8_t*, std::size_t>> out{{reinterpret_cast<std::uint8_t*>(images), image_bytes}};
+        if (window_codes != nullptr) {
+            out.emplace_back(window_codes, window_code_bytes);
+            out.emplace_back(window_side, window_side_bytes);
+        }
+        out.insert(out.end(), pools.begin(), pools.end());
+        return out;
+    }
+    [[nodiscard]] std::vector<std::uint8_t> lane_bytes(int lane) const {
+        std::vector<std::uint8_t> out;
+        for (const auto& [p, bytes] : planes()) {
+            const std::size_t slice = bytes / static_cast<std::size_t>(lanes);
+            const std::vector<std::uint8_t> host = download(p + static_cast<std::size_t>(lane) * slice, slice);
+            out.insert(out.end(), host.begin(), host.end());
+        }
+        return out;
+    }
+    // Lane `to`'s state made lane `from`'s, byte for byte (the same history; a profile's lanes).
+    void copy_lane(int from, int to) {
+        for (const auto& [p, bytes] : planes()) {
+            const std::size_t slice = bytes / static_cast<std::size_t>(lanes);
+            cuda(cudaMemcpy(p + static_cast<std::size_t>(to) * slice, p + static_cast<std::size_t>(from) * slice, slice,
+                            cudaMemcpyDeviceToDevice),
+                 "copy lane");
+        }
     }
     // A host copy of every byte of the state, and its return (both synchronous).
     void save() {
         saved.clear();
-        saved.push_back(std::vector<std::uint8_t>(image_bytes));
-        cuda(cudaMemcpy(saved.back().data(), images, image_bytes, cudaMemcpyDeviceToHost), "save");
-        for (const auto& [p, bytes] : pools) {
+        for (const auto& [p, bytes] : planes()) {
             saved.push_back(std::vector<std::uint8_t>(bytes));
             cuda(cudaMemcpy(saved.back().data(), p, bytes, cudaMemcpyDeviceToHost), "save");
         }
     }
     void restore() {
-        cuda(cudaMemcpy(images, saved[0].data(), image_bytes, cudaMemcpyHostToDevice), "restore");
-        for (std::size_t i = 0; i < pools.size(); ++i) {
-            cuda(cudaMemcpy(pools[i].first, saved[i + 1].data(), pools[i].second, cudaMemcpyHostToDevice), "restore");
+        const auto all = planes();
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            cuda(cudaMemcpy(all[i].first, saved[i].data(), all[i].second, cudaMemcpyHostToDevice), "restore");
         }
     }
     ~State() {
         cudaFree(images);
         cudaFree(window_codes);
         cudaFree(window_side);
+        cudaFree(unpackable);
         for (const auto& [p, bytes] : pools) { cudaFree(p); }
         cudaFree(table);
     }
@@ -1118,6 +1161,116 @@ bool split_replay(const m::Parameters& p, const Reference& ref, bool a8) {
     return ok;
 }
 
+// 10. Several lanes' prompt units in one prompt call (the Engine's prefill companions, engine-architecture "Prefill
+//     order"): three lanes with different histories (none, 300 and 2,100 positions: the last past its windows' ring)
+//     prefill 200, 37 and 1 columns in one call (the first wider than a key unit, so the call takes the staging rings and
+//     conv histories for every lane), then 56, 30 and 1 (narrow lanes only: each lane's rings direct), under every pool
+//     format with BF16 windows and the INT8 and bf16p windows over INT8 pools. Each lane's final hidden rows, its last
+//     column's logits (the head over the three last columns at once, Forward::head_rows) and its state (image, window
+//     codes and pool pages) equal its call alone bit for bit: the same lane of the same forward and state, from the same
+//     history. a8: on the --a8-activations route.
+bool prompt_lanes(const m::Parameters& p, bool a8) {
+    const auto& c = p.model.config().text;
+    constexpr int kLanes = 3, kCapacity = 2304, kWidest = 200;
+    const int history[kLanes] = {0, 300, 2100};
+    const int pages           = (2100 + kWidest) / ik::kKeyUnit + 2;
+    std::uint64_t lcg = 777;
+    std::vector<std::vector<std::int32_t>> tokens(kLanes);
+    for (int l = 0; l < kLanes; ++l) {
+        for (int t = 0; t < history[l] + kWidest; ++t) {
+            lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+            tokens[l].push_back(static_cast<std::int32_t>((lcg >> 33) % 200000));
+        }
+    }
+    const auto lane_call = [&](int l, int from, int count) {
+        m::CallPlan plan;
+        plan.prompt = true;
+        plan.first.assign(static_cast<std::size_t>(l) + 1, 0);
+        for (int t = from; t < from + count; ++t) {
+            plan.tokens.push_back(tokens[l][t]);
+            plan.lane.push_back(l);
+            plan.position.push_back(t);
+        }
+        return plan;
+    };
+    const auto run = [&](m::Forward& fw, State& state, const m::CallPlan& plan) {
+        fw.prepare(plan);
+        fw.embed(nullptr);
+        for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, nullptr); }
+        fw.finish(state.view, fw.final_inputs(), nullptr, 0, 0);
+    };
+    using K = ik::KvCodec;
+    const std::vector<std::pair<K, K>> formats = {
+        {K::Bf16, K::Bf16},          {K::Int8G64, K::Bf16},    {K::Fp8Row, K::Bf16},     {K::Nvfp4G16, K::Bf16},
+        {K::Fp8KeyNvfp4V, K::Bf16},  {K::Bf16Packed, K::Bf16}, {K::Vq2, K::Bf16},        {K::Q4KeyVq2V, K::Bf16},
+        {K::Int8G64, K::Int8G64},    {K::Int8G64, K::Bf16Packed}};
+    const char* names[] = {"bf16", "int8", "fp8", "nvfp4", "k8v4", "bf16p", "vq2", "k4v2"};
+    const auto name = [&](K k) { return names[static_cast<int>(k)]; };
+    const std::array<std::array<int, kLanes>, 2> widths = {{{kWidest, 37, 1}, {56, 30, 1}}};
+    bool ok = true;
+    for (const auto& [pool, window] : formats) {
+        m::Forward fw(p, kLanes, kCapacity,
+                      a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8,
+                      window);
+        State state(fw.layout(), kLanes, pages, window, pool);
+        for (int l = 0; l < kLanes; ++l) {
+            if (history[l] > 0) { run(fw, state, lane_call(l, 0, history[l])); }
+        }
+        cuda(cudaDeviceSynchronize(), "history");
+        state.save();
+        for (const std::array<int, kLanes>& width : widths) {
+            // Together: the lanes' columns in lane order, one call.
+            state.restore();
+            m::CallPlan together;
+            together.prompt = true;
+            together.first.assign(kLanes, 0);
+            std::vector<std::int32_t> last;
+            for (int l = 0; l < kLanes; ++l) {
+                const m::CallPlan one = lane_call(l, history[l], width[l]);
+                together.tokens.insert(together.tokens.end(), one.tokens.begin(), one.tokens.end());
+                together.lane.insert(together.lane.end(), one.lane.begin(), one.lane.end());
+                together.position.insert(together.position.end(), one.position.begin(), one.position.end());
+                last.push_back(together.columns() - 1);
+            }
+            run(fw, state, together);
+            const std::vector<std::uint16_t> hidden_together =
+                download(fw.buffers().final_hidden, static_cast<std::size_t>(together.columns()) * c.hidden_size);
+            fw.head_rows(last, nullptr);
+            const std::vector<float> logits_together =
+                download(fw.buffers().logits, static_cast<std::size_t>(kLanes) * c.vocab_size);
+            std::vector<std::vector<std::uint8_t>> state_together;
+            for (int l = 0; l < kLanes; ++l) { state_together.push_back(state.lane_bytes(l)); }
+            // Alone: each lane's call by itself from the same saved history (a call writes only its own lane).
+            state.restore();
+            std::size_t column = 0;
+            for (int l = 0; l < kLanes; ++l) {
+                run(fw, state, lane_call(l, history[l], width[l]));
+                const std::vector<std::uint16_t> hidden =
+                    download(fw.buffers().final_hidden, static_cast<std::size_t>(width[l]) * c.hidden_size);
+                fw.head(width[l] - 1, 1, nullptr);
+                const std::vector<float> logits = download(fw.buffers().logits, c.vocab_size);
+                const bool same_hidden = std::memcmp(hidden.data(), hidden_together.data() + column * c.hidden_size,
+                                                     hidden.size() * 2) == 0;
+                const bool same_logits =
+                    std::memcmp(logits.data(), logits_together.data() + static_cast<std::size_t>(l) * c.vocab_size,
+                                logits.size() * 4) == 0;
+                const bool same_state = state.lane_bytes(l) == state_together[l];
+                ok = ok && same_hidden && same_logits && same_state;
+                std::printf("prompt lanes (%s pools, %s windows): lane %d (%d columns after %d) in a 3-lane prompt call of "
+                            "%d columns: %s\n",
+                            name(pool), name(window), l, width[l], history[l], together.columns(),
+                            same_hidden && same_logits && same_state
+                                ? "its call alone bit for bit (hidden rows, logits, state)"
+                                : (std::string("DIFFERENT:") + (same_hidden ? "" : " hidden rows") +
+                                   (same_logits ? "" : " logits") + (same_state ? "" : " state"))
+                                      .c_str());
+                column += static_cast<std::size_t>(width[l]);
+            }
+        }
+    }
+    return ok;
+}
+
 // Timing (INFERNIX_INKLING2_LANES_PROFILE = n lanes, INFERNIX_INKLING2_CONTEXT = each lane's positions before the
 // round, default 4096; INFERNIX_INKLING2_GROUP_WIDTH = the rounds' CallPlan::group_width, default 0): each lane's
 // context prefilled by prompt-route calls of 4,096 columns of the reference's ids
@@ -1206,6 +1359,101 @@ void profile_lanes(const m::Parameters& p, const Reference& ref, int lanes, int 
     cuda(cudaStreamDestroy(stream), "stream");
 }
 
+// Timing (INFERNIX_INKLING2_PROMPT_LANES_PROFILE = n lanes, INFERNIX_INKLING2_PROMPT_WIDTH = w columns a lane, default
+// 32, INFERNIX_INKLING2_CONTEXT = each lane's positions before the call, default 2048): lane 0's history prefilled in
+// prompt calls of 4,096 and copied to the other lanes, then (three times, from the saved state) each lane's w-column
+// prompt call alone with its last column's head, and one prompt call of the n lanes with the head over their last
+// columns (Forward::head_rows), each timed by events: what one shared call saves against n calls one after another.
+void profile_prompt_lanes(const m::Parameters& p, int lanes, int width, int context) {
+    const auto& c = p.model.config().text;
+    constexpr int kContextChunk = 4096;
+    m::Forward fw(p, lanes, std::max(kContextChunk, lanes * width), ops::w4a4_moe::ExpertActivation::Checkpoint, false,
+                  window_from_env());
+    State state(fw.layout(), lanes, (context + width) / ik::kKeyUnit + 2, window_from_env(), kv_from_env());
+    std::uint64_t lcg = 4242;
+    const auto next_id = [&] {
+        lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<std::int32_t>((lcg >> 33) % 200000);
+    };
+    const auto run = [&](const m::CallPlan& plan) {
+        fw.prepare(plan);
+        fw.embed(nullptr);
+        for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, nullptr); }
+        fw.finish(state.view, fw.final_inputs(), nullptr, 0, 0);
+    };
+    for (int c0 = 0; c0 < context; c0 += kContextChunk) {
+        m::CallPlan chunk;
+        chunk.prompt = true;
+        chunk.first  = {0};
+        for (int t = c0; t < std::min(context, c0 + kContextChunk); ++t) {
+            chunk.tokens.push_back(next_id());
+            chunk.lane.push_back(0);
+            chunk.position.push_back(t);
+        }
+        run(chunk);
+    }
+    cuda(cudaDeviceSynchronize(), "context");
+    for (int l = 1; l < lanes; ++l) { state.copy_lane(0, l); }
+    state.save();
+    std::vector<m::CallPlan> alone(static_cast<std::size_t>(lanes));
+    m::CallPlan together;
+    together.prompt = true;
+    together.first.assign(static_cast<std::size_t>(lanes), 0);
+    std::vector<std::int32_t> last;
+    for (int l = 0; l < lanes; ++l) {
+        m::CallPlan& one = alone[static_cast<std::size_t>(l)];
+        one.prompt = true;
+        one.first.assign(static_cast<std::size_t>(l) + 1, 0);
+        for (int t = 0; t < width; ++t) {
+            const std::int32_t id = next_id();
+            one.tokens.push_back(id), one.lane.push_back(l), one.position.push_back(context + t);
+            together.tokens.push_back(id), together.lane.push_back(l), together.position.push_back(context + t);
+        }
+        last.push_back(together.columns() - 1);
+    }
+    cudaEvent_t start = nullptr, stop = nullptr;
+    cuda(cudaEventCreate(&start), "event");
+    cuda(cudaEventCreate(&stop), "event");
+    const auto timed = [&](const std::function<void()>& call) {
+        cuda(cudaEventRecord(start, nullptr), "event");
+        call();
+        cuda(cudaEventRecord(stop, nullptr), "event");
+        cuda(cudaEventSynchronize(stop), "event");
+        float ms = 0;
+        cuda(cudaEventElapsedTime(&ms, start, stop), "event");
+        return static_cast<double>(ms);
+    };
+    std::printf("prompt lanes profile: %d lanes x %d columns at context %d (%s pools)\n", lanes, width, context,
+                kv_from_env() == ik::KvCodec::Bf16 ? "BF16" : "INT8");
+    for (int rep = 0; rep < 4; ++rep) { // the first a warm-up
+        state.restore();
+        std::vector<double> ms;
+        for (int l = 0; l < lanes; ++l) {
+            ms.push_back(timed([&] {
+                run(alone[static_cast<std::size_t>(l)]);
+                fw.head(width - 1, 1, nullptr);
+            }));
+        }
+        state.restore();
+        const double shared = timed([&] {
+            run(together);
+            fw.head_rows(last, nullptr);
+        });
+        double sum = 0;
+        std::string each;
+        for (const double t : ms) {
+            sum += t;
+            each += (each.empty() ? "" : " ") + std::to_string(t).substr(0, 7);
+        }
+        std::printf("  run %d%s: alone %s ms (sum %.3f), together %.3f ms: %.3f ms saved, each lane past the first "
+                    "%.3f ms\n",
+                    rep, rep == 0 ? " (warm-up)" : "", each.c_str(), sum, shared, sum - shared,
+                    lanes > 1 ? (shared - ms[0]) / (lanes - 1) : 0.0);
+    }
+    cuda(cudaEventDestroy(start), "event");
+    cuda(cudaEventDestroy(stop), "event");
+}
+
 } // namespace
 
 int main() {
@@ -1218,8 +1466,10 @@ int main() {
     try {
         // The checks read BF16 windows and hold the BF16 windows' criteria.
         if (window_from_env() != ik::KvCodec::Bf16 && std::getenv("INFERNIX_INKLING2_PROFILE") == nullptr &&
-            std::getenv("INFERNIX_INKLING2_PREFILL_PROFILE") == nullptr) {
-            std::printf("FAIL: INFERNIX_INKLING2_WINDOW is for the profiles (INFERNIX_INKLING2_PROFILE, _PREFILL_PROFILE) only\n");
+            std::getenv("INFERNIX_INKLING2_PREFILL_PROFILE") == nullptr &&
+            std::getenv("INFERNIX_INKLING2_PROMPT_LANES_PROFILE") == nullptr) {
+            std::printf("FAIL: INFERNIX_INKLING2_WINDOW is for the profiles (INFERNIX_INKLING2_PROFILE, _PREFILL_PROFILE, "
+                        "_PROMPT_LANES_PROFILE) only\n");
             return 1;
         }
         DeviceContext device(0);
@@ -1279,6 +1529,14 @@ int main() {
             const char* ctx = std::getenv("INFERNIX_INKLING2_CONTEXT");
             profile_lanes(parameters, ref, std::clamp(std::atoi(lanes), 1, 8), ctx != nullptr ? std::max(1, std::atoi(ctx)) : 4096,
                           a8);
+            return 0;
+        }
+        if (const char* lanes = std::getenv("INFERNIX_INKLING2_PROMPT_LANES_PROFILE"); lanes != nullptr) {
+            const char* ctx   = std::getenv("INFERNIX_INKLING2_CONTEXT");
+            const char* width = std::getenv("INFERNIX_INKLING2_PROMPT_WIDTH");
+            profile_prompt_lanes(parameters, std::clamp(std::atoi(lanes), 1, 8),
+                                 width != nullptr ? std::clamp(std::atoi(width), 1, 512) : 32,
+                                 ctx != nullptr ? std::max(0, std::atoi(ctx)) : 2048);
             return 0;
         }
 
@@ -1486,6 +1744,7 @@ int main() {
         ok = lanes_alone(parameters, forward, state, ref, a8) && ok;
         ok = wide_lanes(parameters, forward, state, ref, a8) && ok;
         ok = split_replay(parameters, ref, a8) && ok;
+        ok = prompt_lanes(parameters, a8) && ok;
         std::printf(ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& error) {

@@ -230,6 +230,16 @@ struct PrefillProgress {
     std::optional<PromptReadout> readout;
 };
 
+// Several lanes' prefill units in one prompt call (Program::advance_prefill_group): each lane's progress in the call's
+// order, none with a pending batch of its own; the lanes that completed their prompt sample together, `pending`'s rows
+// those lanes in the call's order (`completed`: their indices in it).
+struct PrefillGroupProgress {
+    std::vector<PrefillProgress> lanes;
+    std::optional<PendingBatch> pending;
+    std::vector<std::uint32_t> completed;
+    runtime::ExecutionTiming timing;
+};
+
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     GenerationTimings timings;
@@ -409,6 +419,18 @@ public:
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr,
                                                   runtime::TokenMaskProvider* masks = nullptr);
+    // The Engine's prefill companions (engine-architecture "Prefill order"): whether `companion`'s next prefill unit may
+    // join the prompt call of `units` (the lanes already in it, the first the primary, each prefilling): the unit
+    // completes its prompt within kPrefillCompanionTokens, and the call stays within the prefill chunk. Never on
+    // --lossless (its calls are one lane's).
+    static constexpr std::uint32_t kPrefillCompanionTokens = 64;
+    [[nodiscard]] bool prefill_joins(std::span<const SequenceHandle> units, SequenceHandle companion) const;
+    // Each sequence's next prefill unit (as advance_prefill would run it alone) in one prompt call, `sequences[0]` the
+    // primary and the rest admitted by prefill_joins: every column is computed from its own inputs on the prompt
+    // route, so each lane's bits are its unit alone's. `masks` rows are `sequences` positions.
+    [[nodiscard]] PrefillGroupProgress advance_prefill_group(std::span<const SequenceHandle> sequences,
+                                                             runtime::ExecutionTiming* failed_timing = nullptr,
+                                                             runtime::TokenMaskProvider* masks       = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
                                       runtime::ExecutionTiming* failed_timing = nullptr,

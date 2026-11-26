@@ -56,6 +56,14 @@ constexpr int kStages        = 2;
 
 constexpr int kTableColumns  = 128; // the distances a CTA's rows meet in one unit: 64 rows + 64 keys - 1, whole
 
+// A call of several lanes' columns (prefill groups): each CTA's columns [begin, end), at most kTileColumns of one lane
+// (each lane's columns from its first in tiles of 64). count 0: one lane's call, CTA t its columns 64 t .. 64 t + 63.
+constexpr int kMaxPromptTiles = 160; // 8 lanes, a call of at most 9,728 columns
+struct PromptTiles {
+    std::int32_t count = 0;
+    std::int32_t begin[kMaxPromptTiles] = {}, end[kMaxPromptTiles] = {};
+};
+
 // The quantized instance's code stage: a unit's codes and side records, a plane each (codes, then side records at a
 // fixed offset), sized for the largest form's rows (bf16p: 192 code bytes and 16 side bytes).
 constexpr int kCodeRowBytes = 192, kSideRowBytes = 16;
@@ -133,14 +141,15 @@ __device__ __forceinline__ void unrotate_rows(float (&acc)[16][4], int t4) {
 
 // Quantized: the instance for a quantized pool or window ring (attention.cu's split): the BF16 instance has no decoders.
 template <bool Quantized>
-__global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const AttentionArgs a) {
+__global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const AttentionArgs a, const PromptTiles tiles) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     SharedT<Quantized>& sm = *reinterpret_cast<SharedT<Quantized>*>(smem_raw);
     const int tile = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, ln = tid & 31;
     const int g = ln >> 2, t4 = ln & 3;
     const bool full = a.layer.full;
-    const int c0 = tile * kTileColumns, c_end = min(a.columns, c0 + kTileColumns);
+    const int c0    = tiles.count == 0 ? tile * kTileColumns : tiles.begin[tile];
+    const int c_end = tiles.count == 0 ? min(a.columns, c0 + kTileColumns) : tiles.end[tile];
     pdl::enter();
     const int lane  = a.map.lane[c0];
     const int first = a.map.first[lane];
@@ -433,11 +442,36 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
 
 void attention_prompt(const AttentionArgs& a, cudaStream_t stream) {
     if (a.columns <= 0 || a.columns > a.ws.capacity || a.host_groups == nullptr || a.groups <= 0) {
-        throw std::invalid_argument("inkling2 attention_prompt: 1..capacity columns of one lane, its groups on the host");
+        throw std::invalid_argument("inkling2 attention_prompt: 1..capacity columns, its groups on the host");
     }
-    for (int g = 1; g < a.groups; ++g) {
-        if (a.host_groups[3 * g + 2] != a.host_groups[2]) {
-            throw std::invalid_argument("inkling2 attention_prompt: a prompt call is one lane's columns");
+    // Several lanes: each lane's consecutive columns (no padding) in tiles of its own from its first column.
+    PromptTiles tiles;
+    bool one_lane = true;
+    for (int g = 1; g < a.groups; ++g) { one_lane = one_lane && a.host_groups[3 * g + 2] == a.host_groups[2]; }
+    if (!one_lane) {
+        std::int32_t covered = 0, tile_lane = -1;
+        for (int g = 0; g < a.groups; ++g) {
+            const std::int32_t col = a.host_groups[3 * g], count = a.host_groups[3 * g + 1], lane = a.host_groups[3 * g + 2];
+            covered += count;
+            for (std::int32_t c = col; c < col + count; ++c) {
+                // The column extends the open tile if it is the same lane's next column and the tile has room.
+                const bool extend = tiles.count > 0 && lane == tile_lane && tiles.end[tiles.count - 1] == c &&
+                                    tiles.end[tiles.count - 1] - tiles.begin[tiles.count - 1] < kTileColumns;
+                if (extend) {
+                    ++tiles.end[tiles.count - 1];
+                    continue;
+                }
+                if (tiles.count == kMaxPromptTiles) {
+                    throw std::invalid_argument("inkling2 attention_prompt: a call of several lanes takes at most 160 tiles");
+                }
+                tiles.begin[tiles.count] = c;
+                tiles.end[tiles.count]   = c + 1;
+                ++tiles.count;
+                tile_lane = lane;
+            }
+        }
+        if (covered != a.columns) {
+            throw std::invalid_argument("inkling2 attention_prompt: a call of several lanes has no padding columns");
         }
     }
     detail::check_attention_args(a);
@@ -453,11 +487,12 @@ void attention_prompt(const AttentionArgs& a, cudaStream_t stream) {
     }();
     (void)attribute;
     const bool quantized = detail::quantized_pool(a);
-    const dim3 grid(static_cast<unsigned>((a.columns + kTileColumns - 1) / kTileColumns), kKvHeads);
+    const dim3 grid(static_cast<unsigned>(tiles.count != 0 ? tiles.count : (a.columns + kTileColumns - 1) / kTileColumns),
+                    kKvHeads);
     const pdl::LaunchConfig config{grid, dim3(kThreads), static_cast<std::size_t>(quantized ? coded_bytes : plain_bytes),
                                    stream};
-    CUDA_CHECK(quantized ? pdl::launch_consumer(config, attention_prompt_kernel<true>, a)
-                         : pdl::launch_consumer(config, attention_prompt_kernel<false>, a));
+    CUDA_CHECK(quantized ? pdl::launch_consumer(config, attention_prompt_kernel<true>, a, tiles)
+                         : pdl::launch_consumer(config, attention_prompt_kernel<false>, a, tiles));
 }
 
 } // namespace infernix::ops::inkling2

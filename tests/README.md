@@ -557,8 +557,12 @@ in groups) and checks a prompt that opens the answer (it ends with `<|message_mo
 reasoning, and its session publishes the first token as content).
 `infernix_inkling2_forward_real_test` (GPU) runs the forward on `INFERNIX_INKLING2_ARTIFACT` against a CPU reference's
 per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
-their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
-rather than judges and why. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
+their row maximum, the greedy continuation's argmax, decode = verify bit for bit; three lanes' prompt units in one
+prompt call (200, 37 and 1 columns, then 56, 30 and 1, after 0, 300 and 2,100 positions) equal to each lane's call alone
+in final hidden rows, last-column logits and state, bit for bit under every pool format and the INT8 and bf16p windows
+(the Engine's prefill groups); its header says what it reports rather than judges and why.
+`INFERNIX_INKLING2_PROMPT_LANES_PROFILE=n` (with `INFERNIX_INKLING2_PROMPT_WIDTH`, `INFERNIX_INKLING2_CONTEXT`) times
+one prompt call of n lanes against each lane's call alone. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
 `INFERNIX_INKLING2_LOGITS_GUARD` compares them); `INFERNIX_INKLING2_Q8` loads with `--q8-weights`' conversion (other
 bits, so the reference criteria do not apply: for its timing, its invariance checks and a census of its FP16 group
 scales). `infernix_inkling2_projections_test` (GPU) requires the fused
@@ -569,7 +573,9 @@ column equal to the same column projected alone.
 `infernix_qwen4_exp_forward_real_test --pack-bf16` loads Flash-Next packed as the Engine does.
 `infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2 through the public Engine against an eager
 one-request Engine prefilling 16 columns a call: the golden prompt's greedy continuation, CUDA graphs, four sampled
-requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's logits equal to the forward test's
+requests at C = 2, 4 and 8, prefill chunks of 7, three prompts queued behind a 900-token prompt at the default chunk
+(prefill groups: their solo tokens, and at least one prefilled in another lane's prompt call; again under DSpark with
+the parsed reply's reasoning ban among them), and a CausalScoring Engine's logits equal to the forward test's
 prompt route (`INFERNIX_INKLING2_PROMPT_LOGITS_GUARD`, which the forward test's `INFERNIX_INKLING2_PROMPT_LOGITS_OUT`
 writes; without it that one check is skipped and says so) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
 128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of

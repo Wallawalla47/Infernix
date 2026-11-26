@@ -249,8 +249,9 @@ struct AttentionArgs {
 };
 void attention(const AttentionArgs& args, cudaStream_t stream);
 
-// The prompt route (a prefill or scoring call: one lane's consecutive columns, any width; its groups on the host): the
-// same prologue, then a row's scores, softmax and P x V on tensor cores over its fixed absolute 64-key units in
+// The prompt route (a prefill or scoring call: each lane's consecutive columns, any width, no padding; its groups on the
+// host; several lanes' columns, a prefill group's, are tiled lane by lane, at most 160 tiles of 64): the same prologue,
+// then a row's scores, softmax and P x V on tensor cores over its fixed absolute 64-key units in
 // ascending order (attention_prompt.cu): S = q k^T by BF16 MMA (FP32, from zero over the head dimension), the decode
 // route's bias, s and t; per unit m_u over visible keys (a unit with none leaves the row unchanged), m = max, c =
 // ex2(m_old - m), p = ex2(t - m) rounded to FP16 for P x V by FP16 MMA (FP32), l = l c + the row sum of p (the four
