@@ -905,6 +905,11 @@ struct EngineOptions {
     // more than that plus 1 GiB has stayed available for 10 s (runtime::expert_offload::RamMonitor). Off: every tier
     // keeps its startup size.
     bool ram_resize = true;
+    // Offloaded experts (--cpu-rates saved|measure): the CPU expert team's rates come from the saved quiet settle of
+    // this machine and configuration beside the expert state (<expert state>.cpu-rates) when it exists, with no
+    // readings at startup (true, the default); false takes the readings at every start, confirmed against the saved
+    // ones (each waits up to 20 s for a quiet CPU).
+    bool cpu_rates_saved = true;
     // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.

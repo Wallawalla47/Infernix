@@ -395,6 +395,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                 ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
     }
     program_options.expert_seed = !options.expert_state_off;
+    program_options.cpu_rates_saved = options.cpu_rates_saved;
     program_options.ngram_volume = volume;
     program_options.ngram_table  = table;
     // The hybrid prefix cache (design §19.3.1). Host-born snapshots live in the pinned slab pool;

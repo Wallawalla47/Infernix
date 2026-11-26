@@ -378,6 +378,8 @@ struct ProgramOptions {
     // Without a usable saved state, seed the frames from the calibrated expert order (false: --expert-state
     // off, an empty cache).
     bool expert_seed = true;
+    // EngineOptions::cpu_rates_saved: a saved quiet settle of the CPU team's rates stands without readings.
+    bool cpu_rates_saved = true;
     // The SSD tier reads each record's tail from this expert stripe (EngineOptions::expert_stripe_path).
     std::filesystem::path expert_stripe;
     // Device memory left free for the display and other programs once the fixed allocations and
