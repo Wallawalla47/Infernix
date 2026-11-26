@@ -3,7 +3,8 @@
 python -I tools/launcher/launcher_check.py --launcher <infernix-launcher> --fake <infernix_launcher_fake_serve>
     --models <dir> [--groups features,watchdog,windowless,autoload,cutoff,ablation]
 Runs on Windows and Linux. <dir> holds at least one supported artifact (only its header is read;
-nothing in it is changed). Each group starts its own launcher with its memory and logs in a fresh
+nothing in it is changed). The groups configure its first Qwen3.8-27B, for which every check was written, else
+its first supported model, on which a check of an option that model does not take is skipped by name. Each group starts its own launcher with its memory and logs in a fresh
 temporary folder (printed; removed afterwards unless --keep).
 
 features: model ids, named configurations, environment, the memory breakdown, script export and
@@ -43,6 +44,7 @@ from pathlib import Path
 
 WINDOWS = os.name == "nt"
 results: list[tuple[str, bool, str]] = []
+skipped: list[tuple[str, str]] = []
 t0 = time.monotonic()
 
 
@@ -54,6 +56,12 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
     results.append((name, ok, detail))
     log(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  ({detail})" if detail else ""))
     return ok
+
+
+def skip(name: str, reason: str) -> None:
+    """A check that cannot run on these models: reported by name in the summary, neither passed nor failed."""
+    skipped.append((name, reason))
+    log(f"SKIP  {name}  ({reason})")
 
 
 def call(port: int, method: str, path: str, body=None, timeout: float = 600.0, headers: dict | None = None,
@@ -182,11 +190,27 @@ def serve_log(port: int) -> str:
     return "\n".join(line["text"] for line in call(port, "GET", "/launcher/api/logs?limit=20000")[1]["lines"])
 
 
+# The launcher's families (src/launcher/artifact_scan.cpp) and which of them take the options some checks exercise
+# (src/launcher/option_support.cpp): --lora on the dense Qwen3.5 models and Inkling 2, --ngram-native-sessions on the
+# Qwen3.5 models.
+QWEN35_DENSE = {"qwen3.8-27b", "qwen3.6-27b", "qwen3.5"}
+QWEN35 = QWEN35_DENSE | {"qwen3.6-35b-a3b", "qwen3.5-122b-a10b"}
+
+
+def takes_lora(model: dict) -> bool:
+    return model["family"] in QWEN35_DENSE or model["family"] == "inkling2-mini"
+
+
 def first_model(port: int) -> dict:
+    """The model the groups configure: the first Qwen3.8-27B in --models (every check was written for it), else the
+    first model of a known family, on which the checks of options it does not take are skipped by name."""
     library = wait_for(lambda: (lambda l: l if l.get("models") else None)(call(port, "GET", "/launcher/api/library")[1]), 30)
     if not library:
         raise RuntimeError("no model found in --models")
-    return next(m for m in library["models"] if m["family"] != "unknown")
+    known = [m for m in library["models"] if m["family"] != "unknown"]
+    if not known:
+        raise RuntimeError("no model of a supported family found in --models")
+    return next((m for m in known if m["family"] == "qwen3.8-27b"), known[0])
 
 
 def run_group(name: str, options, settings: dict, body, windowless: bool = False, extra: tuple[str, ...] = ()) -> None:
@@ -264,10 +288,14 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         status, page = call(port, "GET", "/v1/models?limit=1", headers=anthropic)
         _, after = call(port, "GET", f"/v1/models?limit=1&after_id={ids[0]}", headers=anthropic) if ids else (0, {})
         _, before = call(port, "GET", f"/v1/models?before_id={ids[-1]}", headers=anthropic) if ids else (0, {})
-        check("Anthropic paging: limit, after_id, before_id, has_more, first_id and last_id",
-              len(ids) >= 2 and status == 200 and [m["id"] for m in page["data"]] == ids[:1] and page["has_more"]
-              and page["first_id"] == page["last_id"] == ids[0] and [m["id"] for m in after["data"]] == ids[1:2]
-              and [m["id"] for m in before["data"]] == ids[:-1][-20:], f"{len(ids)} models")
+        if len(ids) >= 2:
+            check("Anthropic paging: limit, after_id, before_id, has_more, first_id and last_id",
+                  status == 200 and [m["id"] for m in page["data"]] == ids[:1] and page["has_more"]
+                  and page["first_id"] == page["last_id"] == ids[0] and [m["id"] for m in after["data"]] == ids[1:2]
+                  and [m["id"] for m in before["data"]] == ids[:-1][-20:], f"{len(ids)} models")
+        else:
+            skip("Anthropic paging: limit, after_id, before_id, has_more, first_id and last_id",
+                 f"paging needs two listed models; --models lists {len(ids)}")
         # Claude Code lists only ids containing "claude" or "anthropic".
         claude = {"User-Agent": "claude-cli/2.1.300 (external, cli)", **anthropic}
         status, seen = call(port, "GET", "/v1/models?limit=1000", headers=claude)
@@ -452,10 +480,17 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         status_lora, adapted = call(port, "POST", f"{cfg}/plan",
                                     {"args": fast + ["--max-context", "65536", "--lora", str(adapter_dir)]})
         labels = [part.get("label") for part in (adapted.get("vram") or {}).get("parts", [])]
-        check("a LoRA adapter's VRAM is a part of the plan and of what it plans",
-              status == 200 and status_lora == 200 and "Adapters" in labels
-              and (adapted.get("vram") or {}).get("planned", 0) - (plain.get("vram") or {}).get("planned", 0)
-              == 318767104, str(labels))
+        # The launcher leaves --lora and --ablate out for a model that does not take them (the Qwen MoE models): there
+        # the two adapter checks are skipped by name.
+        lora = takes_lora(model)
+        no_lora = f"{model['family']} does not take --lora"
+        if lora:
+            check("a LoRA adapter's VRAM is a part of the plan and of what it plans",
+                  status == 200 and status_lora == 200 and "Adapters" in labels
+                  and (adapted.get("vram") or {}).get("planned", 0) - (plain.get("vram") or {}).get("planned", 0)
+                  == 318767104, str(labels))
+        else:
+            skip("a LoRA adapter's VRAM is a part of the plan and of what it plans", no_lora)
         # So is an ablation sidecar's direction (a dense 27B's 20 KiB), alone and beside a LoRA adapter's factors.
         sidecar = Path(tempfile.mkdtemp(prefix="infernix-launcher-ablate-")) / "sidecar.json"
         sidecar.write_text("{}", encoding="utf-8")
@@ -469,10 +504,13 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
             return found[0].get("bytes") if found else None
 
         planned = lambda plan: (plan.get("vram") or {}).get("planned", 0)  # noqa: E731
-        check("an ablation sidecar's direction is the plan's Adapters part and counts in what it plans",
-              status_cut == 200 and status_both == 200 and adapters(cut) == 20480 and adapters(both) == 318767104 + 20480
-              and planned(cut) - planned(plain) == 20480 and planned(both) - planned(adapted) == 20480,
-              f"{adapters(cut)} {adapters(both)} {planned(cut) - planned(plain)} {planned(both) - planned(adapted)}")
+        if lora:
+            check("an ablation sidecar's direction is the plan's Adapters part and counts in what it plans",
+                  status_cut == 200 and status_both == 200 and adapters(cut) == 20480 and adapters(both) == 318767104 + 20480
+                  and planned(cut) - planned(plain) == 20480 and planned(both) - planned(adapted) == 20480,
+                  f"{adapters(cut)} {adapters(both)} {planned(cut) - planned(plain)} {planned(both) - planned(adapted)}")
+        else:
+            skip("an ablation sidecar's direction is the plan's Adapters part and counts in what it plans", no_lora)
         status, plan = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "250000"]})
         suggestions = plan.get("suggestions", [])
         first = suggestions[0] if suggestions and isinstance(suggestions[0], dict) else {}
@@ -499,6 +537,10 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
             (["--vision-offload", "on"], "--vision-offload on needs --vision"),
             (["--causal-scoring", "--max-context", "auto"], "--causal-scoring needs --max-context N"),
         ]
+        if model["family"] not in QWEN35:
+            # The preview leaves an option the model does not take out (named in its warnings) instead.
+            alone = [(extra, want) for extra, want in alone if extra[0] != "--ngram-native-sessions"]
+            skip("the preview names --ngram-native-sessions alone", f"{model['family']} does not take it")
         unnamed = [want for extra, want in alone if not any(w.startswith(want) for w in warned(extra))]
         check("the preview names each", not unnamed, "; ".join(unnamed))
         together = warned(["--ssd-context-gib", "64", "--ssd-context-dir", str(data), "--ssd-context-gib-per-hour", "4",
@@ -1436,9 +1478,11 @@ def main() -> int:
             if not options.keep:
                 shutil.rmtree(tool_root, ignore_errors=True)
     failed = [r for r in results if not r[1]]
-    log(f"SUMMARY: {len(results) - len(failed)} passed, {len(failed)} failed")
+    log(f"SUMMARY: {len(results) - len(failed)} passed, {len(failed)} failed, {len(skipped)} skipped")
     for name, _, detail in failed:
         log(f"  FAILED {name}: {detail}")
+    for name, reason in skipped:
+        log(f"  SKIPPED {name}: {reason}")
     return 1 if failed else 0
 
 
