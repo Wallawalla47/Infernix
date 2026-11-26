@@ -246,7 +246,12 @@ Measured quality per format: [design §7.6](maintainer/inkling2_mini-design.md#7
   Every chunk size gives the same bits.
 - **The prefix cache** is on by default in `infernix-serve` (the `infernix` CLI runs without it). It
   caches only state computed from prompts, so a continuing turn resumes at the previous prompt's end
-  and prefills the previous reply again. `--kv-capacity` then defaults to `auto`. An explicit
+  and prefills the previous reply again. Requests arriving together that share a long prefix (one
+  document, different questions) prefill it once: the others wait for the first's snapshot where they
+  diverge (four questions on a 122K-token document, 7.5K tokens past its last snapshot: 1.4-2.0 s to
+  the first token instead of 1.2-7.1 s), and a later prompt that diverges where an earlier one did
+  resumes there (a second question 187 ms instead of 1.2 s; four after it 185-745 ms).
+  `--kv-capacity` then defaults to `auto`. An explicit
   `--kv-capacity N` must hold `--max-context`, and caps `--max-context auto`. Queued and paused
   requests' resume points are evicted last (`--no-queue-holds` turns that off). `--prefix-cache-file` keeps
   it across restarts, and `--ssd-context-gib` with `--ssd-context-dir` adds an SSD tier. Details:
