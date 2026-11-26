@@ -254,6 +254,18 @@ int main() {
                               "generation":{"source":"test"},"alpha_attn_per_layer":{"1":1.0}})");
         threw(try_load(t.dir, s), "direction_file must be", "a sidecar naming no direction file is refused by name");
     }
+    // The direction file sits beside sidecar.json (docs/ablate.md): a path elsewhere is refused, even to a valid file.
+    for (const std::string& elsewhere : {std::string("../d.f32.bin"), std::string("sub/d.f32.bin"),
+                                         (std::filesystem::temp_directory_path() / "ablate-v2-abs.f32.bin").generic_string()}) {
+        Scratch t("elsewhere");
+        (void)write_direction(t.dir, "d.f32.bin", 1);
+        std::filesystem::create_directories(t.dir / "sub");
+        (void)write_direction(t.dir / "sub", "d.f32.bin", 1);
+        write_json(t.dir, R"({"format":"ablate-direction-v2","direction_file":")" + elsewhere +
+                            R"(","direction_dtype":"float32","direction_dim":8,
+                               "generation":{"source":"test"},"alpha_attn_per_layer":{"1":1.0}})");
+        threw(try_load(t.dir, s), "beside sidecar.json", "a direction_file path out of the folder (" + elsewhere + ") is refused");
+    }
     {
         Scratch t("notes-type");
         const std::string d = write_direction(t.dir, "d.f32.bin", 1);

@@ -209,8 +209,13 @@ AblateSidecar AblateSidecar::load(const std::filesystem::path& json_path, const 
     for (std::uint32_t l = 0; l < n_layers; ++l) {
         if (sidecar.layer_cut(l)) { required[sidecar.per_layer_direction ? l : 0U] = true; }
     }
-    read_direction(json_path.parent_path() / required_string(cfg, "direction_file"), rows, hidden_size, required,
-                   sidecar.d_host);
+    // The direction file sits beside sidecar.json (docs/ablate.md): a file name, not a path elsewhere.
+    const std::filesystem::path direction_file(required_string(cfg, "direction_file"));
+    if (direction_file.empty() || direction_file.has_parent_path() || direction_file.has_root_path() ||
+        direction_file != direction_file.filename() || direction_file == "." || direction_file == "..") {
+        fail("direction_file must name a file beside sidecar.json (a file name, not a path)");
+    }
+    read_direction(json_path.parent_path() / direction_file, rows, hidden_size, required, sidecar.d_host);
     return sidecar;
 }
 
@@ -219,8 +224,9 @@ std::filesystem::path AblateSidecar::direction_path(const std::filesystem::path&
         std::ifstream in(json_path);
         if (!in) { return {}; }
         const nlohmann::json cfg = nlohmann::json::parse(in);
-        const std::string name   = cfg.value("direction_file", std::string());
-        return name.empty() ? std::filesystem::path() : json_path.parent_path() / name;
+        const std::filesystem::path name(cfg.value("direction_file", std::string()));
+        // Only a file beside sidecar.json, as the loader accepts (a path elsewhere is refused there).
+        return name.empty() || name != name.filename() ? std::filesystem::path() : json_path.parent_path() / name;
     } catch (...) {
         return {};
     }
