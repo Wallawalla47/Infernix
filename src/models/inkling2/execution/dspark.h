@@ -37,12 +37,14 @@
 
 namespace infernix::models::inkling2 {
 
-// The full layer's context K and V: two planes of the target's KV pages (page-major [pages][8][64][128] BF16) and the
-// lanes' block-table rows, which the Program owns (its pool's planes; a page holds the drafter's context with the
+// The full layer's context K and V: two planes of the target's KV pages (page-major [pages][8][64][128] BF16), or with
+// every other pool format four INT8 planes (ops::inkling2::DSparkInt8Cache: codes and side records; k and v null), and
+// the lanes' block-table rows, which the Program owns (its pool's planes; a page holds the drafter's context with the
 // target's, so the prefix cache shares and restores both).
 struct DSparkPagedContext {
     std::uint16_t* k            = nullptr;
     std::uint16_t* v            = nullptr;
+    ops::inkling2::DSparkInt8Cache int8;
     const std::int32_t* table   = nullptr;
     std::int32_t table_stride   = 0;
 };

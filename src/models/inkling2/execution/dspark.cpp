@@ -149,7 +149,10 @@ Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int3
         lane_words_[l] = l == 1 ? 0 : static_cast<std::int64_t>(ik::kDSparkKvHeads) * ik::kDSparkRing *
                          ik::kDSparkHeadDim;
     }
-    if (full.k == nullptr || full.v == nullptr || full.table == nullptr || full.table_stride <= 0) {
+    const bool int8 = full.int8.active();
+    if ((!int8 && (full.k == nullptr || full.v == nullptr)) ||
+        (int8 && (full.int8.codes_v == nullptr || full.int8.side_k == nullptr || full.int8.side_v == nullptr)) ||
+        full.table == nullptr || full.table_stride <= 0) {
         throw std::invalid_argument("inkling2 dspark: the full layer's context needs the Program's pages");
     }
     full_       = full;
@@ -274,6 +277,7 @@ void Drafter::append(std::int32_t first, std::int32_t count, cudaStream_t stream
         r.ring          = d_.layers[l].sliding ? ik::kDSparkRing : 0;
         r.table         = full_.table;
         r.table_stride  = full_.table_stride;
+        r.int8          = d_.layers[l].sliding ? ik::DSparkInt8Cache{} : full_.int8;
         r.inv_freq      = inv_freq_;
         ik::dspark_rotate(r, stream);
     }
@@ -352,6 +356,7 @@ void Drafter::draft_blocks(std::int32_t blocks, std::int32_t steps, cudaStream_t
         rk.ring          = o.sliding ? ik::kDSparkRing : 0;
         rk.table         = full_.table;
         rk.table_stride  = full_.table_stride;
+        rk.int8          = o.sliding ? ik::DSparkInt8Cache{} : full_.int8;
         rk.inv_freq      = inv_freq_;
         ik::dspark_rotate(rk, stream);
         ik::DSparkAttentionArgs at;
@@ -362,6 +367,7 @@ void Drafter::draft_blocks(std::int32_t blocks, std::int32_t steps, cudaStream_t
         at.ring           = o.sliding ? ik::kDSparkRing : 0;
         at.table          = full_.table;
         at.table_stride   = full_.table_stride;
+        at.int8           = o.sliding ? ik::DSparkInt8Cache{} : full_.int8;
         at.splits         = o.sliding ? kSlidingSplits : full_splits_;
         at.round          = round;
         at.scratch        = w.attention_scratch;

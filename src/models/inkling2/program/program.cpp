@@ -150,14 +150,19 @@ ops::w4a4_moe::ExpertActivation expert_activation(const ProgramOptions& o) {
                           : ops::w4a4_moe::ExpertActivation::Checkpoint;
 }
 
+// Whether the drafter's full layer keeps its context in INT8 (DSparkInt8Cache): with every target pool format but BF16,
+// whose pages it shares (drafts only: no output depends on it; 10 % more tokens in the pool, design §13.6).
+bool dspark_int8(ops::inkling2::KvCodec codec) { return codec != ops::inkling2::KvCodec::Bf16; }
+
 // The planes of one full visit's page: K and V (16-bit words, BF16 storage), and a quantized form's side records.
 std::size_t kv_planes_per_visit(ops::inkling2::KvCodec codec) { return codec == ops::inkling2::KvCodec::Bf16 ? 2 : 4; }
 
 // The full visits' page geometry (core/paged_kv_cache.h): per full visit its K and V planes, then a quantized form's
 // K and V side planes, each page-major [pages][kKvHeads][64][a row] (attention_common.cuh kv_row): a row of 128 BF16
 // (K) or FP16 (V; BF16 on the lossless route, `lossless`) words, or a quantized form's codes and side record
-// (inkling2_attention.h KvCodec); then, with DSpark, the drafter's full layer's K and V (BF16, inkling2_dspark.h), so a
-// page carries the drafter's context with the target's.
+// (inkling2_attention.h KvCodec); then, with DSpark, the drafter's full layer's K and V (BF16, inkling2_dspark.h; with
+// every other pool format INT8: K and V codes, then K and V side records, ops::inkling2::DSparkInt8Cache), so a page
+// carries the drafter's context with the target's.
 KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec codec, bool dspark, bool lossless) {
     const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
     const auto plane                  = [](DType dtype, std::int32_t row) {
@@ -179,8 +184,16 @@ KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec
     if (dspark) {
         static_assert(ops::inkling2::kDSparkKvHeads == ops::inkling2::kKvHeads &&
                       ops::inkling2::kDSparkHeadDim == ops::inkling2::kHeadDim);
-        g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
-        g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+        if (dspark_int8(codec)) {
+            const ops::inkling2::KvRowBytes i8 = ops::inkling2::kv_row_bytes(ops::inkling2::KvCodec::Int8G64);
+            g.planes.push_back(plane(DType::U8, i8.key_code));
+            g.planes.push_back(plane(DType::U8, i8.value_code));
+            g.planes.push_back(plane(DType::U8, i8.key_side));
+            g.planes.push_back(plane(DType::U8, i8.value_side));
+        } else {
+            g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+            g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+        }
     }
     return g;
 }
@@ -466,12 +479,18 @@ public:
             if (o_.draft_tokens < 1 || o_.draft_tokens > static_cast<std::uint32_t>(ops::inkling2::kMarkovSteps)) {
                 throw std::invalid_argument("Inkling 2: DSpark drafts 1-7 tokens a round");
             }
-            // The full layer's context: the pool's last two planes, through the lanes' block-table rows.
+            // The full layer's context: the pool's last two planes (BF16), or last four (INT8: codes then side records),
+            // through the lanes' block-table rows.
             const std::size_t planes = pool_->plane_count();
-            const DSparkPagedContext full{.k            = static_cast<std::uint16_t*>(pool_->plane(planes - 2).data),
-                                          .v            = static_cast<std::uint16_t*>(pool_->plane(planes - 1).data),
-                                          .table        = view_.table,
-                                          .table_stride = view_.table_stride};
+            DSparkPagedContext full{.table = view_.table, .table_stride = view_.table_stride};
+            if (dspark_int8(o_.kv_codec)) {
+                const auto u8 = [&](std::size_t i) { return static_cast<std::uint8_t*>(pool_->plane(i).data); };
+                full.int8 = {.codes_k = u8(planes - 4), .codes_v = u8(planes - 3), .side_k = u8(planes - 2),
+                             .side_v = u8(planes - 1)};
+            } else {
+                full.k = static_cast<std::uint16_t*>(pool_->plane(planes - 2).data);
+                full.v = static_cast<std::uint16_t*>(pool_->plane(planes - 1).data);
+            }
             drafter_ = std::make_unique<Drafter>(p_, forward_, static_cast<std::int32_t>(lanes_.size()), o_.max_context,
                                                  forward_capacity(o_), full);
         }

@@ -61,10 +61,20 @@ struct DSparkMixArgs {
 };
 void dspark_mix(const DSparkMixArgs& args, cudaStream_t stream);
 
+// The full layer's context in INT8 (the target pools' int8 row codec, inkling2_attention.h KvCodec::Int8G64): K and V
+// code planes [pages][kv heads][64][128] (int8) and side planes [pages][kv heads][64][4] (two FP16 scales a row, one a
+// 64-value group: s = fp16(max |x| / 127), code = clamp(round(x / s), +-127)), page-major as the BF16 cache. A value's
+// represented word is bf16(code * s) for K and V alike. Drafts only: no output depends on them.
+struct DSparkInt8Cache {
+    std::uint8_t *codes_k = nullptr, *codes_v = nullptr, *side_k = nullptr, *side_v = nullptr;
+    [[nodiscard]] bool active() const noexcept { return codes_k != nullptr; }
+};
+
 // Per (row, head) of x: n = bf16(x * rsqrt(sum(x^2) * (1 / 128) + eps) * w), then NeoX RoPE at the row's position
 // (pairs (i, i + 64), angle = fp32(position) * theta^(-i / 64), cos and sin rounded to BF16, FP32 products, one BF16
-// rounding). Destination: a drafter cache (keys; `values` copied beside them unchanged) at the row's position, or a dense
-// [rows][heads][128] buffer. Positions: positions[r], or (positions null) *first + r.
+// rounding). Destination: a drafter cache (keys; `values` copied beside them unchanged, or both encoded into the full
+// layer's INT8 planes, `int8`) at the row's position, or a dense [rows][heads][128] buffer. Positions: positions[r], or
+// (positions null) *first + r.
 struct DSparkRotateArgs {
     const std::uint16_t* x       = nullptr; // BF16 [rows][x_stride]: head h at h * 128
     std::int32_t x_stride        = 0;
@@ -85,6 +95,8 @@ struct DSparkRotateArgs {
     // table[lane * table_stride + p / 64], row p % 64 (lane_stride unused).
     const std::int32_t* table = nullptr;
     std::int32_t table_stride = 0;
+    // The full layer in INT8 (ring 0, values set; cache_k and cache_v then unused).
+    DSparkInt8Cache int8;
     std::uint16_t* dense = nullptr;
     // Rows from rounds (positions null): 0, every row the round's; or the rows are blocks of block_rows rows, block i
     // the round at round + i (a round of several rows drafted in one launch), its rows from round[i].first.
@@ -101,7 +113,7 @@ void dspark_inv_freq(double theta, float (&inv_freq)[kDSparkHeadDim / 2]);
 // order), softmax in FP32 (online over key splits of whole 32-key tiles, at least 128 keys, at most `splits` of them,
 // merged in split order), P x V by BF16 MMAs over each p as two BF16 terms (hi = bf16(p), lo = bf16(p - hi); FP32
 // accumulation), out = bf16 [8][24 * 128]. `splits` is the launch's (dspark_attention_splits): the split boundaries follow the context, so only
-// the drafts' last bits depend on it.
+// the drafts' last bits depend on it. The full layer in INT8 (`int8`): the same over its represented words.
 struct DSparkAttentionArgs {
     const std::uint16_t* q = nullptr; // BF16 [8][24][128] (normed, rotated)
     const std::uint16_t *cache_k = nullptr, *cache_v = nullptr;
@@ -109,6 +121,7 @@ struct DSparkAttentionArgs {
     std::int32_t ring        = 0; // 0: the full layer, its keys through the lane's block-table row (dspark_rotate's)
     const std::int32_t* table = nullptr;
     std::int32_t table_stride = 0;
+    DSparkInt8Cache int8;         // the full layer in INT8 (ring 0; cache_k and cache_v then unused)
     std::int32_t splits      = 0;
     const DSparkRound* round = nullptr;
     float* scratch           = nullptr; // dspark_attention_scratch_bytes(splits)

@@ -17,7 +17,9 @@
 #include "core/pdl.cuh"
 #include "ops/common/canonical_math.h"
 #include "ops/common/mma.cuh"
+#include "ops/inkling2/kv_codec.cuh"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -190,6 +192,20 @@ __global__ void __launch_bounds__(32) rotate_kernel(const DSparkRotateArgs a) {
         return;
     }
     const int lane_index = a.lanes != nullptr ? a.lanes[r] : (a.lane >= 0 ? a.lane : round->lane);
+    if (a.ring == 0 && a.int8.codes_k != nullptr) { // DSparkInt8Cache::active (a host function)
+        // The full layer in INT8: the row's K (its BF16 rounding, as the BF16 cache holds it) and V encoded by the warp
+        // (the target pools' int8 row codec: lane l holds values 4 l .. 4 l + 3).
+        const std::int64_t page = a.table[static_cast<std::int64_t>(lane_index) * a.table_stride + position / 64];
+        const std::size_t row   = (static_cast<std::size_t>(page) * kDSparkKvHeads + h) * 64 + position % 64;
+        const float key[4]      = {bf(rb(out[0])), bf(rb(out[1])), bf(rb(out[2])), bf(rb(out[3]))};
+        (void)detail::kv_encode_int8(key, lane, a.int8.codes_k + row * kD, a.int8.side_k + row * 4, false);
+        const uint2 raw_v =
+            *reinterpret_cast<const uint2*>(a.values + static_cast<std::size_t>(r) * a.values_stride + h * kD + 4 * lane);
+        const float value[4] = {canon::f32_from_bits(raw_v.x << 16), canon::f32_from_bits(raw_v.x & 0xFFFF0000U),
+                                canon::f32_from_bits(raw_v.y << 16), canon::f32_from_bits(raw_v.y & 0xFFFF0000U)};
+        (void)detail::kv_encode_int8(value, lane, a.int8.codes_v + row * kD, a.int8.side_v + row * 4, false);
+        return;
+    }
     std::size_t at;
     if (a.ring > 0) {
         // A slot a later row of the lane also takes is left to it (mix_kernel's rule; rows a lane's consecutive positions).
@@ -276,6 +292,33 @@ struct AttnSmem {
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return static_cast<unsigned>(__cvta_generic_to_shared(p)); }
 
+// An INT8 tile piece in registers (8 values of a K row and of its V row, their groups' FP16 scales), fetched a tile
+// ahead and decoded into the tile stage after the tile before it computes.
+struct Int8Piece {
+    uint2 k = {}, v = {};
+    std::uint16_t k_scale = 0, v_scale = 0;
+    bool live = false;
+};
+
+// 8 int8 codes and their group's FP16 scale as 8 represented BF16 words, bf16(code * s) (the product exact in FP32),
+// a pair a hardware conversion (cvt.rn.bf16x2.f32: round to nearest even, canon::f32_to_bf16_rn's bits for these
+// finite products).
+__device__ __forceinline__ uint4 int8_words(uint2 codes, std::uint16_t scale_bits) {
+    const float s          = __half2float(__ushort_as_half(scale_bits));
+    const std::uint32_t c[2] = {codes.x, codes.y};
+    std::uint32_t w[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const std::uint32_t word = c[i / 2] >> (16 * (i % 2));
+        const float lo           = static_cast<float>(static_cast<std::int8_t>(word & 0xFFU));
+        const float hi           = static_cast<float>(static_cast<std::int8_t>((word >> 8) & 0xFFU));
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(canon::mul_rn(lo, s), canon::mul_rn(hi, s));
+        w[i]                      = *reinterpret_cast<const std::uint32_t*>(&pair);
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+template <bool Int8>
 __global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const DSparkAttentionArgs args) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const DSparkAttentionArgs a = attention_block(args);
@@ -316,11 +359,46 @@ __global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const 
         }
         cp_async_commit();
     };
+    // INT8: a tile's pieces (thread t pieces t and t + 256 as stage's) fetched into registers, then decoded into a stage.
+    Int8Piece ahead[2];
+    const auto fetch = [&](int t0) {
+        const int n = min(kTileKeys, k1 - t0);
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int piece = tid + j * kAttnThreads, key = piece / 16, c = piece % 16;
+            ahead[j].live = key < n;
+            if (ahead[j].live) {
+                const std::size_t row = row_of(t0 + key);
+                ahead[j].k            = *reinterpret_cast<const uint2*>(a.int8.codes_k + row * kD + 8 * c);
+                ahead[j].v            = *reinterpret_cast<const uint2*>(a.int8.codes_v + row * kD + 8 * c);
+                ahead[j].k_scale      = reinterpret_cast<const std::uint16_t*>(a.int8.side_k + row * 4)[c >= 8 ? 1 : 0];
+                ahead[j].v_scale      = reinterpret_cast<const std::uint16_t*>(a.int8.side_v + row * 4)[c >= 8 ? 1 : 0];
+            }
+        }
+    };
+    const auto put = [&](int buffer) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int piece = tid + j * kAttnThreads, key = piece / 16, c = piece % 16;
+            if (ahead[j].live) {
+                *reinterpret_cast<uint4*>(&sm.k[buffer][key][8 * c]) = int8_words(ahead[j].k, ahead[j].k_scale);
+                *reinterpret_cast<uint4*>(&sm.v[buffer][key][8 * c]) = int8_words(ahead[j].v, ahead[j].v_scale);
+            } else {
+                *reinterpret_cast<uint4*>(&sm.v[buffer][key][8 * c]) = make_uint4(0U, 0U, 0U, 0U);
+            }
+        }
+    };
     for (int i = tid; i < kGroupRows * kD / 8; i += kAttnThreads) {
         const int q = i / (kD / 8), c = i % (kD / 8), row = q / 3, head = 3 * g + q % 3;
         cp_async16(&sm.q[q][8 * c], a.q + (static_cast<std::size_t>(row) * kDSparkHeads + head) * kD + 8 * c);
     }
-    stage(k0, 0);
+    if constexpr (Int8) {
+        cp_async_commit(); // the queries' group
+        fetch(k0);
+        put(0);
+    } else {
+        stage(k0, 0);
+    }
     float m[3] = {-INFINITY, -INFINITY, -INFINITY}, l[3] = {0.0F, 0.0F, 0.0F};
     // P x V accumulators (C fragments of O^T): row tile t's dims 16 w + (lane >> 2) (slots 0, 1) and + 8 (slots 2, 3),
     // rows 8 t + 2 (lane & 3) (slots 0, 2) and + 1 (slots 1, 3).
@@ -330,7 +408,12 @@ __global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const 
     for (int t0 = k0; t0 < k1; t0 += kTileKeys, buffer ^= 1) {
         const int n = min(kTileKeys, k1 - t0);
         __syncthreads(); // the last tile's readers are done with the other stage, the scores and the probabilities
-        if (t0 + kTileKeys < k1) {
+        if constexpr (Int8) {
+            // This tile was decoded into `buffer` at the end of the last one (or before the loop); the next one's codes
+            // load into registers now and decode into the other stage once this tile has computed.
+            if (t0 + kTileKeys < k1) { fetch(t0 + kTileKeys); }
+            cp_async_wait<0>(); // the queries
+        } else if (t0 + kTileKeys < k1) {
             stage(t0 + kTileKeys, buffer ^ 1);
             cp_async_wait<1>();
         } else {
@@ -401,6 +484,11 @@ __global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const 
                     mma_bf16(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], vf[0], vf[1], vf[2], vf[3], pl[0], pl[1]);
                 }
             }
+        }
+        // INT8: the next tile into the other stage (its last readers finished before this tile's first barrier; the
+        // next tile's first barrier publishes it).
+        if constexpr (Int8) {
+            if (t0 + kTileKeys < k1) { put(buffer ^ 1); }
         }
     }
     if (lane == 0) {
@@ -853,12 +941,17 @@ void dspark_mix(const DSparkMixArgs& a, cudaStream_t stream) {
 }
 
 void dspark_rotate(const DSparkRotateArgs& a, cudaStream_t stream) {
+    const bool int8 = a.dense == nullptr && a.ring <= 0 && a.int8.active();
     if (a.x == nullptr || a.norm == nullptr || a.rows <= 0 || a.heads <= 0 || a.x_stride < a.heads * kD ||
         (a.positions == nullptr && a.round == nullptr) || a.inv_freq == nullptr ||
-        (a.dense == nullptr && (a.cache_k == nullptr || (a.values != nullptr && a.cache_v == nullptr) ||
+        (a.dense == nullptr && ((!int8 && a.cache_k == nullptr) || (a.values != nullptr && !int8 && a.cache_v == nullptr) ||
                                 (a.lanes == nullptr && a.lane < 0 && a.round == nullptr) ||
                                 (a.ring <= 0 && (a.table == nullptr || a.table_stride <= 0))))) {
         throw std::invalid_argument("inkling2 dspark_rotate: rows, heads, a norm, positions and one destination");
+    }
+    if (int8 && (a.values == nullptr || a.heads != kDSparkKvHeads || a.int8.codes_v == nullptr || a.int8.side_k == nullptr ||
+                 a.int8.side_v == nullptr)) {
+        throw std::invalid_argument("inkling2 dspark_rotate: the INT8 full layer takes keys and values, all four planes");
     }
     check(pdl::launch_consumer(config(dim3(a.rows, a.heads), dim3(32), 0, stream), rotate_kernel, a), "rotate");
 }
@@ -881,16 +974,27 @@ std::size_t dspark_attention_scratch_bytes(std::int32_t splits) {
 }
 
 void dspark_attention(const DSparkAttentionArgs& a, cudaStream_t stream) {
-    if (a.q == nullptr || a.cache_k == nullptr || a.cache_v == nullptr || a.round == nullptr || a.scratch == nullptr ||
-        a.out == nullptr || a.splits <= 0 || (a.ring <= 0 && (a.table == nullptr || a.table_stride <= 0))) {
+    const bool int8 = a.ring <= 0 && a.int8.active();
+    if (a.q == nullptr || (!int8 && (a.cache_k == nullptr || a.cache_v == nullptr)) || a.round == nullptr ||
+        a.scratch == nullptr || a.out == nullptr || a.splits <= 0 || (a.ring <= 0 && (a.table == nullptr || a.table_stride <= 0))) {
         throw std::invalid_argument("inkling2 dspark_attention: queries, a cache, the round, scratch and splits");
     }
-    if (reinterpret_cast<std::uintptr_t>(a.q) % 16 != 0 || reinterpret_cast<std::uintptr_t>(a.cache_k) % 16 != 0 ||
-        reinterpret_cast<std::uintptr_t>(a.cache_v) % 16 != 0) {
+    if (int8 && (a.int8.codes_v == nullptr || a.int8.side_k == nullptr || a.int8.side_v == nullptr ||
+                 reinterpret_cast<std::uintptr_t>(a.int8.codes_k) % 8 != 0 ||
+                 reinterpret_cast<std::uintptr_t>(a.int8.codes_v) % 8 != 0 ||
+                 reinterpret_cast<std::uintptr_t>(a.int8.side_k) % 4 != 0 ||
+                 reinterpret_cast<std::uintptr_t>(a.int8.side_v) % 4 != 0)) {
+        throw std::invalid_argument("inkling2 dspark_attention: the INT8 full layer's four planes, 8- and 4-byte aligned");
+    }
+    if (reinterpret_cast<std::uintptr_t>(a.q) % 16 != 0 ||
+        (!int8 && (reinterpret_cast<std::uintptr_t>(a.cache_k) % 16 != 0 || reinterpret_cast<std::uintptr_t>(a.cache_v) % 16 != 0))) {
         throw std::invalid_argument("inkling2 dspark_attention: 16-byte aligned queries and caches (16-byte row loads)");
     }
     static const bool configured = [] {
-        check(cudaFuncSetAttribute(attention_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        check(cudaFuncSetAttribute(attention_split_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(sizeof(AttnSmem))),
+              "attribute");
+        check(cudaFuncSetAttribute(attention_split_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    static_cast<int>(sizeof(AttnSmem))),
               "attribute");
         return true;
@@ -900,8 +1004,9 @@ void dspark_attention(const DSparkAttentionArgs& a, cudaStream_t stream) {
         throw std::invalid_argument("inkling2 dspark_attention: blocks need their strides");
     }
     const auto blocks = static_cast<unsigned>(a.blocks);
-    check(pdl::launch_consumer(config(dim3(a.splits, kDSparkKvHeads, blocks), dim3(kAttnThreads), sizeof(AttnSmem), stream),
-                               attention_split_kernel, a),
+    const auto split_config = config(dim3(a.splits, kDSparkKvHeads, blocks), dim3(kAttnThreads), sizeof(AttnSmem), stream);
+    check(int8 ? pdl::launch_consumer(split_config, attention_split_kernel<true>, a)
+               : pdl::launch_consumer(split_config, attention_split_kernel<false>, a),
           "attention");
     check(pdl::launch_consumer(config(dim3(kDSparkKvHeads, kGroupRows, blocks), dim3(kD), 0, stream),
                                attention_merge_kernel, a),

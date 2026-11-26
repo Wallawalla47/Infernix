@@ -564,7 +564,7 @@ throughout, and the rule is explicit implementations per supported architecture.
 | Store | Content | Per token | Notes |
 |---|---|---:|---|
 | Main Text (paged, P = 64) | global KV of the 8 full-attention visits | INT8-G64 16.5 KiB; BF16 32 KiB | visit-indexed layers 0-7 = (5), (11, p1..p3), (17, p1..p3), (23) |
-| Draft Full (paged) | DSpark layer 1 context K/V | BF16 4 KiB | only with `--spec dspark`; BF16 as vLLM's SM12x draft KV |
+| Draft Full (paged) | DSpark layer 1 context K/V | INT8-G64 2.06 KiB; BF16 4 KiB with BF16 pools | only with `--spec dspark` (INT8 since 2026-11-26, §13.6) |
 | StateImage | rings and seeds below | fixed per lane | [§7.2](#72-stateimage) |
 
 ### 7.2 StateImage
@@ -604,7 +604,8 @@ form Qwen3.8-Flash-Next's binding takes:
 
 - **Pages.** The full visits' pools are one core `DeviceKVPagePool` of page-major planes (`[pages][8][64][row]`: a
   page is one contiguous run in each plane, so Host records copy whole pages), the lanes' block-table rows a
-  `KVExecutionTablePool`. With DSpark the pool has two more planes, the drafter's full layer's K and V (BF16), read
+  `KVExecutionTablePool`. With DSpark the pool has the drafter's full layer's K and V too: two BF16 planes with BF16
+  pools, four with every other format (INT8-G64 codes and side records, `ops::inkling2::DSparkInt8Cache`), read
   and written through the same rows, so a cached page carries the drafter's context with the model's. The lanes share
   the pool (`--kv-capacity`, at least one `--max-context`): a binding reserves its first unit (a resume: through its
   paused frontier and one round), `reserve_units` each later one (a prompt chunk, a decode round with a DSpark round's
@@ -1401,6 +1402,21 @@ fell only ~0.06 ms of a ~12.7 ms round; the arms' +2.0 to +3.1 % there follows t
 differ: 0.470-0.523 against 0.453-0.501 accepted a draft), so 2K is level within that spread. Both served arms ran a
 build that also held a tensor-core decode and verify attention kernel this engine does not have, so the served figures
 are that build's.
+
+Its full-layer context in INT8 (2026-11-26): with every target pool format but BF16 (bf16p included) the drafter's
+context K and V take the
+INT8-G64 codes and side records of the full visits (`DSparkInt8Cache`: written by `dspark_rotate`, decoded in
+`dspark_attention`'s stage), about 2.06 KiB a token where the two BF16 planes took 4, so the pool holds 10 % more
+tokens (the owner's configuration: 556,224 against 503,680 in the same 9.8 GiB). BF16 pools keep BF16 planes. Drafts
+only. The op test's INT8 writes equal a host encoder bit for bit, and the attention stays within its FP64 bound (worst
+0.79). One row's attention (op bench) is slower at short contexts and faster at long ones: 2K keys 0.0185 → 0.0210 ms,
+8K 0.0308 → 0.0323, 32K 0.0985 → 0.0754, 100K-200K 0.255-0.489 → 0.221-0.418 (about 2.5 µs a row a round at 2K).
+Served (the owner's configuration, seeded, three servers an arm interleaved, two repetitions, against
+a switch that kept the BF16 planes, since removed): tok/s level across the eight phases (mean +0.1 %; four
+level, two +0.6 / +1.4 % and two −1.2 / −1.4 % beyond the arms' spread, each where the arms' drafts differed: same
+accepted counts, a few more drafted), accepted 16,556 of 29,368 drafts against 16,502 of 29,154. A prefix-cache file
+saved by an earlier build, whose pages hold the BF16 planes, is not reused (its fingerprint carries the build's
+identity).
 
 A Q8 head (`--q8-weights`, `--a8-activations`) then runs the drafter's 7 rows on 8-bit inputs (`Forward::project_head`
 with the drafter's own 8-bit input rows: `projections_mma`'s tensor cores instead of the skinny route's FMA chains;
