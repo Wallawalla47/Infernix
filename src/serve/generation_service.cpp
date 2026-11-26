@@ -285,6 +285,7 @@ infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point de
     }
     media.bytes               = std::move(source_bytes);
     media.image_resize_policy = part.image_resize_policy;
+    media.image_max_long_side = part.image_max_long_side;
     return media;
 }
 

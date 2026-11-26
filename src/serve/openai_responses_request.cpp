@@ -132,6 +132,14 @@ infernix::product::media_acquire::Source media_source(std::string value, const c
     return source;
 }
 
+// input_image.detail, as image_url.detail in chat (image_detail_long_side): 'low' caps the longest
+// side, every other value is the native geometry.
+std::string image_detail(const Json& part) {
+    if (!part.contains("detail") || part.at("detail").is_null()) { return "auto"; }
+    if (!part.at("detail").is_string()) { bad_request("input_image.detail must be a string", "input"); }
+    return part.at("detail").get_ref<const std::string&>() == "low" ? "low" : "auto";
+}
+
 infernix::product::media_acquire::Source parse_image_source(const Json& part) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
         bad_request("input_image.file_id requires a Files API, which Infernix does not provide",
@@ -141,18 +149,7 @@ infernix::product::media_acquire::Source parse_image_source(const Json& part) {
         part.at("image_url").get_ref<const std::string&>().empty()) {
         bad_request("input_image must contain a non-empty image_url", "input");
     }
-    if (part.contains("detail") && !part.at("detail").is_null()) {
-        if (!part.at("detail").is_string()) {
-            bad_request("input_image.detail must be a string", "input");
-        }
-        // 'high' is the model's native full-quality preprocessing, as 'auto' (chat's
-        // image_url.detail too).
-        const std::string& detail = part.at("detail").get_ref<const std::string&>();
-        if (detail != "auto" && detail != "high") {
-            bad_request("only input_image detail 'auto' or 'high' is supported", "input",
-                        "image_detail_not_supported");
-        }
-    }
+    (void)image_detail(part);
     return media_source(part.at("image_url").get<std::string>(), "input_image.image_url");
 }
 
@@ -257,10 +254,11 @@ void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage&
         part.kind     = ContentKind::Image;
         part.type_raw = type;
         part.source   = parse_image_source(value);
+        part.image_max_long_side = image_detail_long_side(image_detail(value));
         apply_shared_breakpoint(part, value, breakpoint_count);
         parsed.turn.content.push_back(std::move(part));
         Json canonical{
-            {"type", "input_image"}, {"image_url", value.at("image_url")}, {"detail", "auto"}};
+            {"type", "input_image"}, {"image_url", value.at("image_url")}, {"detail", image_detail(value)}};
         if (value.contains("prompt_cache_breakpoint")) {
             canonical["prompt_cache_breakpoint"] = value.at("prompt_cache_breakpoint");
         }
@@ -557,6 +555,7 @@ ChatTurn parse_function_call_output_item(
                 part.kind     = ContentKind::Image;
                 part.type_raw = type;
                 part.source   = parse_image_source(value);
+                part.image_max_long_side = image_detail_long_side(image_detail(value));
                 apply_shared_breakpoint(part, value, breakpoint_count);
                 turn.content.push_back(std::move(part));
             } else if (type == "input_file") {

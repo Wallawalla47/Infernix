@@ -1893,6 +1893,49 @@ int test_image_smart_resize_canvases() {
     return failures;
 }
 
+// OpenAI's detail 'low' (OwnedMedia::image_max_long_side 512, Frigate's camera descriptions): the
+// image is read as if its longest side were 512, aspect kept, on the model's 32-pixel grid. The same
+// bytes without the cap, prepared first on the same frontend, must not answer from the media cache.
+int test_image_detail_low_canvases() {
+    FrontendResources owned = resources();
+    owned.preprocessor_config_json =
+        R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":8192,"longest_edge":4194304}})";
+    const Frontend frontend = make_frontend(owned);
+
+    struct Case {
+        int width, height;
+        std::uint32_t long_side;
+        int canvas_width, canvas_height;
+        const char* why;
+    };
+    const Case cases[] = {
+        {1280, 720, 0, 1280, 704, "no cap: the native canvas (and it is now in the media cache)"},
+        {1280, 720, 512, 512, 288, "a 16:9 camera frame capped at 512: 144 tokens instead of 880"},
+        {2560, 1440, 512, 512, 288, "a larger frame lands on the same capped canvas"},
+        {640, 480, 512, 512, 384, "4:3 keeps its aspect"},
+        {400, 300, 512, 384, 288, "an image under the cap keeps its native canvas"},
+    };
+    int failures = 0;
+    for (const Case& c : cases) {
+        auto input = image_text_input(block_ppm(c.width, c.height, 127), {}, "detail-low.ppm");
+        input.messages[0].parts[0].media.image_max_long_side = c.long_side;
+        const std::size_t counted = frontend.count_tokens(input);
+        const auto prepared       = frontend.prepare(std::move(input));
+        const auto& data          = FrontendFactory::inspect(prepared);
+        const std::uint64_t expected =
+            static_cast<std::uint64_t>(c.canvas_width / 32) * static_cast<std::uint64_t>(c.canvas_height / 32);
+        const bool matches = data.vision_items.size() == 1 && data.prepare.vision_tokens == expected &&
+                             data.prepare.raw_patches == expected * 4 && counted == data.token_ids.size();
+        if (!matches) {
+            std::cerr << "detail low canvas differs for " << c.width << "x" << c.height << " cap " << c.long_side
+                      << " (" << c.why << "): " << data.prepare.vision_tokens << " tokens, expected " << expected
+                      << ", counted " << counted << " of " << data.token_ids.size() << '\n';
+        }
+        failures += matches ? 0 : 1;
+    }
+    return failures;
+}
+
 int test_explicit_leading_instruction_cache_boundary() {
     const Frontend frontend           = make_frontend(resources(), false);
     constexpr std::string_view stable = "stable cache section.";
@@ -4685,6 +4728,7 @@ int main() try {
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
     failures += test_image_smart_resize_canvases();
+    failures += test_image_detail_low_canvases();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_trimmed_source_cache_boundaries();
     failures += test_source_part_recovery_boundary();
