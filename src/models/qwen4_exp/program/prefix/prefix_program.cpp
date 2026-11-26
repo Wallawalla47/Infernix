@@ -23,6 +23,7 @@ std::atomic<std::int64_t> forced_tap_position{-1}; // -1: none
 std::atomic<std::uint32_t> restore_delay_us{0};
 std::atomic<bool> restore_fault{false};
 std::atomic<std::uint64_t> drain_count{0};
+std::atomic<std::uint64_t> captures_known{0};
 std::atomic<std::uint64_t> tap_block_write_count{0};
 std::atomic<std::int64_t> binding_hold_until{0}; // steady_clock ticks; 0: none
 std::atomic<std::uint64_t> held_finish_count{0};
@@ -86,6 +87,10 @@ std::uint64_t tap_block_writes() noexcept { return tap_block_write_count.load(st
 void count_drain() noexcept { drain_count.fetch_add(1, std::memory_order_relaxed); }
 
 std::uint64_t drains() noexcept { return drain_count.load(std::memory_order_relaxed); }
+
+void record_known_captures(std::uint64_t count) noexcept { captures_known.store(count, std::memory_order_relaxed); }
+
+std::uint64_t known_captures() noexcept { return captures_known.load(std::memory_order_relaxed); }
 
 void set_restore_delay(std::uint32_t microseconds) noexcept { restore_delay_us.store(microseconds); }
 
@@ -1292,6 +1297,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.close_endpoint = false;
     lane.prefix.follow         = PrefixFollow::Unknown;
     lane.prefix.lineage_echo   = false;
+    testing::record_known_captures(prefix_->known_captures());
 }
 
 // After a non-finite failure, once the lane's pins are released (hybrid-prefix-cache-spec §7.8):

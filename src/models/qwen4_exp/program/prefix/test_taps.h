@@ -41,6 +41,11 @@ void count_tap_block_writes(std::uint64_t blocks) noexcept;
 void count_drain() noexcept;
 [[nodiscard]] std::uint64_t drains() noexcept;
 
+// The capture results a Program's prefix cache kept after its latest lane release (prefix_release): what the slots
+// keep for their next admission, however many requests came before (the prefix cache test's growth case).
+void record_known_captures(std::uint64_t count) noexcept;
+[[nodiscard]] std::uint64_t known_captures() noexcept;
+
 // For `hold` after the call (zero: none), a binding's context transaction whose own work is done is reported
 // unfinished: the binding spans more Engine cycles, as a Vision encode lent its window does (a layer group a cycle).
 // And the finishes completed beside an open transaction (finish_held) since the process started; count_held_finish
