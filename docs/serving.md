@@ -362,7 +362,8 @@ The endpoint supports:
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
   `video_url` extension using HTTP(S) or data URIs; image detail is omitted, `auto` or `high` (both the
-  model's native full-quality preprocessing);
+  model's native full-quality preprocessing) or `low` (the picture's longer side capped at 512 px,
+  its aspect kept, on every vision model);
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation. As an extension (OpenAI rejects it), `-1` means no explicit limit:
   the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
@@ -395,7 +396,7 @@ The endpoint supports:
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes nonzero `logit_bias`, requested log probabilities, audio/file input or
-audio output, image detail other than `auto` or `high`, web search, moderation, low/high verbosity, stored
+audio output, image detail other than `auto`, `high` or `low`, web search, moderation, low/high verbosity, stored
 Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee Infernix cannot provide.
 
@@ -1210,7 +1211,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted, `auto` or `high`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted, `auto`, `high` or `low` (longer side capped at 512 px); requires server `--vision` |
 | `input_video` | Infernix extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -1245,7 +1246,7 @@ prompt representation.
 An `input_file` part in a user message or a tool result is a PDF document (`file_data`, a base64 PDF
 as a data URL or bare, or `file_url`; `filename` titles it), read as described in
 [Documents, PDFs and citations](#documents-pdfs-and-citations). A `file_id` input, `input_audio`, image `file_id`,
-image detail other than `auto` or `high`, reasoning metadata without raw
+image detail other than `auto`, `high` or `low`, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.

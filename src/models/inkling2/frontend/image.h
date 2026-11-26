@@ -5,7 +5,9 @@
 // ((rgb * a + bg * (255 - a) + 127) / 255), padded right and bottom to whole (patch * merge)-pixel cells with -1 on
 // the 0-255 scale, (v - 127.5) / 127.5 in FP32, then BF16. One image token per cell. The reference never resizes; an
 // image of more cells than the budget (--vision-max-merged) is first downscaled (bicubic) to the largest whole cells
-// that fit with its aspect kept (smart_resize's floor), or refused when its request says so.
+// that fit with its aspect kept (smart_resize's floor), or refused when its request says so. A request's long-side cap
+// (OwnedMedia::image_max_long_side, OpenAI's detail 'low' = 512) downscales the same way first: to the whole cells
+// whose longer side is at most the cap, the aspect kept.
 
 #include "infernix/types.h"
 #include "models/inkling2/config.h"
@@ -26,13 +28,15 @@ struct ProcessedImage {
     [[nodiscard]] std::int32_t cells() const noexcept { return rows * cols; }
 };
 
-// The cells an image of this size takes (after the budget's downscale), without decoding it.
+// The cells an image of this size takes (after the long-side cap's and the budget's downscales), without decoding it:
+// `resized` either downscale, `over_budget` the budget's (a request may refuse that one).
 struct ImageCells {
     std::int32_t rows = 0, cols = 0;
-    bool resized = false;
+    bool resized     = false;
+    bool over_budget = false;
 };
 [[nodiscard]] ImageCells image_cells(std::int32_t width, std::int32_t height, const VisionConfig& config,
-                                     std::uint32_t max_cells);
+                                     std::uint32_t max_cells, std::uint32_t max_long_side = 0);
 
 // Decodes and processes one image (RequestError InvalidMedia or MediaBudgetExceeded on a refused one).
 [[nodiscard]] ProcessedImage process_image(const OwnedMedia& media, const VisionConfig& config, std::uint32_t max_cells,

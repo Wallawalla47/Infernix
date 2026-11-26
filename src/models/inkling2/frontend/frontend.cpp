@@ -288,8 +288,8 @@ struct Frontend::Impl {
         std::vector<std::int32_t> out;
         for (const OwnedMedia* item : media) {
             const MediaGeometry g = image_geometry(*item);
-            const ImageCells c    = image_cells(g.width, g.height, *vision, max_cells);
-            if (c.resized && item->image_resize_policy == ImageResizePolicy::RejectOversized) {
+            const ImageCells c    = image_cells(g.width, g.height, *vision, max_cells, item->image_max_long_side);
+            if (c.over_budget && item->image_resize_policy == ImageResizePolicy::RejectOversized) {
                 throw RequestError(RequestErrorKind::MediaBudgetExceeded,
                                    "Inkling 2 image: " + std::to_string(g.width) + " x " + std::to_string(g.height) +
                                        " pixels take more than the " + std::to_string(max_cells) +

@@ -388,7 +388,7 @@ int test_typed_items_and_cache_markers() {
                                   .image_max_long_side == 0,
                           "input_image detail 'high' keeps the native geometry");
         for (const auto& [value, long_side] : std::vector<std::pair<const char*, std::uint32_t>>{
-                 {"low", 512U}, {"auto", 0U}, {"original", 0U}}) {
+                 {"low", 512U}, {"auto", 0U}}) {
             detail["input"][2]["output"][1]["detail"] = value;
             failures += check(parse_openai_responses_create_request(detail, limits())
                                       .prompt.input_turns[1]
@@ -397,6 +397,11 @@ int test_typed_items_and_cache_markers() {
                               std::string("input_image detail '") + value +
                                   "' is accepted with long side " + std::to_string(long_side));
         }
+        detail["input"][2]["output"][1]["detail"] = "original";
+        failures += check(api_error([&] {
+                              (void)parse_openai_responses_create_request(detail, limits());
+                          }).code == "image_detail_not_supported",
+                          "input_image detail 'original' refused");
     }
 
     OpenAIResponsesStore store(8, 1ULL << 20);

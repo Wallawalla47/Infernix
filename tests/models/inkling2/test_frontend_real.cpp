@@ -430,6 +430,15 @@ int main() {
                 rejected = error.kind() == infernix::RequestErrorKind::MediaBudgetExceeded;
             }
             check(rejected, "an oversized image is refused when its request refuses downsizing");
+            // A long-side cap (OpenAI's detail 'low' sets 512): the same 400 x 400 image capped at 200 px takes 5 x 5
+            // whole cells, even when the request refuses the budget's downsizing (the cap is the request's own).
+            PromptInput low = big;
+            low.messages.back().parts.back().media.image_max_long_side = 200;
+            const ink::PreparedPrompt capped = budget.prepare(low);
+            check(capped.data().images.size() == 1 && capped.data().images[0].image.rows == 5 &&
+                      capped.data().images[0].image.cols == 5,
+                  "a capped image is downscaled to the whole cells within its long-side cap");
+            check(budget.count_tokens(low) == capped.token_ids().size(), "count_tokens counts the capped image");
         }
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

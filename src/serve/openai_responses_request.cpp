@@ -133,11 +133,15 @@ infernix::product::media_acquire::Source media_source(std::string value, const c
 }
 
 // input_image.detail, as image_url.detail in chat (image_detail_long_side): 'low' caps the longest
-// side, every other value is the native geometry.
+// side, 'auto' and 'high' are the native geometry, any other value is refused.
 std::string image_detail(const Json& part) {
     if (!part.contains("detail") || part.at("detail").is_null()) { return "auto"; }
     if (!part.at("detail").is_string()) { bad_request("input_image.detail must be a string", "input"); }
-    return part.at("detail").get_ref<const std::string&>() == "low" ? "low" : "auto";
+    const std::string& detail = part.at("detail").get_ref<const std::string&>();
+    if (detail != "auto" && detail != "high" && detail != "low") {
+        bad_request("only input_image detail 'auto', 'high' or 'low' is supported", "input", "image_detail_not_supported");
+    }
+    return detail == "low" ? "low" : "auto";
 }
 
 infernix::product::media_acquire::Source parse_image_source(const Json& part) {

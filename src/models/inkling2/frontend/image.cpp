@@ -45,16 +45,29 @@ media::decode::Policy decode_policy(const std::function<void()>& checkpoint) {
 
 } // namespace
 
-ImageCells image_cells(std::int32_t width, std::int32_t height, const VisionConfig& config, std::uint32_t max_cells) {
+ImageCells image_cells(std::int32_t width, std::int32_t height, const VisionConfig& config, std::uint32_t max_cells,
+                       std::uint32_t max_long_side) {
     const auto f = static_cast<std::int64_t>(config.cell());
     if (width <= 0 || height <= 0) { throw RequestError(RequestErrorKind::InvalidMedia, "Inkling 2 image: an empty image"); }
     ImageCells out{static_cast<std::int32_t>((height + f - 1) / f), static_cast<std::int32_t>((width + f - 1) / f)};
+    // The long-side cap (detail 'low'): the whole cells whose longer side is at most the cap, the aspect kept.
+    double h = height, w = width;
+    if (const std::int32_t long_side = std::max(width, height);
+        max_long_side != 0 && static_cast<std::uint32_t>(long_side) > max_long_side) {
+        const double scale = static_cast<double>(max_long_side) / long_side;
+        h *= scale;
+        w *= scale;
+        out.rows    = static_cast<std::int32_t>(std::max<std::int64_t>(1, static_cast<std::int64_t>(std::floor(h / f))));
+        out.cols    = static_cast<std::int32_t>(std::max<std::int64_t>(1, static_cast<std::int64_t>(std::floor(w / f))));
+        out.resized = true;
+    }
     if (static_cast<std::uint64_t>(out.rows) * static_cast<std::uint64_t>(out.cols) <= max_cells) { return out; }
     // smart_resize's floor: the largest whole cells with the aspect kept that the budget holds.
-    const double beta = std::sqrt(static_cast<double>(height) * width / (static_cast<double>(max_cells) * f * f));
-    out.rows    = static_cast<std::int32_t>(std::max<std::int64_t>(1, static_cast<std::int64_t>(std::floor(height / beta / f))));
-    out.cols    = static_cast<std::int32_t>(std::max<std::int64_t>(1, static_cast<std::int64_t>(std::floor(width / beta / f))));
-    out.resized = true;
+    const double beta = std::sqrt(h * w / (static_cast<double>(max_cells) * f * f));
+    out.rows        = static_cast<std::int32_t>(std::max<std::int64_t>(1, static_cast<std::int64_t>(std::floor(h / beta / f))));
+    out.cols        = static_cast<std::int32_t>(std::max<std::int64_t>(1, static_cast<std::int64_t>(std::floor(w / beta / f))));
+    out.resized     = true;
+    out.over_budget = true;
     while (static_cast<std::uint64_t>(out.rows) * static_cast<std::uint64_t>(out.cols) > max_cells) { // a 1-cell side
         if (out.rows >= out.cols) { --out.rows; } else { --out.cols; }
     }
@@ -101,10 +114,10 @@ ProcessedImage process_image(const OwnedMedia& media, const VisionConfig& config
         }
         image.alpha.clear();
     }
-    const ImageCells cells = image_cells(image.width, image.height, config, max_cells);
+    const ImageCells cells = image_cells(image.width, image.height, config, max_cells, media.image_max_long_side);
     const int f            = static_cast<int>(config.cell());
     if (cells.resized) {
-        if (media.image_resize_policy == ImageResizePolicy::RejectOversized) {
+        if (cells.over_budget && media.image_resize_policy == ImageResizePolicy::RejectOversized) {
             throw RequestError(RequestErrorKind::MediaBudgetExceeded,
                                "Inkling 2 image: " + std::to_string(image.width) + " x " + std::to_string(image.height) +
                                    " pixels take more than the " + std::to_string(max_cells) +

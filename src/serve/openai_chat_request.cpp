@@ -253,11 +253,16 @@ infernix::product::media_acquire::Source parse_media_url(const Json& part, const
                 bad_request("image_url.detail must be a string", "messages");
             }
             // 'low' (Frigate's camera descriptions) caps the picture's longest side; 'high' (native
-            // OpenAI clients such as Codex), 'auto' and unknown values take the native geometry.
-            if (max_long_side != nullptr) {
-                *max_long_side =
-                    image_detail_long_side(value.at("detail").get_ref<const std::string&>());
+            // OpenAI clients such as Codex) and 'auto' take the native geometry; any other profile
+            // is one Infernix's frontends cannot apply.
+            const std::string& detail = value.at("detail").get_ref<const std::string&>();
+            if (detail != "auto" && detail != "high" && detail != "low") {
+                bad_request("image_url.detail='" + detail +
+                                "' requests a preprocessing profile Infernix's Vision frontends cannot "
+                                "apply; use 'auto', 'high' or 'low'",
+                            "messages", "image_detail_not_supported");
             }
+            if (max_long_side != nullptr) { *max_long_side = image_detail_long_side(detail); }
         }
     } else {
         bad_request(std::string(field) + " must be a URL string or object", "messages");
