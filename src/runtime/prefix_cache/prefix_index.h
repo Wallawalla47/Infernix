@@ -614,7 +614,7 @@ public:
 
     // ---- SSD tier (§5.7) -------------------------------------------------------------------------
     // Host slabs that can be freed without losing anything: free ones, dead blocks', and every Host
-    // copy (block or image) the SSD also holds. Pinned and held entries are counted too.
+    // copy (block or image) the SSD also holds, each slab once. Pinned and held entries are counted too.
     [[nodiscard]] std::uint64_t host_lossless_slabs() const noexcept;
     // The SSD image fates by kind so far (PrefixIndexStats::ssd_by_kind, without computing the rest).
     [[nodiscard]] const std::array<SsdKindStats, kSnapshotKinds>& ssd_kind_stats() const noexcept { return counters_.ssd_by_kind; }
@@ -721,8 +721,9 @@ private:
         std::uint32_t clean_prev    = kNoId;
         std::uint32_t clean_next    = kNoId;
         std::uint8_t clean_list     = 0xff;
-        // Counted in host_clean_nodes_ (Host and SSD Resident).
-        bool clean_counted = false;
+        // Counted in host_clean_nodes_ (Host and SSD Resident), and in host_clean_dead_ (clean and on the dead list).
+        bool clean_counted      = false;
+        bool clean_dead_counted = false;
         // Lowest queue rank of a held snapshot whose anchor path holds this node (kNoHold: none).
         std::uint8_t hold = kNoHold;
     };
@@ -1040,6 +1041,8 @@ private:
     // Host slabs whose bytes the SSD tier also holds: blocks, and snapshot images with their tails.
     std::uint64_t host_clean_nodes_       = 0;
     std::uint64_t host_clean_image_slabs_ = 0;
+    // Clean blocks that are also dead (counted in dead_count_ too): host_lossless_slabs counts each once.
+    std::uint64_t host_clean_dead_ = 0;
     // Nodes on the kCold or kCleanWarm list: the clean blocks evict_for_slabs may drop (unheld, under no
     // queue hold, under a live snapshot; a dead clean block is on the dead list instead).
     std::uint64_t host_clean_listed_ = 0;

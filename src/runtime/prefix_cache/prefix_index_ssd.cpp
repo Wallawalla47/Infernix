@@ -166,7 +166,7 @@ bool PrefixCacheIndex::allocate_ssd_slabs(std::uint32_t count, std::vector<std::
 }
 
 std::uint64_t PrefixCacheIndex::host_lossless_slabs() const noexcept {
-    return free_slabs_.size() + dead_count_ + host_clean_nodes_ + host_clean_image_slabs_;
+    return free_slabs_.size() + dead_count_ + (host_clean_nodes_ - host_clean_dead_) + host_clean_image_slabs_;
 }
 
 void PrefixCacheIndex::set_ssd_rate(double bytes_per_second) noexcept {

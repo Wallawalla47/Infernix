@@ -2333,6 +2333,22 @@ void test_ssd_held_clean_blocks_are_no_room() {
     index.check_invariants();
 }
 
+// A written block whose last snapshot goes is dead and still clean (its Host and SSD copies stay): it is one slab
+// of lossless room, not two (SsdTier paces write-back on this count).
+void test_ssd_dead_clean_block_counted_once() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(ssd_config(16, 64), backend);
+    const SnapshotRef end = host_endpoint(index, backend, make_tokens(128, 330)); // 2 blocks + 4 image slabs
+    write_back(index);
+    require(index.host_lossless_slabs() == 16, "every used Host slab is clean after the write-back");
+    Withdrawal withdrawal{{}, {end}};
+    require(index.withdraw(withdrawal) == 1 && !index.valid(end), "the snapshot goes");
+    index.check_invariants();
+    require(index.stats().host_free_slabs == 14, "its image slabs are free; its two blocks keep their Host copies");
+    require(index.host_lossless_slabs() == 16,
+            "the two dead clean blocks count once: 14 free + 2, not 18");
+}
+
 void test_ssd_promotion_abort() {
     RecordingBackend backend;
     PrefixCacheIndex index(ssd_config(12, 32), backend);
@@ -3345,6 +3361,7 @@ int main() {
         test_ssd_partial_image();
         test_ssd_eviction_order();
         test_ssd_held_clean_blocks_are_no_room();
+        test_ssd_dead_clean_block_counted_once();
         test_ssd_promotion_abort();
         test_ssd_device_slots();
         test_ssd_random_stress();

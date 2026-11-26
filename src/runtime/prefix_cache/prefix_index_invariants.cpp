@@ -13,7 +13,7 @@ void PrefixCacheIndex::check_invariants() const {
     std::vector<std::uint32_t> warm(nodes_.size(), 0);
     std::vector<std::uint32_t> slab_uses(config_.host_slabs, 0);
     std::vector<std::uint32_t> ssd_uses(config_.ssd_slabs, 0);
-    std::uint64_t clean_nodes = 0, clean_listed_nodes = 0, clean_image_slabs = 0;
+    std::uint64_t clean_nodes = 0, clean_listed_nodes = 0, clean_image_slabs = 0, clean_dead_nodes = 0;
     std::uint32_t dead_nodes          = 0;
     std::uint32_t ssd_dead_nodes      = 0;
     std::uint32_t occupied_nodes      = 0;
@@ -78,6 +78,8 @@ void PrefixCacheIndex::check_invariants() const {
         const bool clean = node.host == CopyState::Resident && node.ssd == CopyState::Resident;
         if (clean != node.clean_counted) { invariant("node clean count is inconsistent"); }
         if (clean) { ++clean_nodes; }
+        if ((clean && dead) != node.clean_dead_counted) { invariant("node clean-and-dead count is inconsistent"); }
+        if (clean && dead) { ++clean_dead_nodes; }
         const std::uint8_t clean_list = clean && !held(node) && node.hold == kNoHold && node.live_below != 0
                                             ? (node.warm_below == 0 ? kCold : kCleanWarm)
                                             : kNoList;
@@ -88,6 +90,7 @@ void PrefixCacheIndex::check_invariants() const {
     }
     if (ssd_dead_nodes != ssd_dead_count_) { invariant("SSD dead node count mismatch"); }
     if (clean_nodes != host_clean_nodes_) { invariant("clean node count mismatch"); }
+    if (clean_dead_nodes != host_clean_dead_) { invariant("clean-and-dead node count mismatch"); }
     if (clean_listed_nodes != host_clean_listed_) { invariant("clean list node count mismatch"); }
     if (dead_nodes != dead_count_) { invariant("dead node count mismatch"); }
     if (transfer_held_nodes != transfer_releasable_) { invariant("transfer-held node count mismatch"); }

@@ -576,6 +576,14 @@ void PrefixCacheIndex::refresh_node(std::uint32_t index) {
             --host_clean_nodes_;
         }
     }
+    if (const bool clean_dead = clean && dead; clean_dead != node.clean_dead_counted) {
+        node.clean_dead_counted = clean_dead;
+        if (clean_dead) {
+            ++host_clean_dead_;
+        } else {
+            --host_clean_dead_;
+        }
+    }
     const std::uint8_t clean_list = clean && !held(node) && node.hold == kNoHold && node.live_below != 0
                                         ? (node.warm_below == 0 ? kCold : kCleanWarm)
                                         : kNoList;
@@ -1761,6 +1769,10 @@ void PrefixCacheIndex::release_node_storage(std::uint32_t index) {
     if (node.clean_counted) {
         node.clean_counted = false;
         --host_clean_nodes_;
+    }
+    if (node.clean_dead_counted) {
+        node.clean_dead_counted = false;
+        --host_clean_dead_;
     }
     lru_remove(index);
     dead_remove(index);
