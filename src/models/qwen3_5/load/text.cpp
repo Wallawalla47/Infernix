@@ -143,7 +143,12 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
                                        offloaded || options.embedding_host ? artifact::Residency::HostPinned
                                                                            : artifact::Residency::Device);
     std::vector<std::string> head_inputs{"text/final_hidden"};
-    if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
+    if (options.dspine()) {
+        // A standalone DSpine drafter declares no use of the target's head: it reads it through the
+        // artifact's DFlash2 drafter's use where there is one (dspine_head_input), else the text's.
+        const auto input = dspine_head_input(b.binder.reader().directory());
+        if (input != head_inputs.front()) { head_inputs.push_back(input); }
+    } else if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
     }
     out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},

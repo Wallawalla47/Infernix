@@ -417,6 +417,25 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "--draft-model admitted without --spec dflash2");
     }
+    // A DSpine drafter: its own artifact by path, which --spec dspine requires.
+    const auto dspine = parse({"infernix-serve", "model.ninfer", "--spec", "dspine", "--draft-tokens", "auto",
+                               "--ngram-draft-tokens", "auto", "--draft-model", "dspine.ninfer"});
+    failures += check(dspine.speculative.backend == infernix::SpeculativeBackend::DSpine &&
+                          dspine.speculative.draft_model == std::filesystem::path("dspine.ninfer") &&
+                          dspine.speculative.draft_tokens_auto && dspine.speculative.ngram_draft_tokens_auto,
+                      "--spec dspine did not keep its drafter, --draft-tokens auto and --ngram-draft-tokens auto");
+    for (const std::vector<std::string>& refused :
+         {std::vector<std::string>{"infernix-serve", "model.ninfer", "--spec", "dspine", "--draft-tokens", "7"},
+          std::vector<std::string>{"infernix-serve", "model.ninfer", "--spec", "dspine", "--draft-tokens", "7",
+                                   "--draft-model", "dspine.ninfer", "--lm-head-draft"},
+          std::vector<std::string>{"infernix-serve", "model.ninfer", "--spec", "dspine", "--draft-tokens", "7",
+                                   "--draft-model", "dspine.ninfer", "--draft-tree-nodes", "auto"}}) {
+        bool rejected = false;
+        try {
+            (void)parse(refused);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--spec dspine admitted a missing drafter, --lm-head-draft or trees");
+    }
     // DFlash2 tree table: entry c applies to rounds of c rows and the last entry to larger batches.
     using TreeTable  = std::array<std::uint32_t, infernix::kMaximumConcurrency>;
     const auto table = parse({"infernix-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens",

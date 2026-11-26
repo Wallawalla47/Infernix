@@ -47,6 +47,11 @@ struct LoadPlan::Impl {
     std::uint64_t mtp_expert_pinned = 0; // the MTP drafter's routed experts' stored bytes, pinned behind the drafter pool
     std::optional<LoraBinding> lora;     // LoadOptions::lora
     std::optional<AblateSidecarBinding> ablate; // LoadOptions::ablate, read at planning so a broken one fails early
+    // --spec dspine: the standalone drafter artifact, its own materialization, and the index of its first
+    // weight in `pending` (its weights follow the main artifact's).
+    std::unique_ptr<artifact::Reader> draft_reader;
+    std::optional<artifact::MaterializationPlan> draft_materialization;
+    std::size_t draft_first = 0;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -88,6 +93,10 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
+std::uint64_t LoadPlan::draft_device_bytes() const {
+    return impl_->draft_materialization ? impl_->draft_materialization->device_capacity_bytes : 0;
+}
+
 const std::optional<VisionOverlayLayout>& LoadPlan::vision_overlay_layout() const {
     return impl_->vision_overlay;
 }
@@ -104,6 +113,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    if (options.dspine()) {
+        // The standalone drafter artifact beside the model (its layers and bridge; the token embedding and
+        // head stay the model's).
+        out->draft_reader = std::make_unique<artifact::Reader>(options.draft_model);
+        out->config.draft = parse_dspine_config(out->draft_reader->directory(), out->config.text);
+    }
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
     // The lossless route binds every Use A16Only; the design reference keeps the declared permissions.
@@ -182,7 +197,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             }
         }
     }
-    if (out->config.draft) {
+    // A DSpine drafter's weights bind from its own artifact, after every main weight (below).
+    if (out->config.draft && !out->draft_reader) {
         out->weights.draft =
             loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
                                 std::string(options.speculative_component()));
@@ -216,7 +232,20 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             bindings.use(out->weights.draft->output_head,
                          std::string(options.speculative_component()) + "/final_hidden");
     }
+    std::vector<loading::PendingWeight> draft_pending;
+    if (out->draft_reader) {
+        out->draft_first = bindings.weights.size();
+        artifact::Binder draft_binder(*out->draft_reader);
+        loading::Bindings draft(draft_binder, options.lossless && !options.reference, /*a8_only=*/false,
+                                out->draft_first);
+        out->weights.draft = loading::bind_draft(draft, *out->config.draft, text, out->weights.text, "dspine");
+        out->weights.draft->output_head_use =
+            bindings.use(out->weights.text.output_head, loading::dspine_head_input(reader.directory()));
+        draft_pending              = std::move(draft.weights);
+        out->draft_materialization = std::move(draft_binder).finish();
+    }
     out->pending = std::move(bindings.weights);
+    for (auto& weight : draft_pending) { out->pending.push_back(std::move(weight)); }
     // The overlay window borrows the evictable tail of the device weights, or with offloaded experts
     // expert frames (design D8), which needs no ladder.
     const bool ladder = options.overlay_vision() && !out->config.text.offloaded_experts;
@@ -256,6 +285,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->info.metadata_json   = reader.directory().metadata.dump();
     out->info.provenance_json = reader.directory().provenance.dump();
     out->info.artifact_id     = reader.artifact_id();
+    if (out->draft_reader) { out->info.draft_artifact_id = out->draft_reader->artifact_id(); }
     return LoadPlan(std::move(out));
 }
 
@@ -272,7 +302,8 @@ struct BoundModel {
 
 BoundModel bind_model(const Config& config, const LoadOptions& options, const ModelWeights& weights,
                       std::vector<loading::PendingWeight>&& pending, const artifact::MaterializedArtifact& backing,
-                      const artifact::Reader& reader) {
+                      const artifact::Reader& reader, const artifact::MaterializedArtifact* draft_backing = nullptr,
+                      std::size_t draft_first = 0) {
     // Streamed banks (the SSD tier, LoadOptions::stream_experts): their objects, before the pending
     // weights resolve.
     const bool streamed = config.text.offloaded_experts && options.stream_experts;
@@ -289,7 +320,19 @@ BoundModel bind_model(const Config& config, const LoadOptions& options, const Mo
         }
     }
     BoundModel out;
-    out.bound = loading::resolve_weights(std::move(pending), backing);
+    if (draft_backing != nullptr) {
+        // A DSpine drafter's weights (from draft_first on) resolve against its own artifact's parents.
+        std::vector<loading::PendingWeight> drafter(
+            std::make_move_iterator(pending.begin() + static_cast<std::ptrdiff_t>(draft_first)),
+            std::make_move_iterator(pending.end()));
+        pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(draft_first), pending.end());
+        out.bound = loading::resolve_weights(std::move(pending), backing);
+        for (auto& weight : loading::resolve_weights(std::move(drafter), *draft_backing)) {
+            out.bound.push_back(std::move(weight));
+        }
+    } else {
+        out.bound = loading::resolve_weights(std::move(pending), backing);
+    }
     // Offloaded MoE layers: the banks' planes and scalars. A pinned routed bank's multipliers (its scale
     // tail) are read in place; a streamed bank's records stay in the artifact and a shared expert's are in
     // device memory only, so their scale tails are read from the artifact into Model memory.
@@ -352,13 +395,17 @@ std::unique_ptr<Model> plan_model(LoadPlan&& plan) {
     }
     const artifact::Reader& reader = *data->materialization.source;
     auto backing = artifact::materialize_geometry(reader, std::move(data->materialization));
-    BoundModel parts =
-        bind_model(data->config, data->options, data->weights, std::move(data->pending), backing, reader);
+    std::optional<artifact::MaterializedArtifact> draft_backing;
+    if (data->draft_reader) {
+        draft_backing = artifact::materialize_geometry(*data->draft_reader, std::move(*data->draft_materialization));
+    }
+    BoundModel parts = bind_model(data->config, data->options, data->weights, std::move(data->pending), backing,
+                                  reader, draft_backing ? &*draft_backing : nullptr, data->draft_first);
     auto model = std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::nullopt, std::move(backing), std::move(parts.banks),
         std::move(parts.shared_banks), std::move(parts.shared_multipliers), std::move(parts.store),
-        runtime::expert_offload::CsfTables{}, std::move(data->lora)));
+        runtime::expert_offload::CsfTables{}, std::move(data->lora), std::move(draft_backing)));
     model->ablate_ = std::move(data->ablate);
     return model;
 }
@@ -420,8 +467,14 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             .ladder_bytes = eviction->evictable_tail_bytes(),
             .layout       = std::move(*data->vision_overlay)};
     }
-    BoundModel parts =
-        bind_model(data->config, data->options, data->weights, std::move(data->pending), backing, reader);
+    // A DSpine drafter's weights, on the same device beside the model's.
+    std::optional<artifact::MaterializedArtifact> draft_backing;
+    if (data->draft_reader) {
+        draft_backing =
+            artifact::materialize(*data->draft_reader, std::move(*data->draft_materialization), device, observer);
+    }
+    BoundModel parts = bind_model(data->config, data->options, data->weights, std::move(data->pending), backing,
+                                  reader, draft_backing ? &*draft_backing : nullptr, data->draft_first);
     // With LoadOptions::expert_csf the pinned routed banks' records become CSF records (runtime::expert_offload::
     // compress_banks): every reader takes their tables, so each host-to-device copy and CPU walk of a record reads ~5 %
     // fewer bytes.
@@ -432,7 +485,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::move(overlay),
         std::move(backing), std::move(parts.banks), std::move(parts.shared_banks),
-        std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables), std::move(data->lora)));
+        std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables), std::move(data->lora),
+        std::move(draft_backing)));
     model->ablate_ = std::move(data->ablate);
     return model;
 }

@@ -569,6 +569,7 @@ void resolve_auto_speculative_backend(EngineOptions& options, models::Architectu
     case SpeculativeBackend::DFlash: chosen = "dflash"; break;
     case SpeculativeBackend::DFlash2: chosen = "dflash2"; break;
     case SpeculativeBackend::DSpark: chosen = "dspark"; break;
+    case SpeculativeBackend::DSpine: chosen = "dspine"; break; // never chosen: its artifact is named
     case SpeculativeBackend::None:
         // Nothing to draft with: plain decode, and every drafter setting goes with the drafter (copy
         // proposals stay where the model verifies them alone).
@@ -735,7 +736,12 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     // block drafters propose their whole block: Qwen3.8-Flash-Next's DFlash2 7; the Qwen3.5 planner
     // resolves its DFlash and DFlash2 blocks per configuration (resolve_auto_draft_length).
     const bool block_drafter = options.speculative.backend == SpeculativeBackend::DFlash ||
-                               options.speculative.backend == SpeculativeBackend::DFlash2;
+                               options.speculative.backend == SpeculativeBackend::DFlash2 ||
+                               options.speculative.backend == SpeculativeBackend::DSpine;
+    // A DSpine drafter runs beside a Qwen3.5-family model (docs/maintainer/dspine.md).
+    if (options.speculative.backend == SpeculativeBackend::DSpine && qwen4_exp) {
+        throw std::invalid_argument("--spec dspine applies to Qwen3.5-family artifacts only");
+    }
     if (options.speculative.draft_tokens_auto) {
         if (options.speculative.backend != SpeculativeBackend::Mtp && !block_drafter) {
             throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash, dflash2 or auto");
@@ -1098,7 +1104,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     std::string pinned_refusal; // a start meets it in the load, after the dense weights' check
     if (plan_only) {
         const artifact::MaterializationPlan& placement = plan.materialization();
-        planned_weights = placement.device_capacity_bytes;
+        // A DSpine drafter artifact's weights sit beside the model's, in their own allocation.
+        planned_weights = placement.device_capacity_bytes + plan.draft_device_bytes();
         // The ladder's chunk alignment beyond the arena (an overlay window borrows evicted chunks: no staging).
         if (ladder) { planned_beside_weights = EvictableWeightPool::mapped_bytes(planned_weights) - planned_weights; }
         planned->vram.weights_bytes = planned_weights;
@@ -1188,7 +1195,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     std::uint64_t dense_bytes = 0;
     if (expert_ram) {
         spill_source              = open_vram_budget_source(device.device, options.vram_past_budget);
-        dense_bytes               = plan_only ? planned_weights : plan.materialization().device_capacity_bytes;
+        dense_bytes               = plan_only ? planned_weights
+                                              : plan.materialization().device_capacity_bytes + plan.draft_device_bytes();
         const VramSnapshot before = spill_source->query();
         const std::uint64_t headroom =
             runtime::expert_offload::display_headroom(before.display, false, options.vram_headroom_bytes);
@@ -1212,7 +1220,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     std::uint64_t pinned_in_load = 0;
     if (!plan_only) {
         if (!spill_source) { spill_source = open_vram_budget_source(device.device, options.vram_past_budget); }
-        dense_bytes    = plan.materialization().device_capacity_bytes;
+        dense_bytes    = plan.materialization().device_capacity_bytes + plan.draft_device_bytes();
         pinned_in_load = plan.materialization().pinned_capacity_bytes + tail_mirror;
         spill.emplace(*spill_source);
         spill->begin();
@@ -1382,6 +1390,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         std::size_t free_bytes =
             plan_only ? planned_free_after_weights(sizing_now, planned_weights,
                                                    planned_beside_weights + instance->parameters.draft_screen_bytes() +
+                                                       instance->parameters.dspine_head_write_bytes() +
                                                        instance->parameters.adapter_bytes())
                       : sizing_now;
         // Other processes' VRAM by NVML, which counts every process (the OS budget does not): its device-wide use
@@ -1684,9 +1693,19 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             }
         }
         if (!file.empty()) {
+            // A DSpine drafter's ring rides in every snapshot: it belongs to that drafter artifact.
+            std::string cache_signature = signature;
+            if (const auto& draft = instance->model->info().draft_artifact_id) {
+                cache_signature += ";draft=";
+                for (const std::byte byte : *draft) {
+                    constexpr char kHex[] = "0123456789abcdef";
+                    cache_signature += kHex[std::to_integer<unsigned>(byte) >> 4U];
+                    cache_signature += kHex[std::to_integer<unsigned>(byte) & 15U];
+                }
+            }
             const runtime::prefix_cache::PersistResult loaded =
                 instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature, device.props),
+                    file, hybrid_cache_fingerprint(options, cache_signature, device.props),
                     options.startup_observer);
             restore = LoadSummary::PrefixCacheRestore{
                 .attempted           = true,

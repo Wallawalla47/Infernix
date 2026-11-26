@@ -404,7 +404,7 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ lanes, __nv_bfloat16* __restrict__ cache_k,
     __half* __restrict__ cache_v, int min_count, int max_count, int width, int padded_capacity) {
-    static_assert(Capacity == 2048 || Capacity == 4096);
+    static_assert(Capacity == 2048 || Capacity == 4096 || Capacity == 8192);
     static_assert((Capacity & (Capacity - 1)) == 0);
     constexpr int UnitsPerToken = kKVCacheAppendPrefixHeads * kKVCacheAppendPrefixHeadDim / 8;
     const int unit              = static_cast<int>(blockIdx.x) * Threads + threadIdx.x;

@@ -69,7 +69,7 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
         pending.source_objects.push_back(
             artifact::object_id(binder.reader().directory().object(part.object)));
     }
-    const WeightId id{weights.size()};
+    const WeightId id{index_base + weights.size()};
     parameters_.emplace(std::move(name), id);
     weights.push_back(std::move(pending));
     return id;

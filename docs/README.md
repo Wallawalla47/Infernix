@@ -56,6 +56,7 @@ other references own narrower contracts:
 | [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
+| [DSpine](maintainer/dspine.md) | the standalone DSpine drafter beside a Qwen3.5-family model: its artifact, causal block, code bridge, refinement and state |
 | [Constrained decoding](maintainer/constrained-decoding.md) | GBNF/JSON/choice/regex, tool policies, masks, speculative transactions and observations |
 | [Tree verification](maintainer/tree-verification.md) | DFlash2 and DFlash per-round draft trees, tree acceptance and its exactness, automatic and per-batch-size tree widths, accepted-path compaction |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | core design for incremental resources, admission, preemption and Replay recovery |

@@ -263,7 +263,7 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
                 dflash_host_ingress->proposal_valid_columns[row] =
-                    static_cast<std::int32_t>((speculative_backend == SpeculativeBackend::DFlash2
+                    static_cast<std::int32_t>((is_sparse_draft_backend(speculative_backend)
                                                    ? capture_proposal_drafts
                                                    : std::min(extent, capture_proposal_drafts)) +
                                               1U);

@@ -51,6 +51,8 @@ std::vector<std::uint16_t> fp16_bits(std::vector<float>& v) {
 struct Cache {
     int window, padded;
     bool boundary;
+    // The query-block mask every case over this cache runs (a DSpine block is causal).
+    ops::SlidingWindowMask mask = ops::SlidingWindowMask::Symmetric;
     std::vector<float> k, v;
     std::vector<std::uint16_t> k_bits, v_bits;
     GuardedDeviceBuffer device_k, device_v;
@@ -153,6 +155,11 @@ std::vector<double> oracle(const Cache& cache, int width, int batch, const std::
                                                             d]);
                     },
                     [&](int, int key) {
+                        // Under the causal mask a query row sees the block's rows at or before it.
+                        if (key >= context_count && cache.mask == ops::SlidingWindowMask::Causal &&
+                            key - context_count > token) {
+                            return false;
+                        }
                         const int kp = key < context_count
                                            ? start + key
                                            : positions[b * width + key - context_count];
@@ -222,8 +229,9 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
     auto context = cache.view();
     DeviceContext device;
     const auto launch = [&] {
-        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, tlane, Geometry, cache.window, Scale,
-                                      context, envelope, workspace, to, device.stream);
+        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, tlane, Geometry, cache.window,
+                                      cache.mask, Scale, context, envelope, workspace, to,
+                                      device.stream);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -274,6 +282,7 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
         cuda_synchronize(device.stream);
         const auto expected = oracle(cache, width, batch, q, qk, value, positions, valid, lanes);
         const std::string label = "SWA window=" + std::to_string(cache.window) +
+                                  (cache.mask == ops::SlidingWindowMask::Causal ? " causal" : "") +
                                   " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
                                   " L=" + std::to_string(base_context) +
                                   " envelope=" + std::to_string(envelope_max) +
@@ -382,6 +391,37 @@ int qualify() {
         Cache edge(4096, true);
         failures += run_case(edge, 2, 1, 4096, 4096, Prefix::Full, true);
         failures += edge.verify();
+    }
+    {
+        // The DSpine block: causal inside the block over an 8192 ring (and the causal mask at 4096,
+        // the symmetric one at 8192): empty, short, direct-route, split, full, wrapped and boundary
+        // contexts, inert tails, every batch boundary the 27B drafter's rounds take, graph replay.
+        Cache dspine(8192);
+        dspine.mask = ops::SlidingWindowMask::Causal;
+        failures += run_case(dspine, 1, 1, 0, 0, Prefix::Full, false);
+        failures += run_case(dspine, 16, 1, 0, 0, Prefix::Full, false);
+        failures += run_case(dspine, 16, 1, 1, 1, Prefix::Full, false);
+        failures += run_case(dspine, 16, 1, 37, 96, Prefix::Full, true);
+        failures += run_case(dspine, 11, 1, 5000, 5000, Prefix::Full, true);
+        failures += run_case(dspine, 16, 1, 8191, 8191, Prefix::Full, true);
+        failures += run_case(dspine, 16, 1, 8192, 8192, Prefix::Full, true);
+        failures += run_case(dspine, 16, 1, 20000, 262144, Prefix::Full, true);
+        for (int width : {2, 8, 16})
+            for (int batch : {2, 4, 6, 8})
+                failures += run_case(dspine, width, batch, 9000, 262144, Prefix::Mixed, true);
+        failures += run_case(dspine, 8, 4, 9000, 9000, Prefix::Zero, true);
+        failures += dspine.verify();
+        Cache dspine_edge(8192, true);
+        dspine_edge.mask = ops::SlidingWindowMask::Causal;
+        failures += run_case(dspine_edge, 2, 1, 8192, 8192, Prefix::Full, true);
+        failures += dspine_edge.verify();
+        Cache symmetric(8192);
+        failures += run_case(symmetric, 16, 2, 8300, 8300, Prefix::Mixed, true);
+        failures += symmetric.verify();
+        Cache causal(4096);
+        causal.mask = ops::SlidingWindowMask::Causal;
+        failures += run_case(causal, 16, 2, 4500, 4500, Prefix::Mixed, true);
+        failures += causal.verify();
     }
     return failures;
 }

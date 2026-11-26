@@ -1,5 +1,13 @@
 #pragma once
 
+#include "core/weight.h"
+
+namespace infernix::models::qwen3_5::execution {
+// Whether ops::linear_add registers a DSpine drafter projection's problem (execution/draft.cpp); the
+// others project into a workspace column block, then add.
+[[nodiscard]] bool dspine_fused_add(const Weight& w);
+} // namespace infernix::models::qwen3_5::execution
+
 #include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/program.h"

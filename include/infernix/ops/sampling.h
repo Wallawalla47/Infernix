@@ -24,6 +24,8 @@ enum SamplePurpose : std::int32_t {
     // committed length L: block verification reads every prefix's uniform, so a later round must not
     // meet one again (the token rule reads only up to its first rejection).
     kSamplePurposeSpeculativeBlockAccept = 7,
+    // A DSpine drafter's sampled proposal (ops::dspine_path), keyed by the drafted position.
+    kSamplePurposeDSpineProposal = 8,
 };
 
 // Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.

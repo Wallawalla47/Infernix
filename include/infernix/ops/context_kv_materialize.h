@@ -48,8 +48,9 @@ struct ContextKVMaterializeExecutionEnvelope {
  * single-request prefill B=1,W=1..2048. W is the physical context width, independent of the draft
  * width and the device-selected committed prefix. Each layer view contains
  * independent RowSplit Q8_G32_FP16 key/value weights [1024,H], a BF16 key norm weight [128], and
- * a capacity-2048 D128/H8 cyclic cache with BF16 K and FP16 V. All caches share padded
- * capacity and lane capacity. rope_theta is finite and above 1 (1e7 for Qwen3.8-27B's and
+ * a D128/H8 cyclic cache of capacity 2048 (DFlash2's), 4096 or 8192 (a DSpine drafter's) with BF16
+ * K and FP16 V. All caches share capacity, padded capacity and lane capacity. rope_theta is finite
+ * and above 1 (1e7 for Qwen3.8-27B's and
  * Qwen3.5-122B-A10B's drafters, 1e4 for Qwen3.8-Flash-Next's).
  *
  * For every layer l, row b, and i in [0,counts[b]), the complete operation is
@@ -63,7 +64,8 @@ struct ContextKVMaterializeExecutionEnvelope {
  *   k[j+64]  = n[j+64] * cos(angle(j)) + n[j]    * sin(angle(j))
  *
  * K is stored as BF16 and V as FP16_RNE from represented BF16 v_raw at absolute position
- * positions[i,b] modulo 2048 in lane state_slots[b]. Columns i>=counts[b] have no state effect.
+ * positions[i,b] modulo the capacity in lane state_slots[b]. Columns i>=counts[b] have no state
+ * effect.
  * Existing cache values outside the addressed rows and all read-only inputs are unchanged. The Op
  * emits no raw K/V and owns no logical frontier, commit, rollback, request identity, or persistent
  * allocation.

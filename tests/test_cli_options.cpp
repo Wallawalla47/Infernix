@@ -257,6 +257,43 @@ int run_tests() {
                       "CLI admitted --draft-model without --spec dflash2");
     failures += check(infernix::cli::usage_text("infernix-cli").find("--draft-model FILE") != std::string::npos,
                       "CLI help omits --draft-model");
+    // A DSpine drafter: its own artifact by path, which --spec dspine requires; chains from the full head.
+    const auto dspine = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dspine",
+                               "--draft-tokens", "auto", "--draft-model", "dspine.ninfer"});
+    failures += check(dspine.speculative.backend == infernix::SpeculativeBackend::DSpine &&
+                          dspine.speculative.draft_model == std::filesystem::path("dspine.ninfer") &&
+                          dspine.speculative.draft_tokens_auto,
+                      "CLI did not keep --spec dspine with its --draft-model and --draft-tokens auto");
+    const auto dspine_fixed = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dspine",
+                                     "--draft-tokens", "15", "--draft-model", "dspine.ninfer"});
+    failures += check(dspine_fixed.speculative.draft_tokens == 15, "CLI did not keep --spec dspine --draft-tokens 15");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dspine",
+                                       "--draft-tokens", "7"});
+                      }),
+                      "CLI admitted --spec dspine without --draft-model");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dspine",
+                                       "--draft-tokens", "16", "--draft-model", "dspine.ninfer"});
+                      }),
+                      "CLI admitted --spec dspine --draft-tokens 16");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dspine",
+                                       "--draft-tokens", "7", "--draft-model", "dspine.ninfer", "--lm-head-draft"});
+                      }),
+                      "CLI admitted --spec dspine --lm-head-draft");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dspine",
+                                       "--draft-tokens", "7", "--draft-model", "dspine.ninfer",
+                                       "--draft-tree-nodes", "12"});
+                      }),
+                      "CLI admitted --spec dspine with tree verification");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dspine",
+                                       "--draft-tokens", "7", "--draft-model", "dspine.ninfer", "--spec-min-p",
+                                       "0.5"});
+                      }),
+                      "CLI admitted --spec dspine --spec-min-p");
     const infernix::cli::Options configured =
         parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

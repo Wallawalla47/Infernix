@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "core/weight_view.h"
+#include "infernix/ops/dspine.h"
 #include "infernix/ops/gdn_input_proj.h"
 #include "infernix/ops/screened_head.h"
 #include "infernix/ops/linear.h"
@@ -318,6 +319,22 @@ public:
                                               tensor(w.selector->predecessor_codebook),
                                               tensor(w.selector->successor_codebook)};
         }
+        if (w.dspine) {
+            DSpineBridgeParameters bridge;
+            bridge.projection         = linear(w.dspine->projection);
+            bridge.gate_bias          = tensor(w.dspine->gate_bias);
+            bridge.head_write_columns = tensor(w.dspine->head_write);
+            bridge.sender_table       = tensor(w.dspine->sender_table);
+            for (const auto& layer : w.dspine->layers) {
+                bridge.layers.push_back({linear(layer.read), linear(layer.write)});
+            }
+            for (const Tensor* t : {&bridge.gate_bias, &bridge.head_write_columns, &bridge.sender_table}) {
+                if (t->dtype != DType::BF16) {
+                    throw std::invalid_argument("the DSpine bridge's bias and tables must be BF16");
+                }
+            }
+            out.dspine = std::move(bridge);
+        }
         return out;
     }
 
@@ -328,6 +345,32 @@ private:
 
 // Every offloaded layer's scales on the device, [layers][experts + 1]: the routed bank's, then the
 // shared expert's (its bank holds one expert; a dense shared expert's entry is unused, zero).
+// The DSpine head-write table (docs/maintainer/dspine.md, "Candidates and the refinement"):
+// TG[v, r] = BF16(Head(w_final * W_write^last[:, r])[v]), the target's head run once over the R columns
+// of the drafter's last write, each scaled by its final norm's weight, in calls of 64 columns.
+void derive_dspine_head_write(const DraftParameters& draft, const TextConfig& text, Tensor& table) {
+    const auto& bridge     = *draft.dspine;
+    const std::int32_t h   = dimension(text.hidden_size);
+    const std::int32_t v   = dimension(text.vocab_size);
+    const std::int32_t r   = bridge.head_write_columns.ne[1];
+    constexpr std::int32_t kChunk = 64;
+    const Weight& head     = draft.output_head.weight;
+    const std::size_t linear_bytes =
+        ops::linear_workspace_capacity_bytes(head.qtype, head.n, head.k, draft.output_head.policy, 1, kChunk);
+    DeviceArena scratch(std::size_t(h) * kChunk * 2 + std::size_t(v) * kChunk * 2 + linear_bytes + 4096);
+    for (std::int32_t first = 0; first < r; first += kChunk) {
+        auto scope            = scratch.scope();
+        const std::int32_t n  = std::min(kChunk, r - first);
+        const Tensor columns  = bridge.head_write_columns.slice(1, first, n);
+        Tensor scaled         = scratch.alloc(DType::BF16, {h, n});
+        ops::dspine_scale_rows(columns, draft.final_norm, scaled, nullptr);
+        Tensor logits = scratch.alloc(DType::BF16, {v, n});
+        ops::linear(scaled, head, logits, draft.output_head.policy, scratch, nullptr);
+        ops::dspine_store_head_write(logits, first, table, nullptr);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+}
+
 DeviceBuffer offloaded_expert_scales(const Model& model) {
     if (!model.offloaded_experts()) { return {}; }
     const auto banks  = model.expert_banks();
@@ -389,8 +432,9 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
             (head.qtype == QType::FP8_E4M3FN_ROW_BF16 || head.qtype == QType::FP8_E4M3FN_ROW_F32 ||
              (head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit)) &&
             head.k == ops::kScreenedTopkHidden && head.n % 16 == 0;
-        if (model.config().draft && model.config().draft->dflash2 && options.proposal_head == ProposalHead::Full &&
-            !options.lossless && screened_head) {
+        // A DSpine drafter ranks the same full head's top sixteen.
+        if (model.config().draft && (model.config().draft->dflash2 || model.config().draft->dspine) &&
+            options.proposal_head == ProposalHead::Full && !options.lossless && screened_head) {
             if (model.weights_resident()) {
                 draft_screen      = DeviceBuffer(ops::screened_head_wide_screen_bytes(head.n));
                 draft_head_screen = ops::screened_head_wide_screen(draft_screen.p, head.n);
@@ -400,6 +444,18 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
                 // A plan-only model (Engine::plan) fits nothing; its plan counts the screen's bytes.
                 planned_draft_screen_bytes = ops::screened_head_wide_screen_bytes(head.n);
             }
+        }
+    }
+    if (draft && draft->dspine) {
+        const auto& extra = *model.config().draft->dspine;
+        const std::uint64_t bytes = std::uint64_t(extra.rank) * config.vocab_size * 2;
+        if (model.weights_resident()) {
+            dspine_head_write_storage = DeviceBuffer(bytes);
+            dspine_head_write         = Tensor(dspine_head_write_storage.p, DType::BF16,
+                                               {dimension(extra.rank), dimension(config.vocab_size)});
+            derive_dspine_head_write(*draft, config, dspine_head_write);
+        } else {
+            planned_dspine_head_write_bytes = bytes;
         }
     }
     if (w.proposal) {

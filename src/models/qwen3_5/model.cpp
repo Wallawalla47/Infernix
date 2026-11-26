@@ -13,8 +13,10 @@ Model::Model(Config config, LoadOptions options, ModelWeights weights,
              std::vector<runtime::expert_offload::ExpertBank> shared_expert_banks,
              std::vector<std::vector<float>> shared_expert_multipliers,
              std::optional<runtime::expert_offload::ExpertStore> expert_store,
-             runtime::expert_offload::CsfTables csf_tables, std::optional<LoraBinding> lora)
+             runtime::expert_offload::CsfTables csf_tables, std::optional<LoraBinding> lora,
+             std::optional<artifact::MaterializedArtifact> draft_backing)
     : overlay_vision_(std::move(overlay_vision)), backing_(std::move(backing)),
+      draft_backing_(std::move(draft_backing)),
       config_(std::move(config)), options_(options), weights_(std::move(weights)),
       bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)),
       expert_banks_(std::move(expert_banks)), shared_expert_banks_(std::move(shared_expert_banks)),

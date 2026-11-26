@@ -270,7 +270,8 @@ public:
     void launch(cudaStream_t stream) {
         ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
                                       positions_tensor_, valid_tensor_, lane_tensor_, kGeometry,
-                                      static_cast<std::uint32_t>(window_), kScale, context_view_,
+                                      static_cast<std::uint32_t>(window_),
+                                      ops::SlidingWindowMask::Symmetric, kScale, context_view_,
                                       envelope_, workspace_, output_tensor_, stream);
     }
 

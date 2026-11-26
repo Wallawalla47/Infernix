@@ -96,7 +96,9 @@ struct LoadOptions {
         return speculative == SpeculativeBackend::DFlash2;
     }
 
-    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
+    [[nodiscard]] bool dspine() const noexcept { return speculative == SpeculativeBackend::DSpine; }
+
+    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2() || dspine(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
         return purpose == EnginePurpose::Generation && speculative != SpeculativeBackend::None &&
@@ -115,13 +117,22 @@ struct LoadOptions {
             return "dflash2";
         case SpeculativeBackend::DSpark:
             return "dspark";
+        case SpeculativeBackend::DSpine:
+            return "dspine";
         }
         return {};
     }
 };
 
 [[nodiscard]] constexpr bool is_masked_draft_backend(SpeculativeBackend backend) noexcept {
-    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
+    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2 ||
+           backend == SpeculativeBackend::DSpine;
+}
+
+// A masked drafter whose chain rounds verify a sparse law of 16 candidates a draft (DFlash2's
+// frame): DFlash2, and DSpine, whose refinement records the same law.
+[[nodiscard]] constexpr bool is_sparse_draft_backend(SpeculativeBackend backend) noexcept {
+    return backend == SpeculativeBackend::DFlash2 || backend == SpeculativeBackend::DSpine;
 }
 
 // --vision-offload auto: on for Qwen4Exp, whose expert cache lends the encode window's device

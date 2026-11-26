@@ -128,10 +128,23 @@ struct SelectorWeights {
     WeightId hidden_projection, predecessor_codebook, successor_codebook;
 };
 
+// A DSpine drafter's code bridge (load/dspine.cpp): the projection [3R, C], gate bias [R], the last
+// write transposed [R, H], every token's sender rows [V, 2R], and each layer's read and write.
+struct DSpineBridgeLayerWeights {
+    WeightId read, write;
+};
+
+struct DSpineBridgeWeights {
+    WeightId projection, gate_bias, head_write, sender_table;
+    std::vector<DSpineBridgeLayerWeights> layers;
+};
+
 struct DraftWeights {
     WeightId feature_projection, context_norm, final_norm;
     std::vector<DraftBlockWeights> layers;
     std::optional<SelectorWeights> selector;
+    // --spec dspine: the bridge; its weights and the layers above are the drafter artifact's.
+    std::optional<DSpineBridgeWeights> dspine;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
 };

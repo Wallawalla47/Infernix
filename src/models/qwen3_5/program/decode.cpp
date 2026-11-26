@@ -1290,7 +1290,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     // for the width it verifies.
     std::uint32_t verify_drafts = family != nullptr ? family->shape.verify_drafts : neural_draft_window;
     const bool drafter_runs     = fixed_width || !any_ngram || lanes.size() > 1;
-    const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
+    // DFlash2 and DSpine draft their whole block and publish probabilities (DFlash: log-probabilities).
+    const bool dflash2_backend        = is_sparse_draft_backend(speculative_backend);
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         dflash_host_ingress->copy_rows[row] = any_ngram && !matches[row].tokens.empty() ? 1 : 0;

@@ -872,9 +872,14 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
 MemoryUsage ProgramImpl::memory_usage() const noexcept {
     MemoryUsage out;
     const auto& storage = parameters.model.storage_stats();
-    out.device.weights  = storage.device_capacity_bytes - std::min<std::uint64_t>(storage.device_capacity_bytes, drafter_weight_bytes);
-    // With the drafter's proposal-head screen (DFlash2, Parameters::draft_screen: 357.6 MB at 248,320 rows).
-    out.device.drafter  = drafter_weight_bytes + persistent_drafter_bytes + parameters.draft_screen.bytes;
+    // A DSpine drafter's weights are its own artifact's, outside the model's storage.
+    const std::uint64_t drafter_in_model =
+        parameters.model.draft_artifact_device_bytes() != 0 ? 0 : drafter_weight_bytes;
+    out.device.weights  = storage.device_capacity_bytes - std::min<std::uint64_t>(storage.device_capacity_bytes, drafter_in_model);
+    // With the drafter's proposal-head screen (DFlash2, Parameters::draft_screen: 357.6 MB at 248,320 rows) and
+    // DSpine's head-write table.
+    out.device.drafter  = drafter_weight_bytes + persistent_drafter_bytes + parameters.draft_screen.bytes +
+                         parameters.dspine_head_write_storage.bytes;
     // --lora: the adapter's factors (Parameters::lora_factors; its per-call U is in the workspace); --ablate: the
     // sidecar's direction (Parameters::ablate).
     out.device.adapter  = parameters.allocated_adapter_bytes();

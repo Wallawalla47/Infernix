@@ -485,6 +485,26 @@ int run_general_bf16_linear() {
     return failures;
 }
 
+int run_width_invariance(int n, int k, int widest_columns, std::initializer_list<int> widths, std::uint32_t seed);
+
+// A DSpine drafter's bridge shapes (shapes/dspine_bridge.cu): the skinny GEMV in launches of 16 columns up to 128,
+// against the reference at the widths a round makes (a row's 2..16 columns, up to eight rows) and past them, eager
+// and replayed; and a column's bits are the same at every width from 1 to 128.
+int run_dspine_bridge() {
+    int failures = 0;
+    for (const auto& [n, k] : std::vector<std::pair<int, int>>{{1024, 5120}, {1536, 1024}, {5120, 512}}) {
+        DeviceWeight weight(make_patterned(n, k, 431U));
+        for (int tokens : {1, 2, 8, 9, 12, 15, 16, 17, 32, 33, 64, 128, 129}) {
+            failures += run_bf16_linear_case(weight, tokens);
+        }
+        failures += run_bf16_linear_case(weight, 16, true);
+        failures += run_bf16_linear_case(weight, 48, true);
+    }
+    failures += run_width_invariance(1024, 5120, 128, {1, 8, 9, 15, 16, 17, 33, 64, 127}, 433U);
+    failures += run_width_invariance(5120, 512, 128, {1, 9, 16, 40, 100}, 437U);
+    return failures;
+}
+
 int run_bf16_linear() {
     int failures = 0;
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
@@ -504,6 +524,7 @@ int run_bf16_linear() {
     failures += run_selector_linear();
     failures += run_vision_bf16_linear();
     failures += run_general_bf16_linear();
+    failures += run_dspine_bridge();
     return failures;
 }
 
@@ -647,11 +668,22 @@ int run_new_bf16(int selected_n = 0, int selected_k = 0) {
 // columns of a call of another width, partial tiles included. Past the skinny route (T > 8), against a 4,096-column
 // call, bit for bit.
 int run_general_tile_widths() {
-    constexpr int kWidest = 4096;
-    const int n = 640, k = 2560;
-    const auto host = infernix::test::linear::make_bf16_weight(n, k, 467U);
+    // 9-64 columns take the chain kernel, past them the tile: every width gives a column the same bits.
+    if (const int failures = run_width_invariance(640, 2560, 4096, {9, 12, 16, 17, 31, 32, 33, 48, 63, 64, 65, 1023,
+                                                                     1024, 1087, 1088, 1089, 2048, 3000},
+                                                  467U)) {
+        return failures;
+    }
+    // A K that is not a multiple of the tile's 32 (the zero-padded tail) and an odd row count.
+    return run_width_invariance(203, 2568, 256, {9, 16, 40, 64, 65}, 479U);
+}
+
+// A call's columns against the same columns of a `widest`-column call of [n, k], bit for bit, at each width.
+int run_width_invariance(int n, int k, int widest_columns, std::initializer_list<int> widths, std::uint32_t seed) {
+    const int kWidest = widest_columns;
+    const auto host   = infernix::test::linear::make_bf16_weight(n, k, seed);
     std::vector<std::uint16_t> activation(static_cast<std::size_t>(k) * kWidest);
-    std::uint32_t state = 467U;
+    std::uint32_t state = seed;
     for (auto& bits : activation) {
         state = state * 1664525U + 1013904223U;
         bits  = infernix::test::f32_to_bf16(static_cast<float>(static_cast<std::int32_t>(state >> 8) - (1 << 23)) /
@@ -676,13 +708,13 @@ int run_general_tile_widths() {
     };
     const std::vector<std::uint16_t> widest = run(kWidest);
     int failures = 0;
-    for (int t : {9, 33, 64, 65, 1023, 1024, 1087, 1088, 1089, 2048, 3000}) {
+    for (int t : widths) {
         const std::vector<std::uint16_t> out = run(t);
         std::size_t differing = 0;
         for (std::size_t i = 0; i < out.size(); ++i) differing += out[i] != widest[i];
         if (differing != 0) {
-            std::cerr << "BF16_A16 general [640,2560] T=" << t << ": " << differing << " outputs differ from a "
-                      << kWidest << "-column call's\n";
+            std::cerr << "BF16_A16 [" << n << "," << k << "] T=" << t << ": " << differing
+                      << " outputs differ from a " << kWidest << "-column call's\n";
             ++failures;
         }
     }

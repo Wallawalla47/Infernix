@@ -75,7 +75,9 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
     if (capacity == 0 || draft_window == 0 || draft_window > 63) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
-    if (backend == SpeculativeBackend::DFlash2) {
+    // Every-layer-local drafters (DFlash2's 2048 ring, DSpine's up to 8192): their attention plans stop
+    // changing past the window.
+    if (is_sparse_draft_backend(backend)) {
         auto profiles = graph_profiles_through(capacity - 1, {96, 511, 2047, 8191, 32767});
         for (std::size_t i = 0; i < profiles.size(); ++i) {
             profiles[i].topology_class = static_cast<std::uint32_t>(i);

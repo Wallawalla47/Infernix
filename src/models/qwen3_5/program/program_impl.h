@@ -812,7 +812,7 @@ public:
     [[nodiscard]] std::uint32_t dflash_ring_window() const noexcept {
         if (!is_masked_draft_backend(speculative_backend)) { return 0U; }
         const auto& draft = parameters.model.config().draft;
-        if (!draft || !draft->dflash2 || draft->local_layer_count() != draft->num_hidden_layers ||
+        if (!draft || (!draft->dflash2 && !draft->dspine) || draft->local_layer_count() != draft->num_hidden_layers ||
             !draft->sliding_window) {
             return 0U;
         }

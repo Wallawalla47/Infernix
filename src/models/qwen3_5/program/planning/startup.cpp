@@ -22,6 +22,7 @@
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/candidate_selector.h"
 #include "infernix/ops/context_kv_materialize.h"
+#include "infernix/ops/dspine.h"
 #include "infernix/ops/dynamic_grouped_conv.h"
 #include "infernix/ops/linear_topk.h"
 #include "infernix/ops/gdn_gating_proj.h"
@@ -1044,9 +1045,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                      std::uint64_t(draft->target_layer_ids.size())),
                            tokens);
                 }
-                if (draft->dflash2.has_value()) {
+                if (draft->dflash2.has_value() || draft->dspine.has_value()) {
+                    // The fused materialization takes a single request's columns in slices of 2048
+                    // (a DSpine ring's prefill block is wider).
                     const auto local_width =
-                        std::min(width, dimension(draft->sliding_window.value_or(0)));
+                        std::min({width, dimension(draft->sliding_window.value_or(0)), 2048});
                     (void)workspace::dflash_context(layout, config, *draft, local_width * batch);
                     linear_scratch(layout, parameters.draft->feature_projection,
                                    local_width * batch, local_width * batch);
@@ -1068,6 +1071,110 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 const std::int32_t tokens          = width * batch;
                 const std::int32_t proposal_drafts = width - 1;
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                if (draft->dspine.has_value()) {
+                    // propose_dspine_rows: the aligned anchors and frontiers, the normed stream, the
+                    // last write's scale, denominator, packed rows and message beside the residual.
+                    const auto& extra       = *draft->dspine;
+                    const std::int32_t h    = dimension(config.hidden_size);
+                    const std::int32_t rank = dimension(extra.rank);
+                    const auto mask_columns = proposal_drafts * batch;
+                    matrix(layout, DType::I32, 1, batch);
+                    matrix(layout, DType::I32, 1, batch);
+                    matrix(layout, DType::BF16, h, tokens);
+                    matrix(layout, DType::FP32, 1, tokens);
+                    matrix(layout, DType::FP32, 1, tokens);
+                    matrix(layout, DType::BF16, 3 * rank, tokens);
+                    matrix(layout, DType::BF16, rank, tokens);
+                    {
+                        auto attention = layout.scope();
+                        matrix(layout, DType::BF16, dimension(draft->attention.query_width()), tokens);
+                        matrix(layout, DType::BF16, dimension(draft->attention.key_width()), tokens);
+                        matrix(layout, DType::BF16, dimension(draft->attention.key_width()), tokens);
+                        matrix(layout, DType::BF16, dimension(draft->attention.query_width()), tokens);
+                        std::size_t widest = ops::sliding_window_attention_workspace_capacity_bytes(
+                            {dimension(draft->attention.head_dim), dimension(draft->attention.num_attention_heads),
+                             dimension(draft->attention.num_key_value_heads)},
+                            dimension(draft->sliding_window.value_or(0)), {0, plan.capacity}, width, width, batch);
+                        // An output projection linear_add does not register projects into a column block first.
+                        bool separate = false;
+                        for (const auto& block : parameters.draft->layers) {
+                            const auto& p = block.output;
+                            if (execution::dspine_fused_add(p.weight)) {
+                                widest = std::max(widest, ops::linear_add_workspace_capacity_bytes(
+                                                              p.weight.qtype, p.weight.n, p.weight.k, p.policy,
+                                                              tokens, tokens));
+                            } else {
+                                separate = true;
+                                widest   = std::max(widest, ops::linear_workspace_capacity_bytes(
+                                                              p.weight.qtype, p.weight.n, p.weight.k, p.policy,
+                                                              tokens, tokens));
+                            }
+                        }
+                        if (separate) { matrix(layout, DType::BF16, h, tokens); }
+                        scratch(layout, widest);
+                    }
+                    {
+                        auto mlp = layout.scope();
+                        matrix(layout, DType::BF16, h, tokens);
+                        matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
+                        std::size_t widest = 0;
+                        for (const auto& block : parameters.draft->layers) {
+                            const auto& p = block.mlp.gate_up;
+                            widest        = std::max(widest, ops::linear_swiglu_workspace_capacity_bytes(
+                                                          p.weight.qtype, p.weight.n, p.weight.k, p.policy,
+                                                          tokens, tokens));
+                            const auto& down = block.mlp.down;
+                            widest = std::max(widest, execution::dspine_fused_add(down.weight)
+                                                          ? ops::linear_add_workspace_capacity_bytes(
+                                                                down.weight.qtype, down.weight.n, down.weight.k,
+                                                                down.policy, tokens, tokens)
+                                                          : ops::linear_workspace_capacity_bytes(
+                                                                down.weight.qtype, down.weight.n, down.weight.k,
+                                                                down.policy, tokens, tokens) +
+                                                                std::size_t(h) * tokens * 2 + 256);
+                        }
+                        scratch(layout, widest);
+                    }
+                    {
+                        auto bridge = layout.scope();
+                        const auto& b = *parameters.draft->dspine;
+                        matrix(layout, DType::BF16, h, tokens);
+                        matrix(layout, DType::BF16, dimension(extra.code_size), tokens);
+                        matrix(layout, DType::BF16, h, tokens);
+                        std::size_t widest = ops::linear_workspace_capacity_bytes(
+                            b.projection.weight.qtype, b.projection.weight.n, b.projection.weight.k,
+                            b.projection.policy, tokens, tokens);
+                        for (const auto& layer : b.layers) {
+                            for (const auto* p : {&layer.read, &layer.write}) {
+                                widest = std::max(widest, ops::linear_workspace_capacity_bytes(
+                                                              p->weight.qtype, p->weight.n, p->weight.k,
+                                                              p->policy, tokens, tokens));
+                            }
+                        }
+                        scratch(layout, widest);
+                    }
+                    // The packed final hidden, the candidates (staged for another frame) and their scores.
+                    matrix(layout, DType::BF16, h, mask_columns);
+                    matrix(layout, DType::I32, ops::kSparseSpeculativeCandidates, mask_columns);
+                    matrix(layout, DType::FP32, ops::kSparseSpeculativeCandidates, mask_columns);
+                    {
+                        const auto& head = parameters.draft->output_head;
+                        std::size_t widest = ops::linear_topk_workspace_capacity_bytes(
+                            head.weight.qtype, head.weight.n, head.weight.k, mask_columns, mask_columns);
+                        if (parameters.draft_head_screen && screened_proposal_columns(mask_columns)) {
+                            widest = std::max(widest, ops::screened_head_topk_workspace_bytes(
+                                                          std::min(mask_columns, ops::kScreenedHeadMaxColumns)));
+                        }
+                        scratch(layout, widest);
+                    }
+                    // The drafts (staged for alignment or another frame), their laws and confidences.
+                    matrix(layout, DType::I32, 1, mask_columns);
+                    matrix(layout, DType::I32, 1, mask_columns);
+                    matrix(layout, DType::FP32, ops::kSparseSpeculativeCandidates, mask_columns);
+                    matrix(layout, DType::FP32, 1, mask_columns);
+                    scratch(layout, ops::dspine_path_workspace_capacity_bytes(proposal_drafts, batch));
+                    return finish(layout);
+                }
                 if (draft->dflash2.has_value()) {
                     const auto prepare = [&] {
                         (void)workspace::dflash2_branch(layout, config, *draft, width, batch);
@@ -1232,7 +1339,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, verify_envelope);
                 std::size_t accept =
-                    draft->dflash2.has_value()
+                    draft->dflash2.has_value() || draft->dspine.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               drafts, drafts, batch, batch)
@@ -1369,6 +1476,20 @@ void validate_target_options(const execution::Parameters& parameters,
         break;
     case SpeculativeBackend::DSpark:
         throw std::invalid_argument("--spec dspark drafts for Inkling 2 artifacts only");
+    case SpeculativeBackend::DSpine: {
+        if (!parameters.draft || !parameters.draft->dspine || !parameters.model.config().draft->dspine) {
+            throw std::invalid_argument("--spec dspine: the DSpine drafter is not loaded");
+        }
+        // A round drafts at most the trained block less its anchor.
+        const std::uint32_t most = std::min(15U, parameters.model.config().draft->dspine->block_size - 1U);
+        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > most) {
+            throw std::invalid_argument("DSpine draft window must be in [1," + std::to_string(most) + "]");
+        }
+        if (options.speculative.draft_tree_auto || tree_table_enabled(options.speculative.draft_tree_nodes)) {
+            throw std::invalid_argument("--spec dspine verifies chains: it takes no tree verification");
+        }
+        break;
+    }
     }
     const bool tree_table = tree_table_enabled(options.speculative.draft_tree_nodes);
     if (tree_table || options.speculative.draft_tree_auto) {
@@ -1407,6 +1528,7 @@ void validate_target_options(const execution::Parameters& parameters,
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
           options.speculative.backend != SpeculativeBackend::DFlash &&
+          options.speculative.backend != SpeculativeBackend::DSpine &&
           options.speculative.backend != SpeculativeBackend::Mtp) ||
          options.speculative.ngram_draft_tokens > 63 || options.speculative.ngram_min_match < 4 ||
          options.speculative.ngram_min_match > 64)) {
