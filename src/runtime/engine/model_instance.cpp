@@ -75,6 +75,13 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
                                         "models (the 27B) and Inkling 2 only");
         }
     }
+    // Qwen3.8-Flash-Next's Program reads no use_cuda_graph: its rounds replay CUDA graphs on every route but the lossless
+    // one, which runs them eagerly already; a scoring Program runs no rounds. Refused rather than silently ignored.
+    if (architecture == models::Architecture::Qwen4Exp && !options.use_cuda_graph &&
+        options.purpose == EnginePurpose::Generation && !options.lossless) {
+        throw std::invalid_argument("--no-cuda-graph: Qwen3.8-Flash-Next runs its decode rounds as CUDA graphs (its "
+                                    "--lossless route runs them eagerly)");
+    }
     // The lossless route computes the model's own forward correctly rounded; a cut is not part of it. Refused here,
     // before anything loads.
     if (!options.ablate_sidecar_path.empty() && options.lossless) {

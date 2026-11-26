@@ -527,6 +527,34 @@ int main() {
         failures += check(cut.find("d.f32.bin") != std::string::npos, "the fingerprint does not name the direction file");
         std::filesystem::remove_all(dir);
     }
+    // --no-cuda-graph: Qwen3.8-Flash-Next's Program reads no use_cuda_graph, so its generation start refuses the flag
+    // instead of ignoring it; its lossless route (eager already), a scoring start (no rounds) and Qwen3.5 accept it.
+    {
+        EngineOptions options;
+        options.artifact_path  = "model.infernix";
+        options.use_cuda_graph = false;
+        const auto refused = [&](const EngineOptions& o, infernix::models::Architecture architecture, bool offloaded) {
+            try {
+                infernix::runtime::validate_engine_options(o, architecture, offloaded);
+            } catch (const std::invalid_argument& error) {
+                return std::string(error.what()).find("--no-cuda-graph") != std::string::npos;
+            }
+            return false;
+        };
+        failures += check(refused(options, infernix::models::Architecture::Qwen4Exp, true),
+                          "--no-cuda-graph was accepted on a Qwen3.8-Flash-Next generation start, which ignores it");
+        failures += check(!refused(options, infernix::models::Architecture::Qwen3_5, false) &&
+                              !refused(options, infernix::models::Architecture::Qwen3_5Moe, true),
+                          "--no-cuda-graph was refused on a Qwen3.5-family start, which honours it");
+        EngineOptions lossless = options;
+        lossless.lossless      = true;
+        lossless.fast_paths    = false;
+        EngineOptions scoring  = options;
+        scoring.purpose        = infernix::EnginePurpose::CausalScoring;
+        failures += check(!refused(lossless, infernix::models::Architecture::Qwen4Exp, true) &&
+                              !refused(scoring, infernix::models::Architecture::Qwen4Exp, true),
+                          "--no-cuda-graph was refused on Qwen3.8-Flash-Next's lossless route or a scoring start");
+    }
     // --ablate: every architecture takes it (Qwen3.5, Qwen3.5-MoE, Qwen3.8-Flash-Next).
     {
         EngineOptions options;
