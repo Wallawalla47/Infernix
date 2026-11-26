@@ -10,13 +10,19 @@
 // Skips (77) unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
 //   INFERNIX_QWEN4_ARTIFACT=out.infernix [INFERNIX_QWEN4_NGRAM=v.ngram] [INFERNIX_EXPERT_RAM_MIB=N]
-//   infernix_qwen4_exp_score_real_test @TOKENS REFERENCE.bin [--chunk N] [--top-k K]
+//   infernix_qwen4_exp_score_real_test @TOKENS REFERENCE.bin [--chunk N] [--top-k K] [--no-fast-paths]
+//                                      [--fast-path NAME]... [--without-fast-path NAME]...
+// --fast-path runs the Forward's kernels plus the named paths alone, --without-fast-path the default route less them
+// (the attribution arms of a default-route excess); the run prints the paths it ran and those that apply.
 //
 // TOKENS holds ids separated by commas or whitespace; REFERENCE is the dump of the same ids (int32
 // vocabulary, int32 rows, then one FP32 row per position). INFERNIX_EXPERT_RAM_MIB selects the SSD tier.
-// The dump runs none of the default fast paths: --no-fast-paths runs the Engine on the same kernels. On the default
-// route NVIDIA NVFP4 QAD Dense8's fast paths move the scores beyond these criteria (2026-11-23, 300 tokens at chunk
-// 256: mean |dlogp| 0.067, top-1 96 %; with --no-fast-paths 0.00028, 100 %, and the hidden states bit-identical).
+// The dump runs none of the default fast paths: --no-fast-paths runs the Engine on the same kernels. These criteria
+// are the reproducible route's: a fast path that changes the scores is judged by its certification against the
+// stored reference (model-quality.md 6.1), not here. On the default route NVIDIA NVFP4 QAD Dense8's scoring runs
+// preemption and f16-accumulate-prefill, and the latter alone moves the scores beyond these criteria (2026-11-26, 300
+// tokens at chunk 256: mean |dlogp| 0.067, top-1 96 %; the default route --without-fast-path f16-accumulate-prefill
+// 0.00028, 100 %, as --no-fast-paths, whose hidden states are bit-identical).
 //
 // With --blocks BLOCKS.bin (the forward test's --blocks of the same ids and --chunk: BF16 [position][layer][mixer in,
 // mixer out, MoE in, MoE out][H]), the prompt's hidden states (ScoreOptions::prompt_hidden_states, the window's last
@@ -152,6 +158,7 @@ int main(int argc, char** argv) {
     std::uint32_t chunk = 256, top_k = 8;
     std::string blocks_path;
     bool fast_paths = true;
+    std::vector<infernix::FastPath> alone, without;
     for (int i = 3; i < argc; ++i) {
         const std::string option = argv[i];
         if (option == "--no-fast-paths") { // the Forward's kernels: the dump runs none of the default fast paths
@@ -162,8 +169,19 @@ int main(int argc, char** argv) {
         if (option == "--chunk") { chunk = static_cast<std::uint32_t>(std::stoul(argv[i + 1])); }
         if (option == "--top-k") { top_k = static_cast<std::uint32_t>(std::stoul(argv[i + 1])); }
         if (option == "--blocks") { blocks_path = argv[i + 1]; }
+        // Attribution arms (candidates JK-41): --fast-path NAME runs the Forward's kernels plus that path alone
+        // (repeatable); --without-fast-path NAME the default route less that path.
+        if (option == "--fast-path" || option == "--without-fast-path") {
+            const auto path = infernix::parse_fast_path(argv[i + 1]);
+            if (!path) {
+                std::printf("FAIL: unknown fast path %s\n", argv[i + 1]);
+                return 1;
+            }
+            (option == "--fast-path" ? alone : without).push_back(*path);
+        }
         ++i;
     }
+    if (!alone.empty()) { fast_paths = false; }
     try {
         const auto ids = read_ids(argv[1]);
         std::ifstream reference(argv[2], std::ios::binary);
@@ -185,7 +203,19 @@ int main(int argc, char** argv) {
         options.prefill_chunk = chunk;
         options.kv_cache      = infernix::KvCacheStorage::Int8Group64;
         options.fast_paths    = fast_paths;
+        options.fast_path_candidates = alone;
+        options.fast_path_exclusions = without;
         infernix::Engine engine(options);
+        {
+            const infernix::LoadSummary load = engine.load_summary();
+            const auto join = [](const std::vector<std::string>& names) {
+                std::string out;
+                for (const std::string& name : names) { out += (out.empty() ? "" : ", ") + name; }
+                return out.empty() ? std::string("none") : out;
+            };
+            std::printf("fast paths: %s (applicable: %s)\n", join(load.fast_paths).c_str(),
+                        join(load.fast_paths_applicable).c_str());
+        }
         infernix::ScoreOptions score;
         score.top_k = top_k;
         const infernix::ScoreResult result = engine.score_tokens(ids, 1, score);
