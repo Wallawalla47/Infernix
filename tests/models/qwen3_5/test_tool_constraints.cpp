@@ -591,6 +591,54 @@ void declared_parameter_lines(infernix::text::GrammarCompiler& compiled) {
             "the declared-names grammar changed whether a call may name no parameter");
 }
 
+// After a call's closing lines, a newline and the `<tool_call>` token, the next call is the only reading: a raw
+// value may quote closing lines but not closing lines followed by `\n<tool_call>`. Before, the grammar also read
+// that token as text of the previous value, so a second call it should have refused (an undeclared tool, a JSON
+// call, a malformed parameter) was generated and the decoder failed the turn at its end ("committed tool grammar
+// and parameter decoder disagree", Flash-Next 2026-11-11 and -13). Every text the grammar admits, the decoder
+// reads to the same calls.
+void second_call_framing(infernix::text::GrammarCompiler& compiled) {
+    const std::string closers = "\n</parameter>\n</function>\n</tool_call>";
+    for (const bool strict : {false, true}) {
+        const auto bound = contract(schema({{"type", "string"}}), strict);
+        for (const std::string& bad : {call("a") + "\n" + call("b", "nosuchtool"),
+                                       call("a") + "\n<tool_call>{\"name\": \"call\"}" + closers,
+                                       call("a") + "\n<tool_call>\n<function=call>\n<parameter=x\n>\nb" + closers,
+                                       call("a") + "\n<tool_call>" + closers}) {
+            require(!accepts(compiled, *bound, bad), "a malformed second call was admitted as text of the first value");
+        }
+        require(!accepts(compiled, *bound, call("a" + closers + "\n<tool_call>\nb")),
+                "a value quoted closing lines and the next call's opener");
+        // What stays: two calls, a value quoting closing lines (with or without more text after them), and the
+        // spelling of the token inside a value.
+        for (const std::string& good :
+             {call("a") + "\n" + call("b"), call("a" + closers), call("a" + closers + "\nb"),
+              call("a" + closers + "\n") + "\n" + call("b"), call("see <tool_call> here")}) {
+            require(accepts(compiled, *bound, good), "a well-formed text was refused");
+            frontend::ToolCallOutputDecoder decoder(bound, 64);
+            (void)feed(decoder, good);
+            bool read = true;
+            try {
+                (void)decoder.finish();
+            } catch (const std::logic_error&) { read = false; }
+            require(read, "the decoder refused a text the grammar admits");
+        }
+        // The mask after closers, a newline and the token: only the declared function's opener goes on.
+        auto matcher = frontend::compile_tool_grammar(compiled, *bound, kToolCall, {}, {});
+        for (const std::int32_t token : tokens(call("a") + "\n<tool_call>\n<function=")) {
+            matcher->accept(token);
+            matcher->confirm();
+        }
+        std::vector<std::uint32_t> words(matcher->mask_words());
+        require(matcher->masks({}, words) == 0, "the second call's name found a dead end");
+        const auto allowed = [&](char byte) {
+            const auto t = static_cast<std::uint32_t>(static_cast<unsigned char>(byte));
+            return (words[t / 32] >> (t % 32) & 1U) != 0;
+        };
+        require(allowed('c') && !allowed('n') && !allowed('{'), "the second call's name was not held to the declared tools");
+    }
+}
+
 // A parameter a declared non-strict tool does not declare counts as a schema mismatch on the constrained
 // (streamed) route, as the whole-text route counts it (candidates QA-14).
 void undeclared_parameters() {
@@ -641,6 +689,7 @@ void run() {
     calls_after_closers(compiled);
     unclosed_values(compiled);
     declared_parameter_lines(compiled);
+    second_call_framing(compiled);
     infernix::ToolChoice required;
     required.mode = infernix::ToolChoiceMode::Required;
     auto fixed =

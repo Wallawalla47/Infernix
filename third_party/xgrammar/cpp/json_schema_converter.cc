@@ -3672,12 +3672,38 @@ void XMLToolCallingConverter::AddBasicRules() {
     const int32_t segment = builder_.AddRuleWithHint(
         segment_name, ExcludingString(R"([^\uD800-\uDFFF]*)", segment_name, false)
     );
+    // Infernix: the text after quoted closing lines is a segment that does not begin with the next
+    // call's `\n<tool_call>`. With it, closing lines, a newline and the token read two ways (the
+    // next call, or more of this value), and the second reading let through a next call the decoder
+    // refuses (an undeclared tool, a JSON call): Infernix's "committed tool grammar and parameter
+    // decoder disagree", 2026-11-13. A segment's exclusions cannot see across the closing lines
+    // before it, so the opener is cut from the segment's start here.
+    excludes_.push_back("\n</parameter>");
+    const std::string after_name = kXMLString + "_after_close";
+    int32_t after_close = -1;
+    {
+      auto parsed = GrammarFSMBuilder::Regex(R"([^\uD800-\uDFFF]*)", false);
+      XGRAMMAR_CHECK(parsed.IsOk());
+      auto exclusion = GrammarFSMBuilder::TagDispatch({{}, false, excludes_});
+      XGRAMMAR_CHECK(exclusion.has_value());
+      auto body = FSMWithStartEnd::Intersect(std::move(parsed).Unwrap(), *exclusion);
+      XGRAMMAR_CHECK(body.IsOk());
+      auto opener = GrammarFSMBuilder::Regex(R"(\n<tool_call>[^\uD800-\uDFFF]*)", false);
+      XGRAMMAR_CHECK(opener.IsOk());
+      auto not_opener = std::move(opener).Unwrap().Not();
+      XGRAMMAR_CHECK(not_opener.IsOk());
+      auto fsm = FSMWithStartEnd::Intersect(std::move(body).Unwrap(), std::move(not_opener).Unwrap());
+      XGRAMMAR_CHECK(fsm.IsOk());
+      after_close = builder_.AddRuleWithHint(
+          after_name, AddScalarStringFSM(builder_, std::move(fsm).Unwrap(), after_name, false, false)
+      );
+    }
     excludes_ = std::move(saved);
     // Infernix: a raw value holds its terminator only inside the whole call's closing lines that
     // more value text follows (a document quoting them). The matcher keeps both readings until the
     // output ends or the next call's token begins, and only the closing one completes there.
     const int32_t quoted_close = Sequence(
-        {ByteString("\n</parameter>\n</function>\n</tool_call>"), RuleRef(segment)}
+        {ByteString("\n</parameter>\n</function>\n</tool_call>"), RuleRef(after_close)}
     );
     // Infernix: with quoted parameter lines a raw value also holds `\n</parameter>\n<parameter=NAME>`
     // and more text (a document quoting a call). Both readings stay open; the caller's decoder takes
