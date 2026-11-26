@@ -658,7 +658,7 @@ drafter flags are the fastest measured overall, and `auto` picks the draft lengt
 | Qwen3.6-35B-A3B | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length, 1-5 (DFlash `auto` is faster only on code at one request) |
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
-| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft` | the calibrated number of drafts, up to 7, while one request decodes; rounds of several requests decode plainly |
+| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft` | the calibrated number of drafts, up to 7; requests decoding together draft together, the same number each round |
 
 For long conversations on the 27Bs, whose KV cache two long conversations outgrow, add `--embedding-host`:
 the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes

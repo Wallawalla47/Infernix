@@ -7,6 +7,8 @@
 // 3. Beside unconstrained requests (C = 4, graphs): each constrained request gives its solo tokens, and each
 //    unconstrained one its own.
 // 4. --lm-head-draft (the drafter's shortlist) beside DSpark gives the reference's tokens.
+// 4b. DSpark rounds of several rows (graphs, C = 4, auto and 7 drafts): constrained requests drafting beside an
+//    unconstrained one, each row's verify columns under its own masks, give their solo tokens.
 // 5. Token constraints (TokenConstraint, /v1/decide's generated primitives) on a prompt that opens the answer: every
 //    token in its step's set, forced steps exact, one draw a step; step 0's restricted probabilities, mass, observed
 //    log-probabilities and captured logits against an unconstrained readout of the same position; graphs, C = 4
@@ -356,6 +358,30 @@ int main() {
                 report(label + ": " + all[i].name, result);
                 require_same(label + ": " + all[i].name, reference[i], result.generated_token_ids);
             }
+        }
+        for (const bool automatic : {true, false}) {
+            // Rounds of several rows draft together (graphs, C = 4): three constrained requests beside an unconstrained
+            // one, then the rest beside the other; each row's verify columns sample under its own masks.
+            infernix::Engine engine(engine_options(artifact, true, 4, true, automatic));
+            const std::string label = automatic ? "dspark rows (auto)" : "dspark rows (7 drafts)";
+            std::vector<infernix::GenerationHandle> handles;
+            handles.push_back(engine.submit(engine.prepare(chat(kTexts[0])), unconstrained(0)));
+            for (std::size_t i = 0; i < 3; ++i) { handles.push_back(engine.submit(engine.prepare(all[i].prompt), all[i].options)); }
+            require_same(label + ", C = 4: unconstrained 0", plain[0], handles[0].wait().generated_token_ids);
+            for (std::size_t i = 0; i < 3; ++i) {
+                const auto result = handles[i + 1].wait();
+                report(label + ", C = 4: " + all[i].name, result);
+                require_same(label + ", C = 4: " + all[i].name, reference[i], result.generated_token_ids);
+            }
+            handles.clear();
+            for (std::size_t i = 3; i < all.size(); ++i) { handles.push_back(engine.submit(engine.prepare(all[i].prompt), all[i].options)); }
+            handles.push_back(engine.submit(engine.prepare(chat(kTexts[1])), unconstrained(1)));
+            for (std::size_t i = 3; i < all.size(); ++i) {
+                const auto result = handles[i - 3].wait();
+                report(label + ", C = 4: " + all[i].name, result);
+                require_same(label + ", C = 4: " + all[i].name, reference[i], result.generated_token_ids);
+            }
+            require_same(label + ", C = 4: unconstrained 1", plain[1], handles.back().wait().generated_token_ids);
         }
         {
             // --lm-head-draft shortlists the drafter's proposals only: the masks read the target's whole head.

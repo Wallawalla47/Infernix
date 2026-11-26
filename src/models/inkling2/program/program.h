@@ -332,6 +332,9 @@ struct ProgramOptions {
     // tap planner's limits. Off: no request reuses or publishes anything.
     bool prefix_cache                = false;
     std::uint64_t prefix_host_bytes  = 0;
+    // An automatic Host tier's growth room (--ram-resize auto): the most it may grow to once RAM frees (0: none; the
+    // start page-locks prefix_host_bytes of it).
+    std::uint64_t prefix_host_ceiling_bytes = 0;
     std::uint32_t prefix_max_new_taps   = 8;
     std::uint32_t prefix_ladder_tokens  = 4096;
     std::uint32_t prefix_min_gap_tokens = 1024;
@@ -426,15 +429,26 @@ public:
     [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options);
 
     [[nodiscard]] MemoryUsage memory_usage() const noexcept;
+    // What the start planned for the Program and the Program did not allocate (MemoryUsage::Device::reserved).
+    void set_reserved_bytes(std::uint64_t bytes) noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept {}
 
-    // The idle Engine's maintenance (hybrid_storage_due): the SSD tier's write-backs of what the last requests left in
-    // the Host tier.
+    // The idle Engine's maintenance (hybrid_storage_due, or the RAM monitor's waker): the SSD tier's write-backs of what
+    // the last requests left in the Host tier, and the Host tier's resize under RAM pressure (start_ram_resize).
     void maintain();
-    // ---- the common contract's hooks this slice has nothing behind (runtime/contract/program.h) ----
-    void maintain_busy() {}
-    void set_maintenance_waker(std::function<void()>) {}
+    // Between rounds while requests run, when the waker asked (runtime/contract/program.h): the Host tier's resize
+    // advances or starts.
+    void maintain_busy();
+    // The RAM monitor's waker (start_ram_resize): the Engine then calls maintain() or maintain_busy() on its worker.
+    void set_maintenance_waker(std::function<void()> waker);
+    // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
+    // maintain() and maintain_busy() shrink the prefix cache's Host tier while the OS runs short (less than
+    // max(reserve_bytes / 2, 2 GiB) available) and grow it back, an automatic tier up to its growth room
+    // (ProgramOptions::prefix_host_ceiling_bytes), once more than the reserve plus a step stays free. `trim_host_tier`
+    // (an automatic Host tier): the first maintenance after the start gives back what keeps less than the reserve
+    // available. Without a Host tier, nothing.
+    void start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier);
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
     // The SSD tier (ProgramOptions::prefix_ssd_bytes): landed transfers applied and write-backs started; a source a quote
     // is reading from the SSD; whether a write-back is due, or when one may be.

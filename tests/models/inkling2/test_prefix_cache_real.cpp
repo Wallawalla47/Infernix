@@ -19,19 +19,27 @@
 // 10. Images (INFERNIX_INKLING2_VISION_ARTIFACT): another image never resumes past the image; the same image does.
 // 11. The SSD tier (INFERNIX_INKLING2_PREFIX_SSD_ONLY runs it alone): what the Host tier gives up is written back, read
 //     back on a hit, and resumes as cold.
+// 12. RAM pressure (--ram-resize auto, a faked availability; INFERNIX_INKLING2_PREFIX_RAM_ONLY runs it alone): the Host
+//     tier gives chunks back with its entries moved below the cut, a continuation resumes from them as cold, and the
+//     tier grows back once RAM frees.
 //
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (skips without it)
 
 #include "infernix/engine.h"
 #include "media/decode/decode.h"
+#include "models/inkling2/program/test_taps.h"
 #include "models/resume_cold_probe.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -184,6 +192,59 @@ void ssd_tier(const std::filesystem::path& artifact) {
     std::filesystem::remove_all(dir, ignored);
 }
 
+// 12. The Host tier under RAM pressure (--ram-resize auto; INFERNIX_INKLING2_PREFIX_RAM_ONLY runs it alone): the RAM
+//     monitor reads a faked availability (testing::set_ram_available). A 4 GiB tier with a published 3,500-token prompt;
+//     1.9 GiB available (under the 2 GiB pressure point) gives back whole chunks toward the 4 GiB reserve, the prompt's
+//     entries copied below the cut; at 4.5 GiB (between the two thresholds) nothing more changes; the continuation then
+//     resumes from the moved slabs and equals its cold run; 64 GiB available takes the tier back to its startup size.
+void ram_resize(const std::filesystem::path& artifact) {
+    namespace inkling_testing = infernix::models::inkling2::testing;
+    constexpr std::uint64_t kGiB = 1ULL << 30U;
+    std::atomic<std::uint64_t> available{64 * kGiB};
+    inkling_testing::set_ram_available([&available] { return available.load(); });
+    infernix::EngineOptions options = cache_options(artifact, infernix::KvCacheStorage::BFloat16, 4096, kContext);
+    options.context_cache.host_capacity_bytes = 4 * kGiB;
+    options.ram_resize                        = true;
+    {
+        infernix::Engine engine(options);
+        const Tokens prompt         = long_prompt(engine, 3500, 77);
+        const infernix::TokenId sep = engine.tokenize_text("\n").front();
+        (void)engine.generate(engine.prepare_tokens(prompt), infernix::test::resume_probe_request(1, true));
+        const auto host = [&] { return engine.runtime_stats().hybrid_host_capacity_bytes; };
+        const auto await = [&](const char* what, const std::function<bool(std::uint64_t)>& done, int seconds) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+            while (!done(host())) {
+                require(std::chrono::steady_clock::now() < until, std::string("ram resize: ") + what);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        };
+        const std::uint64_t startup = host();
+        require(startup >= 4 * kGiB - kGiB / 8, "ram resize: the Host tier did not start at its 4 GiB");
+        available = (19 * kGiB) / 10;
+        await("no release under pressure", [&](std::uint64_t now) { return now < startup; }, 30);
+        available = (9 * kGiB) / 2;
+        std::this_thread::sleep_for(std::chrono::seconds(3)); // a release under way completes; nothing more starts
+        const std::uint64_t released = host();
+        Tokens continuation = prompt;
+        continuation.push_back(sep);
+        const infernix::GenerationResult resumed =
+            engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, true));
+        const infernix::GenerationResult cold =
+            engine.generate(engine.prepare_tokens(continuation), infernix::test::resume_probe_request(16, false));
+        std::cout << "ram resize: Host tier " << startup / 1048576 << " MiB, " << released / 1048576
+                  << " MiB after the release; the continuation reused " << resumed.reused_prompt_tokens
+                  << " prompt tokens\n";
+        require(released < startup && released != 0, "ram resize: the release did not hold");
+        require(resumed.reused_prompt_tokens >= 3456, "ram resize: the prompt's entries did not survive the release");
+        require(resumed.generated_token_ids == cold.generated_token_ids,
+                "ram resize: the continuation from the moved slabs differs from cold");
+        available = 64 * kGiB;
+        await("no growth back to the startup size", [&](std::uint64_t now) { return now >= startup; }, 90);
+        std::cout << "ram resize: grown back to " << host() / 1048576 << " MiB\n";
+    }
+    inkling_testing::set_ram_available({});
+}
+
 } // namespace
 
 int main() {
@@ -197,6 +258,11 @@ int main() {
         if (std::getenv("INFERNIX_INKLING2_PREFIX_SSD_ONLY") != nullptr) {
             ssd_tier(artifact);
             std::cout << "PASS (the SSD tier case alone)\n";
+            return 0;
+        }
+        if (std::getenv("INFERNIX_INKLING2_PREFIX_RAM_ONLY") != nullptr) {
+            ram_resize(artifact);
+            std::cout << "PASS (the RAM resize case alone)\n";
             return 0;
         }
         if (std::getenv("INFERNIX_INKLING2_PREFIX_TIMING") != nullptr) {
@@ -446,6 +512,7 @@ int main() {
         }
         // 11. The SSD tier.
         ssd_tier(artifact);
+        ram_resize(artifact);
         std::cout << "PASS\n";
         return 0;
     } catch (const std::exception& e) {

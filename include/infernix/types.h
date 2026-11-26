@@ -2168,6 +2168,10 @@ struct MemoryUsage {
         std::uint64_t prefix        = 0; // the prefix cache's device snapshots and the KV pages only it holds
         std::uint64_t workspace     = 0; // activation workspace, with frames the expert cache lends to prefill and vision
         std::uint64_t cuda_graphs   = 0; // CUDA Graph executables (measured when they were prepared)
+        // Device memory the start planned for the Program and the Program did not allocate (its plan's CUDA graph
+        // allowance and estimates beyond what it took): kept for its later allocations, free on the device meanwhile.
+        // Inkling 2 reports it; 0 elsewhere.
+        std::uint64_t reserved      = 0;
         std::uint64_t staging       = 0; // copy staging and tables (expert misses, the expert cache's tables)
     } device;
     struct Host {

@@ -810,8 +810,6 @@ void refuse_unsupported_options(const ServeOptions& options, std::string_view ar
     };
     refuse(options.expert_state.has_value(), "--expert-state",
            "applies to models with offloaded experts; Inkling 2 keeps its experts in VRAM");
-    refuse(options.ram_resize_explicit, "--ram-resize",
-           "resizes the RAM tiers of the models that have them; Inkling 2's Host tier keeps its startup size");
     refuse(options.reasoning_loop != infernix::ReasoningLoopAction::Off, "--reasoning-loop",
            "stop and conclude: Inkling 2 has no reasoning-loop guard (use off)");
     refuse(options.preserve_thinking.has_value(), "--preserve-thinking",

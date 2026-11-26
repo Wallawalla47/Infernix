@@ -42,7 +42,10 @@ of the Qwen models are [not available on Inkling yet](#not-supported-yet), among
   The execution workspace takes a further 1.8 GiB (3.1 GiB with `--vision`). What is left holds the KV cache, so the
   context you can run depends on the options: [`--plan`](#check-a-configuration-first) reports it for your machine.
 - **RAM.** A peak working set of 1.9 GiB for a short `infernix` run at an 8,192-token context, including the load. The
-  prefix cache's Host tier takes further RAM, down to `--ram-free-mib`.
+  prefix cache's Host tier takes further RAM, down to `--ram-free-mib`, within what Windows lets the GPU page-lock
+  (about 80 % of RAM on the RTX 5090 machine this was built on). Under `--ram-resize auto` (the server's default) it
+  gives RAM back while other programs need it and grows again, past its startup size, as RAM frees; the startup line
+  `Host tier auto: ...` names the bound that set its size.
 - **Disk.** About 20.3 GB for the artifact.
 - **Operating system.** Run and tested on Windows. The engine and launcher also build on Linux (GCC 13, CUDA 13.4), where
   this model has not been run.
@@ -106,7 +109,7 @@ See [Sizing a start without loading](serving.md#sizing-a-start-without-loading).
 
 Each of these fails with a clear error instead of running differently, except where the table says
 otherwise. The engine refuses an option before the model loads. The options only `infernix-serve` or `infernix` reads
-(the tool options, `--reasoning-loop`, `--expert-state FILE`, `--ram-resize`, `--kv-capacity` without the cache) are refused
+(the tool options, `--reasoning-loop`, `--expert-state FILE`, `--kv-capacity` without the cache) are refused
 once the model has loaded; `--plan` reports them without loading.
 
 | Feature | On Inkling 2 Mini |
@@ -120,9 +123,9 @@ once the model has loaded; `--plan` reports them without loading.
 | N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens`, `--ngram-min-match`, `--ngram-tree-nodes`, `--ngram-archive-mib`, `--ngram-session-mib`, `--ngram-residency` | refused |
 | The MTP, DFlash and DFlash2 backends | `--spec mtp`, `dflash` and `dflash2` are refused: the model's drafter is DSpark. So are `--draft-model`, `--spec-min-p`, `--draft-tree-nodes` and `--draft-tree-paths` (DSpark verifies a chain) |
 | `--lm-head-draft` when no drafter runs | refused: an artifact without DSpark, `--spec off` or `--lossless` |
-| Offloaded-expert options: `--expert-state`, `--expert-ram-mib`, `--expert-ram-layout`, `--expert-pin-mib`, `--expert-csf`, `--expert-stripe`, `--expert-tail-skip`, `--route-trace`, and `--ram-resize` | refused: the experts stay in VRAM and the Host tier keeps its startup size |
+| Offloaded-expert options: `--expert-state`, `--expert-ram-mib`, `--expert-ram-layout`, `--expert-pin-mib`, `--expert-csf`, `--expert-stripe`, `--expert-tail-skip`, `--route-trace` | refused: the experts stay in VRAM |
 | Qwen kernel, fast-path and media options: `--use-original-int8-prefill-kernel`, `--use-original-nvfp4-prefill-kernel`, `--prefill-split-workspace-mib`, `--fast-path`, `--no-fast-path`, `--media-cache-mib`, `--media-live-mib`, `--media-preprocess-threads`, `--context-cost-presets` | refused: Inkling has its own prompt route and image path, registers no fast path, and its prefix cache has no cost model |
-| Sizing options that a start would not use: `--vram-headroom-mib` and `--vram-past-budget` without `--max-context auto` or `--kv-capacity auto`; `--ram-free-mib` without the automatic Host tier; `--vision-max-merged` without `--vision` | refused |
+| Sizing options that a start would not use: `--vram-headroom-mib` and `--vram-past-budget` without `--max-context auto` or `--kv-capacity auto`; `--ram-free-mib` without the automatic Host tier and without `--ram-resize auto`; `--vision-max-merged` without `--vision` | refused |
 | `--kv-capacity N` below `--max-context` | refused: the pool holds at least one request's whole context |
 | Generation options on a `--causal-scoring` start (`--prefix-cache-file`, `--host-context-mib`, `--ssd-context-gib`, `--lm-head-draft`, the sizing options) | not refused: scoring runs without them, and the start lists them as unused in its log, as the other models do |
 | `--logits-dtype bf16` | refused at startup: the logits are FP32 |
@@ -141,8 +144,13 @@ for token.
   plainly.
 - `--draft-tokens auto` uses the calibrated number of drafts each round, up to 7. With `--spec dspark`
   a fixed count from 1 to 7 also works.
-- DSpark drafts only while **one request is decoding**. A round with several requests decodes
-  plainly.
+- Requests decoding together draft together: each request's block is drafted, and one verify call
+  takes the same number of drafts from each, the number their calibrated drafts make fastest on the
+  verify times the rounds measure (a batch size whose drafted rounds turn out slower than its plain
+  ones decodes plainly, trying drafts again now and then). Each request's tokens are still its plain
+  decoding's. A request with presence or frequency penalties, a token constraint, forced tokens
+  pending or less than a block of context left decodes plainly, and so does every request beside it
+  in that round; so does a round under `--no-cuda-graph`.
 - `--lossless` runs without a drafter.
 
 ### `--lm-head-draft`

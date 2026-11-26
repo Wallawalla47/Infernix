@@ -9,6 +9,8 @@
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -17,10 +19,26 @@ namespace infernix::models::inkling2::testing {
 namespace {
 
 std::atomic<std::uint32_t> forced_stalls{0};
+std::atomic<std::uint64_t> rows_drafted{0};
+std::mutex ram_mutex;
+std::function<std::uint64_t()> ram_reader; // ram_mutex
 
 } // namespace
 
+void set_ram_available(std::function<std::uint64_t()> reader) {
+    const std::lock_guard<std::mutex> lock(ram_mutex);
+    ram_reader = std::move(reader);
+}
+
+std::function<std::uint64_t()> ram_available() {
+    const std::lock_guard<std::mutex> lock(ram_mutex);
+    return ram_reader;
+}
+
 void force_moe_stall(std::uint32_t rounds) noexcept { forced_stalls.store(rounds); }
+
+void count_rows_drafted(std::uint64_t rows) noexcept { rows_drafted.fetch_add(rows, std::memory_order_relaxed); }
+std::uint64_t rows_drafted_together() noexcept { return rows_drafted.load(std::memory_order_relaxed); }
 
 bool take_forced_stall() noexcept {
     std::uint32_t left = forced_stalls.load();
@@ -59,12 +77,16 @@ PrefixHostLayout plan_prefix_host_layout(const KVPageGeometry& pages, std::size_
 PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool, const LaneImages& lanes,
                          std::uint64_t host_bytes, cudaStream_t compute)
     : taps_(config.taps), pool_(&pool), lanes_(lanes),
-      host_(plan_prefix_host_layout(pool.geometry(), lanes.image_bytes(), host_bytes)), compute_(compute) {
-    if (host_.slabs == 0) {
+      host_(plan_prefix_host_layout(pool.geometry(), lanes.image_bytes(), std::max(host_bytes, config.host_ceiling_bytes))),
+      compute_(compute) {
+    // The slabs page-locked at the start; the rest of host_.slabs is growth room (--ram-resize auto).
+    const auto locked = static_cast<std::uint32_t>(std::min<std::uint64_t>(host_bytes / std::max<std::size_t>(host_.slab_bytes, 1U),
+                                                                           host_.slabs));
+    if (locked == 0) {
         // Host-born snapshots are the only snapshot source: without a Host tier there is no cache.
         throw std::invalid_argument("the Inkling 2 prefix cache needs a Host tier (--host-context-mib)");
     }
-    if (host_.slabs < host_.image_slabs + 2U) {
+    if (locked < host_.image_slabs + 2U) {
         const std::uint64_t mib =
             (static_cast<std::uint64_t>(host_.image_slabs + 2U) * host_.slab_bytes + (1U << 20U) - 1U) >> 20U;
         throw std::invalid_argument("--host-context-mib is too small for the Inkling 2 prefix cache: one snapshot needs " +
@@ -88,7 +110,7 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     index.block_bytes           = host_.page.page_stride;
     index.image_bytes           = host_.image_bytes;
     index.host_blocks           = true;
-    store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, host_.slabs, kHostChunkBytes, "Inkling 2 prefix cache Host tier");
+    store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, locked, kHostChunkBytes, "Inkling 2 prefix cache Host tier");
     store_.set_floor_chunks((host_.image_slabs + 2U + host_.slabs_per_chunk - 1U) / host_.slabs_per_chunk);
     try {
         CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_, cudaStreamNonBlocking));
@@ -102,7 +124,7 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         }
         blocks_.reserve(index.max_nodes);
         index_.emplace(index, *this);
-        store_.limit_index(*index_);
+        store_.limit_index(*index_); // only the locked slabs serve until a growth links more
     } catch (...) {
         ssd_.reset(); // its threads end before the slabs they would read
         index_.reset();
@@ -624,6 +646,21 @@ void PrefixCache::clear() noexcept {
     free_blocks_.clear();
     index_.emplace(config, *this);
     store_.limit_index(*index_);
+}
+
+// ---- Host tier resize ----------------------------------------------------------------------------------
+
+std::uint64_t PrefixCache::begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker) {
+    poll(); // landed writes and captures publish first: their entries can move rather than hold the cut
+    return store_.begin_release(*index_, bytes, worker);
+}
+
+pc::HostSlabStore::Progress PrefixCache::step_host_resize(HostMemoryWorker& worker) {
+    if (!store_.resizing()) { return {}; }
+    poll(); // retires the restores that have landed
+    // A restore batch reads Host slabs from the addresses it was staged with: a move commits only once none is open or
+    // landing. Captures and writes target reserved or filling slabs, which never move.
+    return store_.step(*index_, !restore_.open && landing_.empty(), worker);
 }
 
 // ---- persistence ----------------------------------------------------------------------------------------

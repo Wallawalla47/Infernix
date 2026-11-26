@@ -22,7 +22,9 @@
 //    tokens equal plain decoding's (the golden continuation, a 160-token greedy reply raw and parsed: the parsed one
 //    samples under its reasoning ban, the four sampled requests alone
 //    and C = 2; under --a16-activations and under --a8-activations the greedy reply equals that route's plain tokens);
-//    the acceptance is reported.
+//    the acceptance is reported. 7b. Rounds of several rows drafting together: the four sampled requests at C = 4 and
+//    the greedy and parsed replies at C = 2 give their plain tokens (auto and 7 drafts), and rounds of several rows
+//    drafted (also under each --kv-dtype, 8; under int8 also C = 8 with 7 drafts: 64 verify columns).
 // 8. --kv-dtype (the full visits' pools quantized): each format as a variant of 6 (accepted with --reproducible),
 //    DSpark (auto, graphs) giving its plain tokens, and a 10,000-token prompt's greedy continuation the same in chunks
 //    of 4,096 and 1,000; bf16p (lossless) gives bf16's tokens throughout, the others' agreement with BF16's is reported.
@@ -365,6 +367,48 @@ int main() {
                     }
                 }
             }
+            // 7b. Rounds of several rows draft together (decode_dspark_rows): four sampled requests at once, and the
+            // 160-token greedy reply beside the parsed one (its reasoning ban, a row of its own), auto and 7 drafts,
+            // give their plain tokens; rounds of several rows must have drafted (testing::rows_drafted_together).
+            for (const bool automatic : {true, false}) {
+                infernix::EngineOptions options = engine_options(artifact, 0, true, 4);
+                options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                options.speculative.draft_tokens_auto = automatic;
+                options.speculative.draft_tokens      = 7;
+                infernix::Engine engine(options);
+                const std::string label = std::string("dspark rows (") + (automatic ? "auto" : "7 drafts") + ")";
+                const std::uint64_t together = infernix::models::inkling2::testing::rows_drafted_together();
+                std::vector<infernix::GenerationHandle> handles;
+                for (std::size_t i = 0; i < texts().size(); ++i) {
+                    handles.push_back(engine.submit(engine.prepare(chat(texts()[i])), sampled(i)));
+                }
+                std::vector<infernix::GenerationResult> results;
+                for (std::size_t i = 0; i < handles.size(); ++i) {
+                    results.push_back(handles[i].wait());
+                    require_same(label + ", C = 4, request " + std::to_string(i), reference_tokens[i],
+                                 results.back().generated_token_ids);
+                }
+                for (std::size_t i = 0; i < results.size(); ++i) {
+                    const infernix::SpeculativeStats& s = results[i].speculative;
+                    std::cout << label << ", C = 4, request " << i << ": " << s.rounds << " rounds, " << s.accepted_tokens
+                              << " of " << s.drafted_tokens << " drafts accepted, " << s.fallback_steps << " plain steps\n";
+                }
+                const std::uint64_t drafted_together =
+                    infernix::models::inkling2::testing::rows_drafted_together() - together;
+                std::cout << label << ", C = 4: " << drafted_together << " rows drafted in rounds of several rows\n";
+                require(drafted_together > 0, label + ": no round of several rows drafted");
+                auto reply  = engine.submit(engine.prepare(chat(texts()[1])), long_greedy);
+                auto parsed = engine.submit(engine.prepare(chat(texts()[0])), reasoning);
+                const auto reply_result  = reply.wait();
+                const auto parsed_result = parsed.wait();
+                require_same(label + ", C = 2: a 160-token greedy reply", plain_long, reply_result.generated_token_ids);
+                require_same(label + ", C = 2: a 160-token parsed greedy reply (reasoning ban)", plain_reasoning,
+                             parsed_result.generated_token_ids);
+                std::cout << label << ", C = 2: greedy reply " << reply_result.speculative.accepted_tokens << " of "
+                          << reply_result.speculative.drafted_tokens << " drafts accepted, parsed reply "
+                          << parsed_result.speculative.accepted_tokens << " of "
+                          << parsed_result.speculative.drafted_tokens << "\n";
+            }
             {
                 // --lm-head-draft: the drafter reads a shortlist, and verification still decides every output. On an
                 // artifact without a ranking the flag is refused (INFERNIX_INKLING2_RANKED=1: the artifact must have one).
@@ -607,9 +651,11 @@ int main() {
                 infernix::EngineOptions plain = engine_options(artifact, 0, true, 1);
                 set(plain);
                 Tokens plain_reply;
+                std::vector<Tokens> plain_sampled;
                 {
                     infernix::Engine engine(plain);
                     plain_reply = engine.generate(engine.prepare(chat(texts()[1])), greedy(160)).generated_token_ids;
+                    plain_sampled = alone(engine);
                     if (lossless) {
                         require_same(name + ": the golden continuation", continuation,
                                      engine.generate(engine.prepare_tokens(prompt), greedy(8)).generated_token_ids);
@@ -634,6 +680,50 @@ int main() {
                     const infernix::SpeculativeStats& s = result.speculative;
                     std::cout << name << ", dspark (auto, graphs): " << s.rounds << " rounds, " << s.accepted_tokens
                               << " of " << s.drafted_tokens << " drafts accepted\n";
+                }
+                {
+                    // 7b under the format: the four sampled requests at once draft in rounds of several rows and give
+                    // the format's plain tokens.
+                    infernix::EngineOptions rows = engine_options(artifact, 0, true, 4);
+                    set(rows);
+                    rows.speculative = spec.speculative;
+                    infernix::Engine engine(rows);
+                    const std::uint64_t together = infernix::models::inkling2::testing::rows_drafted_together();
+                    std::vector<infernix::GenerationHandle> handles;
+                    for (std::size_t i = 0; i < texts().size(); ++i) {
+                        handles.push_back(engine.submit(engine.prepare(chat(texts()[i])), sampled(i)));
+                    }
+                    for (std::size_t i = 0; i < handles.size(); ++i) {
+                        require_same(name + ", dspark rows, C = 4, request " + std::to_string(i), plain_sampled[i],
+                                     handles[i].wait().generated_token_ids);
+                    }
+                    require(infernix::models::inkling2::testing::rows_drafted_together() > together,
+                            name + ", dspark rows: no round of several rows drafted");
+                }
+                if (storage == infernix::KvCacheStorage::Int8Group64) {
+                    // The widest round: eight requests with 7 drafts each (8 x 8 = 64 verify columns, every sample
+                    // chunk), INT8 pools (the owner's format).
+                    infernix::EngineOptions rows = engine_options(artifact, 0, true, 8);
+                    set(rows);
+                    rows.speculative                   = spec.speculative;
+                    rows.speculative.draft_tokens_auto = false;
+                    infernix::Engine engine(rows);
+                    const std::uint64_t together = infernix::models::inkling2::testing::rows_drafted_together();
+                    std::vector<infernix::GenerationHandle> handles;
+                    for (int copy = 0; copy < 2; ++copy) {
+                        for (std::size_t i = 0; i < texts().size(); ++i) {
+                            handles.push_back(engine.submit(engine.prepare(chat(texts()[i])), sampled(i)));
+                        }
+                    }
+                    for (std::size_t j = 0; j < handles.size(); ++j) {
+                        require_same(name + ", dspark rows (7 drafts), C = 8, request " + std::to_string(j),
+                                     plain_sampled[j % texts().size()], handles[j].wait().generated_token_ids);
+                    }
+                    std::cout << name << ", dspark rows (7 drafts), C = 8: "
+                              << infernix::models::inkling2::testing::rows_drafted_together() - together
+                              << " rows drafted in rounds of several rows\n";
+                    require(infernix::models::inkling2::testing::rows_drafted_together() > together,
+                            name + ", dspark rows (7 drafts), C = 8: no round of several rows drafted");
                 }
                 Tokens ten_k_reply;
                 for (const std::uint32_t chunk : {4096U, 1000U}) {

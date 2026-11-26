@@ -40,7 +40,7 @@ constexpr std::array kRules = {
     Rule{"--route-trace", kOffload},
     // Memory.
     Rule{"--kv-window-dtype", kInkling},    // Inkling's sliding windows; normalize_engine_options refuses it elsewhere
-    Rule{"--ram-resize", kQwen},            // Inkling's Program has no resizable RAM tiers
+    Rule{"--ram-resize", kQwen | kInkling}, // the prefix cache's Host tier (and Flash-Next's expert RAM)
     Rule{"--embedding-host", kDense | kMoe | kInkling}, // Flash-Next does not read it; offloaded Qwen pins it anyway
     Rule{"--prefill-split-workspace-mib", kQwen35},
     Rule{"--use-original-int8-prefill-kernel", kQwen35},

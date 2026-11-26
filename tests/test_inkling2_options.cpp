@@ -105,8 +105,6 @@ void test_refused_options() {
     refused({"--expert-state", "experts.state"}, "--expert-state");
     refused({"--expert-stripe", "experts.stripe"}, "--expert-stripe");
     refused({"--route-trace", "routes.trace"}, "--route-trace");
-    refused({"--ram-resize", "off"}, "--ram-resize");
-    refused({"--ram-resize", "auto"}, "--ram-resize");
     // Speculation: DSpark drafts a chain from the artifact's own component.
     refused({"--draft-model", "companion.infernix"}, "--draft-model");
     refused({"--draft-tree-paths", "4"}, "--draft-tree-paths");
@@ -123,7 +121,8 @@ void test_refused_options() {
     refused({"--kv-capacity", "65536", "--vram-headroom-mib", "512"}, "--vram-headroom-mib");
     refused({"--no-prefix-reuse", "--vram-past-budget"}, "--vram-past-budget");
     refused({"--no-prefix-reuse", "--ram-free-mib", "8192"}, "--ram-free-mib");
-    refused({"--host-context-mib", "4096", "--ram-free-mib", "8192"}, "--ram-free-mib");
+    // An explicit Host tier keeps the reserve free only under --ram-resize auto.
+    refused({"--host-context-mib", "4096", "--ram-resize", "off", "--ram-free-mib", "8192"}, "--ram-free-mib");
     // The server's thinking and tool options.
     refused({"--reasoning-loop", "stop"}, "--reasoning-loop");
     refused({"--preserve-thinking"}, "--preserve-thinking");
@@ -192,6 +191,10 @@ void test_accepted_starts() {
     accepted({"--no-prefix-reuse", "--max-context", "auto", "--vram-headroom-mib", "512", "--vram-past-budget"});
     accepted({"--vram-headroom-mib", "512", "--vram-past-budget"}); // the cache's --kv-capacity auto
     accepted({"--ram-free-mib", "8192"});                           // the automatic Host tier
+    // The Host tier follows RAM pressure (--ram-resize auto, the default) or keeps its startup size.
+    accepted({"--ram-resize", "auto"});
+    accepted({"--ram-resize", "off"});
+    accepted({"--host-context-mib", "4096", "--ram-free-mib", "8192"}); // the reserve --ram-resize auto keeps
     accepted({"--max-context", "8192", "--max-concurrency", "2", "--kv-capacity", "32768"});
     accepted({"--max-context", "8192", "--max-concurrency", "2", "--kv-capacity", "16384"});
     // The lanes share the pool, which needs only one request's context (a resident pauses when they outgrow it), with

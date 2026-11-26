@@ -58,7 +58,7 @@ void walk(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity, 
         add(b.ctx_k[l], T * kKv * 2);
         add(b.ctx_v[l], T * kKv * 2);
     }
-    add(b.round, sizeof(ik::DSparkRound));
+    add(b.round, L * sizeof(ik::DSparkRound));
     add(b.block_in, kB * kH * 2), add(b.residual, kB * kH * 2), add(b.normed, kB * kH * 2);
     add(b.q, kB * kQ * 2), add(b.k, kB * kKv * 2), add(b.v, kB * kKv * 2), add(b.qr, kB * kQ * 2);
     add(b.attention, kB * kQ * 2), add(b.a, kB * kH * 2), add(b.y, kB * kH * 2);
@@ -66,7 +66,7 @@ void walk(std::int32_t lanes, std::uint32_t max_context, std::int32_t capacity, 
     add(b.base, static_cast<std::size_t>(ik::kMarkovSteps) * vocab * 4);
     add(b.attention_scratch, ik::dspark_attention_scratch_bytes(std::max(full_splits(max_context), kSlidingSplits)));
     add(b.markov_scratch, ik::dspark_markov_scratch_bytes(static_cast<std::int32_t>(vocab)));
-    add(b.tokens, kB * 4), add(b.probabilities, kB * 4), add(b.inv_freq, ik::kDSparkHeadDim / 2 * 4);
+    add(b.tokens, L * kB * 4), add(b.probabilities, L * kB * 4), add(b.inv_freq, ik::kDSparkHeadDim / 2 * 4);
     add(b.head_x8, static_cast<std::size_t>(kB) * ik::projection_a8_column_words(kH) * 4);
 }
 
@@ -114,7 +114,7 @@ Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int3
     : p_(parameters), d_(parameters.dspark.value()), forward_(forward), lanes_(lanes), capacity_(capacity),
       full_splits_(full_splits(max_context)),
       vocab_(parameters.model.config().text.vocab_size),
-      pinned_(align(sizeof(ik::DSparkRound)) + align(kB * 4) + align(kB * 4)) {
+      pinned_(align(lanes * sizeof(ik::DSparkRound)) + 2 * align(static_cast<std::size_t>(lanes) * kB * 4)) {
     if (d_.layers.size() != 3 || !d_.layers[0].sliding || d_.layers[1].sliding || !d_.layers[2].sliding) {
         throw std::invalid_argument("inkling2 dspark: the drafter is 3 layers, sliding, full, sliding");
     }
@@ -160,11 +160,20 @@ Drafter::Drafter(const Parameters& parameters, const Forward& forward, std::int3
         CUDA_CHECK(cudaMemcpy(block_in_ + static_cast<std::size_t>(r) * kH, d_.mask_embedding, kH * 2,
                               cudaMemcpyDeviceToDevice));
     }
-    auto* host          = static_cast<std::uint8_t*>(pinned_.data());
-    host_round_         = reinterpret_cast<ik::DSparkRound*>(host);
-    host_tokens_        = reinterpret_cast<std::int32_t*>(host + align(sizeof(ik::DSparkRound)));
-    host_probabilities_ = reinterpret_cast<float*>(host + align(sizeof(ik::DSparkRound)) + align(kB * 4));
-    *host_round_        = {};
+    auto* host                = static_cast<std::uint8_t*>(pinned_.data());
+    const std::size_t rounds  = align(static_cast<std::size_t>(lanes) * sizeof(ik::DSparkRound));
+    const std::size_t drafts  = align(static_cast<std::size_t>(lanes) * kB * 4);
+    host_round_               = reinterpret_cast<ik::DSparkRound*>(host);
+    host_tokens_              = reinterpret_cast<std::int32_t*>(host + rounds);
+    host_probabilities_       = reinterpret_cast<float*>(host + rounds + drafts);
+    std::fill_n(host_round_, lanes, ik::DSparkRound{});
+}
+
+void Drafter::stage(std::span<const ik::DSparkRound> rounds) {
+    if (rounds.empty() || rounds.size() > static_cast<std::size_t>(lanes_)) {
+        throw std::invalid_argument("inkling2 dspark: a round drafts 1 .. lanes rows");
+    }
+    std::copy(rounds.begin(), rounds.end(), host_round_);
 }
 
 void Drafter::project(ik::ProjectionArgs& args, cudaStream_t stream) const {
@@ -233,11 +242,20 @@ void Drafter::append(std::int32_t first, std::int32_t count, cudaStream_t stream
     }
 }
 
-void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
+void Drafter::draft(std::int32_t steps, cudaStream_t stream, std::int32_t rows) {
     if (steps < 1 || steps > ik::kMarkovSteps) { throw std::invalid_argument("inkling2 dspark: 1-7 drafts a round"); }
-    CUDA_CHECK(cudaMemcpyAsync(round_, host_round_, sizeof(ik::DSparkRound), cudaMemcpyHostToDevice, stream));
+    if (rows < 1 || rows > lanes_) { throw std::invalid_argument("inkling2 dspark: a round drafts 1 .. lanes rows"); }
+    CUDA_CHECK(cudaMemcpyAsync(round_, host_round_, static_cast<std::size_t>(rows) * sizeof(ik::DSparkRound),
+                               cudaMemcpyHostToDevice, stream));
+    for (std::int32_t row = 0; row < rows; ++row) { draft_row(row, steps, stream); }
+}
+
+// One row's block (its round words at round_ + row; its lane's caches; its drafts into the row's slot) on the shared
+// workspace: rows run one after another on the stream.
+void Drafter::draft_row(std::int32_t row, std::int32_t steps, cudaStream_t stream) {
+    ik::DSparkRound* const round = round_ + row;
     // The block's input: the anchor's normed target embedding, then the mask rows; the residual stream starts there.
-    ik::embed(&round_->anchor, 1, p_.embedding, p_.embedding_norm, block_in_, stream);
+    ik::embed(&round->anchor, 1, p_.embedding, p_.embedding_norm, block_in_, stream);
     CUDA_CHECK(cudaMemcpyAsync(residual_, block_in_, static_cast<std::size_t>(kB) * kH * 2, cudaMemcpyDeviceToDevice,
                                stream));
     for (int l = 0; l < 3; ++l) {
@@ -263,7 +281,7 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
         rq.rows     = kB;
         rq.heads    = ik::kDSparkHeads;
         rq.norm     = o.query_norm;
-        rq.round    = round_;
+        rq.round    = round;
         rq.dense    = qr_;
         rq.inv_freq = inv_freq_;
         ik::dspark_rotate(rq, stream);
@@ -276,7 +294,7 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
         rk.rows          = kB;
         rk.heads         = ik::kDSparkKvHeads;
         rk.norm          = o.key_norm;
-        rk.round         = round_;
+        rk.round         = round;
         rk.cache_k       = cache_k_[l];
         rk.cache_v       = cache_v_[l];
         rk.lane_stride   = lane_words_[l];
@@ -294,7 +312,7 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
         at.table       = full_.table;
         at.table_stride = full_.table_stride;
         at.splits      = o.sliding ? kSlidingSplits : full_splits_;
-        at.round       = round_;
+        at.round       = round;
         at.scratch     = attention_scratch_;
         at.out         = attention_;
         ik::dspark_attention(at, stream);
@@ -365,17 +383,24 @@ void Drafter::draft(std::int32_t steps, cudaStream_t stream) {
         mk.row_ids     = shortlist->token_ids;
     }
     mk.softcap       = p_.model.config().text.final_logit_softcap;
-    mk.round         = round_;
-    mk.tokens        = tokens_;
-    mk.probabilities = probabilities_;
+    mk.round         = round;
+    mk.tokens        = tokens_ + static_cast<std::size_t>(row) * kB;
+    mk.probabilities = probabilities_ + static_cast<std::size_t>(row) * kB;
     mk.scratch       = markov_scratch_;
     ik::dspark_markov(mk, steps, stream);
 }
 
-void Drafter::download(std::int32_t steps, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemcpyAsync(host_tokens_, tokens_, static_cast<std::size_t>(steps) * 4, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(host_probabilities_, probabilities_, static_cast<std::size_t>(steps) * 4,
-                               cudaMemcpyDeviceToHost, stream));
+void Drafter::download(std::int32_t steps, cudaStream_t stream, std::int32_t rows) {
+    if (rows == 1) { // one row: its steps only
+        CUDA_CHECK(cudaMemcpyAsync(host_tokens_, tokens_, static_cast<std::size_t>(steps) * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_probabilities_, probabilities_, static_cast<std::size_t>(steps) * 4,
+                                   cudaMemcpyDeviceToHost, stream));
+        return;
+    }
+    // Several rows: their whole slots, in one copy each.
+    const std::size_t bytes = static_cast<std::size_t>(rows) * kB * 4;
+    CUDA_CHECK(cudaMemcpyAsync(host_tokens_, tokens_, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_probabilities_, probabilities_, bytes, cudaMemcpyDeviceToHost, stream));
 }
 
 } // namespace infernix::models::inkling2

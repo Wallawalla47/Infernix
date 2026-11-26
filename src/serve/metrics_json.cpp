@@ -64,6 +64,13 @@ Json memory_json(const MetricsJsonSnapshot& s) {
     add_part(device_parts, "workspace", m.device.workspace);
     add_part(device_parts, "cuda_graphs", m.device.cuda_graphs);
     add_part(device_parts, "staging", m.device.staging);
+    // Not allocated: what the plan keeps of the free device memory beyond the headroom for the server's later
+    // allocations, so it shrinks as they are made (and when another program takes the memory).
+    {
+        const infernix::DeviceMemoryReading& d = s.device_memory;
+        const std::uint64_t spare = d.total_bytes != 0 && d.free_bytes > m.vram_headroom ? d.free_bytes - m.vram_headroom : 0U;
+        add_part(device_parts, "reserved", std::min(m.device.reserved, spare));
+    }
     Json host_parts = Json::array();
     add_part(host_parts, "experts", m.host.experts, std::nullopt,
              m.host.expert_records != 0 ? std::optional<std::uint64_t>(m.host.expert_records) : std::nullopt);

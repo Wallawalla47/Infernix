@@ -100,6 +100,9 @@ struct PrefixCacheConfig {
     std::filesystem::path ssd_directory;
     std::uint64_t ssd_write_bytes_per_hour = 0;
     std::filesystem::path ssd_kept_file;
+    // An automatic Host tier's growth room (--host-context-mib auto with --ram-resize auto): the index is sized for this
+    // many bytes, of which the start page-locks its size; a growth links the rest once RAM frees. 0: none.
+    std::uint64_t host_ceiling_bytes = 0;
 };
 
 struct RestoreTicket {
@@ -124,6 +127,9 @@ public:
     [[nodiscard]] const PrefixCacheCounters& counters() const noexcept { return counters_; }
     [[nodiscard]] const PrefixHostLayout& host_layout() const noexcept { return host_; }
     [[nodiscard]] std::uint64_t pinned_bytes() const noexcept { return store_.pinned_bytes(); }
+    // The slabs the Host tier holds now (its locked chunks'; host_layout().slabs includes an automatic tier's growth
+    // room).
+    [[nodiscard]] std::uint32_t pinned_slabs() const noexcept { return store_.pinned_slabs(); }
 
     // ---- blocks ------------------------------------------------------------------------------
     // Inserts a committed full block whose page is `lease`. When the index keeps it (a new node, or an existing node
@@ -209,6 +215,23 @@ public:
 
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;
+
+    // ---- Host tier resize (RAM pressure, --ram-resize; runtime::prefix_cache::HostSlabStore) -----------------
+    // Idle or while lanes run. Starts giving back whole chunks worth at least `bytes`, keeping image_slabs + 2 slabs:
+    // the lowest-valued entries go, the entries past the cut are copied below it on `worker`; returns the bytes it aims
+    // at (0: held entries keep every chunk in use now).
+    std::uint64_t begin_host_release(std::uint64_t bytes, HostMemoryWorker& worker);
+    // Starts page-locking chunks of at most `bytes` on `worker`, up to the tier's slabs (an automatic tier's growth
+    // room included: PrefixCacheConfig::host_ceiling_bytes); returns the bytes asked.
+    std::uint64_t begin_host_growth(std::uint64_t bytes, HostMemoryWorker& worker) {
+        return store_.begin_growth(bytes, worker);
+    }
+    // Applies what the worker finished (never waits): a release commits its moves once no restore is in flight.
+    runtime::prefix_cache::HostSlabStore::Progress step_host_resize(HostMemoryWorker& worker);
+    [[nodiscard]] bool host_resizing() const noexcept { return store_.resizing(); }
+    // What a release could give back and a growth take now.
+    [[nodiscard]] std::uint64_t host_tier_shrinkable_bytes() const noexcept { return store_.shrinkable_bytes(); }
+    [[nodiscard]] std::uint64_t host_tier_growable_bytes() const noexcept { return store_.growable_bytes(); }
 
     // ---- persistence (runtime/prefix_cache/persist_file.h) ------------------------------------
     // Writes every Host-backed snapshot and its block path to `path` (through `path.tmp`). Requires idle transfers.

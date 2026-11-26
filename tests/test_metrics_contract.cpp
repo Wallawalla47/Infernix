@@ -398,6 +398,7 @@ int main() {
         m.ssd.experts            = 3000;
         m.ssd.expert_records     = 100;
         m.vram_headroom          = 256;
+        m.device.reserved        = 1000; // free memory is below the headroom: none of it is kept, no part
         held.device_memory       = {.total_bytes = 34000, .free_bytes = 230, .process_bytes = 33000};
         held.host_memory         = {.total_physical = 102000, .available_physical = 7000, .process_resident = 85000};
         const Json full          = Json::parse(render_metrics_json(held))["memory"];
@@ -416,6 +417,17 @@ int main() {
         failures += check(device["parts"][2]["count"] == 87 && device["parts"][3]["used_bytes"] == 400 &&
                               !device["parts"][0].contains("used_bytes") && !device["parts"][0].contains("count"),
                           "memory.device experts' frames and the KV cache's used pages");
+        {
+            // `reserved`: the plan's unallocated share, at most the free memory beyond the headroom.
+            MetricsJsonSnapshot spare = held;
+            spare.device_memory.free_bytes = 900;
+            const Json capped = Json::parse(render_metrics_json(spare))["memory"]["device"]["parts"];
+            spare.stats.memory.device.reserved = 100;
+            const Json whole = Json::parse(render_metrics_json(spare))["memory"]["device"]["parts"];
+            failures += check(capped.back()["key"] == "reserved" && capped.back()["bytes"] == 644 &&
+                                  whole.back()["key"] == "reserved" && whole.back()["bytes"] == 100,
+                              "memory.device reserved: the plan's unallocated share, within the free memory past the headroom");
+        }
         const Json& host = full["host"];
         failures += check(host["total_bytes"] == 102000 && host["available_bytes"] == 7000 && host["process_bytes"] == 85000 &&
                               host["parts"].size() == 4 && host["parts"][0]["key"] == "experts" &&

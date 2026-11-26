@@ -15,6 +15,7 @@
 #include "models/inkling2/execution/vision.h"
 #include "models/inkling2/program/prefix_cache.h"
 #include "models/inkling2/program/test_taps.h"
+#include "runtime/expert_offload/ram_monitor.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "runtime/prefix_cache/prefix_holds.h"
 #include "runtime/prefix_cache/source_policy.h"
@@ -29,9 +30,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -215,13 +219,24 @@ KvLayout kv_layout(const ProgramOptions& o, std::int32_t full_visits) {
 
 std::uint64_t align_256(std::uint64_t bytes) { return (bytes + 255) / 256 * 256; }
 
+// The sampled rows of one call at most: a DSpark round of several rows verifies up to a block of columns each.
+constexpr std::int32_t kMaxSampleRows = kMaximumConcurrency * ops::inkling2::kDSparkBlock;
+// The graphs of DSpark rounds of several rows a Program keeps (the most recently used): one batch size's take 14 (the
+// verify forward at 7 widths, the drafts at 7 lengths), so three batch sizes alternate without a recapture.
+constexpr std::int32_t kRowsGraphs = 42;
+
 // Constrained rows' token masks (constrained-decoding.md §7.1): one packed vocabulary mask a position. Slot r is a plain
-// round's row r, slot i a DSpark verify call's column i (one row drafts at a time), so the slots cover both.
-constexpr std::int32_t kMaskSlots = std::max<std::int32_t>(kMaximumConcurrency, ops::inkling2::kDSparkBlock);
+// round's row r, slot i a DSpark verify call's column i (a row's columns in a round of several rows), so the slots
+// cover both: a block a lane with the drafter, a row a lane without.
+std::int32_t mask_slots(const ProgramOptions& options) {
+    return options.dspark ? std::max<std::int32_t>(static_cast<std::int32_t>(options.max_concurrency), 1) *
+                                ops::inkling2::kDSparkBlock
+                          : kMaximumConcurrency;
+}
 std::uint64_t mask_words(std::uint64_t vocab) { return (vocab + 31) / 32; }
 // Device and pinned bytes of the masks (generation only: scoring samples nothing).
 std::uint64_t mask_bytes(const ProgramOptions& options, std::uint64_t vocab) {
-    return options.causal_scoring ? 0 : align_256(4 * mask_words(vocab) * kMaskSlots);
+    return options.causal_scoring ? 0 : align_256(4 * mask_words(vocab) * static_cast<std::uint64_t>(mask_slots(options)));
 }
 
 // Token constraints' operands for one sample call of at most kMaximumConcurrency rows (ops::constrain_logits), in 4-byte
@@ -272,6 +287,10 @@ struct Lane {
     std::shared_ptr<const ConstraintPlan> constraint;
     std::vector<ConstrainedDraw> constraint_round, constraint_trace;
     std::uint64_t prefill_ns = 0, decode_ns = 0, decode_share_ns = 0;
+    // The prompt calls' time on the device (prefill_seconds) and the timing events of those not yet read (settled
+    // before a pause copies the lane, so a ResumeState holds none).
+    std::uint64_t prefill_device_ns = 0;
+    std::vector<std::array<cudaEvent_t, 2>> prefill_events;
     // DSpark: the drafts' acceptance by probability decile (draft_length.h) and the request's counters.
     runtime::speculative::DraftCalibration calibration;
     std::uint64_t policy_rounds = 0;
@@ -323,7 +342,7 @@ public:
           sampling_(ops::sampling_workspace_capacity_bytes(vocab_, 1, static_cast<std::int32_t>(kMaximumConcurrency)) +
                     4096),
           host_(align_256(forward_.upload_words() * 4 * kStagingSlots) +
-                align_256(sizeof(ops::SamplingConfig) * kMaximumConcurrency) + 3 * align_256(4 * kMaximumConcurrency) +
+                align_256(sizeof(ops::SamplingConfig) * kMaxSampleRows) + 3 * align_256(4 * kMaxSampleRows) +
                 align_256(4)) {
         const StateLayout& layout = forward_.layout();
         const std::uint32_t pages = pages_per_lane(o_.max_context);
@@ -380,9 +399,9 @@ public:
         view_.table        = static_cast<const std::int32_t*>(tables_->matrix().data);
         view_.table_stride = static_cast<std::int32_t>(tables_->logical_page_capacity());
         counts_            = DeviceBuffer(static_cast<std::size_t>(vocab_) * 4 * lanes_.size());
-        configs_           = DeviceBuffer(sizeof(ops::SamplingConfig) * kMaximumConcurrency);
-        positions_         = DeviceBuffer(4 * kMaximumConcurrency);
-        sampled_           = DeviceBuffer(4 * kMaximumConcurrency);
+        configs_           = DeviceBuffer(sizeof(ops::SamplingConfig) * kMaxSampleRows);
+        positions_         = DeviceBuffer(4 * kMaxSampleRows);
+        sampled_           = DeviceBuffer(4 * kMaxSampleRows);
         if (const std::uint64_t bytes = mask_bytes(o_, static_cast<std::uint64_t>(vocab_)); bytes != 0) {
             masks_ = DeviceBuffer(bytes);
             host_masks_.emplace(bytes);
@@ -395,13 +414,13 @@ public:
         staging_           = reinterpret_cast<std::int32_t*>(base);
         base += align_256(forward_.upload_words() * 4 * kStagingSlots);
         host_configs_ = reinterpret_cast<ops::SamplingConfig*>(base);
-        base += align_256(sizeof(ops::SamplingConfig) * kMaximumConcurrency);
+        base += align_256(sizeof(ops::SamplingConfig) * kMaxSampleRows);
         host_positions_ = reinterpret_cast<std::int32_t*>(base);
-        base += align_256(4 * kMaximumConcurrency);
+        base += align_256(4 * kMaxSampleRows);
         host_sampled_ = reinterpret_cast<std::int32_t*>(base);
-        base += align_256(4 * kMaximumConcurrency);
+        base += align_256(4 * kMaxSampleRows);
         nonfinite_ = reinterpret_cast<std::int32_t*>(base);
-        base += align_256(4 * kMaximumConcurrency);
+        base += align_256(4 * kMaxSampleRows);
         // The MoE's error word, mapped: a down CTA that waited past its bound sets it, and finish_sample reads it after
         // the round's own synchronization (no copy).
         moe_error_  = reinterpret_cast<std::uint32_t*>(base);
@@ -466,6 +485,7 @@ public:
             config.ssd_directory                     = o_.prefix_ssd_directory;
             config.ssd_write_bytes_per_hour          = o_.prefix_ssd_write_bytes_per_hour;
             config.ssd_kept_file                     = o_.prefix_ssd_kept_file;
+            config.host_ceiling_bytes                = o_.prefix_host_ceiling_bytes;
             prefix::LaneImages images;
             const std::size_t lane_bytes = static_cast<std::size_t>(forward_.layout().lane_words) * 2;
             images.parts.push_back({static_cast<std::byte*>(images_.p), lane_bytes, lane_bytes});
@@ -488,7 +508,10 @@ public:
     ~ProgramImpl() {
         // The cache's transfers and the compute stream's last calls land before any buffer they read is freed.
         (void)cudaStreamSynchronize(device_.stream);
+        ram_.reset(); // the RAM monitor's thread and worker stop (finishing their jobs) before the cache they resize goes
         prefix_.reset();
+        for (Lane& lane : lanes_) { drop_prefill_events(lane); }
+        for (const cudaEvent_t event : timing_events_) { (void)cudaEventDestroy(event); }
     }
 
     // ---------------------------------------------------------------- admission
@@ -912,6 +935,7 @@ public:
             CUDA_CHECK(cudaStreamSynchronize(device_.stream));
             wait_ns_ += elapsed_ns(wait);
         }
+        settle_prefill_events(lane, true); // synchronized above: the copy below holds no events
         auto saved       = std::make_unique<ResumeStateImpl>();
         saved->target    = lane.replay ? lane.replay_target : lane.processed;
         saved->generated = lane.replay || lane.processed >= lane.prompt_tokens;
@@ -1036,9 +1060,58 @@ public:
         out.processed_tokens = width;
         out.complete         = end == lane.replay_target;
         if (out.complete) { lane.replay = false; }
-        out.timing = timing_since(start);
-        lane.prefill_ns += elapsed_ns(start);
+        out.timing = timing_since(start); // the Engine counts a replay's time and tokens apart from the prefill's
         return out;
+    }
+
+    // ---------------------------------------------------------------- prefill timing
+    // A request's prefill time is its prompt calls' time on the device: each call is bracketed by a pair of timing events
+    // on the compute stream, where the lanes' calls run one at a time. Host time misses it: a prompt call returns once
+    // enqueued, and the rounds of other lanes that wait on the stream absorb the chunk's work (2026-11-25: 8,251 prompt
+    // tokens in chunks of 4,096, 4,096 and 59 beside decoding lanes timed 99 ms, the 59-token call's wait, for 84K tok/s).
+    std::array<cudaEvent_t, 2> take_timing_pair() {
+        std::array<cudaEvent_t, 2> pair{};
+        for (cudaEvent_t& event : pair) {
+            if (!timing_events_.empty()) {
+                event = timing_events_.back();
+                timing_events_.pop_back();
+            } else {
+                CUDA_CHECK(cudaEventCreate(&event));
+            }
+        }
+        return pair;
+    }
+
+    // Adds the durations of the lane's calls whose end has been reached to its device prefill time and returns their
+    // events to the pool; `all`: every call (the caller synchronized the stream).
+    void settle_prefill_events(Lane& lane, bool all) {
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < lane.prefill_events.size(); ++i) {
+            const std::array<cudaEvent_t, 2>& pair = lane.prefill_events[i];
+            if (!all && cudaEventQuery(pair[1]) == cudaErrorNotReady) {
+                lane.prefill_events[kept++] = pair;
+                continue;
+            }
+            float ms = 0.0F;
+            if (cudaEventElapsedTime(&ms, pair[0], pair[1]) == cudaSuccess && ms > 0.0F) {
+                lane.prefill_device_ns += static_cast<std::uint64_t>(static_cast<double>(ms) * 1.0e6);
+            }
+            (void)cudaGetLastError(); // an unrecorded pair (a failed call) reports an error that is not sticky
+            timing_events_.push_back(pair[0]);
+            timing_events_.push_back(pair[1]);
+        }
+        lane.prefill_events.resize(kept);
+    }
+
+    // A released lane's pairs go back unread (re-recording an event is allowed while its last record is pending).
+    void drop_prefill_events(Lane& lane) noexcept {
+        for (const std::array<cudaEvent_t, 2>& pair : lane.prefill_events) {
+            try {
+                timing_events_.push_back(pair[0]);
+                timing_events_.push_back(pair[1]);
+            } catch (...) {}
+        }
+        lane.prefill_events.clear();
     }
 
     // ---------------------------------------------------------------- execution
@@ -1065,14 +1138,27 @@ public:
             call.lane.push_back(static_cast<std::int32_t>(index));
             call.position.push_back(static_cast<std::int32_t>(lane.processed + i));
         }
+        // The call is timed on the device (prefill_events) unless it only rebuilds positions the Engine was already told
+        // of (a prompt resumed below its paused frontier), as its tokens are not counted again.
+        settle_prefill_events(lane, false);
+        const bool timed = lane.processed + chunk > lane.counted;
+        // Held by the lane at once, so a call that throws returns them with it (an unrecorded end reads no time).
+        std::array<cudaEvent_t, 2> events{};
+        if (timed) {
+            events = take_timing_pair();
+            lane.prefill_events.push_back(events);
+        }
         if (lossless_) {
+            if (timed) { CUDA_CHECK(cudaEventRecord(events[0], device_.stream)); }
             run_lossless(index, call, last);
         } else {
             upload(call);
+            if (timed) { CUDA_CHECK(cudaEventRecord(events[0], device_.stream)); }
             run_forward(static_cast<std::int32_t>(chunk) - 1, last ? 1 : 0,
                         [&] { overlay_images(lane.images, lane.processed, chunk); });
             if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(chunk), device_.stream); } // its context rows
         }
+        if (timed) { CUDA_CHECK(cudaEventRecord(events[1], device_.stream)); }
         lane.processed += chunk;
         const std::size_t captured = lane.prefix.captures.size();
         publish_prefill(index);
@@ -1094,6 +1180,7 @@ public:
             // token constraint masks them in place for the sampler.
             if (!lane.options.readout_tokens.empty()) { out.readout = readout(lane, 0); }
             sample({&row, 1}, {&index, 1}, 0, ops::kSamplePurposePrefill, masks);
+            settle_prefill_events(lane, true); // the sample synchronized the stream
             out.timing = timing_since(start);
             out.pending.emplace(ContractAccess::batch(this, transaction, {&row, 1}, {sampled_tokens_.data(), 1},
                                                       out.timing, {failures_.data(), 1}));
@@ -1111,11 +1198,23 @@ public:
         const auto start = Clock::now();
         if (pending_) { throw std::logic_error("Inkling 2: a pending batch awaits its commit"); }
         if (sequences.empty() || sequences.size() > lanes_.size()) { throw std::invalid_argument("Inkling 2: a decode of 1-8 rows"); }
+        round_captured_ = false; // instantiate_graph and rows_graph's evictions set it
         // A row's round licenses at most its remaining generated tokens: a DSpark round needs two of them.
         const std::uint32_t remaining = budgets.empty() ? 0U : budgets[0].generated_tokens_remaining;
         if (remaining >= 2 && dspark_round(sequences)) { return decode_dspark(sequences[0], remaining, masks, start); }
         if (lossless_) { return decode_lossless(sequences, masks, start); }
-        if (drafter_ && sequences.size() == 1) { ++lanes_[lane_of(sequences[0])].fallback; } // a plain round of a drafting row
+        // Several rows draft together (decode_dspark_rows), unless the round's width verifies no draft: it then
+        // decodes plainly below.
+        bool drafted = false;
+        if (dspark_rows_round(sequences, budgets)) {
+            if (std::optional<PendingBatch> batch = decode_dspark_rows(sequences, budgets, masks, start)) {
+                return std::move(*batch);
+            }
+            drafted = true;
+        }
+        if (drafter_ && (sequences.size() == 1 || drafted)) { // a plain round of drafting rows
+            for (const SequenceHandle& s : sequences) { ++lanes_[lane_of(s)].fallback; }
+        }
         std::vector<std::uint32_t> rows;
         for (const SequenceHandle& s : sequences) { rows.push_back(lane_of(s)); }
         // A lane's columns are consecutive and lanes ascend in the call; rows keep the Engine's order.
@@ -1146,8 +1245,12 @@ public:
         for (const std::uint32_t index : rows) { logit_rows.push_back(last_column[index]); }
         // Rows sample in the Engine's order; their logits rows in the call's column order.
         const std::uint64_t transaction = ++transaction_;
+        // A plain round of rows that could draft together measures the cost line rounds of drafts are weighed against.
+        const bool timed = rows.size() >= 2 && rows_eligible(sequences, budgets);
+        float device_ms  = 0.0F;
         if (uniform && o_.use_cuda_graph) {
-            decode_graph(static_cast<std::int32_t>(order.back()) + 1, columns, rows, logit_rows, masks);
+            decode_graph(static_cast<std::int32_t>(order.back()) + 1, columns, rows, logit_rows, masks,
+                         timed ? &device_ms : nullptr);
         } else {
             run_decode_call(columns);
             sample(sequences, rows, logit_rows, ops::kSamplePurposeDecode, masks);
@@ -1157,6 +1260,17 @@ public:
             lane.processed = static_cast<std::uint32_t>(lane.tokens.size());
         }
         const std::uint64_t ns = elapsed_ns(start);
+        if (timed && !round_captured_) {
+            RowsCost& cost = rows_cost(sequences);
+            if (drafted) {
+                // A drafted round whose width verified nothing: its drafts were spent for the rows' plain tokens.
+                ewma(cost.draft_wall, static_cast<double>(ns) * 1e-6);
+                ewma(cost.draft_tokens, static_cast<double>(rows.size()));
+            } else if (device_ms > 0.0F) {
+                ewma(cost.plain_ms, device_ms);
+                ewma(cost.plain_wall, static_cast<double>(ns) * 1e-6);
+            }
+        }
         for (const std::uint32_t index : rows) {
             lanes_[index].decode_ns += ns;
             lanes_[index].decode_share_ns += ns / rows.size();
@@ -1212,11 +1326,13 @@ public:
             if (pending_draft_.active) {
                 // A DSpark row: its accepted prefix; the lane holds positions F .. F + accepted - 1, its last token
                 // pending.
-                if (d.accepted_tokens == 0 || d.accepted_tokens > static_cast<std::uint32_t>(row_counts_[0])) {
+                if (d.accepted_tokens == 0 || d.accepted_tokens > static_cast<std::uint32_t>(row_counts_[row])) {
                     throw std::logic_error("Inkling 2: a DSpark row commits 1 .. its licensed tokens");
                 }
-                for (std::uint32_t i = 0; i < d.accepted_tokens; ++i) { lane.tokens.push_back(sampled_tokens_[i]); }
-                lane.processed = pending_draft_.first + d.accepted_tokens;
+                for (std::uint32_t i = 0; i < d.accepted_tokens; ++i) {
+                    lane.tokens.push_back(round_tokens_[row * kRowStride + i]);
+                }
+                lane.processed = pending_firsts_[row] + d.accepted_tokens;
             } else {
                 if (d.accepted_tokens != 1) { throw std::logic_error("Inkling 2: a row commits exactly one token"); }
                 lane.tokens.push_back(sampled_tokens_[row]);
@@ -1502,7 +1618,7 @@ public:
         for (const Lane& lane : lanes_) {
             if (lane.bound) { ++out.occupied.state_slots; }
         }
-        out.occupied.main_kv_pages = static_cast<std::uint32_t>(mapped_pages());
+        out.occupied.main_kv_pages = request_pages();
         out.capacity.state_slots   = static_cast<std::uint32_t>(lanes_.size());
         out.capacity.main_kv_pages = plan_.kv_pages - 1; // the scratch page holds nothing
         return out;
@@ -1511,12 +1627,20 @@ public:
     [[nodiscard]] MemoryUsage memory_usage() const noexcept {
         MemoryUsage out;
         out.device.weights   = p_.model.device_weight_bytes();
-        out.device.kv        = plan_.kv;
+        // As the Qwen3.5 family's: the pool less the pages only the prefix cache holds (its evictable blocks, `prefix`),
+        // and of the rest the pages requests hold (every allocated page but the scratch page and those blocks: a lane's
+        // own, and the cached blocks its row maps).
+        const std::uint64_t cached = cache_only_pages();
+        out.device.prefix    = cached * plan_.page_bytes;
+        out.device.kv        = plan_.kv > out.device.prefix ? plan_.kv - out.device.prefix : 0U;
+        out.device.kv_used   = std::uint64_t{request_pages()} * plan_.page_bytes;
         out.device.state     = plan_.state + plan_.io;
         out.device.workspace = plan_.workspace;
         out.device.adapter   = p_.adapter_bytes(); // --lora's factors and --ablate's direction (0 without them)
         out.device.cuda_graphs = graph_bytes_.load(std::memory_order_relaxed);
-        out.device.kv_used   = mapped_pages() * plan_.page_bytes;
+        // The plan's untaken share less what the graphs instantiated since took from it.
+        const std::uint64_t since = out.device.cuda_graphs > reserved_graphs_ ? out.device.cuda_graphs - reserved_graphs_ : 0U;
+        out.device.reserved       = reserved_bytes_ > since ? reserved_bytes_ - since : 0U;
         out.host.staging   = host_.size();
         return out;
     }
@@ -1537,11 +1661,12 @@ public:
     const ProgramDevicePlan& device_plan() const noexcept { return plan_; }
 
 private:
-    // A DSpark round's row awaiting its commit: the lane, the anchor's position and the tokens it licenses.
+    // A DSpark round awaiting its commit: each row's anchor position (pending_firsts_), tokens (round_tokens_, a row
+    // each kRowStride) and the count it licenses (row_counts_).
     struct PendingDraft {
-        bool active        = false;
-        std::uint32_t lane = 0, first = 0;
+        bool active = false;
     };
+    static constexpr std::uint32_t kRowStride = ops::inkling2::kDSparkBlock;
     enum class PendingKind : std::uint8_t { Prefill, Decode };
 
     SequenceHandle handle(std::uint32_t index) const {
@@ -1564,6 +1689,7 @@ private:
         if (index < lanes_.size()) {
             release_prefix(index, pausing);
             release_pages(index);
+            drop_prefill_events(lanes_[index]);
             lanes_[index] = Lane{};
             clear_failed_prefix();
         }
@@ -1585,7 +1711,9 @@ private:
     }
     static GenerationTimings timings(const Lane& lane) {
         GenerationTimings out;
-        out.prefill_seconds      = static_cast<double>(lane.prefill_ns) * 1e-9;
+        // The prompt calls' device time (settle_prefill_events); host time only for a request with none timed (one
+        // resumed past its prompt, whose first binding's time the ResumeState kept).
+        out.prefill_seconds = static_cast<double>(lane.prefill_device_ns != 0 ? lane.prefill_device_ns : lane.prefill_ns) * 1e-9;
         out.decode_seconds       = static_cast<double>(lane.decode_ns) * 1e-9;
         out.decode_share_seconds = static_cast<double>(lane.decode_share_ns) * 1e-9;
         return out;
@@ -1750,12 +1878,28 @@ private:
         kv.reservation.release();
     }
 
-    [[nodiscard]] std::uint64_t mapped_pages() const noexcept {
-        std::uint64_t out = 0;
-        for (const LaneKv& kv : kv_lanes_) {
-            for (std::uint32_t p = 0; p < kv.mapped; ++p) { out += kv.pages[p].valid() ? 1U : 0U; }
-        }
-        return out;
+    // The pool's pages only the prefix cache holds: its blocks no lane maps (a lane pins the blocks its row maps), and
+    // those only an in-flight Host write holds (a finished prompt's blocks while their copies land), as room_possible
+    // counts them.
+    [[nodiscard]] std::uint32_t cache_only_pages() const noexcept {
+        if (!prefix_) { return 0; }
+        const runtime::prefix_cache::PrefixCacheIndex& cache = prefix_->index();
+        return std::min(cache.device_evictable_blocks() + cache.device_transfer_held_blocks(), pool_->allocated_pages());
+    }
+    // The pool's pages requests hold: every allocated page (a lane's own, a cached block, a snapshot's tail) but the
+    // scratch page and the cache's own. A published block stays a request's while its lane maps it.
+    [[nodiscard]] std::uint32_t request_pages() const noexcept {
+        const std::uint32_t allocated = pool_->allocated_pages();
+        const std::uint32_t other     = 1U + cache_only_pages(); // the scratch page
+        return allocated > other ? allocated - other : 0U;
+    }
+
+public:
+    // What the start planned for the Program and the Program did not allocate (MemoryUsage::Device::reserved): set once
+    // the Program is built, from the free device memory before and after.
+    void set_reserved_bytes(std::uint64_t bytes) noexcept {
+        reserved_bytes_  = bytes;
+        reserved_graphs_ = graph_bytes_.load(std::memory_order_relaxed); // the startup graphs are in what was taken
     }
 
     // ---------------------------------------------------------------- prefix cache (prefix_cache.h)
@@ -1862,6 +2006,124 @@ public:
         return prefix_ ? prefix_->ssd_retry_at() : std::nullopt;
     }
 
+    // ---- RAM pressure (Program::start_ram_resize, runtime::expert_offload::RamMonitor) ----
+    // As Qwen3.8-Flash-Next's (qwen4_exp program_impl.h maintain_ram), for the one RAM tier this Program has: the
+    // prefix cache's Host tier.
+    void set_maintenance_waker(std::function<void()> waker) {
+        const std::lock_guard<std::mutex> lock(waker_mutex_);
+        if (ram_) { ram_->set_waker(waker); }
+        waker_ = std::move(waker);
+    }
+
+    void start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier) {
+        if (!prefix_) { return; }
+        ram_ = std::make_unique<runtime::expert_offload::RamMonitor>(reserve_bytes, device_.device,
+                                                                     inkling2::testing::ram_available());
+        ram_->set_room(prefix_->host_tier_shrinkable_bytes(), prefix_->host_tier_growable_bytes());
+        ram_reserve_ = reserve_bytes;
+        ram_trim_    = trim_host_tier;
+        ram_->set_busy(ram_trim_); // the first maintenance trims
+        const std::lock_guard<std::mutex> lock(waker_mutex_);
+        if (waker_) { ram_->set_waker(waker_); }
+    }
+
+    // The Host tier's resize, idle (maintain) and between rounds while requests run (maintain_busy). It advances the
+    // resize under way (the tier commits its moves and links or releases its chunks as the monitor's worker finishes
+    // them) and, with none under way, starts the one the monitor finds due: a release of whole chunks (the lowest-valued
+    // entries go, the rest are copied below the cut), or a growth of one step. A release is logged once complete, the
+    // growth steps together once they stop.
+    void maintain_ram(bool idle) {
+        if (!ram_ || !prefix_) { return; }
+        HostMemoryWorker& worker = ram_->worker();
+        if (prefix_->host_resizing()) {
+            const runtime::prefix_cache::HostSlabStore::Progress step = prefix_->step_host_resize(worker);
+            if (ram_resize_) { ram_resize_->prefix += step.released + step.grown; }
+            // Landed moves wait only for the restores in flight, which this round finishes: the next step before the
+            // next round.
+            if (step.waiting && !idle) { ram_->poke(); }
+        }
+        const bool busy = prefix_->host_resizing();
+        ram_->set_busy(busy);
+        if (busy) { return; }
+        if (ram_resize_) {
+            const RamResize done = *std::exchange(ram_resize_, std::nullopt);
+            const bool more      = ram_->resized(done.release || done.prefix == 0, prefix_->host_tier_shrinkable_bytes(),
+                                                 prefix_->host_tier_growable_bytes());
+            if (done.trim) {
+                report_trim(done.asked_at, done.prefix);
+            } else if (done.release) {
+                report_ram(true, done.asked_at, done.prefix);
+            } else {
+                ram_grown_ += done.prefix;
+                if (!more) { report_ram(false, ram_->available(), std::exchange(ram_grown_, 0)); }
+            }
+            return; // the next step, if due, at the wake resized() asked for
+        }
+        if (ram_trim_ && trim_host_tier(worker)) { return; }
+        if (!idle && !ram_->due()) { return; }
+        const runtime::expert_offload::RamDecision decision =
+            ram_->decide(prefix_->host_tier_shrinkable_bytes(), prefix_->host_tier_growable_bytes());
+        if (decision.grow == 0) { report_ram(false, ram_->available(), std::exchange(ram_grown_, 0)); }
+        if (decision.release == 0 && decision.grow == 0) { return; }
+        // The monitor hears back (resized) after every decision, one the tier could not start included.
+        const RamResize resize{.release = decision.release != 0, .asked_at = ram_->available()};
+        if (decision.release != 0) {
+            (void)prefix_->begin_host_release(decision.release, worker);
+        } else {
+            (void)prefix_->begin_host_growth(std::min(decision.grow, runtime::expert_offload::RamControl::kStepBytes),
+                                             worker);
+        }
+        ram_resize_ = resize;
+        ram_->set_busy(true);
+    }
+
+    // Once, at the first maintenance after the start (the Engine is ready): an automatic Host tier was sized from the
+    // start's plan, and the process holds more than the plan counts once it runs (its CUDA context, the driver's copy
+    // of its code, runtime buffers), so it gives back what keeps less than --ram-free-mib available, whole chunks, to
+    // leave the reserve free as auto promises. Whether a release started.
+    bool trim_host_tier(HostMemoryWorker& worker) {
+        ram_trim_                     = false;
+        const std::uint64_t available = ram_->measure();
+        if (available >= ram_reserve_) { return false; }
+        if (prefix_->begin_host_release(ram_reserve_ - available, worker) == 0) { return false; }
+        ram_resize_ = RamResize{.release = true, .trim = true, .asked_at = available};
+        ram_->set_busy(true);
+        return true;
+    }
+    void report_trim(std::uint64_t available, std::uint64_t prefix) const {
+        if (prefix == 0) { return; }
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        char text[256];
+        std::snprintf(text, sizeof(text),
+                      "RAM after the start: %.1f GiB available, under --ram-free-mib %.1f GiB: the automatic prefix "
+                      "cache gave back %.2f GiB",
+                      static_cast<double>(available) / kGiB, static_cast<double>(ram_reserve_) / kGiB,
+                      static_cast<double>(prefix) / kGiB);
+        report(DiagnosticLevel::Info, text);
+    }
+    // A release with the reading that asked for it; a growth with what is available after it.
+    void report_ram(bool release, std::uint64_t available, std::uint64_t prefix) const {
+        if (prefix == 0) { return; }
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        char text[256];
+        if (release) {
+            std::snprintf(text, sizeof(text), "RAM pressure: %.1f GiB available; the prefix cache gave back %.1f GiB",
+                          static_cast<double>(available) / kGiB, static_cast<double>(prefix) / kGiB);
+        } else {
+            std::snprintf(text, sizeof(text),
+                          "RAM freed: the prefix cache took back %.1f GiB (%.1f GiB in RAM now); %.1f GiB available",
+                          static_cast<double>(prefix) / kGiB, static_cast<double>(prefix_->pinned_bytes()) / kGiB,
+                          static_cast<double>(available) / kGiB);
+        }
+        report(DiagnosticLevel::Info, text);
+    }
+    void report(DiagnosticLevel level, const char* text) const noexcept {
+        if (!o_.diagnostics.callback) { return; }
+        try {
+            o_.diagnostics.callback(Diagnostic{.level = level, .message = text});
+        } catch (...) {}
+    }
+
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept {
         HybridPrefixCacheStats out;
         if (!prefix_) { return out; }
@@ -1871,7 +2133,7 @@ public:
         out.snapshots               = s.snapshots;
         out.device_resident_blocks  = s.device_resident_blocks;
         out.device_evictable_blocks = s.device_evictable_blocks;
-        out.host_slabs              = prefix_->host_layout().slabs;
+        out.host_slabs              = s.host_slab_limit; // in service now (host_free_slabs' bound): a resize moves it
         out.host_free_slabs         = s.host_free_slabs;
         out.host_slab_bytes         = prefix_->host_layout().slab_bytes;
         out.snapshot_hits           = s.snapshot_hits;
@@ -2377,17 +2639,433 @@ private:
         lane.drafted += static_cast<std::uint64_t>(k);
         lane.accepted += static_cast<std::uint64_t>(a);
         for (std::int32_t i = 0; i < a; ++i) { ++lane.accepted_at[static_cast<std::size_t>(i)]; }
-        row_counts_[0]   = a + 1;
-        pending_draft_   = {true, index, static_cast<std::uint32_t>(F)};
+        row_counts_[0] = a + 1;
+        std::copy_n(sampled_tokens_.begin(), a + 1, round_tokens_.begin());
+        pending_draft_     = {true};
+        pending_firsts_[0] = static_cast<std::uint32_t>(F);
         const std::uint64_t transaction = ++transaction_;
         const std::uint64_t ns          = elapsed_ns(start);
         lane.decode_ns += ns;
         lane.decode_share_ns += ns;
         pending_      = transaction;
         pending_kind_ = PendingKind::Decode;
-        return ContractAccess::batch(this, transaction, {&sequence, 1}, {sampled_tokens_.data(), kMaximumConcurrency},
-                                     timing_since(start), {failures_.data(), 1}, {row_counts_.data(), 1},
-                                     static_cast<std::uint32_t>(kMaximumConcurrency));
+        return ContractAccess::batch(this, transaction, {&sequence, 1}, {round_tokens_.data(), kRowStride},
+                                     timing_since(start), {failures_.data(), 1}, {row_counts_.data(), 1}, kRowStride);
+    }
+
+    // ---------------------------------------------------------------- DSpark, several rows (design §13.7)
+    // Rows decoding together draft together: every row's block is drafted (the rows one after another), and one verify
+    // call takes 1 + K columns of each row (K the round's one width: a graph per (rows, K) instead of one per mix of
+    // widths), each column sampled as decoding would. The decode route is width-invariant (a lane's columns'
+    // bits do not depend on the other lanes' columns, the forward test's wide_lanes), so a round of several rows
+    // commits the tokens their plain decoding would, as a one-row round does.
+    //
+    // The width is the one that makes the most of the rows' calibrated drafts per verify time: the rows' expected
+    // tokens at K (draft_length.h, each row capped by its budget) over the verify call's device time at K. The rounds
+    // measure that cost line themselves (rows_cost_, per row count: the plain round's and each width's device time, as
+    // EWMAs), since it moves with the context (attention is per lane, the experts' union per column). A batch size
+    // whose drafted rounds commit fewer tokens per host millisecond than its plain rounds decodes plainly, drafting
+    // again every kRowsProbe rounds to re-measure; a plain round every kRowsPlainProbe drafted rounds keeps the plain
+    // rate measured.
+    struct RowsCost {
+        double plain_ms = 0;                                         // a plain round's forward and sample (device)
+        std::array<double, ops::inkling2::kDSparkBlock> verify_ms{}; // [k]: the verify call of 1 + k columns a row
+        double plain_wall = 0, draft_wall = 0, draft_tokens = 0;     // host ms of a round; a drafted round's tokens
+        std::uint64_t rounds = 0, skipped = 0;                       // drafted rounds; plain ones since the last draft
+        // What the policy did since the last report (report_rows): the widths it chose and the rounds it left plain.
+        std::array<std::uint64_t, ops::inkling2::kDSparkBlock> widths{};
+        std::uint64_t plain_rounds = 0;
+    };
+    static constexpr std::uint64_t kRowsReport = 256; // drafted rounds between a batch size's Debug reports
+    // The cost line moves with the context (attention reads every key of each lane, the drafter's full layer too; the
+    // acceptance moves with the text): rounds are measured per row count and per bucket of the rows' longest context,
+    // up to 2K, 4K, ... 128K and beyond (2026-11-26: costs measured at 100K and taken for 2K rounds kept drafting on
+    // there at 18 % acceptance, 17 % slower than plain).
+    static constexpr std::size_t kContextBuckets = 8;
+    [[nodiscard]] static std::size_t context_bucket(std::uint32_t longest) noexcept {
+        std::size_t bucket = 0;
+        while (bucket + 1 < kContextBuckets && (std::uint64_t{2048} << bucket) < longest) { ++bucket; }
+        return bucket;
+    }
+    [[nodiscard]] std::uint32_t longest_context(std::span<const SequenceHandle> sequences) const noexcept {
+        std::uint32_t longest = 0;
+        for (const SequenceHandle& s : sequences) { longest = std::max(longest, lanes_[lane_of(s)].processed); }
+        return longest;
+    }
+    [[nodiscard]] RowsCost& rows_cost(std::span<const SequenceHandle> sequences) noexcept {
+        return rows_cost_[sequences.size()][context_bucket(longest_context(sequences))];
+    }
+    static constexpr double kCostWeight            = 0.1;
+    static constexpr double kColumnPrior           = 0.1; // a width's cost in plain rounds a draft, before any is measured
+    static constexpr std::uint64_t kRowsProbe      = 16;
+    static constexpr std::uint64_t kRowsPlainProbe = 64;
+    static void ewma(double& value, double sample) noexcept {
+        value = value == 0.0 ? sample : (1.0 - kCostWeight) * value + kCostWeight * sample;
+    }
+
+    // Whether every row could draft: its one pending input (no forced tokens), its drafter context (F >= 1), a whole
+    // block of positions left in the context, no penalty counting its draws and no token constraint. A grammar and a
+    // reasoning ban are fine, as in a one-row round.
+    [[nodiscard]] bool rows_eligible(std::span<const SequenceHandle> sequences,
+                                     std::span<const runtime::RoundBudget> budgets) const {
+        if (!drafter_ || lossless_ || sequences.size() < 2 || budgets.size() != sequences.size()) { return false; }
+        for (std::size_t r = 0; r < sequences.size(); ++r) {
+            const Lane& lane = lanes_[lane_of(sequences[r])];
+            if (lane.penalties || lane.constraint || lane.processed == 0 || lane.tokens.size() != lane.processed + 1U ||
+                std::uint64_t{lane.processed} + ops::inkling2::kDSparkBlock > o_.max_context ||
+                budgets[r].generated_tokens_remaining == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // A round of several rows drafts when they are eligible and their batch size's measured rates favour drafting.
+    [[nodiscard]] bool dspark_rows_round(std::span<const SequenceHandle> sequences,
+                                         std::span<const runtime::RoundBudget> budgets) {
+        if (!rows_eligible(sequences, budgets) || !o_.use_cuda_graph) { return false; }
+        RowsCost& cost = rows_cost(sequences);
+        if (!o_.draft_tokens_auto) { return true; } // a fixed --draft-tokens drafts every round
+        // The plain rate is measured after the first drafted round, and kept measured by a plain round every
+        // kRowsPlainProbe drafted rounds.
+        if (cost.rounds != 0 && cost.skipped == 0 && (cost.plain_wall == 0.0 || cost.rounds % kRowsPlainProbe == 0)) {
+            ++cost.skipped;
+            return false;
+        }
+        if (cost.plain_wall == 0.0 || cost.draft_wall == 0.0) {
+            cost.skipped = 0;
+            return true;
+        }
+        const double drafted = cost.draft_tokens / cost.draft_wall;
+        const double plain   = static_cast<double>(sequences.size()) / cost.plain_wall;
+        if (drafted >= plain || ++cost.skipped >= kRowsProbe) {
+            cost.skipped = 0;
+            return true;
+        }
+        ++cost.plain_rounds;
+        return false;
+    }
+
+    // A batch size's Debug report every kRowsReport drafted rounds: the widths chosen, the rounds the rates left plain,
+    // the cost line and both rates, and the graphs captured and evicted so far.
+    void report_rows(std::size_t rows, std::size_t bucket, RowsCost& cost) {
+        if (!o_.diagnostics.callback || cost.rounds % kRowsReport != 0) { return; }
+        std::string widths;
+        for (std::size_t k = 0; k < cost.widths.size(); ++k) {
+            if (cost.widths[k] != 0) { widths += " K" + std::to_string(k) + ":" + std::to_string(cost.widths[k]); }
+        }
+        char text[512];
+        std::snprintf(text, sizeof(text),
+                      "Inkling 2 DSpark rounds of %zu rows, contexts up to %lluK: widths%s; %llu rounds plain by the "
+                      "rates; plain round %.2f "
+                      "ms (device), %.2f ms (host), %.3f tok/ms; drafted round %.2f ms (host), %.2f tokens, %.3f tok/ms; "
+                      "verify ms by width %.2f %.2f %.2f %.2f %.2f %.2f %.2f; graphs of these rounds %llu captured, "
+                      "%llu evicted",
+                      rows, static_cast<unsigned long long>(2ULL << bucket), widths.c_str(),
+                      static_cast<unsigned long long>(cost.plain_rounds), cost.plain_ms,
+                      cost.plain_wall, cost.plain_wall > 0.0 ? static_cast<double>(rows) / cost.plain_wall : 0.0,
+                      cost.draft_wall, cost.draft_tokens, cost.draft_wall > 0.0 ? cost.draft_tokens / cost.draft_wall : 0.0,
+                      cost.verify_ms[1], cost.verify_ms[2], cost.verify_ms[3], cost.verify_ms[4], cost.verify_ms[5],
+                      cost.verify_ms[6], cost.verify_ms[7], static_cast<unsigned long long>(rows_captures_),
+                      static_cast<unsigned long long>(rows_evictions_));
+        report(DiagnosticLevel::Debug, text);
+        cost.widths       = {};
+        cost.plain_rounds = 0;
+    }
+
+    // The verify call's device time at width k for rows of `cost`: measured, else interpolated between measured widths
+    // (the plain round is width 0), else extrapolated by the last measured slope or the prior. An unmeasured plain
+    // round is the narrowest measured width less the prior's cost; with nothing measured the times are in plain rounds.
+    [[nodiscard]] static double verify_estimate(const RowsCost& cost, std::int32_t k) noexcept {
+        double plain = cost.plain_ms;
+        for (std::int32_t w = 1; plain == 0.0 && w < ops::inkling2::kDSparkBlock; ++w) {
+            if (const double v = cost.verify_ms[static_cast<std::size_t>(w)]; v > 0.0) { plain = v / (1.0 + kColumnPrior * w); }
+        }
+        if (plain == 0.0) { plain = 1.0; }
+        if (k == 0) { return plain; }
+        if (cost.verify_ms[static_cast<std::size_t>(k)] > 0.0) { return cost.verify_ms[static_cast<std::size_t>(k)]; }
+        const auto at = [&](std::int32_t w) { return w == 0 ? plain : cost.verify_ms[static_cast<std::size_t>(w)]; };
+        std::int32_t lo = k - 1;
+        while (lo > 0 && at(lo) == 0.0) { --lo; }
+        std::int32_t hi = k + 1;
+        while (hi < ops::inkling2::kDSparkBlock && at(hi) == 0.0) { ++hi; }
+        if (hi < ops::inkling2::kDSparkBlock) { return at(lo) + (at(hi) - at(lo)) * (k - lo) / (hi - lo); }
+        double slope = kColumnPrior * plain;
+        if (lo > 0) {
+            std::int32_t below = lo - 1;
+            while (below > 0 && at(below) == 0.0) { --below; }
+            slope = std::max(0.0, (at(lo) - at(below)) / (lo - below));
+        }
+        return at(lo) + slope * (k - lo);
+    }
+
+    // A round of several rows (rows_eligible): their drafts, the round's width and one verify call. Empty when the
+    // width verifies no draft (the caller decodes plainly; the drafts are spent).
+    std::optional<PendingBatch> decode_dspark_rows(std::span<const SequenceHandle> sequences,
+                                                   std::span<const runtime::RoundBudget> budgets,
+                                                   runtime::TokenMaskProvider* masks, Clock::time_point start) {
+        namespace ik            = ops::inkling2;
+        const std::size_t n     = sequences.size();
+        RowsCost& cost          = rows_cost(sequences);
+        const auto window       = static_cast<std::int32_t>(o_.draft_tokens);
+        std::array<std::uint32_t, kMaximumConcurrency> index{}, order{};
+        std::int32_t steps = 0, room = 0;
+        for (std::size_t r = 0; r < n; ++r) {
+            index[r] = lane_of(sequences[r]);
+            order[r] = static_cast<std::uint32_t>(r);
+            const Lane& lane = lanes_[index[r]];
+            steps = std::max(steps, o_.draft_tokens_auto ? lane.step_cap : window);
+            room  = std::max(room, static_cast<std::int32_t>(std::min<std::uint32_t>(budgets[r].generated_tokens_remaining,
+                                                                                      ik::kDSparkBlock)) - 1);
+        }
+        // The rows in the call's order: lanes ascending, each lane's columns consecutive.
+        std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(n),
+                  [&](std::uint32_t a, std::uint32_t b) { return index[a] < index[b]; });
+        // Drafts no row's budget can take are not drafted.
+        steps = std::min({steps, room, ik::kMarkovSteps});
+        if (steps < 1) { return std::nullopt; }
+        // Each row's block rows F .. F + 7 go to the full layer's pages first; the drafts are rows in the call's order.
+        std::array<ik::DSparkRound, kMaximumConcurrency> rounds{};
+        for (std::size_t b = 0; b < n; ++b) {
+            const std::uint32_t lane = index[order[b]];
+            const auto F             = static_cast<std::int32_t>(lanes_[lane].processed);
+            map_lane_pages(lane, F + ik::kDSparkBlock);
+            rounds[b] = {F, lanes_[lane].tokens[static_cast<std::size_t>(F)], static_cast<std::int32_t>(lane)};
+        }
+        drafter_->stage(std::span<const ik::DSparkRound>(rounds.data(), n));
+        // The graph first (a first use captures it), so the events time the launch alone.
+        DecodeGraphExecutable& draft = rows_draft_graph(static_cast<std::int32_t>(n), steps);
+        CUDA_CHECK(cudaEventRecord(round_events_[0], device_.stream));
+        draft.launch(device_.stream);
+        CUDA_CHECK(cudaEventRecord(round_events_[1], device_.stream));
+        {
+            const auto wait = Clock::now();
+            CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+            wait_ns_ += elapsed_ns(wait);
+        }
+        // Each row's drafts and confidences (draft row b is the call's b-th row).
+        std::array<std::array<TokenId, ik::kMarkovSteps>, kMaximumConcurrency> drafts{};
+        std::array<std::array<float, ik::kMarkovSteps>, kMaximumConcurrency> probabilities{};
+        for (std::size_t b = 0; b < n; ++b) {
+            for (std::int32_t i = 0; i < steps; ++i) {
+                drafts[b][static_cast<std::size_t>(i)]        = drafter_->host_tokens(static_cast<std::int32_t>(b))[i];
+                probabilities[b][static_cast<std::size_t>(i)] = drafter_->host_probabilities(static_cast<std::int32_t>(b))[i];
+            }
+        }
+        // The width: every row verifies K drafts (a fixed --draft-tokens: all it drafted).
+        std::int32_t K = steps;
+        if (o_.draft_tokens_auto) {
+            double best = -1.0;
+            for (std::int32_t k = 0; k <= steps; ++k) {
+                double tokens = 0.0;
+                for (std::size_t b = 0; b < n; ++b) {
+                    const std::size_t r    = order[b];
+                    const auto licensed    = static_cast<std::int32_t>(budgets[r].generated_tokens_remaining);
+                    const std::int32_t own = std::min(k, licensed - 1);
+                    tokens += runtime::speculative::expected_draft_tokens(
+                        lanes_[index[r]].calibration,
+                        std::span<const float>(probabilities[b].data(), static_cast<std::size_t>(steps)), own);
+                }
+                const double score = tokens / verify_estimate(cost, k);
+                if (score > best) {
+                    best = score;
+                    K    = k;
+                }
+            }
+            // One width more every kProbeInterval rounds keeps the longer widths' cost and acceptance measured.
+            if (++cost.rounds % kProbeInterval == 0) { K = std::min(K + 1, steps); }
+            for (std::size_t b = 0; b < n; ++b) {
+                Lane& lane     = lanes_[index[order[b]]];
+                lane.step_cap  = std::clamp(K + 2, std::min(2, window), window);
+                ++lane.policy_rounds;
+            }
+        } else {
+            ++cost.rounds;
+        }
+        ++cost.widths[static_cast<std::size_t>(K)];
+        report_rows(n, context_bucket(longest_context(sequences)), cost);
+        if (K == 0) { return std::nullopt; }
+        // The verify call: each row's pending input and its K drafts at F .. F + K, in lane order.
+        const std::int32_t width = K + 1;
+        CallPlan call;
+        call.first.assign(lanes_.size(), 0); // every lane's entry: the call's graph is the same whichever lanes it has
+        std::array<std::uint32_t, kMaxSampleRows> sample_lanes{}, providers{};
+        std::array<std::int32_t, kMaxSampleRows> logit_rows{}, positions{};
+        std::array<std::int32_t, kMaximumConcurrency> offset{};
+        for (std::size_t b = 0; b < n; ++b) {
+            const std::size_t r      = order[b];
+            const std::uint32_t lane = index[r];
+            const auto F             = static_cast<std::int32_t>(lanes_[lane].processed);
+            offset[r]                = static_cast<std::int32_t>(call.tokens.size());
+            for (std::int32_t i = 0; i < width; ++i) {
+                const auto column = static_cast<std::size_t>(offset[r] + i);
+                call.tokens.push_back(i == 0 ? lanes_[lane].tokens[static_cast<std::size_t>(F)]
+                                             : drafts[b][static_cast<std::size_t>(i - 1)]);
+                call.lane.push_back(static_cast<std::int32_t>(lane));
+                call.position.push_back(F + i);
+                sample_lanes[column] = lane;
+                providers[column]    = static_cast<std::uint32_t>(r);
+                logit_rows[column]   = static_cast<std::int32_t>(column);
+                positions[column]    = F + i;
+            }
+        }
+        upload(call);
+        const auto T = static_cast<std::size_t>(call.columns());
+        // Every column samples under its row's reasoning ban (read before the masks are filled, as a one-row round
+        // reads it) and mask.
+        std::array<runtime::ReasoningBan, kMaximumConcurrency> bans{};
+        bool constrained = false;
+        for (std::size_t r = 0; r < n && masks != nullptr; ++r) {
+            bans[r]     = masks->reasoning_ban(r);
+            constrained = constrained || masks->constrained(r);
+        }
+        stage_sample({sample_lanes.data(), T}, {logit_rows.data(), T}, ops::kSamplePurposeDecode, masks,
+                     {positions.data(), T}, false, {providers.data(), T});
+        DecodeGraphExecutable& verify = rows_verify_graph(static_cast<std::int32_t>(n), width);
+        CUDA_CHECK(cudaEventRecord(round_events_[2], device_.stream));
+        // The forward's graph, then (a constrained row's masks filled while it runs: column i samples under the mask of
+        // its position after its drafts 0 .. i - 1) the sample of every column.
+        verify.launch(device_.stream);
+        std::array<std::uint64_t, kMaximumConcurrency> dead{};
+        for (std::size_t b = 0; b < n && constrained; ++b) {
+            const std::size_t r = order[b];
+            if (!masks->constrained(r)) { continue; }
+            fill_masks(*masks, r, static_cast<std::size_t>(offset[r]),
+                       std::span<const TokenId>(drafts[b].data(), static_cast<std::size_t>(K)));
+            dead[r] = mask_dead_[r];
+        }
+        launch_sample(T, {logit_rows.data(), T}, ops::kSamplePurposeDecode);
+        CUDA_CHECK(cudaEventRecord(round_events_[3], device_.stream));
+        finish_sample(T, true);
+        float draft_ms = 0, gap_ms = 0, verify_ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&draft_ms, round_events_[0], round_events_[1]));
+        CUDA_CHECK(cudaEventElapsedTime(&gap_ms, round_events_[1], round_events_[2]));
+        CUDA_CHECK(cudaEventElapsedTime(&verify_ms, round_events_[2], round_events_[3]));
+        // A round that captured a graph (or evicted one) is no sample of the cost line.
+        if (!round_captured_) { ewma(cost.verify_ms[static_cast<std::size_t>(K)], verify_ms); }
+        // Each row: its accepted prefix, as a one-row round decides it.
+        std::array<runtime::PendingRowFailure, kMaximumConcurrency> row_failures{};
+        std::int32_t committed = 0;
+        for (std::size_t b = 0; b < n; ++b) {
+            const std::size_t r       = order[b];
+            const std::uint32_t idx   = index[r];
+            Lane& lane                = lanes_[idx];
+            const auto F              = static_cast<std::int32_t>(lane.processed);
+            const auto o              = static_cast<std::size_t>(offset[r]);
+            const auto licensed       = static_cast<std::int32_t>(budgets[r].generated_tokens_remaining);
+            std::int32_t a            = 0;
+            while (a < K && drafts[b][static_cast<std::size_t>(a)] == sampled_tokens_[o + static_cast<std::size_t>(a)] &&
+                   failures_[o + static_cast<std::size_t>(a)] == runtime::PendingRowFailure::None) {
+                ++a;
+            }
+            lane.calibration.observe(std::span<const float>(probabilities[b].data(), static_cast<std::size_t>(steps)),
+                                     static_cast<std::uint32_t>(K), static_cast<std::uint32_t>(a), kAcceptanceWeight);
+            // The row's round ends at the first reasoning close it draws, and at its budget.
+            if (const runtime::ReasoningBan& ban = bans[r]; ban.active()) {
+                for (std::int32_t i = 0; i < a; ++i) {
+                    if (sampled_tokens_[o + static_cast<std::size_t>(i)] == ban.close) {
+                        a = i;
+                        break;
+                    }
+                }
+            }
+            const std::int32_t kept = std::min(a, licensed - 1);
+            runtime::PendingRowFailure failure = runtime::PendingRowFailure::None;
+            for (std::int32_t i = 0; i <= kept; ++i) {
+                if (failures_[o + static_cast<std::size_t>(i)] != runtime::PendingRowFailure::None) {
+                    failure = failures_[o + static_cast<std::size_t>(i)];
+                    break;
+                }
+            }
+            if (failure == runtime::PendingRowFailure::None && (dead[r] & ((std::uint64_t{2} << kept) - 1U)) != 0) {
+                failure = runtime::PendingRowFailure::ConstraintDeadEnd;
+            }
+            if (const std::uint32_t at = unpackable_seen_[idx]; at != kNoPosition) {
+                if (at <= static_cast<std::uint32_t>(F + kept)) {
+                    if (failure == runtime::PendingRowFailure::None) { failure = runtime::PendingRowFailure::UnpackableKv; }
+                } else {
+                    clear_unpackable(idx);
+                }
+            }
+            if (failure != runtime::PendingRowFailure::None && failure != runtime::PendingRowFailure::ConstraintDeadEnd) {
+                lane.prefix.withdraw = true; // as finish_sample does for a plain row
+            }
+            row_failures[r] = failure;
+            ++lane.rounds;
+            lane.drafted += static_cast<std::uint64_t>(K);
+            lane.accepted += static_cast<std::uint64_t>(kept);
+            for (std::int32_t i = 0; i < kept; ++i) { ++lane.accepted_at[static_cast<std::size_t>(i)]; }
+            lane.draft_ms += draft_ms, lane.gap_ms += gap_ms, lane.verify_ms += verify_ms;
+            row_counts_[r]     = kept + 1;
+            pending_firsts_[r] = static_cast<std::uint32_t>(F);
+            std::copy_n(sampled_tokens_.begin() + static_cast<std::ptrdiff_t>(o), kept + 1,
+                        round_tokens_.begin() + static_cast<std::ptrdiff_t>(r * kRowStride));
+            committed += kept + 1;
+        }
+        std::copy_n(row_failures.begin(), n, failures_.begin());
+        inkling2::testing::count_rows_drafted(n);
+        pending_draft_ = {true};
+        const std::uint64_t transaction = ++transaction_;
+        const std::uint64_t ns          = elapsed_ns(start);
+        if (!round_captured_) {
+            ewma(cost.draft_wall, static_cast<double>(ns) * 1e-6);
+            ewma(cost.draft_tokens, static_cast<double>(committed));
+        }
+        for (std::size_t r = 0; r < n; ++r) {
+            lanes_[index[r]].decode_ns += ns;
+            lanes_[index[r]].decode_share_ns += ns / n;
+        }
+        pending_      = transaction;
+        pending_kind_ = PendingKind::Decode;
+        return ContractAccess::batch(this, transaction, sequences, {round_tokens_.data(), n * kRowStride},
+                                     timing_since(start), {failures_.data(), n}, {row_counts_.data(), n}, kRowStride);
+    }
+
+    // The captured drafts of `rows` rows and `steps` steps (a round of several rows), the most recently used
+    // kRowsGraphs of them kept.
+    DecodeGraphExecutable& rows_draft_graph(std::int32_t rows, std::int32_t steps) {
+        const std::uint64_t key = (1ULL << 63) | (1ULL << 60) | static_cast<std::uint64_t>(rows) << 8 |
+                                  static_cast<std::uint32_t>(steps);
+        return rows_graph(key, [&] {
+            drafter_->draft(steps, device_.stream, rows);
+            drafter_->download(steps, device_.stream, rows);
+        });
+    }
+
+    // The captured forward of a verify call of `rows` rows of `width` columns each (its call plan uploaded before the
+    // launch; the sample follows it, eagerly, so a constrained row's masks can be filled meanwhile). Its topology
+    // depends on those counts only: which lanes the rows are, their tokens and positions are device data (each lane's
+    // columns stay one attention group, below the conv ring's and window's wide paths, so no launch names a lane).
+    DecodeGraphExecutable& rows_verify_graph(std::int32_t rows, std::int32_t width) {
+        const std::uint64_t key = (1ULL << 63) | (1ULL << 61) | kForwardOnlyGraph | static_cast<std::uint64_t>(rows) << 8 |
+                                  static_cast<std::uint32_t>(width);
+        return rows_graph(key, [&] { run_decode_call(rows * width); });
+    }
+
+    // A graph of rounds of several rows by key, captured on first use; the least recently used is destroyed once
+    // kRowsGraphs are held (the graphs' allowance counts kRowsGraphs).
+    template <class Body>
+    DecodeGraphExecutable& rows_graph(std::uint64_t key, Body&& body) {
+        if (const auto used = std::find(rows_graph_order_.begin(), rows_graph_order_.end(), key);
+            used != rows_graph_order_.end()) {
+            rows_graph_order_.erase(used);
+            rows_graph_order_.push_back(key);
+            return graphs_.at(key);
+        }
+        while (rows_graph_order_.size() >= static_cast<std::size_t>(kRowsGraphs)) {
+            graphs_.erase(rows_graph_order_.front());
+            rows_graph_order_.pop_front();
+            graph_executables_.fetch_sub(1, std::memory_order_relaxed);
+            round_captured_ = true;
+            ++rows_evictions_;
+        }
+        ++rows_captures_;
+        DecodeGraphDefinition definition;
+        definition.capture(device_.stream, body);
+        DecodeGraphExecutable exec;
+        instantiate_graph(exec, definition);
+        rows_graph_order_.push_back(key);
+        return graphs_.emplace(key, std::move(exec)).first->second;
     }
 
     // The captured draft of `steps` drafts (its round words copied in from pinned memory, the drafts copied out).
@@ -2477,7 +3155,7 @@ private:
     // mask_dead_[row].
     void fill_masks(runtime::TokenMaskProvider& masks, std::size_t row, std::size_t slot, std::span<const TokenId> drafts) {
         const auto words = static_cast<std::size_t>(mask_words(static_cast<std::uint64_t>(vocab_)));
-        if (slot + drafts.size() + 1 > static_cast<std::size_t>(kMaskSlots)) {
+        if (slot + drafts.size() + 1 > static_cast<std::size_t>(mask_slots(o_))) {
             throw std::logic_error("Inkling 2: a constrained round needs more mask slots than it has");
         }
         auto* host = static_cast<std::uint32_t*>(host_masks_->data()) + slot * words;
@@ -2657,12 +3335,16 @@ private:
     // before its launch (outside a graph). A constrained row's config names its mask slot; fill_staged_masks fills it.
     // `positions`: each row's draw key (a verify call's columns); empty: the lane's. `mask_row_zero`: every row takes the
     // masks' row 0 (a verify call's columns of one row), whose masks decode_dspark fills into the columns' slots.
+    // `providers`: each row's row of the masks (a verify call's columns of several rows, whose masks
+    // decode_dspark_rows fills); empty: the row itself.
     void stage_sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> logit_rows, std::int32_t purpose,
                       runtime::TokenMaskProvider* masks, std::span<const std::int32_t> positions = {},
-                      bool mask_row_zero = false) {
-        staged_masks_ = 0;
+                      bool mask_row_zero = false, std::span<const std::uint32_t> providers = {}) {
+        if (lanes.size() > static_cast<std::size_t>(kMaxSampleRows)) { throw std::logic_error("Inkling 2: too many sample rows"); }
+        const bool verify = mask_row_zero || !providers.empty();
+        staged_masks_     = 0;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!mask_row_zero) { mask_dead_[row] = 0; }
+            if (!verify) { mask_dead_[row] = 0; }
             const Lane& lane                       = lanes_[lanes[row]];
             const ResolvedSamplingParameters& s    = lane.options.sampling;
             ops::SamplingConfig config;
@@ -2683,7 +3365,7 @@ private:
             config.nonfinite         = &nonfinite_[row];
             sample_lanes_[row]       = lanes[row];
             if (masks != nullptr) {
-                const std::size_t provider_row  = mask_row_zero ? 0 : row;
+                const std::size_t provider_row  = mask_row_zero ? 0 : !providers.empty() ? providers[row] : row;
                 const runtime::ReasoningBan ban = masks->reasoning_ban(provider_row);
                 config.reasoning_close          = ban.close;
                 config.reasoning_ends[0]        = ban.ends[0];
@@ -2691,7 +3373,7 @@ private:
                 config.reasoning_withheld       = ban.withheld;
                 // A constrained row samples among its grammar's legal tokens (constrained-decoding.md §7.3).
                 if (masks->constrained(provider_row)) {
-                    if (!mask_row_zero) { staged_rows_[staged_masks_++] = row; }
+                    if (!verify) { staged_rows_[staged_masks_++] = row; }
                     config.mask = mask_slot(row);
                 }
             }
@@ -2707,8 +3389,9 @@ private:
                                    cudaMemcpyHostToDevice, device_.stream));
         CUDA_CHECK(cudaMemcpyAsync(positions_.p, host_positions_, 4 * lanes.size(), cudaMemcpyHostToDevice,
                                    device_.stream));
-        // A verify call's columns are one drafting row's, and a token-constrained row never drafts (dspark_round).
-        if (mask_row_zero) {
+        // A verify call's columns are drafting rows', and a token-constrained row never drafts (dspark_round,
+        // dspark_rows_round).
+        if (verify) {
             staged_constraint_ = false;
         } else {
             stage_constraints(lanes);
@@ -2729,6 +3412,8 @@ private:
         bool identity = true;
         for (std::size_t i = 0; i < rows; ++i) { identity = identity && logit_rows[i] == static_cast<std::int32_t>(i); }
         if (!identity) {
+            // Plain rounds only (at most a row a lane): a verify call samples its columns in order.
+            if (rows > kMaximumConcurrency) { throw std::logic_error("Inkling 2: a gathered sample of more than 8 rows"); }
             if (gathered_.bytes == 0) { gathered_ = DeviceBuffer(static_cast<std::size_t>(vocab_) * 4 * kMaximumConcurrency); }
             for (std::size_t i = 0; i < rows; ++i) {
                 CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(gathered_.p) + i * vocab_,
@@ -2739,13 +3424,19 @@ private:
         }
         // A token-constrained row's logits are masked to its step's tokens (records written) before the sampler reads them.
         if (staged_constraint_) { constrain_staged(const_cast<float*>(logits), rows); }
-        const Tensor in(const_cast<float*>(logits), DType::FP32, {vocab_, static_cast<std::int32_t>(rows)});
-        Tensor out(sampled_.p, DType::I32, {static_cast<std::int32_t>(rows)});
-        const Tensor positions(positions_.p, DType::I32, {static_cast<std::int32_t>(rows)});
         // Any lane may sample the whole vocabulary (top_k 0, JM-40) and the call is in captured graphs, so every call
-        // but the lossless route's (which never does) declares such rows.
-        ops::sample(in, out, vocab_, static_cast<const ops::SamplingConfig*>(configs_.p), positions, purpose, sampling_,
-                    device_.stream, !o_.lossless);
+        // but the lossless route's (which never does) declares such rows. A DSpark round of several rows samples its
+        // columns 8 at a time: the sampler's own route for the widths plain decoding and a one-row round use, so each
+        // column draws as it would there (and the workspace stays sized for 8 rows).
+        for (std::size_t first = 0; first < rows; first += kMaximumConcurrency) {
+            const auto count = static_cast<std::int32_t>(std::min<std::size_t>(kMaximumConcurrency, rows - first));
+            const Tensor in(const_cast<float*>(logits) + first * static_cast<std::size_t>(vocab_), DType::FP32,
+                            {vocab_, count});
+            Tensor out(static_cast<std::int32_t*>(sampled_.p) + first, DType::I32, {count});
+            const Tensor positions(static_cast<std::int32_t*>(positions_.p) + first, DType::I32, {count});
+            ops::sample(in, out, vocab_, static_cast<const ops::SamplingConfig*>(configs_.p) + first, positions, purpose,
+                        sampling_, device_.stream, !o_.lossless);
+        }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_, sampled_.p, 4 * rows, cudaMemcpyDeviceToHost, device_.stream));
     }
 
@@ -2816,8 +3507,10 @@ private:
 
     // A uniform decode round (every lane one input) as the graph of its (lanes, columns), captured on first use; the
     // call plan, configs and positions are uploaded before the launch.
+    // `device_ms`: the round's forward and sample timed on the device (round_events_ 2 and 3), read after its sync.
     void decode_graph(std::int32_t lanes, std::int32_t columns, std::span<const std::uint32_t> rows,
-                      std::span<const std::int32_t> logit_rows, runtime::TokenMaskProvider* masks) {
+                      std::span<const std::int32_t> logit_rows, runtime::TokenMaskProvider* masks,
+                      float* device_ms = nullptr) {
         stage_sample(rows, logit_rows, ops::kSamplePurposeDecode, masks);
         // A round with a constrained row (a grammar's masks, a token constraint) runs the forward's graph alone, fills
         // the masks while it runs, then constrains and samples.
@@ -2836,12 +3529,15 @@ private:
         }
         auto found = graphs_.find(key);
         if (found == graphs_.end()) { found = capture_decode(lanes, columns, sample); }
+        if (device_ms != nullptr) { CUDA_CHECK(cudaEventRecord(round_events_[2], device_.stream)); }
         found->second.launch(device_.stream);
         if (!sample) {
             fill_staged_masks(masks);
             launch_sample(rows.size(), logit_rows, ops::kSamplePurposeDecode);
         }
+        if (device_ms != nullptr) { CUDA_CHECK(cudaEventRecord(round_events_[3], device_.stream)); }
         finish_sample(rows.size());
+        if (device_ms != nullptr) { CUDA_CHECK(cudaEventElapsedTime(device_ms, round_events_[2], round_events_[3])); }
     }
 
     // The graph of a uniform decode call over `lanes` lanes with `columns` of them active (its rows the call's columns
@@ -2869,6 +3565,7 @@ private:
     // allowance, ProgramDevicePlan::graphs). The upload is the one its first launch would make.
     void instantiate_graph(DecodeGraphExecutable& exec, const DecodeGraphDefinition& definition) {
         std::size_t before = 0, after = 0, total = 0;
+        round_captured_ = true; // the round's times are no sample of the cost line (decode_dspark_rows)
         CUDA_CHECK(cudaMemGetInfo(&before, &total));
         exec.instantiate(definition);
         exec.upload(device_.stream);
@@ -2948,6 +3645,27 @@ private:
     std::map<std::int32_t, DecodeGraphExecutable> draft_graphs_;
     PendingDraft pending_draft_;
     std::array<std::int32_t, kMaximumConcurrency> row_counts_{};
+    std::array<std::uint32_t, kMaximumConcurrency> pending_firsts_{};
+    // By row count and context bucket (decode_dspark_rows, rows_cost).
+    std::array<std::array<RowsCost, kContextBuckets>, kMaximumConcurrency + 1> rows_cost_{};
+    std::deque<std::uint64_t> rows_graph_order_;               // rows_graph's keys, least recently used first
+    bool round_captured_ = false; // the decode round captured or evicted a graph
+    std::uint64_t rows_captures_ = 0, rows_evictions_ = 0; // rows_graph's (report_rows)
+    // RAM pressure (start_ram_resize): the monitor, the reserve, the start's trim still to make, the resize under way,
+    // the growth not yet reported, and the Engine's waker.
+    struct RamResize {
+        bool release            = false;
+        bool trim               = false;
+        std::uint64_t asked_at  = 0;
+        std::uint64_t prefix    = 0;
+    };
+    std::unique_ptr<runtime::expert_offload::RamMonitor> ram_;
+    std::uint64_t ram_reserve_ = 0;
+    bool ram_trim_             = false;
+    std::optional<RamResize> ram_resize_;
+    std::uint64_t ram_grown_ = 0;
+    std::mutex waker_mutex_;
+    std::function<void()> waker_;
     std::int32_t vocab_ = 0;
     std::vector<Lane> lanes_;
     DeviceBuffer images_, counts_, configs_, positions_, sampled_, gathered_;
@@ -3001,14 +3719,14 @@ private:
         a.fill(kNoPosition);
         return a;
     }();
-    std::array<std::uint32_t, kMaximumConcurrency> sample_lanes_{}; // the staged sample rows' lanes
-    // Constrained rows' masks (mask_bytes, fill_masks): device and pinned [kMaskSlots][words], and each staged row's
+    std::array<std::uint32_t, kMaxSampleRows> sample_lanes_{}; // the staged sample rows' lanes
+    // Constrained rows' masks (mask_bytes, fill_masks): device and pinned [mask_slots][words], and each staged row's
     // dead positions (bit j: its j-th position has no legal token).
     DeviceBuffer masks_;
     std::optional<PinnedHostBuffer> host_masks_;
-    std::array<std::uint64_t, kMaximumConcurrency> mask_dead_{};
+    std::array<std::uint64_t, kMaxSampleRows> mask_dead_{};
     // The rows stage_sample left for fill_staged_masks.
-    std::array<std::size_t, kMaximumConcurrency> staged_rows_{};
+    std::array<std::size_t, kMaxSampleRows> staged_rows_{};
     std::size_t staged_masks_ = 0;
     // Token constraints (constraint_words): device and pinned operands, the plan whose sets each lane's columns hold,
     // and the staged call's rows: each one's descriptor (-1 unconstrained) and step.
@@ -3023,8 +3741,11 @@ private:
     std::vector<float> captured_rows_; // TokenConstraint::capture_logits: the staged rows' logits, before the mask
     // A graph key's bit for a capture without the sample (a constrained round samples after its masks).
     static constexpr std::uint64_t kForwardOnlyGraph = 1ULL << 62;
-    std::array<TokenId, kMaximumConcurrency> sampled_tokens_{};
-    std::array<runtime::PendingRowFailure, kMaximumConcurrency> failures_{};
+    std::array<TokenId, kMaxSampleRows> sampled_tokens_{};
+    std::array<runtime::PendingRowFailure, kMaxSampleRows> failures_{};
+    // A DSpark round's rows' tokens, row-major (kDSparkBlock a row): what each row licenses (row_counts_), committed from
+    // here.
+    std::array<TokenId, kMaxSampleRows> round_tokens_{};
     std::map<std::uint64_t, DecodeGraphExecutable> graphs_;
     static constexpr int kStagingSlots = 4;
     struct Events {
@@ -3060,6 +3781,9 @@ private:
     std::atomic<std::uint64_t> graph_bytes_{0};
     std::atomic<std::uint32_t> graph_executables_{0};
     std::vector<std::int32_t> penalty_host_; // a resumed lane's penalty counts on the host (rebuild_counts)
+    std::vector<cudaEvent_t> timing_events_; // the prompt calls' timing events not in use (take_timing_pair)
+    std::uint64_t reserved_bytes_ = 0;      // set_reserved_bytes
+    std::uint64_t reserved_graphs_ = 0;     // graph_bytes_ when reserved_bytes_ was set
     std::optional<std::uint64_t> pending_;
     PendingKind pending_kind_ = PendingKind::Decode;
     std::uint64_t transaction_ = 0;
@@ -3185,11 +3909,13 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     if (options.use_cuda_graph && !options.causal_scoring && !options.lossless) {
         // The decode graphs and their forward-only forms; with DSpark a verify graph per (lane, 2-8 columns, sampled or
-        // forward-only) and a draft graph per step count.
+        // forward-only) and a draft graph per step count, and with several lanes the rounds of several rows' graphs
+        // (rows_graph keeps kRowsGraphs).
         std::uint64_t executables = 2ULL * out.graph_bound;
         if (dspark) {
             executables += lanes * static_cast<std::uint64_t>(ops::inkling2::kDSparkBlock - 1) * 2 +
                            static_cast<std::uint64_t>(ops::inkling2::kMarkovSteps);
+            if (lanes >= 2) { executables += static_cast<std::uint64_t>(detail::kRowsGraphs); }
         }
         out.graphs = kGraphDriverBytes + executables * kGraphExecutableBytes;
     }
@@ -3229,7 +3955,15 @@ ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::Executi
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 bool Program::hybrid_poll_storage() { return impl_->prefix_poll_storage(); }
-void Program::maintain() { (void)impl_->prefix_poll_storage(); }
+void Program::maintain() {
+    (void)impl_->prefix_poll_storage();
+    impl_->maintain_ram(true);
+}
+void Program::maintain_busy() { impl_->maintain_ram(false); }
+void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
+void Program::start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier) {
+    impl_->start_ram_resize(reserve_bytes, trim_host_tier);
+}
 bool Program::hybrid_source_pending() const noexcept { return impl_->prefix_ssd_wait(); }
 bool Program::hybrid_storage_due() const noexcept { return impl_->prefix_storage_due(); }
 std::optional<std::chrono::steady_clock::time_point> Program::hybrid_storage_retry_at() const noexcept {
@@ -3294,6 +4028,7 @@ ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_t
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 MemoryUsage Program::memory_usage() const noexcept { return impl_->memory_usage(); }
+void Program::set_reserved_bytes(std::uint64_t bytes) noexcept { impl_->set_reserved_bytes(bytes); }
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
 } // namespace infernix::models::inkling2
