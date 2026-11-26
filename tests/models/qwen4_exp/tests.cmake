@@ -192,11 +192,15 @@ set_tests_properties(infernix_qwen4_exp_prefix_cache_real_test PROPERTIES SKIP_R
 
 # A continuation resumed after speculative decoding against a cold run, MTP and DFlash2 (INFERNIX_QWEN4_DFLASH2),
 # on the reproducible route (bit-identical) and the default route (a teacher-forced log-probability bound).
+# The DFlash2 case is an entry of its own (as in every test here that has one): it skips without
+# INFERNIX_QWEN4_DFLASH2, and inside the MTP entry that skip read as a pass.
 infernix_add_test(infernix_qwen4_exp_resume_cold_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_resume_cold_real.cpp"
   LIBRARIES infernix_engine
-  ARGS mtp dflash2)
-set_tests_properties(infernix_qwen4_exp_resume_cold_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+  ARGS mtp)
+add_test(NAME infernix_qwen4_exp_resume_cold_dflash2_real_test COMMAND infernix_qwen4_exp_resume_cold_real_test dflash2)
+set_tests_properties(infernix_qwen4_exp_resume_cold_real_test infernix_qwen4_exp_resume_cold_dflash2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 infernix_add_test(infernix_qwen4_exp_resume_width_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_resume_width_real.cpp"
   LIBRARIES infernix_engine)
@@ -223,16 +227,21 @@ set_tests_properties(infernix_qwen4_exp_ablate_real_test PROPERTIES SKIP_RETURN_
 infernix_add_test(infernix_qwen4_exp_startup_capture_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_startup_capture_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime
-  ARGS plain mtp dflash2)
-set_tests_properties(infernix_qwen4_exp_startup_capture_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+  ARGS plain mtp)
+add_test(NAME infernix_qwen4_exp_startup_capture_dflash2_real_test
+  COMMAND infernix_qwen4_exp_startup_capture_real_test dflash2)
+set_tests_properties(infernix_qwen4_exp_startup_capture_real_test infernix_qwen4_exp_startup_capture_dflash2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # The decode and verification expert calls' fork route at every width up to eight columns, MTP and DFlash2
 # (INFERNIX_QWEN4_DFLASH2): no call offered it may lose it to the staging slots (NVFP4-QAD's shared job, design §6.1.3).
 infernix_add_test(infernix_qwen4_exp_fork_route_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fork_route_real.cpp"
   LIBRARIES infernix_engine infernix_ops
-  ARGS mtp dflash2)
-set_tests_properties(infernix_qwen4_exp_fork_route_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+  ARGS mtp)
+add_test(NAME infernix_qwen4_exp_fork_route_dflash2_real_test COMMAND infernix_qwen4_exp_fork_route_real_test dflash2)
+set_tests_properties(infernix_qwen4_exp_fork_route_real_test infernix_qwen4_exp_fork_route_dflash2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # A long prompt's layer walk while another lane decodes, with SSD-only experts (issue #5): both
 # requests complete with their solo ids and no call reports a silent host.
@@ -257,11 +266,14 @@ set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RET
 infernix_add_test(infernix_qwen4_exp_wide_plan_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_plan_real.cpp"
   LIBRARIES infernix_engine
-  ARGS banks tier mtp dflash2 two-lanes scoring a8 bf16p chat reproducible kv-bf16 kv-fp8 kv-nvfp4 kv-k8v4 kv-vq2
+  ARGS banks tier mtp two-lanes scoring a8 bf16p chat reproducible kv-bf16 kv-fp8 kv-nvfp4 kv-k8v4 kv-vq2
        kv-k4v2 long cut)
 add_test(NAME infernix_qwen4_exp_wide_plan_a4_real_test
   COMMAND infernix_qwen4_exp_wide_plan_real_test a4 a4-residual a4-residual-3)
+# dflash2 apart: it skips without INFERNIX_QWEN4_DFLASH2, which inside the main entry read as a pass.
+add_test(NAME infernix_qwen4_exp_wide_plan_dflash2_real_test COMMAND infernix_qwen4_exp_wide_plan_real_test dflash2)
 set_tests_properties(infernix_qwen4_exp_wide_plan_real_test infernix_qwen4_exp_wide_plan_a4_real_test
+  infernix_qwen4_exp_wide_plan_dflash2_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against

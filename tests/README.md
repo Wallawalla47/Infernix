@@ -355,10 +355,11 @@ request and a prefix-cached extension of the failed one return their cold tokens
 completes; and eight failures in a row stop the Engine. After each swept failure no cached block stays
 pinned and no Device state slot is left reserved. `INFERNIX_TEST_OOM_SWEEP_STRIDE=S` adds every S-th count
 up to 4181 to the sweep (28: 166 counts, about 5 minutes on the NVFP4 27B and 15 on FP4-Local).
-`infernix_qwen4_exp_wide_plan_real_test` (scenarios: the expert banks, the SSD tier, MTP, DFlash2 with
-`INFERNIX_QWEN4_DFLASH2` naming the drafter, two lanes, causal scoring, `--a8-activations`, the packed BF16
-KV cache, a chat prompt's pair call, `--reproducible`, every other KV storage, a 48K prompt's 32,768-column
-MoE group, and a walk whose chunks a structural tap cuts below the prefill chunk) and
+`infernix_qwen4_exp_wide_plan_real_test` (scenarios: the expert banks, the SSD tier, MTP, two lanes, causal
+scoring, `--a8-activations`, the packed BF16 KV cache, a chat prompt's pair call, `--reproducible`, every other KV
+storage, a 48K prompt's 32,768-column MoE group, and a walk whose chunks a structural tap cuts below the prefill
+chunk), `infernix_qwen4_exp_wide_plan_dflash2_real_test` (DFlash2, with `INFERNIX_QWEN4_DFLASH2` naming the
+drafter; skipped without it) and
 `infernix_qwen4_exp_wide_plan_a4_real_test` (the expert-A4 routes, which only FP4-Local's W4A16 banks take)
 record every prefill call that runs in the wide workspace lent from the expert frames
 (`testing::record_wide_scopes`) and print its arena, the forward's plan for it (`Forward::plan_run` and its
@@ -441,25 +442,31 @@ positional speculation is `none`, `mtp`, `dflash` or `dflash2` (the artifact mus
 drafter).
 
 The resume entries (`infernix_qwen3_5_resume_cold_real_test` and
-`infernix_qwen4_exp_resume_cold_real_test`, arguments `mtp dflash2`) decode 256 tokens with the
+`infernix_qwen4_exp_resume_cold_real_test`, arguments `mtp dflash2`; Qwen4Exp's DFlash2 case is its own entry,
+`infernix_qwen4_exp_resume_cold_dflash2_real_test`) decode 256 tokens with the
 drafter, then compare the continuation resumed from the prefix cache with a cold run: on the
 reproducible route the tokens and the teacher-forced log-probabilities of the 16 tokens past the
 decoded text are bit-identical; on the default route, which resumes from the decode-computed
 endpoint, the mean log-probability difference stays within max(0.5, 4 x) (Qwen3.5) or max(0.1, 4 x)
 (Qwen4Exp) that of a resume from a prefill-made state. A stale state measured 3.99; the NVFP4 27B's
 decode-computed states differ from prefill-made ones by up to 0.185 over ten texts, since its prompt path
-takes 4-bit activations and its decode path 16 (the test's comment has the measurements). The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
+takes 4-bit activations and its decode path 16 (the test's comment has the measurements). The Qwen4Exp DFlash2 entry
+runs only with `INFERNIX_QWEN4_DFLASH2`, and reports a skip without it: each Flash-Next test with a DFlash2 case
+(resume, startup capture, fork route, wide plan) registers it as an entry of its own, since a skipped case inside an
+entry that ran others read as a pass.
 Run directly, these entries and the startup-capture one need their arguments: with none they fail (exit 2), and
 when every named case is skipped they report a skip (77), never a pass with nothing checked.
 
-`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; Flash-Next design §19.3.37; the
+`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp`, and `dflash2` in
+`infernix_qwen4_exp_startup_capture_dflash2_real_test`; Flash-Next design §19.3.37; the
 first-use Engine turns startup capture off through `testing::set_startup_capture`) runs two prompts, alone and then together, through an
 Engine that captures each CUDA graph at its first use and one that captures the graph set at startup: on the
 reproducible route the ids must be equal; on both routes no graph may be captured after the startup capture. It
 prints each Engine's construction time and free VRAM. It reads `INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM`,
 `INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it) and `INFERNIX_QWEN4_KV`.
 
-`infernix_qwen4_exp_fork_route_real_test` (arguments `mtp dflash2`) starts an Engine per drafter with seven drafts and
+`infernix_qwen4_exp_fork_route_real_test` (argument `mtp`; `dflash2` in
+`infernix_qwen4_exp_fork_route_dflash2_real_test`) starts an Engine per drafter with seven drafts and
 two lanes on the default expert layout and runs a code prompt alone and two together: at every width every decode or
 verification expert call of at most eight columns that has the fork route's side stream must take it (its jobs within
 the staging slots), and an eight-column call must have. It prints the counts per width. The rule needs every routed
