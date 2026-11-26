@@ -303,6 +303,17 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-tail-skip", "7"}).expert_tail_skip == 7 &&
                           parse({"infernix-serve", "model.ninfer"}).expert_tail_skip == 0,
                       "--expert-tail-skip did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).cpu_rates_saved &&
+                          !parse({"infernix-serve", "model.ninfer", "--cpu-rates", "measure"}).cpu_rates_saved &&
+                          parse({"infernix-serve", "model.ninfer", "--cpu-rates", "saved"}).cpu_rates_saved,
+                      "--cpu-rates did not parse (default saved)");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--cpu-rates", "sometimes"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--cpu-rates accepted a value other than saved or measure");
+    }
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
                       "--expert-a4-activations did not parse (default off)");
