@@ -528,7 +528,9 @@ the prologue bit for bit its emulation, the output against FP64 over the represe
 pool again in every `--kv-dtype` form with its codes and side records bit for bit against a host encoder, bf16p equal
 to the bf16 storage of its words and a row with no packed form flagging its lane alone; the rotated vq2 / k4v2 pools
 against a host emulation of their Hadamard rotation and exhaustive pattern search, their rotated queries bit for bit and
-within FP64 of the rotation, attention against FP64 in the rotated domain). `infernix_w4a4_sparse_moe_test` also
+within FP64 of the rotation, attention against FP64 in the rotated domain) and the `inkling2_dspark` cases (the DSpark
+drafter's Ops against FP64 oracles, and a launch over several rounds' blocks giving each block's own launch bit for
+bit: rotate, attention, the Markov head). `infernix_w4a4_sparse_moe_test` also
 requires the one-column launch (`moe_single`) to give the separate kernels' routing and outputs byte for byte, eagerly
 and in graphs interleaving both paths.
 `infernix_inkling2_chat_template_test` (CPU only) renders `tools/chat_templates/inkling2.jinja` (the checkpoint's,

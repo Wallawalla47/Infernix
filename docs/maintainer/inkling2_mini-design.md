@@ -1392,9 +1392,11 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
   36 columns against single-column decoding. The sampler draws each column 8 rows at a time (its route for the widths
   plain rounds and a one-row round use). So a round of several rows commits each request's plain tokens on every route
   that drafts, the reproducible one included.
-- **Shape.** Every row's block is drafted at once (`Drafter::draft(steps, stream, rows)`: row 0 on the round's
-  stream, the others on streams of their own forked from it and joined back inside the draft's graph, each row with
-  a workspace, round words and draft slot of its own), then one verify call takes n (K + 1) columns: each row's
+- **Shape.** Every row's block is drafted in one chain (`Drafter::draft(steps, stream, rows)`, 2026-11-26): the
+  projections, norms and SwiGLU over all the blocks' rows at once on the decode projection route (16-column launches,
+  so each matrix is read once a 16 rows rather than once a row, and a row's drafts are its single-row drafts bit for
+  bit), the rotations, attention and Markov steps one launch over the blocks (each its own round words, lane, rows,
+  scratch and draft slot), the target head once over the blocks' final rows. Then one verify call takes n (K + 1) columns: each row's
   pending input and its share of the n × K drafts, the rows in lane order. Its graph is keyed by (rows, K), not by
   the shares: the forward alone (no launch names a lane: each lane's columns stay one attention group below the conv
   ring's and window's wide paths) with attention sized for a row's widest group (`CallPlan::group_width`, 8), so any
@@ -1435,7 +1437,14 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
 - **Measured, the rows at once and their shares** (2026-11-26, the same configuration and workloads, seeded so every
   arm samples the same text; §13.5's attention kernel in both arms). The rows' drafts on streams of their own against
   one after another: a four-row round's draft 2.7 → 2.0 ms at 100K, 141.2 / 142.4 against 139.3 / 138.6 tok/s (+2.1 %,
-  the worst pair +1.4 %), and 481.1 / 479.4 against 468.6 / 472.4 at 2K (+2.1 %, the worst pair +1.5 %). Shares dealt
+  the worst pair +1.4 %), and 481.1 / 479.4 against 468.6 / 472.4 at 2K (+2.1 %, the worst pair +1.5 %). One chain
+  over the rows against those streams (2026-11-26, two repetitions): a four-row round's device draft 1.54-1.59 →
+  1.04-1.13 ms at ~2K and 3.07-3.38 → 2.62-2.95 ms at ~122K; four ~2K-token requests +2.7 % tok/s warm (+1.4 % on the
+  first repetition), four on a ~122K-token prefix +0.4 % (ranges overlapping) and +1.4 %; at a fixed 3 drafts both
+  accept the same counts in the same rounds. The chain's first form ran the wide projections on projections_mma, whose
+  unsplit K launches too few CTAs at 24-32 columns: 2.12-2.19 ms at 2K, −2.0 to −6.7 % tok/s. At 122K about 1.6 ms of
+  the four-row draft is each lane's own full-layer attention (gate: the attention skipped, 3.07-3.30 → 1.49-1.56 ms),
+  which no batching shares. Shares dealt
   by expected tokens against K each (3 servers an arm, 4 repetitions each, seeds shifted per repetition): at 100K the
   first repetition 155.6-157.6 against 150.0-151.2 tok/s (+3.9 %, the worst pair +2.9 %), the later ones (the whole
   prompt cached) +6.9 %, every server ahead of every K-each server at the same repetition; at 2K the later repetitions

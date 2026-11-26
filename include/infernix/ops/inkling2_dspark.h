@@ -86,6 +86,9 @@ struct DSparkRotateArgs {
     const std::int32_t* table = nullptr;
     std::int32_t table_stride = 0;
     std::uint16_t* dense = nullptr;
+    // Rows from rounds (positions null): 0, every row the round's; or the rows are blocks of block_rows rows, block i
+    // the round at round + i (a round of several rows drafted in one launch), its rows from round[i].first.
+    std::int32_t block_rows = 0;
 };
 void dspark_rotate(const DSparkRotateArgs& args, cudaStream_t stream);
 // The RoPE table dspark_rotate reads: inv_freq[i] = fl32(theta^(-i / 64)) in FP64, i = 0 .. 63 (host).
@@ -109,6 +112,11 @@ struct DSparkAttentionArgs {
     const DSparkRound* round = nullptr;
     float* scratch           = nullptr; // dspark_attention_scratch_bytes(splits)
     std::uint16_t* out       = nullptr;
+    // Several blocks in one launch (a round of several rows): block b's round at round + b, its queries at
+    // q + b q_stride, output at out + b out_stride and scratch at scratch + b scratch_stride (words, floats). Each
+    // block's arithmetic is its launch's alone.
+    std::int32_t blocks = 1;
+    std::int64_t q_stride = 0, out_stride = 0, scratch_stride = 0;
 };
 void dspark_attention(const DSparkAttentionArgs& args, cudaStream_t stream);
 [[nodiscard]] std::size_t dspark_attention_scratch_bytes(std::int32_t splits);
@@ -165,6 +173,11 @@ struct DSparkMarkovArgs {
     std::int32_t* tokens            = nullptr; // [steps] out
     float* probabilities            = nullptr; // [steps] out
     float* scratch                  = nullptr; // dspark_markov_scratch_bytes
+    // Several blocks in one launch (a round of several rows): block b's round at round + b, its final rows at
+    // block + b block_stride, base at base + b base_stride, scratch at scratch + b scratch_stride (words, floats, bytes
+    // / 4) and its drafts at tokens and probabilities + b kDSparkBlock. Each block's steps are its own.
+    std::int32_t blocks = 1;
+    std::int64_t block_stride = 0, base_stride = 0, scratch_stride = 0;
 };
 void dspark_markov(const DSparkMarkovArgs& args, std::int32_t steps, cudaStream_t stream);
 [[nodiscard]] std::size_t dspark_markov_scratch_bytes(std::int32_t vocab);

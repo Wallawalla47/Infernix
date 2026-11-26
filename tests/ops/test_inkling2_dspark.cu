@@ -702,6 +702,187 @@ void markov_case(bool q8, bool list) {
     check(repeat, "a repeated dspark_markov call differs");
 }
 
+// A round of several rows in one launch (block_rows / blocks): three blocks, each its own round (position, anchor,
+// lane), data and outputs, give each block's single launch bit for bit: dspark_rotate (dense queries and a sliding
+// ring's keys and values), dspark_attention (full and sliding) and dspark_markov (8-bit shortlist Fold).
+void blocks_case() {
+    std::mt19937 rng(23);
+    constexpr int kBlocks = 3, B = 8;
+    const std::vector<ik::DSparkRound> rounds{{1500, 4321, 1}, {37, 17, 0}, {70001, 999, 2}};
+    bool rotate_ok = true, attention_ok = true, markov_ok = true;
+    // Rotate: 24 query heads into a dense buffer, and 8 key heads (with values) into three lanes' rings.
+    {
+        const auto x  = random_bf16(static_cast<std::size_t>(kBlocks) * B * 24 * D, rng, 1.0);
+        const auto kx = random_bf16(static_cast<std::size_t>(kBlocks) * B * 8 * D, rng, 1.0);
+        const auto vx = random_bf16(static_cast<std::size_t>(kBlocks) * B * 8 * D, rng, 1.0);
+        const auto w  = random_bf16(D, rng, 0.3, 1.0);
+        float table[D / 2];
+        ik::dspark_inv_freq(1e6, table);
+        const std::int64_t lane_words = 8LL * ik::kDSparkRing * D;
+        const std::size_t ring_words  = 3 * static_cast<std::size_t>(lane_words);
+        const auto run = [&](int b0, int count, std::uint16_t* dense, std::uint16_t* ck, std::uint16_t* cv) {
+            const auto* r = upload(std::vector<ik::DSparkRound>(rounds.begin() + b0, rounds.begin() + b0 + count));
+            ik::DSparkRotateArgs q;
+            q.x          = upload(std::vector<std::uint16_t>(x.begin() + static_cast<std::ptrdiff_t>(b0) * B * 24 * D,
+                                                             x.begin() + static_cast<std::ptrdiff_t>(b0 + count) * B * 24 * D));
+            q.x_stride   = 24 * D;
+            q.rows       = count * B;
+            q.heads      = 24;
+            q.norm       = upload(w);
+            q.round      = r;
+            q.block_rows = count > 1 ? B : 0;
+            q.inv_freq   = upload(std::vector<float>(table, table + D / 2));
+            q.dense      = dense;
+            ik::dspark_rotate(q, nullptr);
+            ik::DSparkRotateArgs k = q;
+            k.x           = upload(std::vector<std::uint16_t>(kx.begin() + static_cast<std::ptrdiff_t>(b0) * B * 8 * D,
+                                                              kx.begin() + static_cast<std::ptrdiff_t>(b0 + count) * B * 8 * D));
+            k.x_stride    = 8 * D;
+            k.values      = upload(std::vector<std::uint16_t>(vx.begin() + static_cast<std::ptrdiff_t>(b0) * B * 8 * D,
+                                                              vx.begin() + static_cast<std::ptrdiff_t>(b0 + count) * B * 8 * D));
+            k.values_stride = 8 * D;
+            k.heads       = 8;
+            k.dense       = nullptr;
+            k.cache_k     = ck;
+            k.cache_v     = cv;
+            k.lane_stride = lane_words;
+            k.ring        = ik::kDSparkRing;
+            ik::dspark_rotate(k, nullptr);
+        };
+        std::uint16_t* dense_one = zeros<std::uint16_t>(static_cast<std::size_t>(kBlocks) * B * 24 * D);
+        std::uint16_t* dense_all = zeros<std::uint16_t>(static_cast<std::size_t>(kBlocks) * B * 24 * D);
+        std::uint16_t *k_one = zeros<std::uint16_t>(ring_words), *v_one = zeros<std::uint16_t>(ring_words);
+        std::uint16_t *k_all = zeros<std::uint16_t>(ring_words), *v_all = zeros<std::uint16_t>(ring_words);
+        for (int b = 0; b < kBlocks; ++b) { run(b, 1, dense_one + static_cast<std::size_t>(b) * B * 24 * D, k_one, v_one); }
+        run(0, kBlocks, dense_all, k_all, v_all);
+        cuda_check(cudaDeviceSynchronize(), "rotate blocks");
+        rotate_ok = download(dense_one, static_cast<std::size_t>(kBlocks) * B * 24 * D) ==
+                        download(dense_all, static_cast<std::size_t>(kBlocks) * B * 24 * D) &&
+                    download(k_one, ring_words) == download(k_all, ring_words) &&
+                    download(v_one, ring_words) == download(v_all, ring_words);
+    }
+    // Attention: three lanes' caches (sliding rings; the full layer's pages through a shuffled table of three rows).
+    for (const bool sliding : {true, false}) {
+        // (The full layer's pages at a 4K context: its rounds' positions below it.)
+        const int kMaxContext = sliding ? 72000 : 4096;
+        const std::vector<ik::DSparkRound> at_rounds =
+            sliding ? rounds : std::vector<ik::DSparkRound>{{1500, 4321, 1}, {37, 17, 0}, {3001, 999, 2}};
+        const int splits = ik::dspark_attention_splits(sliding, static_cast<std::uint32_t>(kMaxContext));
+        const int stride = (kMaxContext + 8 + 63) / 64, pages = 3 * stride;
+        const std::int64_t lane_words = sliding ? 8LL * ik::kDSparkRing * D : 0;
+        std::vector<std::int32_t> table(3 * static_cast<std::size_t>(stride));
+        for (std::size_t i = 0; i < table.size(); ++i) { table[i] = static_cast<std::int32_t>(i); }
+        std::shuffle(table.begin(), table.end(), rng);
+        const std::size_t words = sliding ? 3 * static_cast<std::size_t>(lane_words) : static_cast<std::size_t>(pages) * 8 * 64 * D;
+        const auto* k = upload(random_bf16(words, rng, 1.0));
+        const auto* v = upload(random_bf16(words, rng, 1.0));
+        const auto q  = random_bf16(static_cast<std::size_t>(kBlocks) * B * 24 * D, rng, 0.35);
+        const std::size_t scratch = ik::dspark_attention_scratch_bytes(splits) / 4;
+        const auto args = [&](int b0, int count, std::uint16_t* out, float* sc) {
+            ik::DSparkAttentionArgs a;
+            a.q           = upload(std::vector<std::uint16_t>(q.begin() + static_cast<std::ptrdiff_t>(b0) * B * 24 * D,
+                                                              q.begin() + static_cast<std::ptrdiff_t>(b0 + count) * B * 24 * D));
+            a.cache_k     = k;
+            a.cache_v     = v;
+            a.lane_stride = lane_words;
+            a.ring        = sliding ? ik::kDSparkRing : 0;
+            if (!sliding) {
+                a.table        = upload(table);
+                a.table_stride = stride;
+            }
+            a.splits  = splits;
+            a.round   = upload(std::vector<ik::DSparkRound>(at_rounds.begin() + b0, at_rounds.begin() + b0 + count));
+            a.scratch = sc;
+            a.out     = out;
+            if (count > 1) {
+                a.blocks         = count;
+                a.q_stride       = static_cast<std::int64_t>(B) * 24 * D;
+                a.out_stride     = static_cast<std::int64_t>(B) * 24 * D;
+                a.scratch_stride = static_cast<std::int64_t>(scratch);
+            }
+            return a;
+        };
+        std::uint16_t* one = zeros<std::uint16_t>(static_cast<std::size_t>(kBlocks) * B * 24 * D);
+        std::uint16_t* all = zeros<std::uint16_t>(static_cast<std::size_t>(kBlocks) * B * 24 * D);
+        float* sc = zeros<float>(kBlocks * scratch);
+        for (int b = 0; b < kBlocks; ++b) {
+            ik::dspark_attention(args(b, 1, one + static_cast<std::size_t>(b) * B * 24 * D, sc), nullptr);
+        }
+        ik::dspark_attention(args(0, kBlocks, all, sc), nullptr);
+        cuda_check(cudaDeviceSynchronize(), "attention blocks");
+        attention_ok = attention_ok && download(one, static_cast<std::size_t>(kBlocks) * B * 24 * D) ==
+                                           download(all, static_cast<std::size_t>(kBlocks) * B * 24 * D);
+    }
+    // Markov: an 8-bit shortlist Fold; each block its rows, base, three lanes' context rings and seven steps.
+    {
+        constexpr int V = 3000, R3 = 768, K = 5120, kRank = 256, kRing = 16, kSteps = 7;
+        std::vector<std::int8_t> codes(static_cast<std::size_t>(V) * kRank);
+        std::uniform_int_distribution<int> code(-127, 127);
+        for (auto& c : codes) { c = static_cast<std::int8_t>(code(rng)); }
+        std::vector<std::uint16_t> scales(static_cast<std::size_t>(V) * kRank / 32);
+        for (auto& s : scales) { s = __half_as_ushort(__float2half_rn(0.001F)); }
+        std::vector<std::int32_t> ids(V);
+        for (int i = 0; i < V; ++i) { ids[i] = 2 * i + 1; }
+        std::vector<float> base(static_cast<std::size_t>(kBlocks) * B * V);
+        std::normal_distribution<float> normal(0.0F, 3.0F);
+        for (float& b : base) { b = normal(rng); }
+        const auto* proj  = upload(random_bf16(static_cast<std::size_t>(R3) * K, rng, 0.02));
+        const auto* bias  = upload(random_bf16(R3, rng, 0.05));
+        const auto block  = random_bf16(static_cast<std::size_t>(kBlocks) * B * H, rng, 1.0);
+        const auto* ring  = upload(random_bf16(3ULL * kRing * H, rng, 1.0));
+        const auto* w1    = upload(random_bf16(static_cast<std::size_t>(2 * V + 2) * kRank, rng, 1.0));
+        const auto* fbias = upload(random_bf16(V, rng, 0.1));
+        const auto* fcode = upload(codes);
+        const auto* fscal = upload(scales);
+        const auto* rid   = upload(ids);
+        const std::size_t scratch = (ik::dspark_markov_scratch_bytes(V) / 4 + 63) / 64 * 64; // 256-byte slices
+        const auto args = [&](int b0, int count, std::int32_t* tokens, float* probs, float* sc) {
+            ik::DSparkMarkovArgs a;
+            a.projection    = proj;
+            a.bias          = bias;
+            a.block         = upload(std::vector<std::uint16_t>(block.begin() + static_cast<std::ptrdiff_t>(b0) * B * H,
+                                                                block.begin() + static_cast<std::ptrdiff_t>(b0 + count) * B * H));
+            a.f_ring        = ring;
+            a.f_ring_rows   = kRing;
+            a.f_lane_stride = static_cast<std::int64_t>(kRing) * H;
+            a.embedding     = w1;
+            a.fold_codes    = fcode;
+            a.fold_scales   = fscal;
+            a.fold_bias     = fbias;
+            a.base          = upload(std::vector<float>(base.begin() + static_cast<std::ptrdiff_t>(b0) * B * V,
+                                                        base.begin() + static_cast<std::ptrdiff_t>(b0 + count) * B * V));
+            a.vocab         = V;
+            a.row_ids       = rid;
+            a.round         = upload(std::vector<ik::DSparkRound>(rounds.begin() + b0, rounds.begin() + b0 + count));
+            a.tokens        = tokens;
+            a.probabilities = probs;
+            a.scratch       = sc;
+            if (count > 1) {
+                a.blocks         = count;
+                a.block_stride   = static_cast<std::int64_t>(B) * H;
+                a.base_stride    = static_cast<std::int64_t>(B) * V;
+                a.scratch_stride = static_cast<std::int64_t>(scratch);
+            }
+            return a;
+        };
+        std::int32_t* t_one = zeros<std::int32_t>(kBlocks * B);
+        std::int32_t* t_all = zeros<std::int32_t>(kBlocks * B);
+        float* p_one = zeros<float>(kBlocks * B);
+        float* p_all = zeros<float>(kBlocks * B);
+        float* sc    = zeros<float>(kBlocks * scratch);
+        for (int b = 0; b < kBlocks; ++b) {
+            ik::dspark_markov(args(b, 1, t_one + b * B, p_one + b * B, sc), kSteps, nullptr);
+        }
+        ik::dspark_markov(args(0, kBlocks, t_all, p_all, sc), kSteps, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "markov blocks");
+        markov_ok = download(t_one, kBlocks * B) == download(t_all, kBlocks * B) &&
+                    download(p_one, kBlocks * B) == download(p_all, kBlocks * B);
+    }
+    std::printf("DSpark blocks (3 rounds in one launch = each alone): rotate %s, attention (sliding, full) %s, markov %s\n",
+                rotate_ok ? "bit for bit" : "DIFFER", attention_ok ? "bit for bit" : "DIFFER", markov_ok ? "bit for bit" : "DIFFER");
+    check(rotate_ok && attention_ok && markov_ok, "a launch over blocks differs from the blocks' single launches");
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(inkling2_dspark) {
@@ -724,6 +905,7 @@ INFERNIX_OP_TEST(inkling2_dspark) {
     markov_case(true, false);
     markov_case(false, true);
     markov_case(true, true);
+    blocks_case();
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

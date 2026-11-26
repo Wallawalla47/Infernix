@@ -165,7 +165,10 @@ __global__ void __launch_bounds__(32) rotate_kernel(const DSparkRotateArgs a) {
     float n[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) { n[j] = bf(rb(canon::mul_rn(canon::mul_rn(x[j], inv), w[j]))); }
-    const int position = a.positions != nullptr ? a.positions[r] : a.round->first + r;
+    // Rows from rounds: the launch's round, or (block_rows) block r / block_rows's.
+    const DSparkRound* round = a.round == nullptr ? nullptr : a.round + (a.block_rows > 0 ? r / a.block_rows : 0);
+    const int in_block       = a.block_rows > 0 ? r % a.block_rows : r;
+    const int position = a.positions != nullptr ? a.positions[r] : round->first + in_block;
     float out[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -185,7 +188,7 @@ __global__ void __launch_bounds__(32) rotate_kernel(const DSparkRotateArgs a) {
         *reinterpret_cast<uint2*>(a.dense + (static_cast<std::size_t>(r) * a.heads + h) * kD + 4 * lane) = packed;
         return;
     }
-    const int lane_index = a.lanes != nullptr ? a.lanes[r] : (a.lane >= 0 ? a.lane : a.round->lane);
+    const int lane_index = a.lanes != nullptr ? a.lanes[r] : (a.lane >= 0 ? a.lane : round->lane);
     std::size_t at;
     if (a.ring > 0) {
         // A slot a later row of the lane also takes is left to it (mix_kernel's rule; rows a lane's consecutive positions).
@@ -251,8 +254,20 @@ __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
 }
 
-__global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const DSparkAttentionArgs a) {
+// Block blockIdx.z's arguments (a launch of several blocks: each its own round, queries, output and scratch).
+__device__ __forceinline__ DSparkAttentionArgs attention_block(const DSparkAttentionArgs& in) {
+    DSparkAttentionArgs a = in;
+    const int b           = static_cast<int>(blockIdx.z);
+    a.round += b;
+    a.q += b * in.q_stride;
+    a.out += b * in.out_stride;
+    a.scratch += b * in.scratch_stride;
+    return a;
+}
+
+__global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const DSparkAttentionArgs args) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
+    const DSparkAttentionArgs a = attention_block(args);
     auto& sm        = *reinterpret_cast<AttnSmem*>(smem_raw);
     const int split = static_cast<int>(blockIdx.x), g = static_cast<int>(blockIdx.y), tid = static_cast<int>(threadIdx.x);
     const int lane = tid % 32, warp = tid / 32;
@@ -388,7 +403,8 @@ __global__ void __launch_bounds__(kAttnThreads, 2) attention_split_kernel(const 
 }
 
 // The splits' merge in split order: a CTA per (KV head, row), a thread per dim.
-__global__ void __launch_bounds__(kD) attention_merge_kernel(const DSparkAttentionArgs a) {
+__global__ void __launch_bounds__(kD) attention_merge_kernel(const DSparkAttentionArgs args) {
+    const DSparkAttentionArgs a = attention_block(args);
     const int g = static_cast<int>(blockIdx.x), q = static_cast<int>(blockIdx.y), d = static_cast<int>(threadIdx.x);
     pdl::enter();
     int lo = 0, hi = 0;
@@ -480,8 +496,22 @@ __device__ __forceinline__ MarkovScratch& markov_scratch(const DSparkMarkovArgs&
     return *reinterpret_cast<MarkovScratch*>(a.scratch);
 }
 
+// Block blockIdx.y's arguments (a launch of several blocks: each its own round, rows, base, scratch and drafts).
+__device__ __forceinline__ DSparkMarkovArgs markov_block(const DSparkMarkovArgs& in) {
+    DSparkMarkovArgs a = in;
+    const int b        = static_cast<int>(blockIdx.y);
+    a.round += b;
+    a.block += b * in.block_stride;
+    a.base += b * in.base_stride;
+    a.scratch += b * in.scratch_stride;
+    a.tokens += b * kDSparkBlock;
+    a.probabilities += b * kDSparkBlock;
+    return a;
+}
+
 // invariant[i][row] = sum_k W[row][2 rank + k] [x_out[i + 1]; f]_k + bias[row] (FP32): a warp per row.
-__global__ void __launch_bounds__(32 * kMarkovWarps) markov_invariant_kernel(const DSparkMarkovArgs a, int steps) {
+__global__ void __launch_bounds__(32 * kMarkovWarps) markov_invariant_kernel(const DSparkMarkovArgs args, int steps) {
+    const DSparkMarkovArgs a = markov_block(args);
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     const int row  = static_cast<int>(blockIdx.x) * kMarkovWarps + warp;
     MarkovScratch& sc = markov_scratch(a);
@@ -530,7 +560,8 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_invariant_kernel(con
 }
 
 // Step `step` (1-based): u = bf16(invariant + W_step [s; w1[prev]]), a warp per 4 rows; the last CTA applies the gates.
-__global__ void __launch_bounds__(32 * kMarkovWarps) markov_gate_kernel(const DSparkMarkovArgs a, int step) {
+__global__ void __launch_bounds__(32 * kMarkovWarps) markov_gate_kernel(const DSparkMarkovArgs args, int step) {
+    const DSparkMarkovArgs a = markov_block(args);
     __shared__ int last;
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     MarkovScratch& sc = markov_scratch(a);
@@ -583,7 +614,8 @@ __global__ void __launch_bounds__(32 * kMarkovWarps) markov_gate_kernel(const DS
 // Step `step`: the vocabulary's logits, a warp per row; each CTA's argmax (lowest id on ties) and its running softmax
 // sum, merged in CTA order by the last CTA. Q8: the 8-bit Fold (a lane's 8 codes and its group's scale).
 template <bool Q8>
-__global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const DSparkMarkovArgs a, int step) {
+__global__ void __launch_bounds__(32 * kMarkovWarps) markov_logits_kernel(const DSparkMarkovArgs args, int step) {
+    const DSparkMarkovArgs a = markov_block(args);
     __shared__ float lat[kMarkovRank];
     __shared__ float wbest[kMarkovWarps], wmax[kMarkovWarps], wsum[kMarkovWarps];
     __shared__ int windex[kMarkovWarps];
@@ -845,10 +877,15 @@ void dspark_attention(const DSparkAttentionArgs& a, cudaStream_t stream) {
         return true;
     }();
     (void)configured;
-    check(pdl::launch_consumer(config(dim3(a.splits, kDSparkKvHeads), dim3(kAttnThreads), sizeof(AttnSmem), stream),
+    if (a.blocks < 1 || (a.blocks > 1 && (a.q_stride <= 0 || a.out_stride <= 0 || a.scratch_stride <= 0))) {
+        throw std::invalid_argument("inkling2 dspark_attention: blocks need their strides");
+    }
+    const auto blocks = static_cast<unsigned>(a.blocks);
+    check(pdl::launch_consumer(config(dim3(a.splits, kDSparkKvHeads, blocks), dim3(kAttnThreads), sizeof(AttnSmem), stream),
                                attention_split_kernel, a),
           "attention");
-    check(pdl::launch_consumer(config(dim3(kDSparkKvHeads, kGroupRows), dim3(kD), 0, stream), attention_merge_kernel, a),
+    check(pdl::launch_consumer(config(dim3(kDSparkKvHeads, kGroupRows, blocks), dim3(kD), 0, stream),
+                               attention_merge_kernel, a),
           "attention merge");
 }
 
@@ -880,19 +917,26 @@ void dspark_markov(const DSparkMarkovArgs& a, std::int32_t steps, cudaStream_t s
         steps > kMarkovSteps) {
         throw std::invalid_argument("inkling2 dspark_markov: every operand and 1-7 steps");
     }
+    if (a.blocks < 1 || (a.blocks > 1 && (a.block_stride <= 0 || a.base_stride <= 0 || a.scratch_stride <= 0))) {
+        throw std::invalid_argument("inkling2 dspark_markov: blocks need their strides");
+    }
+    if (reinterpret_cast<std::uintptr_t>(a.scratch) % 16 != 0 || (a.blocks > 1 && a.scratch_stride % 4 != 0)) {
+        throw std::invalid_argument("inkling2 dspark_markov: 16-byte aligned scratch slices (16-byte loads)");
+    }
+    const auto blocks = static_cast<unsigned>(a.blocks);
     static_assert(kRank3 % (kMarkovWarps * 4) == 0 && kRank3 / kMarkovWarps / 4 == kGateCtas, "gate rows");
-    check(pdl::launch_consumer(config(dim3(kRank3 / kMarkovWarps), dim3(32 * kMarkovWarps), 0, stream),
+    check(pdl::launch_consumer(config(dim3(kRank3 / kMarkovWarps, blocks), dim3(32 * kMarkovWarps), 0, stream),
                                markov_invariant_kernel, a, static_cast<int>(steps)),
           "markov invariant");
     // A shortlist: one 32-row batch a warp (fewer rows than 512 CTAs' would leave warps idle).
     const int batch_ctas      = (a.vocab + 32 * kMarkovWarps - 1) / (32 * kMarkovWarps);
     const unsigned logit_ctas = static_cast<unsigned>(a.row_ids != nullptr && batch_ctas < kLogitCtas ? batch_ctas : kLogitCtas);
     for (int step = 1; step <= steps; ++step) {
-        check(pdl::launch_consumer(config(dim3(kGateCtas), dim3(32 * kMarkovWarps), 0, stream), markov_gate_kernel, a, step),
+        check(pdl::launch_consumer(config(dim3(kGateCtas, blocks), dim3(32 * kMarkovWarps), 0, stream), markov_gate_kernel, a, step),
               "markov gates");
-        check(q8 ? pdl::launch_consumer(config(dim3(logit_ctas), dim3(32 * kMarkovWarps), 0, stream),
+        check(q8 ? pdl::launch_consumer(config(dim3(logit_ctas, blocks), dim3(32 * kMarkovWarps), 0, stream),
                                         markov_logits_kernel<true>, a, step)
-                 : pdl::launch_consumer(config(dim3(logit_ctas), dim3(32 * kMarkovWarps), 0, stream),
+                 : pdl::launch_consumer(config(dim3(logit_ctas, blocks), dim3(32 * kMarkovWarps), 0, stream),
                                         markov_logits_kernel<false>, a, step),
               "markov logits");
     }
