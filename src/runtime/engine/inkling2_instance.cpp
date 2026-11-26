@@ -257,7 +257,8 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     refuse_option(!options.expert_stripe_path.empty(), "--expert-stripe", kResidentExperts);
     refuse_option(!options.route_trace_path.empty(), "--route-trace", kResidentExperts);
     refuse_option(!options.context_cost.preset_path.empty(), "--context-cost-presets",
-                  "calibrates the Qwen prefix caches' cost model; Inkling 2's prefix cache has none");
+                  "calibrates the Qwen prefix caches' measured cost model; Inkling 2's prefix cache weighs a read "
+                  "against a re-prefill with a fixed fit of its own rates");
     refuse_option(options.media_cache_bytes != kDefaultMediaCacheBytes, "--media-cache-mib", kQwenMedia);
     refuse_option(options.media_live_bytes != kDefaultMediaLiveBytes, "--media-live-mib", kQwenMedia);
     refuse_option(options.media_preprocess_threads != 0, "--media-preprocess-threads", kQwenMedia);
