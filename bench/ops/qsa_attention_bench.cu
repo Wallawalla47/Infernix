@@ -54,6 +54,9 @@ struct Options {
     std::vector<int> prompt_v2{-1};
     // Packed BF16: give qsa_attention its `unpack` scratch (prompt calls unpack the sequence once).
     bool unpack = true;
+    // Print each case's output digest (FNV-1a 64 over the BF16 output) after its timing: two runs compare
+    // their bits case by case (an A/B of a same-bit change).
+    bool digest = false;
 };
 
 const char* storage_name(KvCacheStorage s) {
@@ -117,10 +120,12 @@ Options parse_options(int argc, char** argv) {
             o.prompt_v2 = ints(value());
         } else if (arg == "--unpack") {
             o.unpack = std::atoi(value().data()) != 0;
+        } else if (arg == "--digest") {
+            o.digest = std::atoi(value().data()) != 0;
         } else if (arg == "--help") {
             std::printf("infernix_qsa_attention_bench [--storage bf16,bf16p,int8,fp8,nvfp4,k8v4,vq2,k4v2] "
                         "[--contexts 8192,131072] [--widths 1,5] [--warmup N] [--repeat N] [--prompt-v2 0,1,1,0] "
-                        "[--unpack 0|1]\n"
+                        "[--unpack 0|1] [--digest 0|1]\n"
                         "  --prompt-v2: the prompt kernel's variants timed per case in this order "
                         "(0 combined gather, 1 split K/V stage, -1 the storage's default; default -1)\n"
                         "  --unpack: bf16p calls get qsa_attention's unpack scratch (default 1)\n");
@@ -305,6 +310,16 @@ int main(int argc, char** argv) {
                             std::printf("%-7s %7d %5d %2d %10.2f %10.2f %13.2f\n", storage_name(storage), context,
                                         width, v2 ? 1 : 0, total.median_us, select.median_us,
                                         total.median_us - select.median_us);
+                            if (options.digest) {
+                                data.attention(stream);
+                                CUDA_CHECK(cudaStreamSynchronize(stream));
+                                std::vector<unsigned char> host(static_cast<std::size_t>(kD) * kHeads * width * 2);
+                                CUDA_CHECK(cudaMemcpy(host.data(), data.out.p, host.size(), cudaMemcpyDeviceToHost));
+                                std::uint64_t hash = 1469598103934665603ULL;
+                                for (const unsigned char byte : host) { hash = (hash ^ byte) * 1099511628211ULL; }
+                                std::printf("digest %s %d %d %d %016llx\n", storage_name(storage), context, width,
+                                            v2 ? 1 : 0, static_cast<unsigned long long>(hash));
+                            }
                             std::fflush(stdout);
                         }
                         ops::detail::qsa_prompt_force(-1);

@@ -906,21 +906,56 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
     }
 }
 
-__global__ void merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
+// The split partials' merge, one CTA a (head, column), one thread a dimension: the same arithmetic as a serial
+// fold over the splits in split order, with its latency taken off the critical path. One thread a split loads
+// that split's max and sum, and the max over splits is a reduction of fmaxf (exact, so any order gives the serial
+// fold's value); each split's weight is then the same expf(m_s - m) the fold computed, once, in shared memory. The
+// l and acc folds stay serial in split order with the same multiply-adds, so the bits are the serial fold's, and
+// every split's partial is loaded kMergeBatch at a time before the fold consumes it.
+constexpr int kMergeBatch = 8;
+
+__global__ void __launch_bounds__(kHeadDim)
+merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
+    __shared__ float weight[kHeadDim];
+    __shared__ float sum[kHeadDim];
+    __shared__ bool live[kHeadDim];
+    __shared__ float warp_max[kHeadDim / 32];
     pdl::enter();
     const int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    float m = -INFINITY;
-    for (int s = 0; s < splits; ++s) {
-        m = fmaxf(m, partial[((static_cast<std::size_t>(t) * splits + s) * heads + head) * (kHeadDim + 2) + kHeadDim]);
+    const auto slot = [&](int s) {
+        return partial + ((static_cast<std::size_t>(t) * splits + s) * heads + head) * (kHeadDim + 2);
+    };
+    float ms = -INFINITY;
+    if (d < splits) {
+        ms     = slot(d)[kHeadDim];
+        sum[d] = slot(d)[kHeadDim + 1];
     }
+    float m = ms;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xffffffffU, m, offset)); }
+    if ((d & 31) == 0) { warp_max[d >> 5] = m; }
+    __syncthreads();
+    m = warp_max[0];
+#pragma unroll
+    for (int w = 1; w < kHeadDim / 32; ++w) { m = fmaxf(m, warp_max[w]); }
+    if (d < splits) {
+        live[d]   = ms != -INFINITY;
+        weight[d] = live[d] ? expf(ms - m) : 0.0F;
+    }
+    __syncthreads();
     float l = 0.0F, acc = 0.0F;
-    for (int s = 0; s < splits; ++s) {
-        const float* slot = partial + ((static_cast<std::size_t>(t) * splits + s) * heads + head) * (kHeadDim + 2);
-        const float ms = slot[kHeadDim];
-        if (ms == -INFINITY) { continue; }
-        const float w = expf(ms - m);
-        l += w * slot[kHeadDim + 1];
-        acc += w * slot[d];
+    for (int s0 = 0; s0 < splits; s0 += kMergeBatch) {
+        float value[kMergeBatch];
+#pragma unroll
+        for (int i = 0; i < kMergeBatch; ++i) { value[i] = s0 + i < splits ? slot(s0 + i)[d] : 0.0F; }
+#pragma unroll
+        for (int i = 0; i < kMergeBatch; ++i) {
+            const int s = s0 + i;
+            if (s >= splits || !live[s]) { continue; }
+            const float w = weight[s];
+            l += w * sum[s];
+            acc += w * value[i];
+        }
     }
     out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(l > 0.0F ? acc / l : 0.0F);
 }
@@ -1370,6 +1405,8 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     }
     check_launch("attention");
     if (splits > 1) {
+        // One thread a split loads its max and sum (merge_kernel).
+        if (splits > kHeadDim) { throw std::logic_error("qsa merge: more splits than a merge CTA has threads"); }
         const cudaError_t error =
             pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel,
                                  static_cast<const float*>(ws.partial), geometry.heads, splits,
