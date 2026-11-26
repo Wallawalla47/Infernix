@@ -737,9 +737,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         resolution.available_after_startup_bytes =
             free_device_bytes(open_vram_budget_source(device.device, options.vram_past_budget)->query());
     }
-    // The headroom an automatic pool kept free, which the memory map shows (EngineCore's metrics read it here).
+    // The headroom an automatic pool kept free, which the memory map shows (EngineCore's metrics read it here): a
+    // startup retry's included, as the Qwen families report theirs.
     if (automatic && !program.causal_scoring) {
-        instance->kv_capacity_resolution.automatic_headroom_bytes = static_cast<std::size_t>(headroom);
+        instance->kv_capacity_resolution.automatic_headroom_bytes = static_cast<std::size_t>(pool_headroom);
     }
     // --prefix-cache-file: the Host tier restored from a file written for this artifact and these options (the KV
     // format, the drafter, the 8-bit weights and 16-bit expert activations change what the cache holds).
