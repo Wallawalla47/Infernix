@@ -164,6 +164,7 @@ def test_plain_matrix_takes_the_engines_q8_rule(tmp_path):
     path = tmp_path / "plain.gguf"
     writer = gguf.GGUFWriter(str(path), "test")
     writer.add_tensor("w", values)
+    writer.add_tensor("narrow", np.ascontiguousarray(values[:, :64]))  # K = 64: not whole 128-element units
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -182,7 +183,7 @@ def test_plain_matrix_takes_the_engines_q8_rule(tmp_path):
         geometry = row_split_geometry("q8_g32_fp16", (rows, k))
         assert len(encode_row_split(words.codes, words.scales, "q8_g32_fp16", (rows, k))) == geometry.payload_bytes
         with pytest.raises(ValueError, match="128-element units"):
-            plain_as_q8(store, "w", (rows * 4, k // 4))
+            plain_as_q8(store, "narrow", (rows, 64))
 
 
 def test_layout_geometry():
