@@ -390,25 +390,33 @@ struct RowState {
 };
 
 struct Smem {
-    std::uint16_t* k;  // [64][kRowStride]
-    std::uint16_t* v;  // [64][kRowStride]
-    std::uint16_t* q;  // [rows][kRowStride]
-    float* r;          // [rows][16]
-    float* p;          // [rows][64]
-    RowState* rows;    // [rows]
+    std::uint16_t* k;     // [64][kRowStride]
+    std::uint16_t* v;     // [64][kRowStride]
+    std::uint8_t* stage;  // the staged INT8 instance's code stage: [2 planes][64 rows x 128 codes, then 64 x 4 side]
+    std::uint16_t* q;     // [rows][kRowStride]
+    float* r;             // [rows][16]
+    float* p;             // [rows][64]
+    RowState* rows;       // [rows]
 };
 
-// (The quantized instances decode a unit's codes from global memory into k and v: no code stage.)
-std::size_t smem_bytes(int rows) {
-    return 2 * std::size_t{kKeyUnit} * kRowStride * 2 + std::size_t(rows) * kRowStride * 2 +
-           std::size_t(rows) * kRelDim * 4 + std::size_t(rows) * kKeyUnit * 4 + std::size_t(rows) * sizeof(RowState);
+// The staged INT8 instance's code stage: a unit's two planes, each its rows' 128 codes and then their 4-byte side
+// records (16-byte aligned: 8,192 + 256 bytes a plane).
+constexpr int kStagePlane = kKeyUnit * (kD + 4);
+constexpr int kStageBytes = 2 * kStagePlane;
+
+// (The other quantized instances decode a unit's codes from global memory into k and v: no code stage.)
+std::size_t smem_bytes(int rows, bool staged = false) {
+    return 2 * std::size_t{kKeyUnit} * kRowStride * 2 + (staged ? std::size_t{kStageBytes} : 0U) +
+           std::size_t(rows) * kRowStride * 2 + std::size_t(rows) * kRelDim * 4 + std::size_t(rows) * kKeyUnit * 4 +
+           std::size_t(rows) * sizeof(RowState);
 }
 
-__device__ __forceinline__ Smem carve(unsigned char* base, int rows) {
+__device__ __forceinline__ Smem carve(unsigned char* base, int rows, bool staged = false) {
     Smem s;
-    s.k    = reinterpret_cast<std::uint16_t*>(base);
-    s.v    = s.k + kKeyUnit * kRowStride;
-    s.q    = s.v + kKeyUnit * kRowStride;
+    s.k     = reinterpret_cast<std::uint16_t*>(base);
+    s.v     = s.k + kKeyUnit * kRowStride;
+    s.stage = reinterpret_cast<std::uint8_t*>(s.v + kKeyUnit * kRowStride);
+    s.q     = reinterpret_cast<std::uint16_t*>(s.stage + (staged ? kStageBytes : 0));
     s.r    = reinterpret_cast<float*>(s.q + rows * kRowStride);
     s.p    = s.r + rows * kRelDim;
     s.rows = reinterpret_cast<RowState*>(s.p + rows * kKeyUnit);
@@ -432,9 +440,13 @@ __device__ __forceinline__ RowUnits row_units(bool full, int pos, int first) {
 __device__ __forceinline__ int full_split_units(int n) { return (n + kFullSplits - 1) / kFullSplits; }
 
 // Form: the lean instance of an int8 G64 or a bf16p pool or window ring (new_kv's: both planes of that form, its piece
-// decoder and its encoder).
+// decoder and its encoder). The int8 instance is staged: a unit's codes are copied into the code stage (cp.async) while
+// the unit before it computes, then decoded from the stage into k and v (kv_decode8_int8, the generic decode_unit's
+// words), without a unit's load latency on the chain (2026-11-26: the same bits as its unstaged decode from global
+// memory, which it replaced).
 template <bool Quantized, bool Rotated, int Form = 0>
 __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionArgs a) {
+    constexpr bool Staged = Form == static_cast<int>(detail::KvForm::Int8);
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __shared__ int range[2];
     __shared__ int last;
@@ -449,7 +461,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     const int rows  = kGroupHeads * count;
     const int first = a.map.first[lane];
     const int pos0  = a.map.position[c0];
-    const Smem s    = carve(smem_raw, kGroupHeads * a.max_group_columns);
+    const Smem s    = carve(smem_raw, kGroupHeads * a.max_group_columns, Staged);
 
     // Rows: their units of this split (the call plan only).
     const int lane_lo = row_units(full, pos0, first).lo;
@@ -488,9 +500,19 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     // off the SM).
     const auto issue_unit = [&](int b) {
         const std::size_t page = kv_row(a.kv, lane, kv, b * kKeyUnit);
-        if constexpr (Form == static_cast<int>(detail::KvForm::Int8)) {
-            detail::decode_unit_int8(a.kv, page, s.k, s.v, [](int row, int d) { return row * kRowStride + d; }, tid,
-                                     kThreads);
+        if constexpr (Staged) {
+            // The unit's rows are consecutive: each plane's 8,192 code bytes and 256 side bytes, 16 bytes a copy.
+            constexpr int kCodeCopies = kKeyUnit * kD / 16, kPlaneCopies = kCodeCopies + kKeyUnit * 4 / 16;
+            for (int i = tid; i < 2 * kPlaneCopies; i += kThreads) {
+                const int plane = i / kPlaneCopies, j = i % kPlaneCopies;
+                std::uint8_t* dst = s.stage + plane * kStagePlane;
+                if (j < kCodeCopies) {
+                    cp_async16(dst + 16 * j, detail::row_codes(a.kv, plane, detail::KvForm::Int8, page) + 16 * j);
+                } else {
+                    const int k = j - kCodeCopies;
+                    cp_async16(dst + kKeyUnit * kD + 16 * k, detail::row_side(a.kv, plane, detail::KvForm::Int8, page) + 16 * k);
+                }
+            }
         } else if constexpr (Form == static_cast<int>(detail::KvForm::Bf16p)) {
             detail::decode_unit_bf16p(a.kv, page, s.k, s.v, [](int row, int d) { return row * kRowStride + d; }, tid,
                                       kThreads);
@@ -559,9 +581,31 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(const AttentionA
     const int key = tid & (kKeyUnit - 1), sc_rg = tid >> 6;
 
     for (int b = range[0]; b <= range[1]; ++b) {
-        if (!early || b != range[0]) { issue_unit(b); }
-        cp_async_wait_all();
-        __syncthreads();
+        if constexpr (Staged) {
+            if (b == range[0] && !early) { issue_unit(b); }
+            cp_async_wait_all();
+            __syncthreads(); // the stage holds unit b's codes (the previous unit's readers of k and v are done)
+            // The unit's words, from the stage: a thread decodes 8-value pieces (kv_decode8_int8), consecutive threads
+            // consecutive 16-byte pieces of a row (stores without bank conflicts), each plane in its own loop.
+            for (int plane = 0; plane < 2; ++plane) {
+                const std::uint8_t* codes = s.stage + plane * kStagePlane;
+                const std::uint8_t* side  = codes + kKeyUnit * kD;
+                std::uint16_t* tile       = plane == 0 ? s.k : s.v;
+                for (int i = tid; i < kKeyUnit * (kD / 8); i += kThreads) {
+                    const int row = i / (kD / 8), piece = i % (kD / 8);
+                    const uint2 c = *reinterpret_cast<const uint2*>(codes + row * kD + 8 * piece);
+                    const std::uint16_t scale = reinterpret_cast<const std::uint16_t*>(side + row * 4)[piece / 8];
+                    *reinterpret_cast<uint4*>(tile + row * kRowStride + 8 * piece) =
+                        plane == 0 ? detail::kv_decode8_int8<false>(c, scale) : detail::kv_decode8_int8<true>(c, scale);
+                }
+            }
+            __syncthreads(); // k and v hold unit b; the stage is free for the next unit's codes
+            if (b + 1 <= range[1]) { issue_unit(b + 1); }
+        } else {
+            if (!early || b != range[0]) { issue_unit(b); }
+            cp_async_wait_all();
+            __syncthreads();
+        }
         if (a.fused) {
             // The group's new keys and values whose positions lie in this unit: computed here (the prologue's
             // arithmetic: each stores its cache and ring rows; a full visit's unit read by two CTAs stores them twice,
@@ -904,13 +948,14 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     }
     if (!a.fused) { detail::launch_attention_prologue(a, stream); }
     if (a.groups == 0) { return; } // every column is padding: the prologue wrote their zero outputs
-    const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns);
     static const bool attribute = [] {
         for (auto* kernel : {attention_kernel<false, false>, attention_kernel<true, false>, attention_kernel<true, true>,
-                             attention_kernel<true, false, kInt8>, attention_kernel<true, false, kBf16p>}) {
+                             attention_kernel<true, false, kBf16p>}) {
             CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(smem_bytes(kMaxRows))));
         }
+        CUDA_CHECK(cudaFuncSetAttribute(attention_kernel<true, false, kInt8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(smem_bytes(kMaxRows, true))));
         return true;
     }();
     (void)attribute;
@@ -919,6 +964,7 @@ void attention(const AttentionArgs& a, cudaStream_t stream) {
     const bool rotated    = detail::rotated_pool(a);
     const bool int8       = a.kv.codec == KvCodec::Int8G64;
     const bool bf16p      = a.kv.codec == KvCodec::Bf16Packed;
+    const std::size_t bytes = smem_bytes(kGroupHeads * a.max_group_columns, int8); // the int8 instance's code stage
     const auto launch = [&](std::int32_t g0, std::int32_t count, std::int32_t base) {
         AttentionArgs b   = a;
         b.groups_columns  = a.groups_columns + 3 * g0;

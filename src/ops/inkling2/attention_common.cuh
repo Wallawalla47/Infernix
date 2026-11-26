@@ -89,25 +89,6 @@ __device__ __forceinline__ void decode_unit(const KvView& kv, std::size_t page, 
     }
 }
 
-// decode_unit for an int8 G64 pool or window ring (both planes int8): a thread decodes 8-value pieces (kv_decode8_int8),
-// consecutive threads consecutive 16-byte pieces of a row (unit stores without bank conflicts), each plane in its own
-// loop (the word form fixed). The same words as decode_unit.
-template <class At>
-__device__ __forceinline__ void decode_unit_int8(const KvView& kv, std::size_t page, std::uint16_t* k_tile,
-                                                 std::uint16_t* v_tile, At at, int tid, int threads) {
-    constexpr int kPieces = kD / 8; // a row's 8-value pieces
-    const auto plane = [&]<bool Value>(const std::uint8_t* codes, const std::uint8_t* side, std::uint16_t* tile) {
-        for (int i = tid; i < kKeyUnit * kPieces; i += threads) {
-            const int row = i / kPieces, piece = i % kPieces;
-            const uint2 c = *reinterpret_cast<const uint2*>(codes + row * kD + 8 * piece);
-            const std::uint16_t s = reinterpret_cast<const std::uint16_t*>(side + row * 4)[piece / 8];
-            *reinterpret_cast<uint4*>(tile + at(row, 8 * piece)) = kv_decode8_int8<Value>(c, s);
-        }
-    };
-    plane.template operator()<false>(row_codes(kv, 0, KvForm::Int8, page), row_side(kv, 0, KvForm::Int8, page), k_tile);
-    plane.template operator()<true>(row_codes(kv, 1, KvForm::Int8, page), row_side(kv, 1, KvForm::Int8, page), v_tile);
-}
-
 // decode_unit for a bf16p pool or window ring (both planes bf16p): a thread decodes 8-value pieces (kv_decode8_bf16p),
 // consecutive threads consecutive pieces of a row, each plane in its own loop. The same words as decode_unit.
 template <class At>
