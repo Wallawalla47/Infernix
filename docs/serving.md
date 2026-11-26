@@ -155,8 +155,9 @@ What is exact and what is estimated (`estimated` is always `true`):
   the chat template as the start's frontend does); its Program then re-plans with the fast paths
   selected, so its actual frames can differ slightly from `expert_frames`. Both families'
   `expert_frames` leave off the 64 MiB chunk per record-size pool a start keeps free (a GGUF import's
-  layers have up to seven). A start reads the CUDA kernel images (about 4.5 GiB of RAM) before its RAM
-  ledger, which then sees them used; the plan, which launches no kernel, counts them as process growth.
+  layers have up to seven). A start reads the CUDA kernel images (about 1.5 GiB of RAM) on a thread of
+  its own beside its weight read, after its RAM ledger, which counts them as process growth, as the
+  plan does (it launches no kernel).
 - The Qwen3.5 family's capacity is resolved against the free VRAM read where a start reads it
   (under Windows with a DXGI budget, at most the budget less the process's usage, which can be GiBs
   below the driver's free figure; a KV sized past it would be demoted to system memory), less

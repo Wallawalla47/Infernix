@@ -2,8 +2,6 @@
 
 #include "core/device.h"
 
-#include "core/temporary_switches.h"
-
 #include <atomic>
 #include <chrono>
 #include <cuda_runtime.h>
@@ -41,10 +39,6 @@ std::uint64_t kernel_images_pending_bytes() noexcept {
     return g_loaded.load(std::memory_order_relaxed) ? 0 : kImageBytes;
 }
 
-bool kernel_images_beside_weights() {
-    return temporary_switches::integer("INFERNIX_TMP_KERNEL_PREWARM", 1, 0, 1) != 0;
-}
-
 struct KernelImagesLoad::State {
     std::thread thread;
     std::exception_ptr error;
@@ -52,7 +46,7 @@ struct KernelImagesLoad::State {
 };
 
 KernelImagesLoad::KernelImagesLoad(int device) {
-    if (g_loaded.load(std::memory_order_relaxed) || !kernel_images_beside_weights()) { return; }
+    if (g_loaded.load(std::memory_order_relaxed)) { return; }
     state_       = new State;
     State* state = state_;
     try {

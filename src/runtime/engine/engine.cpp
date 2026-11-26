@@ -52,8 +52,8 @@ namespace {
 constexpr std::size_t kStackBytes         = 256;
 constexpr std::size_t kLosslessStackBytes = 1536;
 
-// `start`: a start (not Engine::plan) also loads the kernel images now (load_kernel_images).
-DeviceContext initialize_device(const EngineOptions& options, bool start) {
+// A start reads the kernel images beside its weight read, after its RAM plan (ops::KernelImagesLoad).
+DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     DeviceContext device(options.device);
     // Every kernel is built for sm_120a alone: another GPU is refused by name here, before the artifact is read, rather
@@ -68,19 +68,6 @@ DeviceContext initialize_device(const EngineOptions& options, bool start) {
     device.bind_to_current_thread();
     if (const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, stack); err != cudaSuccess) {
         throw std::runtime_error(std::string("cudaDeviceSetLimit(cudaLimitStackSize) failed: ") + cudaGetErrorString(err));
-    }
-    if (start && !ops::kernel_images_beside_weights()) {
-        // (By default a start reads them beside its weight read instead, after its RAM plan: ops::KernelImagesLoad.)
-        // The first kernel launch reads the kernel images into RAM (ops/kernel_images.h). Launched here, before the RAM plans read
-        // the host's free memory, they see it used: a launch after them left Qwen3.8-Flash-Next and the 122B 2.4-3.8 GiB
-        // short of the RAM their plans left free, and an automatic Host prefix tier pinned that RAM while Windows moved
-        // the images to the page file (2026-11-13). The start pays the load's time here instead of at that launch.
-        const std::uint64_t before = host_memory_snapshot().process_resident;
-        ops::load_kernel_images();
-        const std::uint64_t after = host_memory_snapshot().process_resident;
-        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
-                                    "CUDA kernel images: %llu MiB of RAM, read at the first kernel launch",
-                                    static_cast<unsigned long long>((after > before ? after - before : 0) >> 20));
     }
     phase.complete();
     return device;
@@ -369,7 +356,7 @@ public:
     explicit Impl(EngineOptions engine_options,
                   std::shared_ptr<runtime::expert_offload::HostSlotPool> slot_pool = nullptr)
         : options(normalize(std::move(engine_options))),
-          device(initialize_device(options, true)) {
+          device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         // The lossless ops' rounding mode is process-wide device state: every lossless Engine sets it, so
         // a noise twin never leaks into a later lossless run.
@@ -631,7 +618,7 @@ EnginePlan Engine::plan(EngineOptions engine_options) {
     EngineOptions options             = normalize_options(std::move(engine_options), architecture);
     // The start's CUDA context and stack reserve come first there too, so the free memory the plan
     // reads is the free memory a start would read.
-    DeviceContext device = initialize_device(options, false);
+    DeviceContext device = initialize_device(options);
     EnginePlan plan;
     if (architecture == models::Architecture::Inkling2Loop) {
         (void)runtime::construct_inkling2(options, device, &plan);

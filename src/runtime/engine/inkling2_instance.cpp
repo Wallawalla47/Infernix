@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/vram_budget.h"
+#include "infernix/ops/kernel_images.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/load.h"
 #include "runtime/engine/diagnostics.h"
@@ -595,7 +596,11 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     std::string template_override;
     if (!options.chat_template_path.empty()) { template_override = read_text(options.chat_template_path); }
     const std::uint64_t pinned_bytes = plan.materialization().pinned_capacity_bytes;
+    // The kernel images load beside the weights: the RAM plan above counted them as the process's growth.
+    ops::KernelImagesLoad kernel_images(device.device);
     auto model = models::inkling2::materialize_model(std::move(plan), device, &options.startup_observer);
+    device.synchronize();
+    report_kernel_images(options, kernel_images.finish());
     const auto* vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
     if (options.max_context_auto) {
         const VramSnapshot after = open_vram_budget_source(device.device, options.vram_past_budget)->query();
