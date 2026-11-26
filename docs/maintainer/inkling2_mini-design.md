@@ -1398,7 +1398,9 @@ reads' floor on this card). Served (the owner's configuration, seeded, two serve
 four-row round's device draft at ~122K 2.78-3.02 → 2.15-2.39 ms and a one-row round's 1.20 → 1.00 ms; four requests on
 a ~122K-token prefix +2.8 % tok/s warm (+1.6 % on the first repetition), one there +0.7 to +1.0 %. At ~2K the draft
 fell only ~0.06 ms of a ~12.7 ms round; the arms' +2.0 to +3.1 % there follows their acceptance (the drafts' bits
-differ: 0.470-0.523 against 0.453-0.501 accepted a draft), so 2K is level within that spread.
+differ: 0.470-0.523 against 0.453-0.501 accepted a draft), so 2K is level within that spread. Both served arms ran a
+build that also held a tensor-core decode and verify attention kernel this engine does not have, so the served figures
+are that build's.
 
 A Q8 head (`--q8-weights`, `--a8-activations`) then runs the drafter's 7 rows on 8-bit inputs (`Forward::project_head`
 with the drafter's own 8-bit input rows: `projections_mma`'s tensor cores instead of the skinny route's FMA chains;
@@ -1469,7 +1471,8 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
   over the rows against those streams (2026-11-26, two repetitions): a four-row round's device draft 1.54-1.59 →
   1.04-1.13 ms at ~2K and 3.07-3.38 → 2.62-2.95 ms at ~122K; four ~2K-token requests +2.7 % tok/s warm (+1.4 % on the
   first repetition), four on a ~122K-token prefix +0.4 % (ranges overlapping) and +1.4 %; at a fixed 3 drafts both
-  accept the same counts in the same rounds. The chain's first form ran the wide projections on projections_mma, whose
+  accept the same counts in the same rounds (both arms on a build that also held a tensor-core decode and verify
+  attention kernel this engine does not have). The chain's first form ran the wide projections on projections_mma, whose
   unsplit K launches too few CTAs at 24-32 columns: 2.12-2.19 ms at 2K, −2.0 to −6.7 % tok/s. At 122K about 1.6 ms of
   the four-row draft is each lane's own full-layer attention (gate: the attention skipped, 3.07-3.30 → 1.49-1.56 ms),
   which no batching shares. Shares dealt
