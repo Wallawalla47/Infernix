@@ -1263,6 +1263,26 @@ int main() {
                           "a log already at its limit was not rotated at startup");
     }
 
+    // A staged file an earlier rotation left behind (its retire and its move back both failed) is retired before the
+    // next rotation stages PATH, so its records are kept, not replaced.
+    reset_rotation_dir();
+    {
+        std::ofstream orphan(rotation_log.string() + ".rotating");
+        orphan << "{\"orphaned\":true}\n";
+    }
+    {
+        JsonlRequestLog writer(rotation_log.string(), {}, {},
+                               RequestLogRotation{.max_bytes = server_start_bytes + request_bytes / 2, .keep = 2});
+        write_server_start(writer);
+        write_request(writer, 1); // past the limit: rotated
+    }
+    {
+        const std::vector<Json> older = read_records(rotated(2));
+        failures += check(!std::filesystem::exists(rotation_log.string() + ".rotating") && older.size() == 1 &&
+                              older[0].value("orphaned", false) && read_records(rotated(1)).size() == 2,
+                          "a rotation replaced a staged file an earlier rotation left, or did not retire it");
+    }
+
     // keep 0 deletes the full file instead of retaining it.
     reset_rotation_dir();
     {

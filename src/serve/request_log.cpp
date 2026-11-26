@@ -1176,9 +1176,8 @@ std::string JsonlRequestLog::rotate_locked() {
         // first: PATH moves aside before any retained file is touched, so a failed rotation loses nothing (it
         // used to shift and delete the oldest, and with keep 1 the only retained file, at every attempt).
         const std::string staged = path_ + ".rotating";
-        std::filesystem::rename(path_, staged, error);
-        if (!error) {
-            // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire the moved PATH.
+        // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire the staged file as PATH.1.
+        const auto retire_staged = [&](std::error_code& retire_error) {
             for (std::uint32_t index = rotation_.keep - 1; index >= 1; --index) {
                 std::error_code shift_error;
                 if (!std::filesystem::exists(rotated_path(index), shift_error)) { continue; }
@@ -1187,7 +1186,14 @@ std::string JsonlRequestLog::rotate_locked() {
             }
             std::error_code remove_error;
             std::filesystem::remove(rotated_path(1), remove_error);
-            std::filesystem::rename(staged, rotated_path(1), error);
+            std::filesystem::rename(staged, rotated_path(1), retire_error);
+        };
+        // A staged file an earlier rotation could neither retire nor move back (both renames failed) is retired
+        // first, so this rotation's rename does not replace it; while it cannot be, PATH stays where it is.
+        if (std::error_code exists_error; std::filesystem::exists(staged, exists_error)) { retire_staged(error); }
+        if (!error) { std::filesystem::rename(path_, staged, error); }
+        if (!error) {
+            retire_staged(error);
             if (error) { // keep appending to it under its own name
                 std::error_code back_error;
                 std::filesystem::rename(staged, path_, back_error);
