@@ -19,6 +19,7 @@ struct ResolvedExecutionOptions {
     // The Engine's idle-time pass over a finished turn (hybrid-prefix-cache-spec §7.9), which no client
     // waits for: it yields to a request at its next unit boundary, so a Program keeps its units short.
     bool background = false;
+    bool decision = false;
 };
 
 // A row whose thinking is open at a call's first position: its end-of-turn tokens, and the tool-call opener when it
@@ -73,6 +74,9 @@ struct RequestPlanSummary {
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;
     bool publish_continuation             = true;
+    // False for a decision: its finished state is no conversation's next turn, so it publishes no
+    // endpoint snapshot (which would take a Device snapshot slot from another conversation).
+    bool publish_endpoint                 = true;
 };
 
 } // namespace infernix::runtime

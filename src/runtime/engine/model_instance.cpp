@@ -617,6 +617,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                                ignored.c_str());
         }
         options.max_concurrency      = 1;
+        options.decision_lanes       = 0;
         options.max_pending_requests = 1;
         options.kv_capacity         = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
@@ -630,6 +631,10 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+    if (options.decision_lanes >= options.max_concurrency) {
+        throw std::invalid_argument(
+            "Engine decision_lanes must leave at least one general lane (less than max_concurrency)");
     }
     // The Engine resolves --spec auto from the artifact's drafters first (resolve_auto_speculative_backend);
     // an unresolved one means it could not read them.
@@ -821,7 +826,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
         // their Host copies are written. Without a Host tier these slots are the only snapshot
-        // storage, so one more is kept for shared prefixes.
+        // storage, so one more is kept for shared prefixes. Decision lanes hold no conversation
+        // (a decision publishes no endpoint), so they add no slot.
         if (!qwen4_exp) {
             // With offloaded experts and a Host tier one slot (candidates §22 VM-03, 2026-10-27): each further slot
             // is 146.5 MiB of the 122B's frames, and the VRAM defaults measured its one-request decode +1.0-1.7 %
@@ -830,9 +836,10 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             // lanes one slot against five gave 14,272 more tokens and, where two agent conversations did not fit
             // the pool together, continuing turns of 1.9 s mean and 9.2 s worst against 2.5-2.6 s and 16.5 s
             // (hybrid spec §16.13); an image restores from the Host tier in a few milliseconds, pipelined behind
-            // the first pass. Without a Host tier the slots are the only snapshot storage: one per lane and two.
-            hybrid.device_snapshot_slots =
-                hybrid.device_snapshot_slots.value_or(host_tier ? 1U : concurrency + 2U);
+            // the first pass. Without a Host tier the slots are the only snapshot storage: one per general lane
+            // and two (decision lanes hold no conversation).
+            hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(
+                host_tier ? 1U : concurrency - options.decision_lanes + 2U);
         }
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
@@ -1622,6 +1629,40 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             [observer = options.diagnostic_observer](const std::string& text, DiagnosticLevel level) {
                 publish_diagnostic(observer, level, "%s", text.c_str());
             });
+    }
+    if (options.decision_lanes != 0) {
+        // Decision lanes are ordinary lanes (a StateImage, buffers and Graph rows each), so their
+        // Device memory comes out of the KV budget: an automatic pool is that much smaller, an
+        // explicit one needs that much more free memory. Say how much, from the same planner.
+        EngineOptions general   = options;
+        general.max_concurrency = options.max_concurrency - options.decision_lanes;
+        general.decision_lanes  = 0;
+        const SequenceCapacityCurve with =
+            models::qwen3_5::make_sequence_planner(instance->parameters, device, options)
+                .capacity_curve();
+        const SequenceCapacityCurve without =
+            models::qwen3_5::make_sequence_planner(instance->parameters, device, general)
+                .capacity_curve();
+        const std::size_t lane_bytes =
+            with.minimum_device_reservation_bytes > without.minimum_device_reservation_bytes
+                ? with.minimum_device_reservation_bytes - without.minimum_device_reservation_bytes
+                : 0U;
+        const std::uint64_t lane_tokens =
+            with.bytes_per_additional_main_page_group == 0
+                ? 0U
+                : static_cast<std::uint64_t>(lane_bytes) / with.bytes_per_additional_main_page_group *
+                      with.main_page_tokens;
+        publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "decision lanes: %u of %u lanes take only decisions; they take %.0f MiB of Device memory "
+            "(about %llu KV tokens), %s; KV capacity is %u tokens",
+            options.decision_lanes, options.max_concurrency,
+            static_cast<double>(lane_bytes) / static_cast<double>(1U << 20U),
+            static_cast<unsigned long long>(lane_tokens),
+            options.kv_capacity.mode == KvCapacityMode::Automatic
+                ? "taken from the automatic KV pool"
+                : "beside the explicit --kv-capacity",
+            instance->kv_capacity_resolution.resolved_tokens);
     }
     LoadSummary::PrefixCacheRestore restore;
     if (options.context_cache.enabled) {

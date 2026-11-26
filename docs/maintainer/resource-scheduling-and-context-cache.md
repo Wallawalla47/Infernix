@@ -307,6 +307,40 @@ respective context and local state rules. Vision keeps prepared media, media ide
 stale vision handoff is re-encoded on demand.
 These resume constraints use the same model mathematics implementation as ordinary execution.
 
+<a id="decisions"></a>
+### 5.4 Decisions
+
+A decision (`ExecutionOptions::decision`, set on every `/v1/decide` question) is a short request:
+one prefill and a staged token, or a few constrained digits. Without help it waits like any fresh
+request for a lane to free, and with every lane held by a generating request that wait is a whole
+generation: two lanes and two generating agents measured a decision p50 of 8.5 s. Decisions
+therefore get four rules, all in the Engine and Scheduler; the Program sees an ordinary request.
+
+- **Queue.** A decision enters the fresh queue ahead of every waiting request that is not a
+  decision, in arrival order among decisions (`Scheduler::enqueue`). Admitting it never bypasses a
+  waiting request, so the FIFO bypass allowance is untouched, and a blocked decision keeps the head's
+  protection.
+- **Lanes.** `EngineOptions::decision_lanes` (`--decision-lanes`, which the server adds beside
+  `--max-concurrency`) reserves the last lanes for decisions (`Scheduler::free_lane`). A decision
+  takes a decision lane first and a general lane when they are all busy; no other request takes a
+  decision lane. A decision lane is an ordinary lane: its StateImage, buffers and Graph rows come
+  out of the Device budget like any lane's, and startup logs what they cost in KV tokens. The default
+  Device snapshot slots count only the general lanes, since a decision publishes no endpoint.
+- **Prefill turn.** A prefilling or replaying decision takes the next prefill turn ahead of the
+  rotation (`Scheduler::next_prefill`), oldest decision first, without moving the rotation cursor.
+  A decision therefore waits at most for the prefill step already running (one chunk, or one
+  `idle-wide-prefill` step) and one decode round per unit of its own.
+- **Pressure.** Permits are requested for the progress owner (or a protected recovery) first, then
+  for decisions, then in ticket order. A decision is a preemption victim only when no other
+  resident can be one (`Scheduler::preemption_victim`); a blocked decision takes a turn like any
+  request (§5.1) and is never paused for its own shortage; and a paused owner that is not a
+  decision does not pause a decision to take its lane, which could not seat it.
+
+On the Qwen3.5 family a decision publishes its prompt blocks and taps (the evidence prefix its
+sibling questions reuse) but no endpoint snapshot (`RequestPlanSummary::publish_endpoint`): its
+finished state is no conversation's next turn, and an endpoint would take a Device snapshot slot
+from one.
+
 <a id="transfers"></a>
 ## 6. Context transactions and cancellation
 

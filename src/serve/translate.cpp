@@ -375,6 +375,7 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     options.execution.readout_tokens          = request.readout_tokens;
     options.execution.constraint              = request.token_constraint;
+    options.execution.decision = request.decision;
     // The budget as set; GenerationService settles it against the answer room (settle_thinking) once the prompt
     // length, and so the room the context leaves, is known.
     if (semantics.enable_thinking != false) { options.execution.thinking = thinking_controls(request, server); }

@@ -589,6 +589,7 @@ std::string format_server_start_json(
              {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
              {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
              {"max_concurrency", engine_options.max_concurrency},
+             {"decision_lanes", engine_options.decision_lanes},
              {"max_pending_requests", engine_options.max_pending_requests},
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},

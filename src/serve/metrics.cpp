@@ -186,6 +186,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
         << product::speculative_backend_name(options_.speculative.backend) << "\",kv=\""
         << infernix::kv_cache_cli_name(options_.kv_cache) << "\"} 1\n";
     gauge("max_concurrency", options_.max_concurrency, "Maximum resident execution lanes.");
+    gauge("decision_lanes", options_.decision_lanes,
+          "Resident lanes, of max_concurrency, that only decisions take.");
     gauge("max_context_tokens", options_.max_context, "Per-request logical context limit.");
     gauge("spec_decode_draft_window", options_.speculative.draft_tokens,
           "Configured speculative draft window.");

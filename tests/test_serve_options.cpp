@@ -300,6 +300,25 @@ int main() {
         }
     }
 
+    // --decision-lanes adds decision-only lanes beside --max-concurrency, within the 8-lane limit.
+    {
+        const auto lanes = parse({"infernix-serve", "model.ninfer", "--max-concurrency", "3",
+                                  "--decision-lanes", "1"});
+        failures += check(lanes.max_concurrency == 3 && lanes.decision_lanes == 1 &&
+                              parse({"infernix-serve", "model.ninfer"}).decision_lanes == 0,
+                          "--decision-lanes did not parse beside --max-concurrency (default 0)");
+        failures += check(parse({"infernix-serve", "model.ninfer", "--max-concurrency", "7",
+                                 "--decision-lanes", "1"})
+                                  .decision_lanes == 1,
+                          "seven general lanes and one decision lane were refused");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--max-concurrency", "7",
+                                       "--decision-lanes", "2"})
+                                  .find("at most 8") != std::string::npos,
+                          "more than eight lanes in all were accepted");
+        failures += check(serve_usage_text("infernix-serve").find("--decision-lanes") !=
+                              std::string::npos,
+                          "serving help omits --decision-lanes");
+    }
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-tail-skip", "7"}).expert_tail_skip == 7 &&
                           parse({"infernix-serve", "model.ninfer"}).expert_tail_skip == 0,
                       "--expert-tail-skip did not parse (default off)");

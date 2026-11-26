@@ -99,7 +99,7 @@ public:
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options)
         : instance_(instance), device_(device), max_context_(options.max_context),
-          max_concurrency_(options.max_concurrency),
+          max_concurrency_(options.max_concurrency), decision_lanes_(options.decision_lanes),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -113,7 +113,8 @@ public:
                                         std::chrono::milliseconds{0})
                                   : std::chrono::milliseconds{0}) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            decision_lanes_ >= max_concurrency_ || options.max_pending_requests == 0 ||
+            pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         paused_.reserve(max_outstanding_);
@@ -377,7 +378,8 @@ public:
                                                 std::move(observation), pending_deadline, ready);
             ++next_request_id_;
             ++next_publication_order_;
-            pending_.push_back(request);
+            // A decision enters ahead of every waiting request that is not one (Scheduler::enqueue).
+            Scheduling::enqueue(pending_, request);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -1818,13 +1820,14 @@ private:
         }
     }
 
-    [[nodiscard]] std::optional<std::uint32_t> free_lane() const noexcept {
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (!slots_[lane] && (!materializing_ || materializing_->destination.value != lane)) {
-                return lane;
-            }
-        }
-        return std::nullopt;
+    // A free lane `request` may bind: decision lanes take only decisions (resource-scheduling §5.4).
+    [[nodiscard]] std::optional<std::uint32_t> free_lane(bool decision) const noexcept {
+        return Scheduling::free_lane(max_concurrency_, decision_lanes_, decision,
+                                     [this](std::uint32_t lane) {
+                                         return !slots_[lane] &&
+                                                (!materializing_ ||
+                                                 materializing_->destination.value != lane);
+                                     });
     }
 
     [[nodiscard]] bool resident_empty() const noexcept {
@@ -1960,9 +1963,16 @@ private:
         };
     }
 
-    // Pauses the progress owner's victim, the next one when a resident cannot pause now.
-    bool pause_reclaim_victim() {
+    // Pauses the progress owner's victim, the next one when a resident cannot pause now. `general`: the
+    // owner needs a general lane (it is not a decision), so the decision lanes' residents are passed over.
+    bool pause_reclaim_victim(bool general = false) {
         std::vector<std::uint32_t> skipped;
+        if (general) {
+            for (std::uint32_t lane = max_concurrency_ - std::min(decision_lanes_, max_concurrency_);
+                 lane < max_concurrency_; ++lane) {
+                skipped.push_back(lane);
+            }
+        }
         while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped, pause_cost())) {
             if (pause_resident(*victim)) { return true; }
             if (instance_.program->has_context_transaction()) { return false; }
@@ -2162,7 +2172,6 @@ private:
     // resident for its lane or capacity; otherwise admits a fresh request.
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
-        const auto lane  = free_lane();
         const auto owner = scheduler_.progress_owner();
         const auto suspended =
             restoring ? std::find_if(paused_.begin(), paused_.end(),
@@ -2171,14 +2180,20 @@ private:
         if (restoring && suspended == paused_.end()) { return false; }
         // The owner needs a lane: the resident whose pause recomputes least, the next one when it cannot
         // pause now (while the owner is paused no resident reserves a unit, so a victim that refused would
-        // never reach a boundary where it can).
-        if (!lane && restoring) { return pause_reclaim_victim(); }
+        // never reach a boundary where it can). A paused request that is not a decision needs a general
+        // lane, so pausing a decision lane's resident would not seat it.
+        if (restoring && !free_lane((*suspended)->is_decision())) {
+            return pause_reclaim_victim(!(*suspended)->is_decision());
+        }
         if (admission_decision_ && (admission_decision_->restoring != restoring ||
                                     (restoring && *suspended != admission_decision_->request))) {
             admission_decision_.reset();
         }
-        // A decision is only ever kept across a pause it started, which frees a lane.
-        if (!lane) { admission_decision_.reset(); }
+        // A decision is only ever kept across a pause it started, which frees a lane (a general one for a
+        // request that is not a decision): without a lane its request could not bind below.
+        if (admission_decision_ && !free_lane(admission_decision_->request->is_decision())) {
+            admission_decision_.reset();
+        }
         std::vector<std::shared_ptr<Request>> candidates;
         if (admission_decision_) {
             candidates.push_back(admission_decision_->request);
@@ -2189,6 +2204,7 @@ private:
             candidates = scheduler_.fresh_candidates(pending_, max_concurrency_);
         }
         for (const auto& request : candidates) {
+            const auto lane = free_lane(request->is_decision());
             if (!admission_decision_) {
                 if (!restoring) {
                     scheduler_.admission_candidate_checked(request->id);
@@ -2508,9 +2524,15 @@ private:
                 candidates.push_back(lane);
             }
         }
+        // The priority row first (the progress owner, or a protected recovery), then decisions
+        // (they finish within a few units), then original ticket order.
         std::sort(candidates.begin(), candidates.end(), [&](auto a, auto b) {
             if (a == b) { return false; }
             if (priority == a || priority == b) { return priority == a; }
+            if (recovering == a || recovering == b) { return recovering == a; }
+            if (slots_[a]->is_decision() != slots_[b]->is_decision()) {
+                return slots_[a]->is_decision();
+            }
             return slots_[a]->id < slots_[b]->id;
         });
         // Set once the owner's capacity is in hand-over (a pause or a transfer for it): the rest
@@ -3401,10 +3423,14 @@ private:
                         cumulative_stats_.execution.prefill.add(
                             elapsed_ns(prefill_started, Clock::now()));
                     }
+                    // A decision's unit is taken out of order: it, and its group's companions, leave the
+                    // rotation where it was (Scheduler::prefill_executed).
+                    const bool decision_led = request->is_decision();
                     const auto age = [&](std::uint32_t at, std::uint64_t tokens) {
                         scheduler_.prefill_executed(at, max_concurrency_, slots_,
                                                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                                                        tokens, std::numeric_limits<std::uint32_t>::max())));
+                                                        tokens, std::numeric_limits<std::uint32_t>::max())),
+                                                    decision_led);
                     };
                     age(*lane, request->computed_prompt_tokens + request->replayed_tokens - tokens_before);
                     update_recovery(request);
@@ -3450,6 +3476,8 @@ private:
     DeviceContext& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
+    // The last decision_lanes_ lanes take only decisions (EngineOptions::decision_lanes).
+    const std::uint32_t decision_lanes_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool queue_holds_;

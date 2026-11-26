@@ -227,7 +227,8 @@ std::string_view canonical_api_path(std::string_view path) noexcept {
 
 httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options) {
     const std::size_t queued_requests =
-        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
+        static_cast<std::size_t>(options.max_concurrency) + options.decision_lanes +
+        options.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
     // cpp-httplib runs each accepted connection's keep-alive loop as one pool task, so an
     // open connection — idle or not — occupies its worker for the whole idle window. Stock
