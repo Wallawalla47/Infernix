@@ -494,7 +494,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             available, until --ram-free-mib is, and take it\n"
            "                             back once --ram-free-mib plus 1 GiB stays free;\n"
            "                             off keeps their startup sizes\n"
-           "  --cpu-rates saved|measure  Offloaded experts: saved (default) takes the CPU\n"
+           "  --cpu-rates saved|measure  Qwen3.8-Flash-Next: saved (default) takes the CPU\n"
            "                             expert team's rates from the saved quiet settle\n"
            "                             beside the expert state when there is one, with\n"
            "                             no readings at startup; measure reads them at\n"

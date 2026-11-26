@@ -35,6 +35,7 @@ constexpr std::array kRules = {
     Rule{"--expert-csf", kOffload},
     Rule{"--expert-pin-mib", kOffload},
     Rule{"--expert-state", kOffload},
+    Rule{"--cpu-rates", kFlash},             // only Flash-Next's start reads the stored rates
     Rule{"--expert-stripe", kOffload},
     Rule{"--expert-tail-skip", kOffload},   // refused without offloaded experts
     Rule{"--route-trace", kOffload},

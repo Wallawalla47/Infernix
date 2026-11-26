@@ -352,6 +352,18 @@ const EXPERTS: FormSection = {
       more: true,
     },
     {
+      kind: "select",
+      flag: "--cpu-rates",
+      label: "CPU expert rates",
+      help: "Qwen3.8-Flash-Next: where the CPU expert team's rates come from at startup. Saved takes the rates stored beside the expert state with no readings (a first start, or a deleted file, still measures and stores them); Measure reads them at every start, each reading waiting up to 20 s for a quiet CPU. The rates decide which experts the CPU serves, never the output.",
+      options: [
+        { value: "saved", label: "Saved" },
+        { value: "measure", label: "Measure at every start" },
+      ],
+      unsetLabel: "Saved (default)",
+      more: true,
+    },
+    {
       kind: "text",
       flag: "--expert-state",
       label: "Expert cache state file",

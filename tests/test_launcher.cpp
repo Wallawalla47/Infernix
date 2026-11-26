@@ -533,6 +533,7 @@ void test_option_support() {
     row("--q8-weights", false, false, false, false, true);
     row("--kv-window-dtype", false, false, false, false, true);
     row("--expert-state", false, false, true, true, false);
+    row("--cpu-rates", false, false, false, true, false);
     row("--expert-tail-skip", false, false, true, true, false);
     row("--embedding-host", true, true, false, false, true);
     row("--rope-yarn-factor", true, true, true, true, false);

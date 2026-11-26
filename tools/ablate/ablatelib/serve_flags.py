@@ -85,6 +85,7 @@ RULES: dict[str, Rule] = {
     "--expert-ram-layout": Rule(CARRY, _MEMORY),
     "--expert-pin-mib": Rule(CARRY, _MEMORY),
     "--expert-csf": Rule(CARRY, _MEMORY),
+    "--cpu-rates": Rule(CARRY, "where the CPU expert team's rates come from: placement only, never the output"),
     # KV CACHE
     "--kv-capacity": Rule(OWNED, "sized by the engine from the tool's context and concurrency"),
     "--vram-headroom-mib": Rule(CARRY, _MEMORY),
