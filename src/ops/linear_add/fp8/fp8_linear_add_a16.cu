@@ -51,7 +51,7 @@ void launch_matrix(const Tensor& x, const Operands& operands, const Weight& weig
     // would add a wave (257..384 columns). Up to 64 columns the cp.async producer stages the tiles; beyond, the
     // fenced TMA producer (the same consumers and bits), which measured 5-9 % faster from 96 columns at K 17408
     // and 4-8 % from 192 at K 6144 (equal at 96-128), and 11-17 % slower at K 6144 up to 64 (fp8_linear_add_bench,
-    // RTX 5090, 2026-10-25; the cp.async producer of 4b5eae7a had cost 6-11 % at those widths, candidates CF-05).
+    // RTX 5090, 2026-10-25; the cp.async producer of 9497bc13 had cost 6-11 % at those widths, candidates CF-05).
     const auto ring = [&]<class Schedule>() {
         launch_fp8_a16_ring_mma<Fp8ScheduleInstance<Schedule, K>>(operands, output, epilogue,
                                                                  stream);

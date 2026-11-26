@@ -110,7 +110,7 @@ void launch_bf16_kv_merge(const CausalAttentionOperands& p, Bf16KvCacheView<Writ
         throw std::invalid_argument("BF16 merge capacity exceeds the reduction block");
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
     // A captured merge launches as a programmatic dependent of the grouped kernel, which triggers it
-    // once its KV loop ends (as the other formats' merges, 6049964f); eager launches serialize. One or
+    // once its KV loop ends (as the other formats' merges, 26090869); eager launches serialize. One or
     // two columns in the call gather the live splits first (bf16_kv_merge_kernel's Gather).
     const auto launch = [&](auto kernel) {
         CUDA_CHECK(pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(S::kThreads), 0, stream}, kernel,
