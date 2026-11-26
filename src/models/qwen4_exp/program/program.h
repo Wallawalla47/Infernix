@@ -455,8 +455,9 @@ struct ProgramOptions {
     //   more rows do;
     // - free_cache_resume (free-cache-resume): prefill calls, taps and resumes at any position, sibling
     //   coalescing, and endpoints and blocks holding decode-computed state; without it every call
-    //   boundary, tap and resume is a multiple of 16 tokens (the GDN prefill's sub-chunk) and only
-    //   prompt blocks and taps are published;
+    //   boundary and tap is a multiple of 16 tokens (the GDN prefill's sub-chunk), a request resumes
+    //   only on the prefill-chunk grid (resume_grid: the chunk, at least 16) and only prompt blocks and
+    //   taps are published;
     // - preemption (preemption): KV pages grow per unit and a short pool pauses residents (replay
     //   recomputes generated tokens as prefill); without it a request holds its whole extent from
     //   admission.

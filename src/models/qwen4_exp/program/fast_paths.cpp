@@ -657,7 +657,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // The wide route of NVFP4 W4A16 experts: recipe C's weight-only export (FP8-row dense) and NVIDIA
     // FP4-Local's banks at their default 16-bit activations (MXFP8 dense). GGUF and block-FP8 experts
     // also take 16-bit activations but have no such kernel.
-    // Its narrow form (decode and verification widths, GPU kernels and CPU engine) serves the same banks.
+    // Its narrow form (decode and verification widths, GPU kernels and CPU engine) serves the same banks; registered
+    // nowhere: it decoded slower than the default route (FP4-Local -10.8 % in the 2026-10-25 pass, Dense8 -9..-10 %).
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3:
     case FastPath::ExpertA4ResidualDecode:

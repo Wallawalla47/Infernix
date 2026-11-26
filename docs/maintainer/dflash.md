@@ -400,8 +400,10 @@ has the 27B drafter's mathematics at the geometry above; the fused Ops register 
   prefix cache's state image (the drafter group), with its frontier in the image header; a tap
   inside a layer walk copies the ring as it stood before the span, which only costs acceptance after
   a resume from it.
-- **Rounds.** One-row rounds speculate; two-row rounds only with the `dflash2-pairs` fast path (an
-  unqualified candidate, `--fast-path dflash2-pairs`; `adaptive-speculation` is MTP's), whose rounds
+- **Rounds.** One-row rounds speculate; two-row rounds only with the `dflash2-pairs` fast path (on by
+  default on every configuration and KV format by the owner's decision of 2026-10-24, ahead of its quality
+  gate, which has not run: Dense8, two requests, INT8 KV, decode +28 % median;
+  [model quality §6.7](model-quality.md#67-fast-path-registry); `adaptive-speculation` is MTP's), whose rounds
   of two rows share one proposal and verify one width of at most two drafts per row (2 x 3 columns,
   inside the column-invariant routes; three drafts reach 8 columns, which cost MTP pair rounds 3.1
   plain rounds). With `--draft-tokens auto` the width is the k maximizing (both rows' expected tokens

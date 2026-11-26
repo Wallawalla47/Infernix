@@ -357,7 +357,8 @@ the request-coupling paths (two-row MTP rounds: two concurrent requests decode 8
 16-bit and 125 -> 162 with 4-bit expert activations; free cache resume; preemption), sampled MTP
 drafts, and `expert-a4-residual` for long prefills with 16-bit expert activations, on every KV
 format ([model quality §6.7](maintainer/model-quality.md#67-fast-path-registry)).
-`--fast-path expert-a4-residual-decode` (a candidate, not yet qualified or timed) takes the same two
+`--fast-path expert-a4-residual-decode` (a candidate, not qualified; timed slower than the default route:
+FP4-Local decode -10.8 % in the 2026-10-25 fast-path pass, Dense8 -9 to -10 % in an earlier run) takes the same two
 NVFP4 terms in decode and verification calls with 16-bit expert activations, on the GPU and for
 CPU-served misses alike (exact sums, so where an expert runs changes no bit). Its exact route is
 deterministic and gives each request the same bits alone and with up to eight concurrent requests.

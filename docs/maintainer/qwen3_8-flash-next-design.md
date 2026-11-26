@@ -10997,7 +10997,9 @@ width the other way; beside `expert-a4-residual` every width takes the same term
 summation differs (exact against the tensor core's FP32 order). Op checks: `test_offloaded_moe_a4r_cpu`
 (encoding against a binary64 oracle, exact row sums, ISAs, team, FP64 expert, error against the exact
 route), the W4A16 layer cases of `test_offloaded_moe_wide` (N1, N2) and `test_offloaded_moe_layer`
-(every placement and CPU share). Not yet built, gated or timed.
+(every placement and CPU share). Built; not gated; timed slower than the default route (FP4-Local decode -10.8 %
+in the 2026-10-25 fast-path pass, `abc0a0646`; Dense8 -9 to -10 % in an earlier run), so it stays an unregistered
+candidate.
 
 **The prefill hyper-connection up projection fused with its collapse: adopted (bit-exact).** For
 Q8_G32_FP16 W_up and more than 96 columns, one Q8 MMA tile computes 16 features x 4 streams of u

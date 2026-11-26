@@ -2,8 +2,9 @@
 
 This document defines the architecture, functional semantics and execution contract of Infernix's
 constrained decoding. GBNF, JSON object, JSON Schema, choice, regex and tool constraints are
-implemented across ordinary decoding, MTP, DFlash and DFlash2 (Qwen3.5), ordinary decoding, MTP
-and n-gram copy drafting (Qwen3.8-Flash-Next), and ordinary decoding, DSpark and the lossless route (Inkling 2
+implemented across ordinary decoding, MTP, DFlash and DFlash2 (Qwen3.5), ordinary decoding, MTP,
+DFlash2 (its `--draft-model` companion) and n-gram copy drafting (Qwen3.8-Flash-Next: every drafter's verify
+columns take the rows' masks), and ordinary decoding, DSpark and the lossless route (Inkling 2
 Mini, §4.4). Content constraints are used through
 `RequestOptions::constraint`, the CLI and the three HTTP protocols; tool declarations belong to the
 Prompt and the call policy to `RequestOptions::tool_choice`.

@@ -1374,7 +1374,8 @@ K/V through the codec before reading it, so in-chunk and cached keys are the sam
 ([§9.3](#93-prefill)). The model has no recurrent layer whose kernel chunking regroups sums (its convs read a 3-position
 history), so, as TokenSpeed notes for KV-only models, a prefix resumes at any token bit for bit. Then publication and
 resumes are exact at any prefill-computed frontier, chunks can be any width (the default is the fastest measured,
-4,096 columns today, no wider than the context), and the prompt's last two calls merge (L23). Where an Op cannot be made invariant, the Qwen rule
+4,096 columns today, no wider than the context). Unlike Flash-Next (L23), the prompt's last two calls do not merge:
+each call is at most the chunk (`advance_prefill`), so a prompt just past a chunk multiple pays one more call. Where an Op cannot be made invariant, the Qwen rule
 applies instead: a canonical chunk grid and grid-only publication on the reproducible route.
 
 Built (2026-11-21): the first prefill route keeps the decode route's arithmetic at every width instead of a second
