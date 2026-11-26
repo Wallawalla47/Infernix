@@ -728,7 +728,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         // the metrics, the request log and the startup lines, as the Qwen families fill theirs: the requested mode
         // (auto stays auto), the pool's pages in the occupied-pages gauge's unit (the scratch page holds nothing; fixed
         // at startup, so its maximum too), the bytes the plan counted and what the pool was sized from; the automatic
-        // headroom is set below. The minimum reservation and the slack have no Inkling counterpart: left 0.
+        // headroom is set below; the planned slack is what the pool was sized from less the plan's bytes, as Flash-Next
+        // reports it. The minimum reservation has no Inkling counterpart: left 0.
         KvCapacityResolution& resolution = instance->kv_capacity_resolution;
         resolution.mode                  = options.kv_capacity.mode;
         resolution.main_page_groups      = planned_device.kv_pages > 0 ? planned_device.kv_pages - 1U : 0U;
@@ -737,6 +738,9 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         resolution.bytes_per_additional_main_page_group = static_cast<std::size_t>(planned_device.page_bytes);
         resolution.runtime_reservation_bytes            = static_cast<std::size_t>(planned_device.fixed_bytes());
         resolution.available_after_weights_bytes        = static_cast<std::size_t>(pool_sizing_bytes);
+        resolution.planned_slack_bytes                  = pool_sizing_bytes > planned_device.fixed_bytes()
+                                                              ? static_cast<std::size_t>(pool_sizing_bytes - planned_device.fixed_bytes())
+                                                              : 0U;
         resolution.available_after_startup_bytes =
             free_device_bytes(open_vram_budget_source(device.device, options.vram_past_budget)->query());
     }
