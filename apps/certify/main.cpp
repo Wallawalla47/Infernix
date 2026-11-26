@@ -92,6 +92,14 @@ namespace llama      = infernix::certify::llama;
 constexpr std::uint32_t kTop = 256;
 static_assert(kTop <= infernix::kMaximumScoreTopTokens && kTop <= infernix::kMaximumObservedTokens);
 
+// Top-1 agreement in every arm: the evaluated distribution's most probable token is the reference's, or the
+// reference's ties it at the top. Selection breaks an exact tie by token id, which says nothing about the two
+// distributions (BF16 logits make ties common); the decode arm sees only log-probabilities and so compares them.
+bool top1_agrees(infernix::TokenId evaluated_top, infernix::TokenId reference_top, float evaluated_logprob_of_reference_top,
+                 float evaluated_top_logprob) noexcept {
+    return evaluated_top == reference_top || evaluated_logprob_of_reference_top >= evaluated_top_logprob;
+}
+
 struct Options {
     std::string command;
     std::string artifact;
@@ -517,7 +525,9 @@ int run_reference(const Options& options) {
                                   perplexity::position_divergence(
                                       std::span<const float>(base.top_logprobs.data() + r * kTop, kTop),
                                       std::span<const float>(scored.candidate_logprobs.data() + r * kTop, kTop),
-                                      scored.top_ids[r * kTop] == base.top_ids[r * kTop], base.target_logprobs[r],
+                                      top1_agrees(scored.top_ids[r * kTop], base.top_ids[r * kTop],
+                                                  scored.candidate_logprobs[r * kTop], scored.top_logprobs[r * kTop]),
+                                      base.target_logprobs[r],
                                       scored.logprobs[r]));
             }
             writer.write(perplexity::ReferenceWindow{.stream_index    = window.index,
@@ -697,7 +707,9 @@ int run_prefill(const Options& options) {
             const std::span<const float> reference_top(ref.top_logprobs.data() + r * kTop, kTop);
             const std::span<const float> evaluated(scored.candidate_logprobs.data() + r * kTop, kTop);
             rows.add(windows[w].index, -1, r + 1,
-                     perplexity::position_divergence(reference_top, evaluated, scored.top_ids[r] == ref.top_ids[r * kTop],
+                     perplexity::position_divergence(reference_top, evaluated,
+                                                     top1_agrees(scored.top_ids[r], ref.top_ids[r * kTop], evaluated[0],
+                                                                 scored.top_logprobs[r]),
                                                      ref.target_logprobs[r], scored.logprobs[r]));
         }
         std::cerr << "prefill window " << w + 1 << "/" << windows.size() << '\n';
@@ -854,6 +866,7 @@ int run_decode(const Options& options) {
             const std::size_t row                 = segment.start + k - 1;
             underflows += draw.mass < 1.0e-37F ? 1U : 0U;
             const std::span<const float> reference_top(ref.top_logprobs.data() + row * kTop, kTop);
+            // top1_agrees without ids: the step reports log-probabilities only (the observed list is the reference's).
             const bool top1 = !draw.observed_logprobs.empty() && draw.observed_logprobs[0] >= draw.top_logprob;
             rows.add(windows[segment.window].index, segment.index, segment.start + k,
                      perplexity::position_divergence(reference_top, draw.observed_logprobs, top1, ref.target_logprobs[row],
