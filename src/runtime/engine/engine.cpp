@@ -383,6 +383,7 @@ public:
             load                = std::move(constructed.load);
             model_metadata      = std::move(constructed.model_metadata);
             load.cuda_sync_mode = device.sync_mode();
+            load.temporary_switches = temporary_switches::describe(temporary_switches::Scope::Inkling2);
             sampling_defaults   = inkling->frontend.sampling_defaults();
             StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
             if (options.purpose == EnginePurpose::CausalScoring) {

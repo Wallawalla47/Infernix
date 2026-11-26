@@ -30,7 +30,7 @@ constexpr Registration kSwitches[] = {
     {"INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG", Scope::Qwen3_5, Kind::Value},
     // TEMPORARY: =<file> appends every instantiated CUDA graph's top-level edges and their dependency types
     // (core/decode_graph.cpp, dump_graph_edges; the PDL edge census, candidates §57). Diagnostic only.
-    {"INFERNIX_TMP_GRAPH_EDGES", Scope::All, Kind::Value},
+    {"INFERNIX_TMP_GRAPH_EDGES", Scope::Every, Kind::Value},
     // Diagnostic: the CPU team's rates on 32 records in three memories, logged at startup
     // (runtime/expert_offload/expert_offload.cpp, cpu_probe_detail; candidates §11.2 OR-08).
     {"INFERNIX_TMP_CPU_PROBE_DETAIL", Scope::All, Kind::Flag},
@@ -250,7 +250,9 @@ std::string describe(Scope scope) {
     if ((static_cast<unsigned>(scope) & static_cast<unsigned>(Scope::Qwen3_5)) != 0) {
         (void)gw_shape();
     }
-    (void)continuing_prompt();
+    // The offloaded-expert switches act on the Qwen families alone: Inkling 2 neither parses nor reports them.
+    const bool offload_families = (static_cast<unsigned>(scope) & static_cast<unsigned>(Scope::All)) != 0;
+    if (offload_families) { (void)continuing_prompt(); }
     std::string out;
     for (std::size_t i = 0; i < kCount; ++i) {
         if ((static_cast<unsigned>(kSwitches[i].scope) & static_cast<unsigned>(scope)) == 0) { continue; }
@@ -258,7 +260,7 @@ std::string describe(Scope scope) {
         if (!out.empty()) { out += " | "; }
         out += std::string(kSwitches[i].name) + "=" + (values[i] ? *values[i] : std::string("unset"));
     }
-    if (const OffloadSwitches& offloaded = offload(); !offloaded.errors.empty()) {
+    if (const OffloadSwitches& offloaded = offload(); offload_families && !offloaded.errors.empty()) {
         out += "; ignored (invalid):";
         for (const auto& error : offloaded.errors) { out += " " + error; }
     }
