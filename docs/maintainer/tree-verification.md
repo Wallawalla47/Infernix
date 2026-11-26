@@ -56,7 +56,7 @@ a chain.
 | Option | Meaning | Default |
 |---|---|---|
 | `--draft-tree-nodes auto` | every all-neural round of up to four rows chooses chain verification or a tree of K+5 or K+9 columns from measured round time and acceptance ([Automatic widths](#automatic-widths)) | off |
-| `--draft-tree-nodes LIST` | fixed columns per tree row by batch size: entry c applies to rounds of c rows and the last entry to every larger batch; `0` keeps that batch size on chain verification; nonzero entries are `draft tokens + 2 .. 32` | off |
+| `--draft-tree-nodes LIST` | fixed columns per tree row by batch size: entry c applies to rounds of c rows and the last entry to every larger batch; `0` keeps that batch size on chain verification; nonzero entries are `draft tokens + 2 .. 32`; refused under fixed speculation (`--reproducible`, or a configuration without `adaptive-speculation`), which plans no tree family | off |
 | `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` (n-gram trees too; Qwen3.8-Flash-Next at most 3) | `8` |
 | `--ngram-tree-nodes N` | with `--ngram-draft-tokens`: a copy round in which a row's copy sources continue differently verifies them as one tree of at most N columns, `4..32` and, with several requests, at least a batched round's neural draft tokens + 2 (Qwen3.8-Flash-Next 4..32, verified as at most 3 path rows whose columns together fit a one-row round's 16, when they beat the copy by expected tokens per measured round time) ([N-gram trees](#n-gram-trees)); `0` keeps copies on chain verification | `0` |
 

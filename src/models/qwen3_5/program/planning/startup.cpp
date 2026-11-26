@@ -1397,6 +1397,12 @@ void validate_target_options(const execution::Parameters& parameters,
             throw std::invalid_argument("tree verification requires single FP8, NVFP4 or Q8 "
                                         "GDN input projections");
         }
+        // Fixed speculation verifies the chain at a fixed width every round and plans no tree family (below), so
+        // a fixed table would never run: refused, as n-gram trees are (automatic widths fall back to chains).
+        if (tree_table && execution_schedule(parameters, options).fixed_speculation) {
+            throw std::invalid_argument("--draft-tree-nodes needs adaptive speculation: the reproducible route, and a "
+                                        "configuration without adaptive-speculation, verify chains at a fixed width");
+        }
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
