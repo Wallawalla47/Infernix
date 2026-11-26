@@ -593,6 +593,9 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     // An automatic Host tier (sized below from the RAM free now): trimmed after the start and grown as RAM frees under
     // --ram-resize auto.
     const bool host_auto = program.prefix_cache && !options.context_cache.host_capacity_bytes;
+    // What the pool was sized from and the headroom it kept (a startup retry adds to it), for the KV capacity's
+    // resolution below.
+    std::uint64_t pool_sizing_bytes = 0, pool_headroom = headroom;
     if (!program.causal_scoring) {
         const VramSnapshot now = open_vram_budget_source(device.device, options.vram_past_budget)->query();
         if (program.prefix_cache) {
@@ -605,7 +608,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
             if (tier.ceiling > tier.bytes) { options.context_cache.host_growth_capacity_bytes = tier.ceiling; }
         }
         const std::uint64_t free_now = free_device_bytes(now) > adapter_bytes ? free_device_bytes(now) - adapter_bytes : 0;
-        program.kv_pages = pool_pages(options, program, model->config(), sizing_of(now, 0), headroom);
+        pool_sizing_bytes = sizing_of(now, 0);
+        program.kv_pages  = pool_pages(options, program, model->config(), pool_sizing_bytes, headroom);
         const models::inkling2::ProgramDevicePlan sized = models::inkling2::Program::plan_device(program, model->config());
         // An explicit context or capacity that does not fit is refused here, with its figures, before any allocation.
         if (sized.fixed_bytes() + headroom > free_now) {
@@ -686,8 +690,9 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         (void)cudaGetLastError(); // an allocation failure is not sticky; clear its record
         constexpr std::uint64_t kRetryHeadroom = 1ULL << 30U;
         const VramSnapshot now       = open_vram_budget_source(device.device, options.vram_past_budget)->query();
-        program.kv_pages = pool_pages(options, program, instance->model->config(), sizing_of(now, kRetryHeadroom),
-                                      headroom + kRetryHeadroom);
+        pool_sizing_bytes = sizing_of(now, kRetryHeadroom);
+        pool_headroom     = headroom + kRetryHeadroom;
+        program.kv_pages  = pool_pages(options, program, instance->model->config(), pool_sizing_bytes, pool_headroom);
         const models::inkling2::ProgramDevicePlan retried =
             models::inkling2::Program::plan_device(program, instance->model->config());
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
@@ -713,6 +718,21 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
                            "it the CUDA graphs' allowance)",
                            static_cast<double>(taken) / kMiB, static_cast<double>(planned_device.fixed_bytes()) / kMiB,
                            static_cast<double>(planned_device.graphs) / kMiB);
+        // The KV capacity's resolution, which the Engine lays over the Program's memory summary (with_kv_capacity) for
+        // the metrics, the request log and the startup lines, as the Qwen families fill theirs: the requested mode
+        // (auto stays auto), the pool's pages in the occupied-pages gauge's unit (the scratch page holds nothing; fixed
+        // at startup, so its maximum too), the bytes the plan counted and what the pool was sized from; the automatic
+        // headroom is set below. The minimum reservation and the slack have no Inkling counterpart: left 0.
+        KvCapacityResolution& resolution = instance->kv_capacity_resolution;
+        resolution.mode                  = options.kv_capacity.mode;
+        resolution.main_page_groups      = planned_device.kv_pages > 0 ? planned_device.kv_pages - 1U : 0U;
+        resolution.maximum_main_page_groups             = resolution.main_page_groups;
+        resolution.resolved_tokens                      = static_cast<std::uint32_t>(pool_tokens(planned_device.kv_pages));
+        resolution.bytes_per_additional_main_page_group = static_cast<std::size_t>(planned_device.page_bytes);
+        resolution.runtime_reservation_bytes            = static_cast<std::size_t>(planned_device.fixed_bytes());
+        resolution.available_after_weights_bytes        = static_cast<std::size_t>(pool_sizing_bytes);
+        resolution.available_after_startup_bytes =
+            free_device_bytes(open_vram_budget_source(device.device, options.vram_past_budget)->query());
     }
     // The headroom an automatic pool kept free, which the memory map shows (EngineCore's metrics read it here).
     if (automatic && !program.causal_scoring) {
