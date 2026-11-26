@@ -947,9 +947,14 @@ forward test's prompt calls of 1, 64 and 4,096 columns after 122,000 positions h
 Measured (INT8 pools, RTX 5090): the 4,096-column call 903.8 → 700.2 ms (attention 717 → 513 ms), 64 columns 203.7 →
 153.4, one column 184.8 → 134.9. Served (the owner's configuration, two servers an arm): a cold 122,215-token prompt's
 first token 16.70 → 13.77 s (7,338 → 8,905 tokens a second), a question past a cached 114,688-token snapshot 1,807 →
-1,414 ms, a fully cached one 237 → 186 ms. The narrow calls stay slow: a call of one tile is 8 CTAs (the KV heads), each walking
-every key unit before it, ~1.0 us a key at 122K (attention 125.5 ms of the one-column call), so a resumed request's
-first token at long context waits ~135 ms for its last call, and units narrower than a wave of tiles lose prefill rate
+1,414 ms, a fully cached one 237 → 186 ms. A quantized pool's units are staged (2026-11-26): one key tile and two code
+planes in shared memory, the next unit's codes and side records copied by cp.async while this unit computes, then
+decoded from the plane into the tile (`decode_unit` over the staged codes: the same words), where the decode from
+global memory left a unit's load latency on the chain. Same bits (the prompt calls of 1 and 4,096 columns after
+122,000 positions hash as before); one column 134.9 → 125.2 ms, 4,096 columns 702 → 668 ms (INT8 pools; BF16 pools
+102 and 580 ms). The narrow calls stay slow: a call of one tile is 8 CTAs (the KV heads), each walking
+every key unit before it, ~0.9 us a key at 122K (attention 114.7 ms of the one-column call), so a resumed request's
+first token at long context waits ~125 ms for its last call, and units narrower than a wave of tiles lose prefill rate
 (§14.5). Splitting a row's keys into fixed absolute segments merged in order would keep calls width-invariant, but at a
 cost: wide calls would merge in place (a second accumulator set, past the kernel's registers) or write per-segment
 partials (0.4-1.5 GB of workspace at 240K for a 4,096-column call); not built.
