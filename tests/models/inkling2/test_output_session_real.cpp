@@ -24,6 +24,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -202,6 +203,17 @@ void rule_cases(const Harness& h) {
         check(turn.content == "The answer ", "content stop: content " + Json(turn.content).dump());
         check(turn.reasoning == "this 4 is 4 in thinking", "content stop: thinking is not matched");
         check(session.matched_stop_string() == std::optional<std::string>("is 4"), "content stop: matched string");
+    }
+    { // A commit with no preview to commit (the Engine's protocol error) throws std::logic_error, so the Engine fails
+      // the request (or answers every request) instead of the process aborting in std::terminate.
+        ink::OutputSession session(h.settings(nullptr));
+        (void)session.preview_model(cat({M, CT}), 1000, FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        bool threw = false;
+        try {
+            (void)session.commit_preview();
+        } catch (const std::logic_error&) { threw = true; }
+        check(threw, "a second commit_preview without a new preview throws std::logic_error");
     }
     { // A reasoning stop string with include_in_output, in rounds of 3.
         auto s = h.settings(nullptr);

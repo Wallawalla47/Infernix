@@ -2462,6 +2462,20 @@ int test_terminal_flush(const Frontend& frontend) {
     return failures;
 }
 
+// A commit with no preview to commit (the Engine's protocol error) throws, so the Engine fails the request
+// (or answers every request) instead of the process aborting in std::terminate.
+int test_commit_without_preview_throws(const Frontend& frontend) {
+    auto prompt  = frontend.prepare_tokens({0});
+    auto session = frontend.make_output_session(prompt, infernix::StopPolicy{});
+    (void)session.preview_model(std::array<infernix::TokenId, 1>{1}, 2, infernix::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    bool threw = false;
+    try {
+        (void)session.commit_preview(); // the preview was committed already
+    } catch (const std::logic_error&) { threw = true; }
+    return check(threw, "a second commit_preview without a new preview did not throw std::logic_error");
+}
+
 // The Engine builds the constraint vocabulary index on a startup thread while requests may already
 // be arriving: concurrent warm-ups and a constrained request that races them share one build and
 // all succeed.
@@ -4684,6 +4698,7 @@ int main() try {
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
+    failures += test_commit_without_preview_throws(frontend);
     failures += test_structured_tool_output();
     failures += test_deferred_tool_declarations();
     failures += test_constraint_warm_up();

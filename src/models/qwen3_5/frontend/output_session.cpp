@@ -855,7 +855,11 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
 }
 
 PublishedOutput OutputSession::commit_preview() {
-    if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
+    // A commit without a preview is the Engine's own protocol error: thrown, so the commit's caller fails this
+    // request (EngineCore::commit_output) or the worker answers every request, rather than the process aborting.
+    if (impl_ == nullptr || !impl_->preview_ready) {
+        throw std::logic_error("output session: commit_preview without a preview to commit");
+    }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);
