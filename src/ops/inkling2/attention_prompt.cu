@@ -208,20 +208,26 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
         }
         __syncthreads();
         // The relative table's columns for this unit's distances cdmin .. cdmin + 127 (cdmin = p_first - j0 - 63),
-        // transposed; zero past the table.
+        // transposed; zero past the table. A unit whose nearest distance is past the table (far: every key of it at
+        // least kRelativeExtent before the CTA's first row) has each bias the fma fold of zeros, +0: it builds no table
+        // and folds no bias, the same bits (CTA-uniform; units ascend, so the far ones come first and no later unit
+        // reads a table a far one skipped).
         const int j0 = unit * kKeyUnit, cdmin = p_first - j0 - 63;
-        for (int i = tid; i < kTableColumns * kRelDim; i += kThreads) {
-            const int dim = i / kTableColumns, dl = i % kTableColumns, d = cdmin + dl;
-            sm.table[dl][dim] = d >= 0 && d < kRelativeExtent ? __ldg(a.layer.relative_table + dim * kRelativeExtent + d)
-                                                               : std::uint16_t{0};
+        const bool far = cdmin >= kRelativeExtent;
+        if (!far) {
+            for (int i = tid; i < kTableColumns * kRelDim; i += kThreads) {
+                const int dim = i / kTableColumns, dl = i % kTableColumns, d = cdmin + dl;
+                sm.table[dl][dim] = d >= 0 && d < kRelativeExtent ? __ldg(a.layer.relative_table + dim * kRelativeExtent + d)
+                                                                   : std::uint16_t{0};
+            }
+            __syncthreads();
         }
-        __syncthreads();
         if (warp_live && unit >= w_lo && unit <= w_hi) {
             // The warp's bias for distances wdmin .. wdmin + 79 (wdmin = wpos0 - j0 - 63; row r, key c: index r - c + 63)
             // in the decode route's arithmetic: bf16 of the fma fold of r[i] P[i][d] over i in order. Lane l: row l & 15,
             // indices (l >> 4) + 2k.
             const int off = wc0 - c0;
-            for (int idx = ln >> 4; idx < kBiasColumns - 1; idx += 2) {
+            for (int idx = far ? kBiasColumns : ln >> 4; idx < kBiasColumns - 1; idx += 2) {
                 const uint4* col = reinterpret_cast<const uint4*>(sm.table[off + idx]);
                 const uint4 w0 = col[0], w1 = col[1];
                 const std::uint32_t words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
@@ -264,7 +270,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
                     const int r  = g + 8 * hr;
                     const int kpos = j0 + key, dist = pos_g[hr] - kpos;
                     const bool visible = dist >= 0 && (full || dist < kWindow) && kpos >= first;
-                    const float bias = canon::bf16_to_f32(sm.bias[warp][r][r - key + 63]);
+                    const float bias = far ? 0.0F : canon::bf16_to_f32(sm.bias[warp][r][r - key + 63]);
                     const float s    = canon::add_rn(canon::mul_rn(sc[nt][e], kInvSqrtD), bias);
                     sc[nt][e]        = visible ? canon::mul_rn(s, kLog2e) : neg_inf();
                     mu[hr]           = sc[nt][e] > mu[hr] ? sc[nt][e] : mu[hr];
