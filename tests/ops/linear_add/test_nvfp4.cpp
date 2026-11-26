@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <numeric>
 #include <span>
 #include <string>
 #include <vector>
@@ -46,6 +47,22 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
             std::find(result.begin(), result.end(), index) == result.end()) {
             result.push_back(index);
         }
+    }
+    return result;
+}
+
+// The A4 criteria (and the A4 residual profile's, from 5 columns) are distribution-level verdicts on the 4-bit
+// activations' noise, so they are judged on 31 rows spread over the output, at every token, as the GDN input
+// projection's are (9d47f62ca): seven rows of seven tokens put the relative L2 error anywhere from about 0.05 to
+// 0.23 there and failed about a third of widths. The A16 criteria keep the seven-by-seven sample.
+constexpr std::int32_t kA4SampleRows = 31;
+
+std::vector<std::int32_t> spread_indices(std::int32_t extent, std::int32_t count) {
+    std::vector<std::int32_t> result;
+    for (std::int32_t i = 0; i < count; ++i) {
+        const auto index = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * (extent - 1) /
+                                                     std::max<std::int32_t>(1, count - 1));
+        if (result.empty() || result.back() != index) { result.push_back(index); }
     }
     return result;
 }
@@ -186,6 +203,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::vector<std::int32_t> rows = sampled_indices(n);
     const std::vector<float> materialized_weight =
         quantized_weight::materialize_rows_fp32(host_weight, rows);
+    const std::vector<std::int32_t> a4_rows = spread_indices(n, kA4SampleRows);
+    const std::vector<float> a4_weight      = quantized_weight::materialize_rows_fp32(host_weight, a4_rows);
     const std::vector<std::uint16_t> activation = make_activation(k, kMaximumTokens, seed + 1U);
     const std::vector<std::uint16_t> initial_residual = make_residual(n, kMaximumTokens, seed + 2U);
 
@@ -243,15 +262,24 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
         std::vector<std::uint16_t> actual_bits(output_words);
         output.copy_to_host(actual_bits.data(), output.bytes());
-        const std::vector<std::int32_t> tokens = sampled_indices(invocation.tokens);
+        const bool statistical = a4 || (a4_residual && invocation.tokens >= 5);
+        const std::vector<std::int32_t>& check_rows = statistical ? a4_rows : rows;
+        const std::vector<float>& check_weight      = statistical ? a4_weight : materialized_weight;
+        std::vector<std::int32_t> tokens;
+        if (statistical) {
+            tokens.resize(static_cast<std::size_t>(invocation.tokens));
+            std::iota(tokens.begin(), tokens.end(), 0);
+        } else {
+            tokens = sampled_indices(invocation.tokens);
+        }
         std::vector<double> actual;
         std::vector<double> expected;
-        actual.reserve(rows.size() * tokens.size());
-        expected.reserve(rows.size() * tokens.size());
-        for (std::size_t sampled_row = 0; sampled_row < rows.size(); ++sampled_row) {
-            const std::int32_t row = rows[sampled_row];
+        actual.reserve(check_rows.size() * tokens.size());
+        expected.reserve(check_rows.size() * tokens.size());
+        for (std::size_t sampled_row = 0; sampled_row < check_rows.size(); ++sampled_row) {
+            const std::int32_t row = check_rows[sampled_row];
             const float* weight_row =
-                materialized_weight.data() + sampled_row * static_cast<std::size_t>(k);
+                check_weight.data() + sampled_row * static_cast<std::size_t>(k);
             for (const std::int32_t token : tokens) {
                 double sum = 0.0;
                 const std::uint16_t* activation_row =
