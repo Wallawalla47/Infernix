@@ -188,6 +188,16 @@ void refusals() {
     with_config("rank mismatch", [](Json& c) { c["r"] = 8; }, "rank");
     with_config("bad pattern", [](Json& c) { c["rank_pattern"] = {{"(", 4}}; },
                 " is refused: its adapter_config.json's rank_pattern / alpha_pattern key '(' is not a regular expression");
+    // Values of the wrong type are refused by name (a nlohmann type error named neither the adapter nor the key).
+    with_config("alpha as text", [](Json& c) { c["lora_alpha"] = "32"; }, "states lora_alpha as \"32\", not a number");
+    with_config("rank as text", [](Json& c) { c["r"] = "16"; }, "states r as \"16\", not a positive integer");
+    with_config("negative rank", [](Json& c) { c["r"] = -16; }, "states r as -16");
+    with_config("rslora as text", [](Json& c) { c["use_rslora"] = "yes"; }, "states use_rslora as \"yes\"");
+    with_config("pattern rank as text", [](Json& c) { c["rank_pattern"] = {{"q_proj", "16"}}; },
+                "states rank_pattern['q_proj'] as \"16\"");
+    with_config("pattern alpha as text", [](Json& c) { c["alpha_pattern"] = {{"q_proj", "x"}}; },
+                "states alpha_pattern['q_proj'] as \"x\"");
+    with_config("bias as boolean", [](Json& c) { c["bias"] = true; }, "states bias as true");
 
     const auto with_tensors = [](const std::string& label, std::vector<TensorSpec> tensors, const std::string& needle) {
         Dir dir("tensors");
@@ -245,6 +255,11 @@ void safetensors_validation() {
     rejects([&] { SafetensorsFile f(file); }, "'a'", "shape against bytes");
     write_safetensors(file, two, [](Json& h) { h["a"]["dtype"] = "Q9"; });
     rejects([&] { SafetensorsFile f(file); }, "'a'", "unknown dtype");
+    // A shape whose element count wraps 64 bits (2^62 x 4 F32 elements read as 0) stated with no bytes.
+    write_safetensors(file, two, [](Json& h) {
+        h["z"] = {{"dtype", "F32"}, {"shape", {std::uint64_t{1} << 62, 4}}, {"data_offsets", {24, 24}}};
+    });
+    rejects([&] { SafetensorsFile f(file); }, "exceeds 64 bits", "a shape whose element count wraps");
     write_safetensors(file, two);
     const SafetensorsFile ok(file);
     require(ok.tensors().size() == 2 && ok.metadata().at("format") == "pt", "valid header");

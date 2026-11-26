@@ -108,7 +108,17 @@ SafetensorsFile::SafetensorsFile(const std::filesystem::path& path)
         tensor.dtype = entry.at("dtype").get<std::string>();
         const std::uint64_t element_bytes = safetensors_dtype_bytes(tensor.dtype);
         if (element_bytes == 0) { fail("unknown dtype " + tensor.dtype); }
-        for (const auto& extent : entry.at("shape")) { tensor.shape.push_back(extent.get<std::uint64_t>()); }
+        // The element count is checked as it is formed: a product that wraps would read as a small (or zero) count
+        // and pass the data range check below.
+        std::uint64_t count = 1;
+        for (const auto& extent : entry.at("shape")) {
+            const std::uint64_t value = extent.get<std::uint64_t>();
+            if (value != 0 && count > std::numeric_limits<std::uint64_t>::max() / value) {
+                fail("its shape's element count exceeds 64 bits");
+            }
+            count *= value;
+            tensor.shape.push_back(value);
+        }
         const auto& offsets = entry.at("data_offsets");
         if (!offsets.is_array() || offsets.size() != 2) { fail("data_offsets is not a [begin, end] pair"); }
         const std::uint64_t begin = offsets[0].get<std::uint64_t>(), end = offsets[1].get<std::uint64_t>();

@@ -9,6 +9,8 @@
 #include <map>
 #include <regex>
 #include <sstream>
+#include <string>
+#include <string_view>
 
 namespace infernix::artifact {
 namespace {
@@ -118,6 +120,10 @@ PeftLoraAdapter::PeftLoraAdapter(const std::filesystem::path& path) {
     if (config.contains("bias") && config.at("bias").is_string() && config.at("bias").get<std::string>() != "none") {
         refuse("trains the base model's biases (bias is '" + config.at("bias").get<std::string>() + "', not 'none')");
     }
+    // PEFT's bias is one of the strings "none", "all" and "lora_only"; any other value is no adapter PEFT wrote.
+    if (config.contains("bias") && !config.at("bias").is_string() && !config.at("bias").is_null()) {
+        refuse("states bias as " + config.at("bias").dump() + " (PEFT's bias is a string: 'none', 'all' or 'lora_only')");
+    }
     // Each of these changes the computation. (layers_to_transform and layers_pattern only restrict which modules carry
     // factors, which the tensors present decide here.)
     struct Feature {
@@ -146,7 +152,30 @@ PeftLoraAdapter::PeftLoraAdapter(const std::filesystem::path& path) {
             refuse("uses a LoRA variant (" + key + " is set) whose computation differs from plain LoRA");
         }
     }
-    rslora_       = config.value("use_rslora", false);
+    // The scalars the factors' scale reads, by PEFT's types: refused by name when the file states another type (a
+    // nlohmann type error would name neither the adapter nor the key).
+    const auto wrong_type = [&](const std::string& key, const ConfigJson& value, const char* want) {
+        throw ArtifactError("LoRA adapter " + config_path_.parent_path().string() + " is refused: its " +
+                            "adapter_config.json states " + key + " as " + value.dump() + ", not " + want);
+    };
+    if (config.contains("use_rslora") && !config.at("use_rslora").is_null() && !config.at("use_rslora").is_boolean()) {
+        wrong_type("use_rslora", config.at("use_rslora"), "true or false");
+    }
+    if (config.contains("lora_alpha") && !config.at("lora_alpha").is_number()) {
+        wrong_type("lora_alpha", config.at("lora_alpha"), "a number");
+    }
+    if (config.contains("r") && !config.at("r").is_number_unsigned()) { wrong_type("r", config.at("r"), "a positive integer"); }
+    for (const char* patterns : {"rank_pattern", "alpha_pattern"}) {
+        if (!config.contains(patterns) || !config.at(patterns).is_object()) { continue; }
+        const bool rank = std::string_view(patterns) == "rank_pattern";
+        for (const auto& [key, value] : config.at(patterns).items()) {
+            if (rank ? !value.is_number_unsigned() : !value.is_number()) {
+                wrong_type(std::string(patterns) + "['" + key + "']", value, rank ? "a positive integer" : "a number");
+            }
+        }
+    }
+    rslora_       = config.contains("use_rslora") && config.at("use_rslora").is_boolean() &&
+              config.at("use_rslora").get<bool>();
     base_model_   = config.value("base_model_name_or_path", std::string{});
     peft_version_ = config.value("peft_version", std::string{});
     const double default_alpha = config.contains("lora_alpha") ? config.at("lora_alpha").get<double>() : 8.0;
