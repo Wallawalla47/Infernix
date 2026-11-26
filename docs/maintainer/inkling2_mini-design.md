@@ -1387,6 +1387,19 @@ softmax in registers, and a merge combines the ranges. Drafts only, as above; th
 configuration, §13.7) decoded 6.6 % faster than the deployed build of 2026-11-25 (243083c14, so the comparison also
 holds the later commits).
 
+Its splits on tensor cores (2026-11-26): scores as Sᵀ = K Qᵀ (m16n8k16 BF16 MMAs, a tile's 32 keys as M and the
+block's 24 query rows as three 8-row N tiles, so nothing is padded), the softmax as before, writing each p as two BF16
+terms (hi = bf16(p), lo = bf16(p − hi)), and P×V as Oᵀ = Vᵀ Pᵀ (warp w the dims 16w … 16w + 15, the hi terms' MMA and
+then the lo terms' per 16 keys); a partial tile's missing V rows are zeros, since their p are 0 and a stale row could
+hold a NaN. The op test's FP64 bound holds as before (worst 0.04-0.71) and a launch over blocks still equals the blocks'
+single launches bit for bit. Measured (RTX 5090, op bench, one row's 8 queries, against the FP32 folds): 2K keys 0.027
+→ 0.019-0.023 ms, 32K 0.132 → 0.098, 100K 0.367 → 0.255, 200K 0.735 → 0.491 (1.67 TB/s of keys and values, about the
+reads' floor on this card). Served (the owner's configuration, seeded, two servers an arm, two repetitions): a
+four-row round's device draft at ~122K 2.78-3.02 → 2.15-2.39 ms and a one-row round's 1.20 → 1.00 ms; four requests on
+a ~122K-token prefix +2.8 % tok/s warm (+1.6 % on the first repetition), one there +0.7 to +1.0 %. At ~2K the draft
+fell only ~0.06 ms of a ~12.7 ms round; the arms' +2.0 to +3.1 % there follows their acceptance (the drafts' bits
+differ: 0.470-0.523 against 0.453-0.501 accepted a draft), so 2K is level within that spread.
+
 A Q8 head (`--q8-weights`, `--a8-activations`) then runs the drafter's 7 rows on 8-bit inputs (`Forward::project_head`
 with the drafter's own 8-bit input rows: `projections_mma`'s tensor cores instead of the skinny route's FMA chains;
 the only Q8 route that takes the head's unaligned FP32 rows). Drafts only, as above. Measured (2026-11-23, Basalt's

@@ -97,9 +97,10 @@ void dspark_inv_freq(double theta, float (&inv_freq)[kDSparkHeadDim / 2]);
 // The block's attention: the 8 query rows (positions F .. F + 7) against one layer's cached keys at positions
 // [lo, F + 8) of the round's lane (the context before the block and the block's own 8, written there by dspark_rotate;
 // every row sees all of them: the block is non-causal), lo = max(0, F - 1024) for a sliding layer, 0 for the full one.
-// Query head h reads KV head h / 3. Scores q.k / sqrt(128) in FP32, softmax in FP32 (online over key splits of whole
-// 32-key tiles, at least 128 keys, at most `splits` of them, merged in split order), P x V in FP32, out = bf16
-// [8][24 * 128]. `splits` is the launch's (dspark_attention_splits): the split boundaries follow the context, so only
+// Query head h reads KV head h / 3. Scores q.k / sqrt(128) by BF16 MMAs (FP32 accumulation over the head dimension in
+// order), softmax in FP32 (online over key splits of whole 32-key tiles, at least 128 keys, at most `splits` of them,
+// merged in split order), P x V by BF16 MMAs over each p as two BF16 terms (hi = bf16(p), lo = bf16(p - hi); FP32
+// accumulation), out = bf16 [8][24 * 128]. `splits` is the launch's (dspark_attention_splits): the split boundaries follow the context, so only
 // the drafts' last bits depend on it.
 struct DSparkAttentionArgs {
     const std::uint16_t* q = nullptr; // BF16 [8][24][128] (normed, rotated)
