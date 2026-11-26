@@ -71,11 +71,17 @@ enum class ActiveRequestPhase : std::uint8_t { Queued, Prefill, Decode };
 // request continuing after a server-side tool shows its latest generation).
 struct MetricsJsonActiveRequest {
     std::uint64_t id = 0;
-    // The Engine's id once admitted (GenerationProgressObservation); 0 before. Joins GET /monitor's
-    // rows to the server's request; not rendered in live.active.
+    // The Engine's id once admitted (GenerationProgressObservation), the latest generation's; 0 before. Not
+    // rendered in live.active.
     std::uint64_t engine_request_id = 0;
+    // Every Engine request it has fed so far (a continuation after a server-side tool adds one): joins
+    // GET /monitor's and GET /slots' Engine rows to the server's request.
+    std::vector<std::uint64_t> engine_request_ids;
     std::string label; // X-Infernix-Request-Label; empty: none (rendered null)
     std::string protocol;
+    // The client's own identifiers (LiveRequestIdentity); not rendered in live.active.
+    std::string client_request_id;
+    std::string session_id;
     ActiveRequestPhase phase       = ActiveRequestPhase::Queued;
     std::uint32_t prompt_tokens    = 0;
     std::uint32_t cached_tokens    = 0;
@@ -89,13 +95,23 @@ struct MetricsJsonActiveRequest {
 // until their terminal record, fed by the Engine's progress observations
 // (infernix::GenerationObservationOptions::progress). Thread-safe; a poll copies at most
 // --max-concurrency + --max-pending-requests rows.
+// Who a request in flight is, as the client named it.
+struct LiveRequestIdentity {
+    std::string label; // X-Infernix-Request-Label (empty: none)
+    std::string protocol;
+    // The client's X-Request-Id and X-Session-Id headers (client_header_id: empty when absent or not a
+    // valid identifier).
+    std::string client_request_id;
+    std::string session_id;
+};
+
 class LiveRequests {
 public:
     using Clock = std::chrono::steady_clock;
 
     // `started`: when the server took the request (its preparation's start); a default time point
     // stands for now.
-    void begin(std::uint64_t id, std::string label, std::string protocol, std::uint32_t prompt_tokens,
+    void begin(std::uint64_t id, LiveRequestIdentity identity, std::uint32_t prompt_tokens,
                Clock::time_point started);
     // The request's newest position; ignored once it has ended.
     void progress(std::uint64_t id, const infernix::GenerationProgressObservation& observation);
@@ -105,11 +121,11 @@ public:
 
 private:
     struct Entry {
-        std::string label;
-        std::string protocol;
+        LiveRequestIdentity identity;
         Clock::time_point started;
         bool admitted = false;
         infernix::GenerationProgressObservation position;
+        std::vector<std::uint64_t> engine_request_ids;
     };
 
     mutable std::mutex mutex_;
@@ -163,6 +179,29 @@ inline constexpr const char* kMonitorJsonSchema = "infernix.monitor/1";
 [[nodiscard]] std::string render_monitor_json(const infernix::RequestMonitor& monitor,
                                               const std::vector<MetricsJsonActiveRequest>& active,
                                               double time_unix);
+
+// GET /slots: llama.cpp's slot array (its server's GET /slots), one object per lane in lane order, idle
+// lanes included, so supervisors written for llama.cpp read Infernix's lanes. llama.cpp's fields carry
+// what applies (`id_task`: the Engine request id, -1 idle; `next_token[0].n_decoded`: output tokens;
+// `n_remain` -1: unknown); its `params` (per-request sampling) are not reported. Infernix's own facts
+// are under `infernix`: the monitor phase, whether the lane is a decision lane, the resident's token
+// counts, its prefill and decode rates from the Engine's own timings (prefill_seconds, decode_seconds:
+// every poller sees the same), and the server request that fed it (`active`, joined by any of its
+// Engine ids) with the client's X-Request-Id and X-Session-Id. No prompt or output text.
+struct SlotsFacts {
+    std::uint32_t lanes          = 0; // EngineOptions::max_concurrency, the decision lanes included
+    std::uint32_t decision_lanes = 0; // the last ones
+    std::uint32_t n_ctx          = 0;
+    bool speculative             = false;
+};
+
+[[nodiscard]] std::string render_slots_json(const infernix::RequestMonitor& monitor,
+                                            const std::vector<MetricsJsonActiveRequest>& active,
+                                            const SlotsFacts& facts);
+
+// Whether every lane an ordinary request could take holds a request (GET /slots?fail_on_no_slot=1 then
+// answers 503); a decision lane does not count.
+[[nodiscard]] bool slots_all_busy(const infernix::RequestMonitor& monitor, const SlotsFacts& facts);
 
 [[nodiscard]] MetricsJsonRequest make_metrics_json_request(std::uint64_t id,
                                                            const RequestLogContext& context,

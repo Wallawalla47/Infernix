@@ -242,9 +242,9 @@ int main() {
         using Clock = LiveRequests::Clock;
         const Clock::time_point t0 = Clock::now();
         LiveRequests live;
-        live.begin(12, "launcher-3", "anthropic_messages", 50, t0);
-        live.begin(9, "launcher-7", "openai_chat_completions", 1200, t0);
-        live.begin(15, "", "decide", 30, Clock::time_point{}); // no start time: now
+        live.begin(12, {"launcher-3", "anthropic_messages"}, 50, t0);
+        live.begin(9, {"launcher-7", "openai_chat_completions"}, 1200, t0);
+        live.begin(15, {"", "decide"}, 30, Clock::time_point{}); // no start time: now
 
         auto active = live.rows(t0 + std::chrono::milliseconds(250));
         failures += check(active.size() == 3 && active[0].id == 9 && active[1].id == 12 && active[2].id == 15,
@@ -312,8 +312,10 @@ int main() {
         using Clock = LiveRequests::Clock;
         const Clock::time_point t0 = Clock::now();
         LiveRequests live;
-        live.begin(21, "agent-a", "anthropic_messages", 70000, t0);
-        live.begin(22, "", "openai_chat_completions", 900, t0);
+        live.begin(21, {"agent-a", "anthropic_messages"}, 70000, t0);
+        live.begin(22, {"", "openai_chat_completions"}, 900, t0);
+        // A continuation after a server-side tool: the server request fed Engine request 103, then 104.
+        live.progress(21, {.engine_request_id = 103, .prompt_tokens = 60000});
         live.progress(21, {.engine_request_id = 104, .prompt_tokens = 70000, .reused_prompt_tokens = 65536});
         infernix::RequestMonitor monitor;
         monitor.progress_owner_request_id = 104;
@@ -338,7 +340,8 @@ int main() {
                                     .since_progress_seconds = 0.25});
         monitor.requests.push_back({.engine_request_id = 105, .phase = infernix::RequestMonitorPhase::Paused,
                                     .background = true, .prompt_tokens = 4000});
-        monitor.requests.push_back({.engine_request_id = 106, .phase = infernix::RequestMonitorPhase::Queued});
+        monitor.requests.push_back({.engine_request_id = 106, .phase = infernix::RequestMonitorPhase::Queued,
+                                    .decision = true});
         const Json body = Json::parse(render_monitor_json(monitor, live.rows(t0), 1234.5));
         failures += check(body["schema"] == "infernix.monitor/1" && body["time"] == 1234.5 &&
                               body["progress_owner"] == 104 && body["no_progress_s"] == 0.5 &&
@@ -363,9 +366,82 @@ int main() {
                           "an Engine-only request has no server identity");
         failures += check(body["requests"][2]["phase"] == "queued" && body["requests"][2]["id"].is_null(),
                           "a queued request's Engine id joins no server request before admission");
+        failures += check(body["requests"][2]["decision"] == true && body["requests"][0]["decision"] == false,
+                          "the monitor marks decisions");
         infernix::RequestMonitor idle;
         failures += check(Json::parse(render_monitor_json(idle, {}, 1.0))["progress_owner"].is_null(),
                           "no service turn renders null");
+    }
+
+    // GET /slots: llama.cpp's slot array, one object per lane (idle ones and the decision lane included),
+    // Infernix's facts under `infernix`, joined with the server request by any Engine id it fed.
+    {
+        using Clock = LiveRequests::Clock;
+        const Clock::time_point t0 = Clock::now();
+        LiveRequests live;
+        live.begin(31, {"agent-a", "anthropic_messages", "client-1", "sess-9"}, 900, t0);
+        live.progress(31, {.engine_request_id = 203, .prompt_tokens = 800});
+        live.progress(31, {.engine_request_id = 204, .prompt_tokens = 900, .reused_prompt_tokens = 512});
+        infernix::RequestMonitor monitor;
+        monitor.requests.push_back({.engine_request_id      = 204,
+                                    .phase                  = infernix::RequestMonitorPhase::Decode,
+                                    .lane                   = 0U,
+                                    .prompt_tokens          = 900,
+                                    .reused_prompt_tokens   = 512,
+                                    .computed_prompt_tokens = 388,
+                                    .output_tokens          = 101,
+                                    .age_seconds            = 3.0,
+                                    .prefill_seconds        = 0.5,
+                                    .decode_seconds         = 2.0});
+        monitor.requests.push_back({.engine_request_id      = 207,
+                                    .phase                  = infernix::RequestMonitorPhase::Prefill,
+                                    .lane                   = 2U,
+                                    .decision               = true,
+                                    .prompt_tokens          = 300,
+                                    .computed_prompt_tokens = 150,
+                                    .prefill_seconds        = 0.25});
+        monitor.requests.push_back({.engine_request_id = 205, .phase = infernix::RequestMonitorPhase::Paused});
+        monitor.requests.push_back({.engine_request_id = 206, .phase = infernix::RequestMonitorPhase::Queued});
+        const SlotsFacts facts{.lanes = 3, .decision_lanes = 1, .n_ctx = 4096, .speculative = true};
+        const Json slots = Json::parse(render_slots_json(monitor, live.rows(t0), facts));
+        failures += check(slots.is_array() && slots.size() == 3, "one slot object per lane");
+        const Json& first = slots[0];
+        failures += check(first["id"] == 0 && first["id_task"] == 204 && first["n_ctx"] == 4096 &&
+                              first["speculative"] == true && first["is_processing"] == true &&
+                              first["next_token"][0]["n_decoded"] == 101 && first["next_token"][0]["n_remain"] == -1 &&
+                              first["next_token"][0]["has_next_token"] == true,
+                          "a resident lane's llama.cpp fields");
+        const Json& own = first["infernix"];
+        failures += check(own["phase"] == "decode" && own["decision_lane"] == false && own["decision"] == false &&
+                              own["prompt_tokens"] == 900 && own["cached_tokens"] == 512 &&
+                              own["computed_prompt_tokens"] == 388 && own["output_tokens"] == 101 &&
+                              near(own["prefill_tps"].get<double>(), 776.0, 1e-9) &&
+                              near(own["decode_tps"].get<double>(), 50.0, 1e-9) && own["age_s"] == 3.0,
+                          "a resident lane's Infernix facts and its rates from the Engine's timings");
+        failures += check(own["request"]["id"] == 31 && own["request"]["label"] == "agent-a" &&
+                              own["request"]["protocol"] == "anthropic_messages" &&
+                              own["request"]["client_request_id"] == "client-1" &&
+                              own["request"]["session_id"] == "sess-9",
+                          "a continuation's lane keeps its server request and client identity");
+        failures += check(slots[1]["is_processing"] == false && slots[1]["id_task"] == -1 &&
+                              slots[1]["next_token"][0]["n_decoded"] == 0 && slots[1]["infernix"]["phase"] == "idle" &&
+                              !slots[1]["infernix"].contains("request"),
+                          "an idle lane");
+        const Json& asked = slots[2]["infernix"];
+        failures += check(slots[2]["id_task"] == 207 && asked["decision_lane"] == true && asked["decision"] == true &&
+                              asked["phase"] == "prefill" && near(asked["prefill_tps"].get<double>(), 600.0, 1e-9) &&
+                              asked["decode_tps"].is_null() && asked["request"].is_null(),
+                          "the decision lane holding a decision the server has not identified");
+        std::vector<std::string> keys;
+        for (const auto& item : first.items()) { keys.push_back(item.key()); }
+        std::sort(keys.begin(), keys.end());
+        failures += check(keys == std::vector<std::string>{"id", "id_task", "infernix", "is_processing", "n_ctx",
+                                                           "next_token", "speculative"},
+                          "a slot carries llama.cpp's fields and Infernix's, no request text");
+        failures += check(!slots_all_busy(monitor, facts), "an idle general lane is a free slot");
+        monitor.requests.push_back({.engine_request_id = 208, .phase = infernix::RequestMonitorPhase::Binding,
+                                    .lane = 1U});
+        failures += check(slots_all_busy(monitor, facts), "a free decision lane is no slot for an ordinary request");
     }
 
     // memory: what the server holds on the device, in RAM and on the SSD, by part, with the totals the launcher's

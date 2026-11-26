@@ -186,7 +186,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                 .model                  = request.model,
                                 .stream                 = request.stream,
                                 .output_tokens_explicit = request.output_tokens_explicit,
-                                .label                  = request_label(req)};
+                                .label                  = request_label(req),
+                                .client_request_id      = client_header_id(req, "x-request-id"),
+                                .session_id             = client_header_id(req, "x-session-id")};
     const GenerationConsumerMode consumer_mode =
         request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate;
     PreparedRequest prepared;

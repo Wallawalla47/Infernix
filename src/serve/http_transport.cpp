@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <stdexcept>
@@ -170,6 +171,16 @@ std::string request_label(const httplib::Request& request) {
                        std::all_of(label.begin(), label.end(),
                                    [](unsigned char c) { return c >= 32 && c < 127; });
     return valid ? label : std::string{};
+}
+
+std::string client_header_id(const httplib::Request& request, const char* header) {
+    if (request.get_header_value_count(header) != 1) { return {}; }
+    std::string value = request.get_header_value(header);
+    const bool valid  = !value.empty() && value.size() <= 128 &&
+                       std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                           return std::isalnum(c) != 0 || c == '.' || c == '_' || c == ':' || c == '-';
+                       });
+    return valid ? value : std::string{};
 }
 
 bool client_disconnected(const httplib::Request& request) { return request.is_connection_closed(); }

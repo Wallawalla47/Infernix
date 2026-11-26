@@ -366,14 +366,37 @@ const char* request_monitor_phase_name(infernix::RequestMonitorPhase phase) noex
     return "unknown";
 }
 
+namespace {
+
+// The server's request that fed Engine request `engine_request_id` (any of its generations), or end().
+std::vector<MetricsJsonActiveRequest>::const_iterator
+server_request_of(const std::vector<MetricsJsonActiveRequest>& active, std::uint64_t engine_request_id) {
+    return std::find_if(active.begin(), active.end(), [&](const MetricsJsonActiveRequest& row) {
+        return std::find(row.engine_request_ids.begin(), row.engine_request_ids.end(), engine_request_id) !=
+               row.engine_request_ids.end();
+    });
+}
+
+Json optional_text(const std::string& text) { return text.empty() ? Json(nullptr) : Json(text); }
+
+// The request holding lane `lane` (binding into it, or resident), or end().
+std::vector<infernix::RequestMonitorEntry>::const_iterator lane_holder(const infernix::RequestMonitor& monitor,
+                                                                       std::uint32_t lane) {
+    return std::find_if(monitor.requests.begin(), monitor.requests.end(),
+                        [&](const infernix::RequestMonitorEntry& entry) {
+                            return entry.lane == lane && entry.phase != infernix::RequestMonitorPhase::Queued &&
+                                   entry.phase != infernix::RequestMonitorPhase::Paused;
+                        });
+}
+
+} // namespace
+
 std::string render_monitor_json(const infernix::RequestMonitor& monitor,
                                 const std::vector<MetricsJsonActiveRequest>& active, double time_unix) {
     Json requests = Json::array();
     for (const infernix::RequestMonitorEntry& entry : monitor.requests) {
-        const auto server = std::find_if(active.begin(), active.end(), [&](const MetricsJsonActiveRequest& row) {
-            return row.engine_request_id != 0 && row.engine_request_id == entry.engine_request_id;
-        });
-        const bool known = server != active.end();
+        const auto server = server_request_of(active, entry.engine_request_id);
+        const bool known  = server != active.end();
         requests.push_back(Json{
             {"engine_id", entry.engine_request_id},
             {"id", known ? Json(server->id) : Json(nullptr)},
@@ -382,6 +405,7 @@ std::string render_monitor_json(const infernix::RequestMonitor& monitor,
             {"phase", request_monitor_phase_name(entry.phase)},
             {"lane", entry.lane ? Json(*entry.lane) : Json(nullptr)},
             {"background", entry.background},
+            {"decision", entry.decision},
             {"progress_owner", entry.progress_owner},
             {"recovery_pending", entry.recovery_pending},
             {"recovery_route", entry.recovery_route == infernix::GenerationRecoveryRoute::Replay ? "replay" : "none"},
@@ -408,6 +432,63 @@ std::string render_monitor_json(const infernix::RequestMonitor& monitor,
         {"requests", std::move(requests)},
     };
     return root.dump() + '\n';
+}
+
+std::string render_slots_json(const infernix::RequestMonitor& monitor,
+                              const std::vector<MetricsJsonActiveRequest>& active, const SlotsFacts& facts) {
+    Json slots                  = Json::array();
+    const std::uint32_t general = facts.lanes - std::min(facts.decision_lanes, facts.lanes);
+    for (std::uint32_t lane = 0; lane < facts.lanes; ++lane) {
+        const auto held = lane_holder(monitor, lane);
+        const bool busy = held != monitor.requests.end();
+        Json slot{
+            {"id", lane},
+            {"id_task", busy ? Json(held->engine_request_id) : Json(-1)},
+            {"n_ctx", facts.n_ctx},
+            {"speculative", facts.speculative},
+            {"is_processing", busy},
+            {"next_token", Json::array({Json{{"has_next_token", busy},
+                                              {"has_new_line", false},
+                                              {"n_remain", -1},
+                                              {"n_decoded", busy ? held->output_tokens : std::uint64_t{0}}}})},
+        };
+        Json own{{"phase", busy ? request_monitor_phase_name(held->phase) : "idle"}, {"decision_lane", lane >= general}};
+        if (busy) {
+            const infernix::RequestMonitorEntry& entry = *held;
+            const auto rate = [](double tokens, const std::optional<double>& seconds) {
+                return seconds && *seconds > 0.0 && tokens > 0.0 ? Json(tokens / *seconds) : Json(nullptr);
+            };
+            own["decision"]               = entry.decision;
+            own["background"]             = entry.background;
+            own["prompt_tokens"]          = entry.prompt_tokens;
+            own["cached_tokens"]          = entry.reused_prompt_tokens;
+            own["computed_prompt_tokens"] = entry.computed_prompt_tokens;
+            own["output_tokens"]          = entry.output_tokens;
+            own["prefill_tps"] = rate(static_cast<double>(entry.computed_prompt_tokens), entry.prefill_seconds);
+            own["decode_tps"]  = rate(entry.output_tokens > 1 ? static_cast<double>(entry.output_tokens - 1) : 0.0,
+                                      entry.decode_seconds);
+            own["age_s"]       = entry.age_seconds;
+            const auto server  = server_request_of(active, entry.engine_request_id);
+            own["request"]     = server == active.end()
+                                     ? Json(nullptr)
+                                     : Json{{"id", server->id},
+                                            {"label", optional_text(server->label)},
+                                            {"protocol", server->protocol},
+                                            {"client_request_id", optional_text(server->client_request_id)},
+                                            {"session_id", optional_text(server->session_id)}};
+        }
+        slot["infernix"] = std::move(own);
+        slots.push_back(std::move(slot));
+    }
+    return slots.dump() + '\n';
+}
+
+bool slots_all_busy(const infernix::RequestMonitor& monitor, const SlotsFacts& facts) {
+    const std::uint32_t general = facts.lanes - std::min(facts.decision_lanes, facts.lanes);
+    for (std::uint32_t lane = 0; lane < general; ++lane) {
+        if (lane_holder(monitor, lane) == monitor.requests.end()) { return false; }
+    }
+    return true;
 }
 
 void RequestHistory::done(const RequestLogContext& context, const GenerationOutcome& outcome) {
@@ -443,11 +524,10 @@ bool RequestHistory::rates(double& decode, double& prefill) const {
     return rates_valid_;
 }
 
-void LiveRequests::begin(std::uint64_t id, std::string label, std::string protocol,
-                         std::uint32_t prompt_tokens, Clock::time_point started) {
+void LiveRequests::begin(std::uint64_t id, LiveRequestIdentity identity, std::uint32_t prompt_tokens,
+                         Clock::time_point started) {
     Entry entry;
-    entry.label                  = std::move(label);
-    entry.protocol               = std::move(protocol);
+    entry.identity               = std::move(identity);
     entry.started                = started == Clock::time_point{} ? Clock::now() : started;
     entry.position.prompt_tokens = prompt_tokens;
     std::lock_guard lock(mutex_);
@@ -461,6 +541,11 @@ void LiveRequests::progress(std::uint64_t id,
     if (found == entries_.end()) { return; }
     found->second.admitted = true;
     found->second.position = observation;
+    std::vector<std::uint64_t>& fed = found->second.engine_request_ids;
+    if (observation.engine_request_id != 0 &&
+        std::find(fed.begin(), fed.end(), observation.engine_request_id) == fed.end()) {
+        fed.push_back(observation.engine_request_id);
+    }
 }
 
 void LiveRequests::end(std::uint64_t id) noexcept {
@@ -478,9 +563,12 @@ std::vector<MetricsJsonActiveRequest> LiveRequests::rows(Clock::time_point now) 
         const infernix::GenerationProgressObservation& p = entry.position;
         MetricsJsonActiveRequest row;
         row.id                = id;
-        row.engine_request_id = entry.admitted ? p.engine_request_id : 0U;
-        row.label         = entry.label;
-        row.protocol      = entry.protocol;
+        row.engine_request_id  = entry.admitted ? p.engine_request_id : 0U;
+        row.engine_request_ids = entry.engine_request_ids;
+        row.label              = entry.identity.label;
+        row.protocol           = entry.identity.protocol;
+        row.client_request_id  = entry.identity.client_request_id;
+        row.session_id         = entry.identity.session_id;
         row.phase         = !entry.admitted              ? ActiveRequestPhase::Queued
                             : p.generated_tokens != 0 ? ActiveRequestPhase::Decode
                                                       : ActiveRequestPhase::Prefill;

@@ -209,6 +209,27 @@ int test_request_label() {
     return failures;
 }
 
+int test_client_header_id() {
+    using namespace infernix::serve;
+    int failures = 0;
+    httplib::Request request;
+    failures += check(client_header_id(request, "x-request-id").empty(), "absent client id gave one");
+    request.set_header("X-Request-Id", "agent-7:turn_3.a");
+    failures += check(client_header_id(request, "x-request-id") == "agent-7:turn_3.a", "valid client id was not read");
+    request.set_header("x-request-id", "second");
+    failures += check(client_header_id(request, "x-request-id").empty(), "repeated client id accepted");
+    for (const std::string& value : {std::string{}, std::string(129, 'x'), std::string("with space"),
+                                     std::string("slash/no"), std::string("caf\xc3\xa9")}) {
+        request.headers.clear();
+        request.set_header("x-session-id", value);
+        failures += check(client_header_id(request, "x-session-id").empty(), "malformed client id accepted");
+    }
+    request.headers.clear();
+    request.set_header("x-session-id", std::string(128, 'x'));
+    failures += check(client_header_id(request, "x-session-id").size() == 128, "128-character client id rejected");
+    return failures;
+}
+
 int test_ngram_generation() {
     using namespace infernix;
     using namespace infernix::serve;
@@ -551,7 +572,7 @@ int test_inherited_socket_liveness() {
 } // namespace
 
 int main() {
-    int failures = test_ngram_identity() + test_request_label() + test_ngram_generation() + test_sse_transport() +
+    int failures = test_ngram_identity() + test_request_label() + test_client_header_id() + test_ngram_generation() + test_sse_transport() +
                    test_sse_response_headers() + test_prompt_json_member_order() +
                    test_schema_number_precision() + test_json_nesting();
 #if defined(__linux__) || defined(_WIN32)

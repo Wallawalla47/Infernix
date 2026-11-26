@@ -185,6 +185,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
 | `GET /metrics?format=json` | JSON snapshot: engine identity, live gauges, totals, and the last 128 terminal requests (`Accept: application/json` also selects it) |
 | `GET /monitor` | each request the Engine holds now: phase, lane, service turn, recovery and progress ([Request monitor](#request-monitor)) |
+| `GET /slots` | llama.cpp's slot array, one object per lane, for supervisors written for llama.cpp's server ([Slots](#slots)) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -2590,11 +2591,50 @@ curl http://127.0.0.1:8080/monitor
 | `requests[].phase` | `queued`, `binding` (restoring cached state into a lane), `prefill`, `replay` (a resume recomputing its history), `pausing`, `paused`, `decode`, `control` (forced control tokens) or `finishing` |
 | `requests[].lane` | its lane while it holds one, else `null` |
 | `requests[].background` | the Engine's idle-time prefill of a finished turn |
+| `requests[].decision` | a `/v1/decide` question ([Decisions](#decisions)) |
 | `requests[].progress_owner`, `recovery_pending` | it owns the service turn; a resumed request still protects its recovery capacity |
 | `requests[].recovery_route` | `replay` when its latest resume recomputed history, else `none` |
 | `requests[].prompt_tokens`, `reused_tokens`, `computed_prompt_tokens`, `output_tokens` | its prompt, the prefix its binding reused, the prompt tokens computed since, and the tokens it has generated |
 | `requests[].preemptions`, `snapshot_restores`, `replay_restores`, `replayed_tokens` | its pauses, its resumes from a snapshot at the paused frontier and by Replay, and the history tokens Replay recomputed |
 | `requests[].age_s`, `paused_s`, `since_progress_s` | seconds since submission, paused in total, and since its last committed progress (prompt prefilled, history replayed or output committed; `null` before any) |
+
+A server request that continues after a server-side tool (Messages, Responses) runs one Engine request per
+generation; each of them joins the server request's `id`.
+
+### Slots
+
+`GET /slots` answers llama.cpp's slot array (its server's `GET /slots`), so supervisors and dashboards
+written for llama.cpp read Infernix's lanes unchanged: one object per lane in lane order, idle lanes and
+`--decision-lanes` included, from the same Engine publication as `/monitor`. It follows the server's API-key
+authentication, sends `Cache-Control: no-store`, and carries no request text. `?fail_on_no_slot=1` answers 503
+(`no_slot_available`) when every lane an ordinary request can take is held; a free decision lane does not
+count, since only questions take it. The launcher's port does not forward it (as for `/monitor`): ask the
+model's server.
+
+```bash
+curl http://127.0.0.1:8080/slots
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | the lane |
+| `id_task` | the Engine request id holding it (`engine_id` in `/monitor`), `-1` when idle |
+| `n_ctx` | `--max-context` |
+| `speculative` | a drafter is configured (`--spec` other than `none`) |
+| `is_processing` | a request holds the lane (binding into it, prefilling, replaying, generating, pausing or finishing) |
+| `next_token[0]` | `n_decoded`: tokens it has generated; `has_next_token`: as `is_processing`; `has_new_line` `false` and `n_remain` `-1` (not tracked) |
+| `infernix.phase` | `idle`, or the holder's `/monitor` phase |
+| `infernix.decision_lane` | the lane is one of the `--decision-lanes` |
+| `infernix.decision`, `background` | the holder is a `/v1/decide` question; the Engine's idle-time prefill |
+| `infernix.prompt_tokens`, `cached_tokens`, `computed_prompt_tokens`, `output_tokens` | as `/monitor`'s `prompt_tokens`, `reused_tokens`, `computed_prompt_tokens`, `output_tokens` |
+| `infernix.prefill_tps` | computed prompt tokens per second from its admission to its first token (to now while it has none); `null` before any |
+| `infernix.decode_tps` | tokens per second from its first output token to its latest; `null` before a second |
+| `infernix.age_s` | seconds since submission |
+| `infernix.request` | the server request (`id`, `label`, `protocol`) with the client's `X-Request-Id` and `X-Session-Id` (`client_request_id`, `session_id`: 1-128 characters of `[A-Za-z0-9._:-]`, else `null`); `null` for the Engine's idle-time prefill |
+
+The rates come from the Engine's own timestamps, so every poller sees the same figures however often it
+polls; they include the request's pauses and the other lanes' work between its units. llama.cpp's
+`params` (the request's sampling) are not reported; the `infernix` fields are absent on an idle lane.
 
 ## Structured request log
 

@@ -198,6 +198,7 @@ void EngineCore<Instance>::publish_runtime_stats() {
         out.phase                  = phase;
         out.lane                   = lane;
         out.background             = request.background;
+        out.decision               = request.is_decision();
         out.progress_owner         = request.id == live.progress_owner_request_id;
         out.recovery_pending       = request.recovery_pending;
         out.recovery_route         = request.recovery_route;
@@ -214,6 +215,13 @@ void EngineCore<Instance>::publish_runtime_stats() {
             static_cast<double>(request.paused_ns + (request.paused_at ? elapsed_ns(*request.paused_at, now) : 0)) * 1.0e-9;
         if (request.last_progress) {
             out.since_progress_seconds = std::chrono::duration<double>(now - *request.last_progress).count();
+        }
+        if (request.admitted_at) {
+            out.prefill_seconds =
+                std::chrono::duration<double>(request.first_token.value_or(now) - *request.admitted_at).count();
+        }
+        if (request.first_token && request.last_token && *request.last_token > *request.first_token) {
+            out.decode_seconds = std::chrono::duration<double>(*request.last_token - *request.first_token).count();
         }
         return out;
     };

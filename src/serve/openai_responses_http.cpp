@@ -401,6 +401,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         .output_tokens_explicit            = request.requested_max_output_tokens.has_value(),
         .preserve_thinking_semantic_change = resolved.preserve_thinking_semantic_change,
         .label                             = request_label(req),
+        .client_request_id                 = client_header_id(req, "x-request-id"),
+        .session_id                        = client_header_id(req, "x-session-id"),
     };
     PreparedRequest prepared;
     try {

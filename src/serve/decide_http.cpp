@@ -117,6 +117,8 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
             .stream                 = false,
             .output_tokens_explicit = true,
             .label                  = request_label(req),
+            .client_request_id      = client_header_id(req, "x-request-id"),
+            .session_id             = client_header_id(req, "x-session-id"),
         };
         try {
             run.prepared.emplace(service_->prepare(

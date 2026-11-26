@@ -17,6 +17,9 @@ struct RequestLogContext {
     std::uint64_t id = 0;
     std::string http_request_id;
     std::string label; // X-Infernix-Request-Label (empty: none)
+    // The client's X-Request-Id and X-Session-Id (client_header_id; empty: none), for the live views.
+    std::string client_request_id;
+    std::string session_id;
     std::string response_id;
     std::string protocol;
     std::string model;
@@ -54,6 +57,8 @@ struct RequestLogMetadata {
     bool preserve_thinking_semantic_change = false;
     std::string label;
     std::optional<ReasoningRestore> reasoning; // RequestLogContext::reasoning
+    std::string client_request_id;             // RequestLogContext::client_request_id
+    std::string session_id;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
