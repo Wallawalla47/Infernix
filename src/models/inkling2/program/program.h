@@ -338,6 +338,9 @@ struct ProgramOptions {
     std::uint32_t prefix_max_new_taps   = 8;
     std::uint32_t prefix_ladder_tokens  = 4096;
     std::uint32_t prefix_min_gap_tokens = 1024;
+    // In-flight coalescing (hybrid-prefix-cache-spec §12.2): the longest predicted wait for a prefilling sibling's
+    // snapshot a fresh request takes instead of prefilling the shared prefix again (0: never waits).
+    double prefix_coalesce_wait_seconds = 0.0;
     // The product's control over the shutdown save (--prefix-cache-file; a second Ctrl+C abandons it).
     PrefixCacheSaveControl prefix_save;
     // The SSD tier below the Host tier (0: none): its size, directory, write budget (0: none) and kept file.

@@ -19,6 +19,8 @@
 // 10. Images (INFERNIX_INKLING2_VISION_ARTIFACT): another image never resumes past the image; the same image does.
 // 11. The SSD tier (INFERNIX_INKLING2_PREFIX_SSD_ONLY runs it alone): what the Host tier gives up is written back, read
 //     back on a hit, and resumes as cold.
+// 13. One document, different questions: sequentially, a question resumes at the matched blocks' end the one before it
+//     snapshotted; at once, the followers wait for the first's snapshot at their divergence (in-flight coalescing).
 // 12. RAM pressure (--ram-resize auto, a faked availability; INFERNIX_INKLING2_PREFIX_RAM_ONLY runs it alone): the Host
 //     tier gives chunks back with its entries moved below the cut, a continuation resumes from them as cold, and the
 //     tier grows back once RAM frees.
@@ -346,6 +348,70 @@ int main() {
             const Tokens cold_again = cold(continuation);
             std::cout << "C = 2: the continuation reused " << again.reused_prompt_tokens << " prompt tokens\n";
             require(again.generated_token_ids == cold_again, "C = 2: the continuation differs from cold");
+        }
+        // 13. One 3,000-token document and different 40-token questions (INT8 KV, chunks of 512, so the first prompt
+        //     takes several units and the followers are quoted while it prefills). Sequential: a second question
+        //     resumes below the document's end (the first's snapshots), so it snapshots the matched blocks' end, where
+        //     a third resumes. At once (in-flight coalescing, hybrid-prefix-cache-spec §12.2): three questions on a
+        //     fresh Engine; the followers wait for the first's snapshot at their divergence and resume there. Every
+        //     request's tokens equal its prompt's cold run alone.
+        {
+            infernix::EngineOptions options = cache_options(artifact, KvCacheStorage::Int8Group64, 512, 8 * kContext);
+            options.max_concurrency         = 3;
+            const auto questions = [&](infernix::Engine& engine, int count) {
+                const Tokens document = long_prompt(engine, 3000, 19);
+                std::vector<Tokens> out;
+                for (int i = 0; i < count; ++i) {
+                    Tokens prompt         = document;
+                    const Tokens question = long_prompt(engine, 40, 1000 + 97 * i);
+                    prompt.insert(prompt.end(), question.begin(), question.end());
+                    out.push_back(std::move(prompt));
+                }
+                return out;
+            };
+            const std::uint32_t boundary = 3000 / 64 * 64; // the block boundary below the divergence
+            std::vector<Tokens> cold;
+            {
+                infernix::Engine engine(options);
+                for (const Tokens& prompt : questions(engine, 6)) {
+                    cold.push_back(engine.generate(engine.prepare_tokens(prompt), infernix::test::resume_probe_request(16, false))
+                                       .generated_token_ids);
+                }
+            }
+            {
+                infernix::Engine engine(options);
+                const std::vector<Tokens> prompts = questions(engine, 3);
+                std::vector<std::uint32_t> reused;
+                for (std::size_t i = 0; i < prompts.size(); ++i) {
+                    const infernix::GenerationResult r =
+                        engine.generate(engine.prepare_tokens(prompts[i]), infernix::test::resume_probe_request(16, true));
+                    require(r.generated_token_ids == cold[i], "document, sequential: question " + std::to_string(i) +
+                                                                  " differs from its cold run");
+                    reused.push_back(r.reused_prompt_tokens);
+                }
+                std::cout << "document, sequential: reused " << reused[0] << ", " << reused[1] << ", " << reused[2]
+                          << " prompt tokens\n";
+                require(reused[2] >= boundary, "document, sequential: the third question did not resume at the matched end");
+            }
+            {
+                infernix::Engine engine(options);
+                const std::vector<Tokens> prompts = questions(engine, 6);
+                std::vector<infernix::GenerationHandle> handles;
+                for (std::size_t i = 3; i < 6; ++i) {
+                    handles.push_back(engine.submit(engine.prepare_tokens(prompts[i]), infernix::test::resume_probe_request(16, true)));
+                }
+                std::vector<std::uint32_t> reused;
+                for (std::size_t i = 0; i < handles.size(); ++i) {
+                    const infernix::GenerationResult r = handles[i].wait();
+                    require(r.generated_token_ids == cold[3 + i], "document, at once: question " + std::to_string(3 + i) +
+                                                                      " differs from its cold run");
+                    reused.push_back(r.reused_prompt_tokens);
+                }
+                std::cout << "document, at once: reused " << reused[0] << ", " << reused[1] << ", " << reused[2]
+                          << " prompt tokens\n";
+                require(reused[1] >= boundary && reused[2] >= boundary,
+                        "document, at once: a follower did not resume at the first's divergence snapshot");
+            }
         }
         // 5. A Host-tier restore: the pool holds the lane's context alone, so the unrelated prompt takes every page the
         //    cache held and the continuation's path comes back from the Host tier.

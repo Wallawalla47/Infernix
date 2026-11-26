@@ -100,6 +100,9 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options, s
             .prefix_max_new_taps   = options.context_cache.hybrid.max_new_taps.value_or(8U),
             .prefix_ladder_tokens  = options.context_cache.hybrid.tap_ladder_tokens.value_or(4096U),
             .prefix_min_gap_tokens = options.context_cache.hybrid.tap_min_gap_tokens.value_or(1024U),
+            // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait is kept well inside
+            // its queue timeout (as the Qwen families keep it).
+            .prefix_coalesce_wait_seconds = static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0,
             .prefix_save           = options.context_cache.hybrid.persistent_save,
             .prefix_ssd_bytes      = options.context_cache.ssd_capacity_bytes,
             .prefix_ssd_directory  = options.context_cache.ssd_directory,

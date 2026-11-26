@@ -188,6 +188,30 @@ KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec
 // Whether the Program runs the drafter (its two planes in every page).
 bool dspark_planes(const ProgramOptions& o) { return o.dspark && !o.causal_scoring; }
 
+// The prompt route's time (runtime/prefix_cache/cost.h's model): a linear fit of its measured rates (RTX 5090,
+// infernix_bench C = 1, pp2048, 2026-11-21: 9,514 tokens a second in chunks of 512, 16,400 in chunks of 2,048): ~30 ms
+// a call and 1 / 21,600 s a token, and attention's 1.0 ns a (query, key) pair (2026-11-26, the owner's configuration,
+// INT8 KV, chunks of 4,096, the prompt kernel's far-unit skip in: a cold 122,215-token prompt at 8,905 tokens a second,
+// 0.96 ns; 7,544 tokens after 114,688 at 5,475, 1.08 ns). It prices the prefix cache's sources and its coalescing
+// waits (await_sibling); a narrow call's own cost is split_seconds'.
+runtime::prefix_cache::CacheCostModel prompt_cost(const ProgramOptions& o) {
+    runtime::prefix_cache::CacheCostModel cost;
+    cost.chunk_tokens           = o.prefill_chunk;
+    cost.chunk_seconds          = 30.0e-3;
+    cost.token_seconds          = 1.0 / 21600.0;
+    cost.attention_pair_seconds = 1.0e-9;
+    if (o.lossless) {
+        // The lossless route's calls (lossless-route.md §3a; inkling2-mini, RTX 5090, 2026-11-23): about 0.27 s a call
+        // (infernix --lossless, one-column decode calls at a 20-token context, 3.6 tok/s), then 3.1 ms a token and
+        // 0.89 us a (query, key) pair, fitted to its scoring runs (infernix-perplexity: 11 windows of 2,048 tokens in
+        // 93.7 s, 2 of 9,216 in 133.5 s).
+        cost.chunk_seconds          = 0.27;
+        cost.token_seconds          = 3.1e-3;
+        cost.attention_pair_seconds = 0.89e-6;
+    }
+    return cost;
+}
+
 // The full visits' page pool (its scratch page included), shared by the lanes, and their block-table rows in one
 // backing allocation. The pool holds at least one lane's whole context, so a request alone always completes.
 struct KvLayout {
@@ -296,6 +320,7 @@ struct Lane {
     std::uint64_t policy_rounds = 0;
     std::int32_t step_cap = ops::inkling2::kMarkovSteps; // the calibrated length's Markov steps a round drafts
     std::uint64_t rounds = 0, drafted = 0, accepted = 0, fallback = 0;
+    std::uint64_t rates_plain = 0; // its rounds of several rows the measured rates left plain (dspark_rows_round)
     double draft_ms = 0, gap_ms = 0, verify_ms = 0; // device-side sums over the rounds (CUDA events)
     std::array<std::uint64_t, ops::inkling2::kMarkovSteps> accepted_at{}; // rounds accepting draft i
     // The prefix cache: whether the request reuses and publishes, its keys (a block past the prompt's full blocks under
@@ -463,23 +488,10 @@ public:
                                .ladder_tokens  = o_.prefix_ladder_tokens,
                                .min_gap_tokens = o_.prefix_min_gap_tokens};
             config.kv_pages = pool_->capacity_pages();
-            // The source choice's machine model (runtime/prefix_cache/cost.h), a linear fit of the prompt route's measured
-            // rates (RTX 5090, infernix_bench C = 1, pp2048, 2026-11-21: 9,514 tokens a second in chunks of 512, 16,400
-            // in chunks of 2,048): ~30 ms a call and 1 / 21,600 s a token. Host-to-Device at 22 GB/s, an estimate for
-            // the PCIe x8 link (restores are not measured yet). It only ranks a snapshot against a root start.
-            config.index.cost.chunk_tokens           = o_.prefill_chunk;
-            config.index.cost.chunk_seconds          = 30.0e-3;
-            config.index.cost.token_seconds          = 1.0 / 21600.0;
-            config.index.cost.attention_pair_seconds = 0.0;
-            if (o_.lossless) {
-                // The lossless route's calls (lossless-route.md §3a; inkling2-mini, RTX 5090, 2026-11-23): about 0.27 s a
-                // call (infernix --lossless, one-column decode calls at a 20-token context, 3.6 tok/s), then 3.1 ms a
-                // token and 0.89 us a (query, key) pair, fitted to its scoring runs (infernix-perplexity: 11 windows of
-                // 2,048 tokens in 93.7 s, 2 of 9,216 in 133.5 s).
-                config.index.cost.chunk_seconds          = 0.27;
-                config.index.cost.token_seconds          = 3.1e-3;
-                config.index.cost.attention_pair_seconds = 0.89e-6;
-            }
+            // The source choice's machine model (runtime/prefix_cache/cost.h): the prompt route's rates (prompt_cost) and
+            // Host-to-Device at 22 GB/s, an estimate for the PCIe x8 link (restores are not measured yet). It ranks a
+            // snapshot against a root start, values snapshots for eviction and prices a coalescing wait (await_sibling).
+            config.index.cost                        = prompt_cost_;
             config.index.cost.h2d_bytes_per_second   = 22.0e9;
             config.ssd_bytes                         = o_.prefix_ssd_bytes;
             config.ssd_directory                     = o_.prefix_ssd_directory;
@@ -597,15 +609,17 @@ public:
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
             return excluded(spans, c.frontier) || c.filling_blocks != 0;
         });
-        if (match.candidates.empty()) { return {root}; }
         std::optional<std::size_t> picked;
         if (r != nullptr) {
             for (std::size_t i = 0; i < match.candidates.size(); ++i) {
                 if (!picked || match.candidates[i].frontier > match.candidates[*picked].frontier) { picked = i; }
             }
-        } else {
+        } else if (!match.candidates.empty()) {
             picked = prefix_->index().choose(match, n).candidate;
         }
+        // A fresh request sharing more with a prefilling sibling than the cache serves now waits for its snapshot
+        // (await_sibling): no sources, and the Engine quotes it again at each of the sibling's prefill boundaries.
+        if (r == nullptr && await_sibling(b, picked ? match.candidates[*picked].frontier : 0U)) { return {}; }
         if (!picked) { return {root}; }
         const pc::MatchCandidate& c = match.candidates[*picked];
         if (c.ssd_bytes != 0) {
@@ -629,6 +643,91 @@ public:
         chosen.reuse_path          = PrefixReusePath::HybridSnapshot;
         chosen.cached_block_tokens = root.cached_block_tokens;
         return {chosen, root};
+    }
+
+    // In-flight coalescing (hybrid-prefix-cache-spec §12.2, as the Qwen families coalesce): a fresh request whose prompt
+    // shares more with a lane still prefilling its prompt than the cache serves now (`reuse`: its chosen source's
+    // frontier, 0 at a root start) waits for that lane's snapshot at their divergence instead of prefilling the shared
+    // part again (four requests over one long document and different questions prefill the document's tail once).
+    // The target is the block boundary below the divergence (whole blocks of equal keys, a block's key carrying the
+    // media items that begin before its end, and equal tokens; at most n - 1 and inside the sibling's prompt), added to
+    // the sibling's taps as an exact boundary tap (neither lineage supersedes its snapshot); a planned exact tap of the
+    // sibling's at or below it serves instead when prefilling the tokens between them costs no more than a call. It
+    // waits only when the prefill it saves exceeds the split it may add, and when twice the sibling's predicted prefill
+    // to the target (other lanes' decode rounds interleave) is within the wait limit. The resumed request's bits are its
+    // cold run's: the prompt route is chunk-invariant and a snapshot is the state its positions computed.
+    // What an exact tap at `position` adds to the prefill it splits: a call, whose narrow remainder's attention walks
+    // every key before it on few CTAs (the prompt kernel's grid is its 64-column tiles x the KV heads), not the cost
+    // model's chunk_seconds alone. Measured (2026-11-26, RTX 5090, INT8 KV, the forward test's prefill profile after
+    // 122,000 positions): a 1-column call 134.9 ms, 125.5 of it attention; ~10 ms plus 1.0 us a key before it (served:
+    // a 56-token tail after 122,176 160 ms).
+    [[nodiscard]] double split_seconds(std::uint32_t position) const noexcept {
+        return prompt_cost_.chunk_seconds + 1.0e-6 * static_cast<double>(position);
+    }
+
+    [[nodiscard]] bool await_sibling(const BasePlanImpl& b, std::uint32_t reuse) {
+        namespace pc = runtime::prefix_cache;
+        if (o_.prefix_coalesce_wait_seconds <= 0.0) { return false; }
+        const auto n = static_cast<std::uint32_t>(b.tokens.size());
+        if (n < 2) { return false; }
+        const pc::CacheCostModel& cost = prefix_->index().config().cost;
+        const auto extra = [](const std::vector<std::uint64_t>& extras, std::size_t i) {
+            return i < extras.size() ? extras[i] : 0U;
+        };
+        struct Wait {
+            std::uint32_t lane = 0, target = 0;
+            bool plan_tap = false;
+        };
+        std::optional<Wait> best;
+        for (std::uint32_t i = 0; i < lanes_.size(); ++i) {
+            const Lane& lane = lanes_[i];
+            if (!lane.bound || lane.replay || !lane.prefix.reuse || lane.processed >= lane.prompt_tokens) { continue; }
+            const std::uint32_t limit = std::min<std::uint32_t>(n - 1U, lane.prompt_tokens - 1U);
+            const auto equal          = static_cast<std::uint32_t>(
+                std::mismatch(b.tokens.begin(), b.tokens.begin() + limit, lane.tokens.begin()).first - b.tokens.begin());
+            std::size_t blocks = equal / pc::kBlockTokens;
+            for (std::size_t k = 0; k < blocks; ++k) {
+                if (k >= b.block_hashes.size() || k >= lane.prefix.hashes.size() || b.block_hashes[k] != lane.prefix.hashes[k] ||
+                    extra(b.block_extras, k) != extra(lane.prefix.extras, k)) {
+                    blocks = k;
+                    break;
+                }
+            }
+            const auto aligned = static_cast<std::uint32_t>(blocks * pc::kBlockTokens);
+            if (aligned <= reuse || aligned <= lane.processed || aligned <= lane.prefix.base) { continue; }
+            Wait wait{.lane = i, .target = aligned, .plan_tap = true};
+            for (const pc::PlannedTap& tap : lane.prefix.taps) {
+                if (tap.position > aligned) { break; }
+                if (tap.placement != pc::TapPlacement::Exact || tap.position <= lane.processed || tap.position <= reuse) {
+                    continue;
+                }
+                if (tap.position == aligned || cost.prefill_seconds(tap.position, aligned - tap.position) <= split_seconds(aligned)) {
+                    wait = Wait{.lane = i, .target = tap.position, .plan_tap = false}; // planned already
+                }
+            }
+            if (excluded(image_spans(lane.images), wait.target) ||
+                std::find(lane.prefix.frontiers.begin(), lane.prefix.frontiers.end(), wait.target) != lane.prefix.frontiers.end()) {
+                continue;
+            }
+            const double saved     = cost.prefill_seconds(reuse, wait.target - reuse);
+            const double predicted = 2.0 * cost.prefill_seconds(lane.processed, wait.target - lane.processed);
+            if (saved > (wait.plan_tap ? split_seconds(wait.target) : 0.0) && predicted <= o_.prefix_coalesce_wait_seconds &&
+                (!best || wait.target > best->target)) {
+                best = wait;
+            }
+        }
+        if (!best) { return false; }
+        // The snapshot the waiting request resumes from is where two conversations diverge: a boundary.
+        std::vector<pc::PlannedTap>& taps = lanes_[best->lane].prefix.taps;
+        const auto at = std::lower_bound(taps.begin(), taps.end(), best->target,
+                                         [](const pc::PlannedTap& tap, std::uint32_t position) { return tap.position < position; });
+        if (at != taps.end() && at->position == best->target) {
+            at->boundary  = true;
+            at->placement = pc::TapPlacement::Exact;
+        } else {
+            taps.insert(at, pc::PlannedTap{.position = best->target, .placement = pc::TapPlacement::Exact, .boundary = true});
+        }
+        return true;
     }
 
     // Makes `pages` free in the pool: evicts cached blocks (none a lane maps), waiting for a transfer when only
@@ -893,6 +992,25 @@ public:
         for (const pc::MatchCandidate& c : match.candidates) { lane.prefix.frontiers.push_back(c.frontier); }
         const auto spans = exclusions(b);
         lane.prefix.taps = pc::plan_taps(n, lane.prefix.base, b.tap_hints, lane.prefix.frontiers, spans, prefix_->taps());
+        // Cached blocks past the lane's base with no state to resume at their end: another prompt shares them and
+        // diverged there (one document, another question), so the next prompt diverging at or past that end would
+        // prefill from the base again. An exact boundary tap at the matched path's end serves it (in-flight coalescing's
+        // tap, for a request that arrives after this one), when the tokens it saves cost more than the split.
+        const auto matched = static_cast<std::uint32_t>(match.path.size()) * pc::kBlockTokens;
+        const pc::CacheCostModel& cost = prefix_->index().config().cost;
+        if (matched > lane.prefix.base + pc::kMinimumTapSeparation && matched <= n - 1U && !excluded(spans, matched) &&
+            std::find(lane.prefix.frontiers.begin(), lane.prefix.frontiers.end(), matched) == lane.prefix.frontiers.end() &&
+            cost.prefill_seconds(lane.prefix.base, matched - lane.prefix.base) > split_seconds(matched)) {
+            std::vector<pc::PlannedTap>& taps = lane.prefix.taps;
+            const auto at = std::lower_bound(taps.begin(), taps.end(), matched,
+                                             [](const pc::PlannedTap& tap, std::uint32_t position) { return tap.position < position; });
+            if (at != taps.end() && at->position == matched) {
+                at->boundary  = true;
+                at->placement = pc::TapPlacement::Exact;
+            } else {
+                taps.insert(at, pc::PlannedTap{.position = matched, .placement = pc::TapPlacement::Exact, .boundary = true});
+            }
+        }
     }
 
     ContextProgress poll_context() {
@@ -1264,11 +1382,13 @@ public:
             RowsCost& cost = rows_cost(sequences);
             if (drafted) {
                 // A drafted round whose width verified nothing: its drafts were spent for the rows' plain tokens.
-                ewma(cost.draft_wall, static_cast<double>(ns) * 1e-6);
-                ewma(cost.draft_tokens, static_cast<double>(rows.size()));
+                ++cost.draft_samples;
+                rate(cost.draft_wall, static_cast<double>(ns) * 1e-6, cost.draft_samples);
+                rate(cost.draft_tokens, static_cast<double>(rows.size()), cost.draft_samples);
             } else if (device_ms > 0.0F) {
-                ewma(cost.plain_ms, device_ms);
-                ewma(cost.plain_wall, static_cast<double>(ns) * 1e-6);
+                ++cost.plain_samples;
+                rate(cost.plain_ms, device_ms, cost.plain_samples);
+                rate(cost.plain_wall, static_cast<double>(ns) * 1e-6, cost.plain_samples);
             }
         }
         for (const std::uint32_t index : rows) {
@@ -2671,6 +2791,7 @@ private:
         double plain_ms = 0;                                         // a plain round's forward and sample (device)
         std::array<double, ops::inkling2::kDSparkBlock> verify_ms{}; // [k]: the verify call of 1 + k columns a row
         double plain_wall = 0, draft_wall = 0, draft_tokens = 0;     // host ms of a round; a drafted round's tokens
+        std::uint64_t plain_samples = 0, draft_samples = 0;          // the rates' samples so far (rate)
         std::uint64_t rounds = 0, skipped = 0;                       // drafted rounds; plain ones since the last draft
         // What the policy did since the last report (report_rows): the widths it chose, the rounds it left plain, the
         // dealt rounds' expected tokens over K each's at the same columns, and the rounds that dealt a row every draft
@@ -2705,6 +2826,14 @@ private:
     static constexpr std::uint64_t kRowsPlainProbe = 64;
     static void ewma(double& value, double sample) noexcept {
         value = value == 0.0 ? sample : (1.0 - kCostWeight) * value + kCostWeight * sample;
+    }
+    // The plain and drafted rates: the mean of a bucket's first 1 / kCostWeight samples, then the EWMA. An EWMA seeded
+    // at full weight by a cold bucket's first round (its captures excluded, its text's first tokens) that started low
+    // recovered by a tenth a probe, one probe in kRowsProbe rounds: cold 2K buckets of four rows left 143-375 rounds
+    // plain where drafting was faster (2026-11-26). `samples` counts this one.
+    static void rate(double& value, double sample, std::uint64_t samples) noexcept {
+        const double weight = std::max(kCostWeight, 1.0 / static_cast<double>(samples));
+        value               = samples <= 1 ? sample : (1.0 - weight) * value + weight * sample;
     }
 
     // Whether every row could draft: its one pending input (no forced tokens), its drafter context (F >= 1), a whole
@@ -2747,6 +2876,7 @@ private:
             return true;
         }
         ++cost.plain_rounds;
+        for (const SequenceHandle& s : sequences) { ++lanes_[lane_of(s)].rates_plain; }
         return false;
     }
 
@@ -3075,8 +3205,9 @@ private:
         const std::uint64_t transaction = ++transaction_;
         const std::uint64_t ns          = elapsed_ns(start);
         if (!round_captured_) {
-            ewma(cost.draft_wall, static_cast<double>(ns) * 1e-6);
-            ewma(cost.draft_tokens, static_cast<double>(committed));
+            ++cost.draft_samples;
+            rate(cost.draft_wall, static_cast<double>(ns) * 1e-6, cost.draft_samples);
+            rate(cost.draft_tokens, static_cast<double>(committed), cost.draft_samples);
         }
         for (std::size_t r = 0; r < n; ++r) {
             lanes_[index[r]].decode_ns += ns;
@@ -3178,13 +3309,15 @@ private:
         if (!drafter_ || lane.rounds == 0 || !o_.diagnostics.callback) { return; }
         try {
             const double n = static_cast<double>(lane.rounds);
-            char text[256];
+            char text[320];
             std::snprintf(text, sizeof(text),
                           "Inkling 2 DSpark: %llu rounds (%llu plain), %llu of %llu drafts accepted; a round's draft "
-                          "%.3f ms, host gap %.3f ms, verify call %.3f ms (device means)",
+                          "%.3f ms, host gap %.3f ms, verify call %.3f ms (device means); %llu rounds of several rows "
+                          "plain by the rates",
                           static_cast<unsigned long long>(lane.rounds), static_cast<unsigned long long>(lane.fallback),
                           static_cast<unsigned long long>(lane.accepted), static_cast<unsigned long long>(lane.drafted),
-                          lane.draft_ms / n, lane.gap_ms / n, lane.verify_ms / n);
+                          lane.draft_ms / n, lane.gap_ms / n, lane.verify_ms / n,
+                          static_cast<unsigned long long>(lane.rates_plain));
             o_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Debug, .message = text});
         } catch (...) {}
     }
@@ -3701,6 +3834,7 @@ private:
     const TextConfig& c_;
     DeviceContext& device_;
     ProgramOptions o_;
+    const runtime::prefix_cache::CacheCostModel prompt_cost_ = prompt_cost(o_); // after o_
     ProgramDevicePlan plan_;
     Forward forward_;
     std::unique_ptr<LosslessForward> lossless_; // --lossless (scored windows; generation's cache form)
