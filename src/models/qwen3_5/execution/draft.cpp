@@ -323,19 +323,10 @@ void copy_leading_columns(const Tensor& source, const Tensor& destination, std::
 
 } // namespace
 
-// Whether ops::linear_add registers the weight's problem (infernix/ops/linear_add.h): a DSpine drafter's
-// projections that it does not (the 27B drafter's Q8 attention output [5120,4096]) project, then add.
+// Whether ops::linear_add registers the weight's problem (ops::linear_add_supported): a DSpine drafter's
+// projections that it does not (the 27B drafter's attention output [5120,4096]) project, then add.
 bool dspine_fused_add(const Weight& w) {
-    const auto n = w.n, k = w.k;
-    switch (w.qtype) {
-    case QType::Q8_G32_FP16:
-        return w.layout == QuantLayout::RowSplit &&
-               ((n == 2048 && (k == 4096 || k == 6144)) || (n == 5120 && (k == 6144 || k == 17408)));
-    case QType::BF16:
-        return n == 5120 && k == 6144;
-    default:
-        return false;
-    }
+    return ops::linear_add_supported(w.qtype, w.layout, static_cast<std::int32_t>(w.n), static_cast<std::int32_t>(w.k));
 }
 
 namespace {

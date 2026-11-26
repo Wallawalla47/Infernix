@@ -226,6 +226,14 @@ int main(int argc, char** argv) {
         std::cout << "SKIP: set INFERNIX_TEST_ARTIFACT to an explicit Qwen3.5 artifact\n";
         return 77;
     }
+    for (int a = 1; a < argc; ++a) {
+        const std::string_view drafter = argv[a];
+        const char* dspine = std::getenv("INFERNIX_TEST_DSPINE_DRAFTER");
+        if ((drafter == "dspine" || drafter == "dspine-ngram") && (dspine == nullptr || *dspine == '\0')) {
+            std::cout << "SKIP: set INFERNIX_TEST_DSPINE_DRAFTER to a DSpine drafter artifact for " << drafter << '\n';
+            return 77;
+        }
+    }
     try {
         require(argc >= 2,
                 "usage: infernix_qwen3_5_speculation_invariance_real_test "

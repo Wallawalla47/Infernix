@@ -197,6 +197,10 @@ add_test(NAME infernix_qwen3_5_speculation_invariance_real_test
   COMMAND infernix_qwen3_5_speculation_invariance_real_test mtp mtp-cut mtp-sampled dflash2 dflash2-ngram
   dflash2-ngram15 dflash2-ngram16 dflash2-ngram63)
 set_tests_properties(infernix_qwen3_5_speculation_invariance_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# The same against a DSpine drafter artifact (INFERNIX_TEST_DSPINE_DRAFTER, for the 27B; skipped without it).
+add_test(NAME infernix_qwen3_5_speculation_invariance_dspine_real_test
+  COMMAND infernix_qwen3_5_speculation_invariance_real_test dspine dspine-ngram)
+set_tests_properties(infernix_qwen3_5_speculation_invariance_dspine_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_qwen3_5_readout_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_readout_real.cpp"

@@ -443,6 +443,11 @@ the cold request, and a KV pool for two extents serving four requests without pr
 positional speculation is `none`, `mtp`, `dflash` or `dflash2` (the artifact must hold that
 drafter).
 
+`infernix_qwen3_5_speculation_invariance_dspine_real_test` runs the speculation-invariance test's `dspine` and
+`dspine-ngram` drafters on the 27B (`INFERNIX_TEST_ARTIFACT`) with the DSpine drafter artifact
+`INFERNIX_TEST_DSPINE_DRAFTER` names (skipped without it): every prompt's plain tokens, greedy and with presence
+penalty 1.5.
+
 The resume entries (`infernix_qwen3_5_resume_cold_real_test` and
 `infernix_qwen4_exp_resume_cold_real_test`, arguments `mtp dflash2`; Qwen4Exp's DFlash2 case is its own entry,
 `infernix_qwen4_exp_resume_cold_dflash2_real_test`) decode 256 tokens with the

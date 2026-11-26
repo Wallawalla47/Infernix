@@ -143,7 +143,10 @@ inline constexpr std::int32_t kDSpineCandidates = 16;
  * is at least min_p times the largest p; the first-ranked candidate of nonzero p always), writes q
  * = the kept p renormalized as proposal_q, and draws the candidate whose cumulative q (in slot
  * order) first exceeds u * the total, u = uniform(seed, base_positions[b] + i,
- * kSamplePurposeDSpineProposal), the last kept slot at most. The drawn id is drafts[i,b] and the
+ * kSamplePurposeDSpineProposal, i) (the step i as sub-key: a later round's draft at the same position has a
+ * smaller step, so it never reuses this uniform), the last kept slot at most; a gumbel_max row instead takes the
+ * kept candidate of the greatest sampling_gumbel_score(q, seed, base_positions[b] + i + 1, id), the lower slot on
+ * a tie (the draw its verification's own noise favours). The drawn id is drafts[i,b] and the
  * next row's sender. With confidence (FP32 [K,B]), the Op also stores the drawn candidate's
  * probability under softmax(edge / d[n,b]).
  *

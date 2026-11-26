@@ -99,4 +99,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
  */
 [[nodiscard]] bool linear_add_lora_supported(QType qtype, std::int32_t output_rows, std::int32_t input_rows);
 
+// Whether linear_add registers a weight of this format, layout and shape (the logical shapes above): a caller with
+// a weight it does not may project and add instead. Reads no data pointer, so a plan-only model's weights answer
+// as its bound ones will.
+[[nodiscard]] bool linear_add_supported(QType qtype, QuantLayout layout, std::int32_t output_rows,
+                                        std::int32_t input_rows) noexcept;
+
 } // namespace infernix::ops

@@ -223,11 +223,12 @@ std::uint64_t splitmix64(std::uint64_t value) {
     return value ^ (value >> 31);
 }
 
-double oracle_uniform(std::uint64_t seed, std::int32_t position) {
+double oracle_uniform(std::uint64_t seed, std::int32_t position, std::uint32_t sub) {
     std::uint64_t key = seed;
     key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
                             0xD1B54A32D192ED03ULL));
-    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeDSpineProposal) << 21));
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeDSpineProposal) << 21) ^
+                     (static_cast<std::uint64_t>(sub) * 0x2545F4914F6CDD1DULL));
     const auto top = static_cast<std::uint32_t>(key >> 40);
     return static_cast<float>(top) * (1.0F / 16777216.0F);
 }
@@ -235,7 +236,20 @@ double oracle_uniform(std::uint64_t seed, std::int32_t position) {
 struct PathCase {
     int rank = 512, vocab = 2048, steps = 15, width = 16, batch = 3;
     std::uint32_t seed = 1;
+    bool gumbel = false; // sampled rows are gumbel_max rows (the coupled draw)
 };
+
+// sampling_gumbel_score's uniform: (seed, position, kSamplePurposeGumbel, token), held below 1.
+double oracle_gumbel_uniform(std::uint64_t seed, std::int32_t position, std::int32_t token) {
+    std::uint64_t key = seed;
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
+                            0xD1B54A32D192ED03ULL));
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeGumbel) << 21) ^
+                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(token)) * 0x2545F4914F6CDD1DULL));
+    const auto top = static_cast<std::uint32_t>(key >> 40);
+    return std::min(static_cast<double>(static_cast<float>(top) * (1.0F / 16777216.0F)) + 1.0 / 33554432.0,
+                    static_cast<double>(0x1.fffffep-1F));
+}
 
 struct PathData {
     std::vector<std::int32_t> ids, anchors, positions;
@@ -276,6 +290,7 @@ PathData make_path(const PathCase& p) {
         ops::SamplingConfig config;
         config.temperature = temperatures[b % 3];
         config.seed        = 1000003ULL * (b + 1) + p.seed;
+        config.gumbel_max  = p.gumbel && config.temperature > 0.0F;
         if (b % 3 == 2) {
             config.top_k = 6;
             config.top_p = 0.8F;
@@ -368,19 +383,32 @@ PathOracle path_oracle(const PathCase& p, const PathData& d) {
                         o.margin = std::min(o.margin, std::abs(prob[c] - config.min_p * p_max));
                 }
                 double cumulative = 0, threshold = 0;
-                const double u = oracle_uniform(config.seed, d.positions[b] + i);
+                const double u = oracle_uniform(config.seed, d.positions[b] + i, static_cast<std::uint32_t>(i));
                 threshold      = u * 1.0;
                 int last       = 0;
                 selected       = -1;
+                double score[16];
                 for (int c = 0; c < 16; ++c) {
                     const double qc = keep[c] ? prob[c] / kept_total : 0.0;
                     o.q[row * 16 + c] = qc;
                     if (keep[c]) last = c;
                     cumulative += qc;
-                    if (keep[c]) o.margin = std::min(o.margin, std::abs(cumulative - threshold));
+                    if (keep[c] && !config.gumbel_max) o.margin = std::min(o.margin, std::abs(cumulative - threshold));
                     if (selected < 0 && cumulative > threshold) selected = c;
+                    const double g = oracle_gumbel_uniform(config.seed, d.positions[b] + i + 1, d.ids[row * 16 + c]);
+                    score[c] = keep[c] && qc > 0 ? std::log(qc) - std::log(-std::log(g))
+                                                 : -std::numeric_limits<double>::infinity();
                 }
                 if (selected < 0 || selected > last) selected = last;
+                if (config.gumbel_max) {
+                    // The coupled draw: the kept candidate of the greatest Gumbel score, the lower slot on a tie.
+                    selected = 0;
+                    for (int c = 1; c < 16; ++c)
+                        if (score[c] > score[selected]) selected = c;
+                    for (int c = 0; c < 16; ++c)
+                        if (c != selected && score[c] > -std::numeric_limits<double>::infinity())
+                            o.margin = std::min(o.margin, score[selected] - score[c]);
+                }
             }
             double total = 0;
             for (int c = 0; c < 16; ++c) total += std::exp((edge[c] - maximum) / scale);
@@ -470,6 +498,7 @@ INFERNIX_OP_TEST(dspine) {
         failures += test_store_head_write(DType::BF16, 1000, 512, 7, 64);
         failures += test_store_head_write(DType::FP32, 248320, 512, 0, 32);
         failures += test_path({});
+        failures += test_path({.gumbel = true});
         failures += test_path({.rank = 256, .vocab = 4096, .steps = 1, .width = 2, .batch = 1,
                                .seed = 7});
         failures += test_path({.rank = 512, .vocab = 3000, .steps = 7, .width = 16, .batch = 8,

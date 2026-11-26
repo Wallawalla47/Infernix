@@ -174,6 +174,33 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
     linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream);
 }
 
+bool linear_add_supported(QType qtype, QuantLayout layout, std::int32_t output_rows,
+                          std::int32_t input_rows) noexcept {
+    switch (qtype) {
+    case QType::Q4_G64_FP16:
+    case QType::Q5_G64_FP16:
+    case QType::Q8_G32_FP16:
+        if (layout != QuantLayout::RowSplit) { return false; }
+        break;
+    case QType::BF16:
+        if (layout != QuantLayout::Contiguous) { return false; }
+        break;
+    case QType::NVFP4:
+        if (layout != QuantLayout::BlockScaleK16M128x4) { return false; }
+        break;
+    default:
+        if (!is_fp8_row(qtype)) { return false; }
+        break;
+    }
+    try {
+        // The workspace query refuses every unregistered (format, shape), as linear_add itself does.
+        (void)linear_add_workspace_capacity_bytes(qtype, output_rows, input_rows, 1, 1);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool linear_add_lora_supported(QType qtype, std::int32_t output_rows, std::int32_t input_rows) {
     return output_rows == 5120 && (input_rows == 6144 || input_rows == 17408) &&
            (qtype == QType::NVFP4 || is_fp8_row(qtype) || qtype == QType::Q5_G64_FP16);

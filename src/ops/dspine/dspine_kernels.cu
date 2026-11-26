@@ -358,15 +358,30 @@ __global__ void path_walk_kernel(DSpinePathArgs a) {
                 if (lane >= offset) cumulative += previous;
             }
             const float total = __shfl_sync(kFullWarpMask, cumulative, kCandidates - 1);
-            float uniform     = lane == 0 ? sampling_uniform(config.seed, a.base_positions[b] + i,
-                                                             kSamplePurposeDSpineProposal, 0U)
+            if (config.gumbel_max) {
+                // A Gumbel-max row's coupled draw (DFlash2's coupled_rank): the kept candidate whose token scores
+                // highest under the noise its verification gives that token at the produced position (base + i +
+                // 1), the lower slot on a tie, so the draft is the target's own draw whenever the drafter keeps
+                // that token. A draw from q all the same (Gumbel-max over its support).
+                const float score = keep && q > 0.0F
+                                        ? sampling_gumbel_score(q, config.seed, a.base_positions[b] + i + 1, id)
+                                        : -CUDART_INF_F;
+                const float best       = warp_max(score);
+                const unsigned winners = __ballot_sync(kFullWarpMask, keep && q > 0.0F && score == best);
+                selected               = winners == 0 ? 0 : __ffs(winners) - 1;
+            } else {
+                // Sub-key i, as DFlash2's (speculative_round.h): a later round's draft at the same position
+                // has a smaller step, so it never reuses this uniform.
+                float uniform = lane == 0 ? sampling_uniform(config.seed, a.base_positions[b] + i,
+                                                             kSamplePurposeDSpineProposal, static_cast<unsigned>(i))
                                           : 0.0F;
-            uniform           = __shfl_sync(kFullWarpMask, uniform, 0);
-            const float threshold = uniform * total;
-            const unsigned below  = __ballot_sync(kFullWarpMask, slot && cumulative <= threshold);
-            const unsigned kept_slots = __ballot_sync(kFullWarpMask, keep);
-            const int last            = kept_slots == 0 ? 0 : 31 - __clz(kept_slots);
-            selected                  = min(__popc(below), last);
+                uniform                   = __shfl_sync(kFullWarpMask, uniform, 0);
+                const float threshold     = uniform * total;
+                const unsigned below      = __ballot_sync(kFullWarpMask, slot && cumulative <= threshold);
+                const unsigned kept_slots = __ballot_sync(kFullWarpMask, keep);
+                const int last            = kept_slots == 0 ? 0 : 31 - __clz(kept_slots);
+                selected                  = min(__popc(below), last);
+            }
         }
         if (slot) a.proposal_q[row_slot * kCandidates + lane] = q;
         const int drawn = __shfl_sync(kFullWarpMask, id, selected);
