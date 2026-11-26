@@ -55,7 +55,6 @@ constexpr std::array kRules = {
     Rule{"--cache-host-state", kQwen35},    // Flash-Next and Inkling refuse everything but fp32
     Rule{"--device-snapshot-slots", kQwen35}, // refused by Flash-Next and Inkling
     Rule{"--cache-tool-hold-secs", kQwen35},  // refused by Flash-Next and Inkling
-    Rule{"--cache-next-turn-ms", kQwen},    // refused by Inkling
     Rule{"--context-cost-presets", kQwen},  // Inkling's prefix cache has no cost model
     // Speculative decoding.
     Rule{"--draft-model", kFlash},

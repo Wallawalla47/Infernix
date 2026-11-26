@@ -656,7 +656,22 @@ form Qwen3.8-Flash-Next's binding takes:
   one after the other there 1,252 / 1,244 → 1,414 / 187 ms (the first pays the matched-end tap's split, ~160 ms, the
   second resumes at it); four at once after them (both arms after the same two) 1,244-7,144 → 185-745 ms (mean 4,186 →
   460 ms), the four's wall 13.1 → 7.0 s; a cold prompt unchanged.
-- **Not built yet**: next-turn prefill, tool-call holds and prefetching for waiting requests.
+- **Next-turn prefill** (hybrid-prefix-cache-spec §7.9, built 2026-11-26): the frontend renders a finished turn's
+  history as the next request will (a probe message after the reply, the prompt cut after its opener token, so the
+  reply's block must end with `<|content_model_end_sampling|>`), and the Engine's idle pass prefills it as a
+  background request, which reuses and publishes like any other: the planner's prompt-tail tap is the history's end,
+  where the next request resumes. The pass computes on the prompt route, so a turn resumed from it equals an uncached
+  run (`infernix_inkling2_prefix_cache_real_test`'s case 14 on the default, DSpark and reproducible routes, with a
+  request arriving mid-pass admitted within a call). Measured (the owner's configuration, two servers an arm, three
+  conversations each on a cached ~122K-token document, ~0.7-1.2K-token replies): turn 2's first token 159 ms against
+  200-221 ms without the pass when it came 3 s after the reply, but 258-288 ms against 201-221 ms when it came 0.2 s
+  after (it waits for the running pass's unit, the whole reply, then resumes in a narrow call, ~125 ms at 122K). So
+  the quiet period defaults to 1 s here (Qwen3.5's 150 ms): a client answering within it never meets a pass; one
+  arriving in the next ~0.2 s (the reply's prefill at 122K) still does. Measured at 1 s (each phase its own
+  question): 0.2 s after the reply level with no pass (355 / 202 ms both), 1.1 s after it 194-213 against 196-213 ms
+  (+7.5 % at worst), 3 s after it 158-159 against 200-228 ms (−21 to −30 %). The gain reaches clients that send the
+  reply back as rendered (its reasoning included). Off by default on `--lossless`.
+- **Not built yet**: tool-call holds and prefetching for waiting requests.
 
 Sizes: an image is 190 MiB with BF16 windows, 107 MiB with INT8 windows (by default every profile but `bf16` and
 `bf16p`) and 158 MiB with `bf16p` windows, plus 9 MiB of drafter rings; restoring a BF16 one takes ~8 ms over the PCIe link,

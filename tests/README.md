@@ -611,6 +611,11 @@ reports the snapshot restores, replays, replayed tokens and time paused, and che
 cancels two requests once one is paused and serves a third: the Program must keep no capture result once idle (neither
 the cancelled pause's nor a released lane's last capture landing after its release; `INFERNIX_INKLING2_ONLY_CANCEL_CASE`
 runs that case alone).
+`infernix_inkling2_prefix_cache_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`; its cases listed in its header) resumes
+requests from the prefix cache and requires a cold run's bits; case 14, the idle next-turn prefill on the default,
+DSpark and reproducible routes, requires the next turn to resume at the history's end with an uncached run's tokens and
+a request arriving mid-pass to be admitted within about one call (`INFERNIX_INKLING2_PREFIX_NEXT_TURN_ONLY` runs it
+alone, as `INFERNIX_INKLING2_PREFIX_SSD_ONLY` and `INFERNIX_INKLING2_PREFIX_RAM_ONLY` run theirs).
 `infernix_inkling2_withdraw_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) reports a row as non-finite through
 `runtime::testing::set_nonfinite_fault`, as the other families' withdrawal tests do: a failed prompt's entries leave the
 prefix cache (its retry resumes from nothing and equals a cache-off run, which also reports its

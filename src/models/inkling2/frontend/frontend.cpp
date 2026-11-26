@@ -301,10 +301,22 @@ struct Frontend::Impl {
     }
 
     // The template's context: messages, the declared tools and the thinking effort; the images, in order, into `media`.
+    // Next-turn history (the Engine's idle prefill of a finished turn, hybrid-prefix-cache-spec §7.9): the conversation
+    // ends with the reply, and a probe message follows it so the template places the reply as the next request will
+    // (a tool result when the reply calls tools, else a user turn); render() cuts after the probe's first token.
     [[nodiscard]] Json context(const PromptInput& input, std::vector<const OwnedMedia*>& media) const {
         const PromptOptions& options = input.options;
-        if (options.continuation != PromptContinuationMode::NewAssistantTurn) {
-            throw std::invalid_argument("Inkling 2 renders a new assistant turn only (no continuation modes yet)");
+        const bool history_only      = options.continuation == PromptContinuationMode::NextTurnHistory;
+        if (options.continuation != PromptContinuationMode::NewAssistantTurn && !history_only) {
+            throw std::invalid_argument("Inkling 2 renders a new assistant turn or a next turn's history only");
+        }
+        const auto has_media = [](const ChatMessage& message) {
+            return std::any_of(message.parts.begin(), message.parts.end(),
+                               [](const MessagePart& part) { return part.kind == MessagePartKind::Media; });
+        };
+        if (history_only && (input.messages.empty() || input.messages.back().role != ChatRole::Assistant ||
+                             std::any_of(input.messages.begin(), input.messages.end(), has_media))) {
+            throw std::invalid_argument("next-turn history requires text messages ending with an assistant reply");
         }
         Json out = parse_object(options.chat_template_kwargs_json, "chat_template_kwargs");
         if (options.reasoning_effort) {
@@ -315,6 +327,12 @@ struct Frontend::Impl {
         Json messages = Json::array();
         for (const ChatMessage& message : input.messages) {
             messages.push_back(message_json(message, vision ? &media : nullptr));
+        }
+        if (history_only) {
+            const ChatMessage& reply = input.messages.back();
+            Json probe{{"role", reply.tool_calls.empty() ? "user" : "tool"}, {"content", ""}};
+            if (!reply.tool_calls.empty()) { probe["tool_call_id"] = reply.tool_calls.front().id; }
+            messages.push_back(std::move(probe));
         }
         out["messages"] = std::move(messages);
         if (!options.tool_jsons.empty()) {
@@ -349,6 +367,23 @@ struct Frontend::Impl {
                                                rendered.literal_spans)
                       .input_ids;
         out.text = std::move(rendered.text);
+        if (input.options.continuation == PromptContinuationMode::NextTurnHistory) {
+            // The reply's block ends its turn (<|content_model_end_sampling|>) and the probe's opener follows it: the
+            // prompt keeps that opener, a control token whatever the next request opens with, so the pass's last state
+            // (one token before its end, the opener's message-boundary tap) is where the next request departs.
+            const bool tool  = !input.messages.back().tool_calls.empty();
+            const TokenId op = message_starts[tool ? 3 : 0];
+            const std::string_view spelling = tool ? "<|message_tool|>" : "<|message_user|>";
+            const auto at   = std::find(out.ids.rbegin(), out.ids.rend(), op);
+            const auto text = out.text.rfind(spelling);
+            if (at == out.ids.rend() || at + 1 == out.ids.rend() || *(at + 1) != markers.end_of_turn ||
+                text == std::string::npos) {
+                throw std::invalid_argument("chat template does not close the reply where the next turn begins");
+            }
+            out.ids.resize(static_cast<std::size_t>(out.ids.rend() - at));
+            out.text.resize(text + spelling.size());
+            return out;
+        }
         // PromptOptions::open_answer: the reply's answer opener ends the prompt (the model writes no thinking block
         // first), so the next token is the answer's first.
         if (input.options.open_answer) {

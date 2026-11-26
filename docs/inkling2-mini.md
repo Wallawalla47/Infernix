@@ -131,7 +131,7 @@ once the model has loaded; `--plan` reports them without loading.
 | `--logits-dtype bf16` | refused at startup: the logits are FP32 |
 | `--rope-yarn-factor` other than 1 | refused at startup: the model has no RoPE and reaches its full context natively |
 | `--expert-a4-activations` | refused at startup (it belongs to one Qwen3.8-Flash-Next artifact) |
-| `--cache-next-turn-ms`, `--cache-tool-hold-secs` | refused unless `0`: not built for this model |
+| `--cache-tool-hold-secs` | refused unless `0`: not built for this model |
 | `--device-snapshot-slots`, `--cache-host-state` other than `fp32`, `--host-context-mib 0` | refused: snapshots live in the Host tier, exactly. Use `--no-prefix-reuse` to turn the cache off |
 
 ## DSpark drafting
@@ -245,8 +245,10 @@ Measured quality per format: [design §7.6](maintainer/inkling2_mini-design.md#7
 - **Prefill chunks** default to 4,096 tokens. `--prefill-chunk` takes multiples of 128 up to 8,064.
   Every chunk size gives the same bits.
 - **The prefix cache** is on by default in `infernix-serve` (the `infernix` CLI runs without it). It
-  caches only state computed from prompts, so a continuing turn resumes at the previous prompt's end
-  and prefills the previous reply again. Requests arriving together that share a long prefix (one
+  caches only state computed from prompts, so a continuing turn would resume at the previous prompt's
+  end and prefill the previous reply again; the server's idle [next-turn prefill](serving.md#next-turn-prefill)
+  (`--cache-next-turn-ms`, 1 s by default, off on `--lossless`) prefills the reply as the next request will
+  render it once nothing else runs, so the next turn resumes at the history's end. Requests arriving together that share a long prefix (one
   document, different questions) prefill it once: the others wait for the first's snapshot where they
   diverge (four questions on a 122K-token document, 7.5K tokens past its last snapshot: 1.4-2.0 s to
   the first token instead of 1.2-7.1 s), and a later prompt that diverges where an earlier one did

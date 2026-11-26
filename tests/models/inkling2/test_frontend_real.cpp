@@ -8,6 +8,8 @@
 //    sent back as the assistant message of the history renders the prompt's ids followed by the generated ids where
 //    the model wrote the template's canonical form, and tokenize_chat marks exactly the reply's ids as generated; the
 //    first differing position is reported otherwise (it decides where a next turn's prefix reuse ends).
+//    Next-turn history: the idle pass's prompt (after a text reply and after a tool call) is a prefix of the next
+//    request's and ends with that request's next message opener right after the reply's end of turn.
 // 3. Refusals: images without --vision, continuation modes, a required tool choice without tools; constrained output
 //    and strict tools accepted; context length.
 // 4. Images with --vision (tests/fixtures/inkling2/vision_golden.json's PNGs): placeholder expansion and order, a
@@ -21,6 +23,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -255,6 +258,43 @@ int main() {
             check(text.find("These tools are now also available:\n" + spec) != std::string::npos &&
                       text.find("<tools>") == std::string::npos,
                   "a loaded definition renders in Inkling's declaration form");
+        }
+
+        // Next-turn history (PromptContinuationMode::NextTurnHistory, the Engine's idle prefill of a finished turn): the
+        // pass's prompt is a prefix of the next request's and ends with the probe's opener right after the reply's end
+        // of turn: a user turn after a text reply, a tool result after a reply that calls a tool.
+        for (const bool call : {false, true}) {
+            std::vector<ChatMessage> history = question.messages;
+            ChatMessage reply{.role = ChatRole::Assistant};
+            reply.reasoning_content = "Checking the forecast.";
+            if (call) {
+                reply.tool_calls.push_back({.id = "call_0", .name = "get_forecast", .arguments_json = R"({"city":"Oslo"})"});
+            } else {
+                reply.parts.push_back({.text = "It will rain."});
+            }
+            history.push_back(std::move(reply));
+            PromptInput pass          = question;
+            pass.messages             = history;
+            pass.options.continuation = infernix::PromptContinuationMode::NextTurnHistory;
+            PromptInput next          = question;
+            next.messages             = history;
+            ChatMessage follow{.role = call ? ChatRole::Tool : ChatRole::User};
+            follow.parts.push_back({.text = call ? "Rain, 12 C." : "And tomorrow?"});
+            if (call) { follow.tool_call_id = "call_0"; }
+            next.messages.push_back(std::move(follow));
+            const std::vector<TokenId> a = frontend.render(pass, 1U << 20).ids, b = frontend.render(next, 1U << 20).ids;
+            const std::string kind = call ? "next-turn history after a tool call" : "next-turn history after a text reply";
+            check(a.size() >= 2 && a.size() < b.size() && std::equal(a.begin(), a.end(), b.begin()),
+                  kind + ": the pass's ids are a prefix of the next request's");
+            check(a.size() >= 2 &&
+                      a.back() == tokenizer->find_added_token(call ? "<|message_tool|>" : "<|message_user|>")->id &&
+                      a[a.size() - 2] == tokenizer->find_added_token("<|content_model_end_sampling|>")->id,
+                  kind + ": the pass ends with the next message's opener after the reply's end of turn");
+        }
+        {
+            PromptInput not_a_reply   = question;
+            not_a_reply.options.continuation = infernix::PromptContinuationMode::NextTurnHistory;
+            check(throws([&] { (void)frontend.prepare(not_a_reply); }), "next-turn history needs a final assistant reply");
         }
 
         // 3. Refusals and limits.

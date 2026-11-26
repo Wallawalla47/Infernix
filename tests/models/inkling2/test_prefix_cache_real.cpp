@@ -24,6 +24,9 @@
 // 12. RAM pressure (--ram-resize auto, a faked availability; INFERNIX_INKLING2_PREFIX_RAM_ONLY runs it alone): the Host
 //     tier gives chunks back with its entries moved below the cut, a continuation resumes from them as cold, and the
 //     tier grows back once RAM frees.
+// 14. Next-turn prefill (INFERNIX_INKLING2_PREFIX_NEXT_TURN_ONLY runs it alone): the idle pass prefills a finished turn's
+//     history, the next turn resumes at its end as an uncached run, and a request arriving mid-pass is admitted; the
+//     default route, DSpark (auto) and the reproducible route.
 //
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (skips without it)
 
@@ -249,6 +252,128 @@ void ram_resize(const std::filesystem::path& artifact) {
 
 } // namespace
 
+// 14. Next-turn prefill (hybrid-prefix-cache-spec §7.9; INFERNIX_INKLING2_PREFIX_NEXT_TURN_ONLY runs it alone). The cache
+//     keeps prompt-computed state only, so a second turn would prefill the first reply again; Engine::prefill_next_turn
+//     prefills the history (the reply as the next request renders it) while the Engine is idle. Turn 2 resumes at the
+//     history's end and gives an uncached run's tokens (the prompt route's bits do not depend on where a call starts).
+//     A request arriving while a long pass runs is admitted within about one call (the pass yields at its next unit)
+//     and gives an uncached run's tokens too.
+// `route`: 0 the default (INT8 KV, plain decoding), 1 DSpark (auto draft lengths), 2 the reproducible route with
+// --a16-activations (its prompt calls run the narrow kernels).
+void next_turn(const std::filesystem::path& artifact, int route) {
+    std::cout << "next turn (" << (route == 0 ? "default" : route == 1 ? "dspark" : "reproducible") << " route)\n";
+    infernix::EngineOptions options = cache_options(artifact, infernix::KvCacheStorage::Int8Group64, 512, 8 * kContext);
+    options.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{20};
+    if (route == 1) {
+        options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+        options.speculative.draft_tokens_auto = true;
+    } else if (route == 2) {
+        options.expert_a16_activations = true;
+        options.fast_paths             = false;
+    }
+    infernix::Engine engine(options);
+    const auto text = [](infernix::ChatRole role, std::string value) {
+        infernix::ChatMessage m{.role = role};
+        m.parts.push_back({.text = std::move(value)});
+        return m;
+    };
+    const auto input_of = [](std::vector<infernix::ChatMessage> messages) {
+        infernix::PromptInput input;
+        input.messages                 = std::move(messages);
+        input.options.reasoning_effort = infernix::ReasoningEffort::Low;
+        return input;
+    };
+    const auto chat = [&](std::vector<infernix::ChatMessage> messages, std::uint32_t outputs, bool reuse) {
+        infernix::RequestOptions request    = infernix::test::resume_probe_request(outputs, reuse);
+        request.stop.include_model_defaults = true;
+        return engine.generate(engine.prepare(input_of(std::move(messages))), request);
+    };
+    const auto settled = [](const infernix::RuntimeStats& s) {
+        return s.next_turn_prefills_completed + s.next_turn_prefills_yielded + s.next_turn_prefills_skipped +
+               s.next_turn_prefills_dropped;
+    };
+    const auto ended = [&](const infernix::RuntimeStats& before) {
+        for (int i = 0; i < 12000; ++i) {
+            if (settled(engine.runtime_stats()) > settled(before)) { return true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    };
+    const auto first_difference = [](const Tokens& a, const Tokens& b) {
+        std::size_t i = 0;
+        while (i < a.size() && i < b.size() && a[i] == b[i]) { ++i; }
+        return i == a.size() && i == b.size() ? std::string("equal") : "first difference at token " + std::to_string(i);
+    };
+
+    const std::vector<infernix::ChatMessage> turn1{
+        text(infernix::ChatRole::System, "You are a careful assistant for a small warehouse."),
+        text(infernix::ChatRole::User, "Explain in about 120 words how to plan shelf space for four product colours.")};
+    const infernix::GenerationResult first = chat(turn1, 160, true);
+    std::vector<infernix::ChatMessage> history = turn1;
+    infernix::ChatMessage reply = text(infernix::ChatRole::Assistant, first.content);
+    reply.reasoning_content     = first.reasoning; // as a client that sends the reply back whole
+    history.push_back(std::move(reply));
+    std::vector<infernix::ChatMessage> turn2 = history;
+    turn2.push_back(text(infernix::ChatRole::User, "Now say it in one sentence."));
+    infernix::PromptInput rendered = input_of(history);
+    rendered.options.continuation  = infernix::PromptContinuationMode::NextTurnHistory;
+    const std::uint32_t pass_tokens = engine.prepare(std::move(rendered)).summary().prompt_tokens;
+    const infernix::RuntimeStats idle = engine.runtime_stats();
+    engine.prefill_next_turn(input_of(history));
+    require(ended(idle), "next turn: the pass ended within two minutes");
+    const infernix::RuntimeStats passed     = engine.runtime_stats();
+    const infernix::GenerationResult second = chat(turn2, 24, true);
+    const infernix::GenerationResult cold   = chat(turn2, 24, false);
+    std::cout << "next turn: reply " << first.generated_token_ids.size() << " tokens, history " << pass_tokens
+              << " tokens; turn 2 reused " << second.reused_prompt_tokens << " of " << second.prompt.prompt_tokens
+              << "; the pass computed " << passed.next_turn_prefill_tokens - idle.next_turn_prefill_tokens
+              << " tokens; turn 2 against an uncached run: "
+              << first_difference(second.generated_token_ids, cold.generated_token_ids) << '\n';
+    require(passed.next_turn_prefills_completed == idle.next_turn_prefills_completed + 1,
+            "next turn: the pass did not run to its end");
+    require(second.reused_prompt_tokens + 1U >= pass_tokens && second.reused_prompt_tokens < second.prompt.prompt_tokens,
+            "next turn: turn 2 did not resume at the history's end (" + std::to_string(pass_tokens - 1U) + ")");
+    require(second.generated_token_ids == cold.generated_token_ids, "next turn: turn 2 differs from an uncached run");
+
+    // Yield: a long conversation's pass (3,000-token document, units of 512), interrupted once it has started.
+    std::string document;
+    for (int paragraph = 0; paragraph < 120; ++paragraph) {
+        document += "Section " + std::to_string(paragraph) + " records that the warehouse moved " +
+                    std::to_string(paragraph * 37 % 101) + " crates of part " + std::to_string(paragraph % 17) +
+                    " to bay " + std::to_string(paragraph % 9) + " during the night shift. ";
+    }
+    const std::vector<infernix::ChatMessage> long_history{
+        text(infernix::ChatRole::System, "You summarise warehouse logs."),
+        text(infernix::ChatRole::User, document + "Summarise the log."),
+        text(infernix::ChatRole::Assistant, "Crates moved between bays every night.")};
+    std::vector<infernix::ChatMessage> long_turn = long_history;
+    long_turn.push_back(text(infernix::ChatRole::User, "Which bay received the most?"));
+    const infernix::RuntimeStats before_long = engine.runtime_stats();
+    engine.prefill_next_turn(input_of(long_history));
+    bool started = false;
+    for (int i = 0; i < 60000 && !started; ++i) {
+        const infernix::RuntimeStats now = engine.runtime_stats();
+        started = now.next_turn_prefills_started > before_long.next_turn_prefills_started && now.prefilling_requests != 0;
+        if (!started) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    }
+    const infernix::GenerationResult interrupted = chat(long_turn, 16, true);
+    const infernix::RuntimeStats after_long      = engine.runtime_stats();
+    const infernix::GenerationResult long_cold   = chat(long_turn, 16, false);
+    std::cout << "next turn: the long pass computed "
+              << after_long.next_turn_prefill_tokens - before_long.next_turn_prefill_tokens
+              << " tokens before yielding; the request waited " << interrupted.engine_timing.queue_wait_seconds
+              << " s and reused " << interrupted.reused_prompt_tokens << " of " << interrupted.prompt.prompt_tokens
+              << "; against an uncached run: "
+              << first_difference(interrupted.generated_token_ids, long_cold.generated_token_ids) << '\n';
+    require(started && after_long.next_turn_prefills_yielded == before_long.next_turn_prefills_yielded + 1,
+            "next turn: the long pass did not yield to the request");
+    require(interrupted.engine_timing.queue_wait_seconds < 3.0,
+            "next turn: the request waited more than about one call of the pass");
+    require(interrupted.generated_token_ids == long_cold.generated_token_ids,
+            "next turn: the request after the yield differs from an uncached run");
+    engine.stop();
+}
+
 int main() {
     try {
         const char* artifact = std::getenv("INFERNIX_INKLING2_ARTIFACT");
@@ -265,6 +390,11 @@ int main() {
         if (std::getenv("INFERNIX_INKLING2_PREFIX_RAM_ONLY") != nullptr) {
             ram_resize(artifact);
             std::cout << "PASS (the RAM resize case alone)\n";
+            return 0;
+        }
+        if (std::getenv("INFERNIX_INKLING2_PREFIX_NEXT_TURN_ONLY") != nullptr) {
+            for (int route = 0; route < 3; ++route) { next_turn(artifact, route); }
+            std::cout << "PASS (the next-turn case alone)\n";
             return 0;
         }
         if (std::getenv("INFERNIX_INKLING2_PREFIX_TIMING") != nullptr) {
@@ -579,6 +709,7 @@ int main() {
         // 11. The SSD tier.
         ssd_tier(artifact);
         ram_resize(artifact);
+        for (int route = 0; route < 3; ++route) { next_turn(artifact, route); }
         std::cout << "PASS\n";
         return 0;
     } catch (const std::exception& e) {

@@ -41,6 +41,8 @@ constexpr const char* kQwenPromptKernel =
 constexpr const char* kQwenMedia =
     "sizes the Qwen models' media pipeline; Inkling 2's frontend decodes each image without it";
 constexpr const char* kNoNgrams = "configures n-gram drafting, which Inkling 2 does not have (its drafter is DSpark)";
+// The idle next-turn prefill's default quiet period (--cache-next-turn-ms; see normalize's note).
+constexpr std::chrono::milliseconds kInkling2NextTurnPrefillQuiet{1000};
 
 void report(const EngineOptions& options, const std::string& text) {
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "%s", text.c_str());
@@ -375,8 +377,6 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "the prefix cache keeps snapshot state exact (--cache-host-state fp32)");
         refuse(hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0,
                "the prefix cache has no tool-call holds");
-        refuse(hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0,
-               "no idle next-turn prefill yet");
     }
     if (options.purpose == EnginePurpose::Generation) {
         // The VRAM and RAM figures size --max-context auto, --kv-capacity auto (the KV pool the lanes share) and the
@@ -419,7 +419,19 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "the prefix cache keeps its snapshots in the Host tier: --host-context-mib must be positive");
         hybrid.device_snapshot_slots   = 0U;
         hybrid.tool_call_hold          = std::chrono::milliseconds{0};
-        hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{0};
+        // Idle-time prefill of finished turns (hybrid-prefix-cache-spec §7.9): the cache keeps prompt-computed state
+        // only, so a next turn would otherwise prefill the previous reply again; the pass prefills it on the prompt
+        // route, whose bits do not depend on where a call starts, so a turn resumed from it equals an uncached run. The
+        // default quiet is 1 s, not Qwen3.5's 150 ms: a turn that arrives while the pass runs waits for its unit (the
+        // whole reply) and then resumes in a narrow call, which costs ~125 ms at 122K (2026-11-26, a ~1.2K-token reply
+        // on a 122K document: 258-288 ms to the first token against 201-221 ms without the pass at a 0.2 s pause, 159
+        // against 200-221 ms at 3 s). Off by default on --lossless: the pass yields at a prefill unit, which that route
+        // (340-450 tokens a second) takes seconds to finish.
+        hybrid.next_turn_prefill_quiet = hybrid.next_turn_prefill_quiet.value_or(
+            options.lossless ? std::chrono::milliseconds{0} : kInkling2NextTurnPrefillQuiet);
+        refuse(hybrid.next_turn_prefill_quiet->count() < 0 ||
+                   *hybrid.next_turn_prefill_quiet > std::chrono::milliseconds{3'600'000},
+               "idle prefill quiet period must be in [0,3600000] ms");
         hybrid.max_new_taps            = hybrid.max_new_taps.value_or(8U);
         hybrid.tap_ladder_tokens = hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * options.prefill_chunk));
         hybrid.tap_min_gap_tokens = hybrid.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, options.prefill_chunk));

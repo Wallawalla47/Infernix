@@ -546,9 +546,10 @@ public:
         }
         base->tokens                          = std::move(data->token_ids);
         base->options                         = options;
-        // Background requests (next-turn prefill) are not built for this model; a request that may not reuse history
-        // also publishes none.
-        base->reuse        = prefix_ != nullptr && options.allow_prefix_reuse && !options.background && data->reusable;
+        // A request that may not reuse history also publishes none. A background request (the Engine's idle next-turn
+        // prefill: a finished turn's history as the next request renders it, one output token) reuses and publishes
+        // as any other: its taps are what the next request resumes from.
+        base->reuse        = prefix_ != nullptr && options.allow_prefix_reuse && data->reusable;
         base->block_hashes = std::move(data->block_hashes);
         base->block_extras = std::move(data->block_extras);
         base->tap_hints    = std::move(data->tap_hints);

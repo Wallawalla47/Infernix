@@ -214,7 +214,7 @@ const PREFIX_CACHE: FormSection = {
       kind: "number",
       flag: "--cache-next-turn-ms",
       label: "Next-turn prefill (ms)",
-      help: "After a reply, once idle this long, prefill the conversation's next turn as its next request will render it; any request that arrives takes over at once. Default 150, 0 turns it off; on Qwen3.8-Flash-Next the default is 0, and it is refused with the reproducible and lossless routes.",
+      help: "After a reply, once idle this long, prefill the conversation's next turn as its next request will render it; any request that arrives takes over at once. Default 150, 0 turns it off; on Inkling 2 the default is 1000 (0 with the lossless route); on Qwen3.8-Flash-Next it is 0, and it is refused with the reproducible and lossless routes.",
       placeholder: "model default",
       min: 0,
     },
