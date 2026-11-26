@@ -1,3 +1,6 @@
+// Ported from NInfer-all (https://github.com/iamwavecut/ninfer-all, PRs #341 and #365; Apache-2.0) and modified
+// for Infernix (renamed into Infernix's Op contract and its oracle test, the proposal draw sub-keyed by step
+// with the Gumbel-max coupled draw: docs/maintainer/dspine.md).
 // The DSpine code-bridge Ops against naive FP64 oracles (infernix/ops/dspine.h).
 #include "infernix/ops/dspine.h"
 

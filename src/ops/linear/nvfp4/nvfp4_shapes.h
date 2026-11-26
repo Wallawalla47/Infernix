@@ -21,4 +21,8 @@ extern const Nvfp4LinearShape kNvfp4N5120K6144;
 extern const Nvfp4LinearShape kNvfp4N5120K17408;
 // The 27B output head (NVIDIA's NVFP4-QAD artifact): FP32 or BF16 logits, A16 only.
 extern const Nvfp4LinearShape kNvfp4N248320K5120;
+// A DSpine drafter's NVFP4 projections beyond the target's shapes (the 27B's: attention output, feature
+// projection), A16 only.
+extern const Nvfp4LinearShape kNvfp4N5120K4096;
+extern const Nvfp4LinearShape kNvfp4N5120K25600;
 } // namespace infernix::ops::detail

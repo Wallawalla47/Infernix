@@ -13,8 +13,11 @@ Infernix runs a DSpine drafter as its own artifact beside a Qwen3.5-family model
 `--spec dspine --draft-model PATH`. It is never chosen by `--spec auto`, and `--spec dflash2` keeps
 the artifact's bundled DFlash2 drafter as before. The engine refuses a drafter whose hidden width,
 vocabulary or target layer count differs from the model's. Tencent publishes one drafter, for
-Qwen3.8-27B; [WaveCut's NInfer v3 conversion](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)
-(recipe `dspine_q8` of NInfer-all's converter) loads as it is.
+Qwen3.8-27B. Infernix's converter writes it from Tencent's checkpoint (`--components dspine`, recipes
+`qwen3_8_27b_dspine_q8`, `_nvfp4_mlp` and `_nvfp4`: [weight conversion](../weight-conversion.md)), and
+[WaveCut's NInfer v3 conversion](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3) (recipe
+`dspine_q8` of NInfer-all's converter, which `qwen3_8_27b_dspine_q8` reproduces byte for byte but for the
+sender table's rounding) loads as it is.
 
 The port follows [NInfer-all](https://github.com/iamwavecut/ninfer-all) (PR #341 and #365, Apache-2.0):
 its bridge and refinement Ops and their oracle tests are NInfer-all's, renamed; the drafter's
@@ -52,7 +55,10 @@ Tencent's Qwen3.8-27B drafter (revision `5f54174d`): hidden 5120, vocabulary 248
 sliding window of 8192, intermediate 17408, 32 query and 8 KV heads of 128, taps `[1,16,31,46,61]`
 of 64, a block of 16 (the anchor and 15 masks), mask token 248070, code width 1024, rank 512, norm
 epsilon `1e-6`, RoPE theta `1e7`. WaveCut's `dspine_q8` file stores the layers' projections Q8 (groups
-of 32, FP16 scales) and the bridge BF16: 2.27 GiB.
+of 32, FP16 scales) and the bridge BF16: 2.27 GiB. Infernix's recommended conversion,
+`qwen3_8_27b_dspine_nvfp4`, stores the attention output, MLP and feature projection NVFP4 (16-bit
+activations) and keeps the fused query/key/value Q8, which `attn_input_proj`'s drafter form and the fused
+context materialization read: 1.53 GiB, the fastest of the three formats measured (2026-11-26).
 
 The config accepts 32 query and 8 KV heads of 128, 5 or 6 layers (the fused context
 materialization), a rank that is a multiple of 32 up to 512, a block of 2 to 16, a trained window of
@@ -119,7 +125,11 @@ The head-write table TG (`R * V * 2` bytes, 243 MiB for the 27B drafter) is deri
 running the target's head over the last write's R columns. A row at temperature 0 takes the
 candidate of greatest edge; at temperature T it draws from `softmax(edge / (d_n * T))` over the 16
 candidates, truncated by the request's top-k, top-p and min-p, under the request's seed, the drafted
-position and `kSamplePurposeDSpineProposal`, and records that law as the proposal's q. A draft's
+position, `kSamplePurposeDSpineProposal` and the draft's step in its block as sub-key (as DFlash2's: a later
+round's draft at the same position has a smaller step, so no round reuses another's uniform), and records that
+law as the proposal's q. A `gumbel_max` row (the gumbel-sampling fast path) instead takes the kept candidate whose
+token scores highest under the Gumbel noise its verification gives that token at the produced position (DFlash2's
+coupled draw): a draw from the same law, which is the target's own draw whenever the drafter keeps that token. A draft's
 confidence (the `--draft-tokens auto` width policy's input) is its probability under
 `softmax(edge / d_n)`.
 

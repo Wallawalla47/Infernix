@@ -444,7 +444,8 @@ int main(int argc, char** argv) {
                     const ops::SlidingWindowAttentionExecutionEnvelope envelope{
                         0, static_cast<std::uint32_t>(maximum)};
                     const auto plan = ops::detail::sliding_window_attention_resolve_plan(
-                        static_cast<std::uint32_t>(options.window), tokens, batch, envelope);
+                        static_cast<std::uint32_t>(options.window), ops::SlidingWindowMask::Symmetric, tokens,
+                        batch, envelope);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(stream);

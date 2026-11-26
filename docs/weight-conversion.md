@@ -188,6 +188,32 @@ BF16 dynamic-convolution kernel projections, selector projection and codebooks, 
 kernels. The drafter reuses the main artifact's token embedding and its text or proposal head, so
 the companion holds none of them (776 MB). See [container §4.3](maintainer/artifact-container.md#43-companion-artifacts).
 
+A DSpine drafter (Tencent's `Qwen3.8-27B-DSpine-b16`) converts from its own checkpoint into a standalone artifact
+that runs beside a Qwen3.8-27B artifact (`--spec dspine --draft-model FILE`, [DSpine](maintainer/dspine.md)):
+`--components dspine`, `--model` naming the drafter's checkpoint:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B-DSpine-b16 \
+  --components dspine \
+  --recipe qwen3_8_27b_dspine_nvfp4 \
+  --name Qwen3.8-27B-DSpine-b16-Infernix \
+  --out models/Qwen3.8-27B-DSpine-b16-Infernix.infernix
+```
+
+The converter derives the code bridge's projection (the gate, predecessor-gate and value weights, one below the
+other) and its sender table (each token's normalized code times the predecessor-gate and value weights, formed in
+FP64 and rounded to BF16 once) from the checkpoint. `qwen3_8_27b_dspine_q8` stores every layer projection and the
+feature projection `q8_g32_fp16`, the context K/V sharing the layer's K/V words, and the bridge BF16 (2.27 GiB:
+NInfer-all's `dspine_q8` byte for byte but for the sender table's rounding, in 0.006 % of its bytes).
+`qwen3_8_27b_dspine_nvfp4_mlp` stores the layers' MLP in NVFP4 (16-bit activations; 1.64 GiB), and
+`qwen3_8_27b_dspine_nvfp4` the attention output, MLP and feature projection too (1.53 GiB); both keep the fused
+query/key/value in Q8, which the drafter's query/key/value Op and the fused context materialization read.
+`qwen3_8_27b_dspine_nvfp4` is the recommended one: on an RTX 5090 it decoded fastest of the three in every measured
+case (0.9-2.2 % faster than Q8, 0-0.5 % faster than NVFP4-MLP) and leaves the most VRAM for KV cache, with 0.4-1.0 %
+fewer accepted drafts than Q8 on varied text. The drafter only proposes tokens the model verifies, so its format
+changes acceptance and speed, never output.
+
 ## Change part of a recipe
 
 Save the following as `my_recipe.py`:

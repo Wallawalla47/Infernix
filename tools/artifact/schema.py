@@ -314,8 +314,12 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
     if not isinstance(components, dict) or not components:
         raise ArtifactError("components must be a nonempty object")
     # A companion artifact has no text: each of its components targets the text of the main
-    # artifact it is loaded beside.
-    companion = "text" not in components
+    # artifact it is loaded beside. A standalone artifact (a DSpine drafter: its only component
+    # dspine) has no text either and no component declares a target: it binds every parameter it
+    # uses, so it is checked as a main artifact is (src/artifact/schema.cpp parse_components).
+    standalone = "text" not in components and not any(
+        isinstance(component, dict) and "target" in component for component in components.values())
+    companion = "text" not in components and not standalone
     for name, component in components.items():
         identifier(name, "component id")
         members(component, {"config"}, {"target", "resources", "proposal"}, name)

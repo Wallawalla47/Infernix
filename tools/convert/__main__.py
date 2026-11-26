@@ -16,7 +16,7 @@ from .graft import Graft
 from .official_recipes import RECIPES
 from .pipeline import DEFAULT_MAX_BUFFERED_BYTES, convert
 from .proposal import DEFAULT_RANKING, add_official_proposal, add_token_rank
-from . import inkling2_loop, qwen4_exp
+from . import dspine, inkling2_loop, qwen4_exp
 from .screen import add_screen_heads
 from .qwen3_5 import build_model
 from .recipe import Recipe
@@ -232,9 +232,14 @@ def main(argv=None):
             if "dspark" in components and "dspark" not in paths:
                 paths["dspark"] = Path(base.root) / "mtp.safetensors"
         sources = SourceInputs(base, paths, stack)
+        if dspine.is_dspine(base.config):
+            # A DSpine drafter converts from its own checkpoint to a standalone artifact: --components dspine only.
+            if components != ("dspine",) or graft_paths or args.gguf or args.mmproj or args.proposal or \
+                    args.screen_heads or args.ngram_out or args.ngram_reuse or overrides:
+                raise ValueError("a DSpineDraftModel checkpoint converts with --components dspine and no other options")
         inkling = inkling2_loop.is_inkling2_loop(base.config)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
-        companion = "text" not in components
+        companion = "text" not in components and components != ("dspine",)
         if graft_paths and (qwen4 or companion or args.gguf):
             raise ValueError("--graft copies a drafter into a Qwen3.5 artifact converted from its checkpoint")
         if set(graft_paths) & (set(components) | set(paths)):
@@ -272,7 +277,11 @@ def main(argv=None):
 
             mmproj = stack.enter_context(GGUFSource(args.mmproj))
         ngram_out = None
-        if inkling:
+        if components == ("dspine",):
+            if not dspine.is_dspine(base.config):
+                raise ValueError("--components dspine converts a DSpineDraftModel checkpoint (--model)")
+            model = dspine.build_model(base)
+        elif inkling:
             model = inkling2_loop.build_model(
                 base,
                 components=components,

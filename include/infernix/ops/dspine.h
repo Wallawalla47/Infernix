@@ -1,5 +1,9 @@
 #pragma once
 
+// Ported from NInfer-all (https://github.com/iamwavecut/ninfer-all, PRs #341 and #365; Apache-2.0) and modified
+// for Infernix (renamed into Infernix's Op contract and its oracle test, the proposal draw sub-keyed by step
+// with the Gumbel-max coupled draw: docs/maintainer/dspine.md).
+
 // The Ops of the DSpine code bridge (Tencent DSpine, docs/maintainer/dspine.md): the write that
 // follows every drafter layer, and the serial refinement of the last write that turns a block's
 // candidates into a chain of drafts. Each Op states its rounding points; the independent oracle

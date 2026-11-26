@@ -238,9 +238,16 @@ def test_companion_artifact_targets_the_text_it_is_loaded_beside(tmp_path):
     parse_directory(directory)
     with Artifact(tmp_path / "drafter.infernix") as reader:
         assert reader.read_object("w") == struct.pack("<4H", 0, 0x8000, 0x3F80, 0x7FC1)
+    # No component declaring a target makes a standalone artifact (a DSpine drafter), checked as a main artifact:
+    # its Uses may name only its own parameters.
     without_target = dict(directory, components={"dflash2": {"config": {}}})
-    with pytest.raises(ArtifactError, match="companion"):
+    with pytest.raises(ArtifactError, match="missing parameter"):
         parse_directory(without_target)
+    standalone = dict(without_target, uses=[])
+    parse_directory(standalone)
+    # A component that targets anything but text, with no text, is still a broken companion.
+    with pytest.raises(ArtifactError, match="companion"):
+        parse_directory(dict(directory, components={"dflash2": {"config": {}, "target": "vision"}}))
 
 
 def test_main_artifact_uses_name_only_its_own_parameters(tmp_path):

@@ -914,6 +914,57 @@ def qwen3_8_flash_next_dflash2(model, recipe, sources):
     _optional(model, recipe)
 
 
+def _dspine(model, recipe, *, attention, output, mlp, features):
+    """A DSpine drafter's projections (tools/convert/dspine.py): each role's format, ``q8_g32_fp16`` by absmax groups
+    or ``nvfp4`` (MSE scales, 16-bit activations); the code bridge, norms and derived tables stay BF16. The context
+    K/V roles are Q8 whatever the layer's K/V take (the fused context materialization reads Q8): they share the
+    layer's K/V words when those are Q8, and are stored as their own words otherwise. A drafter only proposes
+    tokens the model verifies, so its precision changes acceptance, never output."""
+
+    if set(model.components) != {"dspine"}:
+        raise ValueError("this recipe converts a DSpine drafter (a DSpineDraftModel checkpoint)")
+    layers = model.components["dspine"]["config"]["num_hidden_layers"]
+
+    def put(names, format):
+        if format == "nvfp4":
+            recipe.assign(list(names), format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+        else:
+            for name in names:
+                _assign(recipe, name, format)
+
+    put(["dspine/feature_projection"], features)
+    for layer in range(layers):
+        p = f"dspine/layers/{layer}/"
+        put([p + "attention/query", p + "attention/key", p + "attention/value"], attention)
+        put([p + "attention/output"], output)
+        put([p + "mlp/gate", p + "mlp/up"], mlp)
+        put([p + "mlp/down"], mlp)
+        for role in ("key", "value"):
+            if attention == Q8:
+                recipe.share(p + "attention/context_" + role, p + "attention/" + role)
+            else:
+                _assign(recipe, p + "attention/context_" + role, Q8)
+
+
+def qwen3_8_27b_dspine_q8(model, recipe, sources):
+    """Tencent's Qwen3.8-27B DSpine drafter as NInfer-all's ``dspine_q8`` stores it: every layer projection and the
+    feature projection ``q8_g32_fp16``, the context K/V sharing the layer's K/V words (2.27 GiB)."""
+    _dspine(model, recipe, attention=Q8, output=Q8, mlp=Q8, features=Q8)
+
+
+def qwen3_8_27b_dspine_nvfp4_mlp(model, recipe, sources):
+    """The DSpine drafter with its layers' MLP (gate/up and down) in NVFP4 at 16-bit activations, the attention and
+    feature projections Q8."""
+    _dspine(model, recipe, attention=Q8, output=Q8, mlp="nvfp4", features=Q8)
+
+
+def qwen3_8_27b_dspine_nvfp4(model, recipe, sources):
+    """The DSpine drafter with its attention output, MLP and feature projection in NVFP4 at 16-bit activations: every
+    projection but the fused query/key/value, which stays Q8 (the drafter's attn_input_proj takes a Q8 parent; 5 % of
+    the projections' parameters), its K/V words shared with the context role the fused materialization reads."""
+    _dspine(model, recipe, attention=Q8, output="nvfp4", mlp="nvfp4", features="nvfp4")
+
+
 def inkling2_mini(model, recipe, sources):
     """thinkingmachines/Inkling-2-Mini bit-exact (docs/maintainer/inkling2_mini-design.md §18): the NVFP4 experts
     (layers 0-19) keep their codes and E4M3 scales in ``nvfp4_expert_rg16_v1`` (their exact FP32 amax and
@@ -957,4 +1008,7 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_qad_dense8": qwen3_8_flash_next_nvfp4_qad_dense8,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
+    "qwen3_8_27b_dspine_q8": qwen3_8_27b_dspine_q8,
+    "qwen3_8_27b_dspine_nvfp4_mlp": qwen3_8_27b_dspine_nvfp4_mlp,
+    "qwen3_8_27b_dspine_nvfp4": qwen3_8_27b_dspine_nvfp4,
 }
