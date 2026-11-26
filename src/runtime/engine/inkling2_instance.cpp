@@ -574,7 +574,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         }
         return {};
     }
+    // --chat-template is read before the weights load, so a file that cannot be read fails the start at once (a
+    // template that does not parse still fails when the frontend is built, after the load).
     std::string template_override;
+    if (!options.chat_template_path.empty()) { template_override = read_text(options.chat_template_path); }
     const std::uint64_t pinned_bytes = plan.materialization().pinned_capacity_bytes;
     auto model = models::inkling2::materialize_model(std::move(plan), device, &options.startup_observer);
     const auto* vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
@@ -670,7 +673,6 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         }
     }
     if (!options.chat_template_path.empty()) {
-        template_override = read_text(options.chat_template_path);
         models::inkling2::FrontendResources resources = instance->model->resources();
         resources.chat_template_jinja                 = template_override;
         instance->frontend = models::inkling2::Frontend(resources, frontend_options(*instance->model, options));
