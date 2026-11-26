@@ -13,20 +13,30 @@
 // 6. At scale: a 32,768-token pool, two 12,000-token prompts with 6,000-token replies under DSpark and INT8 KV.
 // 7. The owner's launcher configuration (2026-11-25: 240,000 tokens, four lanes, INT8 KV, vision offloaded, embedding on
 //    the host, DSpark with --lm-head-draft) plans and starts, and serves a request.
+// 8. Two requests cancelled once one is paused (the paused one never resumes), then a third request: the Program keeps
+//    no capture result after it (testing::known_captures), so neither a cancelled pause's captures nor a released
+//    lane's last capture, landing after its release, stays behind.
 // Reported: preemptions, snapshot restores, replays, replayed tokens and the time paused per case.
 //
 //   INFERNIX_INKLING2_ARTIFACT   an artifact converted with the inkling2_mini recipe (with its DSpark drafter and the
 //                                vision tower)
 //   INFERNIX_INKLING2_NO_OWNER_CONFIG / INFERNIX_INKLING2_NO_SCALE_CASE  skip 7 / 6
+//   INFERNIX_INKLING2_ONLY_CANCEL_CASE                                    run 8 alone
 
 #include "infernix/engine.h"
+#include "models/inkling2/program/test_taps.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -162,6 +172,41 @@ Totals pressure(const std::filesystem::path& artifact, const std::vector<Job>& j
     return totals;
 }
 
+void cancelled_while_paused(const std::filesystem::path& artifact, const std::vector<Job>& jobs) {
+    const Setup setup;
+    infernix::Engine engine(options_for(artifact, 2, setup.context, setup));
+    std::atomic<bool> cancel{false};
+    const infernix::CancellationView cancellation([&cancel] { return cancel.load(); });
+    std::array<std::string, 2> outcomes;
+    std::vector<std::thread> clients;
+    for (std::size_t i = 0; i < 2; ++i) {
+        auto handle = std::make_shared<infernix::GenerationHandle>(
+            engine.submit(engine.prepare_tokens(jobs[i].prompt), jobs[i].options));
+        clients.emplace_back([handle, i, &outcomes, cancellation] {
+            try {
+                const auto result = handle->wait(nullptr, cancellation);
+                outcomes[i]       = std::to_string(result.generated_token_ids.size()) + " tokens, finish " +
+                              std::to_string(static_cast<int>(result.finish_reason));
+            } catch (const std::exception& error) { outcomes[i] = std::string("error: ") + error.what(); }
+        });
+    }
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(300);
+    while (engine.runtime_stats().paused_requests == 0 && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool paused = engine.runtime_stats().paused_requests != 0;
+    cancel.store(true);
+    for (std::thread& client : clients) { client.join(); }
+    std::cout << "cancelled while paused: client 0 " << outcomes[0] << "; client 1 " << outcomes[1] << '\n';
+    require(paused, "cancelled while paused: no request was paused");
+    // A third request binds (which forgets what the cancelled pause kept) and releases.
+    const auto third = engine.generate(engine.prepare_tokens(prompt(engine, 300, 12)), greedy(32));
+    require(third.generated_token_ids.size() == 32, "cancelled while paused: the third request did not complete");
+    const std::uint64_t kept = infernix::models::inkling2::testing::known_captures();
+    std::cout << "cancelled while paused: capture results kept once idle " << kept << '\n';
+    require(kept == 0, "cancelled while paused: the Program kept " + std::to_string(kept) + " capture results once idle");
+}
+
 void owner_configuration(const std::filesystem::path& artifact) {
     infernix::EngineOptions options;
     options.artifact_path        = artifact;
@@ -214,6 +259,11 @@ int main() {
             long_two = {{prompt(engine, 12000, 10), greedy(6000)}, {prompt(engine, 12000, 11), greedy(6000)}};
         }
         using KV = infernix::KvCacheStorage;
+        cancelled_while_paused(artifact, two);
+        if (std::getenv("INFERNIX_INKLING2_ONLY_CANCEL_CASE") != nullptr) {
+            std::cout << "PASS (case 8 only)\n";
+            return 0;
+        }
         pressure(artifact, two, "greedy, plain, C = 2", {});
         pressure(artifact, two, "greedy, DSpark, C = 2", {.dspark = true});
         pressure(artifact, two, "greedy, plain, --kv-dtype int8", {.kv = KV::Int8Group64});

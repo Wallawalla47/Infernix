@@ -354,6 +354,9 @@ struct ResumeStateImpl {
     std::uint32_t target  = 0;
     bool generated        = false;
     std::uint64_t capture = 0;
+    // Keeps the Program's record of the lane's capture ids (ProgramImpl::paused_captures_) for as long as this state
+    // lives; null when the lane captured nothing.
+    std::shared_ptr<const void> captures_owner;
 };
 
 class ProgramImpl {
@@ -784,6 +787,7 @@ public:
         }
         ResumeStateImpl* r = ContractAccess::resume_impl(resume);
         if (resume != nullptr && r == nullptr) { throw std::logic_error("Inkling 2: a resume carries no state"); }
+        sweep_paused_captures();
         namespace pc            = runtime::prefix_cache;
         const BasePlanImpl& b   = *base.impl_;
         const std::uint32_t idx = lane_id.value;
@@ -845,6 +849,13 @@ public:
         Lane& lane = lanes_[lane_id.value];
         if (r != nullptr) {
             // The request as its pause left it: its ledger, sampling, constraint, timings and speculative counters.
+            // Its capture ids are the lane's again (forgotten at its release), so the Program's record of them goes.
+            if (r->captures_owner) {
+                std::erase_if(paused_captures_, [&](const PausedCaptures& p) {
+                    return !p.owner.owner_before(r->captures_owner) && !r->captures_owner.owner_before(p.owner);
+                });
+                r->captures_owner.reset();
+            }
             lane                = r->lane;
             lane.prefix.path    = {};
             lane.prefix.taps    = {};
@@ -1046,6 +1057,7 @@ public:
     // request's output equals a cold one's). The lane is then released and the Engine receives the ResumeState.
     bool start_pause(SequenceHandle sequence) {
         if (binding_ || pause_ || pending_) { return false; }
+        sweep_paused_captures();
         const std::uint32_t index = lane_of(sequence);
         Lane& lane                = lanes_[index];
         {
@@ -1069,6 +1081,10 @@ public:
         saved->lane.prefix.restore.reset();
         saved->lane.prefix.capture = 0;
         saved->lane.constraint_round.clear();
+        if (prefix_ && !saved->lane.prefix.captures.empty()) {
+            saved->captures_owner = std::make_shared<const int>(0);
+            paused_captures_.push_back({saved->captures_owner, saved->lane.prefix.captures});
+        }
         release(index, true);
         const std::uint32_t frontier = saved->target;
         pause_.emplace(ContractAccess::resume(std::move(saved), frontier));
@@ -1812,7 +1828,20 @@ private:
             drop_prefill_events(lanes_[index]);
             lanes_[index] = Lane{};
             clear_failed_prefix();
+            sweep_paused_captures();
+            inkling2::testing::record_known_captures(prefix_ ? prefix_->known_captures() : 0U);
         }
+    }
+    // The capture ids of paused requests whose ResumeState is gone (the Engine dropped a request cancelled while
+    // paused): forgotten (paused_captures_).
+    void sweep_paused_captures() noexcept {
+        std::erase_if(paused_captures_, [&](const PausedCaptures& p) {
+            if (!p.owner.expired()) { return false; }
+            if (prefix_) {
+                for (const std::uint64_t id : p.ids) { prefix_->forget_capture(id); }
+            }
+            return true;
+        });
     }
     // bf16p: forgets a lane's rows with no packed form (a new request, or rejected draft rows the next calls overwrite).
     // A fresh lane's quantized windows (BF16 windows are zeroed with its image).
@@ -2477,6 +2506,7 @@ private:
         }
         prefix_->clear();
         prefix_withdrawal_ = {}; // its references would name the rebuilt index's entries
+        paused_captures_.clear(); // and so would the capture ids (the cleared cache knows none)
         prefix_failed_     = false;
     }
 
@@ -3908,6 +3938,15 @@ private:
     std::uint64_t prefix_saves_        = 0; // saves of the cache file that succeeded
     // Entries a withdrawal found pinned by another lane: withdrawn at a later release or before a save.
     runtime::prefix_cache::Withdrawal prefix_withdrawal_;
+    // The capture ids a paused request's ResumeState keeps (for a withdrawal after its resume), each with a token the
+    // ResumeState holds: the Engine drops a cancelled paused request's state without telling the Program, so an
+    // expired token's ids are forgotten at the next pause, binding or release (sweep_paused_captures). A resume's
+    // binding takes its ids back (its lane forgets them at its release).
+    struct PausedCaptures {
+        std::weak_ptr<const void> owner;
+        std::vector<std::uint64_t> ids;
+    };
+    std::vector<PausedCaptures> paused_captures_;
     std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save_;
     // bf16p: device [kMaximumConcurrency], each lane's lowest appended position with no packed form, and its last
     // reading.

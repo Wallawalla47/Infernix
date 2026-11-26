@@ -22,6 +22,7 @@ std::atomic<std::uint32_t> forced_stalls{0};
 std::atomic<std::uint64_t> rows_drafted{0};
 std::atomic<std::uint64_t> unequal_rounds{0}, empty_rows{0}, full_rows{0};
 std::atomic<bool> skewed{false};
+std::atomic<std::uint64_t> captures_known{0};
 std::mutex ram_mutex;
 std::function<std::uint64_t()> ram_reader; // ram_mutex
 
@@ -59,6 +60,9 @@ Dealing dealing() noexcept {
 
 void set_skewed_dealing(bool on) noexcept { skewed.store(on, std::memory_order_relaxed); }
 bool skewed_dealing() noexcept { return skewed.load(std::memory_order_relaxed); }
+
+void record_known_captures(std::uint64_t count) noexcept { captures_known.store(count, std::memory_order_relaxed); }
+std::uint64_t known_captures() noexcept { return captures_known.load(std::memory_order_relaxed); }
 
 bool take_forced_stall() noexcept {
     std::uint32_t left = forced_stalls.load();
@@ -417,7 +421,7 @@ void PrefixCache::poll() {
             (void)index_->supersede(*c.capture.supersedes);
         }
         if (c.capture.anchor.valid()) { index_->unretain_node(c.capture.anchor); }
-        published_[c.capture.id] = result;
+        if (!c.forgotten) { published_[c.capture.id] = result; }
         recycle(c.done);
         captures_.pop_front();
     }
@@ -526,7 +530,12 @@ std::optional<pc::PublishResult> PrefixCache::capture_result(std::uint64_t id) c
     return found->second;
 }
 
-void PrefixCache::forget_capture(std::uint64_t id) noexcept { published_.erase(id); }
+void PrefixCache::forget_capture(std::uint64_t id) noexcept {
+    published_.erase(id);
+    for (PendingCapture& c : captures_) {
+        if (c.capture.id == id) { c.forgotten = true; }
+    }
+}
 
 // ---- restores --------------------------------------------------------------------------------------
 

@@ -183,7 +183,11 @@ public:
     [[nodiscard]] bool await_extended_capture(std::span<const runtime::prefix_cache::NodeRef> path,
                                               std::span<const TokenId> tokens);
     [[nodiscard]] std::optional<runtime::prefix_cache::PublishResult> capture_result(std::uint64_t id) const;
+    // Drops a capture's result, or, for one still copying, the result it would publish (a released lane forgets its
+    // last capture before it lands).
     void forget_capture(std::uint64_t id) noexcept;
+    // The capture results kept (testing::known_captures: an idle Program keeps none).
+    [[nodiscard]] std::size_t known_captures() const noexcept { return published_.size(); }
 
     // ---- restores (one admission staged at a time) --------------------------------------------
     void open_restore(cudaStream_t producer);
@@ -251,6 +255,7 @@ private:
         Capture capture;
         runtime::prefix_cache::HostImageReservation image;
         cudaEvent_t done = nullptr;
+        bool forgotten   = false; // forget_capture before it landed: published without a capture_result
     };
     struct PendingWrite {
         std::vector<runtime::prefix_cache::NodeRef> nodes;

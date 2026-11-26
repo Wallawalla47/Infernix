@@ -3,7 +3,7 @@
 // Test seams of Inkling 2's Program (for tests only): a stall written into the MoE workspace's error word, as a down
 // CTA's lost count sets it (infernix_inkling2_engine_real_test: the round fails its requests instead of committing their
 // tokens, and the next request is served), counts of rows drafted in rounds of several rows and of how they dealt their
-// drafts, a skewed deal, and the RAM reading the Host tier's resize follows.
+// drafts, a skewed deal, the capture results kept after a release, and the RAM reading the Host tier's resize follows.
 
 #include <cstdint>
 #include <functional>
@@ -35,6 +35,12 @@ struct Dealing {
 // place of the expected tokens' deal. Off by default.
 void set_skewed_dealing(bool on) noexcept;
 [[nodiscard]] bool skewed_dealing() noexcept;
+
+// The capture results a Program's prefix cache kept after its latest lane release (the last Program to release one):
+// once no request is bound, paused or running, none. The preemption test's proof that a paused request cancelled before
+// it resumes, and a lane released while its last capture still copies, leave none behind.
+void record_known_captures(std::uint64_t count) noexcept;
+[[nodiscard]] std::uint64_t known_captures() noexcept;
 
 // The available RAM a Program's RAM monitor reads (start_ram_resize), for Programs started after the call: `reader`, or
 // the system's reading when empty (the default). The prefix cache test drives a release and a growth with it.
