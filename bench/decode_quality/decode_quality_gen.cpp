@@ -9,7 +9,8 @@
 // (--a8-activations), `a16` 16-bit activations everywhere (--a16-activations), and `path=NAME` also runs that fast
 // path whether or not it is qualified (qualification). Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact:
 // `draft-model=FILE` selects it (`drafts=N`, 1-7, its draft count, also MTP's; `auto` its per-round length;
-// `full-head` drafts with the text head instead of the proposal head). `concurrency=N` (1-8) keeps N
+// `full-head` drafts with the text head instead of the proposal head); `dspine` with `draft-model=FILE` drafts with
+// that DSpine drafter artifact instead (--spec dspine, the full head). `concurrency=N` (1-8) keeps N
 // segments decoding on an Engine of N lanes (N workers, each taking the next segment as soon as its
 // last completes) and reports their wall-clock throughput. `ngram=N` and
 // `min-match=M` set the n-gram copy window and minimum match (`ngram`: 15 and 12; `ngram=auto` the
@@ -31,6 +32,7 @@
 //                                  [mtp [auto] [min-p=P]] [dflash [auto]] [plain] [reproducible]
 //                                  [a16 | a8] [path=NAME]...
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
+//                                  [dspine draft-model=FILE [drafts=N] [auto]] (a DSpine drafter)
 //                                  [temperature=T] [logits=fp32|bf16] (the head's logits; bf16 for comparisons)
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
 //                                  [route-trace=FILE] (offloaded experts' route trace, route_trace.h)
@@ -65,7 +67,7 @@ int main(int argc, char** argv) {
         const auto segments      = static_cast<std::uint32_t>(std::stoul(argv[4]));
         const auto prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
-        bool ngram = false, mtp = false, dflash = false, plain = false, reproducible = false, draft_auto = false,
+        bool ngram = false, mtp = false, dflash = false, dspine = false, plain = false, reproducible = false, draft_auto = false,
              full_head = false, tree_auto = false, prompt_records = false, ngram_auto = false, a8 = false,
              a16 = false;
         std::uint32_t ngram_drafts = 15, ngram_min_match = 12, tree_nodes = 0, ngram_tree_nodes = 0, tree_paths = 0;
@@ -106,6 +108,8 @@ int main(int argc, char** argv) {
                 mtp = true;
             } else if (flag == "dflash") {
                 dflash = true;
+            } else if (flag == "dspine") {
+                dspine = true;
             } else if (flag == "auto") {
                 draft_auto = true;
             } else if (flag.starts_with("min-p=")) {
@@ -165,7 +169,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 std::cerr << "unknown option " << flag
-                          << " (ngram, ngram=N, min-match=M, ngram-tree=N, tree=auto|N, prompts, mtp, dflash, auto, min-p=P, "
+                          << " (ngram, ngram=N, min-match=M, ngram-tree=N, tree=auto|N, prompts, mtp, dflash, dspine, auto, min-p=P, "
                              "plain, reproducible, a16, a8, path=NAME, draft-model=FILE, drafts=N, full-head, temperature=T, "
                              "ngram-volume=FILE, route-trace=FILE, kv=NAME, logits=fp32|bf16)\n";
                 return 2;
@@ -179,8 +183,12 @@ int main(int argc, char** argv) {
             std::cerr << "plain decoding drafts nothing (no mtp, dflash or ngram)\n";
             return 2;
         }
-        if (mtp && dflash) {
-            std::cerr << "mtp and dflash are two drafters: choose one\n";
+        if (static_cast<int>(mtp) + static_cast<int>(dflash) + static_cast<int>(dspine) > 1) {
+            std::cerr << "mtp, dflash and dspine are different drafters: choose one\n";
+            return 2;
+        }
+        if (dspine && (plain || draft_model.empty())) {
+            std::cerr << "dspine drafts with the DSpine drafter artifact draft-model=FILE names\n";
             return 2;
         }
         if (a8 && reproducible) {
@@ -220,6 +228,16 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens_auto = !mtp && draft_auto;
         // `min-p=P`: --spec-min-p P, the selector-probability cut of a one-row round.
         options.speculative.draft_min_p = min_p;
+        // `dspine`: --spec dspine --draft-model FILE, which drafts from the full head (no --lm-head-draft).
+        if (dspine) {
+            options.speculative.backend       = infernix::SpeculativeBackend::DSpine;
+            options.speculative.proposal_head = infernix::ProposalHead::Full;
+        }
+#else
+        if (dspine) {
+            std::cerr << "DSpine drafting is not available in NInfer\n";
+            return 2;
+        }
 #endif
         if (mtp) {
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)

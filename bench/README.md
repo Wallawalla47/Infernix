@@ -223,7 +223,8 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path, and `auto` with it lets each
   round choose its length (`--draft-tokens auto`), whose one-row rounds of argmax drafts stop at the
   cumulative acceptance cut; `min-p=P` (`--spec-min-p`) cuts the fixed length's (the Engine refuses it
-  with `auto`);
+  with `auto`); `dspine` with `draft-model=FILE` drafts with that DSpine drafter artifact (`--spec dspine`,
+  the full head);
   `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
   `infernix-serve`; `reproducible` runs the reproducible route, `a16` and `a8` `--a16-activations` and
