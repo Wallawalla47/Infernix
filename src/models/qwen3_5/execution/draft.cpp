@@ -42,12 +42,6 @@
 #include <stdexcept>
 #include <utility>
 
-namespace infernix::models::qwen3_5 {
-
-bool screened_proposal_columns(std::int32_t mask_columns) { return mask_columns <= 2 * ops::kScreenedHeadMaxColumns; }
-
-} // namespace infernix::models::qwen3_5
-
 namespace infernix::models::qwen3_5::execution {
 namespace {
 
@@ -530,21 +524,13 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
             const Weight& head = state.execution.parameters.draft->output_head.weight;
             const std::int32_t valid =
                 dimension(state.execution.parameters.model.resources().public_token_count);
-            if (screen && screened_proposal_columns(mask_columns)) {
-                // RV-41: the screened top sixteen, in calls of at most 16 columns; the full head's beyond two calls.
-                // ZK-07: a batched round past 16 columns (three or more requests drafting seven tokens, two drafting
-                // more than eight; the exact schedule drafts a row at a time, so never there) takes two calls, which
-                // still read less than the full head's one. The 27B serving three lanes (nsys, 2026-11-12): such a
-                // round's head 559 against 894 us (-37 %). Each column's candidates are its own, whatever call it is
-                // in.
-                for (std::int32_t first = 0; first < mask_columns; first += ops::kScreenedHeadMaxColumns) {
-                    const std::int32_t n = std::min(ops::kScreenedHeadMaxColumns, mask_columns - first);
-                    auto call_scope      = work.scope();
-                    Tensor call_ids      = ids_flat.slice(1, first, n);
-                    Tensor call_scores   = scores.slice(1, first, n);
-                    ops::screened_head_topk(hidden.slice(1, first, n), head, *screen, valid, ops::ScreenedHeadPolicy{},
-                                            call_ids, call_scores, work, stream);
-                }
+            if (screen) {
+                // RV-41: the screened top sixteen of every round, the op's passes of up to 32 columns each reading
+                // the screen once (a batched round of up to four requests drafting seven tokens is one pass, eight
+                // requests two; the exact schedule drafts a row at a time). Each column's candidates are its own,
+                // whatever pass or round it is in.
+                ops::screened_head_topk(hidden, head, *screen, valid, ops::ScreenedHeadPolicy{}, ids_flat, scores, work,
+                                        stream);
             } else {
                 ops::linear_topk(hidden, head, valid, ids_flat, scores, work, stream);
             }
@@ -726,16 +712,10 @@ void propose_dspine_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& 
         const Weight& head = weights.output_head.weight;
         const std::int32_t valid =
             dimension(state.execution.parameters.model.resources().public_token_count);
-        if (screen && screened_proposal_columns(mask_columns)) {
-            // The screened top sixteen (RV-41), in calls of at most 16 columns, as a DFlash2 round's.
-            for (std::int32_t first = 0; first < mask_columns; first += ops::kScreenedHeadMaxColumns) {
-                const std::int32_t n = std::min(ops::kScreenedHeadMaxColumns, mask_columns - first);
-                auto call_scope      = work.scope();
-                Tensor call_ids      = ids_flat.slice(1, first, n);
-                Tensor call_scores   = scores_flat.slice(1, first, n);
-                ops::screened_head_topk(hidden.slice(1, first, n), head, *screen, valid, ops::ScreenedHeadPolicy{},
-                                        call_ids, call_scores, work, stream);
-            }
+        if (screen) {
+            // The screened top sixteen (RV-41) of every round, as a DFlash2 round's.
+            ops::screened_head_topk(hidden, head, *screen, valid, ops::ScreenedHeadPolicy{}, ids_flat, scores_flat, work,
+                                    stream);
         } else {
             ops::linear_topk(hidden, head, valid, ids_flat, scores_flat, work, stream);
         }

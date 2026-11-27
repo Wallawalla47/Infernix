@@ -29,7 +29,7 @@ struct ScreenedHeadPolicy {
     std::int32_t rescored  = 64; // a multiple of 32 in [32, 256]
 };
 
-// Columns a screened head serves in one call (1..16).
+// Columns the 2,560-wide screened heads (screened_head_top, screened_head_logits) serve in one call (1..16).
 inline constexpr std::int32_t kScreenedHeadMaxColumns = 16;
 // The ranks screened_head_top returns per column (1..4).
 inline constexpr std::int32_t kScreenedHeadMaxRanks = 4;
@@ -163,7 +163,7 @@ void screened_head_fit(const Weight& head, const Weight& screen, cudaStream_t st
 
 /**
  * Caller-owned transient capacity of screened_head_topk for every column count in [1, max_columns]
- * (max_columns <= kScreenedHeadMaxColumns) under `policy`.
+ * (max_columns >= 1) under `policy`.
  */
 [[nodiscard]] std::size_t screened_head_topk_workspace_bytes(std::int32_t max_columns,
                                                             const ScreenedHeadPolicy& policy = {});
@@ -180,8 +180,8 @@ void screened_head_fit(const Weight& head, const Weight& screen, cudaStream_t st
  *   candidate_scores[j,t] = e[candidate_ids[j,t], t].
  *
  * Logical shapes:
- *   x BF16 [5120, T] with T in [1, 16]; candidate_ids I32 and candidate_scores FP32, contiguous [16, T] (rank fastest,
- *   as ops::linear_topk); 16 <= valid_rows <= R.
+ *   x BF16 [5120, T] with T >= 1; candidate_ids I32 and candidate_scores FP32, contiguous [16, T] (rank fastest, as
+ *   ops::linear_topk); 16 <= valid_rows <= R.
  *
  * Supported domain:
  *   head: FP8_E4M3FN_ROW_BF16 / FP8_E4M3FN_ROW_F32, row-split Q8_G32_FP16, or NVFP4 block_scale_k16_m128x4, [R, 5120];
@@ -199,7 +199,8 @@ void screened_head_fit(const Weight& head, const Weight& screen, cudaStream_t st
  *   screened_head_topk_workspace_bytes(T, policy).
  *
  * Execution:
- *   Two launches for each T: capturable in a CUDA Graph and replayable.
+ *   ceil(T / 32) + 1 launches for each T (the screen in passes of at most 32 columns, each reading the whole screen,
+ *   then the rescore): capturable in a CUDA Graph and replayable.
  */
 void screened_head_topk(const Tensor& x, const Weight& head, const Weight& screen, std::int32_t valid_rows,
                         const ScreenedHeadPolicy& policy, Tensor& candidate_ids, Tensor& candidate_scores,

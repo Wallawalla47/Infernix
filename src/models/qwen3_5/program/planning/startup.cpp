@@ -1157,15 +1157,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     matrix(layout, DType::BF16, h, mask_columns);
                     matrix(layout, DType::I32, ops::kSparseSpeculativeCandidates, mask_columns);
                     matrix(layout, DType::FP32, ops::kSparseSpeculativeCandidates, mask_columns);
-                    {
+                    // The candidates: the screened full head's (RV-41, every round) or linear_topk's.
+                    if (parameters.draft_head_screen) {
+                        scratch(layout, ops::screened_head_topk_workspace_bytes(mask_columns));
+                    } else {
                         const auto& head = parameters.draft->output_head;
-                        std::size_t widest = ops::linear_topk_workspace_capacity_bytes(
-                            head.weight.qtype, head.weight.n, head.weight.k, mask_columns, mask_columns);
-                        if (parameters.draft_head_screen && screened_proposal_columns(mask_columns)) {
-                            widest = std::max(widest, ops::screened_head_topk_workspace_bytes(
-                                                          std::min(mask_columns, ops::kScreenedHeadMaxColumns)));
-                        }
-                        scratch(layout, widest);
+                        scratch(layout, ops::linear_topk_workspace_capacity_bytes(head.weight.qtype, head.weight.n,
+                                                                                  head.weight.k, mask_columns,
+                                                                                  mask_columns));
                     }
                     // The drafts (staged for alignment or another frame), their laws and confidences.
                     matrix(layout, DType::I32, 1, mask_columns);
@@ -1227,18 +1226,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                            mask_columns);
                     matrix(layout, DType::FP32, dimension(draft->dflash2->selector_top_k),
                            mask_columns);
-                    const auto& head = plan.proposal_head == ProposalHead::Optimized
-                                           ? parameters.proposal->head
-                                           : parameters.draft->output_head;
-                    scratch(layout, ops::linear_topk_workspace_capacity_bytes(
-                                        head.weight.qtype, head.weight.n, head.weight.k,
-                                        mask_columns, mask_columns));
-                    // RV-41: the screened full head serves rounds of up to two calls of at most 16 columns (ZK-07),
-                    // one call at a time.
-                    if (plan.proposal_head == ProposalHead::Full && parameters.draft_head_screen &&
-                        screened_proposal_columns(mask_columns)) {
-                        scratch(layout, ops::screened_head_topk_workspace_bytes(
-                                            std::min(mask_columns, ops::kScreenedHeadMaxColumns)));
+                    // The candidates: the screened full head's (RV-41, every round) or linear_topk's over the head
+                    // the plan proposes from.
+                    if (plan.proposal_head == ProposalHead::Full && parameters.draft_head_screen) {
+                        scratch(layout, ops::screened_head_topk_workspace_bytes(mask_columns));
+                    } else {
+                        const auto& head = plan.proposal_head == ProposalHead::Optimized
+                                               ? parameters.proposal->head
+                                               : parameters.draft->output_head;
+                        scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                            head.weight.qtype, head.weight.n, head.weight.k,
+                                            mask_columns, mask_columns));
                     }
                     matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
                            mask_columns);

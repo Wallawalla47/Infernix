@@ -317,8 +317,8 @@ public:
     std::optional<DraftParameters> draft;
     // The DFlash2 drafter's full proposal head screened (candidates RV-41): its 2-bit copy, fitted at load
     // (ops::screened_head_fit) where the drafter's top sixteen run over the full head (not on the lossless route) and
-    // the head is a 5,120-wide FP8 row, q8 or NVFP4 head: ops::screened_head_topk serves its calls of at most 16
-    // columns.
+    // the head is a 5,120-wide FP8 row, q8 or NVFP4 head: ops::screened_head_topk serves every round of the DFlash2
+    // or DSpine drafter that ranks it.
     DeviceBuffer draft_screen;
     std::optional<Weight> draft_head_screen;
     // --lora: every adapted layer's factors in their device layout (prepare_lora: BF16, or on the lossless route A's

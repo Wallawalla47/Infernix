@@ -160,7 +160,10 @@ on Infernix's code and sampled Markdown docs, ABBA), none of its own beat them:
   +4.4 % a cell over code and sampled docs at one, two and four requests and chats at one (geometric mean +1.5 %).
   There its 357.6 MB costs 3.3 % of the KV cache (313,152 tokens against 323,712 at two lanes). The screen
   changes only drafts: on the reproducible route a request's tokens stay plain decoding's, greedy and sampled (the
-  speculation invariance test passes with it on QAD-Exact).
+  speculation invariance test passes with it on QAD-Exact). Since 2026-11-27 it serves every round in passes of up
+  to 32 columns (DFlash2's, [dflash.md](dflash.md)): at three to eight requests on QAD-Exact's default route that was
+  +2.2 % against the 16-column calls and their `linear_topk` past 32 columns (+0.2 to +5.8 % a cell over code and
+  sampled docs, none slower).
 
 ## State
 

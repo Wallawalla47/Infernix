@@ -546,7 +546,10 @@ experts workspace to that byte before each width's calls.
 
 `infernix_linear_topk_bench` measures the complete public projection-plus-stable-top-16 Op for the
 Q8 and row-FP8 full heads, the NVFP4 full head of NVIDIA's Qwen3.8-27B NVFP4-QAD (`nvfp4-full`: its
-A16 linear into FP32 logits, then the grouped selection) and the mapped Q4 optimized head. Its independent matrix-column axis is
+A16 linear into FP32 logits, then the grouped selection) and the mapped Q4 optimized head; `q8-screened`,
+`fp8-screened` and `nvfp4-screened` time `ops::screened_head_topk` over a 2-bit screen of the same full head fitted
+before timing (one call of all the columns, which the Op screens in passes of up to 32; the screen's bytes are the
+logical bandwidth). Its independent matrix-column axis is
 `U`; the default sweep covers every `U=1..120` needed by variable-width DFlash2 proposals. A fixed
 positive `--columns U` also exercises larger matrices; `--columns U,...` selects a representative
 set without a full sweep. Codes and stored scales vary across the physical head, including signs,

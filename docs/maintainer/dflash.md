@@ -194,21 +194,21 @@ selection does not apply target penalties, temperature or top-k/top-p/min-p.
 
 Qwen3.8-27B's full head (FP8 row, q8 or NVFP4, 248,320 x 5,120) is screened (since 2026-11-09, candidates RV-41;
 the NVFP4 head of NVIDIA's NVFP4-QAD since 2026-11-27): at load
-the engine fits a 2-bit copy of it (`ops::screened_head_fit`, 357.6 MB of VRAM, beside the KV cache's share), and a
-round of at most 16 mask columns (one request's) takes its top 16 from `ops::screened_head_topk`: every row scored by
-the copy, the rows near each column's best rescored exactly in FP32 and the 16 best kept. They are the full head's top
-16 whenever the copy selects them; otherwise a lower row stands in for a missed one, which can only change which
-drafts are proposed. On the reproducible route greedy output is unchanged (verification decides it); on the default
-route, whose verification is not invariant to the draft width, changed drafts can change greedy text, as any change
-of drafts can there. Sampled requests keep the target distribution (the drafts' own q is what the acceptance test
-reads), though their tokens may differ. A column's
-candidates depend on that column alone; on the reproducible route every row drafts alone, so each of its rounds takes
-the screen and a request's drafts never depend on the batch. A batched round on the default route of 17-32 mask
-columns (three or more requests drafting seven tokens, or two drafting more than eight) takes it in two calls of at
-most 16 columns (since 2026-11-12, candidates ZK-07), which still read less than the full head's one: serving three
-lanes, such a round's head took 559 against 894 us (-37 %, Nsight Systems kernel times). The drafts of those rounds
-change from the full head's exact top 16 to the screened one's, as narrower rounds' already are. Wider rounds,
-`--lm-head-draft`'s shortlist head and the lossless route keep `linear_topk`.
+the engine fits a 2-bit copy of it (`ops::screened_head_fit`, 357.6 MB of VRAM, beside the KV cache's share), and
+every round takes its top 16 from `ops::screened_head_topk`: every row scored by the copy, the rows near each column's
+best rescored exactly in FP32 and the 16 best kept. They are the full head's top 16 whenever the copy selects them;
+otherwise a lower row stands in for a missed one, which can only change which drafts are proposed. On the
+reproducible route a request's tokens are unchanged, greedy and sampled (verification decides them; a sampled row's
+are its Gumbel-max draws); on the default route, whose verification is not invariant to the draft width, changed
+drafts can change greedy text, as any change of drafts can there, and sampled requests keep the target distribution
+(the drafts' own q is what the acceptance test reads) though their tokens may differ. A column's candidates depend on
+that column alone; on the reproducible route every row drafts alone (at most 15 mask columns), so a request's drafts
+never depend on the batch. The screen runs in passes of up to 32 columns, each streaming the whole copy (since
+2026-11-27): a batched round of up to four requests drafting seven tokens is one pass, eight requests two. Before,
+the op took at most 16 columns a call, a batched round of 17-32 mask columns took two calls (2026-11-12, candidates
+ZK-07: serving three lanes, such a round's head took 559 against 894 us for the full head's, Nsight Systems kernel
+times), and wider rounds (five or more requests) took `linear_topk` over the full head. `--lm-head-draft`'s shortlist
+head and the lossless route keep `linear_topk`.
 
 Measured (RTX 5090, 2026-11-09, `infernix_bench -p 512 -n 256 --spec dflash2 --draft-tokens auto`, INT8 KV, ABBA x3):
 the screen and its top 16 take 264 + 39 us a round against `linear_topk`'s 757 us. On the reproducible route, where
@@ -222,17 +222,32 @@ two.
 The NVFP4 head (NVIDIA's NVFP4-QAD, 715 MB: E2M1 codes, an E4M3 scale per 16 weights and the matrix multiplier) is
 fitted and rescored from the same decoded values its A16 projection reads. Measured on QAD-Exact (RTX 5090,
 2026-11-27, INT8 KV): cold op times (`infernix_linear_topk_bench`) at 7, 16 and 32 columns were 515, 742 and 1,137 us
-for `linear_topk` over the full head, 240, 271 and 535 us screened (32 columns in two calls), and 218, 269 and 421 us
-for `--lm-head-draft`'s Q4 proposal head. End to end (`infernix_decode_quality_gen`, `--draft-tokens auto
---ngram-draft-tokens auto`, one request, 24 code segments of 1,280 + 384 tokens and 24 thinking-on chats of 400
-tokens), on the reproducible route, where every arm decoded the same greedy text and two passes agree within 0.4 %:
-the screened full head against it unscreened +1.9 % on code and +1.8 % on chats, against `--lm-head-draft` +4.3 % and
-+0.6 % (on code the screened arm proposed 12,263 drafts against 12,820 and had 7,424 accepted against 7,344). On
-the default route, where the arms decode different texts (about +-3 % a cell), against `--lm-head-draft`: code +5.5,
-+1.7 and +0.9 % at one, two and four requests, sampled docs +6.5, -2.5 and -1.4 %, chats +1.3 % (geometric mean
-+1.7 %). Wider batched rounds (past 32 mask columns, more than four requests) were not measured: they take the full head's
-`linear_topk`. Without `--lm-head-draft` the proposal head is not loaded, so the screen's 357.6 MB costs no KV against
-it (314,688 tokens either way at two lanes). The recommended 27B setting still names `--lm-head-draft`.
+for `linear_topk` over the full head, 240, 273 and 420 us screened, and 218, 267 and 422 us for `--lm-head-draft`'s Q4
+proposal head. End to end (`infernix_decode_quality_gen`, `--draft-tokens auto --ngram-draft-tokens auto`, one
+request, 24 code segments of 1,280 + 384 tokens and 24 thinking-on chats of 400 tokens), on the reproducible route,
+where every arm decoded the same greedy text and two passes agree within 0.4 %: the screened full head against it
+unscreened +1.9 % on code and +1.8 % on chats, against `--lm-head-draft` +4.3 % and +0.6 % (on code the screened arm
+proposed 12,263 drafts against 12,820 and had 7,424 accepted against 7,344). Without `--lm-head-draft` the proposal
+head is not loaded, so the screen's 357.6 MB costs no KV against it (314,688 tokens either way at two lanes, 268,480
+at eight).
+
+The 32-column passes (2026-11-27; cold op times, RTX 5090): a pass costs 240, 273, 337 and 420 us at one to four
+8-column tiles on the NVFP4 head (it is no longer bound by the copy's bytes past two tiles: the four-tile kernel holds
+255 registers and its partial sums take the item's own ring stage after a barrier), so rounds of 21, 35, 56 and 120
+columns took 337, 633, 728 and 1,524 us against the 16-column calls' 513, 775, 1,035 and 2,089 us, `linear_topk` over
+the full head's 920, 1,283, 1,492 and 2,300 us and the Q4 proposal head's 388, 494, 668 and 1,207 us (the FP8 head:
+355, 648, 740 and 1,514 us screened, its `linear_topk` 887, 925, 1,125 and 1,947 us; q8 alike). The screen leads the
+proposal head at 17-24 columns, ties it at 25-32 and trails it by 60-140 us a round at 33-56 (five to eight requests).
+End to end on the default route (`infernix_decode_quality_gen ... concurrency=N`, code and sampled docs, 24 segments
+of 1,280 + 384 tokens at N <= 4 and 48 at N >= 5, two passes in reverse arm order; the arms decode different texts,
+about +-3 % a cell), at three to eight requests on QAD-Exact the passes against the 16-column calls (and their
+`linear_topk` past 32 columns) were +1.8 % for DFlash2's full head (-0.2 to +3.4 % a cell) and +2.2 % for DSpine
+(+0.2 to +5.8 %, no cell slower). The two builds also differ by the main branch's other changes between them; at one
+request, where both run the same screen kernels and the default route repeats, the newer drafted the same tokens and
+ran 0.1-0.2 % faster. Against `--lm-head-draft` the screened full head was +1.8 % over code and sampled docs at one to
+eight requests on QAD-Exact (code +1.0 to +5.5 %, docs -2.5 to +6.5 %) and +1.7 % on NVIDIA's NVFP4, whose head is
+FP8 (code +0.1 to +5.1 %, docs -2.6 to +2.5 %), each cell's two arms in one session; its sampled docs at two to four
+requests were slower in all five cells (-0.9 to -2.6 %). The recommended 27B setting still names `--lm-head-draft`.
 
 Let predecessor/successor codebooks have shape `[vocab_size,R]` and the hidden projection have
 shape `[R,H]`. The current selector receives its projected hidden g_i as BF16, candidate scores as

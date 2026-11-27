@@ -7,13 +7,16 @@
 // rescore reads at most `rescored` rows a column.
 //
 // Kernels, in launch order:
-//   screen    persistent CTAs (one per SM), eight warps splitting K per 16-row item (warp w takes groups
+//   screen    one pass per 32 columns (a call of T columns makes ceil(T / 32) passes, each streaming the whole
+//             screen): persistent CTAs (one per SM), eight warps splitting K per 16-row item (warp w takes groups
 //             [10w, 10w + 10)), a three-stage cp.async ring of items (23.3 KB each). Unlike the 2,560-wide screen,
 //             whose columns sit in shared memory, each thread holds its K slice of the int8 columns in registers
-//             (80 registers at 16 columns): 16 columns of 5,120 bytes would leave no room for the ring in 99 KB.
-//             Per column it keeps the CTA's best kListLength rows.
-//   topk      one CTA per column: the rows to rescore (select_rows), their exact scores (FP32 sums of the decoded
-//             head row times the column, a warp per row), and the sixteen best by (score, lower row).
+//             (40 registers per 8-column tile; 120, 183, 245 and 255 in all at one to four tiles): 16 columns of
+//             5,120 bytes would leave no room for the ring in 99 KB. At four tiles the eight warps' partial sums take
+//             the item's own ring stage once every warp has read it (the ring, the column scales and a buffer of their
+//             own would not fit). Per column it keeps the CTA's best kListLength rows.
+//   topk      one CTA per column of the call: the rows to rescore (select_rows), their exact scores (FP32 sums of the
+//             decoded head row times the column, a warp per row), and the sixteen best by (score, lower row).
 // The fit (screened_head_fit): one thread per 64-weight group of a decoded head row: the binary16 scale of least
 // squared error over a sweep of the group's max-abs times [0.3, 1] in both signs (and the least-squares scale of the
 // max-abs codes), its codes in {-2, -1, 0, 1}, then the scale stretched to keep the group's norm (the converter's
@@ -66,14 +69,26 @@ constexpr int kStageBytes      = kStageCodeBytes + kItemRows * kScaleRowBytes;
 constexpr int kScreenCodeBytes = kCodeRowBytes;       // a screen row's code bytes
 static_assert(kKGroups % kWarps == 0 && kStageBytes % 16 == 0 && kStageCodeBytes % 16 == 0);
 
+constexpr int kPassTiles    = 4;              // 8-column tiles a screen pass holds
+constexpr int kPassColumns  = kPassTiles * 8; // 32
+constexpr int kSharedBudget = 101376;         // a CTA's dynamic shared memory on sm_120 (99 KB)
+
+// The eight warps' partial sums of an item (then its scores), and whether they take the item's ring stage.
+template <int Tiles>
+constexpr int kPartialBytes = kWarps * kItemRows * Tiles * 8 * 4;
+template <int Tiles>
+constexpr bool kPartialsInStage = kStages * kStageBytes + Tiles * 8 * kKGroups * 8 + kPartialBytes<Tiles> > kSharedBudget;
+
 // Dynamic shared memory of the screen: the item ring, each (column, group)'s FP32 scale and twice its code sum, and
-// the eight warps' partial sums (then the item's scores).
+// (unless they take the item's stage) the partial sums.
 template <int Tiles>
 constexpr int wide_screen_shared_bytes() {
     constexpr int C = Tiles * 8;
-    return kStages * kStageBytes + C * kKGroups * 8 + kWarps * kItemRows * C * 4;
+    return kStages * kStageBytes + C * kKGroups * 8 + (kPartialsInStage<Tiles> ? 0 : kPartialBytes<Tiles>);
 }
-static_assert(wide_screen_shared_bytes<2>() <= 101376, "the screen's ring, scales and partials fit one CTA");
+static_assert(!kPartialsInStage<2>, "the one- and two-tile screens keep their partials apart");
+static_assert(wide_screen_shared_bytes<kPassTiles>() <= kSharedBudget && kPartialBytes<kPassTiles> <= kStageBytes,
+              "the screen's ring, scales and partials fit one CTA");
 
 struct WideScreenParams {
     const bf16* x;              // [K, T]
@@ -146,9 +161,9 @@ template <int Tiles>
 __global__ void __launch_bounds__(kThreads, 1) wide_screen_kernel(WideScreenParams p) {
     extern __shared__ __align__(16) std::uint8_t shared[];
     constexpr int C      = Tiles * 8;
-    std::uint8_t* stages = shared;
-    float2* xs           = reinterpret_cast<float2*>(shared + kStages * kStageBytes);
-    float* partial       = reinterpret_cast<float*>(xs + C * kKGroups);
+    std::uint8_t* stages  = shared;
+    float2* xs            = reinterpret_cast<float2*>(shared + kStages * kStageBytes);
+    float* partial_buffer = reinterpret_cast<float*>(xs + C * kKGroups);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t = lane & 3;
     const int items = p.rows / kItemRows;
@@ -227,6 +242,13 @@ __global__ void __launch_bounds__(kThreads, 1) wide_screen_kernel(WideScreenPara
                 acc[nt][2] = fmaf(s1 * x0.x, static_cast<float>(c2) - x0.y, acc[nt][2]);
                 acc[nt][3] = fmaf(s1 * x1.x, static_cast<float>(c3) - x1.y, acc[nt][3]);
             }
+        }
+        // At four tiles the partials overwrite item k's stage once every warp has read its codes and scales; the next
+        // item into that stage (k + kStages) is issued after the next iteration's first barrier.
+        float* partial = partial_buffer;
+        if constexpr (kPartialsInStage<Tiles>) {
+            __syncthreads();
+            partial = reinterpret_cast<float*>(stages + (k % kStages) * kStageBytes);
         }
         float* own = partial + warp * kItemRows * C;
 #pragma unroll
@@ -638,9 +660,7 @@ void screened_head_fit(const Weight& head, const Weight& screen, cudaStream_t st
 
 std::size_t screened_head_topk_workspace_bytes(std::int32_t max_columns, const ScreenedHeadPolicy& policy) {
     validate_topk_policy(policy);
-    if (max_columns < 1 || max_columns > kScreenedHeadMaxColumns) {
-        throw std::invalid_argument("screened_head_topk workspace: columns must be in [1, 16]");
-    }
+    if (max_columns < 1) { throw std::invalid_argument("screened_head_topk workspace: columns must be positive"); }
     WorkspaceLayoutBuilder layout;
     (void)allocate_lists(layout, max_columns);
     return layout.peak_bytes();
@@ -654,8 +674,8 @@ void screened_head_topk(const Tensor& x, const Weight& head, const Weight& scree
     const std::int32_t R = head.n;
     validate_wide_screen(screen, R);
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[0] == kK && x.ne[2] == 1 &&
-                x.ne[3] == 1 && x.ne[1] >= 1 && x.ne[1] <= kScreenedHeadMaxColumns && aligned16(x.data),
-            "x must be contiguous, aligned BF16 [5120, T] with T in [1, 16]");
+                x.ne[3] == 1 && x.ne[1] >= 1 && aligned16(x.data),
+            "x must be contiguous, aligned BF16 [5120, T] with T >= 1");
     const std::int32_t T = x.ne[1];
     require(valid_rows >= kScreenedTopkCandidates && valid_rows <= R, "valid_rows must be in [16, R]");
     require(candidate_ids.data != nullptr && candidate_ids.dtype == DType::I32 && candidate_ids.is_contiguous() &&
@@ -668,17 +688,24 @@ void screened_head_topk(const Tensor& x, const Weight& head, const Weight& scree
     auto scope        = workspace.scope();
     const Tensor lists = allocate_lists(workspace, T);
     const int grid     = wide_screen_grid(R / kItemRows);
-    const WideScreenParams params{.x          = static_cast<const bf16*>(x.data),
-                                  .codes      = static_cast<const std::uint8_t*>(screen.qdata),
-                                  .scales     = static_cast<const std::uint8_t*>(screen.scales),
-                                  .rows       = R,
-                                  .valid_rows = valid_rows,
-                                  .columns    = T,
-                                  .lists      = static_cast<float2*>(lists.data)};
-    if (T <= 8) {
-        launch_wide_screen<1>(params, grid, stream);
-    } else {
-        launch_wide_screen<2>(params, grid, stream);
+    // Passes of 32 columns, the last of the rest at the fewest 8-column tiles; a column's lists depend on that column
+    // alone, whatever pass, tile width or call holds it.
+    for (std::int32_t first = 0; first < T; first += kPassColumns) {
+        const std::int32_t n = std::min<std::int32_t>(kPassColumns, T - first);
+        const WideScreenParams params{
+            .x          = static_cast<const bf16*>(x.data) + static_cast<std::size_t>(first) * kK,
+            .codes      = static_cast<const std::uint8_t*>(screen.qdata),
+            .scales     = static_cast<const std::uint8_t*>(screen.scales),
+            .rows       = R,
+            .valid_rows = valid_rows,
+            .columns    = n,
+            .lists      = static_cast<float2*>(lists.data) + static_cast<std::size_t>(first) * grid * kListLength};
+        switch ((n + 7) / 8) {
+        case 1: launch_wide_screen<1>(params, grid, stream); break;
+        case 2: launch_wide_screen<2>(params, grid, stream); break;
+        case 3: launch_wide_screen<3>(params, grid, stream); break;
+        default: launch_wide_screen<4>(params, grid, stream); break;
+        }
     }
     const TopkParams top{.x      = static_cast<const bf16*>(x.data),
                          .head   = view,

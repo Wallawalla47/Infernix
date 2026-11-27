@@ -1,7 +1,7 @@
 // Public cold-cache benchmark for the registered linear_topk profiles: the fused Q8, FP8 and Q4 heads and the
 // materialized NVFP4 head of NVIDIA's Qwen3.8-27B NVFP4-QAD (its A16 linear, then the grouped selection); and the
-// screened top sixteen of the FP8 and NVFP4 full heads (ops::screened_head_topk over a screen fitted here, in calls
-// of at most 16 columns as the drafters make them).
+// screened top sixteen of the q8, FP8 and NVFP4 full heads (ops::screened_head_topk over a screen fitted here, one
+// call of all the columns as the drafters make it: the op screens in passes of up to 32 columns).
 #include "core/weight.h"
 #include "infernix/ops/linear_topk.h"
 #include "infernix/ops/screened_head.h"
@@ -33,16 +33,20 @@ enum class Profile {
     Fp8,
     Q4,
     Nvfp4,
+    Q8Screened,
     Fp8Screened,
     Nvfp4Screened,
 };
 
-bool screened(Profile profile) { return profile == Profile::Fp8Screened || profile == Profile::Nvfp4Screened; }
+bool screened(Profile profile) {
+    return profile == Profile::Q8Screened || profile == Profile::Fp8Screened || profile == Profile::Nvfp4Screened;
+}
 
 const char* profile_name(Profile profile) {
     if (profile == Profile::Q8) { return "q8-full"; }
     if (profile == Profile::Fp8) { return "fp8-full"; }
     if (profile == Profile::Nvfp4) { return "nvfp4-full"; }
+    if (profile == Profile::Q8Screened) { return "q8-screened"; }
     if (profile == Profile::Fp8Screened) { return "fp8-screened"; }
     if (profile == Profile::Nvfp4Screened) { return "nvfp4-screened"; }
     return "q4-optimized";
@@ -53,7 +57,7 @@ void run(Profile profile, std::int32_t width, std::int32_t columns, int warmup, 
     const std::int32_t rows        = profile == Profile::Q4 ? 131072 : 248320;
     const bool fp8                 = profile == Profile::Fp8 || profile == Profile::Fp8Screened;
     const bool nvfp4               = profile == Profile::Nvfp4 || profile == Profile::Nvfp4Screened;
-    const QType qtype              = profile == Profile::Q8 ? QType::Q8_G32_FP16
+    const QType qtype              = profile == Profile::Q8 || profile == Profile::Q8Screened ? QType::Q8_G32_FP16
                                      : fp8                  ? QType::FP8_E4M3FN_ROW_BF16
                                      : nvfp4                ? QType::NVFP4
                                                             : QType::Q4_G64_FP16;
@@ -81,7 +85,7 @@ void run(Profile profile, std::int32_t width, std::int32_t columns, int warmup, 
         CUDA_CHECK(cudaDeviceSynchronize());
     }
     const std::size_t workspace_bytes =
-        screened(profile) ? ops::screened_head_topk_workspace_bytes(std::min(columns, ops::kScreenedHeadMaxColumns))
+        screened(profile) ? ops::screened_head_topk_workspace_bytes(columns)
                           : ops::linear_topk_workspace_capacity_bytes(qtype, rows, width, columns, columns);
     WorkspaceArena workspace(workspace_bytes);
     Tensor hidden_tensor(hidden.p, DType::BF16, {width, columns});
@@ -94,14 +98,8 @@ void run(Profile profile, std::int32_t width, std::int32_t columns, int warmup, 
 
     const auto launch = [&](cudaStream_t launch_stream) {
         if (screened(profile)) {
-            for (std::int32_t first = 0; first < columns; first += ops::kScreenedHeadMaxColumns) {
-                const std::int32_t n = std::min(ops::kScreenedHeadMaxColumns, columns - first);
-                Tensor x             = hidden_tensor.slice(1, first, n);
-                Tensor call_ids      = ids_tensor.slice(1, first, n);
-                Tensor call_scores   = scores_tensor.slice(1, first, n);
-                ops::screened_head_topk(x, packed.weight, screen, 248077, ops::ScreenedHeadPolicy{}, call_ids,
-                                        call_scores, workspace, launch_stream);
-            }
+            ops::screened_head_topk(hidden_tensor, packed.weight, screen, 248077, ops::ScreenedHeadPolicy{}, ids_tensor,
+                                    scores_tensor, workspace, launch_stream);
         } else if (profile == Profile::Q4) {
             ops::linear_topk(hidden_tensor, packed.weight, map_tensor, ids_tensor, scores_tensor,
                              workspace, launch_stream);
@@ -130,10 +128,11 @@ Profile parse_profile(std::string_view value) {
     if (value == "fp8-full") { return Profile::Fp8; }
     if (value == "q4-optimized") { return Profile::Q4; }
     if (value == "nvfp4-full") { return Profile::Nvfp4; }
+    if (value == "q8-screened") { return Profile::Q8Screened; }
     if (value == "fp8-screened") { return Profile::Fp8Screened; }
     if (value == "nvfp4-screened") { return Profile::Nvfp4Screened; }
-    throw std::invalid_argument(
-        "profile must be q8-full, fp8-full, nvfp4-full, q4-optimized, fp8-screened or nvfp4-screened");
+    throw std::invalid_argument("profile must be q8-full, fp8-full, nvfp4-full, q4-optimized, q8-screened, fp8-screened "
+                                "or nvfp4-screened");
 }
 
 } // namespace
@@ -152,7 +151,8 @@ int main(int argc, char** argv) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::printf(
-                    "usage: %s [--profile all|q8-full|fp8-full|nvfp4-full|q4-optimized|fp8-screened|nvfp4-screened] "
+                    "usage: %s [--profile all|q8-full|fp8-full|nvfp4-full|q4-optimized|q8-screened|fp8-screened|"
+                    "nvfp4-screened] "
                     "[--hidden 5120|2560] "
                     "[--columns U,...] [--warmup N] [--repeat N]\n"
                     "  --hidden: the head width, Qwen3.8-27B's 5120 (default) or Qwen3.8-Flash-Next's 2560\n"
@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
         std::vector<Profile> profiles;
         if (profile == "all")
             profiles = hidden == 5120 ? std::vector{Profile::Q8, Profile::Fp8, Profile::Nvfp4, Profile::Q4,
-                                                    Profile::Fp8Screened, Profile::Nvfp4Screened}
+                                                    Profile::Q8Screened, Profile::Fp8Screened, Profile::Nvfp4Screened}
                                       : std::vector{Profile::Q8, Profile::Q4};
         else
             profiles = {parse_profile(profile)};

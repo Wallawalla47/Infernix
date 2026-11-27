@@ -6,17 +6,21 @@
 // Fit: the screen's bytes against a host replay of the documented fit (every step an explicitly rounded FP32
 // operation, binary16 by round to nearest even), for every 13th row and the planted rows, all 80 groups.
 //
-// Top sixteen, at T = 1, 5, 8, 9 and 16 (both screen tile widths, full and ragged):
-// - columns with planted rows (even columns: 16 rows aligned with the column's signs, at distinct magnitudes, so
-//   their exact scores exceed every other valid row's by far): the candidates equal the FP64 top sixteen exactly;
-//   a planted row past valid_rows with a still larger score never appears;
+// Top sixteen, over 120 columns (eight requests of 15 drafts), each column alone (T = 1 at its own offset) and in calls
+// of T = 16, 5, 8, 9, 17, 24, 25, 32, 33, 56 and 120 (every screen tile width of a pass, one pass and several, full
+// and ragged):
+// - columns with planted rows (the even columns below 16, and columns 32 and 40 in a call's second pass: 16 rows
+//   aligned with the column's signs, at distinct magnitudes, so their exact scores exceed every other valid row's
+//   by far): the candidates equal the FP64 top sixteen exactly; a planted row past valid_rows with a still larger
+//   score never appears;
 // - every column: each candidate's score is its row's FP64 dot within the FP32 summation bound
 //   |s - e| <= 2^-12 sum |w x| + 1e-30, the candidates are distinct valid rows in descending score order (equal
 //   scores in ascending row order);
-// - column invariance: a column's candidates and scores are the same bits in every call that holds it (T = 1 .. 16);
-// - a CUDA Graph replay of the T = 16 call gives the eager call's bits.
-// The recall of the FP64 top sixteen on the unplanted columns is reported (the screen's quality on this synthetic
-// head), not asserted: the contract promises the exact top sixteen only for rows the screen selects.
+// - column invariance: a column's candidates and scores are the same bits in every call that holds it, at any
+//   offset, pass or tile width (each against the column's own T = 1 call);
+// - CUDA Graph replays of the T = 16 and T = 120 calls give the columns' bits.
+// The recall of the FP64 top sixteen on the unplanted columns below 16 is reported (the screen's quality on this
+// synthetic head), not asserted: the contract promises the exact top sixteen only for rows the screen selects.
 #include "ops/op_family.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -36,6 +40,7 @@
 #include <iostream>
 #include <numeric>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace infernix;
@@ -49,9 +54,14 @@ namespace qw = quantized_weight;
 constexpr int kRows    = 8192;
 constexpr int kK       = 5120;
 constexpr int kValid   = kRows - 16;
-constexpr int kColumns = 16;
+constexpr int kColumns = 120; // eight requests of 15 drafts
 constexpr int kGroups  = kK / 64;
 constexpr int kTop     = 16;
+
+// Planted columns: the even ones below 16 and two in a call's second pass of 32 columns.
+bool planted_column(int column) { return column < 16 ? column % 2 == 0 : column == 32 || column == 40; }
+// The columns whose every row's FP64 score the test computes: those below 16 and the planted ones.
+bool exact_column(int column) { return column < 16 || planted_column(column); }
 
 int failures = 0;
 
@@ -62,7 +72,7 @@ void fail(const std::string& what) {
 
 std::uint32_t next(std::uint32_t& state) { return state = state * 1664525U + 1013904223U; }
 
-// x: BF16 [5120, 16] in [-1, 1].
+// x: BF16 [5120, 120] in [-1, 1].
 std::vector<std::uint16_t> make_x() {
     std::vector<std::uint16_t> x(static_cast<std::size_t>(kK) * kColumns);
     std::uint32_t state = 0x5EEDU;
@@ -78,11 +88,11 @@ float x_value(const std::vector<std::uint16_t>& x, int column, int k) {
     return bf16_to_f32(x[static_cast<std::size_t>(column) * kK + k]);
 }
 
-int planted_row(int column, int j) { return 64 + column * 200 + j * 7; }
+int planted_row(int column, int j) { return 64 + column * 200 + j * 7; } // column 40's last: 8,169 < valid_rows
 constexpr int kInvalidPlant = kRows - 3; // past valid_rows
 
-// Rows aligned with even columns' signs, at decreasing code magnitudes; row kInvalidPlant aligned with column 0 at
-// the largest magnitude (and, FP8, a doubled row scale).
+// Rows aligned with the planted columns' signs, at decreasing code magnitudes; row kInvalidPlant aligned with column 0
+// at the largest magnitude (and, FP8, a doubled row scale).
 void plant(qw::PackedWeight& head, const std::vector<std::uint16_t>& x) {
     if (head.weight.qtype == QType::NVFP4) {
         // E2M1 codes of magnitude 6 (index 7) with the column's signs; every block scale of the row the E4M3 word
@@ -102,7 +112,8 @@ void plant(qw::PackedWeight& head, const std::vector<std::uint16_t>& x) {
                 head.payload[at] = scale_word;
             }
         };
-        for (int column = 0; column < kColumns; column += 2) {
+        for (int column = 0; column < kColumns; ++column) {
+            if (!planted_column(column)) { continue; }
             for (int j = 0; j < kTop; ++j) { put(planted_row(column, j), column, static_cast<std::uint8_t>(0x38 - j)); }
         }
         put(kInvalidPlant, 0, 0x40);
@@ -123,7 +134,8 @@ void plant(qw::PackedWeight& head, const std::vector<std::uint16_t>& x) {
             head.payload[static_cast<std::size_t>(row) * kK + k] = code;
         }
     };
-    for (int column = 0; column < kColumns; column += 2) {
+    for (int column = 0; column < kColumns; ++column) {
+        if (!planted_column(column)) { continue; }
         for (int j = 0; j < kTop; ++j) { put(planted_row(column, j), column, j); }
     }
     put(kInvalidPlant, 0, 0);
@@ -261,7 +273,8 @@ void check_fit(const std::string& label, const qw::PackedWeight& head, const Wei
     const auto scales = from_device<std::uint16_t>(screen.scales, static_cast<std::size_t>(kRows) * kGroups);
     std::vector<int> rows;
     for (int row = 0; row < kRows; row += 13) { rows.push_back(row); }
-    for (int column = 0; column < kColumns; column += 2) {
+    for (int column = 0; column < kColumns; ++column) {
+        if (!planted_column(column)) { continue; }
         for (int j = 0; j < kTop; ++j) { rows.push_back(planted_row(column, j)); }
     }
     rows.push_back(kInvalidPlant);
@@ -286,9 +299,20 @@ void check_fit(const std::string& label, const qw::PackedWeight& head, const Wei
 // ---- The top sixteen
 
 struct Exact {
-    std::vector<double> score;     // [column][row]
+    std::vector<double> score;     // [column][row], the exact columns' (exact_column)
     std::vector<double> magnitude; // sum |w x|
 };
+
+// The FP64 score and sum |w x| of one row and column.
+std::pair<double, double> row_dot(const std::vector<float>& w, const std::vector<std::uint16_t>& x, int column) {
+    double sum = 0.0, magnitude = 0.0;
+    for (int k = 0; k < kK; ++k) {
+        const double p = static_cast<double>(w[k]) * x_value(x, column, k);
+        sum += p;
+        magnitude += std::fabs(p);
+    }
+    return {sum, magnitude};
+}
 
 Exact exact_scores(const qw::PackedWeight& head, const std::vector<std::uint16_t>& x) {
     Exact out{std::vector<double>(static_cast<std::size_t>(kColumns) * kRows),
@@ -296,12 +320,8 @@ Exact exact_scores(const qw::PackedWeight& head, const std::vector<std::uint16_t
     for (int row = 0; row < kRows; ++row) {
         const std::vector<float> w = row_values(head, row);
         for (int column = 0; column < kColumns; ++column) {
-            double sum = 0.0, magnitude = 0.0;
-            for (int k = 0; k < kK; ++k) {
-                const double p = static_cast<double>(w[k]) * x_value(x, column, k);
-                sum += p;
-                magnitude += std::fabs(p);
-            }
+            if (!exact_column(column)) { continue; }
+            const auto [sum, magnitude] = row_dot(w, x, column);
             out.score[static_cast<std::size_t>(column) * kRows + row]     = sum;
             out.magnitude[static_cast<std::size_t>(column) * kRows + row] = magnitude;
         }
@@ -324,10 +344,11 @@ struct Result {
     std::vector<float> scores;
 };
 
-Result run_topk(const Weight& head, const Weight& screen, const DeviceBuffer& x, int columns, DeviceArena& workspace,
-                cudaStream_t stream = nullptr) {
+// The call over x's columns [first, first + columns).
+Result run_topk(const Weight& head, const Weight& screen, const DeviceBuffer& x, int first, int columns,
+                DeviceArena& workspace, cudaStream_t stream = nullptr) {
     DeviceBuffer ids(static_cast<std::size_t>(kTop) * columns * 4), scores(static_cast<std::size_t>(kTop) * columns * 4);
-    Tensor xt(x.p, DType::BF16, {kK, columns});
+    Tensor xt(static_cast<std::uint8_t*>(x.p) + static_cast<std::size_t>(first) * kK * 2, DType::BF16, {kK, columns});
     Tensor id_t(ids.p, DType::I32, {kTop, columns});
     Tensor score_t(scores.p, DType::FP32, {kTop, columns});
     ops::screened_head_topk(xt, head, screen, kValid, ops::ScreenedHeadPolicy{}, id_t, score_t, workspace, stream);
@@ -349,76 +370,84 @@ void check_head(const std::string& label, qw::PackedWeight packed, const std::ve
     const Exact exact     = exact_scores(head_buffer.host, x_bits);
     const DeviceBuffer x  = to_device(x_bits);
     DeviceArena workspace(ops::screened_head_topk_workspace_bytes(kColumns));
-    std::vector<Result> by_width;
-    double recall_sum = 0.0;
+
+    // Each column alone (T = 1 at its own offset): the reference of every call's column, checked against FP64.
+    std::vector<Result> alone;
+    double recall_sum  = 0.0;
     int recall_columns = 0;
-    for (const int T : {16, 1, 5, 8, 9}) {
-        const Result r = run_topk(head, screen, x, T, workspace);
-        const std::string call = label + " T=" + std::to_string(T);
-        for (int column = 0; column < T; ++column) {
-            const std::string where = call + " column " + std::to_string(column);
-            const std::int32_t* ids = r.ids.data() + static_cast<std::size_t>(column) * kTop;
-            const float* scores     = r.scores.data() + static_cast<std::size_t>(column) * kTop;
-            for (int j = 0; j < kTop; ++j) {
-                const int row = ids[j];
-                if (row < 0 || row >= kValid) {
-                    fail(where + ": candidate " + std::to_string(row) + " is not a valid row");
-                    return;
-                }
-                for (int i = 0; i < j; ++i) {
-                    if (ids[i] == row) {
-                        fail(where + ": candidate repeated");
-                        return;
-                    }
-                }
-                const std::size_t at = static_cast<std::size_t>(column) * kRows + row;
-                if (!(std::fabs(scores[j] - exact.score[at]) <= std::ldexp(exact.magnitude[at], -12) + 1e-30)) {
-                    fail(where + ": score of row " + std::to_string(row) + " is " + std::to_string(scores[j]) +
-                         ", exact " + std::to_string(exact.score[at]));
-                    return;
-                }
-                if (j > 0 && !(scores[j - 1] > scores[j] || (scores[j - 1] == scores[j] && ids[j - 1] < row))) {
-                    fail(where + ": candidates out of order");
+    for (int column = 0; column < kColumns; ++column) {
+        alone.push_back(run_topk(head, screen, x, column, 1, workspace));
+        const std::string where = label + " column " + std::to_string(column);
+        const std::int32_t* ids = alone.back().ids.data();
+        const float* scores     = alone.back().scores.data();
+        for (int j = 0; j < kTop; ++j) {
+            const int row = ids[j];
+            if (row < 0 || row >= kValid) {
+                fail(where + ": candidate " + std::to_string(row) + " is not a valid row");
+                return;
+            }
+            for (int i = 0; i < j; ++i) {
+                if (ids[i] == row) {
+                    fail(where + ": candidate repeated");
                     return;
                 }
             }
-            const std::vector<int> want = oracle_top(exact, column);
-            if (column % 2 == 0) {
-                if (!std::equal(want.begin(), want.end(), ids)) {
-                    fail(where + ": planted column's candidates differ from the exact top sixteen");
-                    return;
-                }
-            } else if (T == 16) {
-                int hits = 0;
-                for (const int row : want) { hits += std::find(ids, ids + kTop, row) != ids + kTop; }
-                recall_sum += static_cast<double>(hits) / kTop;
-                ++recall_columns;
+            const std::size_t at = static_cast<std::size_t>(column) * kRows + row;
+            const auto [want_score, magnitude] =
+                exact_column(column) ? std::pair{exact.score[at], exact.magnitude[at]}
+                                     : row_dot(row_values(head_buffer.host, row), x_bits, column);
+            if (!(std::fabs(scores[j] - want_score) <= std::ldexp(magnitude, -12) + 1e-30)) {
+                fail(where + ": score of row " + std::to_string(row) + " is " + std::to_string(scores[j]) +
+                     ", exact " + std::to_string(want_score));
+                return;
+            }
+            if (j > 0 && !(scores[j - 1] > scores[j] || (scores[j - 1] == scores[j] && ids[j - 1] < row))) {
+                fail(where + ": candidates out of order");
+                return;
             }
         }
-        // Column invariance against the T = 16 call (the first).
-        if (!by_width.empty()) {
-            const Result& full = by_width.front();
-            for (int column = 0; column < T; ++column) {
-                for (int j = 0; j < kTop; ++j) {
-                    const std::size_t i = static_cast<std::size_t>(column) * kTop + j;
-                    if (r.ids[i] != full.ids[i] || std::memcmp(&r.scores[i], &full.scores[i], 4) != 0) {
-                        fail(call + ": column " + std::to_string(column) + " differs from the T=16 call");
-                        return;
-                    }
-                }
+        if (!exact_column(column)) { continue; }
+        const std::vector<int> want = oracle_top(exact, column);
+        if (planted_column(column)) {
+            if (!std::equal(want.begin(), want.end(), ids)) {
+                fail(where + ": planted column's candidates differ from the exact top sixteen");
+                return;
             }
+        } else {
+            int hits = 0;
+            for (const int row : want) { hits += std::find(ids, ids + kTop, row) != ids + kTop; }
+            recall_sum += static_cast<double>(hits) / kTop;
+            ++recall_columns;
         }
-        by_width.push_back(r);
     }
     std::printf("%s: recall of the exact top sixteen on unplanted columns %.3f (%d columns)\n", label.c_str(),
                 recall_columns > 0 ? recall_sum / recall_columns : 0.0, recall_columns);
 
-    // A CUDA Graph replay of the T = 16 call.
-    {
-        DeviceBuffer ids(static_cast<std::size_t>(kTop) * kColumns * 4), scores(static_cast<std::size_t>(kTop) * kColumns * 4);
-        Tensor xt(x.p, DType::BF16, {kK, kColumns});
-        Tensor id_t(ids.p, DType::I32, {kTop, kColumns});
-        Tensor score_t(scores.p, DType::FP32, {kTop, kColumns});
+    // Column invariance: every call's columns carry their alone bits.
+    const auto same_as_alone = [&](const Result& r, int T, const std::string& call) {
+        for (int column = 0; column < T; ++column) {
+            for (int j = 0; j < kTop; ++j) {
+                const std::size_t i = static_cast<std::size_t>(column) * kTop + j;
+                if (r.ids[i] != alone[column].ids[j] || std::memcmp(&r.scores[i], &alone[column].scores[j], 4) != 0) {
+                    fail(call + ": column " + std::to_string(column) + " differs from its call alone");
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    for (const int T : {16, 5, 8, 9, 17, 24, 25, 32, 33, 56, 120}) {
+        if (!same_as_alone(run_topk(head, screen, x, 0, T, workspace), T, label + " T=" + std::to_string(T))) {
+            return;
+        }
+    }
+
+    // CUDA Graph replays of the T = 16 call (one pass) and the T = 120 call (four).
+    for (const int T : {16, 120}) {
+        DeviceBuffer ids(static_cast<std::size_t>(kTop) * T * 4), scores(static_cast<std::size_t>(kTop) * T * 4);
+        Tensor xt(x.p, DType::BF16, {kK, T});
+        Tensor id_t(ids.p, DType::I32, {kTop, T});
+        Tensor score_t(scores.p, DType::FP32, {kTop, T});
         DeviceContext device;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
@@ -429,12 +458,9 @@ void check_head(const std::string& label, qw::PackedWeight packed, const std::ve
         graph.instantiate(definition);
         graph.launch(device.stream);
         cuda_synchronize(device.stream);
-        const auto got_ids    = from_device<std::int32_t>(ids, static_cast<std::size_t>(kTop) * kColumns);
-        const auto got_scores = from_device<float>(scores, static_cast<std::size_t>(kTop) * kColumns);
-        if (got_ids != by_width.front().ids ||
-            std::memcmp(got_scores.data(), by_width.front().scores.data(), got_scores.size() * 4) != 0) {
-            fail(label + ": graph replay differs");
-        }
+        const Result replay{from_device<std::int32_t>(ids, static_cast<std::size_t>(kTop) * T),
+                            from_device<float>(scores, static_cast<std::size_t>(kTop) * T)};
+        if (!same_as_alone(replay, T, label + " graph replay T=" + std::to_string(T))) { return; }
     }
     if (workspace.used() != 0) { fail(label + ": workspace scope not released"); }
     failures += head_buffer.verify_preserved(label + " head");
