@@ -460,8 +460,9 @@ same mathematics at Inkling 2 Mini's widths, with three differences: its feature
 visits 5, 23 and 41 and the final-normed state, concatenated: no stream mean), its block's inputs are the target's
 normed embeddings, and its selector applies a softcap of 30 to each edge after adding the correction
 (`selector_softcap_mode` `after_correction`; `candidate_selector_path`'s `edge_softcap`). `tools.convert --components
-dflash2 --recipe inkling2_mini_dflash2` writes the companion (Q8 projections as Flash-Next's; the codebooks cut to the
-real 200,058-token vocabulary); `--spec dflash2 --draft-model FILE` loads it beside any Inkling 2 artifact, and DSpark
+dflash2 --recipe inkling2_mini_dflash2_nvfp4_mlp` writes the recommended companion (the MLP NVFP4, below, the other
+projections Q8 as Flash-Next's; the codebooks cut to the real 200,058-token vocabulary), `--recipe
+inkling2_mini_dflash2` an all-Q8 one; `--spec dflash2 --draft-model FILE` loads it beside any Inkling 2 artifact, and DSpark
 is then not bound. Its context ring holds committed positions only (a verify call's committed columns are written at
 its round's commit). The rounds are Inkling 2's ([design §13.8](inkling2_mini-design.md#138-the-dflash2-companion---spec-dflash2---draft-model)):
 a draft is kept only when it equals the target's own draw, so speculation never changes the output.
@@ -479,7 +480,8 @@ a round from 3.49 to 3.33 there, likely because a rank is shared only up to the 
 `--lm-head-draft`, two runs each), the coupled whole-vocabulary drafts decoded at 341.3 tok/s against the greedy
 drafts' 324.3 (+5.3 %; the two arms' top-20 and greedy phases, identical in what they draft, differed by 0.1-0.3 %).
 
-The companion's MLP may be NVFP4 (recipe `inkling2_mini_dflash2_nvfp4_mlp`, 16-bit activations): the gate/up runs as
+The recommended companion's MLP is NVFP4 (recipe `inkling2_mini_dflash2_nvfp4_mlp`, 16-bit activations; the all-Q8
+`inkling2_mini_dflash2` is the other recipe): the gate/up runs as
 the NVFP4 linear ([13824, 2304]) then `silu_mul` over its two halves, and the down through
 `linear_dynamic_grouped_conv_add`'s NVFP4 route, the NVFP4 linear ([2304, 6912]) into the projected matrix then the Q8
 route's finish. Their sliced-K schedules take at most 4 K-warps (a block K of 256: 2304 and 6912 are no multiples of
@@ -487,10 +489,18 @@ route's finish. Their sliced-K schedules take at most 4 K-warps (a block K of 25
 columns NVFP4 A16 against Q8 A16 on a shape both register ([5120, 6144], linear_bench) took 17.0 against 23.1 us,
 23.1 against 25.0 at 16 and 64.1 against 66.1 at 64; at Inkling's shapes (other benches: SwiGLU fused for Q8, the
 NVFP4 linear without silu_mul) 17.0 us against 23.7 for the gate/up and 12.9 against 19.6 (with its finish) for the
-down at 8 columns, about even at 32-64. Served (draft 0.761 against 0.785 ms) it ran 0.5-0.9 % faster than the Q8
-companion one request at a time on short prompts, level on long ones, within the spread at four and eight short
-requests and 4.1 % faster with four questions on a 122K-token prefix, with the same acceptance on short prompts (0.9 %
-lower on long ones) but 1.4-2.0 % fewer tokens a round at a fixed 7 drafts, so the Q8 recipe stays the recommended one. The attention output (9.4 M
+down at 8 columns, about even at 32-64. Served before the cheaper rounds below (2026-11-26, draft 0.761 against
+0.785 ms) it ran 0.5-0.9 % faster than the Q8 companion one request at a time on short prompts, level on long ones,
+within the spread at four and eight short requests and 4.1 % faster with four questions on a 122K-token prefix, with
+the same acceptance on short prompts (0.9 % lower on long ones) but 1.4-2.0 % fewer tokens a round at a fixed 7
+drafts. After them (2026-11-27, `main` at `313d35ff2`) the agentic replay (three seeds, each companion first in some)
+took the same wall time with either (-0.08 % with NVFP4-MLP: -0.21, -0.07 and +0.04 % by seed), and the sweep
+(alternating runs, two each, draft 0.685-0.696 against 0.709-0.712 ms) had it 0.9 % slower on eight short prompts one
+at a time and 1.8 % slower with four at once (both beyond the runs' spread; it accepted 2,357 drafts there against
+2,373), 0.6 % faster with four questions on a ~30K-token prefix and level on the 122K-token prefix and with eight at
+once. The NVFP4-MLP recipe is the recommended one, chosen by that replay's wall time (a tie) and for its size (515
+against 635 MB) and KV pool (554,560 against 547,456 tokens at eight lanes); the real test's CPU oracle decodes only
+BF16 and Q8 weights, so it runs on that companion with `INFERNIX_INKLING2_DFLASH2_ENGINE_ONLY`. The attention output (9.4 M
 parameters a layer against the MLP's 47.8 M) and the feature projection (21 M, once a round) would save about a fifth
 and a tenth of the MLP's 0.024 ms more; q/k/v and the context projections stay Q8 either way
 (`attn_input_proj`'s drafter form and `context_kv_materialize` read Q8).

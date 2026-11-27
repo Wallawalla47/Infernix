@@ -1518,7 +1518,8 @@ incoai's [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-D
 ([dflash.md](dflash.md)) trained on Inkling 2 Mini: five sliding-window layers (window 2,048, 32 query and 8 KV heads of
 128, SwiGLU 6,912, RoPE θ 1e4) with two-tap dynamic convolutions, conditioned on DSpark's features (§13.3: the inputs
 of visits 5, 23 and 41 and the final-normed state, `target_layer_ids` [5, 23, 41, 48]), and its candidate selector
-(rank 256, top 16) over the target's head. It loads as a companion artifact (recipe `inkling2_mini_dflash2`) beside any
+(rank 256, top 16) over the target's head. It loads as a companion artifact (recipe `inkling2_mini_dflash2_nvfp4_mlp`,
+recommended, or the all-Q8 `inkling2_mini_dflash2`) beside any
 Inkling 2 artifact; with it DSpark is not bound: none of its weights, the full layer's context planes in every KV page
 (§13.6) or its tables are built, so the KV pool holds more tokens.
 

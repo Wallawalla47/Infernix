@@ -143,8 +143,9 @@ Thinking Machines' looped 24-layer model (48 layer visits a token), resident in 
   770 MiB more VRAM for the KV cache. Both change the output slightly
   ([measured quality](docs/inkling2-mini.md#routes-and-precision)).
 - **DSpark drafting** with the model's own drafter, or **DFlash2 drafting** with incoai's drafter as a companion
-  artifact (faster than DSpark on short prompts, slower on long contexts and in agentic use, and 9 % more KV
-  capacity: [measured](docs/inkling2-mini.md#speed-and-memory-against-dspark)), each with an optional shortlist
+  artifact (faster than DSpark on short prompts, slower on long contexts and in agentic use, and 10 % more KV
+  capacity: [measured](docs/inkling2-mini.md#speed-and-memory-against-dspark); download it from the repository's
+  [`drafter`](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix/tree/main/drafter) folder), each with an optional shortlist
   (`--lm-head-draft`) built from a token ranking I measured with Inkling itself. Verification decides every
   token, so the output does not change.
 - **Images, one to eight lanes, every KV format, the prefix cache** and the lossless route. With
@@ -735,7 +736,7 @@ drafter flags are the fastest measured overall, and `auto` picks the draft lengt
 | Qwen3.6-35B-A3B | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length, 1-5 (DFlash `auto` is faster only on code at one request) |
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
-| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft`; for short prompts, with the [DFlash2 companion](docs/inkling2-mini.md#dflash2-drafting) converted, `--spec dflash2 --draft-model Inkling-2-Mini-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft` | the calibrated number of drafts, up to 7; requests decoding together draft together, the round's drafts shared out by how likely each request's are to be accepted. DFlash2 ran 15-27 % faster than DSpark one request at a time on short prompts and 16-19 % at four and eight requests, but 7 % slower on a 122K-token prefix and 2.4 % slower over the agentic replay (wall time, three seeds) |
+| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft`; for short prompts, with the [DFlash2 companion](docs/inkling2-mini.md#dflash2-drafting) downloaded from the artifact repository's `drafter` folder, `--spec dflash2 --draft-model drafter\Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix --draft-tokens auto --lm-head-draft` | the calibrated number of drafts, up to 7; requests decoding together draft together, the round's drafts shared out by how likely each request's are to be accepted. DFlash2 ran 15-27 % faster than DSpark one request at a time on short prompts and 16-19 % at four and eight requests, but 7 % slower on a 122K-token prefix and 2.4 % slower over the agentic replay (wall time, three seeds) |
 
 For long conversations on the 27Bs, whose KV cache two long conversations outgrow, add `--embedding-host`:
 the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes
@@ -912,7 +913,7 @@ Thinking Machines' looped model, resident in VRAM ([guide](docs/inkling2-mini.md
 
 | Repository | Converted from | What it is |
 |---|---|---|
-| **[Inkling-2-Mini-Infernix](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix)** | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | The checkpoint's NVFP4 and MXFP8 experts and BF16 weights bit-exact, with its DSpark drafter, vision tower and a token ranking for `--lm-head-draft`; one file of about 20.3 GB. Plain decode at 212 tok/s on an RTX 5090 (default route, one request); DSpark speeds depend on the text and are in the guide. Needs `main` at `a487ad24f` or later. Apache 2.0. |
+| **[Inkling-2-Mini-Infernix](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix)** | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | The checkpoint's NVFP4 and MXFP8 experts and BF16 weights bit-exact, with its DSpark drafter, vision tower and a token ranking for `--lm-head-draft`; one file of about 20.3 GB. Plain decode at 212 tok/s on an RTX 5090 (default route, one request); DSpark speeds depend on the text and are in the guide. Needs `main` at `a487ad24f` or later. The `drafter` folder adds incoai's DFlash2 drafter as a companion (515 MB, `--spec dflash2 --draft-model`; `main` at `6dbeb011d` or later). Apache 2.0. |
 
 ## Documentation
 

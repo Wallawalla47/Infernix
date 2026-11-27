@@ -217,27 +217,28 @@ changes acceptance and speed, never output.
 Inkling 2 Mini's DFlash2 drafter ([incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2))
 converts the same way into a companion of any Inkling 2 Mini artifact (`--spec dflash2 --draft-model FILE`), with
 `--model` naming an Inkling 2 Mini checkpoint or a folder holding only its `config.json` and tokenizer (no weights
-are read from it) and the recipe `inkling2_mini_dflash2`:
+are read from it) and the recipe `inkling2_mini_dflash2_nvfp4_mlp` (the recommended one, published in the `drafter`
+folder of [wallawalla47/Inkling-2-Mini-Infernix](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix/tree/main/drafter)):
 
 ```bash
 python3 -m tools.convert \
   --model /path/to/Inkling-2-Mini \
   --source dflash2=/path/to/Inkling-2-Mini-DFlash2 \
   --components dflash2 \
-  --recipe inkling2_mini_dflash2 \
-  --name Inkling-2-Mini-DFlash2-Infernix \
-  --out models/Inkling-2-Mini-DFlash2-Infernix.infernix
+  --recipe inkling2_mini_dflash2_nvfp4_mlp \
+  --name Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix \
+  --out models/Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix
 ```
 
-The formats are the Flash-Next recipe's. The drafter's blocks start from the main artifact's normed token
-embeddings and draft from its text head or the `--lm-head-draft` shortlist, so the companion holds neither
-(635 MB). The converter checks the drafter's `target_config` (architecture, hidden size, vocabulary, layers and the
-loop's 48 visits) against the checkpoint's, and the engine checks it against the artifact's at load.
-`inkling2_mini_dflash2_nvfp4_mlp` stores every layer's MLP (gate/up and down) NVFP4 instead (`nvfp4_mse`, 16-bit
-activations; 515 MB): it drafts 3 % faster and leaves 1.3 % more KV tokens, and ran 0.5-0.9 % faster than the Q8
-companion one request at a time on short prompts (4.1 % with four questions on a 122K-token prefix), with the same
-acceptance on short prompts under `--draft-tokens auto` but up to 2 % less at a fixed draft length
-([measured](inkling2-mini.md#speed-and-memory-against-dspark)); the Q8 recipe stays the recommended one.
+The drafter's blocks start from the main artifact's normed token embeddings and draft from its text head or the
+`--lm-head-draft` shortlist, so the companion holds neither. The converter checks the drafter's `target_config`
+(architecture, hidden size, vocabulary, layers and the loop's 48 visits) against the checkpoint's, and the engine
+checks it against the artifact's at load. `inkling2_mini_dflash2_nvfp4_mlp` stores every layer's MLP (gate/up and
+down) in NVFP4 (`nvfp4_mse`, run with 16-bit activations) and the rest as the Flash-Next recipe does (515 MB);
+`inkling2_mini_dflash2` stores it all that way, the MLP in `q8_g32_fp16` (635 MB). Against the Q8 companion the
+NVFP4-MLP one took the same wall time over the agentic replay (-0.08 %), leaves 1.3 % more KV tokens and drafts 2-3 %
+faster, but accepts slightly fewer drafts: on short prompts it ran 0.9-1.8 % slower
+([measured](inkling2-mini.md#speed-and-memory-against-dspark)).
 
 ## Change part of a recipe
 
