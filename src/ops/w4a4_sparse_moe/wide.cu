@@ -217,6 +217,7 @@ struct A8Shape {
     static constexpr int kRowBytes       = M == wide::Matrix::GateUp ? kA8XRowBytes : kA8HRowBytes;
     static constexpr bool kTokenRows     = M == wide::Matrix::GateUp;
     static constexpr bool kSharedJobs    = false;
+    static_assert(!kSharedJobs, "Inkling's routed calls carry no shared-expert jobs");
     static_assert(kRowGroups % wide::ScheduleA8Tall::kRowGroups == 0 && kBlocks % wide::ScheduleA8Tall::kUnitsPerKTile == 0,
                   "whole 256-row blocks and 128-element stages");
     static_assert(kRowBytes == kK + kK / 8, "a row holds its codes, then its slice scales");

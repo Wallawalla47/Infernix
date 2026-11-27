@@ -401,7 +401,8 @@ struct TailDump {
         : xm(std::size_t{visits} * kPositions * H), cand(xm.size()), tail(xm.size()),
           routed(std::size_t{visits} * kPositions * 8), worst(visits, 0) {}
     void rows(std::vector<float>& dst, std::uint32_t v, int c0, const std::vector<double>& values) {
-        std::copy(values.begin(), values.end(), dst.begin() + (std::size_t{v} * kPositions + c0) * H);
+        std::transform(values.begin(), values.end(), dst.begin() + (std::size_t{v} * kPositions + c0) * H,
+                       [](double x) { return static_cast<float>(x); });
     }
     void write(const std::string& dir) const {
         const auto put = [&](const std::string& name, const void* data, std::size_t bytes) {

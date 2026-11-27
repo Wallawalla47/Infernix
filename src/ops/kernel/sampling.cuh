@@ -214,7 +214,7 @@ __launch_bounds__(kSamplerBlock) __global__
 }
 
 template <class Logit>
-__launch_bounds__(kSamplerBlock, 9) __global__
+__launch_bounds__(kSamplerBlock) __global__
     void sampling_partial_topk_full_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
                                            const std::int32_t* logical_positions, std::int32_t purpose,
                                            std::int32_t token_domain, std::int32_t physical_rows,
