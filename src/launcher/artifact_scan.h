@@ -49,7 +49,7 @@ struct ScannedModel {
     bool has_proposal        = false; // a proposal head (--lm-head-draft); on Inkling 2 its proposal/token_rank parameter
     bool offloaded_experts   = false;
     bool needs_ngram_volume  = false;
-    bool accepts_draft_model = false;
+    bool accepts_draft_model = false; // takes a drafter artifact (--draft-model): Flash-Next's DFlash2, the 27B's DSpine
     std::uint64_t native_context = 0;
     std::uint64_t hidden_size    = 0;
     std::uint64_t num_layers     = 0;
@@ -196,6 +196,11 @@ struct ParsedEntry {
 // The facts of an adapter_config.json (fields of the wrong type are left out).
 [[nodiscard]] AdapterConfigFacts parse_adapter_config(const Json& config);
 [[nodiscard]] Json to_json(const AdapterConfigFacts& facts);
+
+// Whether a drafter artifact drafts for this model (--draft-model): a model that takes one, the drafter's kind its
+// family's (a DSpine drafter for the Qwen3.8-27B, --spec dspine; a DFlash2 companion for the others that take one,
+// such as Qwen3.8-Flash-Next) and every target dimension the drafter records equal to the model's.
+[[nodiscard]] bool drafter_fits(const ScannedModel& model, const ScannedDrafter& drafter);
 
 // Whether an adapter was trained on this model's base: a dense Qwen3.5-architecture model whose family (Qwen3.8-27B,
 // Qwen3.6-27B) the adapter's base_model_name_or_path names, or Inkling 2 Mini, which it names as such (the --lora models).

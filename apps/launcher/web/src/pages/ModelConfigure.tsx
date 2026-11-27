@@ -357,6 +357,7 @@ function SpecField({ model, form, specArg }: { model: ModelArtifact; form: FormC
     dflash: "DFlash",
     dflash2: "DFlash2",
     dspark: "DSpark",
+    dspine: "DSpine (long agent and coding sessions)",
   };
   // The drafters this model takes (option_support); `off` is the Off item below.
   const options = model.option_support.spec_values
@@ -364,8 +365,11 @@ function SpecField({ model, form, specArg }: { model: ModelArtifact; form: FormC
     .map((value) => ({ value, label: labels[value] ?? value }));
   // UNSET is the Off item; without the flag the server's own default applies.
   const value = current === "off" ? UNSET : current.length > 0 ? current : offIsExplicit ? "auto" : UNSET;
-  const choose = (next: string) =>
-    form.setArgs(setFlag(form.args, "--spec", next === UNSET ? (offIsExplicit ? "off" : null) : next, form.takesValue));
+  const choose = (next: string) => {
+    let args = setFlag(form.args, "--spec", next === UNSET ? (offIsExplicit ? "off" : null) : next, form.takesValue);
+    if (next === "dspine" || current === "dspine") args = withDSpine(args, next === "dspine", model, form);
+    form.setArgs(args);
+  };
   return (
     <div className="flex flex-col gap-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
       <div>
@@ -396,26 +400,49 @@ function SpecField({ model, form, specArg }: { model: ModelArtifact; form: FormC
   );
 }
 
+/** The Qwen3.8-27B's drafter artifact is a DSpine drafter (option_support's drafter_fits): its rounds draft from the
+ * full head, so the server refuses --lm-head-draft beside --spec dspine. Turning DSpine on drops the proposal head;
+ * turning it off drops the DSpine drafter and restores the head the artifact has. */
+function withDSpine(args: string[], on: boolean, model: ModelArtifact, form: FormContext): string[] {
+  if (on) return setFlag(args, "--lm-head-draft", null, form.takesValue);
+  let next = setFlag(args, "--draft-model", null, form.takesValue);
+  const spec = getFlagString(next, "--spec", form.takesValue);
+  if (model.has_proposal && spec !== "off" && spec !== "") next = setFlag(next, "--lm-head-draft", true, form.takesValue);
+  return next;
+}
+
 function DrafterField({ model, form, library }: { model: ModelArtifact; form: FormContext; library: Library }) {
   const current = getFlagString(form.args, "--draft-model", form.takesValue);
   const compatible = library.drafters.filter((drafter) => drafter.compatible_models.includes(model.key));
   const known = compatible.some((drafter) => drafter.path === current);
   const value = current.length > 0 ? current : UNSET;
+  const dspine = model.family === "qwen3.8-27b";
+  const label = dspine ? "DSpine drafter" : "DFlash2 drafter";
+  // On the 27B naming a DSpine drafter selects --spec dspine, and clearing it returns to --spec auto.
+  const choose = (next: string) => {
+    let args = setFlag(form.args, "--draft-model", next === UNSET ? null : next, form.takesValue);
+    if (dspine) {
+      args = setFlag(args, "--spec", next === UNSET ? "auto" : "dspine", form.takesValue);
+      args = withDSpine(args, next !== UNSET, model, form);
+    }
+    form.setArgs(args);
+  };
   return (
     <FieldShell
-      label="DFlash2 drafter"
+      label={label}
       flag="--draft-model"
-      help="Inco AI's DFlash2 drafter is 8-11 % faster than the model's own MTP drafter; with --spec auto, naming it selects it."
+      help={
+        dspine
+          ? "Tencent's DSpine drafter: for long agent and coding sessions, 12-24 % faster at one request on code, level on sampled prose, 8-10 % slower on short chats. Naming it selects --spec dspine (Auto never picks it)."
+          : "Inco AI's DFlash2 drafter is 8-11 % faster than the model's own MTP drafter; with --spec auto, naming it selects it."
+      }
     >
-      <Select
-        value={value}
-        onValueChange={(next) => form.setArgs(setFlag(form.args, "--draft-model", next === UNSET ? null : next, form.takesValue))}
-      >
-        <SelectTrigger aria-label="DFlash2 drafter">
+      <Select value={value} onValueChange={choose}>
+        <SelectTrigger aria-label={label}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value={UNSET}>None (the model's MTP drafter)</SelectItem>
+          <SelectItem value={UNSET}>{dspine ? "None (the artifact's own drafters)" : "None (the model's MTP drafter)"}</SelectItem>
           {compatible.map((drafter) => (
             <SelectItem key={drafter.path} value={drafter.path}>
               {drafter.name} · {formatBytes(drafter.bytes)} · {drafter.dir}
@@ -424,7 +451,13 @@ function DrafterField({ model, form, library }: { model: ModelArtifact; form: Fo
           {!known && current.length > 0 ? <SelectItem value={current}>Other file: {current}</SelectItem> : null}
         </SelectContent>
       </Select>
-      {compatible.length === 0 ? (
+      {compatible.length === 0 && dspine ? (
+        <div className="text-xs text-muted-foreground">
+          No DSpine drafter in your folders: it is the optional{" "}
+          <code className="font-mono text-[11px]">drafter/Qwen3.8-27B-DSpine-b16-Infernix.infernix</code> (1.53 GiB) of
+          the Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact repository.
+        </div>
+      ) : compatible.length === 0 ? (
         <div className="text-xs text-muted-foreground">
           No compatible drafter in your folders.{" "}
           <Link to="/discover" className="font-medium text-foreground underline-offset-4 hover:underline">

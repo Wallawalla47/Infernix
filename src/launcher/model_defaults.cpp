@@ -23,6 +23,8 @@ const ScannedDrafter* best_drafter(const LibraryScan& scan, const ScannedModel& 
             drafter.compatible_models.end()) {
             continue;
         }
+        // DSpine is an opt-in for long agent and coding sessions (8-10 % slower on short chats): never a default.
+        if (drafter.kind == "dspine") { continue; }
         // Several copies of compatible drafters: the newest file.
         if (best == nullptr || drafter.modified > best->modified) { best = &drafter; }
     }

@@ -58,7 +58,7 @@ constexpr std::array kRules = {
     Rule{"--cache-tool-hold-secs", kQwen35},  // refused by Flash-Next and Inkling
     Rule{"--context-cost-presets", kQwen},  // Inkling's prefix cache has no cost model
     // Speculative decoding.
-    Rule{"--draft-model", kFlash},
+    Rule{"--draft-model", kFlash | kDense}, // Flash-Next's DFlash2 companion, a dense Qwen3.5's DSpine drafter
     Rule{"--draft-tree-nodes", kQwen35},    // Flash-Next verifies neural drafts as chains and refuses it
     Rule{"--draft-tree-paths", kQwen},      // Flash-Next: its n-gram trees' paths
     Rule{"--spec-min-p", kQwen},
@@ -149,8 +149,11 @@ std::vector<std::string> spec_values(const ScannedModel& model) {
     std::vector<std::string> values = {"off", "auto"};
     if (model.has_mtp) { values.emplace_back("mtp"); }
     if (model.has_dflash) { values.emplace_back("dflash"); }
-    if (model.has_dflash2 || model.accepts_draft_model) { values.emplace_back("dflash2"); }
+    // A drafter artifact is a DFlash2 companion except on the Qwen3.8-27B, whose is a DSpine drafter (drafter_fits).
+    const bool dspine_target = model.family == "qwen3.8-27b";
+    if (model.has_dflash2 || (model.accepts_draft_model && !dspine_target)) { values.emplace_back("dflash2"); }
     if (model.has_dspark) { values.emplace_back("dspark"); }
+    if (model.accepts_draft_model && dspine_target) { values.emplace_back("dspine"); }
     return values;
 }
 

@@ -132,8 +132,9 @@ void classify_family(ScannedModel& model) {
     }
     if (model.model_type == "qwen3_5_text") {
         if (model.hidden_size == 5120 && (model.has_dflash2 || (says_38 && !says_36))) {
-            model.family       = "qwen3.8-27b";
-            model.family_label = "Qwen3.8-27B";
+            model.family              = "qwen3.8-27b";
+            model.family_label        = "Qwen3.8-27B";
+            model.accepts_draft_model = true; // a DSpine drafter (--spec dspine --draft-model)
         } else if (model.hidden_size == 5120) {
             model.family       = "qwen3.6-27b";
             model.family_label = "Qwen3.6-27B";
@@ -426,6 +427,13 @@ ParsedEntry parse_artifact_directory(const std::filesystem::path& path,
             drafter.target_layers      = json_or<std::uint64_t>(target, "num_hidden_layers", 0);
             drafter.target_vocab       = json_or<std::uint64_t>(target, "vocab_size", 0);
         }
+        if (drafter.kind == "dspine") {
+            // A DSpine drafter records no target config: its own width and vocabulary are the target's, and
+            // num_target_layers the target's layer count (models/qwen3_5/config.cpp, parse_dspine_config).
+            drafter.target_hidden_size = json_or<std::uint64_t>(config, "hidden_size", 0);
+            drafter.target_layers      = json_or<std::uint64_t>(config, "num_target_layers", 0);
+            drafter.target_vocab       = json_or<std::uint64_t>(config, "vocab_size", 0);
+        }
         drafter.modified = modified_ms(path);
         out.drafter      = std::move(drafter);
         return out;
@@ -696,12 +704,7 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
 
     for (ScannedDrafter& drafter : scan.drafters) {
         for (const ScannedModel& model : scan.models) {
-            const bool dflash2 = drafter.kind.find("dflash2") != std::string::npos;
-            if (!model.accepts_draft_model || !dflash2) { continue; }
-            if (drafter.target_architecture && *drafter.target_architecture != model.architecture) { continue; }
-            if (drafter.target_hidden_size != 0 && drafter.target_hidden_size != model.hidden_size) { continue; }
-            if (drafter.target_layers != 0 && drafter.target_layers != model.num_layers) { continue; }
-            if (drafter.target_vocab != 0 && drafter.target_vocab != model.vocab_size) { continue; }
+            if (!drafter_fits(model, drafter)) { continue; }
             drafter.compatible_models.push_back(model.key);
         }
     }
@@ -921,6 +924,21 @@ Json to_json(const AdapterConfigFacts& facts) {
             {"alpha", optional(facts.alpha)},
             {"target_modules", facts.target_modules},
             {"rslora", facts.rslora}};
+}
+
+bool drafter_fits(const ScannedModel& model, const ScannedDrafter& drafter) {
+    if (!model.accepts_draft_model) { return false; }
+    // The Qwen3.8-27B bundles its DFlash2 drafter and takes a standalone DSpine one (--spec dspine); the other models
+    // that take a drafter artifact take DFlash2 companions.
+    const bool dspine_target = model.family == "qwen3.8-27b";
+    const bool dspine        = drafter.kind == "dspine";
+    const bool dflash2       = drafter.kind.find("dflash2") != std::string::npos;
+    if (dspine_target ? !dspine : !dflash2) { return false; }
+    if (drafter.target_architecture && *drafter.target_architecture != model.architecture) { return false; }
+    if (drafter.target_hidden_size != 0 && drafter.target_hidden_size != model.hidden_size) { return false; }
+    if (drafter.target_layers != 0 && drafter.target_layers != model.num_layers) { return false; }
+    if (drafter.target_vocab != 0 && drafter.target_vocab != model.vocab_size) { return false; }
+    return true;
 }
 
 bool adapter_matches(const ScannedModel& model, const ScannedAdapter& adapter) {

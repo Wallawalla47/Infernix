@@ -1409,9 +1409,12 @@ Json Launcher::hf_files_json(const std::string& repo) const {
         } else if (lowered.ends_with(".infernix") || lowered.ends_with(".ninfer")) {
             const std::size_t of = lowered.rfind("-of-");
             const bool later_part = of != std::string::npos && of >= 6 && lowered.substr(of - 5, 5) != "00001";
-            role = kind == "drafter" ? "drafter" : later_part ? "model-part" : "model";
+            role = kind == "drafter" || lowered.starts_with("drafter/") ? "drafter" : later_part ? "model-part" : "model";
         }
-        const bool selected = role == "model" || role == "model-part" || role == "drafter" ||
+        // A model repository's drafter/ folder holds an opt-in drafter (the QAD-Exact 27B's DSpine): offered, not
+        // selected; a drafter repository's own file is.
+        const bool optional_drafter = role == "drafter" && kind != "drafter";
+        const bool selected = role == "model" || role == "model-part" || (role == "drafter" && !optional_drafter) ||
                               role == "expert-state" || (role == "ngram" && !has_model);
         files.push_back({{"path", file.path},
                          {"bytes", file.size},

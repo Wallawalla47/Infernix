@@ -111,7 +111,12 @@ function ComponentBadges({ model, className }: { model: ModelArtifact; className
   if (model.has_mtp) badges.push({ label: "MTP", hint: "Multi-token-prediction drafter" });
   if (model.has_dflash) badges.push({ label: "DFlash", hint: "Bundled DFlash drafter" });
   if (model.has_dflash2) badges.push({ label: "DFlash2", hint: "Bundled DFlash2 drafter" });
-  if (model.accepts_draft_model) badges.push({ label: "DFlash2 companion", hint: "Takes a DFlash2 drafter artifact (--draft-model)" });
+  if (model.accepts_draft_model)
+    badges.push(
+      model.family === "qwen3.8-27b"
+        ? { label: "DSpine drafter", hint: "Takes a DSpine drafter artifact (--spec dspine --draft-model)" }
+        : { label: "DFlash2 companion", hint: "Takes a DFlash2 drafter artifact (--draft-model)" },
+    );
   if (model.has_proposal) badges.push({ label: "Proposal head", hint: "Optimized proposal head (--lm-head-draft)" });
   if (model.offloaded_experts) badges.push({ label: "Experts in RAM", hint: "Routed experts live in system RAM behind a VRAM expert cache" });
   if (model.needs_ngram_volume) badges.push({ label: "N-gram volume", hint: "Needs a PLE n-gram volume, ideally on NVMe" });
@@ -618,7 +623,7 @@ function Companions({ library, actions }: { library: Library; actions: Actions }
               <Sparkles className="size-4 text-muted-foreground" />
               Drafters
             </CardTitle>
-            <CardDescription>DFlash2 drafter artifacts for --draft-model</CardDescription>
+            <CardDescription>DFlash2 and DSpine drafter artifacts for --draft-model</CardDescription>
           </CardHeader>
           <CardContent className="px-0">
             {drafters.length === 0 ? (

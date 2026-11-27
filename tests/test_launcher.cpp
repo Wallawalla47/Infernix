@@ -498,6 +498,58 @@ void test_library() {
     check(!has_flag(dense_args, "--draft-model"), "bundled drafters take no --draft-model");
     // Every KV page stays on the GPU: the server sizes the context to what its KV cache holds.
     check(contains(dense_args, {"--max-context", "auto"}), "the 27B context is the server's to size");
+
+    // A DSpine drafter (a standalone artifact; its own config records the target's width, vocabulary and layers):
+    // it drafts for the Qwen3.8-27B with --spec dspine, never for Flash-Next, and is never a default.
+    Json dspine_directory = {
+        {"components",
+         {{"dspine",
+           {{"config",
+             {{"architectures", Json::array({"DSpineDraftModel"})},
+              {"hidden_size", 5120},
+              {"vocab_size", 248320},
+              {"num_target_layers", 64}}}}}}},
+        {"objects", Json::array()},
+        {"files", Json::array({{{"path", nullptr}, {"payload_bytes", 1647574528}}})},
+        {"metadata", {{"name", "Qwen3.8-27B-DSpine-b16-Infernix"}}}};
+    const std::array<std::uint8_t, 16> dspine_id{8};
+    ParsedEntry dspine = parse_artifact_directory("Z:/models/drafter/dspine.infernix", dspine_id, dspine_directory, 4096);
+    check(dspine.drafter && dspine.drafter->kind == "dspine" && dspine.drafter->target_hidden_size == 5120 &&
+              dspine.drafter->target_layers == 64 && dspine.drafter->target_vocab == 248320 &&
+              !dspine.drafter->target_architecture,
+          "a DSpine drafter takes its target's dimensions from its own config");
+    ScannedModel q27        = dense;
+    q27.accepts_draft_model = true;
+    q27.num_layers          = 64;
+    q27.vocab_size          = 248320;
+    q27.architecture        = "Qwen3_5ForCausalLM";
+    ScannedModel q27_other  = q27;
+    q27_other.num_layers    = 48;
+    if (dspine.drafter) {
+        check(drafter_fits(q27, *dspine.drafter), "a DSpine drafter fits the Qwen3.8-27B");
+        check(!drafter_fits(q27_other, *dspine.drafter), "a target of another layer count does not take it");
+        check(!drafter_fits(model, *dspine.drafter), "Flash-Next takes no DSpine drafter");
+        check(drafter.drafter && !drafter_fits(q27, *drafter.drafter) && drafter_fits(model, *drafter.drafter),
+              "the 27B takes no DFlash2 companion; Flash-Next does");
+        ScannedDrafter offered     = *dspine.drafter;
+        offered.compatible_models  = {q27.key};
+        LibraryScan q27_scan       = scan;
+        q27_scan.drafters.push_back(offered);
+        const Args q27_args = default_args(q27_scan, q27);
+        check(!has_flag(q27_args, "--draft-model") && contains(q27_args, {"--spec", "auto"}) &&
+                  has_flag(q27_args, "--lm-head-draft"),
+              "DSpine is opt-in: the 27B's defaults keep DFlash2 and its proposal head");
+    }
+    const std::vector<std::string> q27_specs = spec_values(q27);
+    check(std::find(q27_specs.begin(), q27_specs.end(), "dspine") != q27_specs.end() &&
+              std::find(q27_specs.begin(), q27_specs.end(), "dflash2") != q27_specs.end(),
+          "the 27B offers dspine beside its bundled DFlash2");
+    ScannedModel q27_plain = q27;
+    q27_plain.has_dflash2  = false;
+    const std::vector<std::string> plain_specs = spec_values(q27_plain);
+    check(std::find(plain_specs.begin(), plain_specs.end(), "dflash2") == plain_specs.end(),
+          "a 27B without a bundled DFlash2 drafter offers no dflash2");
+    check(supports_option(q27, "--draft-model"), "the 27B takes --draft-model");
 }
 
 // Which options each model type takes (option_support.h): the table, the default arguments and a saved configuration.
@@ -541,7 +593,7 @@ void test_option_support() {
     row("--cache-host-state", true, true, true, false, false);
     row("--device-snapshot-slots", true, true, true, false, false);
     row("--cache-next-turn-ms", true, true, true, true, true);
-    row("--draft-model", false, false, false, true, false);
+    row("--draft-model", true, false, false, true, false); // dense: a DSpine drafter (the Qwen3.8-27B)
     row("--draft-tree-nodes", true, true, true, false, false);
     row("--ngram-draft-tokens", true, true, true, true, false);
     row("--ngram-archive-mib", true, true, true, false, false);

@@ -157,9 +157,10 @@ folder levels deep, reading file headers only:
   (Qwen3.8-Flash-Next, Qwen3.8-27B, Qwen3.6-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B). The first part of
   a numbered set (`-00001-of-00003`) stands for the set; missing or incomplete parts are reported and
   such a model cannot load. Copies of one artifact (same id) appear once, with every location.
-- **DFlash2 drafters**: companion artifacts without a text component, such as
-  `Qwen3.8-Flash-Next-DFlash2-Infernix.infernix`, matched to the models whose architecture and shape
-  they were trained for.
+- **Drafters**: artifacts without a text component, matched to the models whose architecture and shape they were
+  trained for: DFlash2 companions such as `Qwen3.8-Flash-Next-DFlash2-Infernix.infernix`, and DSpine drafters
+  (`Qwen3.8-27B-DSpine-b16-Infernix.infernix`, in the QAD-Exact 27B repository's `drafter` folder) for the
+  Qwen3.8-27B.
 - **N-gram volumes**: `.ngram` files of Qwen3.8-Flash-Next, matched to the models that can read them:
   a model's own table first, then FP8, NVFP4, IQ4_NL and BF16 (an FP8 table without a recorded scale
   serves only its own artifact).
@@ -203,7 +204,10 @@ preview names it. A model type the launcher does not know is not restricted. Ink
 when the artifact holds its `proposal/token_rank` parameter and DSpark drafter. The form offers **Sliding-window KV format**
 (`--kv-window-dtype`) beside **KV cache format** for Inkling 2 only. The **DFlash2 drafter** and **N-gram volume**
 pickers (Qwen3.8-Flash-Next) list the compatible
-files found and write `--draft-model` and `--ngram-volume`; the **LoRA adapter** picker (the dense
+files found and write `--draft-model` and `--ngram-volume`. On the Qwen3.8-27B the drafter picker is the **DSpine
+drafter**, an opt-in for long agent and coding sessions (never a default): naming one writes `--spec dspine` and
+drops `--lm-head-draft`, which DSpine refuses, and clearing it returns to `--spec auto` with the proposal head; the
+**Speculative decoding** select offers DSpine there too. The **LoRA adapter** picker (the dense
 27Bs and Inkling 2) lists the adapters found, those of the model's base first (another base's is marked, and
 picking it warns), or takes a folder or file elsewhere, and writes `--lora`. The full command line is previewed with
 warnings (an option this `infernix-serve` does not have, a missing file, a Flash-Next model without
@@ -305,7 +309,8 @@ The launcher sets `--host`, `--port`, `--model-id` (the model id), `--any-model-
 **Discover** lists the published Infernix conversions and NInfer's official artifacts. **Download**
 lists the repository's files with their sizes (the model's parts are selected) and suggests what the
 model also needs, unless a compatible one is already in a model folder: Qwen3.8-Flash-Next's DFlash2
-drafter and an n-gram volume (the recommended table preselected). Choose the destination folder with
+drafter and an n-gram volume (the recommended table preselected). A model repository's `drafter` folder (the
+QAD-Exact 27B's DSpine drafter) is listed as a drafter and left unselected. Choose the destination folder with
 the folder browser; by default each repository gets its own subfolder. Any other repository can be
 entered by its `owner/name`.
 

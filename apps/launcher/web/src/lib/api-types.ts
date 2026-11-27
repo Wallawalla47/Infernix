@@ -215,6 +215,7 @@ export interface ModelArtifact {
   offloaded_experts: boolean;
   /** Qwen3.8-Flash-Next: needs an n-gram volume and takes --draft-model. */
   needs_ngram_volume: boolean;
+  /** Takes a drafter artifact (--draft-model): Flash-Next a DFlash2 companion, the Qwen3.8-27B a DSpine drafter. */
   accepts_draft_model: boolean;
   native_context: number;
   hidden_size: number;
