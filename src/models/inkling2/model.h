@@ -37,6 +37,7 @@ struct InstanceInfo {
     std::string metadata_json;
     std::string provenance_json;
     artifact::ArtifactId artifact_id{};
+    std::optional<artifact::ArtifactId> draft_artifact_id; // the DFlash2 companion's (--draft-model)
 };
 
 class LoadPlan;
@@ -80,7 +81,8 @@ public:
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept { return backing_.stats(); }
     [[nodiscard]] std::uint64_t device_weight_bytes() const noexcept {
         return backing_.stats().device_capacity_bytes + packed_.storage.bytes + q8_.storage.bytes +
-               (draft_head_ ? draft_head_->storage.bytes : 0);
+               (draft_head_ ? draft_head_->storage.bytes : 0) +
+               (draft_backing_ ? draft_backing_->stats().device_capacity_bytes : 0);
     }
     // --lm-head-draft: the drafter's shortlist tables, built at load.
     [[nodiscard]] const std::optional<DraftHead>& draft_head() const noexcept { return draft_head_; }
@@ -97,11 +99,13 @@ public:
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
-          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing, PackedWeights packed,
-          Q8Weights q8, std::optional<DraftHead> draft_head, std::optional<VisionHostWeights> vision_host);
+          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing,
+          std::optional<artifact::MaterializedArtifact> draft_backing, PackedWeights packed, Q8Weights q8,
+          std::optional<DraftHead> draft_head, std::optional<VisionHostWeights> vision_host);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
+    std::optional<artifact::MaterializedArtifact> draft_backing_; // the DFlash2 companion's weights
     PackedWeights packed_;
     Q8Weights q8_;
     std::optional<DraftHead> draft_head_;

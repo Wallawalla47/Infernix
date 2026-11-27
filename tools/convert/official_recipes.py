@@ -986,8 +986,33 @@ def inkling2_mini(model, recipe, sources):
             recipe.group(name, shape=parameter.shape)
 
 
+def inkling2_mini_dflash2(model, recipe, sources):
+    """An Inkling 2 Mini DFlash2 drafter (incoai/Inkling-2-Mini-DFlash2) as a companion artifact (``tools.convert
+    --components dflash2``), stored as the Flash-Next companion is: every projection ``q8_g32_fp16`` except the
+    dynamic-convolution kernel projections and the selector's hidden projection, which stay BF16 with the norms, base
+    kernels and codebooks (the real vocabulary's rows); the context K/V roles share the query block's K/V words. The
+    drafter only proposes tokens the main model verifies, so its precision changes acceptance, never output."""
+
+    if set(model.components) != {"dflash2"} or model.config.get("architectures") != ["Inkling2LoopForCausalLM"]:
+        raise ValueError("this recipe converts an Inkling 2 DFlash2 companion (--components dflash2)")
+    _dflash_drafters(model, recipe)
+
+
+def inkling2_mini_dflash2_nvfp4_mlp(model, recipe, sources):
+    """The Inkling 2 Mini DFlash2 companion with every layer's MLP (gate/up and down) NVFP4 at 16-bit activations
+    (``nvfp4_mse``), the rest as ``inkling2_mini_dflash2`` stores it."""
+
+    inkling2_mini_dflash2(model, recipe, sources)
+    _dflash2_nvfp4_gate_up(model, recipe)
+    layers = model.components["dflash2"]["config"]["num_hidden_layers"]
+    recipe.assign([f"dflash2/layers/{layer}/mlp/down" for layer in range(layers)], format="nvfp4", method=nvfp4_mse,
+                  activation_policy="A16Only")
+
+
 RECIPES = {
     "inkling2_mini": inkling2_mini,
+    "inkling2_mini_dflash2": inkling2_mini_dflash2,
+    "inkling2_mini_dflash2_nvfp4_mlp": inkling2_mini_dflash2_nvfp4_mlp,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

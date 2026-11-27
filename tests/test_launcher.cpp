@@ -565,10 +565,11 @@ void test_option_support() {
     const ScannedModel dense = kind("qwen3_5_text"), moe = kind("qwen3_5_moe_text"), moe_off = kind("qwen3_5_moe_text", true);
     ScannedModel next         = kind("qwen4_exp_text", true);
     next.accepts_draft_model  = true;
-    ScannedModel inkling = kind("inkling2_loop_text");
-    inkling.family       = "inkling2-mini";
-    inkling.num_experts  = 128;
-    inkling.has_dspark   = true;
+    ScannedModel inkling        = kind("inkling2_loop_text");
+    inkling.family              = "inkling2-mini";
+    inkling.num_experts         = 128;
+    inkling.has_dspark          = true;
+    inkling.accepts_draft_model = true; // its DFlash2 companion, as classify_family marks it
     check(model_kind(dense) == ModelKind::Qwen35Dense && model_kind(moe) == ModelKind::Qwen35Moe &&
               model_kind(moe_off) == ModelKind::Qwen35MoeOffloaded && model_kind(next) == ModelKind::FlashNext &&
               model_kind(inkling) == ModelKind::Inkling2 && model_kind(kind("other")) == ModelKind::Unknown,
@@ -593,7 +594,7 @@ void test_option_support() {
     row("--cache-host-state", true, true, true, false, false);
     row("--device-snapshot-slots", true, true, true, false, false);
     row("--cache-next-turn-ms", true, true, true, true, true);
-    row("--draft-model", true, false, false, true, false); // dense: a DSpine drafter (the Qwen3.8-27B)
+    row("--draft-model", true, false, false, true, true); // dense: a DSpine drafter (the Qwen3.8-27B)
     row("--draft-tree-nodes", true, true, true, false, false);
     row("--ngram-draft-tokens", true, true, true, true, false);
     row("--ngram-archive-mib", true, true, true, false, false);
@@ -614,14 +615,18 @@ void test_option_support() {
     ranked.has_dspark   = false;
     check(!supports_option(ranked, "--lm-head-draft"),
           "an Inkling artifact with a ranking but no DSpark drafter does not take --lm-head-draft");
-    ranked.has_dspark = true;
+    ranked.has_draft_companion = true;
+    check(supports_option(ranked, "--lm-head-draft"),
+          "an Inkling artifact with a ranking and a DFlash2 companion in the library takes --lm-head-draft");
+    ranked.has_draft_companion = false;
+    ranked.has_dspark          = true;
     check(supports_option(ranked, "--lm-head-draft"),
           "an Inkling artifact with its ranking and DSpark drafter takes --lm-head-draft");
     check(!supports_context_auto(next) && !supports_context_auto(moe_off) && supports_context_auto(dense) &&
               supports_context_auto(inkling),
           "--max-context auto where experts stay in VRAM");
     const std::vector<std::string> specs = spec_values(inkling);
-    check(specs == std::vector<std::string>{"off", "auto", "dspark"}, "Inkling's --spec values");
+    check(specs == std::vector<std::string>{"off", "auto", "dflash2", "dspark"}, "Inkling's --spec values");
 
     // A saved configuration: what the model does not take is gone, and its neighbours and values stay.
     Args saved = {"--kv-dtype", "int8", "--preserve-thinking", "--ngram-draft-tokens", "12", "--spec", "mtp",
@@ -649,6 +654,32 @@ void test_option_support() {
     ranked_inkling.has_dspark   = true;
     check(has_flag(default_args(scan, ranked_inkling), "--lm-head-draft"),
           "an Inkling artifact with its ranking and DSpark drafter defaults to the proposal head");
+    {
+        // A DFlash2 companion of this model in the library: it is named (--spec auto then drafts with it), and the
+        // shortlist serves its drafts even without DSpark.
+        LibraryScan with_companion;
+        ScannedDrafter companion;
+        companion.path              = "models/Inkling-2-Mini-DFlash2-Infernix.infernix";
+        companion.kind              = "dflash2";
+        companion.compatible_models = {ranked_inkling.key};
+        with_companion.drafters.push_back(companion);
+        ScannedModel bare           = ranked_inkling;
+        bare.has_dspark             = false;
+        bare.has_draft_companion    = true;
+        const Args with             = default_args(with_companion, bare);
+        check(contains(with, {"--draft-model", "models/Inkling-2-Mini-DFlash2-Infernix.infernix"}) &&
+                  contains(with, {"--spec", "auto"}) && has_flag(with, "--lm-head-draft"),
+              "an Inkling artifact without DSpark and with a DFlash2 companion in the library defaults to it, with the "
+              "proposal head");
+        // With its bundled DSpark drafter the companion is not named: --spec auto drafts with DSpark, which won the
+        // agentic replay.
+        ScannedModel bundled        = ranked_inkling;
+        bundled.has_dspark          = true;
+        bundled.has_draft_companion = true;
+        const Args kept             = default_args(with_companion, bundled);
+        check(!has_flag(kept, "--draft-model") && contains(kept, {"--spec", "auto"}) && has_flag(kept, "--lm-head-draft"),
+              "an Inkling artifact with DSpark keeps it beside a DFlash2 companion in the library");
+    }
     ranked_inkling.has_dspark = false;
     check(!has_flag(default_args(scan, ranked_inkling), "--lm-head-draft"),
           "no proposal head without the DSpark drafter it shortlists for");

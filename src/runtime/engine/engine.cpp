@@ -83,14 +83,20 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
     std::vector<std::filesystem::path> dflash2_companions;
     std::exception_ptr unreadable;
     bool inkling2 = false, inkling2_drafter = false;
+    std::vector<std::filesystem::path> inkling2_companions;
     try {
         const artifact::Reader reader(engine_options.artifact_path);
         inkling2         = runtime::artifact_is_inkling2(reader);
         inkling2_drafter = inkling2 && runtime::artifact_has_inkling2_drafter(reader);
+        const SpeculativeOptions& speculative = engine_options.speculative;
+        if (inkling2 && speculative.backend_auto && speculative.draft_model.empty() && !engine_options.lossless &&
+            engine_options.purpose == EnginePurpose::Generation) {
+            inkling2_companions = runtime::inkling2_dflash2_companions_beside(engine_options.artifact_path, reader.directory());
+        }
     } catch (const std::exception&) {}
     if (inkling2) { // its own options (runtime/engine/inkling2_instance.h); none of the Qwen families' defaults apply
         architecture = models::Architecture::Inkling2Loop;
-        return runtime::normalize_inkling2_options(std::move(engine_options), inkling2_drafter);
+        return runtime::normalize_inkling2_options(std::move(engine_options), inkling2_drafter, inkling2_companions);
     }
     try {
         const artifact::Reader reader(engine_options.artifact_path);

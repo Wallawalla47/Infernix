@@ -306,6 +306,192 @@ int coupled_case(int k, int batch, std::mt19937& rng) {
     return failures;
 }
 
+std::uint64_t splitmix64(std::uint64_t value) {
+    value += 0x9E3779B97F4A7C15ULL;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
+}
+
+// The full-vocabulary draw's Gumbel noise at (seed, produced position, token), in FP64 from its documented key
+// (sampling.h): w = (the key's high 32 bits + 0.5) 2^-32 (in FP32, held below 1), g = -log(-log(1 - w)).
+double oracle_full_noise(std::uint64_t seed, std::int32_t position, std::int32_t token) {
+    std::uint64_t key = splitmix64(seed ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
+                                           0xD1B54A32D192ED03ULL));
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeGumbel) << 21) ^
+                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(token)) * 0x2545F4914F6CDD1DULL));
+    const float w = std::min((static_cast<float>(static_cast<std::uint32_t>(key >> 32)) + 0.5F) * 0x1p-32F,
+                             0x1.fffffep-1F);
+    return -std::log(-std::log1p(-static_cast<double>(w)));
+}
+
+// Coupled drafts on a call that verifies them by equality with sample()'s own draws (candidate_selector_path's
+// couple_draws, Inkling 2's DFlash2): draft i of a round at frontier L is coupled with the target's draw at verify
+// column i (input position L + i). `whole`: the rows sample the whole vocabulary (top_k 0), and draft i is the
+// candidate maximizing edge / temperature + that draw's Gumbel noise (keyed at L + i + 1). With the edges equal to the
+// target's logits on the candidates (zero codebooks; every other logit -60, never drawn), every draft must be plain
+// sampling's own token at its column: rows at temperature 1 and 0.7, a greedy row, and a row that also sets
+// gumbel_max (full_vocabulary takes precedence, as in sample()). Each sampled draft of a row without gumbel_max is also
+// the FP64 oracle's (oracle_full_noise, its documented key) wherever the oracle's two best scores differ by more than
+// 1e-4, which pins the key to the documented one rather than to sample()'s alone. Else the rows sample the default top
+// 20, which couple_draws leaves alone: a sampled row without gumbel_max draws exactly as without it (the proposal's
+// uniform), and the greedy and gumbel_max rows are plain sampling's tokens (the Gumbel-max coupling of candidates
+// ZH-01). The rows' proposal-uniform drafts (no couple_draws) match plain sampling only by chance; their count is
+// printed, not checked, and their proposal_q must equal the coupled call's (coupling changes the draw, not the law).
+int coupled_draws_case(int k, int batch, bool softcap, bool whole, std::mt19937& rng) {
+    // Inkling 2 Mini's logits: its real vocabulary's rows (the Program samples [vocab, columns], the domain its rows).
+    constexpr int kVocab = 200058, kRows = kVocab, kRank = 256, kCandidates = 16;
+    std::normal_distribution<float> normal(0.0F, 2.0F);
+    const std::size_t lattice = static_cast<std::size_t>(kCandidates) * k * batch;
+    std::vector<std::int32_t> ids(lattice);
+    std::vector<float> unary(lattice);
+    for (std::size_t column = 0; column < static_cast<std::size_t>(k) * batch; ++column) {
+        const auto first = static_cast<std::int32_t>(rng() % (kVocab - 40 * kCandidates));
+        for (int c = 0; c < kCandidates; ++c) {
+            ids[column * kCandidates + c]   = first + 37 * c;
+            unary[column * kCandidates + c] = normal(rng);
+        }
+    }
+    std::vector<ops::SamplingConfig> target(batch);
+    std::vector<std::int32_t> lengths(batch), anchors(batch, 5);
+    for (int b = 0; b < batch; ++b) {
+        ops::SamplingConfig c;
+        c.temperature     = b % 4 == 1 ? 0.0F : (b % 2 == 0 ? 1.0F : 0.7F);
+        c.top_k           = whole ? 0 : 20;
+        c.top_p           = 1.0F;
+        c.min_p           = 0.0F;
+        c.seed            = 9000 + 37 * b;
+        c.full_vocabulary = whole;
+        c.gumbel_max      = b % 4 == 3;
+        target[b]         = c;
+        lengths[b]        = 700 + 19 * b;
+    }
+    constexpr float kSoftcap = 30.0F; // Inkling 2's final_logit_softcapping (the selector's after its correction)
+    DeviceBuffer d_ids = to_device(ids), d_unary = to_device(unary), d_anchors = to_device(anchors);
+    DeviceBuffer d_base = to_device(lengths), d_sel = to_device(target);
+    DeviceBuffer d_hidden(static_cast<std::size_t>(kRank) * k * batch * 2);
+    DeviceBuffer d_predecessor(static_cast<std::size_t>(kRank) * kVocab * 2), d_successor(d_predecessor.bytes);
+    cuda_check(cudaMemset(d_hidden.p, 0, d_hidden.bytes), "cudaMemset");
+    cuda_check(cudaMemset(d_predecessor.p, 0, d_predecessor.bytes), "cudaMemset");
+    cuda_check(cudaMemset(d_successor.p, 0, d_successor.bytes), "cudaMemset");
+    struct Walk {
+        std::vector<std::int32_t> drafts;
+        std::vector<float> q;
+    };
+    const auto walk = [&](bool couple) {
+        DeviceBuffer d_drafts(static_cast<std::size_t>(k) * batch * 4), d_q(lattice * 4);
+        Tensor tids(d_ids.p, DType::I32, {kCandidates, k, batch}), tunary(d_unary.p, DType::FP32, {kCandidates, k, batch});
+        Tensor thidden(d_hidden.p, DType::BF16, {kRank, k, batch}), tanchors(d_anchors.p, DType::I32, {batch});
+        Tensor tpred(d_predecessor.p, DType::BF16, {kRank, kVocab}), tsucc(d_successor.p, DType::BF16, {kRank, kVocab});
+        Tensor tbase(d_base.p, DType::I32, {batch});
+        Tensor tdrafts(d_drafts.p, DType::I32, {k, batch}), tq(d_q.p, DType::FP32, {kCandidates, k, batch});
+        DeviceBuffer scratch(std::max<std::size_t>(ops::candidate_selector_path_workspace_capacity_bytes(k, k, batch, batch), 1));
+        WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
+        ops::candidate_selector_path(tids, tunary, thidden, tanchors, tpred, tsucc, tbase,
+                                     static_cast<const ops::SamplingConfig*>(d_sel.p), tdrafts, tq, nullptr, workspace,
+                                     nullptr, softcap ? kSoftcap : 0.0F, couple);
+        cuda_synchronize();
+        return Walk{from_device<std::int32_t>(d_drafts, static_cast<std::size_t>(k) * batch),
+                    from_device<float>(d_q, lattice)};
+    };
+    // The edges the selector scores: unary, or softcap * tanh(unary / softcap) (here the host's tanh, which may differ
+    // from the device's tanhf by an ulp: only two scores within that of each other could then draw differently, which
+    // this fixed fixture does not hold).
+    std::vector<float> edges = unary;
+    if (softcap) {
+        for (float& e : edges) { e = kSoftcap * std::tanh(e / kSoftcap); }
+    }
+    // The target's logits: the edges on the column's candidates, -60 elsewhere; its column i is draft i's position.
+    std::vector<std::vector<std::int32_t>> plain_tokens(static_cast<std::size_t>(k));
+    for (int i = 0; i < k; ++i) {
+        std::vector<float> logits(static_cast<std::size_t>(kRows) * batch, -60.0F);
+        std::vector<std::int32_t> positions(batch);
+        for (int b = 0; b < batch; ++b) {
+            const std::size_t at = static_cast<std::size_t>(b) * k + i;
+            for (int c = 0; c < kCandidates; ++c) {
+                logits[static_cast<std::size_t>(b) * kRows + ids[at * kCandidates + c]] = edges[at * kCandidates + c];
+            }
+            positions[b] = lengths[b] + i;
+        }
+        DeviceBuffer d_logits = to_device(logits), d_cfg = to_device(target), d_pos = to_device(positions);
+        DeviceBuffer d_out(static_cast<std::size_t>(batch) * 4);
+        Tensor tl(d_logits.p, DType::FP32, {kRows, batch}), to(d_out.p, DType::I32, {batch});
+        Tensor tp(d_pos.p, DType::I32, {batch});
+        DeviceBuffer scratch(std::max<std::size_t>(ops::sampling_workspace_capacity_bytes(kVocab, batch, batch), 1));
+        WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
+        ops::sample(tl, to, kVocab, static_cast<const ops::SamplingConfig*>(d_cfg.p), tp, ops::kSamplePurposeDecode,
+                    workspace, nullptr, true); // as Inkling 2's every call declares
+        cuda_synchronize();
+        plain_tokens[static_cast<std::size_t>(i)] = from_device<std::int32_t>(d_out, static_cast<std::size_t>(batch));
+    }
+    const Walk coupled = walk(true), proposal = walk(false);
+    const std::string mode = whole ? "whole-vocabulary" : "top-20";
+    int failures = 0, matched = 0, chance = 0, off_argmax = 0, judged = 0;
+    for (int b = 0; b < batch; ++b) {
+        const double T = target[b].temperature;
+        for (int i = 0; i < k; ++i) {
+            const std::size_t at   = static_cast<std::size_t>(b) * k + i;
+            const std::int32_t own = plain_tokens[static_cast<std::size_t>(i)][static_cast<std::size_t>(b)];
+            int best = 0;
+            for (int c = 1; c < kCandidates; ++c) { best = edges[at * kCandidates + c] > edges[at * kCandidates + best] ? c : best; }
+            off_argmax += coupled.drafts[at] != ids[at * kCandidates + best] ? 1 : 0;
+            const bool untouched = !whole && T > 0.0 && !target[b].gumbel_max; // a top-20 row couple_draws leaves
+            if (whole && T > 0.0 && !target[b].gumbel_max) {
+                // The FP64 oracle's coupled draw and its margin.
+                std::vector<double> score(kCandidates);
+                for (int c = 0; c < kCandidates; ++c) {
+                    score[c] = edges[at * kCandidates + c] / T +
+                               oracle_full_noise(target[b].seed, lengths[b] + i + 1, ids[at * kCandidates + c]);
+                }
+                int pick = 0;
+                for (int c = 1; c < kCandidates; ++c) { pick = score[c] > score[pick] ? c : pick; }
+                double second = -1e300;
+                for (int c = 0; c < kCandidates; ++c) {
+                    if (c != pick) { second = std::max(second, score[c]); }
+                }
+                if (score[pick] - second > 1e-4) {
+                    ++judged;
+                    if (coupled.drafts[at] != ids[at * kCandidates + pick]) {
+                        ++failures;
+                        std::cerr << "FAIL " << mode << " coupling row " << b << " draft " << i << ": drafted "
+                                  << coupled.drafts[at] << ", the FP64 oracle's " << ids[at * kCandidates + pick] << "\n";
+                    }
+                }
+            }
+            chance += proposal.drafts[at] == own ? 1 : 0;
+            if (untouched) {
+                if (coupled.drafts[at] != proposal.drafts[at]) {
+                    ++failures;
+                    std::cerr << "FAIL " << mode << " row " << b << " draft " << i
+                              << ": couple_draws changed a top-20 row's proposal draw\n";
+                }
+            } else if (coupled.drafts[at] == own) {
+                ++matched;
+            } else {
+                ++failures;
+                std::cerr << "FAIL " << mode << " coupling row " << b << " draft " << i << ": drafted " << coupled.drafts[at]
+                          << ", plain sampling's " << own << "\n";
+            }
+            for (int c = 0; c < kCandidates; ++c) {
+                if (coupled.q[at * kCandidates + c] != proposal.q[at * kCandidates + c]) {
+                    ++failures;
+                    std::cerr << "FAIL " << mode << " coupling row " << b << " draft " << i << ": proposal_q differs\n";
+                    break;
+                }
+            }
+        }
+    }
+    std::cout << mode << " coupled drafts K=" << k << " B=" << batch << (softcap ? " softcap" : "") << ": " << matched
+              << " of " << k * batch << " are plain sampling's tokens, " << judged
+              << " judged against the FP64 key oracle (" << off_argmax
+              << " off the argmax; the same rows' proposal-uniform drafts: " << chance << ")\n";
+    if (whole && judged == 0) {
+        std::cerr << "FAIL " << mode << " coupling: no draft was judged against the FP64 key oracle\n";
+        ++failures;
+    }
+    return failures;
+}
+
 // Coupled argmax drafts (speculative_couple_drafts, candidates QK-04): a Gumbel-max row's MTP draft of step `step`,
 // re-drawn under the key its verification column gives each token (L + step + 1), is plain sampling's own draw of
 // the drafter's logits at the input position L + step (the same support and noise: checked exactly, which pins the
@@ -445,6 +631,10 @@ INFERNIX_OP_TEST(gumbel_speculation) {
         failures += distribution_case(rng);
         failures += coupled_case(7, 6, rng);
         failures += coupled_case(15, 2, rng);
+        failures += coupled_draws_case(7, 8, false, true, rng);
+        failures += coupled_draws_case(7, 5, true, true, rng);
+        failures += coupled_draws_case(7, 8, false, false, rng);
+        failures += coupled_draws_case(7, 5, true, false, rng);
         failures += couple_drafts_case(4, 0, false, rng);
         failures += couple_drafts_case(5, 1, true, rng);
         failures += couple_drafts_case(6, 2, false, rng);

@@ -8,12 +8,15 @@
 namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next's drafter calls (H 2560, at most 16 columns: one row of up to 16, or a pair of up
-// to 8) take the fused kernel; every other shape the RMSNorm, split-K projection and reduction.
+// to 8) and every Inkling 2 drafter call (H 2304, in chunks of whole rows) take the fused kernel; every
+// other shape the RMSNorm, split-K projection and reduction.
 DynamicConvPrepareRoute resolve_route(int hidden, int tokens) {
     if (bf16_dynamic_grouped_conv_prepare_fused_supported(hidden, tokens)) return {0, 0, 0, true};
     // Complete cold-cache Graph timings favor split-8 R16 through 48 columns.
     // R32 halves split scratch and avoids the repeated wide tile above that range.
-    if (tokens <= 48) return {16, tokens <= 8 ? 8 : tokens <= 16 ? 16 : tokens <= 32 ? 32 : 48, 8};
+    if (tokens <= 48) {
+        return {16, tokens <= 8 ? 8 : tokens <= 16 ? 16 : tokens <= 32 ? 32 : 48, dynamic_conv_prepare_r16_split(hidden)};
+    }
     return {32, tokens <= 96 ? 32 : 64, 4};
 }
 
@@ -43,8 +46,8 @@ std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int hidde
                                                                        int max_width,
                                                                        int min_batch,
                                                                        int max_batch) {
-    if (hidden != 5120 && hidden != 2560 && hidden != 3072)
-        throw std::invalid_argument("dynamic grouped conv prepare workspace: H must be 5120, 2560 or 3072");
+    if (hidden != 5120 && hidden != 2560 && hidden != 3072 && hidden != 2304)
+        throw std::invalid_argument("dynamic grouped conv prepare workspace: H must be 5120, 2560, 3072 or 2304");
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
         max_batch > 8 || min_batch > max_batch)
         throw std::invalid_argument("dynamic grouped conv prepare workspace: invalid W/B interval");

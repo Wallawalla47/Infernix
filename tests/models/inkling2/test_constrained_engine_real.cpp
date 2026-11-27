@@ -23,6 +23,7 @@
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (its DSpark drafter included)
 
 #include "infernix/engine.h"
+#include "models/inkling2/drafter_choice.h"
 #include "models/inkling2/program/test_taps.h"
 
 #include <nlohmann/json.hpp>
@@ -66,7 +67,7 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact, bo
     options.context_cache.host_capacity_bytes = std::size_t{2} << 30U;
     options.use_cuda_graph       = graphs;
     if (dspark) {
-        options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+        infernix::test::inkling2::use_drafter(options.speculative);
         options.speculative.draft_tokens_auto = automatic;
         options.speculative.draft_tokens      = 7;
     }

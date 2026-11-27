@@ -364,8 +364,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
     // The 35B-A3B DFlash drafter (2048) and the DFlash2 drafters: Qwen3.8-Flash-Next's (2560),
-    // Qwen3.5-122B-A10B's (3072) and Qwen3.8-27B's (5120).
-    if (hidden != 2048 && hidden != 2560 && hidden != 3072 && hidden != 5120) {
+    // Qwen3.5-122B-A10B's (3072), Qwen3.8-27B's (5120) and Inkling 2 Mini's (2304).
+    if (hidden != 2048 && hidden != 2560 && hidden != 3072 && hidden != 5120 && hidden != 2304) {
         throw std::invalid_argument("attn_input_proj: unsupported Q8 Q/K/V profile");
     }
     require_matrix(x, hidden, cols, "x");

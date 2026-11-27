@@ -124,11 +124,12 @@ void launch(const Tensor& input, const Weight& weight, float* partial, cudaStrea
 template <int H>
 void launch_route(DynamicConvPrepareRoute route, const Tensor& input, const Weight& weight,
                   float* partial, cudaStream_t stream) {
-    if (route.rows == 16 && route.split_k == 8) {
+    constexpr int kSplit = dynamic_conv_prepare_r16_split(H);
+    if (route.rows == 16 && route.split_k == kSplit) {
         switch (route.columns) {
 #define COL(C)                                                                                     \
     case C:                                                                                        \
-        return launch<H, 16, C, 8>(input, weight, partial, stream)
+        return launch<H, 16, C, kSplit>(input, weight, partial, stream)
             COL(8);
             COL(16);
             COL(32);
@@ -154,6 +155,8 @@ void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute ro
         return launch_route<2560>(route, input, weight, partial, stream);
     case 3072:
         return launch_route<3072>(route, input, weight, partial, stream);
+    case 2304:
+        return launch_route<2304>(route, input, weight, partial, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: unregistered hidden width");
 }

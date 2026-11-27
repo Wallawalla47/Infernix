@@ -173,6 +173,140 @@ def dspark_config(source: Mapping, text: Mapping) -> dict:
     }
 
 
+def visits(text: Mapping) -> int:
+    """The layer visits of one forward (the core's layers run ``passes`` times)."""
+
+    loop = text["loop"]
+    return (loop["core_end"] - loop["core_start"]) * (loop["passes"] - 1) + text["num_hidden_layers"]
+
+
+def dflash2_target(source: Mapping) -> dict:
+    """The identity of the Inkling 2 text model a DFlash2 companion binds to (checked at load against the main
+    artifact's text config): read from the checkpoint's config alone, as text_config validates it, without the
+    expert banks a companion never reads."""
+
+    _require(is_inkling2_loop(source), f"architectures must be [{ARCHITECTURE!r}]")
+    raw = source.get("text_config")
+    _require(isinstance(raw, Mapping) and raw.get("model_type") == "inkling2_loop_text", "text_config is missing")
+    layers = _positive_int(raw, "num_hidden_layers")
+    loop = raw.get("loop_config")
+    _require(isinstance(loop, Mapping) and loop.get("is_varloop") is False, "loop_config must be a fixed loop")
+    vocab = _positive_int(raw, "unpadded_vocab_size")
+    _require(vocab <= _positive_int(raw, "vocab_size"), "unpadded_vocab_size exceeds vocab_size")
+    text = {
+        "architectures": [TEXT_ARCHITECTURE],
+        "hidden_size": _positive_int(raw, "hidden_size"),
+        "num_hidden_layers": layers,
+        "vocab_size": vocab,
+        "loop": {key: _positive_int(loop, key) for key in ("core_start", "core_end")} |
+                {"passes": _positive_int(loop, "num_passes")},
+    }
+    text["visits"] = visits(text)
+    return text
+
+
+DFLASH2_ARCHITECTURE = "DFlash2DraftModel"
+# The target fields a DFlash2 companion records (target_config) and the loader checks.
+DFLASH2_TARGET_FIELDS = ("architectures", "hidden_size", "vocab_size", "num_hidden_layers", "visits")
+DFLASH2_SOFTCAP_MODES = ("before_correction", "after_correction")
+
+
+def dflash2_config(raw: Mapping, target: Mapping) -> dict:
+    """The normalized config of an Inkling 2 DFlash2 drafter (``DFlash2DraftModel``, e.g. incoai/Inkling-2-Mini-DFlash2):
+    the DFlash2 backbone (docs/maintainer/dflash.md) over the target's DSpark features (the inputs of the listed layer
+    visits, then the final-normed state), drafting from the target's head over its real vocabulary. The selector's
+    logit softcap is applied where ``selector_softcap_mode`` says (SGLang's default ``before_correction``: on the
+    candidates' logits; ``after_correction``: on each edge's corrected score)."""
+
+    def fixed(scope: Mapping, key: str, expected) -> None:
+        if key in scope:
+            _require(scope[key] == expected, f"dflash2.{key} must be {expected!r}")
+
+    _require(raw.get("architectures") == [DFLASH2_ARCHITECTURE], f"dflash2 architectures must be [{DFLASH2_ARCHITECTURE!r}]")
+    _require(raw.get("model_type") == "qwen3", "dflash2 model_type must be qwen3")
+    for key, expected in (("hidden_act", "silu"), ("attention_bias", False), ("is_causal", False),
+                          ("tie_word_embeddings", False), ("hidden_size", target["hidden_size"]),
+                          ("num_target_layers", target["visits"])):
+        fixed(raw, key, expected)
+    _require(raw.get("hidden_size") == target["hidden_size"], "dflash2.hidden_size must be the target's")
+    # The drafter's vocabulary may be the target's padded storage; it reads only the real rows.
+    _require(type(raw.get("vocab_size")) is int and raw["vocab_size"] >= target["vocab_size"],
+             "dflash2.vocab_size must cover the target's vocabulary")
+    layers = _positive_int(raw, "num_hidden_layers")
+    heads, kv_heads, head_dim = (_positive_int(raw, key) for key in ("num_attention_heads", "num_key_value_heads",
+                                                                     "head_dim"))
+    _require(heads % kv_heads == 0 and head_dim % 2 == 0, "dflash2: invalid attention geometry")
+    kinds = raw.get("layer_types")
+    _require(isinstance(kinds, list) and len(kinds) == layers and all(k == "sliding_attention" for k in kinds),
+             "dflash2: the drafter's layers are all sliding_attention")
+    rope = raw.get("rope_parameters", {})
+    _require(isinstance(rope, Mapping) and rope.get("rope_type", "default") == "default", "dflash2: default RoPE only")
+    theta = rope.get("rope_theta", raw.get("rope_theta"))
+    _require(type(theta) in (int, float) and theta > 1, "dflash2: rope_theta must exceed 1")
+    draft = raw.get("dflash_config")
+    _require(isinstance(draft, Mapping), "dflash2: dflash_config is missing")
+    taps = draft.get("target_layer_ids")
+    _require(isinstance(taps, list) and len(taps) >= 2 and taps == sorted(set(taps)) and taps[-1] == target["visits"]
+             and all(type(v) is int and 0 <= v for v in taps),
+             "dflash2.target_layer_ids must be ascending visit inputs ending at the final state")
+    mask = draft.get("mask_token_id")
+    _require(type(mask) is int and 0 <= mask < target["vocab_size"], "dflash2: the mask token is outside the vocabulary")
+    mode = draft.get("selector_softcap_mode", "before_correction")
+    _require(mode in DFLASH2_SOFTCAP_MODES, f"dflash2.selector_softcap_mode must be one of {DFLASH2_SOFTCAP_MODES}")
+    softcap = draft.get("final_logit_softcapping")
+    _require(softcap is None or (type(softcap) in (int, float) and softcap >= 0), "dflash2: invalid softcap")
+    for scope in (raw, draft):
+        fixed(scope, "input_embedding_scale", 1.0)
+        fixed(scope, "output_multiplier", 1.0)
+        fixed(scope, "sample_from_anchor", False)
+    out = {key: _positive_int(draft, key) for key in ("block_size", "conv_kernel_size", "conv_group_size",
+                                                       "selector_rank", "selector_top_k")}
+    _require(target["hidden_size"] % out["conv_group_size"] == 0, "dflash2: the hidden width must split into conv groups")
+    out |= {"target_layer_ids": list(taps), "mask_token_id": mask,
+            "final_logit_softcapping": float(softcap or 0.0), "selector_softcap_mode": mode}
+    return {
+        "architectures": [DFLASH2_ARCHITECTURE],
+        "model_type": "qwen3",
+        "hidden_size": target["hidden_size"],
+        "intermediate_size": _positive_int(raw, "intermediate_size"),
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        "num_hidden_layers": layers,
+        "max_position_embeddings": _positive_int(raw, "max_position_embeddings"),
+        "rms_norm_eps": _number(raw, "rms_norm_eps"),
+        "rope_parameters": {"rope_theta": float(theta)},
+        "layer_types": list(kinds),
+        "sliding_window": _positive_int(raw, "sliding_window"),
+        "dflash_config": out,
+        "target_config": {key: target[key] for key in DFLASH2_TARGET_FIELDS},
+    }
+
+
+def build_dflash2_companion(base: SafetensorsSource, draft: SafetensorsSource) -> Model:
+    """A companion artifact holding only a DFlash2 drafter of Inkling 2 (``--draft-model``), loaded beside any artifact
+    of that model. ``base`` supplies the target's config and tokenizer (no weights are read from it); the drafter embeds
+    with the target's token embedding and its norm and drafts from the target's head, so the companion declares its
+    Use of that head. The codebooks keep the real vocabulary's rows (the checkpoint's are its padded storage)."""
+
+    target = dflash2_target(base.config)
+    config = dflash2_config(draft.config, target)
+    _, _, count, special = load_resources(base.root, vocab_size=target["vocab_size"], qwen_normalizers=False)
+    if count != target["vocab_size"]:
+        raise ValueError(f"the tokenizer's {count} public tokens differ from the model's {target['vocab_size']} rows")
+    if config["dflash_config"]["selector_top_k"] > count:
+        raise ValueError("DFlash2 selector_top_k exceeds the public token domain")
+    model = Model(
+        {"dflash2": {"config": config, "target": "text"}},
+        token_count=count,
+        special_token_ids=special,
+        target=target,
+        external_uses=(("text/output_head", "dflash2/final_hidden"),),
+    )
+    _Builder(model).dflash2(draft, config, target)
+    return model
+
+
 def vision_config(source: Mapping, text: Mapping) -> dict:
     """The vision tower's mathematics (design §15): the ``inkling2_vision`` ViT, its 2 x 2 merge and the projector into
     the text width. Its fixed semantics (CLS token, axial rotary on interleaved pairs, exact GELU, layer scale) are the
@@ -675,6 +809,50 @@ class _Builder:
         self.add(mk + "fold", store, None, (vocab, rank), inputs=(mk + "latent",),
                  source=fold_source(base, head, vocab, store, bias=False))
         self.add(mk + "fold_bias", store, None, (vocab,), source=fold_source(base, head, vocab, store, bias=True))
+
+    def dflash2(self, store: SafetensorsSource, config: dict, target: dict) -> None:
+        """A DFlash2 drafter's parameters under Qwen4Exp's companion names (tools/convert/qwen3_5.py _Builder.draft):
+        the context K/V roles read the query block's K/V words (the recipe shares them)."""
+
+        h, vocab = target["hidden_size"], target["vocab_size"]
+        d = config["head_dim"]
+        q, k = config["num_attention_heads"] * d, config["num_key_value_heads"] * d
+        draft, inter = config["dflash_config"], config["intermediate_size"]
+        taps, groups = draft["conv_kernel_size"], h // draft["conv_group_size"]
+        self.add("dflash2/feature_projection", store, "fc.weight", (h, len(draft["target_layer_ids"]) * h),
+                 inputs=("dflash2/target_features",))
+        self.add("dflash2/context_norm", store, "hidden_norm.weight", (h,))
+        self.add("dflash2/final_norm", store, "norm.weight", (h,))
+        for index in range(config["num_hidden_layers"]):
+            p, sp = f"dflash2/layers/{index}/", f"layers.{index}."
+            a, sa = p + "attention/", sp + "self_attn."
+            self.add(p + "input_norm", store, sp + "input_layernorm.weight", (h,))
+            self.add(p + "post_attention_norm", store, sp + "post_attention_layernorm.weight", (h,))
+            for role, field, rows in (("query", "q_proj", q), ("key", "k_proj", k), ("value", "v_proj", k)):
+                self.add(a + role, store, sa + field + ".weight", (rows, h), inputs=(p + "query_projection_input",))
+                if role != "query":
+                    self.add(a + "context_" + role, store, sa + field + ".weight", (rows, h),
+                             inputs=("dflash2/context_input",))
+            self.group(a + "query", a + "key", a + "value")
+            self.add(a + "query_norm", store, sa + "q_norm.weight", (d,))
+            self.add(a + "key_norm", store, sa + "k_norm.weight", (d,))
+            self.add(a + "output", store, sa + "o_proj.weight", (h, q), inputs=(p + "attention_output",))
+            for role in ("gate", "up"):
+                self.add(p + "mlp/" + role, store, sp + "mlp." + role + "_proj.weight", (inter, h),
+                         inputs=(p + "mlp_input",))
+            self.add(p + "mlp/down", store, sp + "mlp.down_proj.weight", (h, inter), inputs=(p + "mlp_product",))
+            self.group(p + "mlp/gate", p + "mlp/up")
+            for branch in ("attention_conv", "mlp_conv"):
+                self.add(p + branch + "/base_kernel", store, sp + branch + ".base_kernel", (2, taps, h))
+                self.add(p + branch + "/kernel_projection", store, sp + branch + ".kernel_projection.weight",
+                         (2 * taps * groups, h), inputs=(p + branch + "_input",))
+        rank = draft["selector_rank"]
+        self.add("dflash2/candidate_selector/hidden_projection", store, "candidate_selector.hidden_projection.weight",
+                 (rank, h), inputs=("dflash2/final_hidden",))
+        stored = store.describe("candidate_selector.predecessor_codebook").shape[0]
+        for role in ("predecessor_codebook", "successor_codebook"):
+            self.add("dflash2/candidate_selector/" + role, store, "candidate_selector." + role, (vocab, rank),
+                     rows=vocab, source_shape=(stored, rank))
 
 
 def _expert_formats(store: SafetensorsSource, layers: int) -> list[str]:

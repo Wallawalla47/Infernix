@@ -915,7 +915,35 @@ __global__ void __launch_bounds__(256) gather_rows_kernel(const std::uint16_t* s
     out[i] = src[static_cast<long long>(ids[row]) * row_words + word];
 }
 
+// A CTA per (block column j, row b): column first[b] + j of the call (j < counts[b]) to column b * width + j.
+__global__ void __launch_bounds__(256) gather_columns_kernel(const std::uint16_t* features, std::int32_t column_words,
+                                                             const std::int32_t* positions, const std::int32_t* words,
+                                                             std::int32_t padded, std::int32_t width,
+                                                             std::uint16_t* out_features, std::int32_t* out_positions) {
+    const int j = static_cast<int>(blockIdx.x), b = static_cast<int>(blockIdx.y);
+    const std::int32_t count = words[b], first = words[padded + b];
+    if (j >= count) { return; }
+    const long long from = static_cast<long long>(first) + j, to = static_cast<long long>(b) * width + j;
+    const auto* src = reinterpret_cast<const uint4*>(features + from * column_words);
+    auto* dst       = reinterpret_cast<uint4*>(out_features + to * column_words);
+    for (int i = static_cast<int>(threadIdx.x); i < column_words / 8; i += 256) { dst[i] = src[i]; }
+    if (threadIdx.x == 0) { out_positions[to] = positions[from]; }
+}
+
 } // namespace
+
+void dflash2_gather_columns(const std::uint16_t* features, std::int32_t column_words, const std::int32_t* positions,
+                            const std::int32_t* words, std::int32_t padded, std::int32_t rows, std::int32_t width,
+                            std::uint16_t* out_features, std::int32_t* out_positions, cudaStream_t stream) {
+    if (features == nullptr || positions == nullptr || words == nullptr || out_features == nullptr ||
+        out_positions == nullptr || column_words <= 0 || column_words % 8 != 0 || rows <= 0 || width <= 0 ||
+        padded < rows) {
+        throw std::invalid_argument("inkling2 dflash2_gather_columns: features, positions, the rows' words and outputs");
+    }
+    gather_columns_kernel<<<dim3(static_cast<unsigned>(width), static_cast<unsigned>(rows)), 256, 0, stream>>>(
+        features, column_words, positions, words, padded, width, out_features, out_positions);
+    check(cudaGetLastError(), "gather columns");
+}
 
 void dspark_gather_rows(const std::uint16_t* src, std::int32_t row_words, const std::int32_t* ids, std::int32_t rows,
                         std::uint16_t* out, cudaStream_t stream) {

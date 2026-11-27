@@ -82,8 +82,9 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
  * contiguous FP32 `[16,U]`: per column the 16 largest logits in descending order, equal values by lower row, and
  * the logits themselves as scores (no log-sum-exp). The ids are therefore top_logprobs' ids for the same logits;
  * a consumer that needs only differences between one column's scores (a softmax over the candidates) reads the same
- * values top_logprobs' log-probabilities would give it, shifted. One CTA per 128 rows reads every column, instead
- * of one CTA per column.
+ * values top_logprobs' log-probabilities would give it, shifted. One warp per 512 rows and column takes that group's
+ * top sixteen (sixteen warp-wide maxima over 16 keys a lane), and the merge selects across groups, instead of one
+ * CTA per column.
  *
  * `logits` is preserved; both outputs are completely overwritten. Inputs, outputs and workspace must not overlap.
  * The Op has no persistent state and performs no internal device allocation.

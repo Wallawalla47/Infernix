@@ -32,5 +32,6 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const Tensor& successor_codebook,
                                       const Tensor& base_positions, const SamplingConfig* configs,
                                       Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, float edge_softcap, bool couple_draws,
+                                      cudaStream_t stream);
 } // namespace infernix::ops::detail

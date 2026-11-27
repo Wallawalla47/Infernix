@@ -16,7 +16,8 @@ namespace {
 
 constexpr std::int32_t kCandidates   = 16;
 constexpr std::int32_t kRank         = 256;
-constexpr std::int32_t kCodebookRows = 248320;
+// The registered vocabularies: Qwen3.8's 248,320 rows, Inkling 2's 200,058.
+bool registered_vocabulary(std::int32_t rows) { return rows == 248320 || rows == 200058; }
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -129,9 +130,12 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
     require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
     require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
     require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
-    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+    if (!registered_vocabulary(predecessor_codebook.ne[1])) {
+        throw std::invalid_argument("candidate_selector: the codebooks' vocabulary is not registered");
+    }
+    require_tensor(predecessor_codebook, DType::BF16, kRank, predecessor_codebook.ne[1], 1, 1,
                    "predecessor_codebook");
-    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+    require_tensor(successor_codebook, DType::BF16, kRank, predecessor_codebook.ne[1], 1, 1,
                    "successor_codebook");
     require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
     require_tensor(current_extents, DType::I32, batch_size, 1, 1, 1, "current_extents");
@@ -300,7 +304,10 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
-                             WorkspaceArena& workspace, cudaStream_t stream) {
+                             WorkspaceArena& workspace, cudaStream_t stream, float edge_softcap, bool couple_draws) {
+    if (!(edge_softcap >= 0.0F) || edge_softcap == std::numeric_limits<float>::infinity()) {
+        throw std::invalid_argument("candidate_selector_path: the edge softcap must be finite and >= 0");
+    }
     const std::int32_t batch_size = candidate_ids.ne[2];
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
@@ -312,9 +319,12 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
     require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
     require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
     require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
-    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+    if (!registered_vocabulary(predecessor_codebook.ne[1])) {
+        throw std::invalid_argument("candidate_selector: the codebooks' vocabulary is not registered");
+    }
+    require_tensor(predecessor_codebook, DType::BF16, kRank, predecessor_codebook.ne[1], 1, 1,
                    "predecessor_codebook");
-    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+    require_tensor(successor_codebook, DType::BF16, kRank, predecessor_codebook.ne[1], 1, 1,
                    "successor_codebook");
     require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
     require_tensor(drafts, DType::I32, kSteps, batch_size, 1, 1, "drafts");
@@ -341,7 +351,8 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
 
     detail::candidate_selector_path_dispatch(
         candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
-        successor_codebook, base_positions, configs, drafts, proposal_q, confidence, workspace, stream);
+        successor_codebook, base_positions, configs, drafts, proposal_q, confidence, workspace, edge_softcap,
+        couple_draws, stream);
 }
 
 } // namespace infernix::ops

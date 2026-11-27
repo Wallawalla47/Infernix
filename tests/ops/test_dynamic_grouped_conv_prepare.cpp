@@ -243,7 +243,8 @@ int run_geometry(std::int32_t hidden) {
                  base_device = to_device(base_host);
     const auto capacity =
         ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(g_hidden, 2, 16, 1, 8);
-    WorkspaceArena workspace(capacity);
+    // H 2304's fused route takes no workspace at any shape (capacity 0): the arena still needs a buffer.
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
     Tensor norm(norm_device.p, DType::BF16, {g_hidden});
@@ -322,8 +323,8 @@ INFERNIX_OP_TEST(dynamic_grouped_conv_prepare) {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        // Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
-        const int failures = run_geometry(5120) + run_geometry(2560) + run_geometry(3072);
+        // Qwen3.8-27B's drafter, Qwen3.8-Flash-Next's, Qwen3.5-122B-A10B's and Inkling 2 Mini's.
+        const int failures = run_geometry(5120) + run_geometry(2560) + run_geometry(3072) + run_geometry(2304);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_dynamic_grouped_conv_prepare\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

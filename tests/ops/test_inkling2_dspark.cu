@@ -1044,6 +1044,49 @@ void blocks_case() {
     check(rotate_ok && attention_ok && markov_ok, "a launch over blocks differs from the blocks' single launches");
 }
 
+// dflash2_gather_columns (the DFlash2 commit's context): row b's counts[b] columns from firsts[b] land at b * 8 .. in
+// order, exact words and positions; every other output column keeps its bytes. Rows of uneven widths and empty rows, as
+// a dealt verify call commits them.
+void gather_case() {
+    constexpr int kWords = 4 * 2304, kWidth = 8, kRows = 5, kPadded = 64, kColumns = 30;
+    std::vector<std::uint16_t> features(static_cast<std::size_t>(kColumns) * kWords);
+    for (std::size_t i = 0; i < features.size(); ++i) { features[i] = static_cast<std::uint16_t>((i * 2654435761U) >> 7); }
+    std::vector<std::int32_t> positions(kColumns);
+    for (int c = 0; c < kColumns; ++c) { positions[c] = 1000 + 3 * c; }
+    // counts then firsts (the commit's words, `padded` apart)
+    std::vector<std::int32_t> words(2 * kPadded, 0);
+    const int counts[kRows] = {3, 0, 8, 1, 5}, firsts[kRows] = {0, 3, 4, 20, 22};
+    for (int b = 0; b < kRows; ++b) { words[b] = counts[b], words[kPadded + b] = firsts[b]; }
+    std::uint16_t* d_features = upload(features);
+    std::int32_t* d_positions = upload(positions);
+    std::int32_t* d_words     = upload(words);
+    const std::size_t out_words = static_cast<std::size_t>(kWidth) * kRows * kWords;
+    std::vector<std::uint16_t> sentinel(out_words, 0xABCD);
+    std::vector<std::int32_t> sentinel_positions(kWidth * kRows, -7);
+    std::uint16_t* d_out         = upload(sentinel);
+    std::int32_t* d_out_position = upload(sentinel_positions);
+    ik::dflash2_gather_columns(d_features, kWords, d_positions, d_words, kPadded, kRows, kWidth, d_out, d_out_position,
+                               nullptr);
+    cuda_check(cudaDeviceSynchronize(), "gather columns");
+    const std::vector<std::uint16_t> out  = download(d_out, out_words);
+    const std::vector<std::int32_t> outp = download(d_out_position, static_cast<std::size_t>(kWidth) * kRows);
+    bool ok = true;
+    for (int b = 0; b < kRows; ++b) {
+        for (int j = 0; j < kWidth; ++j) {
+            const std::size_t to = static_cast<std::size_t>(b) * kWidth + j;
+            const bool live      = j < counts[b];
+            const std::size_t from = static_cast<std::size_t>(firsts[b] + j);
+            ok = ok && outp[to] == (live ? positions[from] : -7);
+            for (int w = 0; w < kWords; ++w) {
+                ok = ok && out[to * kWords + w] == (live ? features[from * kWords + w] : 0xABCD);
+            }
+        }
+    }
+    std::printf("dflash2_gather_columns: %s\n", ok ? "exact" : "DIFFERS");
+    check(ok, "dflash2_gather_columns: a gathered column differs or an idle column changed");
+    cudaFree(d_features), cudaFree(d_positions), cudaFree(d_words), cudaFree(d_out), cudaFree(d_out_position);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(inkling2_dspark) {
@@ -1070,6 +1113,7 @@ INFERNIX_OP_TEST(inkling2_dspark) {
     markov_case(false, true);
     markov_case(true, true);
     blocks_case();
+    gather_case();
     std::printf(g_failures == 0 ? "PASS\n" : "FAILED (%d)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

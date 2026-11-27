@@ -11,7 +11,9 @@
 #include "models/inkling2/program/program.h"
 #include "runtime/engine/kv_capacity.h"
 
+#include <filesystem>
 #include <memory>
+#include <vector>
 
 namespace infernix {
 struct DeviceContext;
@@ -46,11 +48,16 @@ struct ConstructedInkling2 {
 [[nodiscard]] bool artifact_is_inkling2(const artifact::Reader& reader);
 // True when the artifact bundles the DSpark drafter (its dspark component).
 [[nodiscard]] bool artifact_has_inkling2_drafter(const artifact::Reader& reader);
+// The DFlash2 companion artifacts of this Inkling 2 model in its folder (.infernix / .ninfer files whose dflash2
+// component targets it), sorted.
+[[nodiscard]] std::vector<std::filesystem::path> inkling2_dflash2_companions_beside(const std::filesystem::path& artifact_path,
+                                                                                   const artifact::Directory& target);
 
-// The options this slice runs (models/inkling2/program/program.h): the prefix cache, the n-gram archive, preemption and
-// next-turn prefill off, the context limit's KV reserved for every lane; --spec auto drafts with the bundled DSpark
-// drafter when `bundled_drafter` (generation, not --lossless); refuses what it cannot run.
-[[nodiscard]] EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter);
+// The options this slice runs (models/inkling2/program/program.h): the n-gram archive off; refuses what it cannot run.
+// --spec auto (generation, not --lossless) drafts with the DFlash2 companion --draft-model names, else the bundled
+// DSpark drafter when `bundled_drafter`, else the one of `dflash2_companions`.
+[[nodiscard]] EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter,
+                                                       const std::vector<std::filesystem::path>& dflash2_companions = {});
 
 // With `plan` (Engine::plan) the construction stops before any weight is read: the device plan lands in *plan and the
 // result is empty.

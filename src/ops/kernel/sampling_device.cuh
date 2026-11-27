@@ -474,18 +474,23 @@ __device__ __forceinline__ bool sampling_full(const SamplingConfig& c) {
 // w = 1 - u (half a step in from either end, at most the float below 1) and -log u as -log1p(-w), so it stays finite
 // and keeps its precision near u = 1: sampling_gumbel_score's u + 2^-25 rounds to 1 at the top 24-bit draw (noise
 // +inf), which over a whole vocabulary's 200K tokens is about one draw in 84. The largest noise, -log(-log1p(-2^-33)),
-// is about 22.9, so a token below e^-22.9 of the top token's probability is never drawn.
-__device__ __forceinline__ float sampling_full_score(float adjusted, const SamplingConfig& c, int position,
-                                                     int token) {
+// is about 22.9, so a token below e^-22.9 of the top token's probability is never drawn. The candidate selector's
+// full-vocabulary rows (candidate_selector_path) score their candidates with the same noise.
+__device__ __forceinline__ float sampling_full_noise(unsigned long long seed, int position, int token) {
     unsigned long long key = sampling_splitmix64(
-        c.seed ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) * 0xD1B54A32D192ED03ull));
+        seed ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) * 0xD1B54A32D192ED03ull));
     key = sampling_splitmix64(key ^ (static_cast<unsigned long long>(kSamplePurposeGumbel) << 21) ^
                               (static_cast<unsigned long long>(static_cast<unsigned int>(token)) *
                                0x2545F4914F6CDD1Dull));
     const float w = fminf((static_cast<float>(static_cast<unsigned int>(key >> 32)) + 0.5f) * 0x1p-32f,
                           0x1.fffffep-1f);
     const float e = -log1pf(-w); // -log u, u = 1 - w
-    return __fadd_rn(__fdiv_rn(adjusted, c.temperature), -__logf(e));
+    return -__logf(e);
+}
+
+__device__ __forceinline__ float sampling_full_score(float adjusted, const SamplingConfig& c, int position,
+                                                     int token) {
+    return __fadd_rn(__fdiv_rn(adjusted, c.temperature), sampling_full_noise(c.seed, position, token));
 }
 
 // thread-local: the Gumbel-max token over support entries 0..n-1 (idx_at(j), prob_at(j)); ties to

@@ -32,6 +32,10 @@ void linear_topk_nvfp4_launch(const Tensor& hidden, const Weight& head, std::int
 // (the 122B heads: NVFP4 through rg16_linear, per-row FP8 through linear).
 void linear_topk_logits_launch(const Tensor& logits, std::int32_t valid_rows, const LinearTopKWorkspace& workspace,
                                cudaStream_t stream);
+// logits_topk's producers: each kLogitsTopKRows-row group's top sixteen per column of FP32 logits, one warp a group
+// and column (the same candidates as linear_topk_logits_launch's).
+void logits_topk_warp_launch(const Tensor& logits, std::int32_t valid_rows, const LinearTopKWorkspace& workspace,
+                             cudaStream_t stream);
 void linear_topk_merge_launch(const LinearTopKWorkspace& workspace, Tensor& candidate_ids,
                               Tensor& candidate_scores, cudaStream_t stream);
 

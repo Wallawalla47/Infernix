@@ -358,7 +358,7 @@ std::size_t logits_topk_workspace_capacity_bytes(std::int32_t rows, std::int32_t
     const std::int32_t widest = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
     for (std::int32_t columns = 1; columns <= widest; ++columns) {
         auto scope = layout.scope();
-        (void)detail::allocate_linear_topk_workspace(layout, rows, columns, detail::kLinearTopKGroupedRows);
+        (void)detail::allocate_linear_topk_workspace(layout, rows, columns, detail::kLogitsTopKRows);
     }
     return layout.peak_bytes();
 }
@@ -386,12 +386,12 @@ void logits_topk(const Tensor& logits, std::int32_t valid_rows, Tensor& candidat
         const std::int32_t columns = std::min(detail::kLinearTopKMaxChunkColumns, total - first);
         auto scope                 = workspace.scope();
         const auto scratch =
-            detail::allocate_linear_topk_workspace(workspace, logits.ne[0], columns, detail::kLinearTopKGroupedRows);
+            detail::allocate_linear_topk_workspace(workspace, logits.ne[0], columns, detail::kLogitsTopKRows);
         require_scratch_nonoverlap(logits, candidate_ids, candidate_scores, nullptr, scratch);
         const Tensor x     = column_slice(logits, first, columns);
         Tensor out_ids     = column_slice(candidate_ids, first, columns);
         Tensor out_scores  = column_slice(candidate_scores, first, columns);
-        detail::linear_topk_logits_launch(x, valid_rows, scratch, stream);
+        detail::logits_topk_warp_launch(x, valid_rows, scratch, stream);
         detail::linear_topk_merge_launch(scratch, out_ids, out_scores, stream);
         first += columns;
     }

@@ -6,17 +6,22 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <stdexcept>
 
-// The prepare in one kernel for Qwen3.8-Flash-Next's drafter (H = 2560, at most 16 columns): the RMS
-// scale factors out of the projection, d = inv * sum_h W[row, h] * (r[h] * w[h]), so every CTA projects
+// The prepare in one kernel for Qwen3.8-Flash-Next's drafter (H = 2560, at most 16 columns) and Inkling 2's
+// (H = 2304, any call: its columns in chunks of whole rows, at most 16 columns each, one chunk per grid row): the
+// RMS scale factors out of the projection, d = inv * sum_h W[row, h] * (r[h] * w[h]), so every CTA projects
 // the raw residual times the norm weight and accumulates each column's sum of squares on the way,
 // instead of an RMSNorm kernel, a split-K projection and a reduction. A CTA owns four groups: their
 // sixteen coefficient rows (two sides x two taps) over all of H, so it also writes those groups'
 // prepared channels and finish deltas.
 namespace infernix::ops::detail {
 namespace {
-constexpr int kBlockK = 64, kWarps = 8, kThreads = kWarps * 32;
+constexpr int kBlockK = 64;
+// A CTA's warps split its 64-channel tiles evenly: H 2560's 40 over eight, H 2304's 36 over six.
+template <int Hidden>
+constexpr int kWarpsFor = Hidden == 2304 ? 6 : 8;
 // Pipeline depth per warp: three stages fit sm_120a's 99 KB of shared memory at 8 columns, two at 16.
 template <int Columns>
 constexpr int kStages = Columns <= 8 ? 3 : 2;
@@ -42,22 +47,33 @@ struct Own {
     __nv_bfloat16 base[2 * kBlockK];
 };
 
-template <int Columns>
+template <int Hidden, int Columns>
 constexpr std::size_t shared_bytes() {
-    return sizeof(Stage<Columns>) * kStages<Columns> * kWarps + sizeof(Own<Columns>) +
-           sizeof(float) * kWarps * kCtaRows * Columns + sizeof(float) * kWarps * Columns +
+    constexpr int warps = kWarpsFor<Hidden>;
+    return sizeof(Stage<Columns>) * kStages<Columns> * warps + sizeof(Own<Columns>) +
+           sizeof(float) * warps * kCtaRows * Columns + sizeof(float) * warps * Columns +
            sizeof(float) * kCtaRows * Columns + sizeof(float) * Columns;
 }
 
-// Columns: the MMA column width (8 or 16) holding the call's tokens, which are W x B <= Columns.
+// Columns: the MMA column width (8 or 16) holding a chunk's tokens. Grid row y is the call's columns
+// [y * chunk, y * chunk + chunk) (whole rows of `width`; the last chunk may hold fewer), of `tokens` in all.
 template <int Hidden, int Columns>
-__global__ __launch_bounds__(kThreads, 1) void dynamic_grouped_conv_prepare_fused_kernel(
+__global__ __launch_bounds__(kWarpsFor<Hidden> * 32, 1) void dynamic_grouped_conv_prepare_fused_kernel(
     const __nv_bfloat16* residual, const __nv_bfloat16* __restrict__ norm,
     const __nv_bfloat16* __restrict__ base, const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ prepared, __nv_bfloat16* __restrict__ finish, float eps, int tokens, int width) {
+    __nv_bfloat16* __restrict__ prepared, __nv_bfloat16* __restrict__ finish, float eps, int tokens, int width,
+    int chunk) {
     constexpr int kGroups = Hidden / 16, kTiles = Hidden / kBlockK, kBlocks = Columns / 8;
     constexpr int kInputVectors = Columns * (kBlockK / 8) / 32; // per lane and tile
+    constexpr int kWarps = kWarpsFor<Hidden>, kThreads = kWarps * 32;
     static_assert(kTiles % kWarps == 0 && kInputVectors >= 1);
+    {
+        const int first = static_cast<int>(blockIdx.y) * chunk;
+        tokens          = min(chunk, tokens - first);
+        residual += static_cast<std::int64_t>(first) * Hidden;
+        prepared += static_cast<std::int64_t>(first) * Hidden;
+        finish += static_cast<std::int64_t>(first) * 2 * kGroups;
+    }
     extern __shared__ __align__(16) unsigned char smem[];
     auto* stages    = reinterpret_cast<Stage<Columns>*>(smem);
     auto* mine      = reinterpret_cast<Own<Columns>*>(stages + kStages<Columns> * kWarps);
@@ -199,15 +215,16 @@ __global__ __launch_bounds__(kThreads, 1) void dynamic_grouped_conv_prepare_fuse
         for (int w = 0; w < kWarps; ++w) { sum += squares[w * Columns + tid]; }
         inverse[tid] = rsqrtf(sum / static_cast<float>(Hidden) + eps);
     }
-    if (tid < kCtaRows * Columns) {
+    // Strided: six warps (H 2304) hold fewer threads than the 16 x 16 entries of a 16-column call.
+    for (int i = tid; i < kCtaRows * Columns; i += kThreads) {
         float sum = 0;
-        for (int w = 0; w < kWarps; ++w) { sum += partial[w * kCtaRows * Columns + tid]; }
-        projected[tid] = sum;
+        for (int w = 0; w < kWarps; ++w) { sum += partial[w * kCtaRows * Columns + i]; }
+        projected[i] = sum;
     }
     __syncthreads();
     // d[c][g][t] = inv[t] * projected[c * 4 + g][t]; coefficients 2 and 3 (side 1) are the finish deltas.
-    if (tid < 2 * kGroupsPerCta * Columns) {
-        const int column = tid % Columns, g = tid / Columns % kGroupsPerCta, tap = tid / Columns / kGroupsPerCta;
+    for (int i = tid; i < 2 * kGroupsPerCta * Columns; i += kThreads) {
+        const int column = i % Columns, g = i / Columns % kGroupsPerCta, tap = i / Columns / kGroupsPerCta;
         if (column < tokens) {
             finish[(column * 2 + tap) * kGroups + group0 + g] =
                 __float2bfloat16_rn(inverse[column] * projected[((2 + tap) * kGroupsPerCta + g) * Columns + column]);
@@ -234,10 +251,11 @@ __global__ __launch_bounds__(kThreads, 1) void dynamic_grouped_conv_prepare_fuse
     }
 }
 
+// `chunk`: the columns a grid row takes (whole rows of the call's width, at most Columns).
 template <int Hidden, int Columns>
 void launch(const Tensor& residual, const Tensor& norm, float eps, const Tensor& base, const Weight& weight,
-            Tensor& prepared, Tensor& finish, cudaStream_t stream) {
-    constexpr std::size_t bytes = shared_bytes<Columns>();
+            Tensor& prepared, Tensor& finish, int chunk, cudaStream_t stream) {
+    constexpr std::size_t bytes = shared_bytes<Hidden, Columns>();
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(dynamic_grouped_conv_prepare_fused_kernel<Hidden, Columns>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
@@ -245,7 +263,9 @@ void launch(const Tensor& residual, const Tensor& norm, float eps, const Tensor&
     }();
     (void)configured;
     const int tokens = residual.ne[1] * residual.ne[2];
-    CUDA_CHECK(pdl::launch_consumer({dim3(Hidden / 16 / kGroupsPerCta), dim3(kThreads), bytes, stream},
+    const int chunks = (tokens + chunk - 1) / chunk;
+    CUDA_CHECK(pdl::launch_consumer({dim3(Hidden / 16 / kGroupsPerCta, chunks), dim3(kWarpsFor<Hidden> * 32), bytes,
+                                     stream},
                                     dynamic_grouped_conv_prepare_fused_kernel<Hidden, Columns>,
                                     static_cast<const __nv_bfloat16*>(residual.data),
                                     static_cast<const __nv_bfloat16*>(norm.data),
@@ -253,26 +273,47 @@ void launch(const Tensor& residual, const Tensor& norm, float eps, const Tensor&
                                     static_cast<const __nv_bfloat16*>(weight.qdata),
                                     static_cast<__nv_bfloat16*>(prepared.data),
                                     static_cast<__nv_bfloat16*>(finish.data), eps, tokens,
-                                    static_cast<int>(residual.ne[1])));
+                                    static_cast<int>(residual.ne[1]), chunk));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace
 
 bool bf16_dynamic_grouped_conv_prepare_fused_supported(int hidden, int tokens) {
-    return hidden == 2560 && tokens <= 16;
+    return (hidden == 2560 && tokens <= 16) || hidden == 2304;
 }
 
 void bf16_dynamic_grouped_conv_prepare_fused_launch(const Tensor& residual, const Tensor& norm, float eps,
                                                     const Tensor& base, const Weight& weight, Tensor& prepared,
                                                     Tensor& finish, cudaStream_t stream) {
-    const int tokens = residual.ne[1] * residual.ne[2];
+    const int width = residual.ne[1], tokens = width * residual.ne[2];
+    if (residual.ne[0] == 2304) {
+        // A chunk of whole rows: as many as 8 columns hold (one 8-column MMA block, the most CTAs), unless those
+        // chunks' CTAs (one an SM: ~62 KB of shared memory) would take a second wave, then as many as 16 columns
+        // hold (at W 8 and five rows: 10.9 us in two waves against 6.8 us for up to four, 2026-11-27).
+        static const int sms = [] {
+            int device = 0, count = 0;
+            CUDA_CHECK(cudaGetDevice(&device));
+            CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+            return count;
+        }();
+        int rows = std::max(1, 8 / width);
+        if (width <= 8 && (residual.ne[2] + rows - 1) / rows * (2304 / 64) > sms) { rows = 16 / width; }
+        const int chunk = rows * width;
+        if (chunk <= 8) {
+            launch<2304, 8>(residual, norm, eps, base, weight, prepared, finish, chunk, stream);
+        } else {
+            launch<2304, 16>(residual, norm, eps, base, weight, prepared, finish, chunk, stream);
+        }
+        return;
+    }
     if (residual.ne[0] != 2560 || tokens > 16) {
-        throw std::logic_error("dynamic grouped conv prepare: the fused route takes H 2560 and at most 16 columns");
+        throw std::logic_error("dynamic grouped conv prepare: the fused route takes H 2560 and at most 16 columns, or "
+                               "H 2304");
     }
     if (tokens <= 8) {
-        launch<2560, 8>(residual, norm, eps, base, weight, prepared, finish, stream);
+        launch<2560, 8>(residual, norm, eps, base, weight, prepared, finish, tokens, stream);
     } else {
-        launch<2560, 16>(residual, norm, eps, base, weight, prepared, finish, stream);
+        launch<2560, 16>(residual, norm, eps, base, weight, prepared, finish, tokens, stream);
     }
 }
 } // namespace infernix::ops::detail

@@ -565,6 +565,8 @@ INFERNIX_OP_TEST(logits_topk) {
         for (const int columns : {1, 2, 7, 16, 32}) { failures += run_logits_topk(1000, 777, columns); }
         for (const int columns : {1, 14, 129}) { failures += run_logits_topk(kShortRows, kShortRows, columns); }
         for (const int columns : {1, 7, 56}) { failures += run_logits_topk(kFullRows, kValidRows, columns); }
+        // Inkling 2's DFlash2 shortlist (65,536 rows): one row's 7 drafts and four rows' 28.
+        for (const int columns : {7, 28}) { failures += run_logits_topk(65536, 65536, columns); }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " logits_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

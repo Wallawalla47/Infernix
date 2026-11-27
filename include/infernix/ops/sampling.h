@@ -59,9 +59,10 @@ struct SamplingConfig {
     // A positive-temperature row drawn from the whole token domain (candidates JM-40): the token maximizing
     // adjusted_v / temperature + g_v, g_v the gumbel_max noise (keyed by seed, the produced token's position and v),
     // whatever gumbel_max says; top_k, top_p and min_p do not apply, so a caller sets it only when all three are
-    // unlimited. Only sample() reads it, and only on a call that passes full_vocabulary_rows: speculative acceptance
-    // keeps its 20-candidate supports, so only a family that verifies drafts by sampling each column with sample()
-    // sets it.
+    // unlimited. sample() reads it only on a call that passes full_vocabulary_rows: speculative acceptance keeps its
+    // 20-candidate supports, so only a family that verifies drafts by sampling each column with sample() sets it.
+    // candidate_selector_path also reads it on a call that couples its drafts with sample()'s draws (couple_draws,
+    // candidate_selector.h).
     bool full_vocabulary = false;
     // A row whose reasoning is open at the call's first position (the frontend's thinking not yet closed):
     // reasoning_close is the close token and reasoning_ends the end-of-turn tokens (-1: none), which take no

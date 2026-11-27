@@ -4,9 +4,11 @@
 // planning and Program execution): Weights for ops::linear, raw device pointers for the visit-chain, attention and
 // expert Ops. Built once from the frozen Model; borrows its device memory.
 
+#include "core/tensor.h"
 #include "core/weight.h"
 #include "infernix/ops/inkling2_attention.h"
 #include "infernix/ops/inkling2_visit.h"
+#include "infernix/ops/rope.h"
 #include "infernix/ops/w4a4_sparse_moe.h"
 #include "models/ablate/parameters.h"
 #include "models/inkling2/execution/lora_parameters.h"
@@ -76,6 +78,28 @@ struct DSparkOperands {
     const std::uint16_t* fold_bias              = nullptr; // BF16 [V]
 };
 
+// The DFlash2 drafter's operands (bound with --spec dflash2 --draft-model), in the fused DFlash2 Ops' types
+// (execution/dflash2.cpp): Q8 projections but the convolutions' kernel projections and the selector's (BF16).
+struct DFlash2LayerOperands {
+    Tensor input_norm, post_attention_norm;   // BF16 [H]
+    Weight query_key_value;                   // Q8 [q + kv + kv, H] (ops::attn_input_proj's parent)
+    Weight context_key, context_value;        // Q8 [kv, H]: the K/V words, shared
+    Tensor query_norm, key_norm;              // BF16 [d]
+    Weight output;                            // Q8 [H, q]
+    Weight gate_up, down;                     // Q8 [2I, H] (gate rows, then up), [H, I]
+    Tensor attention_base, mlp_base;          // BF16 [H, taps, sides]
+    Weight attention_projection, mlp_projection; // BF16 [2 taps H / group, H]
+};
+
+struct DFlash2Operands {
+    ops::PreparedRope rope;    // full-head 1-D, the drafter's theta
+    Weight feature_projection; // Q8 [H, features * H]
+    Tensor context_norm, final_norm;
+    std::vector<DFlash2LayerOperands> layers;
+    Weight selector_hidden;                          // BF16 [rank, H]
+    Tensor predecessor_codebook, successor_codebook; // BF16 [rank, V]
+};
+
 // The vision tower's operands (bound with --vision): BF16 vectors [H] unless noted.
 struct VisionLayerOperands {
     const std::uint16_t *attention_norm = nullptr, *attention_norm_bias = nullptr;
@@ -108,8 +132,9 @@ struct Parameters {
     const float* output_query           = nullptr;
     Weight head;                                   // BF16 [V][H], FP32 logits
     std::vector<LayerOperands> layers;
-    std::optional<DSparkOperands> dspark; // --spec dspark
-    std::optional<VisionOperands> vision; // --vision
+    std::optional<DSparkOperands> dspark;   // --spec dspark
+    std::optional<DFlash2Operands> dflash2; // --spec dflash2
+    std::optional<VisionOperands> vision;   // --vision
     std::optional<LoraParameters> lora;     // --lora (docs/lora.md): the adapter's device factors
     std::optional<AblateParameters> ablate; // --ablate (docs/ablate.md): the direction's device copy, each layer's cuts
 

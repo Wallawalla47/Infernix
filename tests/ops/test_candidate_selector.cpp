@@ -28,6 +28,11 @@ constexpr std::int32_t kRank         = 256;
 constexpr std::int32_t kCodebookRows = 248320;
 constexpr std::int32_t kTokenDomain  = 248077;
 constexpr std::int32_t kMaxBatch     = 8;
+// The case under test: the codebooks' vocabulary (Qwen3.8's 248,320 rows or Inkling 2's 200,058), the anchors' first
+// id, and the edge softcap (0: none; > 0: edge = softcap tanh(edge / softcap), a softcap after the correction).
+std::int32_t g_codebook_rows = kCodebookRows;
+std::int32_t g_anchor_base   = 220000;
+float g_softcap              = 0.0F;
 
 constexpr PointwiseCriterion kProbabilityCriterion{/*absolute=*/2.0e-6,
                                                    /*relative=*/2.0e-5};
@@ -115,7 +120,7 @@ std::vector<std::uint16_t> make_projected_hidden() {
 std::vector<std::int32_t> make_anchors() {
     std::vector<std::int32_t> result(kMaxBatch);
     for (std::int32_t batch = 0; batch < kMaxBatch; ++batch) {
-        result[batch] = 220000 + batch * 101;
+        result[batch] = g_anchor_base + batch * 101;
     }
     return result;
 }
@@ -172,6 +177,7 @@ std::vector<double> build_lattice(const std::vector<std::int32_t>& candidate_ids
                             static_cast<double>(bf16_to_f32(projected_hidden[hidden_base + rank])) *
                             static_cast<double>(successor_value(successor, rank));
                     }
+                    if (g_softcap > 0.0F) { edge = g_softcap * std::tanh(edge / g_softcap); }
                     lattice[lattice_offset(batch, step, predecessor_rank, candidate)] = edge;
                 }
             }
@@ -441,9 +447,9 @@ int run(bool ties = false, bool dependent = false) {
     DeviceBuffer anchor_device    = to_device(anchors);
     DeviceBuffer position_device  = to_device(base_positions);
     DeviceBuffer config_device    = to_device(configs);
-    DeviceBuffer predecessor_device(static_cast<std::size_t>(kRank) * kCodebookRows *
+    DeviceBuffer predecessor_device(static_cast<std::size_t>(kRank) * g_codebook_rows *
                                     sizeof(std::uint16_t));
-    DeviceBuffer successor_device(static_cast<std::size_t>(kRank) * kCodebookRows *
+    DeviceBuffer successor_device(static_cast<std::size_t>(kRank) * g_codebook_rows *
                                   sizeof(std::uint16_t));
     predecessor_device.fill();
     successor_device.fill();
@@ -451,8 +457,8 @@ int run(bool ties = false, bool dependent = false) {
     populate_codebook(predecessor_device, tokens, true);
     populate_codebook(successor_device, tokens, false);
 
-    Tensor predecessor(predecessor_device.p, DType::BF16, {kRank, kCodebookRows});
-    Tensor successor(successor_device.p, DType::BF16, {kRank, kCodebookRows});
+    Tensor predecessor(predecessor_device.p, DType::BF16, {kRank, g_codebook_rows});
+    Tensor successor(successor_device.p, DType::BF16, {kRank, g_codebook_rows});
 
     int failures = 0;
     for (int batch_size = 1; batch_size <= kMaxBatch; ++batch_size) {
@@ -480,7 +486,7 @@ int run(bool ties = false, bool dependent = false) {
             ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor,
                                          positions,
                                          static_cast<const ops::SamplingConfig*>(config_device.p),
-                                         drafts, q, &confidence, workspace, stream);
+                                         drafts, q, &confidence, workspace, stream, g_softcap);
         };
         launch(nullptr);
         cuda_synchronize();
@@ -607,7 +613,7 @@ int run(bool ties = false, bool dependent = false) {
             tq(dq.data(), DType::FP32, {kCandidates, kSteps, 3});
         ops::candidate_selector_path(ti, tu, th, ta, predecessor, successor, tp,
                                      static_cast<const ops::SamplingConfig*>(dc.p), td, tq,
-                                     nullptr, workspace, nullptr);
+                                     nullptr, workspace, nullptr, g_softcap);
         cuda_synchronize();
         const auto actual_d = from_device<int>(dd.data(), 3 * kSteps);
         const auto actual_q = from_device<float>(dq.data(), 3 * kSteps * kCandidates);
@@ -651,6 +657,24 @@ INFERNIX_OP_TEST(candidate_selector) {
             failures += run(false, true);
             kSteps = 15;
             failures += run(false, true);
+        }
+        {
+            // A softcap after the correction, on Inkling 2's vocabulary (incoai's Inkling 2 drafter: 30): a cap of 0.5
+            // bends the fixture's edges (|edge| < 0.5) well away from the identity, 30 is the trained one.
+            g_codebook_rows = 200058;
+            g_anchor_base   = 190000;
+            for (const float softcap : {0.5F, 30.0F}) {
+                g_softcap = softcap;
+                for (const int steps : {1, 4, 5, 7, 15}) {
+                    kSteps = steps;
+                    failures += run();
+                }
+            }
+            g_softcap       = 0.0F;
+            kSteps          = 7;
+            failures += run(); // the vocabulary alone
+            g_codebook_rows = kCodebookRows;
+            g_anchor_base   = 220000;
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " candidate_selector_path\n";
         return failures == 0 ? 0 : 1;

@@ -71,8 +71,11 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model) {
     add("--kv-dtype", "int8");
 
     // Speculative decoding: the Engine picks the drafter measured fastest for the artifact.
-    const ScannedDrafter* drafter = model.accepts_draft_model ? best_drafter(scan, model) : nullptr;
-    // Inkling 2: auto drafts with DSpark when the artifact bundles it and decodes plainly when not.
+    // Inkling 2's DFlash2 companion only for an artifact without the bundled DSpark drafter, which won the agentic replay
+    // against it (2026-11-26, docs/inkling2-mini.md); the user may still choose it (--draft-model).
+    const ScannedDrafter* drafter =
+        model.accepts_draft_model && !(inkling && model.has_dspark) ? best_drafter(scan, model) : nullptr;
+    // Inkling 2: auto drafts with DSpark when the artifact bundles it, else with a companion, else plainly.
     if (has_drafter_component || drafter != nullptr || inkling) {
         add("--spec", "auto");
         add("--draft-tokens", "auto");

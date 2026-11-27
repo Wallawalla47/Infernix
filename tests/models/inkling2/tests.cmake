@@ -66,6 +66,16 @@ infernix_add_test(infernix_inkling2_engine_real_test
 set_tests_properties(infernix_inkling2_engine_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
   LABELS "gpu;real" TIMEOUT 1800)
 
+# The DFlash2 companion drafter (--spec dflash2 --draft-model): its drafts and confidences against an FP64 oracle of the
+# drafter's mathematics (synthetic context, the text head and the --lm-head-draft shortlist), then through the Engine
+# speculative tokens equal plain decoding's at C = 1, 2, 4 and 8 (greedy and sampled, graphs and eager, a prefix-cache
+# resume). Skips without INFERNIX_INKLING2_ARTIFACT and INFERNIX_INKLING2_DFLASH2.
+infernix_add_test(infernix_inkling2_dflash2_real_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime infernix_model_loading infernix_ops infernix_core)
+set_tests_properties(infernix_inkling2_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+  LABELS "gpu;real" TIMEOUT 1800)
+
 # The prefix cache on a real artifact: a resumed request's output equals a cold run's bit for bit (every KV format,
 # chunks of 100, a decoded prefix, DSpark, a Host-tier restore); skips without INFERNIX_INKLING2_ARTIFACT.
 infernix_add_test(infernix_inkling2_prefix_cache_real_test

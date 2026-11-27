@@ -205,8 +205,17 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.purpose != EnginePurpose::Generation && options.purpose != EnginePurpose::CausalScoring) {
             throw ArtifactError("unknown loading purpose");
         }
-        if (options.speculative != SpeculativeBackend::None && options.speculative != SpeculativeBackend::DSpark) {
-            throw ArtifactError("Inkling 2's drafter is DSpark (--spec dspark)");
+        if (options.speculative != SpeculativeBackend::None && options.speculative != SpeculativeBackend::DSpark &&
+            options.speculative != SpeculativeBackend::DFlash2) {
+            throw ArtifactError("Inkling 2 drafts with DSpark (--spec dspark) or a DFlash2 companion (--spec dflash2 "
+                                "--draft-model FILE)");
+        }
+        // The DFlash2 drafter is the companion's (plan_load parses it); DSpark stays unbound beside it.
+        if (options.speculative == SpeculativeBackend::DFlash2 && options.draft_model.empty()) {
+            throw ArtifactError("--spec dflash2 needs the drafter's companion artifact (--draft-model FILE)");
+        }
+        if (options.speculative != SpeculativeBackend::DFlash2 && !options.draft_model.empty()) {
+            throw ArtifactError("--draft-model is the DFlash2 drafter's companion (--spec dflash2)");
         }
         Config out;
         out.text = text(directory.component("text").config);
@@ -236,6 +245,114 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         throw;
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Inkling2Loop config: ") + error.what());
+    }
+}
+
+DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target) {
+    try {
+        if (!companion.companion || companion.components.size() != 1 || !companion.components.contains("dflash2")) {
+            throw ArtifactError("the draft model must be a DFlash2 companion artifact (one dflash2 component, no text)");
+        }
+        const Json& value = companion.component("dflash2").config;
+        require_members(value,
+                        {"architectures", "model_type", "hidden_size", "intermediate_size", "num_attention_heads",
+                         "num_key_value_heads", "head_dim", "num_hidden_layers", "max_position_embeddings",
+                         "rms_norm_eps", "rope_parameters", "layer_types", "sliding_window", "dflash_config",
+                         "target_config"},
+                        {}, "DFlash2 config");
+        if (value.at("architectures") != Json::array({"DFlash2DraftModel"}) || value.at("model_type") != "qwen3") {
+            throw ArtifactError("the draft model is not a DFlash2DraftModel");
+        }
+        // The target it was converted for (tools/convert/inkling2_loop.py DFLASH2_TARGET_FIELDS).
+        const Json& t = value.at("target_config");
+        require_members(t, {"architectures", "hidden_size", "vocab_size", "num_hidden_layers", "visits"}, {},
+                        "DFlash2 target");
+        if (t.at("architectures") != Json::array({"Inkling2LoopForCausalLM"}) ||
+            dimension(t, "hidden_size") != target.hidden_size || dimension(t, "vocab_size") != target.vocab_size ||
+            dimension(t, "num_hidden_layers") != target.num_hidden_layers || dimension(t, "visits") != target.visits() ||
+            dimension(value, "hidden_size") != target.hidden_size) {
+            throw ArtifactError("the DFlash2 drafter was converted for another target (" + t.dump() + ")");
+        }
+        DFlash2Config out;
+        out.layers       = dimension(value, "num_hidden_layers");
+        out.heads        = dimension(value, "num_attention_heads");
+        out.kv_heads     = dimension(value, "num_key_value_heads");
+        out.head_dim     = dimension(value, "head_dim");
+        out.intermediate = dimension(value, "intermediate_size");
+        out.window       = dimension(value, "sliding_window");
+        out.rms_norm_eps = positive_float(value, "rms_norm_eps");
+        require_members(value.at("rope_parameters"), {"rope_theta"}, {}, "DFlash2 RoPE");
+        out.rope_theta = positive_float(value.at("rope_parameters"), "rope_theta");
+        for (const AttentionKind kind : layer_types(value.at("layer_types"), out.layers, "dflash2")) {
+            if (kind != AttentionKind::Sliding) { throw ArtifactError("the DFlash2 drafter's layers are all sliding"); }
+        }
+        const Json& d = value.at("dflash_config");
+        require_members(d,
+                        {"target_layer_ids", "mask_token_id", "block_size", "conv_kernel_size", "conv_group_size",
+                         "selector_rank", "selector_top_k", "final_logit_softcapping", "selector_softcap_mode"},
+                        {}, "DFlash2 dflash_config");
+        const Json& taps = d.at("target_layer_ids");
+        if (!taps.is_array() || taps.size() < 2) { throw ArtifactError("DFlash2 needs its feature visits"); }
+        for (const Json& tap : taps) {
+            const std::uint32_t visit = integer(tap, "target_layer_ids", false);
+            if (!out.target_layer_ids.empty() && visit <= out.target_layer_ids.back()) {
+                throw ArtifactError("DFlash2 target_layer_ids must ascend");
+            }
+            out.target_layer_ids.push_back(visit);
+        }
+        if (out.target_layer_ids.back() != target.visits()) {
+            throw ArtifactError("DFlash2 target_layer_ids must end at the final state (visit " +
+                                std::to_string(target.visits()) + ")");
+        }
+        out.mask_token_id  = integer(d.at("mask_token_id"), "mask_token_id", false);
+        out.block_size     = dimension(d, "block_size");
+        out.conv_kernel    = dimension(d, "conv_kernel_size");
+        out.conv_group     = dimension(d, "conv_group_size");
+        out.selector_rank  = dimension(d, "selector_rank");
+        out.selector_top_k = dimension(d, "selector_top_k");
+        if (!d.at("final_logit_softcapping").is_number()) { throw ArtifactError("DFlash2 softcap must be a number"); }
+        out.softcap = d.at("final_logit_softcapping").get<float>();
+        if (!std::isfinite(out.softcap) || out.softcap < 0) { throw ArtifactError("DFlash2 softcap must be >= 0"); }
+        const Json& mode = d.at("selector_softcap_mode");
+        if (mode != "before_correction" && mode != "after_correction") {
+            throw ArtifactError("DFlash2 selector_softcap_mode must be before_correction or after_correction");
+        }
+        out.softcap_after_correction = mode == "after_correction";
+        if (out.mask_token_id >= target.vocab_size || out.heads % out.kv_heads || out.head_dim % 2 ||
+            out.block_size < 2 || target.hidden_size % out.conv_group) {
+            throw ArtifactError("the DFlash2 config does not fit this Inkling 2 model");
+        }
+        return out;
+    } catch (const ArtifactError&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw ArtifactError(std::string("Inkling 2 DFlash2 config: ") + error.what());
+    }
+}
+
+bool dflash2_companion_of(const artifact::Directory& companion, const artifact::Directory& target) {
+    try {
+        (void)parse_dflash2_config(companion, text(target.component("text").config));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void require_dflash2_kernel_geometry(const DFlash2Config& d, const TextConfig& text) {
+    const bool ok = text.hidden_size == 2304 && d.layers == 5 && d.heads == 32 && d.kv_heads == 8 &&
+                    d.head_dim == 128 && d.intermediate == 6912 && d.window == 2048 && d.block_size == 8 &&
+                    d.conv_kernel == 2 && d.conv_group == 16 && d.selector_rank == 256 && d.selector_top_k == 16 &&
+                    d.rms_norm_eps == 1e-6F && d.rope_theta > 1.0F &&
+                    d.target_layer_ids.size() == static_cast<std::size_t>(ops::inkling2::kDSparkFeatures) &&
+                    // The selector applies a softcap after its correction (candidate_selector_path's edge_softcap);
+                    // one on the candidates' logits before it is not built.
+                    (d.softcap == 0.0F || d.softcap_after_correction);
+    if (!ok) {
+        throw ArtifactError("the DFlash2 Ops are registered for Inkling 2 Mini's drafter (5 sliding layers; 32 query "
+                            "and 8 KV heads of 128; MLP 6912; window 2048; block 8; two conv taps in groups of 16; "
+                            "top 16 of rank 256; eps 1e-6; 4 features; a selector softcap after its correction); "
+                            "this companion states another");
     }
 }
 

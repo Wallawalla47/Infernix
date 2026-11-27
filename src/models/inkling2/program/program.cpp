@@ -9,6 +9,7 @@
 #include "infernix/ops/inkling2_attention.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/token_constraint.h"
+#include "models/inkling2/execution/dflash2.h"
 #include "models/inkling2/execution/dspark.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/lossless.h"
@@ -36,10 +37,12 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace infernix::models::inkling2 {
 namespace detail {
@@ -263,12 +266,12 @@ constexpr std::int32_t kMaxSampleRows = kMaximumConcurrency * ops::inkling2::kDS
 constexpr std::int32_t kRowsGraphs = 42;
 
 // Constrained rows' token masks (constrained-decoding.md §7.1): one packed vocabulary mask a position. Slot r is a plain
-// round's row r, slot i a DSpark verify call's column i (a row's columns in a round of several rows), so the slots
-// cover both: a block a lane with the drafter, a row a lane without.
+// round's row r, slot i a drafting round's verify column i (a row's columns in a round of several rows), so the slots
+// cover both: a block a lane with a drafter (DSpark or DFlash2, both blocks of 8), a row a lane without.
 std::int32_t mask_slots(const ProgramOptions& options) {
-    return options.dspark ? std::max<std::int32_t>(static_cast<std::int32_t>(options.max_concurrency), 1) *
-                                ops::inkling2::kDSparkBlock
-                          : kMaximumConcurrency;
+    return options.dspark || options.dflash2
+               ? std::max<std::int32_t>(static_cast<std::int32_t>(options.max_concurrency), 1) * ops::inkling2::kDSparkBlock
+               : kMaximumConcurrency;
 }
 std::uint64_t mask_words(std::uint64_t vocab) { return (vocab + 31) / 32; }
 // Device and pinned bytes of the masks (generation only: scoring samples nothing).
@@ -297,6 +300,34 @@ ConstraintWords constraint_words(std::uint32_t lanes) {
 }
 std::uint64_t constraint_bytes(const ProgramOptions& options) {
     return options.causal_scoring ? 0 : align_256(4 * constraint_words(options.max_concurrency).total);
+}
+
+// DFlash2's one-row costs at a context, in plain one-row rounds there: calibrated_draft_length's verify (a verify
+// call's fixed cost beyond a plain round), per_draft and proposal.
+struct ContextCost {
+    double context = 0, verify = 0, per_draft = 0, proposal = 0;
+};
+// Anchors in ascending context (2026-11-27, served, one request, --lm-head-draft, INT8 KV; docs/maintainer/dflash.md):
+// to 4,096 tokens the fixed costs (a verified draft 0.12, the proposal 0.16), which beat the costs fitted there
+// (0.215, 0.1062, 0.107) on short prompts; at ~26K and ~122K the costs fitted to wall round times at fixed lengths
+// 1-7 against plain rounds (a verify column attends over the whole context, so a draft costs more there).
+constexpr std::array<ContextCost, 3> kDFlash2ContextCosts{{
+    {4096, 0.0, 0.12, 0.16},
+    {25856, 0.203, 0.1290, 0.098},
+    {122486, 0.183, 0.1556, 0.071},
+}};
+// The costs at a lane's context: linear in log2 of the context between the anchors, the end anchors beyond them.
+ContextCost dflash2_cost(std::uint32_t processed) noexcept {
+    const auto& a  = kDFlash2ContextCosts;
+    const double x = std::log2(std::max(1.0, static_cast<double>(processed)));
+    if (x <= std::log2(a.front().context)) { return a.front(); }
+    if (x >= std::log2(a.back().context)) { return a.back(); }
+    std::size_t i = 1;
+    while (std::log2(a[i].context) < x) { ++i; }
+    const double x0 = std::log2(a[i - 1].context), x1 = std::log2(a[i].context), f = (x - x0) / (x1 - x0);
+    const auto mix  = [&](double ContextCost::*m) { return a[i - 1].*m + f * (a[i].*m - a[i - 1].*m); };
+    return {static_cast<double>(processed), mix(&ContextCost::verify), mix(&ContextCost::per_draft),
+            mix(&ContextCost::proposal)};
 }
 
 } // namespace
@@ -336,6 +367,8 @@ struct Lane {
     std::uint64_t rates_plain = 0; // its rounds of several rows the measured rates left plain (dspark_rows_round)
     double draft_ms = 0, gap_ms = 0, verify_ms = 0; // device-side sums over the rounds (CUDA events)
     std::array<std::uint64_t, ops::inkling2::kMarkovSteps> accepted_at{}; // rounds accepting draft i
+    // The drafts the calibration observed and those accepted, by probability decile (report_rounds, Debug).
+    std::array<std::uint32_t, runtime::speculative::DraftCalibration::kBins> decile_verified{}, decile_accepted{};
     // The prefix cache: whether the request reuses and publishes, its keys (a block past the prompt's full blocks under
     // `salt`, a decode-route key only resumes ask for: pause_keys), the blocks its row maps from the cache (path, root
     // first: pinned for the lane), the taps still to take, the snapshot frontiers on its path, what it published
@@ -494,6 +527,16 @@ public:
             drafter_ = std::make_unique<Drafter>(p_, forward_, static_cast<std::int32_t>(lanes_.size()), o_.max_context,
                                                  forward_capacity(o_), full);
         }
+        if (o_.dflash2 && !o_.causal_scoring) {
+            if (o_.dspark || !p_.dflash2) {
+                throw std::invalid_argument("Inkling 2: --spec dflash2 needs the companion drafter's parameters alone");
+            }
+            if (o_.draft_tokens < 1 || o_.draft_tokens > static_cast<std::uint32_t>(DFlash2Drafter::kDrafts)) {
+                throw std::invalid_argument("Inkling 2: DFlash2 drafts 1-7 tokens a round");
+            }
+            dflash2_ = std::make_unique<DFlash2Drafter>(p_, forward_, static_cast<std::int32_t>(lanes_.size()),
+                                                        o_.max_context);
+        }
         if (o_.vision) {
             if (!p_.vision || !parameters.model.config().vision) {
                 throw std::invalid_argument("Inkling 2: --vision needs the tower's parameters");
@@ -504,7 +547,7 @@ public:
                                                     host ? &*host : nullptr, device_.transfer_stream);
         }
         if (o_.prefix_cache && !o_.causal_scoring) {
-            // A snapshot's image: the lane's state image and, with DSpark, the drafter's sliding rings.
+            // A snapshot's image: the lane's state image and the drafter's rings (DSpark's sliding ones, DFlash2's).
             prefix::PrefixCacheConfig config;
             config.taps     = {.max_new_taps   = o_.prefix_max_new_taps,
                                .ladder_tokens  = o_.prefix_ladder_tokens,
@@ -530,6 +573,12 @@ public:
             }
             if (drafter_) {
                 for (const DSparkStatePart& part : drafter_->snapshot_parts()) {
+                    const std::size_t bytes = static_cast<std::size_t>(part.lane_words) * 2;
+                    images.parts.push_back({reinterpret_cast<std::byte*>(part.base), bytes, bytes});
+                }
+            }
+            if (dflash2_) { // its rings: every layer's K and V of the lane's last window
+                for (const DSparkStatePart& part : dflash2_->snapshot_parts()) {
                     const std::size_t bytes = static_cast<std::size_t>(part.lane_words) * 2;
                     images.parts.push_back({reinterpret_cast<std::byte*>(part.base), bytes, bytes});
                 }
@@ -787,11 +836,13 @@ public:
     }
 
 private:
-    // The positions a unit of the lane may write past its frontier: a DSpark round's block rows (F .. F + 7, the verify
-    // call's columns among them), else one.
+    // The positions a unit of the lane may write past its frontier: a drafting round's block rows (F .. F + 7, the
+    // verify call's columns among them), else one.
     [[nodiscard]] std::uint32_t round_positions() const noexcept {
-        return drafter_ ? static_cast<std::uint32_t>(ops::inkling2::kDSparkBlock) : 1U;
+        return drafting() ? static_cast<std::uint32_t>(ops::inkling2::kDSparkBlock) : 1U;
     }
+    // A drafter is bound: DSpark or a DFlash2 companion.
+    [[nodiscard]] bool drafting() const noexcept { return drafter_ || dflash2_; }
     // The lane's block-table entries that positions [0, end) need (no more than its row).
     [[nodiscard]] std::uint32_t pages_through(std::uint64_t end) const noexcept {
         const std::uint64_t pages = (end + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit;
@@ -1207,6 +1258,7 @@ public:
                 run_forward(static_cast<std::int32_t>(width) - 1, 0);
             }
             if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(width), device_.stream); } // its context rows
+            if (dflash2_) { dflash2_->context(0, static_cast<std::int32_t>(width), device_.stream); }
         }
         lane.processed = end;
         publish_prefill(index);
@@ -1385,6 +1437,11 @@ public:
             }
         });
         if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(call.tokens.size()), device_.stream); }
+        if (dflash2_) {
+            for (const Unit& u : units) {
+                dflash2_->context(static_cast<std::int32_t>(u.column), static_cast<std::int32_t>(u.chunk), device_.stream);
+            }
+        }
         PrefillGroupProgress out;
         std::vector<std::int32_t> heads;
         for (std::uint32_t i = 0; i < units.size(); ++i) {
@@ -1482,6 +1539,7 @@ public:
             run_forward(static_cast<std::int32_t>(chunk) - 1, last ? 1 : 0,
                         [&] { overlay_images(lane.images, lane.processed, chunk); });
             if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(chunk), device_.stream); } // its context rows
+            if (dflash2_) { dflash2_->context(0, static_cast<std::int32_t>(chunk), device_.stream); }
         }
         if (timed) { CUDA_CHECK(cudaEventRecord(events[1], device_.stream)); }
         lane.processed += chunk;
@@ -1537,7 +1595,7 @@ public:
             }
             drafted = true;
         }
-        if (drafter_ && (sequences.size() == 1 || drafted)) { // a plain round of drafting rows
+        if (drafting() && (sequences.size() == 1 || drafted)) { // a plain round of drafting rows
             for (const SequenceHandle& s : sequences) { ++lanes_[lane_of(s)].fallback; }
         }
         std::vector<std::uint32_t> rows;
@@ -1577,7 +1635,16 @@ public:
             decode_graph(static_cast<std::int32_t>(order.back()) + 1, columns, rows, logit_rows, masks,
                          timed ? &device_ms : nullptr);
         } else {
-            run_decode_call(columns);
+            // A lane's columns are consecutive (its pending input and forced tokens): DFlash2's context a lane at a time.
+            run_decode_call(columns, uniform ? DraftContext::Columns : DraftContext::Caller);
+            if (dflash2_ && !uniform) {
+                for (const std::uint32_t index : order) {
+                    const Lane& lane    = lanes_[index];
+                    const auto inputs   = static_cast<std::int32_t>(lane.tokens.size() - lane.processed);
+                    const std::int32_t last = last_column[index];
+                    dflash2_->context(last - inputs + 1, inputs, device_.stream);
+                }
+            }
             sample(sequences, rows, logit_rows, ops::kSamplePurposeDecode, masks);
         }
         for (const std::uint32_t index : order) {
@@ -1670,6 +1737,26 @@ public:
             out.rows[row].disposition =
                 d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
             speculative_of(lane, out.rows[row]);
+        }
+        if (dflash2_ && pending_draft_.active) {
+            // The verify call's committed columns (each row's accepted prefix: positions F .. F + accepted - 1) into the
+            // rings, before any later call overwrites the forward's features; a released row's none.
+            std::array<std::int32_t, kMaximumConcurrency> counts{}, firsts{}, slots{};
+            for (std::size_t row = 0; row < rows.size(); ++row) {
+                const auto& d = decisions[row];
+                counts[row]   = d.cancelled || d.failed ? 0 : static_cast<std::int32_t>(d.accepted_tokens);
+                firsts[row]   = pending_columns_[row];
+                slots[row]    = static_cast<std::int32_t>(ContractAccess::lane(rows[row]));
+            }
+            if (o_.use_cuda_graph) {
+                // The words from pinned memory, the gather and the materializer: one launch per row count.
+                dflash2_->stage_commit({counts.data(), rows.size()}, {firsts.data(), rows.size()},
+                                       {slots.data(), rows.size()});
+                commit_graph(static_cast<std::int32_t>(rows.size())).launch(device_.stream);
+            } else {
+                dflash2_->context_rows({counts.data(), rows.size()}, {firsts.data(), rows.size()},
+                                       {slots.data(), rows.size()}, device_.stream);
+            }
         }
         pending_draft_ = {};
         const std::uint64_t ns = elapsed_ns(start);
@@ -2521,7 +2608,8 @@ private:
 
     // The positions an image captured after a call ending at `end` serves (state_image's rings: the conv rings hold 32
     // positions, of which a frontier reads its 3 before; the drafter's Markov ring 16, of which it reads 1).
-    [[nodiscard]] std::uint32_t capture_reach() const noexcept { return drafter_ ? 15U : 29U; }
+    // DFlash2's rings hold exactly the window: a capture past the tap would lose the tap's oldest keys, so none.
+    [[nodiscard]] std::uint32_t capture_reach() const noexcept { return drafter_ ? 15U : dflash2_ ? 0U : 29U; }
 
     // After a prompt (or replay) call: the lane's full blocks the call completed are published, then each tap the call
     // reached is captured. Shared keys hold prompt-computed state only (a resumed request's output equals a cold one's);
@@ -2810,11 +2898,16 @@ private:
                                      timing_since(start), {failures_.data(), sequences.size()});
     }
 
-    // A decode or verify call: the Forward with the head over every column, then (DSpark) its columns' context rows
-    // (a rejected verify column's rows are overwritten before anything reads them).
-    void run_decode_call(std::int32_t columns) {
+    // Where a decode or verify call's DFlash2 context goes: every column its own row (a uniform plain round), the
+    // caller's (a plain round's lanes of several columns), or the round's commit (a verify call: committed columns only).
+    enum class DraftContext : std::uint8_t { Columns, Caller, Commit };
+
+    // A decode or verify call: the Forward with the head over every column, then its columns' context rows: DSpark's
+    // every column (a rejected verify column's rows are overwritten before anything reads them), DFlash2's as `context`.
+    void run_decode_call(std::int32_t columns, DraftContext context) {
         run_forward(0, columns);
         if (drafter_) { drafter_->append(0, columns, device_.stream); }
+        if (dflash2_ && context == DraftContext::Columns) { dflash2_->context_columns(columns, device_.stream); }
     }
 
     // ---------------------------------------------------------------- DSpark (design §13)
@@ -2824,6 +2917,44 @@ private:
     // the draft's ~1 ms of a ~6 ms round).
     static constexpr double kDraftCost    = 0.12;
     static constexpr double kProposalCost = 0.18;
+    // DFlash2's one-row costs depend on the context: kDFlash2ContextCosts.
+
+    // A verified round's drafts into the lane's calibration (`verified` of them verified, the first `accepted`
+    // accepted) and its decile counts.
+    static void observe_drafts(Lane& lane, std::span<const float> probabilities, std::int32_t verified,
+                               std::int32_t accepted) noexcept {
+        lane.calibration.observe(probabilities, static_cast<std::uint32_t>(verified), static_cast<std::uint32_t>(accepted),
+                                 kAcceptanceWeight);
+        for (std::int32_t j = 0; j < verified && j <= accepted && j < static_cast<std::int32_t>(probabilities.size()); ++j) {
+            const std::size_t bin = runtime::speculative::DraftCalibration::bin(probabilities[static_cast<std::size_t>(j)]);
+            ++lane.decile_verified[bin];
+            lane.decile_accepted[bin] += j < accepted ? 1U : 0U;
+        }
+    }
+
+    // top_k 0 (no limit) with top_p 1 and min_p 0: the whole vocabulary (JM-40), except on the lossless route, which
+    // keeps the 20-candidate cap and its bits.
+    [[nodiscard]] bool samples_full_vocabulary(const ResolvedSamplingParameters& s) const noexcept {
+        return s.top_k == 0 && s.top_p >= 1.0F && s.min_p <= 0.0F && !o_.lossless;
+    }
+
+    // The selector draw of a DFlash2 round's row (DFlash2Drafter::stage): a row sampling the whole vocabulary at a
+    // positive temperature passes its temperature and seed, its drafts coupled with its verify columns' draws by their
+    // Gumbel noise (2026-11-26: 3.14 -> 3.48 tokens a round at 7 drafts on the real test's prompts; served, one request,
+    // 323.8 -> 341.3 tok/s); every other row drafts the greedy path. (A top-20 row's drafts coupled by sample()'s
+    // inverse-CDF uniform accepted less than its greedy drafts, 3.33 against 3.49 tokens a round, likely because a rank
+    // is shared only up to the smaller of the two laws' probabilities.)
+    [[nodiscard]] ops::SamplingConfig dflash2_draw(const Lane& lane) const noexcept {
+        ops::SamplingConfig draw;
+        draw.temperature                    = 0.0F;
+        const ResolvedSamplingParameters& s = lane.options.sampling;
+        if (s.temperature > 0.0F && samples_full_vocabulary(s)) {
+            draw.temperature     = s.temperature;
+            draw.seed            = s.seed;
+            draw.full_vocabulary = true;
+        }
+        return draw;
+    }
 
     // A round drafts when one row decodes with its one pending input, the drafter has its context (F >= 1), the
     // position after the anchor fits the context, and no penalty counts the draws: verification samples each column as
@@ -2831,7 +2962,7 @@ private:
     // it draws), and so is a grammar (each column samples under the mask of its position after the drafts before it,
     // constrained-decoding.md §8.1).
     [[nodiscard]] bool dspark_round(std::span<const SequenceHandle> sequences) const {
-        if (!drafter_ || sequences.size() != 1) { return false; }
+        if (!drafting() || sequences.size() != 1) { return false; }
         const Lane& lane = lanes_[lane_of(sequences[0])];
         // A token-constrained row decodes plainly: its steps' records come from its one column a round.
         return !lane.penalties && !lane.constraint && lane.processed != 0 && lane.tokens.size() == lane.processed + 1U &&
@@ -2846,17 +2977,27 @@ private:
         // Drafts whose positions fit the context and whose round (drafts + 1 tokens) fits the row's budget.
         // With the calibrated length the Markov head drafts at most two more steps than the last round verified (each
         // step reads the whole folded vocabulary): room for the policy's probe of one more.
-        const std::int32_t most = o_.draft_tokens_auto ? lane.step_cap : static_cast<std::int32_t>(o_.draft_tokens);
+        // DFlash2 drafts its whole block at one cost: every draft up to --draft-tokens.
+        const std::int32_t most = o_.draft_tokens_auto && !dflash2_ ? lane.step_cap : static_cast<std::int32_t>(o_.draft_tokens);
         const std::int32_t steps =
             std::min({most, static_cast<std::int32_t>(o_.max_context) - 1 - F,
                       static_cast<std::int32_t>(std::min<std::uint32_t>(remaining - 1U, ops::inkling2::kMarkovSteps))});
         // The drafts: the block, the head over its rows and the Markov steps, read back before the verify call. The
         // block's rows F .. F + 7 go to the full layer's pages first (mapped here: the verify call maps no more).
         map_lane_pages(index, F + ops::inkling2::kDSparkBlock);
-        drafter_->stage({F, lane.tokens[static_cast<std::size_t>(F)], static_cast<std::int32_t>(index)});
+        const ops::inkling2::DSparkRound round{F, lane.tokens[static_cast<std::size_t>(F)], static_cast<std::int32_t>(index)};
+        if (dflash2_) {
+            const ops::SamplingConfig draw = dflash2_draw(lane);
+            dflash2_->stage(round, &draw);
+        } else {
+            drafter_->stage(round);
+        }
         CUDA_CHECK(cudaEventRecord(round_events_[0], device_.stream));
         if (o_.use_cuda_graph) {
             draft_graph(steps).launch(device_.stream);
+        } else if (dflash2_) {
+            dflash2_->draft(device_.stream);
+            dflash2_->download(device_.stream);
         } else {
             drafter_->draft(steps, device_.stream);
             drafter_->download(steps, device_.stream);
@@ -2870,14 +3011,21 @@ private:
         std::array<TokenId, ops::inkling2::kMarkovSteps> drafts{};
         std::array<float, ops::inkling2::kMarkovSteps> probabilities{};
         for (std::int32_t i = 0; i < steps; ++i) {
-            drafts[static_cast<std::size_t>(i)]        = drafter_->host_tokens()[i];
-            probabilities[static_cast<std::size_t>(i)] = drafter_->host_probabilities()[i];
+            drafts[static_cast<std::size_t>(i)]        = dflash2_ ? dflash2_->host_tokens()[i] : drafter_->host_tokens()[i];
+            probabilities[static_cast<std::size_t>(i)] =
+                dflash2_ ? dflash2_->host_probabilities()[i] : drafter_->host_probabilities()[i];
         }
         std::int32_t k = steps;
         if (o_.draft_tokens_auto) {
-            k = runtime::speculative::calibrated_draft_length(
-                lane.calibration, std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)), steps,
-                kDraftCost, kProposalCost);
+            const std::span<const float> drafted(probabilities.data(), static_cast<std::size_t>(steps));
+            if (dflash2_) {
+                const ContextCost c = dflash2_cost(lane.processed);
+                k = runtime::speculative::calibrated_draft_length(lane.calibration, drafted, steps, c.per_draft,
+                                                                  c.proposal, c.verify);
+            } else {
+                k = runtime::speculative::calibrated_draft_length(lane.calibration, drafted, steps, kDraftCost,
+                                                                  kProposalCost);
+            }
             if (++lane.policy_rounds % kProbeInterval == 0) { k = std::min(k + 1, steps); }
             const auto window = static_cast<std::int32_t>(o_.draft_tokens);
             lane.step_cap     = std::clamp(k + 2, std::min(2, window), window);
@@ -2912,7 +3060,7 @@ private:
             if (o_.use_cuda_graph) {
                 verify_graph(index, columns, false).launch(device_.stream);
             } else {
-                run_decode_call(columns);
+                run_decode_call(columns, DraftContext::Commit);
             }
             fill_masks(*masks, 0, 0, std::span<const TokenId>(drafts.data(), static_cast<std::size_t>(k)));
             dead = mask_dead_[0];
@@ -2920,7 +3068,7 @@ private:
         } else if (o_.use_cuda_graph) {
             verify_graph(index, columns).launch(device_.stream);
         } else {
-            run_decode_call(columns);
+            run_decode_call(columns, DraftContext::Commit);
             launch_sample(n, {logit_rows.data(), n}, ops::kSamplePurposeDecode);
         }
         CUDA_CHECK(cudaEventRecord(round_events_[3], device_.stream));
@@ -2938,8 +3086,7 @@ private:
                failures_[static_cast<std::size_t>(a)] == runtime::PendingRowFailure::None) {
             ++a;
         }
-        lane.calibration.observe(std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)),
-                                 static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(a), kAcceptanceWeight);
+        observe_drafts(lane, std::span<const float>(probabilities.data(), static_cast<std::size_t>(steps)), k, a);
         // The round ends at the first reasoning close it draws: later columns sampled under the ban the close lifts.
         if (ban.active()) {
             for (std::int32_t i = 0; i < a; ++i) {
@@ -2982,8 +3129,9 @@ private:
         for (std::int32_t i = 0; i < a; ++i) { ++lane.accepted_at[static_cast<std::size_t>(i)]; }
         row_counts_[0] = a + 1;
         std::copy_n(sampled_tokens_.begin(), a + 1, round_tokens_.begin());
-        pending_draft_     = {true};
-        pending_firsts_[0] = static_cast<std::uint32_t>(F);
+        pending_draft_      = {true};
+        pending_firsts_[0]  = static_cast<std::uint32_t>(F);
+        pending_columns_[0] = 0;
         const std::uint64_t transaction = ++transaction_;
         const std::uint64_t ns          = elapsed_ns(start);
         lane.decode_ns += ns;
@@ -3062,7 +3210,7 @@ private:
     // reasoning ban are fine, as in a one-row round.
     [[nodiscard]] bool rows_eligible(std::span<const SequenceHandle> sequences,
                                      std::span<const runtime::RoundBudget> budgets) const {
-        if (!drafter_ || lossless_ || sequences.size() < 2 || budgets.size() != sequences.size()) { return false; }
+        if (!drafting() || lossless_ || sequences.size() < 2 || budgets.size() != sequences.size()) { return false; }
         for (std::size_t r = 0; r < sequences.size(); ++r) {
             const Lane& lane = lanes_[lane_of(sequences[r])];
             if (lane.penalties || lane.constraint || lane.processed == 0 || lane.tokens.size() != lane.processed + 1U ||
@@ -3111,13 +3259,13 @@ private:
         }
         char text[768];
         std::snprintf(text, sizeof(text),
-                      "Inkling 2 DSpark rounds of %zu rows, contexts up to %lluK: widths%s; %llu rounds plain by the "
+                      "Inkling 2 %s rounds of %zu rows, contexts up to %lluK: widths%s; %llu rounds plain by the "
                       "rates; plain round %.2f "
                       "ms (device), %.2f ms (host), %.3f tok/ms; drafted round %.2f ms (host), %.2f tokens, %.3f tok/ms; "
                       "verify ms by width %.2f %.2f %.2f %.2f %.2f %.2f %.2f; graphs of these rounds %llu captured, "
                       "%llu evicted; the drafts dealt by row expect %+.1f %% more tokens than K each at the same "
                       "columns; %llu rounds dealt a row every draft it had",
-                      rows, static_cast<unsigned long long>(2ULL << bucket), widths.c_str(),
+                      dflash2_ ? "DFlash2" : "DSpark", rows, static_cast<unsigned long long>(2ULL << bucket), widths.c_str(),
                       static_cast<unsigned long long>(cost.plain_rounds), cost.plain_ms,
                       cost.plain_wall, cost.plain_wall > 0.0 ? static_cast<double>(rows) / cost.plain_wall : 0.0,
                       cost.draft_wall, cost.draft_tokens, cost.draft_wall > 0.0 ? cost.draft_tokens / cost.draft_wall : 0.0,
@@ -3175,7 +3323,7 @@ private:
             index[r] = lane_of(sequences[r]);
             order[r] = static_cast<std::uint32_t>(r);
             const Lane& lane = lanes_[index[r]];
-            steps = std::max(steps, o_.draft_tokens_auto ? lane.step_cap : window);
+            steps = std::max(steps, o_.draft_tokens_auto && !dflash2_ ? lane.step_cap : window);
             room  = std::max(room, static_cast<std::int32_t>(std::min<std::uint32_t>(budgets[r].generated_tokens_remaining,
                                                                                       ik::kDSparkBlock)) - 1);
         }
@@ -3193,7 +3341,14 @@ private:
             map_lane_pages(lane, F + ik::kDSparkBlock);
             rounds[b] = {F, lanes_[lane].tokens[static_cast<std::size_t>(F)], static_cast<std::int32_t>(lane)};
         }
-        drafter_->stage(std::span<const ik::DSparkRound>(rounds.data(), n));
+        if (dflash2_) {
+            std::array<ops::SamplingConfig, kMaximumConcurrency> draws{};
+            for (std::size_t b = 0; b < n; ++b) { draws[b] = dflash2_draw(lanes_[index[order[b]]]); }
+            dflash2_->stage(std::span<const ik::DSparkRound>(rounds.data(), n),
+                            std::span<const ops::SamplingConfig>(draws.data(), n));
+        } else {
+            drafter_->stage(std::span<const ik::DSparkRound>(rounds.data(), n));
+        }
         // The graph first (a first use captures it), so the events time the launch alone.
         DecodeGraphExecutable& draft = rows_draft_graph(static_cast<std::int32_t>(n), steps);
         CUDA_CHECK(cudaEventRecord(round_events_[0], device_.stream));
@@ -3208,9 +3363,11 @@ private:
         std::array<std::array<TokenId, ik::kMarkovSteps>, kMaximumConcurrency> drafts{};
         std::array<std::array<float, ik::kMarkovSteps>, kMaximumConcurrency> probabilities{};
         for (std::size_t b = 0; b < n; ++b) {
+            const auto row = static_cast<std::int32_t>(b);
             for (std::int32_t i = 0; i < steps; ++i) {
-                drafts[b][static_cast<std::size_t>(i)]        = drafter_->host_tokens(static_cast<std::int32_t>(b))[i];
-                probabilities[b][static_cast<std::size_t>(i)] = drafter_->host_probabilities(static_cast<std::int32_t>(b))[i];
+                drafts[b][static_cast<std::size_t>(i)] = dflash2_ ? dflash2_->host_tokens(row)[i] : drafter_->host_tokens(row)[i];
+                probabilities[b][static_cast<std::size_t>(i)] =
+                    dflash2_ ? dflash2_->host_probabilities(row)[i] : drafter_->host_probabilities(row)[i];
             }
         }
         // The round's columns, n (K + 1), and each row's share of its n x K drafts (a fixed --draft-tokens: K = all it
@@ -3376,8 +3533,7 @@ private:
                    failures_[o + static_cast<std::size_t>(a)] == runtime::PendingRowFailure::None) {
                 ++a;
             }
-            lane.calibration.observe(std::span<const float>(probabilities[b].data(), static_cast<std::size_t>(steps)),
-                                     static_cast<std::uint32_t>(own[b]), static_cast<std::uint32_t>(a), kAcceptanceWeight);
+            observe_drafts(lane, std::span<const float>(probabilities[b].data(), static_cast<std::size_t>(steps)), own[b], a);
             // The row's round ends at the first reasoning close it draws, and at its budget.
             if (const runtime::ReasoningBan& ban = bans[r]; ban.active()) {
                 for (std::int32_t i = 0; i < a; ++i) {
@@ -3414,8 +3570,9 @@ private:
             lane.accepted += static_cast<std::uint64_t>(kept);
             for (std::int32_t i = 0; i < kept; ++i) { ++lane.accepted_at[static_cast<std::size_t>(i)]; }
             lane.draft_ms += draft_ms, lane.gap_ms += gap_ms, lane.verify_ms += verify_ms;
-            row_counts_[r]     = kept + 1;
-            pending_firsts_[r] = static_cast<std::uint32_t>(F);
+            row_counts_[r]      = kept + 1;
+            pending_firsts_[r]  = static_cast<std::uint32_t>(F);
+            pending_columns_[r] = offset[r];
             std::copy_n(sampled_tokens_.begin() + static_cast<std::ptrdiff_t>(o), kept + 1,
                         round_tokens_.begin() + static_cast<std::ptrdiff_t>(r * kRowStride));
             committed += kept + 1;
@@ -3443,11 +3600,17 @@ private:
     // The captured drafts of `rows` rows and `steps` steps (a round of several rows), the most recently used
     // kRowsGraphs of them kept.
     DecodeGraphExecutable& rows_draft_graph(std::int32_t rows, std::int32_t steps) {
+        if (dflash2_) { steps = DFlash2Drafter::kDrafts; } // its whole block, whatever the round verifies
         const std::uint64_t key = (1ULL << 63) | (1ULL << 60) | static_cast<std::uint64_t>(rows) << 8 |
                                   static_cast<std::uint32_t>(steps);
         return rows_graph(key, [&] {
-            drafter_->draft(steps, device_.stream, rows);
-            drafter_->download(steps, device_.stream, rows);
+            if (dflash2_) {
+                dflash2_->draft(device_.stream, rows);
+                dflash2_->download(device_.stream, rows);
+            } else {
+                drafter_->draft(steps, device_.stream, rows);
+                drafter_->download(steps, device_.stream, rows);
+            }
         });
     }
 
@@ -3458,7 +3621,7 @@ private:
     DecodeGraphExecutable& rows_verify_graph(std::int32_t rows, std::int32_t width) {
         const std::uint64_t key = (1ULL << 63) | (1ULL << 61) | kForwardOnlyGraph | static_cast<std::uint64_t>(rows) << 8 |
                                   static_cast<std::uint32_t>(width);
-        return rows_graph(key, [&] { run_decode_call(rows * width); });
+        return rows_graph(key, [&] { run_decode_call(rows * width, DraftContext::Commit); });
     }
 
     // A graph of rounds of several rows by key, captured on first use; the least recently used is destroyed once
@@ -3489,16 +3652,36 @@ private:
 
     // The captured draft of `steps` drafts (its round words copied in from pinned memory, the drafts copied out).
     DecodeGraphExecutable& draft_graph(std::int32_t steps) {
+        if (dflash2_) { steps = DFlash2Drafter::kDrafts; } // its whole block, whatever the round verifies
         auto found = draft_graphs_.find(steps);
         if (found == draft_graphs_.end()) {
             DecodeGraphDefinition definition;
             definition.capture(device_.stream, [&] {
-                drafter_->draft(steps, device_.stream);
-                drafter_->download(steps, device_.stream);
+                if (dflash2_) {
+                    dflash2_->draft(device_.stream);
+                    dflash2_->download(device_.stream);
+                } else {
+                    drafter_->draft(steps, device_.stream);
+                    drafter_->download(steps, device_.stream);
+                }
             });
             DecodeGraphExecutable exec;
             instantiate_graph(exec, definition);
             found = draft_graphs_.emplace(steps, std::move(exec)).first;
+        }
+        return found->second;
+    }
+
+    // DFlash2's captured commit context of `rows` rows (DFlash2Drafter::commit_rows: its words staged in pinned memory
+    // before the launch), one per row count.
+    DecodeGraphExecutable& commit_graph(std::int32_t rows) {
+        auto found = commit_graphs_.find(rows);
+        if (found == commit_graphs_.end()) {
+            DecodeGraphDefinition definition;
+            definition.capture(device_.stream, [&] { dflash2_->commit_rows(rows, device_.stream); });
+            DecodeGraphExecutable exec;
+            instantiate_graph(exec, definition);
+            found = commit_graphs_.emplace(rows, std::move(exec)).first;
         }
         return found->second;
     }
@@ -3515,7 +3698,7 @@ private:
             for (std::int32_t i = 0; i < columns; ++i) { identity[static_cast<std::size_t>(i)] = i; }
             DecodeGraphDefinition definition;
             definition.capture(device_.stream, [&] {
-                run_decode_call(columns);
+                run_decode_call(columns, DraftContext::Commit);
                 if (sample) { launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode); }
             });
             DecodeGraphExecutable exec;
@@ -3527,28 +3710,34 @@ private:
 
     // A request's DSpark rounds at its end (Debug): their counts and the mean device time of a round's parts.
     void report_rounds(const Lane& lane) const noexcept {
-        if (!drafter_ || lane.rounds == 0 || !o_.diagnostics.callback) { return; }
+        if (!drafting() || lane.rounds == 0 || !o_.diagnostics.callback) { return; }
         try {
             const double n = static_cast<double>(lane.rounds);
             char text[320];
             std::snprintf(text, sizeof(text),
-                          "Inkling 2 DSpark: %llu rounds (%llu plain), %llu of %llu drafts accepted; a round's draft "
+                          "Inkling 2 %s: %llu rounds (%llu plain), %llu of %llu drafts accepted; a round's draft "
                           "%.3f ms, host gap %.3f ms, verify call %.3f ms (device means); %llu rounds of several rows "
                           "plain by the rates",
-                          static_cast<unsigned long long>(lane.rounds), static_cast<unsigned long long>(lane.fallback),
+                          dflash2_ ? "DFlash2" : "DSpark", static_cast<unsigned long long>(lane.rounds),
+                          static_cast<unsigned long long>(lane.fallback),
                           static_cast<unsigned long long>(lane.accepted), static_cast<unsigned long long>(lane.drafted),
                           lane.draft_ms / n, lane.gap_ms / n, lane.verify_ms / n,
                           static_cast<unsigned long long>(lane.rates_plain));
-            o_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Debug, .message = text});
+            std::string message = text;
+            message += "; accepted/verified by probability decile:";
+            for (std::size_t i = 0; i < lane.decile_verified.size(); ++i) {
+                message += " " + std::to_string(lane.decile_accepted[i]) + "/" + std::to_string(lane.decile_verified[i]);
+            }
+            o_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Debug, .message = message});
         } catch (...) {}
     }
 
     // A lane's speculative counters and statistics for the Engine.
     void speculative_of(const Lane& lane, CommitRowResult& row) const {
-        if (!drafter_) { return; }
+        if (!drafting()) { return; }
         row.speculative_counters = {lane.rounds, lane.drafted, lane.accepted, lane.fallback};
         SpeculativeStats& s      = row.speculative;
-        s.backend                = SpeculativeBackend::DSpark;
+        s.backend                = dflash2_ ? SpeculativeBackend::DFlash2 : SpeculativeBackend::DSpark;
         s.enabled                = true;
         s.draft_window           = o_.draft_tokens;
         s.rounds                 = lane.rounds;
@@ -3778,9 +3967,7 @@ private:
             config.seed              = s.seed;
             // The lossless route draws by Gumbel-max (lossless-route.md §3a).
             config.gumbel_max        = o_.lossless;
-            // top_k 0 (no limit) with top_p 1 and min_p 0: the whole vocabulary (JM-40), except on the lossless route,
-            // which keeps the 20-candidate cap and its bits.
-            config.full_vocabulary = s.top_k == 0 && s.top_p >= 1.0F && s.min_p <= 0.0F && !o_.lossless;
+            config.full_vocabulary   = samples_full_vocabulary(s);
             config.token_counts      = lane.penalties ? lane_counts(lanes[row]) : nullptr;
             nonfinite_[row]          = 0;
             config.nonfinite         = &nonfinite_[row];
@@ -3942,7 +4129,7 @@ private:
         bool identity = true;
         for (std::size_t i = 0; i < rows.size(); ++i) { identity = identity && logit_rows[i] == static_cast<std::int32_t>(i); }
         if (!identity) {
-            run_decode_call(columns);
+            run_decode_call(columns, DraftContext::Columns);
             fill_staged_masks(masks);
             launch_sample(rows.size(), logit_rows, ops::kSamplePurposeDecode);
             finish_sample(rows.size());
@@ -3971,7 +4158,7 @@ private:
         for (std::int32_t i = 0; i < columns; ++i) { identity[static_cast<std::size_t>(i)] = i; }
         DecodeGraphDefinition definition;
         definition.capture(device_.stream, [&] {
-            run_decode_call(columns);
+            run_decode_call(columns, DraftContext::Columns);
             if (sample) { launch_sample(static_cast<std::size_t>(columns), identity, ops::kSamplePurposeDecode); }
         });
         DecodeGraphExecutable exec;
@@ -4060,14 +4247,18 @@ private:
     Forward forward_;
     std::unique_ptr<LosslessForward> lossless_; // --lossless (scored windows; generation's cache form)
     std::unique_ptr<Drafter> drafter_; // --spec dspark
+    std::unique_ptr<DFlash2Drafter> dflash2_; // --spec dflash2
     std::unique_ptr<VisionTower> vision_; // --vision
     std::shared_ptr<const std::vector<PromptImage>> encoded_set_; // the prompt whose image the tower last encoded
     std::size_t encoded_index_          = 0;
     const std::uint16_t* encoded_rows_  = nullptr;
     std::map<std::int32_t, DecodeGraphExecutable> draft_graphs_;
+    std::map<std::int32_t, DecodeGraphExecutable> commit_graphs_; // DFlash2's commit context by row count
     PendingDraft pending_draft_;
     std::array<std::int32_t, kMaximumConcurrency> row_counts_{};
     std::array<std::uint32_t, kMaximumConcurrency> pending_firsts_{};
+    // A drafted round's rows' first columns in its verify call (DFlash2's commit writes their committed context).
+    std::array<std::int32_t, kMaximumConcurrency> pending_columns_{};
     // By row count and context bucket (decode_dspark_rows, rows_cost).
     std::array<std::array<RowsCost, kContextBuckets>, kMaximumConcurrency + 1> rows_cost_{};
     std::deque<std::uint64_t> rows_graph_order_;               // rows_graph's keys, least recently used first
@@ -4308,14 +4499,21 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
                     lanes;
     out.io        = static_cast<std::uint64_t>(config.text.vocab_size) * 4 * lanes * 2 +
              detail::mask_bytes(options, config.text.vocab_size) + detail::constraint_bytes(options);
-    const bool dspark = options.dspark && !options.causal_scoring;
+    const bool dspark  = options.dspark && !options.causal_scoring;
+    const bool dflash2 = options.dflash2 && !options.causal_scoring;
     out.workspace = Forward::device_bytes(config.text, static_cast<std::int32_t>(lanes), detail::forward_capacity(options),
-                                          dspark, detail::expert_activation(options), options.a8, options.window_codec) +
+                                          dspark || dflash2, detail::expert_activation(options), options.a8,
+                                          options.window_codec) +
                     ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(config.text.vocab_size), 1,
                                                            static_cast<std::int32_t>(kMaximumConcurrency));
     if (dspark) {
         out.workspace += Drafter::device_bytes(static_cast<std::int32_t>(lanes), options.max_context,
                                                detail::forward_capacity(options), config.text.vocab_size);
+    }
+    if (dflash2) {
+        if (!config.dflash2) { throw std::invalid_argument("Inkling 2: --spec dflash2 needs the companion's config"); }
+        out.workspace += DFlash2Drafter::device_bytes(config, static_cast<std::int32_t>(lanes), options.max_context,
+                                                      options.shortlist_head);
     }
     if (options.vision) {
         if (!config.vision || options.vision_max_cells == 0) {
@@ -4339,13 +4537,14 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     }
     out.graph_bound = static_cast<std::uint32_t>(lanes * (lanes + 1) / 2);
     if (options.use_cuda_graph && !options.causal_scoring && !options.lossless) {
-        // The decode graphs and their forward-only forms; with DSpark a verify graph per (lane, 2-8 columns, sampled or
-        // forward-only) and a draft graph per step count, and with several lanes the rounds of several rows' graphs
-        // (rows_graph keeps kRowsGraphs).
+        // The decode graphs and their forward-only forms; with a drafter a verify graph per (lane, 2-8 columns, sampled or
+        // forward-only) and a draft graph per step count (DSpark's 7; DFlash2's one, its whole block, and its commit
+        // context's per row count), and with several lanes the rounds of several rows' graphs (rows_graph keeps
+        // kRowsGraphs).
         std::uint64_t executables = 2ULL * out.graph_bound;
-        if (dspark) {
+        if (dspark || dflash2) {
             executables += lanes * static_cast<std::uint64_t>(ops::inkling2::kDSparkBlock - 1) * 2 +
-                           static_cast<std::uint64_t>(ops::inkling2::kMarkovSteps);
+                           (dflash2 ? 1U + lanes : static_cast<std::uint64_t>(ops::inkling2::kMarkovSteps));
             if (lanes >= 2) { executables += static_cast<std::uint64_t>(detail::kRowsGraphs); }
         }
         out.graphs = kGraphDriverBytes + executables * kGraphExecutableBytes;

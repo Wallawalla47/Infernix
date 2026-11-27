@@ -70,8 +70,10 @@ bool is_companion_shape(const Q8AttnInputProblem& problem) noexcept {
 }
 
 bool is_dflash2_shape(const Q8AttnInputProblem& problem) noexcept {
-    // Qwen3.8-27B's drafter (H 5120), Qwen3.8-Flash-Next's (H 2560) and Qwen3.5-122B-A10B's (H 3072).
-    return (problem.input_rows == 5120 || problem.input_rows == 2560 || problem.input_rows == 3072) &&
+    // Qwen3.8-27B's drafter (H 5120), Qwen3.8-Flash-Next's (H 2560), Qwen3.5-122B-A10B's (H 3072) and Inkling 2
+    // Mini's (H 2304).
+    return (problem.input_rows == 5120 || problem.input_rows == 2560 || problem.input_rows == 3072 ||
+            problem.input_rows == 2304) &&
            problem.query_rows == 4096 &&
            problem.kv_rows == 1024 &&
            problem.parent_rows == 6144 && problem.padded_k == problem.input_rows;

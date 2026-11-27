@@ -24,8 +24,9 @@ void require(bool ok, const std::string& what) {
     if (!ok) { throw std::runtime_error(what); }
 }
 
-// The k in [0, most] with the highest expected tokens per round time, by exhaustive evaluation.
-int brute_force(const DraftCalibration& c, const std::vector<float>& p, int most, double w, double f) {
+// The k in [0, most] with the highest expected tokens per round time, by exhaustive evaluation: a round of k >= 1
+// drafts costs 1 + f + v + w * k plain rounds, one of none 1 + f.
+int brute_force(const DraftCalibration& c, const std::vector<float>& p, int most, double w, double f, double v = 0.0) {
     int best = 0;
     double best_score = 1.0 / (1.0 + f);
     for (int k = 1; k <= most; ++k) {
@@ -35,13 +36,18 @@ int brute_force(const DraftCalibration& c, const std::vector<float>& p, int most
             for (int i = 0; i < j; ++i) { reach *= c.accept[DraftCalibration::bin(p[static_cast<std::size_t>(i)])]; }
             tokens += reach;
         }
-        const double score = tokens / (1.0 + f + w * k);
+        const double score = tokens / (1.0 + f + v + w * k);
         if (score > best_score + 1e-12) {
             best_score = score;
             best       = k;
         }
     }
     return best;
+}
+
+// The expected tokens per round time of verifying k drafts (k = 0: a plain round, 1 + f).
+double score_of(const DraftCalibration& c, const std::vector<float>& p, int k, double w, double f, double v) {
+    return k == 0 ? 1.0 / (1.0 + f) : expected_draft_tokens(c, p, k) / (1.0 + f + v + w * k);
 }
 
 // A two-row round's best expected tokens per round time over every pair of row lengths (ka, kb),
@@ -98,6 +104,10 @@ int main() {
         const std::vector<float> broken{0.97F, 0.96F, 0.05F, 0.97F, 0.97F, 0.97F, 0.97F};
         require(calibrated_draft_length(c, broken, 7, 0.31, 0.1) == 2, "a doubtful third draft ends the run");
         require(calibrated_draft_length(c, sure, 3, 0.31, 0.1) == 3, "the length never exceeds `most`");
+        // A verify call's fixed cost weighs every drafted round, not the plain one: large enough, even confident
+        // drafts are not verified.
+        require(calibrated_draft_length(c, sure, 7, 0.31, 0.1, 0.2) == 7, "a small verify cost keeps confident drafts");
+        require(calibrated_draft_length(c, sure, 7, 0.31, 0.1, 10.0) == 0, "a verify cost past the drafts' worth");
         // Against the exhaustive choice over a grid of probabilities and costs.
         std::uint32_t state = 7;
         for (int trial = 0; trial < 2000; ++trial) {
@@ -110,6 +120,13 @@ int main() {
             const int most = 1 + trial % 7;
             require(calibrated_draft_length(c, p, most, w, f) == brute_force(c, p, most, w, f),
                     "the policy's choice equals the exhaustive one (trial " + std::to_string(trial) + ")");
+            // With a verify cost the decile centres can tie two lengths exactly (1 + 0.2 + 0.35 = 1 + 0.55), where
+            // the two evaluations' rounding picks either: the chosen length's score must equal the best one's.
+            const double v = 0.1 * (trial % 3);
+            const int chosen = calibrated_draft_length(c, p, most, w, f, v), best = brute_force(c, p, most, w, f, v);
+            require(std::abs(score_of(c, p, chosen, w, f, v) - score_of(c, p, best, w, f, v)) < 1e-12,
+                    "with a verify cost, the policy's choice scores as the exhaustive one's (trial " +
+                        std::to_string(trial) + ": " + std::to_string(chosen) + " against " + std::to_string(best) + ")");
             // The expected tokens of every prefix, against the direct sum of products.
             for (int k = 0; k <= 9; ++k) {
                 double direct = 1.0;

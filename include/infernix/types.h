@@ -411,10 +411,11 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // --spec auto (backend None until the Engine resolves it; requires draft_tokens_auto and no
     // draft_min_p): startup chooses, among the drafters the artifact can run, the one measured fastest
-    // overall: Qwen3.8-Flash-Next DFlash2 with a draft_model, else MTP; a Qwen3.5-family artifact with
-    // offloaded experts MTP; any other Qwen3.5-family artifact DFlash2, then MTP, then DFlash, as
-    // bundled. Without one the Engine decodes plain. Engine::options() then reports false and the
-    // chosen backend.
+    // overall: Qwen3.8-Flash-Next DFlash2 with a draft_model, else MTP; Inkling 2 DFlash2 with a
+    // draft_model, else its bundled DSpark, else the one DFlash2 companion beside the artifact; a
+    // Qwen3.5-family artifact with offloaded experts MTP; any other Qwen3.5-family artifact DFlash2,
+    // then MTP, then DFlash, as bundled. Without one the Engine decodes plain. Engine::options() then
+    // reports false and the chosen backend.
     bool backend_auto = false;
     // Startup-fixed K: MTP 1..7 (Qwen3.5/3.6 1..5); DFlash and DFlash2 1..15 (query width K+1).
     // With draft_tokens_auto it is the most a round may draft; 0 there takes the model's most
@@ -430,10 +431,11 @@ struct SpeculativeOptions {
     // (fewer only near the output limit; draft_min_p defaults to 0).
     bool draft_tokens_auto = false;
     ProposalHead proposal_head = ProposalHead::Full;
-    // Qwen3.8-Flash-Next DFlash2 (--draft-model): the companion artifact holding the drafter
-    // (tools.convert --components dflash2), loaded beside the main artifact. Qwen3.5/3.6 artifacts
-    // bundle their DFlash and DFlash2 drafters and refuse it for those. DSpine (Qwen3.5 family): the
-    // standalone drafter artifact (component dspine), which --spec dspine requires.
+    // Qwen3.8-Flash-Next and Inkling 2 DFlash2 (--draft-model): the companion artifact holding the
+    // drafter (tools.convert --components dflash2), loaded beside the main artifact (Inkling 2 then
+    // loads no DSpark). Qwen3.5/3.6 artifacts bundle their DFlash and DFlash2 drafters and refuse it
+    // for those. DSpine (Qwen3.5 family): the standalone drafter artifact (component dspine), which
+    // --spec dspine requires.
     std::filesystem::path draft_model;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.

@@ -20,17 +20,23 @@ namespace infernix::ops {
  *
  * For K in [1,15] and B in [1,8], the inputs are contiguous candidate_ids I32 [16,K,B],
  * unary_scores FP32 [16,K,B], projected_hidden BF16 [256,K,B], anchors I32 [B],
- * predecessor_codebook and successor_codebook BF16 [256,248320], base_positions I32 [B], and a
- * device-resident SamplingConfig[B]. Candidate rank is the fastest axis. The 16 candidate ids in
- * each row are distinct, and all candidate and anchor token ids lie in [0,248077); the registered
- * vocabulary, artifact binding, and linear_topk producer establish that trusted value contract.
+ * predecessor_codebook and successor_codebook BF16 [256,V] with V a registered vocabulary (Qwen3.8's
+ * 248320, Inkling 2's 200058), base_positions I32 [B], and a device-resident SamplingConfig[B].
+ * Candidate rank is the fastest axis. The 16 candidate ids in each row are distinct, and all
+ * candidate and anchor token ids lie in [0,V) (Qwen3.8's public domain [0,248077)); the registered
+ * vocabulary, artifact binding, and top-16 producer establish that trusted value contract.
  *
  * Starting with predecessor=anchors[b], each position i in [0,K) computes:
  *
  *   edge[c] = unary_scores[c,i,b]
  *           + sum_r predecessor_codebook[r,predecessor]
  *                   * projected_hidden[r,i,b]
- *                   * successor_codebook[r,candidate_ids[c,i,b]].
+ *                   * successor_codebook[r,candidate_ids[c,i,b]],
+ *
+ * then, with edge_softcap > 0 (a selector trained with its softcap after the correction: incoai's
+ * Inkling 2 drafter, selector_softcap_mode after_correction), edge[c] = edge_softcap *
+ * tanh(edge[c] / edge_softcap) in FP32 before every use below; edge_softcap is finite and >= 0, and
+ * 0 leaves the edges as they are.
  *
  * A row with configs[b].temperature<=0 selects the lowest candidate rank attaining max(edge) and
  * writes its exact one-hot distribution. A positive-temperature row writes the FP32 softmax of
@@ -41,9 +47,15 @@ namespace infernix::ops {
  * the target's Gumbel-max draw; sampling.h) instead takes the candidate maximizing log q + g, g the
  * Gumbel variate of (seed, base_positions[b]+i+1, kSamplePurposeGumbel, candidate id): the key its
  * verification column i gives that token (candidates ZH-01), so the draft equals the target's draw
- * whenever the target's draw is the drafter's own Gumbel winner. Gumbel-max is an exact draw from q, so
- * proposal_q is unchanged. The selected global id is
- * written to drafts[i,b] and becomes the next predecessor. The Op ignores all other
+ * whenever the target's draw is the drafter's own Gumbel winner.
+ *
+ * With couple_draws (a caller that verifies each draft by equality with sample()'s own draw at verify
+ * column i, whose input position is base_positions[b]+i: Inkling 2), a positive-temperature row with
+ * configs[b].full_vocabulary (whatever gumbel_max says, as in sample()) takes the candidate maximizing
+ * edge/temperature + g, g that draw's noise at (seed, base_positions[b]+i+1, candidate id) (sampling.h):
+ * the draft is the target's draw whenever that token is a candidate and the edges order it as the logits
+ * do. It is an exact draw from q (Gumbel-max), so proposal_q is unchanged; other rows draw as above. The
+ * selected global id is written to drafts[i,b] and becomes the next predecessor. The Op ignores all other
  * SamplingConfig fields and never updates token_counts.
  *
  * drafts is contiguous I32 [K,B] and proposal_q is contiguous FP32 [16,K,B]. Both outputs are
@@ -59,7 +71,8 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
-                             WorkspaceArena& workspace, cudaStream_t stream);
+                             WorkspaceArena& workspace, cudaStream_t stream, float edge_softcap = 0.0F,
+                             bool couple_draws = false);
 
 /**
  * Op: candidate_selector_tree
@@ -85,6 +98,8 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
  * gumbel_max rows do, and node v's next child is its law's untaken rank of the highest Gumbel score at the
  * child's verification key (seed, base+i, kSamplePurposeGumbel, candidate id) for a child at depth i: the
  * law's Gumbel top ranks in order, a draw without replacement. Such a row builds no transport shape.
+ * The tree has no couple_draws: a row without gumbel_max draws with the proposal's counter keys whatever
+ * its full_vocabulary says.
  *
  * Outputs: drafts I32 [W-1,B]; column_candidates I32 [16,W-1,B] (the lattice candidates of the
  * column's position); proposal_q FP32 [16,W-1,B] holding the full q of the column's parent (a

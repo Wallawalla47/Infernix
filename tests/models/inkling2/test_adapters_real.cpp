@@ -16,6 +16,7 @@
 
 #include "artifact/safetensors_writer.h"
 #include "infernix/engine.h"
+#include "models/inkling2/drafter_choice.h"
 
 #include <nlohmann/json.hpp>
 
@@ -348,8 +349,8 @@ int main() {
                     infernix::Engine engine(plain);
                     expected = replies(engine);
                 }
-                infernix::EngineOptions draft         = plain;
-                draft.speculative.backend             = infernix::SpeculativeBackend::DSpark;
+                infernix::EngineOptions draft = plain;
+                infernix::test::inkling2::use_drafter(draft.speculative); // DSpark or the DFlash2 companion
                 draft.speculative.draft_tokens_auto   = true;
                 draft.speculative.draft_tokens        = 7;
                 if (std::getenv("INFERNIX_INKLING2_RANKED") != nullptr) {
@@ -357,7 +358,7 @@ int main() {
                 }
                 {
                     infernix::Engine engine(draft);
-                    require_replies(label + ": DSpark against plain", expected, replies(engine));
+                    require_replies(label + ": drafting against plain", expected, replies(engine));
                 }
                 if (name == "--reproducible") {
                     infernix::EngineOptions lanes = generating(artifact, 3);

@@ -685,10 +685,11 @@ int run_q8_companion() {
     return failures;
 }
 
-// Qwen3.8-27B's drafter (H 5120), Qwen3.8-Flash-Next's (H 2560) and Qwen3.5-122B-A10B's (H 3072).
+// Qwen3.8-27B's drafter (H 5120), Qwen3.8-Flash-Next's (H 2560), Qwen3.5-122B-A10B's (H 3072) and Inkling 2 Mini's
+// (H 2304).
 int run_q8_dflash2() {
     int failures = 0;
-    for (const int hidden : {5120, 2560, 3072}) {
+    for (const int hidden : {5120, 2560, 3072, 2304}) {
         DevicePackedWeight parent(
             quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, hidden, 313U));
         const std::string label = "DFlash2 H=" + std::to_string(hidden);

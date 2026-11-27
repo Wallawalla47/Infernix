@@ -145,8 +145,9 @@ void classify_family(ScannedModel& model) {
         return;
     }
     if (model.model_type == "inkling2_loop_text") {
-        model.family       = "inkling2-mini";
-        model.family_label = "Inkling 2 Mini";
+        model.family              = "inkling2-mini";
+        model.family_label        = "Inkling 2 Mini";
+        model.accepts_draft_model = true; // its DFlash2 companion (--spec dflash2 --draft-model)
         return;
     }
     model.family       = "unknown";
@@ -703,9 +704,10 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
     g_cache = std::move(seen);
 
     for (ScannedDrafter& drafter : scan.drafters) {
-        for (const ScannedModel& model : scan.models) {
+        for (ScannedModel& model : scan.models) {
             if (!drafter_fits(model, drafter)) { continue; }
             drafter.compatible_models.push_back(model.key);
+            model.has_draft_companion = true;
         }
     }
     for (ScannedNgramVolume& volume : scan.ngram_volumes) {

@@ -35,8 +35,10 @@ using Launch = Q8Launch;
 
 template <int Rows, int InputRows, int TileColumns>
 void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    constexpr int Warps =
-        InputRows == 4096 ? (TileColumns <= 40 ? 8 : 4) : (TileColumns <= 32 ? 8 : 4);
+    // K warps take 64-wide slices: 4 where C does not divide into 512s (Inkling 2 Mini's 6912).
+    constexpr int Warps = InputRows % 512 != 0     ? 4
+                          : InputRows == 4096 ? (TileColumns <= 40 ? 8 : 4)
+                                              : (TileColumns <= 32 ? 8 : 4);
     constexpr Cache Activation =
         InputRows == 4096 && ((TileColumns > 24 && TileColumns <= 40) || TileColumns > 48)
             ? Cache::cg
@@ -65,13 +67,16 @@ constexpr auto make_launchers(std::index_sequence<I...>) {
 }
 
 // The registered (H, C) pairs: Qwen3.8-27B's drafter (5120; 4096 and 17408),
-// Qwen3.8-Flash-Next's (2560; 4096 and 7680) and Qwen3.5-122B-A10B's (3072; 4096 and 9216).
+// Qwen3.8-Flash-Next's (2560; 4096 and 7680), Qwen3.5-122B-A10B's (3072; 4096 and 9216) and Inkling 2
+// Mini's (2304; 4096 and 6912).
 constexpr auto attention_5120 = make_launchers<5120, 4096>(std::make_index_sequence<11>{});
 constexpr auto mlp_5120       = make_launchers<5120, 17408>(std::make_index_sequence<11>{});
 constexpr auto attention_2560 = make_launchers<2560, 4096>(std::make_index_sequence<11>{});
 constexpr auto mlp_2560       = make_launchers<2560, 7680>(std::make_index_sequence<11>{});
 constexpr auto attention_3072 = make_launchers<3072, 4096>(std::make_index_sequence<11>{});
 constexpr auto mlp_3072       = make_launchers<3072, 9216>(std::make_index_sequence<11>{});
+constexpr auto attention_2304 = make_launchers<2304, 4096>(std::make_index_sequence<11>{});
+constexpr auto mlp_2304       = make_launchers<2304, 6912>(std::make_index_sequence<11>{});
 
 template <int Rows>
 __global__ void finish_kernel(const __nv_bfloat16* projected, const __nv_bfloat16* base,
@@ -92,6 +97,8 @@ const std::array<Launch, 11>& tiled_launchers(int rows, int input_rows) {
     if (rows == 2560 && input_rows == 7680) return mlp_2560;
     if (rows == 3072 && input_rows == 4096) return attention_3072;
     if (rows == 3072 && input_rows == 9216) return mlp_3072;
+    if (rows == 2304 && input_rows == 4096) return attention_2304;
+    if (rows == 2304 && input_rows == 6912) return mlp_2304;
     throw std::logic_error("linear dynamic grouped conv add: unregistered (H, C)");
 }
 
@@ -110,6 +117,20 @@ void finish(const Tensor& projected, const Tensor& base, const Tensor& delta, Te
                                     static_cast<__nv_bfloat16*>(residual.data), width));
 }
 
+void finish_rows(const Tensor& projected, const Tensor& base, const Tensor& delta, Tensor& residual, int width,
+                 int tokens, cudaStream_t stream) {
+    const int rows = residual.ne[0];
+    if (rows == 5120) {
+        finish<5120>(projected, base, delta, residual, width, tokens, stream);
+    } else if (rows == 3072) {
+        finish<3072>(projected, base, delta, residual, width, tokens, stream);
+    } else if (rows == 2304) {
+        finish<2304>(projected, base, delta, residual, width, tokens, stream);
+    } else {
+        finish<2560>(projected, base, delta, residual, width, tokens, stream);
+    }
+}
+
 void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weight& weight,
                   const Tensor& base, const Tensor& delta, Tensor& residual, Tensor& projected,
                   cudaStream_t stream) {
@@ -125,15 +146,14 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
         launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
         break;
     }
-    if (rows == 5120) {
-        finish<5120>(projected, base, delta, residual, x.ne[1], tokens, stream);
-    } else if (rows == 3072) {
-        finish<3072>(projected, base, delta, residual, x.ne[1], tokens, stream);
-    } else {
-        finish<2560>(projected, base, delta, residual, x.ne[1], tokens, stream);
-    }
+    finish_rows(projected, base, delta, residual, x.ne[1], tokens, stream);
 }
 } // namespace
+
+void dynamic_grouped_conv_add_finish_launch(const Tensor& projected, const Tensor& base, const Tensor& delta,
+                                            Tensor& residual, int width, int tokens, cudaStream_t stream) {
+    finish_rows(projected, base, delta, residual, width, tokens, stream);
+}
 
 void q8_dynamic_grouped_conv_add_materialized_launch(Q8DynamicConvAddSchedule schedule,
                                                      const Tensor& x, const Weight& weight,

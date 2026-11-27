@@ -626,9 +626,9 @@ INFERNIX_OP_TEST(context_kv_materialize) {
             return 77;
         }
         // Qwen3.8-27B's drafter (5 layers, H 5120, theta 1e7), Qwen3.8-Flash-Next's (5, H 2560,
-        // theta 1e4) and Qwen3.5-122B-A10B's (6, H 3072, theta 1e7).
+        // theta 1e4), Qwen3.5-122B-A10B's (6, H 3072, theta 1e7) and Inkling 2 Mini's (5, H 2304, theta 1e4).
         const int failures = run_geometry(5, 5120, 1.0e7) + run_geometry(5, 2560, 1.0e4) +
-                             run_geometry(6, 3072, 1.0e7) + run_dspine_ring();
+                             run_geometry(6, 3072, 1.0e7) + run_geometry(5, 2304, 1.0e4) + run_dspine_ring();
         if (failures != 0) {
             std::cerr << "context_kv_materialize failures=" << failures << '\n';
             return 1;

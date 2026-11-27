@@ -47,4 +47,12 @@ void record_known_captures(std::uint64_t count) noexcept;
 void set_ram_available(std::function<std::uint64_t()> reader);
 [[nodiscard]] std::function<std::uint64_t()> ram_available();
 
+// Called by every DFlash2 context call of the forward's sequential columns (DFlash2Drafter::context(first, count): a
+// prompt call's) with the columns' device features [count][features * H], their positions [count] and the call's stream,
+// after the call is enqueued; none when empty (the default). The DFlash2 test reads a real prompt's features with it.
+using ContextObserver =
+    std::function<void(const std::uint16_t* features, const std::int32_t* positions, std::int32_t count, void* stream)>;
+void set_context_observer(ContextObserver observer);
+[[nodiscard]] ContextObserver context_observer();
+
 } // namespace infernix::models::inkling2::testing

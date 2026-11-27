@@ -37,6 +37,7 @@ struct Problem {
 
 constexpr Problem kCompanion{"companion", 12288, 6144, 2048};
 constexpr Problem kDFlash2{"dflash2", 34816, 17408, 5120};
+constexpr Problem kInkling2{"inkling2", 13824, 6912, 2304}; // Inkling 2 Mini's DFlash2 drafter
 
 struct Options {
     std::vector<std::int32_t> t_sweep;
@@ -100,7 +101,7 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("execution must be eager or graph");
             options.graph = mode == "graph";
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--problem companion|dflash2] [--t-sweep 1,2,...] "
+            std::printf("Usage: %s [--problem companion|dflash2|inkling2] [--t-sweep 1,2,...] "
                         "[--warmup N] [--repeat N] [--csv-out PATH] [--profile] "
                         "[--execution eager|graph]\n",
                         argv[0]);
@@ -112,7 +113,7 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    if (options.problem != kCompanion.name && options.problem != kDFlash2.name) {
+    if (options.problem != kCompanion.name && options.problem != kDFlash2.name && options.problem != kInkling2.name) {
         throw std::invalid_argument("--problem must be companion or dflash2");
     }
     if (options.t_sweep.empty()) {
@@ -170,7 +171,9 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
 int main(int argc, char** argv) {
     try {
         const Options options  = parse_options(argc, argv);
-        const Problem& problem = options.problem == kDFlash2.name ? kDFlash2 : kCompanion;
+        const Problem& problem = options.problem == kDFlash2.name    ? kDFlash2
+                                 : options.problem == kInkling2.name ? kInkling2
+                                                                     : kCompanion;
         DeviceContext context;
         const cudaStream_t stream = context.stream;
         std::printf("# gpu=%s sm=%d%d cuda_runtime=%d cache=cold\n", context.props.name,

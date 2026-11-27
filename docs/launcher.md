@@ -288,7 +288,7 @@ Defaults per family (README "Recommended settings per model"):
 | Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --max-context auto` (the context the GPU's memory holds beside the artifact, below) |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
 | Qwen3.5-122B-A10B | `--max-context 262144` |
-| Inkling 2 Mini | `--max-context auto` and, with the artifact's token ranking and DSpark drafter, `--lm-head-draft` |
+| Inkling 2 Mini | `--max-context auto`; for an artifact without the DSpark drafter, the DFlash2 companion found (`--draft-model`: `--spec auto` then drafts with it; beside DSpark it is left for you to choose, DSpark being faster in the agentic replay); and, with the artifact's token ranking and a drafter (DSpark or the companion), `--lm-head-draft` |
 
 No family sets `--host-context-mib`: `infernix-serve`'s default (`auto`) gives the Host prefix cache all the RAM
 the model and its experts leave beyond `--ram-free-mib` ([serving guide](serving.md)).

@@ -305,6 +305,8 @@ void validate_profile(const Profile& profile) {
                                        profile.output_rows == 7680;
     const bool q8_122b_dflash2 = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 18432 &&
                                  profile.input_rows == 3072 && profile.output_rows == 9216;
+    const bool q8_inkling2_dflash2 = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 13824 &&
+                                     profile.input_rows == 2304 && profile.output_rows == 6912;
     const bool q8_flash_next = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 1280 &&
                                profile.input_rows == 2560 && profile.output_rows == 640;
     const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
@@ -314,8 +316,8 @@ void validate_profile(const Profile& profile) {
     // Qwen3.5-122B-A10B's per-row FP8 shared expert (A16 and column-invariant routes only).
     const bool fp8_122b_shared = profile.qtype == QType::FP8_E4M3FN_ROW_F32 && profile.gate_up_rows == 2048 &&
                                  profile.input_rows == 3072 && profile.output_rows == 1024;
-    if ((!q4 && !q8_companion && !q8_dflash2 && !q8_flash_next_dflash2 && !q8_122b_dflash2 && !q8_flash_next &&
-         !nvfp4 && !fp8 && !fp8_122b_shared) ||
+    if ((!q4 && !q8_companion && !q8_dflash2 && !q8_flash_next_dflash2 && !q8_122b_dflash2 && !q8_inkling2_dflash2 &&
+         !q8_flash_next && !nvfp4 && !fp8 && !fp8_122b_shared) ||
         profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }

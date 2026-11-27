@@ -132,8 +132,8 @@ def main(argv=None):
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2; dflash2 alone writes a Qwen4Exp "
-        "DFlash2 companion artifact (--model: the target checkpoint)",
+        help="comma-separated text,vision,mtp,dflash,dflash2; dflash2 alone writes a Qwen4Exp or Inkling 2 "
+        "DFlash2 companion artifact (--model: the target checkpoint, its config and tokenizer)",
     )
     parser.add_argument(
         "--graft",
@@ -226,7 +226,8 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         if inkling2_loop.is_inkling2_loop(base.config):
-            # Inkling2Loop converts from its own checkpoint only: no GGUF, graft, n-gram or companion options.
+            # Inkling2Loop converts from its own checkpoint only (or writes a DFlash2 companion): no GGUF, graft or
+            # n-gram options.
             if graft_paths or args.gguf or args.mmproj or args.screen_heads or args.ngram_out or args.ngram_reuse:
                 raise ValueError("Inkling2Loop takes no --graft, --gguf, --mmproj, --screen-heads or n-gram options")
             if "dspark" in components and "dspark" not in paths:
@@ -250,7 +251,7 @@ def main(argv=None):
         ]
         if companion and (
             components != ("dflash2",)
-            or not qwen4
+            or not (qwen4 or inkling)
             or args.gguf
             or args.mmproj
             or args.proposal
@@ -260,8 +261,8 @@ def main(argv=None):
             or overrides
         ):
             raise ValueError(
-                "without text, --components dflash2 writes a Qwen4Exp DFlash2 companion: --model is "
-                "the target checkpoint and --source dflash2=PATH the drafter; no GGUF, proposal, "
+                "without text, --components dflash2 writes a Qwen4Exp or Inkling 2 DFlash2 companion: --model "
+                "is the target checkpoint and --source dflash2=PATH the drafter; no GGUF, proposal, "
                 "n-gram or resource options apply"
             )
         gguf_store = None
@@ -281,6 +282,8 @@ def main(argv=None):
             if not dspine.is_dspine(base.config):
                 raise ValueError("--components dspine converts a DSpineDraftModel checkpoint (--model)")
             model = dspine.build_model(base)
+        elif inkling and companion:
+            model = inkling2_loop.build_dflash2_companion(base, sources["dflash2"])
         elif inkling:
             model = inkling2_loop.build_model(
                 base,

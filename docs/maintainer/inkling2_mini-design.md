@@ -1512,6 +1512,54 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
   took every draft it had while it could have drafted more in ~20 % of four-row rounds at 100K (its next round drafts
   2 past those, so the cap follows a round later).
 
+### 13.8 The DFlash2 companion (`--spec dflash2 --draft-model`)
+
+incoai's [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) is a DFlash2 drafter
+([dflash.md](dflash.md)) trained on Inkling 2 Mini: five sliding-window layers (window 2,048, 32 query and 8 KV heads of
+128, SwiGLU 6,912, RoPE θ 1e4) with two-tap dynamic convolutions, conditioned on DSpark's features (§13.3: the inputs
+of visits 5, 23 and 41 and the final-normed state, `target_layer_ids` [5, 23, 41, 48]), and its candidate selector
+(rank 256, top 16) over the target's head. It loads as a companion artifact (recipe `inkling2_mini_dflash2`) beside any
+Inkling 2 artifact; with it DSpark is not bound: none of its weights, the full layer's context planes in every KV page
+(§13.6) or its tables are built, so the KV pool holds more tokens.
+
+```text
+features f_t (4 × H) as §13.3;  c_t = norm_hidden(W_fc f_t)                      (no per-layer mixing)
+K_ctx^l = rope_1e4(norm_k,l(W_k,l c_t)),  V_ctx^l = W_v,l c_t                    (the block's own K/V words)
+block (positions F..F+7): [normed_embed(anchor), normed_embed(mask 200056) × 7]   (the target's embedding and its norm)
+layer: n = norm(x); (p, d) = conv_attn.prepare(n); q, k, v = W_qkv p; q, k = rope(norm_q q), rope(norm_k k)
+       a = attention(q, [K_ctx ∪ block], window 2048, non-causal); x += conv_attn.finish(W_o a, d)
+       m = norm(x); (p, d) = conv_mlp.prepare(m); x += conv_mlp.finish(W_down (silu(W_gate p) ⊙ W_up p), d)
+h_i = norm_final(x_i), i = 1..7;  u_i = W_head h_i (raw, the real vocabulary);  C_i = top16(u_i)
+E_i[p, c] = 30 tanh((u_i[c] + Σ_r A[pred(p)]_r (W_sel h_i)_r B[C_i[c]]_r) / 30)    (softcap after the correction)
+draft_i = C_i[argmax_c E_i[draft_{i-1}, c]];  confidence_i = softmax(E_i[draft_{i-1}, ·])[draft_i]
+```
+
+Three things differ from the Flash-Next drafter: the block's inputs are the target's *normed* embeddings (SGLang's
+Inkling `get_input_embeddings` applies `embed_norm`), the selector's softcap comes after its correction
+(`selector_softcap_mode` `after_correction`, `candidate_selector_path`'s `edge_softcap`), and the candidates come from
+the real vocabulary (the checkpoint's codebooks are its 201,024-row padded storage; the companion keeps 200,058).
+
+- **Ops.** The Flash-Next drafter's fused Ops at Inkling 2 Mini's widths (`execution/dflash2.cpp`): the context
+  materializer, the dynamic convolutions' prepare and finish, the Q/K/V projection, SwiGLU, sliding-window attention,
+  the final norm over the mask columns, the selector path; the head is the target's (`Forward::project_head`, on 8-bit
+  inputs where the head is 8-bit) with `logits_topk`; the selector's hidden projection Inkling's `projections_dmma`.
+- **Context.** Each lane's five rings (BF16 K, FP16 V, 2,048 slots: exactly the window, 40 MiB a lane) hold committed
+  positions only: a ring slot a rejected verify column overwrote would be one the next block still reads (DSpark's rings
+  keep 128 slots of slack, DFlash2's none). A prefill call's columns and a plain round's are all committed and write
+  their context in the call (the plain rounds' graphs carry it); a verify call writes none, and its round's commit
+  writes each row's committed columns (`dflash2_gather_columns` packs the rows' uneven shares into eight columns a
+  row, then one materializer launch; with CUDA graphs one graph per row count, its words staged in pinned memory). A prefix-cache snapshot carries the rings (10 parts a lane), and captures are
+  exact (`capture_reach` 0: a capture past its tap would lose the tap's oldest keys).
+- **Rounds.** §13.4 and §13.7's rounds unchanged: verification keeps a draft only when it equals the target's own draw
+  at its position, so speculation never changes the output; the calibrated length reads the selector's confidence. The
+  drafter always drafts its whole block (7 drafts at one cost), so no step cap applies; one graph per row count. A
+  whole-vocabulary row's drafts are coupled with its verify columns' Gumbel noise (`couple_draws`,
+  [DFlash](dflash.md#inkling-2-mini)); greedy and top-20 rows draft the selector's greedy path. A one-row round's
+  costs follow its context (`kDFlash2ContextCosts`: to 4,096 tokens 0.12 a verified draft and 0.16 the proposal, in
+  plain rounds; fitted at ~26K and ~122K, where a draft costs more; [DFlash](dflash.md#inkling-2-mini)).
+- **`--lm-head-draft`.** The 65,536-row shortlist of §13.6 without DSpark's Fold: the head's rows alone, 8-bit, their
+  candidates remapped to token ids before the codebooks.
+
 ---
 
 ## 14. Prefill

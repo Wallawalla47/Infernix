@@ -214,6 +214,31 @@ case (0.9-2.2 % faster than Q8, 0-0.5 % faster than NVFP4-MLP) and leaves the mo
 fewer accepted drafts than Q8 on varied text. The drafter only proposes tokens the model verifies, so its format
 changes acceptance and speed, never output.
 
+Inkling 2 Mini's DFlash2 drafter ([incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2))
+converts the same way into a companion of any Inkling 2 Mini artifact (`--spec dflash2 --draft-model FILE`), with
+`--model` naming an Inkling 2 Mini checkpoint or a folder holding only its `config.json` and tokenizer (no weights
+are read from it) and the recipe `inkling2_mini_dflash2`:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Inkling-2-Mini \
+  --source dflash2=/path/to/Inkling-2-Mini-DFlash2 \
+  --components dflash2 \
+  --recipe inkling2_mini_dflash2 \
+  --name Inkling-2-Mini-DFlash2-Infernix \
+  --out models/Inkling-2-Mini-DFlash2-Infernix.infernix
+```
+
+The formats are the Flash-Next recipe's. The drafter's blocks start from the main artifact's normed token
+embeddings and draft from its text head or the `--lm-head-draft` shortlist, so the companion holds neither
+(635 MB). The converter checks the drafter's `target_config` (architecture, hidden size, vocabulary, layers and the
+loop's 48 visits) against the checkpoint's, and the engine checks it against the artifact's at load.
+`inkling2_mini_dflash2_nvfp4_mlp` stores every layer's MLP (gate/up and down) NVFP4 instead (`nvfp4_mse`, 16-bit
+activations; 515 MB): it drafts 3 % faster and leaves 1.3 % more KV tokens, and ran 0.5-0.9 % faster than the Q8
+companion one request at a time on short prompts (4.1 % with four questions on a 122K-token prefix), with the same
+acceptance on short prompts under `--draft-tokens auto` but up to 2 % less at a fixed draft length
+([measured](inkling2-mini.md#speed-and-memory-against-dspark)); the Q8 recipe stays the recommended one.
+
 ## Change part of a recipe
 
 Save the following as `my_recipe.py`:

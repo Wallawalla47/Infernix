@@ -31,6 +31,7 @@
 //   INFERNIX_INKLING2_ARTIFACT  an artifact converted with the inkling2_mini recipe (skips without it)
 
 #include "infernix/engine.h"
+#include "models/inkling2/drafter_choice.h"
 #include "media/decode/decode.h"
 #include "models/inkling2/program/test_taps.h"
 #include "models/resume_cold_probe.h"
@@ -100,7 +101,7 @@ void timing(const std::filesystem::path& artifact, bool dspark) {
     infernix::EngineOptions options = cache_options(artifact, infernix::KvCacheStorage::BFloat16, 4096, 4 * 16384);
     options.max_context             = 16384;
     if (dspark) {
-        options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+        infernix::test::inkling2::use_drafter(options.speculative);
         options.speculative.draft_tokens_auto = true;
     }
     infernix::Engine engine(options);
@@ -265,7 +266,7 @@ void next_turn(const std::filesystem::path& artifact, int route) {
     infernix::EngineOptions options = cache_options(artifact, infernix::KvCacheStorage::Int8Group64, 512, 8 * kContext);
     options.context_cache.hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{20};
     if (route == 1) {
-        options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+        infernix::test::inkling2::use_drafter(options.speculative);
         options.speculative.draft_tokens_auto = true;
     } else if (route == 2) {
         options.expert_a16_activations = true;
@@ -430,7 +431,7 @@ int main() {
         //    reported beside a cold run's of the same continuation.
         if (std::getenv("INFERNIX_INKLING2_NO_DSPARK") == nullptr) {
             infernix::EngineOptions options       = cache_options(artifact, KvCacheStorage::BFloat16, 4096, pool);
-            options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+            infernix::test::inkling2::use_drafter(options.speculative);
             options.speculative.draft_tokens_auto = true;
             infernix::Engine engine(options);
             const infernix::TokenId sep = engine.tokenize_text("\n").front();
@@ -583,7 +584,7 @@ int main() {
         for (const bool dspark : {false, true}) {
             infernix::EngineOptions options = cache_options(artifact, KvCacheStorage::BFloat16, 1024, pool);
             if (dspark) {
-                options.speculative.backend           = infernix::SpeculativeBackend::DSpark;
+                infernix::test::inkling2::use_drafter(options.speculative);
                 options.speculative.draft_tokens_auto = true;
             }
             infernix::Engine engine(options);

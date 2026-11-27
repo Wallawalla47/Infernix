@@ -410,6 +410,106 @@ def test_the_vision_tower_converts_word_for_word(tmp_path):
     assert result["derived"] == 3 and "unconverted" not in result
 
 
+DF_LAYERS, DF_HEADS, DF_KV, DF_D, DF_INTER, DF_RANK = 2, 4, 2, 16, 96, 32
+
+
+def _dflash2_checkpoint(directory, *, mode="after_correction", taps=(1, 3, 5, 8)):
+    """An Inkling 2 DFlash2 drafter (incoai/Inkling-2-Mini-DFlash2's names) at small shapes: its codebooks over the
+    padded vocabulary, as the checkpoint stores them."""
+    g = torch.Generator().manual_seed(11)
+    d = {"fc.weight": _bf16(H, len(taps) * H, generator=g), "hidden_norm.weight": _bf16(H, generator=g),
+         "norm.weight": _bf16(H, generator=g),
+         "candidate_selector.hidden_projection.weight": _bf16(DF_RANK, H, generator=g),
+         "candidate_selector.predecessor_codebook": _bf16(PADDED, DF_RANK, generator=g),
+         "candidate_selector.successor_codebook": _bf16(PADDED, DF_RANK, generator=g)}
+    for i in range(DF_LAYERS):
+        sp, sa = f"layers.{i}.", f"layers.{i}.self_attn."
+        for leaf in ("input_layernorm", "post_attention_layernorm"):
+            d[f"{sp}{leaf}.weight"] = _bf16(H, generator=g)
+        for leaf, rows in (("q_proj", DF_HEADS * DF_D), ("k_proj", DF_KV * DF_D), ("v_proj", DF_KV * DF_D)):
+            d[f"{sa}{leaf}.weight"] = _bf16(rows, H, generator=g)
+        d[sa + "o_proj.weight"] = _bf16(H, DF_HEADS * DF_D, generator=g)
+        d[sa + "q_norm.weight"] = _bf16(DF_D, generator=g)
+        d[sa + "k_norm.weight"] = _bf16(DF_D, generator=g)
+        d[sp + "mlp.gate_proj.weight"] = _bf16(DF_INTER, H, generator=g)
+        d[sp + "mlp.up_proj.weight"] = _bf16(DF_INTER, H, generator=g)
+        d[sp + "mlp.down_proj.weight"] = _bf16(H, DF_INTER, generator=g)
+        for branch in ("attention_conv", "mlp_conv"):
+            d[f"{sp}{branch}.base_kernel"] = _bf16(2, 2, H, generator=g)
+            d[f"{sp}{branch}.kernel_projection.weight"] = _bf16(2 * 2 * (H // 16), H, generator=g)
+    save_file(d, str(directory / "model.safetensors"))
+    config = {
+        "architectures": ["DFlash2DraftModel"], "model_type": "qwen3", "attention_bias": False, "hidden_act": "silu",
+        "hidden_size": H, "intermediate_size": DF_INTER, "num_attention_heads": DF_HEADS, "num_key_value_heads": DF_KV,
+        "head_dim": DF_D, "num_hidden_layers": DF_LAYERS, "max_position_embeddings": 1048576, "rms_norm_eps": 1e-6,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}, "is_causal": False,
+        "layer_types": ["sliding_attention"] * DF_LAYERS, "sliding_window": 2048, "use_sliding_window": True,
+        "num_target_layers": 8, "tie_word_embeddings": False, "vocab_size": PADDED,
+        "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
+                          "final_logit_softcapping": 30.0, "mask_token_id": VOCAB - 2, "selector_rank": DF_RANK,
+                          "selector_softcap_mode": mode, "selector_top_k": 4, "target_layer_ids": list(taps)},
+    }
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return d
+
+
+def _dflash2_convert(tmp_path, **options):
+    source, drafter = tmp_path / "source", tmp_path / "drafter"
+    source.mkdir()
+    drafter.mkdir()
+    _checkpoint(source)
+    d = _dflash2_checkpoint(drafter, **options)
+    out = tmp_path / "companion.infernix"
+    main(["--model", str(source), "--recipe", "inkling2_mini_dflash2", "--components", "dflash2", "--source",
+          f"dflash2={drafter}", "--out", str(out), "--device", "cpu"])
+    return d, out
+
+
+def test_the_dflash2_companion_converts(tmp_path):
+    # A companion (no text component) for this target: its identity recorded, the codebooks cut to the real vocabulary,
+    # every projection Q8 but the convolutions' kernel projections and the selector's (BF16), the context K/V roles on
+    # the block's K/V words, and its Use of the target's head declared.
+    d, out = _dflash2_convert(tmp_path)
+    with Artifact(out) as artifact:
+        directory = artifact.directory
+        assert set(directory.components) == {"dflash2"}
+        config = directory.components["dflash2"]["config"]
+        assert config["target_config"] == {"architectures": ["Inkling2LoopForCausalLM"], "hidden_size": H,
+                                           "vocab_size": VOCAB, "num_hidden_layers": LAYERS, "visits": 8}
+        draft = config["dflash_config"]
+        assert (draft["selector_softcap_mode"], draft["final_logit_softcapping"], draft["target_layer_ids"]) == (
+            "after_correction", 30.0, [1, 3, 5, 8])
+        objects = {o.id: o for o in directory.objects}
+
+        def tensor(name):
+            binding = directory.bindings[name]
+            return objects[binding["object"] if "object" in binding else binding["parts"][0]["object"]]
+
+        for name in ("dflash2/feature_projection", "dflash2/layers/0/attention/query", "dflash2/layers/1/mlp/down",
+                     "dflash2/layers/1/attention/output"):
+            assert tensor(name).format == "q8_g32_fp16", name
+        for name in ("dflash2/layers/0/attention_conv/kernel_projection",
+                     "dflash2/candidate_selector/hidden_projection", "dflash2/candidate_selector/successor_codebook"):
+            assert tensor(name).format == "bf16", name
+        # The context roles read the block's K/V words.
+        assert directory.bindings["dflash2/layers/0/attention/context_key"] == directory.bindings[
+            "dflash2/layers/0/attention/key"]
+        codebook = d["candidate_selector.predecessor_codebook"][:VOCAB]
+        assert _bound(artifact, "dflash2/candidate_selector/predecessor_codebook") == _words(codebook)
+        assert _bound(artifact, "dflash2/layers/1/mlp_conv/base_kernel") == _words(d["layers.1.mlp_conv.base_kernel"])
+        assert any(use["parameter"] == "text/output_head" and use["input"] == "dflash2/final_hidden"
+                   for use in directory.uses)
+
+
+@pytest.mark.parametrize(("options", "message"), [
+    ({"mode": "on_logits"}, "selector_softcap_mode"),
+    ({"taps": (1, 3, 5, 7)}, "target_layer_ids"),
+])
+def test_a_dflash2_companion_of_another_shape_is_refused(tmp_path, options, message):
+    with pytest.raises(ValueError, match=message):
+        _dflash2_convert(tmp_path, **options)
+
+
 def test_a_different_image_processor_is_refused(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

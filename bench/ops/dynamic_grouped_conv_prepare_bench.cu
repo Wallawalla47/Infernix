@@ -57,7 +57,7 @@ Options parse_args(int argc, char** argv) {
             options.flush_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
             std::printf(
-                "usage: %s [--hidden 5120|2560|3072] [--width W] [--batch B] [--warmup N] [--repeat N]\n"
+                "usage: %s [--hidden 5120|2560|3072|2304] [--width W] [--batch B] [--warmup N] [--repeat N]\n"
                 "       [--flush-mib N]\n",
                 argv[0]);
             std::exit(0);
@@ -65,8 +65,8 @@ Options parse_args(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(argv[index]));
         }
     }
-    if (options.hidden != 5120 && options.hidden != 2560 && options.hidden != 3072) {
-        throw std::invalid_argument("hidden must be 5120, 2560 or 3072");
+    if (options.hidden != 5120 && options.hidden != 2560 && options.hidden != 3072 && options.hidden != 2304) {
+        throw std::invalid_argument("hidden must be 5120, 2560, 3072 or 2304");
     }
     if ((options.width != 0 && (options.width < 2 || options.width > 16)) || options.batch < 0 ||
         options.batch > 8 || options.warmup < 0 || options.repeat <= 0) {
@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(options.flush_bytes);
         const std::size_t workspace_bytes =
             ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(hidden, 2, 16, 1, 8);
-        WorkspaceArena workspace(workspace_bytes);
+        WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256)); // a fused route takes none
         Tensor norm_weight(norm.p, DType::BF16, {hidden});
         Tensor base_kernel(base.p, DType::BF16, {hidden, kTaps, kSides});
 

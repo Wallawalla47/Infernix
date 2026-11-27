@@ -470,14 +470,16 @@ bool launch_projection(const Tensor& context, const Tensor& positions, const Ten
                        ContextKVMaterializeRoute route, const Tensor& key_scratch,
                        cudaStream_t stream) {
     using Route = ContextKVMaterializeRoute;
+    // The split-K tiles take K in 64-wide slices a K warp: 8 warps where H divides into 512s, else 4 (2304).
+    constexpr int kKWarps = H % 512 == 0 ? 8 : 4;
     switch (route) {
     case Route::KSplit16:
-        launch_grouped<H, 16>(context, positions, counts, state_slots, device_layers, envelope,
-                              key_scratch, stream);
+        launch_grouped<H, 16, kKWarps>(context, positions, counts, state_slots, device_layers, envelope,
+                                       key_scratch, stream);
         return true;
     case Route::KSplit24:
-        launch_grouped<H, 24>(context, positions, counts, state_slots, device_layers, envelope,
-                              key_scratch, stream);
+        launch_grouped<H, 24, kKWarps>(context, positions, counts, state_slots, device_layers, envelope,
+                                       key_scratch, stream);
         return true;
     case Route::Mma32:
         launch_mma<H, 64, 32, 128, 2>(context, positions, counts, state_slots, device_layers,
@@ -517,6 +519,7 @@ void context_kv_materialize_launch(
     };
     const bool post = context.ne[0] == 5120   ? project.template operator()<5120>()
                       : context.ne[0] == 3072 ? project.template operator()<3072>()
+                      : context.ne[0] == 2304 ? project.template operator()<2304>()
                                               : project.template operator()<2560>();
     if (!post) { return; }
     CUDA_CHECK(pdl::launch_consumer(

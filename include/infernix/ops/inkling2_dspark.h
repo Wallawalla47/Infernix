@@ -200,4 +200,12 @@ void dspark_markov(const DSparkMarkovArgs& args, std::int32_t steps, cudaStream_
 void dspark_gather_rows(const std::uint16_t* src, std::int32_t row_words, const std::int32_t* ids, std::int32_t rows,
                         std::uint16_t* out, cudaStream_t stream);
 
+// The DFlash2 drafter's committed context columns of a verify call (models/inkling2/execution/dflash2.h): for each row
+// b < rows and j < words[b] (its count, at most `width`), the call's column words[padded + b] + j (its first, then its
+// next ones) to column b * width + j: `column_words` BF16 words (a multiple of 8, 16-byte aligned columns) of
+// `features` into out_features, and its position into out_positions. Exact copies; other output columns unchanged.
+void dflash2_gather_columns(const std::uint16_t* features, std::int32_t column_words, const std::int32_t* positions,
+                            const std::int32_t* words, std::int32_t padded, std::int32_t rows, std::int32_t width,
+                            std::uint16_t* out_features, std::int32_t* out_positions, cudaStream_t stream);
+
 } // namespace infernix::ops::inkling2

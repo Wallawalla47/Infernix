@@ -17,9 +17,11 @@
 namespace infernix::ops {
 namespace {
 
-// The registered context widths: Qwen3.8-27B's DFlash2 (5120), Qwen3.8-Flash-Next's (2560) and
-// Qwen3.5-122B-A10B's (3072).
-bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560 || hidden == 3072; }
+// The registered context widths: Qwen3.8-27B's DFlash2 (5120), Qwen3.8-Flash-Next's (2560),
+// Qwen3.5-122B-A10B's (3072) and Inkling 2 Mini's (2304).
+bool registered_hidden(std::int32_t hidden) {
+    return hidden == 5120 || hidden == 2560 || hidden == 3072 || hidden == 2304;
+}
 constexpr std::int32_t kKVSize     = 1024;
 constexpr std::int32_t kHeadDim    = 128;
 constexpr std::int32_t kKVHeads    = 8;
@@ -140,7 +142,7 @@ void context_kv_materialize(
     const std::int32_t width  = context.ne[1];
     const std::int32_t batch  = context.ne[2];
     if (!registered_hidden(hidden)) {
-        throw std::invalid_argument("context_kv_materialize: H must be 5120, 2560 or 3072");
+        throw std::invalid_argument("context_kv_materialize: H must be 5120, 2560, 3072 or 2304");
     }
     if (!(rope_theta > 1.0F) || !std::isfinite(rope_theta)) {
         throw std::invalid_argument("context_kv_materialize: theta must be finite and above 1");

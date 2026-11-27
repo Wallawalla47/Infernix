@@ -58,7 +58,7 @@ constexpr std::array kRules = {
     Rule{"--cache-tool-hold-secs", kQwen35},  // refused by Flash-Next and Inkling
     Rule{"--context-cost-presets", kQwen},  // Inkling's prefix cache has no cost model
     // Speculative decoding.
-    Rule{"--draft-model", kFlash | kDense}, // Flash-Next's DFlash2 companion, a dense Qwen3.5's DSpine drafter
+    Rule{"--draft-model", kFlash | kDense | kInkling}, // DFlash2 companions (Flash-Next, Inkling 2), DSpine (dense)
     Rule{"--draft-tree-nodes", kQwen35},    // Flash-Next verifies neural drafts as chains and refuses it
     Rule{"--draft-tree-paths", kQwen},      // Flash-Next: its n-gram trees' paths
     Rule{"--spec-min-p", kQwen},
@@ -134,9 +134,9 @@ bool supports_option(const ScannedModel& model, std::string_view flag) {
     if (flag == "--expert-a4-activations") { return kind == ModelKind::FlashNext && fp4_local(model); }
     if (flag == "--a16-activations") { return takes_a16(model); }
     if (flag == "--lm-head-draft") {
-        // On Inkling its proposal/token_rank parameter, and the DSpark drafter it shortlists for (the Engine refuses
-        // the flag without one).
-        return model.has_proposal && (kind != ModelKind::Inkling2 || model.has_dspark);
+        // On Inkling its proposal/token_rank parameter, and a drafter it shortlists for (DSpark or a DFlash2 companion:
+        // the Engine refuses the flag without one).
+        return model.has_proposal && (kind != ModelKind::Inkling2 || model.has_dspark || model.has_draft_companion);
     }
     if (std::find(kNeedsVision.begin(), kNeedsVision.end(), flag) != kNeedsVision.end() && !model.has_vision) {
         return false;

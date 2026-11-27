@@ -20,7 +20,7 @@ namespace infernix::ops::detail {
 namespace {
 
 // The DFlash2 drafters' Q/K/V parent [6144, H]: H = 5120 (Qwen3.8-27B), 2560
-// (Qwen3.8-Flash-Next) or 3072 (Qwen3.5-122B-A10B).
+// (Qwen3.8-Flash-Next), 3072 (Qwen3.5-122B-A10B) or 2304 (Inkling 2 Mini).
 constexpr std::int32_t kQueryRows       = 4096;
 constexpr std::int32_t kKvRows          = 1024;
 constexpr std::int32_t kLastSmallTokens = 48;
@@ -29,14 +29,17 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
 
 // Exact input-load unrolling matters in the first two MMA column tiles. Wider blocks use
 // runtime live columns with one specialization per accumulator capacity. The narrowest columns
-// split K across 16 warps where H divides into 1024-wide blocks (5120, 3072), 8 otherwise (2560).
+// split K across 16 warps where H divides into 1024-wide blocks (5120, 3072), 8 where it divides into 512-wide ones
+// (2560), 4 otherwise (2304).
 template <int Hidden, int Columns, bool Exact>
 void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                   cudaStream_t stream) {
     using Geometry         = Q8LinearGeometry<6144, Hidden>;
     constexpr int Capacity = (Columns + 7) / 8 * 8;
-    constexpr int Wide     = Hidden % 1024 == 0 ? 16 : 8;
-    constexpr int Warps    = Columns <= 4 ? Wide : Columns <= 16 ? 8 : 4;
+    // K warps take 64-wide slices: 8 where H divides into 512s, else 4 (Inkling 2 Mini's 2304).
+    constexpr int Most     = Hidden % 512 == 0 ? 8 : 4;
+    constexpr int Wide     = Hidden % 1024 == 0 ? 16 : Most;
+    constexpr int Warps    = Columns <= 4 ? Wide : Columns <= 16 ? Most : 4;
     constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16) ? Q8ScaleAccess::Direct
                                                                             : Q8ScaleAccess::Shared;
     using Schedule         = Q8A16SlicedKMmaSchedule<Capacity, Warps, 1, 2, Scales>;
@@ -98,6 +101,8 @@ void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight,
         return small_t<2560>(x, weight, q, k, v, stream);
     case 3072:
         return small_t<3072>(x, weight, q, k, v, stream);
+    case 2304:
+        return small_t<2304>(x, weight, q, k, v, stream);
     }
     throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported H");
 }

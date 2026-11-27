@@ -23,7 +23,8 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const Tensor& successor_codebook,
                                       const Tensor& base_positions, const SamplingConfig* configs,
                                       Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      WorkspaceArena& workspace, float edge_softcap, bool couple_draws,
+                                      cudaStream_t stream) {
     const auto route = candidate_selector_path_route(candidate_ids.ne[1], candidate_ids.ne[2]);
     auto scope       = workspace.scope();
     const auto scratch =
@@ -49,6 +50,7 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
     }
     candidate_selector_path_launch(route, candidate_ids, unary_scores, projected_hidden, anchors,
                                    predecessor_codebook, successor_codebook, base_positions,
-                                   configs, drafts, proposal_q, confidence, scratch, stream);
+                                   configs, drafts, proposal_q, confidence, scratch, edge_softcap, couple_draws,
+                                   stream);
 }
 } // namespace infernix::ops::detail

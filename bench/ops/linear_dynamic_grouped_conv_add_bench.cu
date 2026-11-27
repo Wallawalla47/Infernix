@@ -28,12 +28,14 @@ constexpr std::int32_t kSides            = 2;
 constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
 
 // The registered drafters' hidden widths H (output rows, H / 16 groups) and their two input widths C: the attention
-// output and the MLP down projections of Qwen3.8-27B (5120), Qwen3.5-122B-A10B (3072) and Qwen3.8-Flash-Next (2560).
+// output and the MLP down projections of Qwen3.8-27B (5120), Qwen3.5-122B-A10B (3072), Qwen3.8-Flash-Next (2560) and
+// Inkling 2 Mini (2304).
 std::array<std::int32_t, 2> input_widths(std::int32_t hidden) {
     if (hidden == 5120) { return {4096, 17408}; }
     if (hidden == 3072) { return {4096, 9216}; }
     if (hidden == 2560) { return {4096, 7680}; }
-    throw std::invalid_argument("hidden must be 5120, 3072 or 2560");
+    if (hidden == 2304) { return {4096, 6912}; }
+    throw std::invalid_argument("hidden must be 5120, 3072, 2560 or 2304");
 }
 
 struct Options {
@@ -71,9 +73,9 @@ Options parse_args(int argc, char** argv) {
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
             options.flush_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
-            std::printf("usage: %s [--hidden 5120|3072|2560] [--width 2..16] [--k C] [--batch 1..8] [--warmup N] "
+            std::printf("usage: %s [--hidden 5120|3072|2560|2304] [--width 2..16] [--k C] [--batch 1..8] [--warmup N] "
                         "[--repeat N] [--flush-mib N]\n"
-                        "  C: 4096 or 17408 at hidden 5120, 4096 or 9216 at 3072, 4096 or 7680 at 2560\n",
+                        "  C: 4096 or 17408 at hidden 5120, 4096 or 9216 at 3072, 4096 or 7680 at 2560, 4096 or 6912 at 2304\n",
                         argv[0]);
             std::exit(0);
         } else {

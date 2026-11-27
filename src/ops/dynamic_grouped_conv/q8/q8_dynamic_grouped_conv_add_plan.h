@@ -11,9 +11,13 @@
 
 namespace infernix::ops::detail {
 
+// (H, C) whose projection may be an NVFP4 parent (Inkling 2 Mini's drafter's MLP down, the NVFP4 linear's registered
+// [2304, 6912]).
+[[nodiscard]] bool nvfp4_parent_registered(int hidden, int input_rows) noexcept;
+
 std::size_t q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
-    std::int32_t min_batch_size, std::int32_t max_batch_size);
+    std::int32_t min_batch_size, std::int32_t max_batch_size, QType qtype);
 
 const char* q8_linear_dynamic_grouped_conv_add_route_name(std::int32_t hidden,
                                                           std::int32_t input_rows,

@@ -224,10 +224,11 @@ SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
                                                        const WeightInput& key,
                                                        const WeightInput& value) {
     const auto& q = matrix(query);
-    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's, Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's
-    // DFlash2 drafters (H 5120, 2560 and 3072).
+    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's, Qwen3.8-Flash-Next's, Qwen3.5-122B-A10B's and Inkling 2
+    // Mini's DFlash2 drafters (H 5120, 2560, 3072 and 2304).
     require((q == std::vector<std::uint64_t>{4096, 2048} || q == std::vector<std::uint64_t>{4096, 2560} ||
-             q == std::vector<std::uint64_t>{4096, 5120} || q == std::vector<std::uint64_t>{4096, 3072}) &&
+             q == std::vector<std::uint64_t>{4096, 5120} || q == std::vector<std::uint64_t>{4096, 3072} ||
+             q == std::vector<std::uint64_t>{4096, 2304}) &&
                 matrix(key) == std::vector<std::uint64_t>{1024, q[1]} &&
                 matrix(value) == matrix(key),
             "QKV input projection: unsupported logical geometry");

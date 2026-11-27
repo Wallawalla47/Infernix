@@ -10,6 +10,8 @@ namespace infernix::ops::detail {
 inline constexpr std::int32_t kLinearTopK                = 16;
 inline constexpr std::int32_t kLinearTopKMaxChunkColumns = 128;
 inline constexpr std::int32_t kLinearTopKGroupedRows     = 128;
+// logits_topk's producer groups (logits_topk_warp.cu: one warp a group, 16 rows a lane).
+inline constexpr std::int32_t kLogitsTopKRows            = 512;
 inline constexpr std::int32_t kLinearTopKDirectRows      = 16;
 // The keys each selection CTA reduces per column (256 threads of 16).
 inline constexpr std::int32_t kLinearTopKSliceKeys       = 4096;

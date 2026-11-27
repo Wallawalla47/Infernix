@@ -13,6 +13,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/lora_forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/dspark.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/dflash2.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/lossless.cpp"
 )

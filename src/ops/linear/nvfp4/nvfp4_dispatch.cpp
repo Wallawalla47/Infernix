@@ -9,7 +9,7 @@ namespace infernix::ops::detail {
 namespace {
 const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
                          &kNvfp4N5120K6144, &kNvfp4N5120K17408, &kNvfp4N248320K5120,
-                         &kNvfp4N5120K4096, &kNvfp4N5120K25600};
+                         &kNvfp4N5120K4096, &kNvfp4N5120K25600, &kNvfp4N13824K2304, &kNvfp4N2304K6912};
 
 const Nvfp4LinearShape* find_shape(std::int32_t n, std::int32_t k) noexcept {
     for (const auto* shape : kShapes)

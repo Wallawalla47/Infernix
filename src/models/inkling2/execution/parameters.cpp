@@ -1,7 +1,10 @@
 #include "models/inkling2/execution/parameters.h"
 
 #include "core/weight_view.h"
+#include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/weight_input.h"
 
+#include <array>
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
@@ -27,10 +30,18 @@ const T* words(const Model& model, WeightId id) {
 const std::uint16_t* bf16(const Model& model, WeightId id) { return words<std::uint16_t>(model, id); }
 const float* fp32(const Model& model, WeightId id) { return words<float>(model, id); }
 
+// The input divisor of a native Weight: an NVFP4 parent's projections run on 16-bit activations here (the DFlash2
+// companion's NVFP4 MLP), which read none, but the native ABI validates a positive one (as prepare_linear_weight
+// sets it); 0 for every other format.
+float a16_divisor(const WeightView& view) {
+    const auto region = contiguous_weight_region(view);
+    return region.parent != nullptr && region.parent->geometry.format == QType::NVFP4 ? 1.0F : 0.0F;
+}
+
 Weight linear(const Model& model, WeightId id) {
     const BoundWeight& w = model.weight(id);
     try {
-        return native_weight(w.view);
+        return native_weight(w.view, a16_divisor(w.view));
     } catch (const std::exception& e) {
         throw std::invalid_argument(w.name + ": " + e.what());
     }
@@ -52,7 +63,7 @@ Weight stacked(const Model& model, std::initializer_list<WeightId> ids) {
         names += (names.empty() ? "" : " + ") + model.weight(id).name;
     }
     try {
-        return native_weight(view);
+        return native_weight(view, a16_divisor(view));
     } catch (const std::exception& e) {
         throw std::invalid_argument(names + ": not adjacent rows of one parent (" + e.what() + ")");
     }
@@ -191,6 +202,57 @@ DSparkOperands dspark_operands(const Model& model, const DSparkWeights& w, const
     return out;
 }
 
+// A direct parameter as a Tensor of its stored shape (innermost axis first).
+Tensor tensor(const Model& model, WeightId id) {
+    const BoundWeight& w = model.weight(id);
+    const auto& view     = w.view;
+    if (view.shape.empty() || view.shape.size() > 4) { throw std::invalid_argument(w.name + ": a direct tensor of rank 1-4"); }
+    std::array<std::int32_t, 4> axes{1, 1, 1, 1};
+    for (std::size_t i = 0; i < view.shape.size(); ++i) {
+        axes[i] = static_cast<std::int32_t>(view.shape[view.shape.size() - 1 - i]);
+    }
+    try {
+        return weight_tensor(view, {axes[0], axes[1], axes[2], axes[3]});
+    } catch (const std::exception& e) {
+        throw std::invalid_argument(w.name + ": " + e.what());
+    }
+}
+
+DFlash2Operands dflash2_operands(const Model& model, const DFlash2Weights& w, const DFlash2Config& c) {
+    DFlash2Operands out;
+    // Full-head 1-D RoPE at absolute positions (the drafter's own theta, unscaled).
+    out.rope               = ops::prepare_rope(static_cast<int>(c.head_dim), c.rope_theta);
+    out.feature_projection = linear(model, w.feature_projection);
+    out.context_norm       = tensor(model, w.context_norm);
+    out.final_norm         = tensor(model, w.final_norm);
+    for (const DFlash2LayerWeights& l : w.layers) {
+        DFlash2LayerOperands o;
+        o.input_norm          = tensor(model, l.input_norm);
+        o.post_attention_norm = tensor(model, l.post_attention_norm);
+        const auto input      = [&](WeightId id) {
+            const BoundWeight& b = model.weight(id);
+            return ops::WeightInput{b.view, b.policy, std::nullopt};
+        };
+        o.query_key_value      = ops::prepare_attn_input_proj_weights(input(l.query), input(l.key), input(l.value)).weight;
+        o.context_key          = linear(model, l.context_key);
+        o.context_value        = linear(model, l.context_value);
+        o.query_norm           = tensor(model, l.query_norm);
+        o.key_norm             = tensor(model, l.key_norm);
+        o.output               = linear(model, l.output);
+        o.gate_up              = stacked(model, l.gate, l.up);
+        o.down                 = linear(model, l.down);
+        o.attention_base       = tensor(model, l.attention_base);
+        o.mlp_base             = tensor(model, l.mlp_base);
+        o.attention_projection = linear(model, l.attention_projection);
+        o.mlp_projection       = linear(model, l.mlp_projection);
+        out.layers.push_back(o);
+    }
+    out.selector_hidden      = linear(model, w.selector_hidden);
+    out.predecessor_codebook = tensor(model, w.predecessor_codebook);
+    out.successor_codebook   = tensor(model, w.successor_codebook);
+    return out;
+}
+
 VisionOperands vision_operands(const Model& model, const VisionWeights& w) {
     VisionOperands out;
     out.patch_embedding = linear(model, w.patch_embedding);
@@ -251,6 +313,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     layers.reserve(w.layers.size());
     for (std::uint32_t i = 0; i < w.layers.size(); ++i) { layers.push_back(layer_operands(model, w.layers[i], c, i)); }
     if (w.dspark) { dspark = dspark_operands(model, *w.dspark, *model.config().dspark); }
+    if (w.dflash2) { dflash2 = dflash2_operands(model, *w.dflash2, *model.config().dflash2); }
     if (w.vision) { vision = vision_operands(model, *w.vision); }
     lora   = prepare_lora(model.lora(), c, model.options().lossless);
     ablate = prepare_ablate(model.ablate(), c.num_hidden_layers, c.hidden_size);

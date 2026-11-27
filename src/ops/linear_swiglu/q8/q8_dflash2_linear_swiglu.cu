@@ -18,7 +18,7 @@ namespace infernix::ops::detail {
 namespace {
 
 // The DFlash2 drafters' gate/up parents: [34816, 5120] (Qwen3.8-27B), [15360, 2560]
-// (Qwen3.8-Flash-Next) and [18432, 3072] (Qwen3.5-122B-A10B).
+// (Qwen3.8-Flash-Next), [18432, 3072] (Qwen3.5-122B-A10B) and [13824, 2304] (Inkling 2 Mini).
 constexpr std::int32_t kFirstSmallT = 1;
 constexpr std::int32_t kLastSmallT  = 40;
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -28,7 +28,7 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     using Geometry                       = Q8LinearGeometry<GateUpRows, Hidden>;
     constexpr std::int32_t kIntermediate = Geometry::kOutputRows / 2;
     using Schedule =
-        Q8A16SlicedKMmaSchedule<Capacity, Capacity == 24 ? 8 : 4, 1, 2, Q8ScaleAccess::Shared>;
+        Q8A16SlicedKMmaSchedule<Capacity, Capacity == 24 && Hidden % 512 == 0 ? 8 : 4, 1, 2, Q8ScaleAccess::Shared>;
     using RowPolicy = Q8SwiGluPairedRows<kIntermediate>;
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((kIntermediate % RowPolicy::kOutputRowsPerCta) == 0);
@@ -55,6 +55,8 @@ constexpr auto kFlashNextLaunchers =
     make_launchers<15360, 2560>(std::make_index_sequence<kLastSmallT / 8>{});
 constexpr auto k122BLaunchers =
     make_launchers<18432, 3072>(std::make_index_sequence<kLastSmallT / 8>{});
+constexpr auto kInklingLaunchers =
+    make_launchers<13824, 2304>(std::make_index_sequence<kLastSmallT / 8>{});
 
 } // namespace
 
@@ -70,6 +72,8 @@ void q8_dflash2_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weig
         kFlashNextLaunchers[index](x, weight, out, stream);
     } else if (x.ne[0] == 3072) {
         k122BLaunchers[index](x, weight, out, stream);
+    } else if (x.ne[0] == 2304) {
+        kInklingLaunchers[index](x, weight, out, stream);
     } else {
         throw std::invalid_argument("Q8 DFlash2 LinearSwiGLU small-T: unsupported H");
     }

@@ -49,7 +49,8 @@ struct ScannedModel {
     bool has_proposal        = false; // a proposal head (--lm-head-draft); on Inkling 2 its proposal/token_rank parameter
     bool offloaded_experts   = false;
     bool needs_ngram_volume  = false;
-    bool accepts_draft_model = false; // takes a drafter artifact (--draft-model): Flash-Next's DFlash2, the 27B's DSpine
+    bool accepts_draft_model = false; // --draft-model: a DFlash2 companion (Flash-Next, Inkling 2), DSpine (27B)
+    bool has_draft_companion = false; // a drafter artifact that fits this model lies in the library (drafter_fits)
     std::uint64_t native_context = 0;
     std::uint64_t hidden_size    = 0;
     std::uint64_t num_layers     = 0;

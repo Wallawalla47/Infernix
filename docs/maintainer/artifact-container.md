@@ -264,14 +264,15 @@ checks the mathematical and data requirements of the features selected at startu
 ### 4.3 Companion artifacts
 
 A companion artifact holds optional components of a model without its text: today a
-Qwen3.8-Flash-Next DFlash2 drafter (`components` is `{"dflash2": ...}`), loaded beside any artifact
+Qwen3.8-Flash-Next or an Inkling 2 Mini DFlash2 drafter (`components` is `{"dflash2": ...}`), loaded beside any artifact
 of that model with `--draft-model`. Every component of a companion must declare `"target": "text"`,
 which names the text of the main artifact it is loaded beside rather than a component of its own.
 A Use of a companion may name a parameter it does not bind: one of the target's (the drafter's
 reads of `text/output_head` and `proposal/head` at `dflash2/final_hidden`). The generic reader
 accepts these; the loader checks each one it binds against the main artifact, and the component's
 config records the target identity it was converted for (`target_config`: architectures,
-hidden_size, vocab_size, num_hidden_layers), which the loader compares with the main artifact's text.
+hidden_size, vocab_size, num_hidden_layers, and for Inkling 2 the loop's `visits`), which the loader compares with the
+main artifact's text.
 A companion is materialized in its own device allocation; its objects never alias the main
 artifact's.
 

@@ -23,7 +23,7 @@ int dflash2_conformance() {
     for (int t : {129, 256, 1024}) tokens.push_back(t);
     constexpr std::array graphs{1,  16, 32, 40, 41, 51, 52, 63,  64,
                                 65, 80, 81, 88, 89, 96, 97, 128, 129};
-    // Qwen3.8-27B's drafter, Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's.
+    // Qwen3.8-27B's drafter, Qwen3.8-Flash-Next's, Qwen3.5-122B-A10B's and Inkling 2 Mini's.
     return run_profile("LinearSwiGLU Q8_A16 DFlash2",
                        {QType::Q8_G32_FP16, 34816, 5120, 17408, 1603U, ActivationCompute::A16},
                        tokens, graphs) +
@@ -32,6 +32,9 @@ int dflash2_conformance() {
                        tokens, graphs) +
            run_profile("LinearSwiGLU Q8_A16 122B DFlash2",
                        {QType::Q8_G32_FP16, 18432, 3072, 9216, 1606U, ActivationCompute::A16},
+                       tokens, graphs) +
+           run_profile("LinearSwiGLU Q8_A16 Inkling 2 DFlash2",
+                       {QType::Q8_G32_FP16, 13824, 2304, 6912, 1608U, ActivationCompute::A16},
                        tokens, graphs);
 }
 

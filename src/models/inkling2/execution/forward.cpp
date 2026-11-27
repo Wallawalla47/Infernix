@@ -232,7 +232,7 @@ Forward::Forward(const Parameters& parameters, std::int32_t max_lanes, std::int3
     std::uint8_t* moe_base       = nullptr;
     std::uint8_t* attention_base = nullptr;
     std::uint8_t* guess_base     = nullptr;
-    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value(), activation, a8, window_codec, b_, moe_base, attention_base, guess_base,
+    walk_buffers(c_, max_lanes, capacity, p_.dspark.has_value() || p_.dflash2.has_value(), activation, a8, window_codec, b_, moe_base, attention_base, guess_base,
                  [&](auto*& pointer, std::size_t bytes) {
         slots.emplace_back(reinterpret_cast<void**>(&pointer), at);
         at = align(at + bytes);
@@ -448,7 +448,7 @@ void Forward::stage_window(const StateView& s, const VisitState& vs, bool in, cu
 }
 
 void Forward::tap(std::uint32_t visit, const std::uint16_t* rows, cudaStream_t stream) const {
-    const std::vector<std::uint32_t>& targets = p_.model.config().dspark->target_layer_ids;
+    const std::vector<std::uint32_t>& targets = p_.model.config().draft_taps(); // DSpark's or DFlash2's
     for (std::size_t j = 0; j < targets.size(); ++j) {
         if (targets[j] != visit) { continue; }
         // The rows (the partial block sums entering the visit; the final-normed state for visit == visits()) into

@@ -128,13 +128,60 @@ struct VisionConfig {
     [[nodiscard]] std::uint32_t merged_width() const noexcept { return merge * merge * hidden_size; }
 };
 
+// A DFlash2 drafter of a companion artifact (--spec dflash2 --draft-model; docs/maintainer/dflash.md, design §13.8): the
+// DFlash2 backbone (sliding-window layers with dynamic convolutions over a per-lane context ring) conditioned on the
+// DSpark features (the same visits), drafting from the target's head over the real vocabulary with the conditional
+// candidate selector.
+struct DFlash2Config {
+    std::uint32_t layers       = 0;
+    std::uint32_t heads        = 0;
+    std::uint32_t kv_heads     = 0;
+    std::uint32_t head_dim     = 0;
+    std::uint32_t intermediate = 0;
+    std::uint32_t window       = 0; // the sliding window and context ring capacity
+    float rms_norm_eps         = 0;
+    float rope_theta           = 0; // full-head 1-D RoPE at absolute positions
+    std::uint32_t block_size   = 0; // the trained block: the anchor and block_size - 1 drafts
+    std::uint32_t mask_token_id  = 0;
+    std::uint32_t conv_kernel    = 0;
+    std::uint32_t conv_group     = 0;
+    std::uint32_t selector_rank  = 0;
+    std::uint32_t selector_top_k = 0;
+    // The selector's logit softcap (0: none), on the candidates' logits (before the correction) or on each edge's
+    // corrected score (after it: incoai's Inkling drafter).
+    float softcap               = 0;
+    bool softcap_after_correction = false;
+    // Inputs of these visits (0-based), then the final state (== TextConfig::visits()): DSpark's taps.
+    std::vector<std::uint32_t> target_layer_ids;
+
+    [[nodiscard]] std::uint32_t query_width() const noexcept { return heads * head_dim; }
+    [[nodiscard]] std::uint32_t key_width() const noexcept { return kv_heads * head_dim; }
+    [[nodiscard]] std::uint32_t feature_width(std::uint32_t hidden) const noexcept {
+        return hidden * static_cast<std::uint32_t>(target_layer_ids.size());
+    }
+};
+
 struct Config {
     TextConfig text;
-    std::optional<DSparkConfig> dspark; // the drafter is bound (--spec dspark)
-    std::optional<VisionConfig> vision; // the tower is bound (--vision)
+    std::optional<DSparkConfig> dspark;   // the drafter is bound (--spec dspark)
+    std::optional<DFlash2Config> dflash2; // the companion's drafter is bound (--spec dflash2 --draft-model)
+    std::optional<VisionConfig> vision;   // the tower is bound (--vision)
+
+    // The bound drafter's feature visits (the Forward's taps); empty without one.
+    [[nodiscard]] const std::vector<std::uint32_t>& draft_taps() const noexcept {
+        static const std::vector<std::uint32_t> none;
+        return dspark ? dspark->target_layer_ids : dflash2 ? dflash2->target_layer_ids : none;
+    }
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
+// The DFlash2 companion's config (one dflash2 component, no text), checked against the target it binds to.
+[[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target);
+// Whether `companion` is a DFlash2 drafter of the Inkling 2 model of `target` (the Engine's companion discovery).
+[[nodiscard]] bool dflash2_companion_of(const artifact::Directory& companion, const artifact::Directory& target);
+// Refuses a drafter outside the fused DFlash2 Ops' registered geometry (execution/dflash2.cpp): 5 sliding layers, 32
+// query and 8 KV heads of 128, MLP 6912, window 2048, block 8, two taps of groups of 16, top 16 of rank 256, eps 1e-6.
+void require_dflash2_kernel_geometry(const DFlash2Config& drafter, const TextConfig& text);
 
 // Refuses (ArtifactError) a drafter the DSpark kernels and buffers are not built for: they are fixed to Inkling 2 Mini's
 // (include/infernix/ops/inkling2_dspark.h; execution/dspark.cpp sizes its buffers by those constants and its kernels

@@ -4,6 +4,7 @@
 #include "core/host_memory.h"
 #include "core/vram_budget.h"
 #include "infernix/ops/kernel_images.h"
+#include "models/inkling2/config.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/load.h"
 #include "runtime/engine/diagnostics.h"
@@ -16,7 +17,10 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstddef>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -41,7 +45,8 @@ constexpr const char* kQwenPromptKernel =
     "selects a Qwen3.5 prompt-attention kernel; Inkling 2 has its own prompt route for every KV format";
 constexpr const char* kQwenMedia =
     "sizes the Qwen models' media pipeline; Inkling 2's frontend decodes each image without it";
-constexpr const char* kNoNgrams = "configures n-gram drafting, which Inkling 2 does not have (its drafter is DSpark)";
+constexpr const char* kNoNgrams =
+    "configures n-gram drafting, which Inkling 2 does not have (its drafters are DSpark and a DFlash2 companion)";
 // The idle next-turn prefill's default quiet period (--cache-next-turn-ms; see normalize's note).
 constexpr std::chrono::milliseconds kInkling2NextTurnPrefillQuiet{1000};
 
@@ -89,8 +94,11 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options, s
             .use_cuda_graph  = options.use_cuda_graph,
             .dspark            = options.speculative.backend == SpeculativeBackend::DSpark &&
                       options.purpose == EnginePurpose::Generation,
+            .dflash2           = options.speculative.backend == SpeculativeBackend::DFlash2 &&
+                       options.purpose == EnginePurpose::Generation,
             .draft_tokens      = options.speculative.draft_tokens == 0 ? 7U : options.speculative.draft_tokens,
             .draft_tokens_auto = options.speculative.draft_tokens_auto,
+            .shortlist_head    = options.speculative.proposal_head == ProposalHead::Optimized,
             .expert_a16        = options.expert_a16_activations,
             .a8                = options.a8_activations,
             .lora_rank         = lora_rank,
@@ -208,7 +216,33 @@ bool artifact_has_inkling2_drafter(const artifact::Reader& reader) {
     return reader.directory().components.contains("dspark");
 }
 
-EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter) {
+std::vector<std::filesystem::path> inkling2_dflash2_companions_beside(const std::filesystem::path& artifact_path,
+                                                                      const artifact::Directory& target) {
+    std::vector<std::filesystem::path> out;
+    const std::filesystem::path folder =
+        artifact_path.has_parent_path() ? artifact_path.parent_path() : std::filesystem::path(".");
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
+        const std::filesystem::path& path = it->path();
+        std::string extension             = path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::error_code ignored;
+        if ((extension != ".infernix" && extension != ".ninfer") || !it->is_regular_file(ignored) ||
+            std::filesystem::equivalent(path, artifact_path, ignored)) {
+            continue;
+        }
+        try {
+            const artifact::Reader reader(path); // a continuation part or an unreadable file throws
+            if (models::inkling2::dflash2_companion_of(reader.directory(), target)) { out.push_back(path); }
+        } catch (const std::exception&) {}
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_drafter,
+                                         const std::vector<std::filesystem::path>& dflash2_companions) {
     refuse(options.reference && !options.lossless, "--reference implies --lossless");
     refuse(options.reference && options.kv_cache != KvCacheStorage::BFloat16,
            "the design reference is built for --kv-dtype bf16 only (V stored as FP16); the coded formats are not yet");
@@ -349,15 +383,15 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     // The resolved options carry 0 (below), and a start from them is the same start.
     refuse_option(asked.ngram_session_bytes != defaults.ngram_session_bytes && asked.ngram_session_bytes != 0,
                   "--ngram-session-mib", kNoNgrams);
-    refuse_option(!asked.draft_model.empty(), "--draft-model",
-                  "names Qwen3.8-Flash-Next's DFlash2 companion; Inkling 2's drafter is the artifact's DSpark component");
+    refuse_option(!asked.draft_model.empty() && asked.backend != SpeculativeBackend::DFlash2 && !asked.backend_auto,
+                  "--draft-model", "names the DFlash2 drafter's companion artifact (--spec dflash2 or --spec auto)");
     refuse_option(asked.draft_min_p.has_value(), "--spec-min-p",
-                  "tunes MTP and DFlash2 rounds; DSpark drafts --draft-tokens");
+                  "tunes the Qwen families' rounds; Inkling 2's drafters draft --draft-tokens");
     refuse(asked.draft_tree_auto ||
                std::any_of(asked.draft_tree_nodes.begin(), asked.draft_tree_nodes.end(),
                            [](std::uint32_t nodes) { return nodes != 0; }) ||
                asked.draft_tree_paths != defaults.draft_tree_paths,
-           "DSpark verifies its drafts as a chain (no --draft-tree-nodes or --draft-tree-paths)");
+           "Inkling 2's drafters verify their drafts as a chain (no --draft-tree-nodes or --draft-tree-paths)");
     refuse(options.max_context_auto && options.purpose != EnginePurpose::Generation,
            "--max-context auto sizes a generation server: causal scoring takes N");
     refuse(options.max_concurrency == 0 || options.max_concurrency > models::inkling2::kMaximumConcurrency,
@@ -449,29 +483,55 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
         } else if (options.lossless || options.reference) {
             spec.backend = SpeculativeBackend::None;
             report(options, "Inkling 2: --spec auto: no speculation on the lossless and reference routes");
+        } else if (!spec.draft_model.empty()) {
+            // The DFlash2 companion --draft-model names: the drafter asked for.
+            spec.backend = SpeculativeBackend::DFlash2;
+            report(options, "Inkling 2: --spec auto drafts with the DFlash2 companion " +
+                                spec.draft_model.filename().string() + " (--draft-model, --draft-tokens auto)");
         } else if (bundled_drafter) {
+            // The bundled DSpark drafter before a companion beside the artifact: DFlash2 drafts faster on short contexts
+            // but lost the agentic replay to DSpark (wall +2.4 % over three seeds, 2026-11-27; docs/inkling2-mini.md).
             spec.backend = SpeculativeBackend::DSpark;
-            report(options, "Inkling 2: --spec auto drafts with the bundled DSpark drafter (--draft-tokens auto)");
+            report(options, std::string("Inkling 2: --spec auto drafts with the bundled DSpark drafter (--draft-tokens "
+                                        "auto)") +
+                                (dflash2_companions.empty() ? ""
+                                                            : "; a DFlash2 companion beside the artifact drafts with "
+                                                              "--draft-model FILE"));
+        } else if (dflash2_companions.size() == 1) {
+            // No bundled drafter: the one DFlash2 companion beside the artifact (faster than plain decoding).
+            spec.backend      = SpeculativeBackend::DFlash2;
+            spec.draft_model  = dflash2_companions.front();
+            report(options, "Inkling 2: --spec auto drafts with the DFlash2 companion " +
+                                spec.draft_model.filename().string() + " beside the artifact (--draft-tokens auto)");
+        } else if (dflash2_companions.size() > 1) {
+            spec.backend = SpeculativeBackend::None;
+            report(options, "Inkling 2: --spec auto: no drafter (the artifact bundles none and several DFlash2 "
+                            "companions lie beside it: name one with --draft-model)");
         } else {
             spec.backend = SpeculativeBackend::None;
-            report(options, "Inkling 2: --spec auto: the artifact bundles no drafter (convert with --components text,dspark)");
+            report(options, "Inkling 2: --spec auto: no drafter (the artifact bundles none and no DFlash2 companion lies "
+                            "beside it; convert with --components text,dspark, or --components dflash2)");
         }
     }
-    if (spec.backend == SpeculativeBackend::DSpark) {
-        refuse(options.purpose != EnginePurpose::Generation, "DSpark drafts for generation only");
-        refuse(options.lossless, "--lossless has no speculation (no --spec dspark)");
+    if (spec.backend == SpeculativeBackend::DSpark || spec.backend == SpeculativeBackend::DFlash2) {
+        const bool dflash2 = spec.backend == SpeculativeBackend::DFlash2;
+        refuse(options.purpose != EnginePurpose::Generation, "Inkling 2's drafters draft for generation only");
+        refuse(options.lossless, "--lossless has no speculation (no --spec dspark or dflash2)");
+        refuse(dflash2 && spec.draft_model.empty(), "--spec dflash2 needs the drafter's companion (--draft-model FILE)");
         if (spec.draft_tokens_auto) {
             if (spec.draft_tokens == 0 || spec.draft_tokens > 7) { spec.draft_tokens = 7; } // the block less its anchor
         } else {
-            refuse(spec.draft_tokens == 0 || spec.draft_tokens > 7, "--spec dspark drafts 1-7 tokens a round");
+            refuse(spec.draft_tokens == 0 || spec.draft_tokens > 7, "Inkling 2's drafters draft 1-7 tokens a round");
         }
     } else if (spec.backend != SpeculativeBackend::None) {
-        throw std::invalid_argument("Inkling 2's drafter is DSpark (--spec dspark)");
+        refuse(true, "--spec drafts with DSpark (--spec dspark) or a DFlash2 companion (--spec dflash2 --draft-model FILE)");
+    } else {
+        spec.draft_model.clear();
     }
     refuse_option(options.purpose == EnginePurpose::Generation && spec.proposal_head == ProposalHead::Optimized &&
-                      spec.backend != SpeculativeBackend::DSpark,
-                  "--lm-head-draft", "shortlists DSpark's drafts: this start runs no drafter (--spec auto finds none "
-                  "bundled, or the route has no speculation)");
+                      spec.backend != SpeculativeBackend::DSpark && spec.backend != SpeculativeBackend::DFlash2,
+                  "--lm-head-draft", "shortlists the drafts: this start runs no drafter (--spec auto finds none, or the "
+                  "route has no speculation)");
     options.speculative.ngram_session_bytes = 0;
     return options;
 }
@@ -775,6 +835,15 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         signature += ";a16=" + std::to_string(options.expert_a16_activations ? 1 : 0);
         signature += ";vision=" + std::to_string(options.enable_vision ? 1 : 0);
         signature += ";window=" + std::to_string(static_cast<int>(program.window_codec)); // the windows' storage
+        // A DFlash2 drafter's rings ride in every snapshot: they belong to that companion artifact.
+        if (const auto& draft = instance->model->info().draft_artifact_id) {
+            signature += ";draft=";
+            for (const std::byte byte : *draft) {
+                constexpr char kHex[] = "0123456789abcdef";
+                signature += kHex[std::to_integer<unsigned>(byte) >> 4U];
+                signature += kHex[std::to_integer<unsigned>(byte) & 15U];
+            }
+        }
         const runtime::prefix_cache::PersistResult loaded = instance->program->attach_prefix_cache_file(
             options.context_cache.hybrid.persistent_file, hybrid_cache_fingerprint(options, signature, device.props),
             options.startup_observer);

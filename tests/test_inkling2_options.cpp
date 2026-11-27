@@ -9,6 +9,7 @@
 #include "serve/serve_options.h"
 
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -46,11 +47,14 @@ std::string joined(const std::vector<std::string>& arguments) {
 struct Start {
     std::string error;                // the first refusal, or empty
     std::vector<std::string> reports; // the Engine's Info diagnostics
+    SpeculativeOptions speculative;   // the drafter the Engine resolved
 };
 
 // An infernix-serve start's option checks, in its order: the parser, the Engine's (twice: the options it resolves
-// start the same start), and the server's once the model is known.
-Start start(const std::vector<std::string>& arguments, bool bundled_drafter = true) {
+// start the same start), and the server's once the model is known. `companions`: the DFlash2 companions beside the
+// artifact (runtime::inkling2_dflash2_companions_beside's).
+Start start(const std::vector<std::string>& arguments, bool bundled_drafter = true,
+            const std::vector<std::filesystem::path>& companions = {}) {
     Start out;
     try {
         const serve::ServeOptions options = parse(arguments);
@@ -58,7 +62,8 @@ Start start(const std::vector<std::string>& arguments, bool bundled_drafter = tr
         engine.diagnostic_observer.callback = [&out](const Diagnostic& diagnostic) {
             out.reports.emplace_back(diagnostic.message);
         };
-        const EngineOptions resolved = runtime::normalize_inkling2_options(std::move(engine), bundled_drafter);
+        const EngineOptions resolved = runtime::normalize_inkling2_options(std::move(engine), bundled_drafter, companions);
+        out.speculative              = resolved.speculative;
         (void)runtime::normalize_inkling2_options(resolved, bundled_drafter);
         serve::refuse_unsupported_options(options, kInkling);
     } catch (const std::exception& error) { out.error = error.what(); }
@@ -105,8 +110,9 @@ void test_refused_options() {
     refused({"--expert-state", "experts.state"}, "--expert-state");
     refused({"--expert-stripe", "experts.stripe"}, "--expert-stripe");
     refused({"--route-trace", "routes.trace"}, "--route-trace");
-    // Speculation: DSpark drafts a chain from the artifact's own component.
-    refused({"--draft-model", "companion.infernix"}, "--draft-model");
+    // Speculation: DSpark (the artifact's own component) or a DFlash2 companion (--draft-model) drafts a chain.
+    refused({"--spec", "dflash2", "--draft-tokens", "auto"}, "--draft-model");
+    refused({"--spec", "mtp", "--draft-tokens", "auto"}, "--spec");
     refused({"--draft-tree-paths", "4"}, "--draft-tree-paths");
     refused({"--ngram-residency", "ram"}, "--ngram-residency");
     refused({"--ngram-min-match", "8"}, "--ngram-min-match");
@@ -211,6 +217,34 @@ void test_accepted_starts() {
               "a KV capacity below one request's context is refused: " + engine_error(small));
     }
     accepted({"--lm-head-draft"});
+    // A DFlash2 companion: named with --spec dflash2 or --spec auto (which then takes it over the bundled DSpark), with
+    // and without --lm-head-draft and a bundled drafter. Beside the artifact unnamed, --spec auto keeps the bundled
+    // DSpark drafter (it won the agentic replay) and takes the companion only where the artifact bundles none, one
+    // companion and not several.
+    {
+        const std::vector<std::filesystem::path> one{"companion.infernix"};
+        const std::vector<std::filesystem::path> two{"a.infernix", "b.infernix"};
+        const Start bundled = start({"--lm-head-draft"}, true, one);
+        check(bundled.error.empty() && bundled.speculative.backend == SpeculativeBackend::DSpark &&
+                  bundled.speculative.draft_model.empty(),
+              "--spec auto keeps the bundled DSpark drafter beside a companion: " + bundled.error);
+        const Start alone = start({}, false, one);
+        check(alone.error.empty() && alone.speculative.backend == SpeculativeBackend::DFlash2 &&
+                  alone.speculative.draft_model == one.front(),
+              "--spec auto takes the one companion where the artifact bundles no drafter: " + alone.error);
+        const Start several = start({}, false, two);
+        check(several.error.empty() && several.speculative.backend == SpeculativeBackend::None,
+              "--spec auto takes none of several companions: " + several.error);
+    }
+    accepted({"--spec", "dflash2", "--draft-tokens", "auto", "--draft-model", "companion.infernix"});
+    accepted({"--spec", "dflash2", "--draft-tokens", "7", "--draft-model", "companion.infernix", "--lm-head-draft"},
+             false);
+    {
+        const Start chosen = start({"--draft-model", "companion.infernix", "--lm-head-draft"});
+        bool dflash2 = false;
+        for (const std::string& line : chosen.reports) { dflash2 = dflash2 || line.find("DFlash2 companion") != std::string::npos; }
+        check(chosen.error.empty() && dflash2, "--spec auto takes the --draft-model DFlash2 companion: " + chosen.error);
+    }
     accepted({"--vision", "--vision-max-merged", "4096"});
     accepted({"--vision-max-merged", "32768"}); // the default, given
     accepted({"--end-in-thinking", "allow"});

@@ -121,7 +121,7 @@ struct ForwardBuffers {
     // words), then W_o's and the head's over the same memory; null without a8.
     std::int32_t* x8 = nullptr;
     std::uint16_t* final_hidden = nullptr;
-    // DSpark's context features (--spec dspark): each column's partial block sums entering the drafter's target visits
+    // The drafter's context features (--spec dspark or dflash2): each column's partial block sums entering its target visits
     // (5, 23, 41) and its final-normed state, BF16 [columns][4][H]; null without the drafter.
     std::uint16_t* features = nullptr;
     float* logits = nullptr;          // [columns][V]

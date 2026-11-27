@@ -22,8 +22,11 @@ constexpr const char* kPrepareOp   = "dynamic grouped conv prepare";
 constexpr const char* kAddOp       = "linear dynamic grouped conv add";
 
 // The registered hidden widths: Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
-// The DFlash2 drafters: Qwen3.8-27B's (5120), Qwen3.8-Flash-Next's (2560), Qwen3.5-122B-A10B's (3072).
-bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560 || hidden == 3072; }
+// The DFlash2 drafters: Qwen3.8-27B's (5120), Qwen3.8-Flash-Next's (2560), Qwen3.5-122B-A10B's (3072),
+// Inkling 2 Mini's (2304).
+bool registered_hidden(std::int32_t hidden) {
+    return hidden == 5120 || hidden == 2560 || hidden == 3072 || hidden == 2304;
+}
 std::int32_t groups(std::int32_t hidden) { return hidden / kGroupWidth; }
 std::int32_t coefficient_rows(std::int32_t hidden) { return groups(hidden) * kTaps * kSides; }
 
@@ -64,6 +67,15 @@ std::uint64_t required_q8_payload_bytes(std::int32_t hidden, std::int32_t input_
 
 void require_finish_projection_weight(const Weight& weight, std::int32_t hidden,
                                       std::int32_t input_rows) {
+    if (weight.qtype == QType::NVFP4) {
+        // An NVFP4 parent where its linear shape is registered (Inkling 2 Mini's drafter's MLP down); the NVFP4 linear
+        // checks its planes.
+        if (!detail::nvfp4_parent_registered(hidden, input_rows) || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
+            weight.ndim != 2 || weight.n != hidden || weight.k != input_rows) {
+            throw std::invalid_argument("linear dynamic grouped conv add: invalid NVFP4 projection_weight");
+        }
+        return;
+    }
     const std::uint64_t payload_bytes = required_q8_payload_bytes(hidden, input_rows);
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
@@ -127,7 +139,7 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     const std::int32_t batch_size = residual.ne[2];
     const std::int32_t width      = residual.ne[1];
     if (!registered_hidden(hidden)) {
-        throw std::invalid_argument("dynamic grouped conv prepare: H must be 5120, 2560 or 3072");
+        throw std::invalid_argument("dynamic grouped conv prepare: H must be 5120, 2560, 3072 or 2304");
     }
     if (width < 2 || width > 16) {
         throw std::invalid_argument("dynamic grouped conv prepare: W must be in [2,16]");
@@ -169,9 +181,9 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
-    std::int32_t min_batch_size, std::int32_t max_batch_size) {
+    std::int32_t min_batch_size, std::int32_t max_batch_size, QType qtype) {
     return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        hidden, input_rows, min_width, max_width, min_batch_size, max_batch_size);
+        hidden, input_rows, min_width, max_width, min_batch_size, max_batch_size, qtype);
 }
 
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
@@ -186,9 +198,11 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
         throw std::invalid_argument("linear dynamic grouped conv add: W must be in [2,16]");
     if (!(hidden == 5120 && (input_rows == 4096 || input_rows == 17408)) &&
         !(hidden == 2560 && (input_rows == 4096 || input_rows == 7680)) &&
-        !(hidden == 3072 && (input_rows == 4096 || input_rows == 9216))) {
+        !(hidden == 3072 && (input_rows == 4096 || input_rows == 9216)) &&
+        !(hidden == 2304 && (input_rows == 4096 || input_rows == 6912))) {
         throw std::invalid_argument(
-            "linear dynamic grouped conv add: (H, C) must be (5120, 4096|17408), (2560, 4096|7680) or (3072, 4096|9216)");
+            "linear dynamic grouped conv add: (H, C) must be (5120, 4096|17408), (2560, 4096|7680), (3072, 4096|9216) "
+            "or (2304, 4096|6912)");
     }
     if (batch_size < 1 || batch_size > 8) {
         throw std::invalid_argument("linear dynamic grouped conv add: B must be in [1,8]");
@@ -199,10 +213,12 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                    "finish_delta");
     require_tensor(residual, DType::BF16, hidden, width, batch_size, 1, kAddOp, "residual");
     require_finish_projection_weight(projection_weight, hidden, input_rows);
-    const std::size_t code_bytes =
-        static_cast<std::size_t>(hidden) * static_cast<std::size_t>(input_rows);
-    const std::size_t scale_bytes = static_cast<std::size_t>(hidden) *
-                                    static_cast<std::size_t>(input_rows / 32) * sizeof(std::uint16_t);
+    // The planes' bytes: Q8 codes and an FP16 scale per 32, or NVFP4 E2M1 codes and an E4M3 scale per 16.
+    const bool nvfp4 = projection_weight.qtype == QType::NVFP4;
+    const std::size_t values     = static_cast<std::size_t>(hidden) * static_cast<std::size_t>(input_rows);
+    const std::size_t code_bytes = nvfp4 ? values / 2 : values;
+    const std::size_t scale_bytes =
+        nvfp4 ? values / 16 : static_cast<std::size_t>(hidden) * static_cast<std::size_t>(input_rows / 32) * sizeof(std::uint16_t);
     require_disjoint(std::array<Range, 7>{{
                          {x.data, x.bytes(), "x"},
                          {projection_weight.qdata, code_bytes, "projection codes"},

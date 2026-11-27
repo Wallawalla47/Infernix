@@ -42,7 +42,7 @@ struct ContextKVMaterializeExecutionEnvelope {
  * caches (one per entry of `layers`).
  *
  * context is contiguous BF16 [H,W,B] with H=5120 (Qwen3.8-27B's DFlash2), H=2560
- * (Qwen3.8-Flash-Next's) or H=3072 (Qwen3.5-122B-A10B's), positions is contiguous device I32
+ * (Qwen3.8-Flash-Next's), H=3072 (Qwen3.5-122B-A10B's) or H=2304 (Inkling 2 Mini's), positions is contiguous device I32
  * [W,B], and counts and state_slots
  * are contiguous device I32 [B]. The registered domains are context blocks W=1..64,B=1..8 and
  * single-request prefill B=1,W=1..2048. W is the physical context width, independent of the draft

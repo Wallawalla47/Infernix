@@ -142,9 +142,11 @@ Thinking Machines' looped 24-layer model (48 layer visits a token), resident in 
   8 bits, and `--q8-weights` makes only the attention projections and head 8-bit weights, leaving about
   770 MiB more VRAM for the KV cache. Both change the output slightly
   ([measured quality](docs/inkling2-mini.md#routes-and-precision)).
-- **DSpark drafting** with the model's own drafter, and an optional shortlist (`--lm-head-draft`) built
-  from a token ranking I measured with Inkling itself. Verification decides every token, so the output
-  does not change.
+- **DSpark drafting** with the model's own drafter, or **DFlash2 drafting** with incoai's drafter as a companion
+  artifact (faster than DSpark on short prompts, slower on long contexts and in agentic use, and 9 % more KV
+  capacity: [measured](docs/inkling2-mini.md#speed-and-memory-against-dspark)), each with an optional shortlist
+  (`--lm-head-draft`) built from a token ranking I measured with Inkling itself. Verification decides every
+  token, so the output does not change.
 - **Images, one to eight lanes, every KV format, the prefix cache** and the lossless route. With
   `--kv-dtype int8` (recommended) the 40 sliding-window visits store their windows in 8 bits as well.
 - **Not yet**: video, assistant prefill, n-gram drafting and `/v1/decide`'s generated number types
@@ -173,9 +175,10 @@ Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
 
 ### And also
 
-- **Speculative decoding**: MTP, DFlash, DFlash2, DSpine (Qwen3.8-27B), DSpark (Inkling 2 Mini) and
-  n-gram drafting with exact sampling, on by default with the drafter measured fastest for each model
-  (`--spec auto`; DSpine runs only when named, `--spec dspine --draft-model FILE`).
+- **Speculative decoding**: MTP, DFlash, DFlash2 (Inkling 2 Mini's as a companion artifact), DSpine
+  (Qwen3.8-27B), DSpark (Inkling 2 Mini) and n-gram drafting with exact sampling, on by default with the
+  drafter measured fastest for each model (`--spec auto`; DSpine runs only when named, `--spec dspine
+  --draft-model FILE`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video (Inkling 2 Mini: images only); the vision encoder can stay in system
   RAM.
@@ -722,7 +725,7 @@ drafter flags are the fastest measured overall, and `auto` picks the draft lengt
 | Qwen3.6-35B-A3B | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length, 1-5 (DFlash `auto` is faster only on code at one request) |
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
-| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft` | the calibrated number of drafts, up to 7; requests decoding together draft together, the round's drafts shared out by how likely each request's are to be accepted |
+| Inkling 2 Mini | `--spec dspark --draft-tokens auto --lm-head-draft`; for short prompts, with the [DFlash2 companion](docs/inkling2-mini.md#dflash2-drafting) converted, `--spec dflash2 --draft-model Inkling-2-Mini-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft` | the calibrated number of drafts, up to 7; requests decoding together draft together, the round's drafts shared out by how likely each request's are to be accepted. DFlash2 ran 15-27 % faster than DSpark one request at a time on short prompts and 16-19 % at four and eight requests, but 7 % slower on a 122K-token prefix and 2.4 % slower over the agentic replay (wall time, three seeds) |
 
 For long conversations on the 27Bs, whose KV cache two long conversations outgrow, add `--embedding-host`:
 the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes

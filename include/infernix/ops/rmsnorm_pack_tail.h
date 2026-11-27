@@ -11,8 +11,9 @@ namespace infernix::ops {
  * them into one dense matrix.
  *
  * @details `input` is contiguous BF16 `[H,W,B]`, `weight` is contiguous BF16 `[H]`, and
- * `output` is contiguous BF16 `[H,(W-1)B]`, for H = 5120 (Qwen3.8-27B's DFlash2) or 2560
- * (Qwen3.8-Flash-Next's), `W` in `[2,16]` and `B` in `[1,8]`. Dimension
+ * `output` is contiguous BF16 `[H,(W-1)B]`, for H = 5120 (Qwen3.8-27B's DFlash2), 2560
+ * (Qwen3.8-Flash-Next's), 3072 (Qwen3.5-122B-A10B's) or 2304 (Inkling 2 Mini's), `W` in `[2,16]` and
+ * `B` in `[1,8]`. Dimension
  * zero is stored fastest. For `b in [0,B)` and `i in [1,W-1]`, the ideal result is
  *
  * @f[

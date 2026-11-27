@@ -8,7 +8,7 @@
 // deepest cached state of its ledger and replays the rest exactly (advance_replay: the prompt route below the prompt's
 // end, the decode route past it, as they first ran). The n-gram archive and next-turn prefill are off for this
 // architecture. Prompts prefill in chunks of one lane; decode rounds are B lanes x 1 column as CUDA graphs per (B, T)
-// captured at startup, and one decoding lane drafts with DSpark. A constrained row (constrained-decoding.md §4.4) samples under its matcher's masks, filled while its
+// captured at startup, and decoding lanes draft with DSpark or a DFlash2 companion. A constrained row (constrained-decoding.md §4.4) samples under its matcher's masks, filled while its
 // call's forward runs (a forward-only graph, then the sample); a token-constrained row (TokenConstraint, /v1/decide)
 // decodes plainly, its logits masked to its step's tokens before the sample (ops::constrain_logits).
 
@@ -317,9 +317,14 @@ struct ProgramOptions {
     // --spec dspark (the drafter bound in the Parameters): a decode round of one row drafts draft_tokens (1-7) and
     // verifies all of them, or (draft_tokens_auto) the count their calibrated probabilities make worth it.
     bool dspark                 = false;
+    // --spec dflash2 --draft-model (the companion's drafter bound in the Parameters; execution/dflash2.h): the same
+    // rounds, each drafting its whole block of 7 (DSpark's KV-page planes and tables are not built).
+    bool dflash2                = false;
     std::uint32_t draft_tokens  = 7;
     bool draft_tokens_auto      = true;
     // --a16-activations: the routed experts on 16-bit activations (w4a4_sparse_moe.h's ExpertActivation::A16).
+    // --lm-head-draft: the drafts read the shortlist head (DFlash2's workspace holds its logits, not the vocabulary's).
+    bool shortlist_head         = false;
     bool expert_a16             = false;
     // --a8-activations (with the 8-bit weights it implies): 8-bit activations in the attention projections, the head
     // and the NVFP4 layers' routed experts, in every call (Forward's a8; the experts' ExpertActivation::A8).

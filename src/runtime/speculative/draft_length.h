@@ -59,19 +59,20 @@ struct DraftCalibration {
 }
 
 // The number of drafts, in [0, most], a one-row round verifies: maximizing expected_draft_tokens
-// / (1 + proposal + per_draft * k), costs in plain one-row rounds. k = 0 verifies nothing: the
-// proposal's cost is already spent, so a draft is kept whenever it pays for its own verification
-// column.
+// / (1 + proposal + verify + per_draft * k), costs in plain one-row rounds (`verify`: a verify
+// call's fixed cost beyond a plain round, k >= 1 only). k = 0 verifies nothing: the proposal's
+// cost is already spent, so a draft is kept whenever it pays for its own verification column.
 [[nodiscard]] inline std::int32_t calibrated_draft_length(const DraftCalibration& calibration,
                                                           std::span<const float> probabilities, std::int32_t most,
-                                                          double per_draft, double proposal) noexcept {
+                                                          double per_draft, double proposal,
+                                                          double verify = 0.0) noexcept {
     std::int32_t best = 0;
     double best_score = 1.0 / (1.0 + proposal), reach = 1.0, tokens = 1.0;
     const auto limit = std::min<std::int32_t>(most, static_cast<std::int32_t>(probabilities.size()));
     for (std::int32_t k = 1; k <= limit; ++k) {
         reach *= calibration.accept[DraftCalibration::bin(probabilities[static_cast<std::size_t>(k - 1)])];
         tokens += reach;
-        const double score = tokens / (1.0 + proposal + per_draft * k);
+        const double score = tokens / (1.0 + proposal + verify + per_draft * k);
         if (score > best_score) {
             best_score = score;
             best       = k;

@@ -49,22 +49,27 @@ std::vector<std::int32_t> draft_head_ids(std::span<const std::int32_t> rank) {
 }
 
 std::uint64_t draft_head_bytes(std::int32_t rows, std::int32_t hidden, std::int32_t markov_rank) {
-    return align_256(ops::q8_g32_bytes(rows, hidden)) + align_256(ops::q8_g32_bytes(rows, markov_rank)) +
-           align_256(static_cast<std::size_t>(rows) * 2) + align_256(static_cast<std::size_t>(rows) * 4);
+    const std::uint64_t fold = markov_rank == 0 ? 0
+                                                : align_256(ops::q8_g32_bytes(rows, markov_rank)) +
+                                                      align_256(static_cast<std::size_t>(rows) * 2);
+    return align_256(ops::q8_g32_bytes(rows, hidden)) + fold + align_256(static_cast<std::size_t>(rows) * 4);
 }
 
-DraftHead build_draft_head(const Weight& head, const Weight& fold, const std::uint16_t* fold_bias,
+DraftHead build_draft_head(const Weight& head, const Weight* fold, const std::uint16_t* fold_bias,
                            std::span<const std::int32_t> token_ids, DeviceContext& device) {
     const auto is_bf16 = [](const Weight& w) {
         return w.qdata != nullptr && w.qtype == QType::BF16 && w.layout == QuantLayout::Contiguous;
     };
-    if (!is_bf16(head) || !is_bf16(fold) || fold_bias == nullptr || token_ids.empty() || head.n != fold.n) {
-        throw std::invalid_argument("inkling2 draft head: the BF16 target head, Fold and fold_bias of one vocabulary");
+    if (!is_bf16(head) || token_ids.empty() ||
+        (fold != nullptr && (!is_bf16(*fold) || fold_bias == nullptr || head.n != fold->n))) {
+        throw std::invalid_argument("inkling2 draft head: the BF16 target head (and the Fold and fold_bias) of one "
+                                    "vocabulary");
     }
     const auto rows = static_cast<std::int32_t>(token_ids.size());
-    const std::int32_t H = head.k, rank = fold.k;
-    const std::size_t head_bytes = align_256(ops::q8_g32_bytes(rows, H)), fold_bytes = align_256(ops::q8_g32_bytes(rows, rank));
-    const std::size_t bias_bytes = align_256(static_cast<std::size_t>(rows) * 2);
+    const std::int32_t H = head.k, rank = fold != nullptr ? fold->k : 0;
+    const std::size_t head_bytes = align_256(ops::q8_g32_bytes(rows, H));
+    const std::size_t fold_bytes = rank == 0 ? 0 : align_256(ops::q8_g32_bytes(rows, rank));
+    const std::size_t bias_bytes = rank == 0 ? 0 : align_256(static_cast<std::size_t>(rows) * 2);
 
     DraftHead out;
     out.rows    = rows;
@@ -79,21 +84,23 @@ DraftHead build_draft_head(const Weight& head, const Weight& fold, const std::ui
     const std::size_t head_words = align_256(static_cast<std::size_t>(rows) * H * 2);
     DeviceBuffer scratch(head_words + align_256(static_cast<std::size_t>(rows) * rank * 2));
     auto* bf16_head = static_cast<std::uint16_t*>(scratch.p);
-    auto* bf16_fold = reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(scratch.p) + head_words);
     namespace ik    = ops::inkling2;
     ik::dspark_gather_rows(static_cast<const std::uint16_t*>(head.qdata), H, ids, rows, bf16_head, device.stream);
-    ik::dspark_gather_rows(static_cast<const std::uint16_t*>(fold.qdata), rank, ids, rows, bf16_fold, device.stream);
-    ik::dspark_gather_rows(fold_bias, 1, ids, rows, bias, device.stream);
     const std::size_t head_codes = static_cast<std::size_t>(rows) * ops::q8_g32_padded_columns(H);
-    const std::size_t fold_codes = static_cast<std::size_t>(rows) * ops::q8_g32_padded_columns(rank);
     out.head = ops::quantize_bf16_q8_g32(bf16_matrix(bf16_head, rows, H), q_head, q_head + head_codes, device.stream);
-    const Weight q8_fold =
-        ops::quantize_bf16_q8_g32(bf16_matrix(bf16_fold, rows, rank), q_fold, q_fold + fold_codes, device.stream);
+    if (fold != nullptr) {
+        auto* bf16_fold = reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(scratch.p) + head_words);
+        ik::dspark_gather_rows(static_cast<const std::uint16_t*>(fold->qdata), rank, ids, rows, bf16_fold, device.stream);
+        ik::dspark_gather_rows(fold_bias, 1, ids, rows, bias, device.stream);
+        const std::size_t fold_codes = static_cast<std::size_t>(rows) * ops::q8_g32_padded_columns(rank);
+        const Weight q8_fold =
+            ops::quantize_bf16_q8_g32(bf16_matrix(bf16_fold, rows, rank), q_fold, q_fold + fold_codes, device.stream);
+        out.fold_codes  = static_cast<const std::int8_t*>(q8_fold.qdata);
+        out.fold_scales = static_cast<const std::uint16_t*>(q8_fold.scales);
+        out.fold_bias   = bias;
+    }
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
-    out.fold_codes  = static_cast<const std::int8_t*>(q8_fold.qdata);
-    out.fold_scales = static_cast<const std::uint16_t*>(q8_fold.scales);
-    out.fold_bias   = bias;
-    out.token_ids   = ids;
+    out.token_ids = ids;
     return out;
 }
 

@@ -25,4 +25,7 @@ extern const Nvfp4LinearShape kNvfp4N248320K5120;
 // projection), A16 only.
 extern const Nvfp4LinearShape kNvfp4N5120K4096;
 extern const Nvfp4LinearShape kNvfp4N5120K25600;
+// Inkling 2 Mini's DFlash2 drafter's NVFP4 MLP (gate/up, down), A16 only.
+extern const Nvfp4LinearShape kNvfp4N13824K2304;
+extern const Nvfp4LinearShape kNvfp4N2304K6912;
 } // namespace infernix::ops::detail

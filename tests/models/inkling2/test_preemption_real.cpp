@@ -24,6 +24,7 @@
 //   INFERNIX_INKLING2_ONLY_CANCEL_CASE                                    run 8 alone
 
 #include "infernix/engine.h"
+#include "models/inkling2/drafter_choice.h"
 #include "models/inkling2/program/test_taps.h"
 
 #include <algorithm>
@@ -70,7 +71,8 @@ infernix::EngineOptions options_for(const std::filesystem::path& artifact, std::
     options.a8_activations       = setup.a8;
     options.context_cache.enabled             = setup.cache;
     options.context_cache.host_capacity_bytes = setup.cache ? std::size_t{8} << 30U : 0U;
-    options.speculative.backend = setup.dspark ? infernix::SpeculativeBackend::DSpark : infernix::SpeculativeBackend::None;
+    options.speculative.backend = infernix::SpeculativeBackend::None;
+    if (setup.dspark) { infernix::test::inkling2::use_drafter(options.speculative); } // DSpark or the DFlash2 companion
     options.speculative.draft_tokens      = 7;
     options.speculative.draft_tokens_auto = true;
     options.diagnostic_observer.callback = [](const infernix::Diagnostic& d) {

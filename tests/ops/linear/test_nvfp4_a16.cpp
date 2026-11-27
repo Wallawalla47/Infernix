@@ -35,9 +35,14 @@ int run_nvfp4_a16() {
                           {5120, 4096, 711U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 25600, 713U, Comparison::Sampled, true, invocations});
+    // Inkling 2 Mini's DFlash2 drafter's NVFP4 MLP (K = 2304 and 6912: sliced-K blocks of 256).
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {13824, 2304, 715U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2304, 6912, 717U, Comparison::Sampled, true, invocations});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{5120, 6144}, std::pair{5120, 17408}, std::pair{5120, 4096},
-                        std::pair{5120, 25600}}) {
+                        std::pair{5120, 25600}, std::pair{13824, 2304}, std::pair{2304, 6912}}) {
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
     return failures;

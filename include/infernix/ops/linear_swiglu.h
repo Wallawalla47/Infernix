@@ -61,6 +61,7 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *     at T <= 16 a column's result does not depend on T);
  *   - Q8_G32_FP16 weight [34816,5120], x [5120,T], out [17408,T];
  *   - Q8_G32_FP16 weight [15360,2560], x [2560,T], out [7680,T] (Qwen3.8-Flash-Next's DFlash2 MLP);
+ *   - Q8_G32_FP16 weight [13824,2304], x [2304,T], out [6912,T] (Inkling 2 Mini's DFlash2 MLP);
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
  *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T];
  *   - FP8_E4M3FN_ROW_F32 RowScale weight [2048,3072], x [3072,T], out [1024,T] (Qwen3.5-122B-A10B's

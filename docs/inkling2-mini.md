@@ -9,7 +9,7 @@ tower and a token-frequency ranking for `--lm-head-draft`. The conversion is bit
 checkpoint's weights are unchanged ([what is stored](#what-the-artifact-stores)).
 
 Generation works through `infernix` and `infernix-serve` (OpenAI Chat Completions and Responses,
-Anthropic Messages) with DSpark drafting, images, one to eight lanes, every KV format and the prefix
+Anthropic Messages) with DSpark or [DFlash2](#dflash2-drafting) drafting, images, one to eight lanes, every KV format and the prefix
 cache, and [constrained output and tool calls](#constrained-output-and-tool-calls).
 `infernix-perplexity` scores it, on the default route or with `--lossless`, and `infernix-serve` answers
 [`/v1/decide`](serving.md#decisions)'s readout questions (each prompt ends with the answer's opener, so the model answers
@@ -31,7 +31,7 @@ of the Qwen models are [not available on Inkling yet](#not-supported-yet), among
 | Attention | 20 sliding-window layers (1,024 tokens) and 4 full-attention layers |
 | Hidden size, vocabulary | 2,304; 200,058 assigned tokens |
 | Context | up to 1,048,576 tokens |
-| Drafter | DSpark (3 layers, blocks of 8: up to 7 drafts a round) |
+| Drafter | DSpark (3 layers, blocks of 8: up to 7 drafts a round), bundled; or incoai's DFlash2 drafter (5 layers, blocks of 8) as a [companion artifact](#dflash2-drafting) |
 | Input | text and images (no video) |
 | License | Apache 2.0, with Thinking Machines' [Model Acceptable Use Policy](https://thinkingmachines.ai/model-acceptable-use-policy/) linked from its card |
 
@@ -67,7 +67,10 @@ infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtyp
 - `--kv-dtype int8` stores the KV cache, the sliding windows included, in 8 bits: about half the memory
   of the default `bf16`, for slightly different output ([KV formats](#kv-formats)). `--kv-window-dtype`
   chooses the sliding windows' format on its own.
-- `--spec dspark --draft-tokens auto` is what the default `--spec auto` chooses for this artifact.
+- `--spec dspark --draft-tokens auto` is what the default `--spec auto` chooses for this artifact, also with
+  incoai's [DFlash2 drafter](#dflash2-drafting) converted beside it: DFlash2 took 2.4 % more wall time over the agentic
+  replay. Name the DFlash2 companion with `--draft-model` for short prompts (measured up to about 600 tokens of
+  context), where it is faster, and for 9 % more KV capacity.
 - `--lm-head-draft` is optional: it changes the speed of drafting, never the output.
 - Add `--vision` for images. Its tower and image buffers stay in VRAM and reduce the context.
 - Add `--max-concurrency N` (1 to 8) for several lanes. The lanes share one KV pool, and each
@@ -121,8 +124,8 @@ once the model has loaded; `--plan` reports them without loading.
 | `--reasoning-loop stop` or `conclude` | refused: the model has no reasoning-loop guard |
 | `--preserve-thinking`, `--tolerant-tool-calls`, `--tool-parameter-names declared` | refused: Qwen template and tool-call options. The template renders the history's reasoning as given |
 | N-gram drafting: `--ngram-volume`, `--ngram-draft-tokens`, `--ngram-min-match`, `--ngram-tree-nodes`, `--ngram-archive-mib`, `--ngram-session-mib`, `--ngram-residency` | refused |
-| The MTP, DFlash and DFlash2 backends | `--spec mtp`, `dflash` and `dflash2` are refused: the model's drafter is DSpark. So are `--draft-model`, `--spec-min-p`, `--draft-tree-nodes` and `--draft-tree-paths` (DSpark verifies a chain) |
-| `--lm-head-draft` when no drafter runs | refused: an artifact without DSpark, `--spec off` or `--lossless` |
+| The MTP and DFlash backends | `--spec mtp` and `dflash` are refused: the model drafts with DSpark or a [DFlash2 companion](#dflash2-drafting). `--spec dflash2` without `--draft-model` is refused, and so is `--draft-model` with `--spec dspark` or `off`. So are `--spec-min-p`, `--draft-tree-nodes` and `--draft-tree-paths` (both drafters verify a chain) |
+| `--lm-head-draft` when no drafter runs | refused: no DSpark in the artifact and no DFlash2 companion, `--spec off` or `--lossless` |
 | Offloaded-expert options: `--expert-state`, `--expert-ram-mib`, `--expert-ram-layout`, `--expert-pin-mib`, `--expert-csf`, `--expert-stripe`, `--expert-tail-skip`, `--route-trace` | refused: the experts stay in VRAM |
 | Qwen kernel, fast-path and media options: `--use-original-int8-prefill-kernel`, `--use-original-nvfp4-prefill-kernel`, `--prefill-split-workspace-mib`, `--fast-path`, `--no-fast-path`, `--media-cache-mib`, `--media-live-mib`, `--media-preprocess-threads`, `--context-cost-presets` | refused: Inkling has its own prompt route and image path, registers no fast path, and its prefix cache weighs a read against a re-prefill with a fixed fit of its own rates, which presets do not calibrate |
 | Sizing options that a start would not use: `--vram-headroom-mib` and `--vram-past-budget` without `--max-context auto` or `--kv-capacity auto`; `--ram-free-mib` without the automatic Host tier and without `--ram-resize auto`; `--vision-max-merged` without `--vision` | refused |
@@ -166,6 +169,119 @@ drafter: a start that runs none (`--spec off`, an artifact without DSpark, `--lo
 On nine English, code, Chinese and other-language prompts (RTX 5090, DSpark `auto`, two runs each) it decoded 2.4 to 5.8 %
 faster than DSpark on the full head on the default route, 2.9 to 4.9 % faster with `--q8-weights` and 2.5 to 4.0 % faster
 with `--a8-activations`. Its tables take about 180 MB of VRAM.
+
+## DFlash2 drafting
+
+incoai's [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) is a DFlash2 drafter trained for
+this model: five sliding-window layers (2,048 tokens) that read the model's hidden states (the inputs of layer visits 5,
+23 and 41 and the final normed state), draft a block of 8 (the last token and seven masks) in one pass, and pick each
+draft among the head's 16 best tokens with a conditional selector. Infernix runs it from a companion artifact beside the
+main one ([conversion](weight-conversion.md#start-with-an-official-recipe): recipe `inkling2_mini_dflash2`, 635 MB), as
+it runs Qwen3.8-Flash-Next's DFlash2 drafter:
+
+```bat
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dflash2 --draft-model Inkling-2-Mini-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft
+```
+
+- Verification is DSpark's: each verify column samples as plain decoding would, and a draft stands only while it equals
+  that draw, so greedy and sampled output are plain decoding's, token for token.
+- With `--spec dflash2` the bundled DSpark drafter is not loaded: none of its weights or KV pages take VRAM, which goes
+  to the context instead.
+- `--lm-head-draft` drafts from the same shortlist of 65,536 tokens, and needs the artifact's ranking as with DSpark.
+- `--draft-tokens auto` verifies the calibrated number of the block's 7 drafts each round, a draft costing more on a
+  longer context; a fixed count from 1 to 7
+  also works, but `auto` beat every fixed count from 3 to 7 by 5-8 % one request at a time and tied the best at four
+  requests ([draft length](maintainer/dflash.md#inkling-2-mini)). Up to eight requests decoding together draft their blocks in one call and share out one verify call, as
+  with DSpark.
+- The prefix cache stores the drafter's rings with each snapshot, so a resumed request drafts as a fresh one would. A
+  `--prefix-cache-file` written with another drafter is not restored.
+- `--spec auto` drafts with the companion that `--draft-model` names, otherwise with DSpark ([why](#agentic-replay));
+  an artifact converted without DSpark drafts with the only companion of this model lying beside it.
+- A request sampling the whole vocabulary (`top_k: 0`) has its drafts drawn with the noise its own verification draws
+  with (the target's Gumbel noise at each verify column), so a draft is the target's own token far more often than
+  the drafter's likeliest token alone would be; its output is unchanged. Greedy requests and the default top-20
+  sampling draft the selector's likeliest path.
+
+### Speed and memory against DSpark
+
+Served on an RTX 5090 in the launcher's configuration (eight lanes, `--max-context 240000`, `--kv-dtype int8`,
+`--lm-head-draft`, `--draft-tokens auto`, `--vision --vision-offload on`, the thinking budget), 512 tokens a request,
+seeded, the arms run in the order DSpark, DFlash2, the NVFP4-MLP companion twice, DFlash2, DSpark (2026-11-26, DSpark
+with its INT8 full-layer context, no warm-up arm: the two DSpark runs agree within 0.6 % one request at a time). The
+one-request rows send eight short prompts (or four questions on a shared 122K-token prefix) one after another; the
+others send them at once. Output tokens per second over the phase's wall time, prefill and first token included (the
+mean, the two runs' range in brackets); every arm produced the same text in every phase. Several requests at once vary
+from run to run (the rounds' interleaving), so those rows carry the spread their ranges show:
+
+| Phase | DSpark | DFlash2 | DFlash2 against DSpark |
+|---|---|---|---|
+| 1 request at a time, 8 prompts, default sampling (top 20, T 1) | 278.0 (277.8-278.1) | 319.4 (317.4-321.3) | +14.9 % |
+| 1 request at a time, 8 prompts, greedy | 309.9 (309.4-310.4) | 392.1 (391.8-392.4) | +26.5 % |
+| 1 request at a time, 8 prompts, whole vocabulary (`top_k 0`) | 281.2 (280.4-282.1) | 355.5 (355.4-355.5) | +26.4 % |
+| 1 request at a time, 4 questions on a 122K-token prefix | 180.0 (179.5-180.5) | 168.2 (167.9-168.4) | -6.6 % |
+| 4 requests at once, default sampling | 499.2 (496.1-502.3) | 578.5 (576.8-580.2) | +15.9 % |
+| 8 requests at once, default sampling | 683.5 (669.0-698.0) | 814.4 (804.7-824.2) | +19.2 % |
+| 4 questions at once on the 122K-token prefix | 317.0 (315.1-319.0) | 294.2 (292.0-296.4) | -7.2 % |
+
+- DFlash2 drafts a round in 0.78-0.79 ms against DSpark's 1.03-1.06 ms (device means over the arms' rounds), and
+  accepts more of its drafts on short contexts (48-57 % against 44-49 % one request at a time).
+- This table predates DFlash2's cheaper rounds (2026-11-27: a fused conv prepare, a feature-projection schedule, a
+  faster top-16 and the commit context as a CUDA graph; [DFlash](maintainer/dflash.md#inkling-2-mini)), which cut
+  its draft by 13 % and ran 1.6 % faster on the short prompts one at a time (0.5-3.6 % elsewhere, within the runs'
+  spread), and its context-dependent draft lengths (0.7 % faster on the 122K-token prefix). DSpark was not re-run
+  against them here; the agentic replay below was.
+- On the 122K-token prefix DSpark is faster: it accepted 57 % of its drafts there against DFlash2's 49 %, likely
+  because DSpark has a full-attention layer over the whole context while DFlash2's layers see the last 2,048 positions.
+  (The same question resumed from the prefix cache and prefilled cold drafted and accepted exactly alike.)
+- In an earlier run (DSpark before its INT8 context) eight short requests at once gave 666.8 tok/s without a drafter
+  (one plain run), 674.5 with DSpark and 795.6 with DFlash2.
+- The KV pool holds 548,992 tokens with DFlash2 against 502,528 with DSpark (+9.2 %; plain decoding 653,120): DSpark's
+  full-layer KV shares the pool's pages, DFlash2's rings are 40 MiB a lane beside it. Its weights take 605 MiB. With
+  the cheaper rounds it holds 547,456 (+8.9 %): the commit context's CUDA graphs take 24 MiB more of the graph
+  allowance.
+- `--lm-head-draft` took DFlash2's draft from 2.40 to 0.93 ms (an earlier run's phase mix, before DSpark's INT8
+  context) and DFlash2 0.2-11 % faster in every phase but the 122K-token question (-2.0 %; one run without it).
+- The companion's MLP in NVFP4 (recipe `inkling2_mini_dflash2_nvfp4_mlp`, 515 MB) drafts 3 % faster (0.761 ms) and
+  gives the KV pool 7,040 more tokens (+1.3 %). One request at a time it ran 0.5-0.9 % faster than the Q8 companion
+  on the short prompts (beyond the runs' small spread) and level on the long questions; at four and eight short
+  requests at once -0.9 to +0.3 % (inside the spread); with four questions at once on the 122K-token prefix 4.1 %
+  faster (306.3 against 294.2 tok/s, beyond the spread). Its acceptance was the Q8 companion's on the short prompts
+  (2,364 against 2,364 accepted drafts, 2,500 against 2,499, 2,419 against 2,421) and 0.9 % lower on the long
+  questions; at a fixed 7 drafts on the real test's four prompts it accepted 1.4-2.0 % fewer tokens a round, which is
+  why the Q8 companion stays the recommended one.
+
+### Agentic replay
+
+The agentic replay (`bench/agentic_ab`: an agent's main-session and subagent turns, 130 requests a seed with prompts of
+11K-134K tokens, median about 30K, 90 % of their tokens from the prefix cache), in the launcher configuration above,
+three workload seeds, the DFlash2 arm first in seeds 42 and 44 and second in seed 43 (2026-11-27, with DFlash2's
+cheaper rounds and context-dependent draft lengths, [DFlash](maintainer/dflash.md#inkling-2-mini)). Mean over the
+seeds, their range in brackets:
+
+| Metric | DSpark | DFlash2 | DFlash2 against DSpark, per seed |
+|---|---|---|---|
+| Workload wall time (min) | 6.0 (5.6-6.2) | 6.1 (5.7-6.4) | +2.4 % (+1.3 to +4.2) |
+| Output tok/s, one request decoding | 281 (270-293) | 281 (271-293) | -0.0 % (-0.6 to +0.4) |
+| Output tok/s, all decoding | 276 (271-280) | 266 (261-273) | -3.4 % (-5.5 to -2.2) |
+| Decode rounds/s, one request decoding | 97.0 (93.1-102) | 99.4 (96.7-102) | +2.5 % (+0.5 to +3.8) |
+| Tokens per round, one request decoding | 2.90 (2.75-3.15) | 2.83 (2.72-3.04) | -2.4 % (-3.6 to -1.1) |
+| Average time to first token (s) | 0.7 (0.6-0.7) | 0.7 (0.6-0.7) | +1.3 % (+0.9 to +1.6) |
+
+- Both arms produced the same number of tokens in every seed (as in the earlier run). DFlash2 was slower in each seed,
+  by 1.3 and 1.6 % where it ran first and 4.2 % where it ran second (the seed it trailed most by in the earlier run
+  too).
+- The earlier run (2026-11-26, before the cheaper rounds, DFlash2 first in every seed) took 2.9 % more wall time with
+  DFlash2 (+1.7 to +4.8 %), one request decoding 2.0 % slower. Since then DFlash2's walls fell 0.5-0.8 % in every seed
+  and DSpark's stayed within 0.2 %. One request at a time DFlash2 now decodes level with DSpark (faster rounds, fewer
+  tokens a round); with several requests decoding at once it is still 3.4 % slower.
+- By prompt length (each request of 16 tokens or more against itself in the other arm): up to 32K -3.1 % decode (55 %
+  of drafts accepted against DSpark's 61 %), 32K-64K -0.7 % (58 % against 60 %), 64K and beyond -3.5 % (61 % against
+  66 %); the earlier run -2.3, -2.0 and -4.8 %. By how well DSpark drafts a request: where it accepts under 65 % of its
+  drafts (290 requests) DFlash2 decodes level or faster (+3.6 and +0.6 %), where it accepts 65 % or more (100 requests,
+  the most predictable text, often what the context already holds) 8.0-14.9 % slower. DSpark's full-attention layer
+  sees the whole context; DFlash2's layers see the last 2,048 positions, as in the reference.
+- So `--spec auto` keeps DSpark, and the DFlash2 companion is for short prompts, named with `--draft-model`. Its gain
+  is measured up to about 600 tokens of context and its loss from 11K; nothing between was measured.
 
 ## Routes and precision
 

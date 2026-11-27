@@ -25,6 +25,7 @@ std::atomic<bool> skewed{false};
 std::atomic<std::uint64_t> captures_known{0};
 std::mutex ram_mutex;
 std::function<std::uint64_t()> ram_reader; // ram_mutex
+ContextObserver context_watcher;           // ram_mutex
 
 } // namespace
 
@@ -36,6 +37,16 @@ void set_ram_available(std::function<std::uint64_t()> reader) {
 std::function<std::uint64_t()> ram_available() {
     const std::lock_guard<std::mutex> lock(ram_mutex);
     return ram_reader;
+}
+
+void set_context_observer(ContextObserver observer) {
+    const std::lock_guard<std::mutex> lock(ram_mutex);
+    context_watcher = std::move(observer);
+}
+
+ContextObserver context_observer() {
+    const std::lock_guard<std::mutex> lock(ram_mutex);
+    return context_watcher;
 }
 
 void force_moe_stall(std::uint32_t rounds) noexcept { forced_stalls.store(rounds); }

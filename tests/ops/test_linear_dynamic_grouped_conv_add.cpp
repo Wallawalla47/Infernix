@@ -183,7 +183,7 @@ int verify_preserved(std::string_view label, const DeviceBuffer& device,
                         std::vector<std::uint16_t>(expected.begin(), expected.end()));
 }
 
-int run_profile(std::int32_t hidden, std::int32_t input_rows) {
+int run_profile(std::int32_t hidden, std::int32_t input_rows, QType qtype = QType::Q8_G32_FP16) {
     g_hidden = hidden;
     g_groups = hidden / 16;
     g_sampled_rows.clear();
@@ -199,11 +199,17 @@ int run_profile(std::int32_t hidden, std::int32_t input_rows) {
     const std::vector<std::uint16_t> residual     = make_residual();
 
     quantized_weight::PatternedWeightOptions weight_options;
-    weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
-    weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
+    if (qtype == QType::Q8_G32_FP16) {
+        weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
+        weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
+    } else {
+        // NVFP4 (block_scale_k16_m128x4): a matrix divisor as the linear tests' NVFP4 fixture has (16-bit
+        // activations: no input divisor is read).
+        weight_options.weight_scale_divisor = 0.125F;
+        weight_options.input_scale_divisor  = 3.5F;
+    }
     input_projection::DevicePackedWeight projection_weight(quantized_weight::make_patterned_weight(
-        QType::Q8_G32_FP16, g_hidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows),
-        weight_options));
+        qtype, g_hidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows), weight_options));
     const std::vector<double> projection =
         projection_oracle(projection_weight.host, activation, input_rows);
 
@@ -211,7 +217,7 @@ int run_profile(std::int32_t hidden, std::int32_t input_rows) {
     DeviceBuffer base_device       = to_device(base_kernel);
     DeviceBuffer delta_device      = to_device(finish_delta);
     const std::size_t capacity     = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        g_hidden, input_rows, 2, 16, 1, kMaximumBatch);
+        g_hidden, input_rows, 2, 16, 1, kMaximumBatch, qtype);
 
     Tensor base(base_device.p, DType::BF16, {g_hidden, kTaps, kSides});
     const Weight weight = projection_weight.view();
@@ -221,7 +227,7 @@ int run_profile(std::int32_t hidden, std::int32_t input_rows) {
             const std::size_t bytes =
                 static_cast<std::size_t>(g_hidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                g_hidden, input_rows, width, width, batch_size, batch_size);
+                g_hidden, input_rows, width, width, batch_size, batch_size, qtype);
             if (exact > capacity)
                 throw std::runtime_error("workspace interval does not cover exact shape");
             GuardedDeviceBuffer scratch(exact);
@@ -266,6 +272,7 @@ int run_profile(std::int32_t hidden, std::int32_t input_rows) {
                 cuda_synchronize();
                 const std::string label = "dynamic conv add H=" + std::to_string(g_hidden) +
                                           " C=" + std::to_string(input_rows) +
+                                          (qtype == QType::NVFP4 ? " NVFP4" : "") +
                                           " W=" + std::to_string(width) +
                                           " B=" + std::to_string(batch_size) +
                                           " graph=" + std::to_string(replay);
@@ -298,10 +305,13 @@ INFERNIX_OP_TEST(linear_dynamic_grouped_conv_add) {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        // Qwen3.8-27B's drafter, Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's.
+        // Qwen3.8-27B's drafter, Qwen3.8-Flash-Next's, Qwen3.5-122B-A10B's and Inkling 2 Mini's (its MLP down also
+        // NVFP4: the NVFP4 linear's route, then the finish).
         const int failures = run_profile(5120, 4096) + run_profile(5120, 17408) +
                              run_profile(2560, 4096) + run_profile(2560, 7680) +
-                             run_profile(3072, 4096) + run_profile(3072, 9216);
+                             run_profile(3072, 4096) + run_profile(3072, 9216) +
+                             run_profile(2304, 4096) + run_profile(2304, 6912) +
+                             run_profile(2304, 6912, QType::NVFP4);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

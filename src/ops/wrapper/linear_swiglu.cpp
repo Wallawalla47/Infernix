@@ -207,13 +207,16 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                           (x.ne[0] == 2560 && out.ne[0] == 640 && gate_up_weight.n == 1280 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 1280 &&
                            gate_up_weight.padded_shape[1] == 2560) ||
-                          // Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's DFlash2 MLPs.
+                          // Qwen3.8-Flash-Next's, Qwen3.5-122B-A10B's and Inkling 2 Mini's DFlash2 MLPs.
                           (x.ne[0] == 2560 && out.ne[0] == 7680 && gate_up_weight.n == 15360 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 15360 &&
                            gate_up_weight.padded_shape[1] == 2560) ||
                           (x.ne[0] == 3072 && out.ne[0] == 9216 && gate_up_weight.n == 18432 &&
                            gate_up_weight.k == 3072 && gate_up_weight.padded_shape[0] == 18432 &&
-                           gate_up_weight.padded_shape[1] == 3072);
+                           gate_up_weight.padded_shape[1] == 3072) ||
+                          (x.ne[0] == 2304 && out.ne[0] == 6912 && gate_up_weight.n == 13824 &&
+                           gate_up_weight.k == 2304 && gate_up_weight.padded_shape[0] == 13824 &&
+                           gate_up_weight.padded_shape[1] == 2304);
     // Qwen3.5-122B-A10B's shared expert (fp8_e4m3fn_row_f32, dealignai's Ornith-1.5-122B-UNCENSORED).
     const bool shared_122b = x.ne[0] == 3072 && out.ne[0] == 1024 && gate_up_weight.n == 2048 &&
                              gate_up_weight.k == 3072 && gate_up_weight.padded_shape[0] == 2048 &&

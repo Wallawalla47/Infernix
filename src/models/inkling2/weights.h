@@ -97,6 +97,30 @@ struct DSparkWeights {
     WeightId fold_bias;               // [V]
 };
 
+// One DFlash2 drafter layer (the companion's names, tools/convert/inkling2_loop.py _Builder.dflash2): the block's q,
+// k, v (one Q8 parent), the context K and V (the same words, bound to the context input), the per-head norms, o, the
+// SwiGLU MLP and the two dynamic convolutions' base kernels and kernel projections.
+struct DFlash2LayerWeights {
+    WeightId input_norm, post_attention_norm;    // BF16 [H]
+    WeightId query, key, value;                  // [q, H], [kv, H], [kv, H]
+    WeightId context_key, context_value;         // [kv, H]
+    WeightId query_norm, key_norm;               // BF16 [d]
+    WeightId output;                             // [H, q]
+    WeightId gate, up, down;                     // [I, H], [I, H], [H, I]
+    WeightId attention_base, mlp_base;           // BF16 [2, taps, H]
+    WeightId attention_projection, mlp_projection; // BF16 [2 taps H / group, H]
+};
+
+// The DFlash2 drafter of a companion artifact: the feature projection over the DSpark features, the context and final
+// norms, the layers and the candidate selector's hidden projection and codebooks (BF16 [V, rank], the real vocabulary).
+struct DFlash2Weights {
+    WeightId feature_projection; // [H, features * H]
+    WeightId context_norm, final_norm;
+    std::vector<DFlash2LayerWeights> layers;
+    WeightId selector_hidden; // [rank, H]
+    WeightId predecessor_codebook, successor_codebook;
+};
+
 // One vision layer: LayerNorm (with bias), q/k/v [H, H] each with biases (q, k, v one parent, their biases another:
 // one GEMM, one bias pass), the output projection and bias, the attention branch's layer scale; LayerNorm, the MLP
 // (up [I, H] + bias, exact GELU, down [H, I] + bias) and its layer scale. Vectors BF16 [H] unless noted.
@@ -130,8 +154,9 @@ struct TextWeights {
     WeightId final_norm;      // BF16 [H]
     WeightId output_query;    // FP32 [H]
     std::vector<LayerWeights> layers;
-    std::optional<DSparkWeights> dspark; // bound with --spec dspark
-    std::optional<VisionWeights> vision; // bound with --vision
+    std::optional<DSparkWeights> dspark;   // bound with --spec dspark
+    std::optional<DFlash2Weights> dflash2; // bound with --spec dflash2 (the companion's, after every main weight)
+    std::optional<VisionWeights> vision;   // bound with --vision
 };
 
 } // namespace infernix::models::inkling2
