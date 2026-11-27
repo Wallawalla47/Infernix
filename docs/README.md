@@ -12,7 +12,7 @@ run the CLI or HTTP server.
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Qwen3.8-Flash-Next](qwen3_8-flash-next.md) | requirements, conversion (recipes A and B, the GSQ-RCO IQ3_S GGUF import), recommended flags, the n-gram table in RAM, measured speed and quality of the offloaded-expert model |
 | [Qwen3.5-122B-A10B](qwen3_5-122b.md) | Ornith-1.5-122B-NVFP4 and its UNCENSORED export with offloaded experts (in progress): requirements, conversion and verification, running, measured speed |
-| [Inkling 2 Mini](inkling2-mini.md) | Thinking Machines' looped model resident on one RTX 5090: requirements, running, what is not supported yet, DSpark and `--lm-head-draft`, precision routes, KV formats, images, conversion and the token ranking |
+| [Inkling 2 Mini](inkling2-mini.md) | Thinking Machines' looped model resident on one RTX 5090: requirements, running, what is not supported yet, DSpark, the DFlash2 companion and `--lm-head-draft`, precision routes, KV formats, images, conversion and the token ranking |
 | [Ngram copy proposals](ngram.md) | optional copy acceleration alongside MTP, DFlash or DFlash2 at any concurrency |
 | [Ablation sidecars](ablate.md) | `--ablate`: directional ablation (refusal removal) applied to any model at runtime; the sidecar format, what it cuts, memory and speed |
 | [Fitting an ablation sidecar](ablate-fitting.md) | `tools/ablate`: fitting a refusal-ablation sidecar for your own setup and evaluating it; prompt sets, requirements, time, reading the results |

@@ -159,16 +159,19 @@ for token.
 
 ### `--lm-head-draft`
 
-With this option DSpark drafts from a shortlist of the 65,536 most frequent tokens instead of the whole
-vocabulary, which makes each round's draft cheaper.
+With this option the drafter, DSpark or the [DFlash2 companion](#dflash2-drafting), drafts from a shortlist of the
+65,536 most frequent tokens instead of the whole vocabulary, which makes each round's draft cheaper. It works with
+either drafter at every `--max-concurrency` from 1 to 8.
 Infernix builds the shortlist at load from the ranking stored in the artifact
 (`proposal/token_rank`). A token outside the list is never drafted; verification still produces it,
 so **the output does not change**. An artifact without a ranking refuses the option, and it needs a
-drafter: a start that runs none (`--spec off`, an artifact without DSpark, `--lossless`) refuses it.
+drafter: a start that runs none (`--spec off`, an artifact without DSpark and no DFlash2 companion,
+`--lossless`) refuses it.
 
 On nine English, code, Chinese and other-language prompts (RTX 5090, DSpark `auto`, two runs each) it decoded 2.4 to 5.8 %
 faster than DSpark on the full head on the default route, 2.9 to 4.9 % faster with `--q8-weights` and 2.5 to 4.0 % faster
-with `--a8-activations`. Its tables take about 180 MB of VRAM.
+with `--a8-activations`. Its tables take about 180 MB of VRAM. DFlash2 reads the shortlist's head rows without DSpark's
+Fold; its measurements are under [DFlash2 drafting](#dflash2-drafting).
 
 ## DFlash2 drafting
 

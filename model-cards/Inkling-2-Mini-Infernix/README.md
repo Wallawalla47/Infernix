@@ -82,8 +82,9 @@ word with it, and it passed on this file: 1,168 tensors, 24 expert banks, the 3 
 
 ## Token ranking and `--lm-head-draft`
 
-With `--lm-head-draft`, DSpark drafts from a shortlist of the 65,536 most frequent tokens, built at load from the
-stored ranking. The full model verifies every token, so **the output is unchanged**. The option is optional.
+With `--lm-head-draft`, the drafter (DSpark, or the [DFlash2 drafter](#dflash2-drafter)) drafts from a shortlist of
+the 65,536 most frequent tokens, built at load from the stored ranking, with up to eight requests decoding together.
+The full model verifies every token, so **the output is unchanged**. The option is optional.
 
 I measured the ranking with Inkling itself: its top prediction at each assistant position of a chat corpus, with
 the corpus's text as context, weighted **English 50 %, Chinese 20 %, code 15 %, other languages 12 %, maths 3 %**.
