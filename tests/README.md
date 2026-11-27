@@ -617,7 +617,8 @@ position within 2e-4, and graphs, C = 4 beside other requests and a DSpark Engin
 bit for bit. It reports a free tools turn's raw text and whether a text turn with a tool declared gives the same tokens
 under Basic protection as free.
 `infernix_inkling2_dflash2_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT` and `INFERNIX_INKLING2_DFLASH2`, the DFlash2
-companion converted with recipe `inkling2_mini_dflash2`) runs the DFlash2 drafter against an FP64 oracle of its
+companion converted with recipe `inkling2_mini_dflash2`, whose weights the oracle decodes; the recommended NVFP4-MLP
+companion runs the Engine half only) runs the DFlash2 drafter against an FP64 oracle of its
 mathematics on the real context features of two of the repository's documents (700 and 2,300 tokens, read from an
 Engine prefill through a test seam): where the oracle's own BF16 roundings leave its argmax and its margin above twice
 their effect, the draft must be its argmax, and the confidence within twice the roundings' effect, with the text head

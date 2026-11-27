@@ -31,6 +31,12 @@ Changes made in this conversion (Apache License 2.0, Section 4(b)):
   - README.md, config.json (metadata only) and the conversion report added.
 
 ------------------------------------------------------------------------------
+The drafter folder contains a conversion of incoai/Inkling-2-Mini-DFlash2
+(https://huggingface.co/incoai/Inkling-2-Mini-DFlash2), a DFlash 2 draft model by incoai for Inkling 2 Mini,
+licensed under the Apache License 2.0 (drafter/LICENSE); drafter/NOTICE lists the changes made in that
+conversion.
+
+------------------------------------------------------------------------------
 Token ranking (proposal/token_rank):
 
 The ranking orders the vocabulary by Inkling 2 Mini's own top prediction at each

@@ -68,9 +68,9 @@ infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtyp
   of the default `bf16`, for slightly different output ([KV formats](#kv-formats)). `--kv-window-dtype`
   chooses the sliding windows' format on its own.
 - `--spec dspark --draft-tokens auto` is what the default `--spec auto` chooses for this artifact, also with
-  incoai's [DFlash2 drafter](#dflash2-drafting) converted beside it: DFlash2 took 2.4 % more wall time over the agentic
-  replay. Name the DFlash2 companion with `--draft-model` for short prompts (measured up to about 600 tokens of
-  context), where it is faster, and for 9 % more KV capacity.
+  incoai's [DFlash2 drafter](#dflash2-drafting) downloaded or converted beside it: DFlash2 took 2.4 % more wall time
+  over the agentic replay. Name the DFlash2 companion with `--draft-model` for short prompts (measured up to about 600
+  tokens of context), where it is faster, and for 10 % more KV capacity.
 - `--lm-head-draft` is optional: it changes the speed of drafting, never the output.
 - Add `--vision` for images. Its tower and image buffers stay in VRAM and reduce the context.
 - Add `--max-concurrency N` (1 to 8) for several lanes. The lanes share one KV pool, and each
@@ -176,11 +176,16 @@ incoai's [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-D
 this model: five sliding-window layers (2,048 tokens) that read the model's hidden states (the inputs of layer visits 5,
 23 and 41 and the final normed state), draft a block of 8 (the last token and seven masks) in one pass, and pick each
 draft among the head's 16 best tokens with a conditional selector. Infernix runs it from a companion artifact beside the
-main one ([conversion](weight-conversion.md#start-with-an-official-recipe): recipe `inkling2_mini_dflash2`, 635 MB), as
-it runs Qwen3.8-Flash-Next's DFlash2 drafter:
+main one, as it runs Qwen3.8-Flash-Next's DFlash2 drafter. The recommended companion, with its MLP in NVFP4 (515 MB),
+is in the `drafter` folder of the
+[Inkling 2 Mini artifact's repository](https://huggingface.co/wallawalla47/Inkling-2-Mini-Infernix/tree/main/drafter);
+it needs Infernix `main` at `6dbeb011d` or later. The converter makes it, or the all-Q8 one, from incoai's checkpoint
+([conversion](weight-conversion.md#start-with-an-official-recipe): recipes `inkling2_mini_dflash2_nvfp4_mlp` and
+`inkling2_mini_dflash2`):
 
 ```bat
-infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dflash2 --draft-model Inkling-2-Mini-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft
+hf download wallawalla47/Inkling-2-Mini-Infernix drafter/Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix --local-dir .
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dflash2 --draft-model drafter\Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix --draft-tokens auto --lm-head-draft
 ```
 
 - Verification is DSpark's: each verify column samples as plain decoding would, and a draft stands only while it equals
@@ -207,7 +212,8 @@ infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtyp
 Served on an RTX 5090 in the launcher's configuration (eight lanes, `--max-context 240000`, `--kv-dtype int8`,
 `--lm-head-draft`, `--draft-tokens auto`, `--vision --vision-offload on`, the thinking budget), 512 tokens a request,
 seeded, the arms run in the order DSpark, DFlash2, the NVFP4-MLP companion twice, DFlash2, DSpark (2026-11-26, DSpark
-with its INT8 full-layer context, no warm-up arm: the two DSpark runs agree within 0.6 % one request at a time). The
+with its INT8 full-layer context, no warm-up arm: the two DSpark runs agree within 0.6 % one request at a time; the
+DFlash2 column is the all-Q8 companion, which the NVFP4-MLP one matches within 2 %, below). The
 one-request rows send eight short prompts (or four questions on a shared 122K-token prefix) one after another; the
 others send them at once. Output tokens per second over the phase's wall time, prefill and first token included (the
 mean, the two runs' range in brackets); every arm produced the same text in every phase. Several requests at once vary
@@ -238,17 +244,18 @@ from run to run (the rounds' interleaving), so those rows carry the spread their
 - The KV pool holds 548,992 tokens with DFlash2 against 502,528 with DSpark (+9.2 %; plain decoding 653,120): DSpark's
   full-layer KV shares the pool's pages, DFlash2's rings are 40 MiB a lane beside it. Its weights take 605 MiB. With
   the cheaper rounds it holds 547,456 (+8.9 %): the commit context's CUDA graphs take 24 MiB more of the graph
-  allowance.
+  allowance. With the NVFP4-MLP companion it holds 554,560 (+10.4 %).
 - `--lm-head-draft` took DFlash2's draft from 2.40 to 0.93 ms (an earlier run's phase mix, before DSpark's INT8
   context) and DFlash2 0.2-11 % faster in every phase but the 122K-token question (-2.0 %; one run without it).
-- The companion's MLP in NVFP4 (recipe `inkling2_mini_dflash2_nvfp4_mlp`, 515 MB) drafts 3 % faster (0.761 ms) and
-  gives the KV pool 7,040 more tokens (+1.3 %). One request at a time it ran 0.5-0.9 % faster than the Q8 companion
-  on the short prompts (beyond the runs' small spread) and level on the long questions; at four and eight short
-  requests at once -0.9 to +0.3 % (inside the spread); with four questions at once on the 122K-token prefix 4.1 %
-  faster (306.3 against 294.2 tok/s, beyond the spread). Its acceptance was the Q8 companion's on the short prompts
-  (2,364 against 2,364 accepted drafts, 2,500 against 2,499, 2,419 against 2,421) and 0.9 % lower on the long
-  questions; at a fixed 7 drafts on the real test's four prompts it accepted 1.4-2.0 % fewer tokens a round, which is
-  why the Q8 companion stays the recommended one.
+- The recommended companion has its MLP (gate/up and down) in NVFP4 (recipe `inkling2_mini_dflash2_nvfp4_mlp`,
+  515 MB against the all-Q8 one's 635 MB). Against the Q8 companion on the same build (2026-11-27, alternating runs,
+  two each, the same texts), it took the same wall time over the agentic replay (-0.08 %: -0.21, -0.07 and +0.04 %
+  over the three seeds, each run in both orders), gives the KV pool 7,104 more tokens (+1.3 %) and drafts 2-3 %
+  faster (0.685-0.696 against 0.709-0.712 ms). It accepts slightly fewer drafts (2,357 against 2,373 on the eight
+  short prompts), so on short prompts it is a little slower: 0.9 % one at a time and 1.8 % with four at once (both
+  beyond the runs' spread), level with eight at once and on the 122K-token prefix, and 0.6 % faster with four
+  questions on a ~30K-token prefix. On the build before the cheaper rounds (2026-11-26) it was 0.5-0.9 % faster on the
+  short prompts, accepting the same drafts there (2,364 each).
 
 ### Agentic replay
 
@@ -267,6 +274,9 @@ seeds, their range in brackets:
 | Tokens per round, one request decoding | 2.90 (2.75-3.15) | 2.83 (2.72-3.04) | -2.4 % (-3.6 to -1.1) |
 | Average time to first token (s) | 0.7 (0.6-0.7) | 0.7 (0.6-0.7) | +1.3 % (+0.9 to +1.6) |
 
+- The DFlash2 arm is the all-Q8 companion. The recommended NVFP4-MLP one took the same wall time in a replay against
+  it on `main` at `313d35ff2` (2026-11-27: wall -0.08 %, by seed -0.21, -0.07 and +0.04 %; every other row within
+  1.3 %, one request decoding +0.7 %).
 - Both arms produced the same number of tokens in every seed (as in the earlier run). DFlash2 was slower in each seed,
   by 1.3 and 1.6 % where it ran first and 4.2 % where it ran second (the seed it trailed most by in the earlier run
   too).

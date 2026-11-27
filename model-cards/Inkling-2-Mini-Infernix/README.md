@@ -16,6 +16,7 @@ tags:
   - mxfp8
   - moe
   - dspark
+  - dflash2
   - speculative-decoding
   - blackwell
   - rtx-5090
@@ -34,12 +35,14 @@ tags:
 > **Engine version:** this artifact needs [Infernix](https://github.com/Wallawalla47/Infernix) built from
 > GitHub `main` at commit `a487ad24f` or later, or a Windows release
 > after `windows-2026.11.20`. Older builds do not support this model. The recommended `--kv-dtype int8`
-> stores the sliding windows in 8 bits too from `main` at `c0e69d556`.
+> stores the sliding windows in 8 bits too from `main` at `c0e69d556`. The optional DFlash2 drafter in
+> [`drafter`](drafter) needs `main` at `6dbeb011d` or later.
 
 Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), packed for
 [Infernix](https://github.com/Wallawalla47/Infernix), a C++/CUDA engine that runs it on **one RTX 5090**
 (32 GB) with the whole model in VRAM. One file holds the text model, the model's DSpark drafter, its vision
-tower and a token-frequency ranking for `--lm-head-draft`.
+tower and a token-frequency ranking for `--lm-head-draft`. The [`drafter`](drafter) folder adds incoai's DFlash2
+drafter as an optional companion, faster than DSpark on short prompts ([DFlash2 drafter](#dflash2-drafter)).
 
 **The conversion is bit-exact.** Every weight the model can use is stored unchanged ([What is stored](#what-is-stored)
 lists the derived tables and the padding rows left out), and by default Infernix computes them in the arithmetic the
@@ -54,6 +57,8 @@ four-over-six rule, MXFP8 experts on 8-bit activations, everything else in BF16 
 | `Inkling-2-Mini-Infernix.infernix.conversion.json` | 425,200 | the converter's per-tensor report |
 | `config.json` | | not read by Infernix; lets the Hub count downloads |
 | `LICENSE`, `NOTICE` | | the Apache License 2.0; the changes made and the credits for the ranking's datasets |
+| `drafter/Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix` | 515,118,080 | optional: incoai's DFlash2 drafter for Inkling 2 Mini, an Infernix companion artifact ([its README](drafter/README.md)) |
+| `drafter/Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix.conversion.json`, `drafter/README.md`, `drafter/LICENSE`, `drafter/NOTICE` | | its conversion report, description, Apache-2.0 licence and notice |
 
 ```text
 hf download wallawalla47/Inkling-2-Mini-Infernix Inkling-2-Mini-Infernix.infernix --local-dir <dir>
@@ -149,6 +154,24 @@ constraint. DSpark keeps drafting under a constraint, and on one request a text 
 within 0.5 % of the same turn free. `/v1/decide` answers its readout questions (`noul`, `choice`, `score`). See
 [constrained output and tool calls](https://github.com/Wallawalla47/Infernix/blob/main/docs/inkling2-mini.md#constrained-output-and-tool-calls).
 
+## DFlash2 drafter
+
+The [`drafter`](drafter) folder holds incoai's [DFlash2 drafter for Inkling 2 Mini](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)
+(Apache-2.0), converted as a 515 MB companion artifact with its MLP in NVFP4. It replaces the artifact's DSpark drafter,
+which is then not loaded, and needs Infernix `main` at `6dbeb011d` or later:
+
+```bat
+hf download wallawalla47/Inkling-2-Mini-Infernix drafter/Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix --local-dir .
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dflash2 --draft-model drafter\Inkling-2-Mini-DFlash2-NVFP4-MLP-Infernix.infernix --draft-tokens auto --lm-head-draft
+```
+
+Use it for **short prompts**: there DFlash2 decoded 15-27 % faster than DSpark one request at a time and 16-19 % faster
+at four and eight requests (measured with an all-Q8 conversion, which this one matches within 2 %). On a 122K-token
+prefix it was 7 % slower, and over an agentic replay (prompts of 11K-134K
+tokens) it took 2.4 % more wall time, so the default `--spec auto` keeps DSpark unless `--draft-model` names the
+drafter. Without DSpark's KV pages the pool holds about 10 % more tokens. Output is unchanged either way: every draft
+is verified. Measurements, the formats and how it works are in [its README](drafter/README.md).
+
 ## KV formats
 
 `--kv-dtype` selects how the 8 full-attention visits store their keys and values, and with it the 40 sliding
@@ -242,5 +265,6 @@ paths of the machine that converted it.
 
 Inkling 2 Mini is licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) by Thinking
 Machines Lab, Inc.; `NOTICE` lists the changes made here and credits the ranking's datasets. Thinking Machines' card
-also links its [Model Acceptable Use Policy](https://thinkingmachines.ai/model-acceptable-use-policy/). The Infernix
-engine has its own license in its repository.
+also links its [Model Acceptable Use Policy](https://thinkingmachines.ai/model-acceptable-use-policy/). The drafter
+in `drafter` is incoai's, also under the Apache License 2.0 (`drafter/LICENSE`); `drafter/NOTICE` lists the changes
+made in its conversion. The Infernix engine has its own license in its repository.
