@@ -936,7 +936,13 @@ def watchdog(launcher: Launcher, port: int, data: Path, skip_ram: bool) -> None:
     # A load that does not fit in VRAM: the server's own message, and suggestions.
     kv = ("automatic KV capacity requires 11215218944 bytes total (10141477120 bytes minimum Engine runtime "
           "reservation + 1073741824 bytes automatic headroom), but only 9738125312 bytes are available after weights")
+    # A fixed context above what the stand-in's plan fits (225,280 tokens): the 27B's default `--max-context auto`
+    # leaves the server to size the context, and then no lower one is suggested (launch_plan.cpp, the plan's fit).
     failing = [a for a in base_args] + ["--fake-load-ms", "300", "--fake-fail-load", kv]
+    if "--max-context" in failing:
+        failing[failing.index("--max-context") + 1] = "262144"
+    else:
+        failing += ["--max-context", "262144"]
     call(port, "PUT", f"/launcher/api/models/{key}/config", {"args": failing})
     call(port, "POST", "/launcher/api/unload", {})
     wait_for(lambda: instance(port)["state"] in ("idle", "failed"), 30)
