@@ -191,7 +191,8 @@ For each mask hidden h_i, the selected head produces stable top-16 unary scores 
 token IDs C_i. An indexed proposal head remaps shortlist rows before codebook access. Unary top-16
 selection does not apply target penalties, temperature or top-k/top-p/min-p.
 
-Qwen3.8-27B's full head (FP8 row or q8, 248,320 x 5,120) is screened (since 2026-11-09, candidates RV-41): at load
+Qwen3.8-27B's full head (FP8 row, q8 or NVFP4, 248,320 x 5,120) is screened (since 2026-11-09, candidates RV-41;
+the NVFP4 head of NVIDIA's NVFP4-QAD since 2026-11-27): at load
 the engine fits a 2-bit copy of it (`ops::screened_head_fit`, 357.6 MB of VRAM, beside the KV cache's share), and a
 round of at most 16 mask columns (one request's) takes its top 16 from `ops::screened_head_topk`: every row scored by
 the copy, the rows near each column's best rescored exactly in FP32 and the 16 best kept. They are the full head's top
@@ -216,6 +217,21 @@ the draft width), so acceptance moved both ways: NVIDIA +7.2 % (acceptance 2.05 
 both), official -0.4 % (1.73 -> 1.66) for one prompt each. Greedy output on the reproducible route stayed identical
 at ~150, ~2,000 and ~20,000-token prompts on all three, with acceptance equal in 7 of the 9 and 1.7-2.2 % lower in
 two.
+
+The NVFP4 head (NVIDIA's NVFP4-QAD, 715 MB: E2M1 codes, an E4M3 scale per 16 weights and the matrix multiplier) is
+fitted and rescored from the same decoded values its A16 projection reads. Measured on QAD-Exact (RTX 5090,
+2026-11-27, INT8 KV): cold op times (`infernix_linear_topk_bench`) at 7, 16 and 32 columns were 515, 742 and 1,137 us
+for `linear_topk` over the full head, 240, 271 and 535 us screened (32 columns in two calls), and 218, 269 and 421 us
+for `--lm-head-draft`'s Q4 proposal head. End to end (`infernix_decode_quality_gen`, `--draft-tokens auto
+--ngram-draft-tokens auto`, one request, 24 code segments of 1,280 + 384 tokens and 24 thinking-on chats of 400
+tokens), on the reproducible route, where every arm decoded the same greedy text and two passes agree within 0.4 %:
+the screened full head against it unscreened +1.9 % on code and +1.8 % on chats, against `--lm-head-draft` +4.3 % and
++0.6 % (on code the screened arm proposed 12,263 drafts against 12,820 and had 7,424 accepted against 7,344). On
+the default route, where the arms decode different texts (about +-3 % a cell), against `--lm-head-draft`: code +5.5,
++1.7 and +0.9 % at one, two and four requests, sampled docs +6.5, -2.5 and -1.4 %, chats +1.3 % (geometric mean
++1.7 %). Wider batched rounds (past 32 mask columns, more than four requests) were not measured: they take the full head's
+`linear_topk`. Without `--lm-head-draft` the proposal head is not loaded, so the screen's 357.6 MB costs no KV against
+it (314,688 tokens either way at two lanes). The recommended 27B setting still names `--lm-head-draft`.
 
 Let predecessor/successor codebooks have shape `[vocab_size,R]` and the hidden projection have
 shape `[R,H]`. The current selector receives its projected hidden g_i as BF16, candidate scores as
