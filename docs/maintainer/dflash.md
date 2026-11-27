@@ -247,7 +247,8 @@ request, where both run the same screen kernels and the default route repeats, t
 ran 0.1-0.2 % faster. Against `--lm-head-draft` the screened full head was +1.8 % over code and sampled docs at one to
 eight requests on QAD-Exact (code +1.0 to +5.5 %, docs -2.5 to +6.5 %) and +1.7 % on NVIDIA's NVFP4, whose head is
 FP8 (code +0.1 to +5.1 %, docs -2.6 to +2.5 %), each cell's two arms in one session; its sampled docs at two to four
-requests were slower in all five cells (-0.9 to -2.6 %). The recommended 27B setting still names `--lm-head-draft`.
+requests were slower in all five cells (-0.9 to -2.6 %). Since 2026-11-27 the recommended 27B NVFP4 setting leaves
+`--lm-head-draft` off; the groupwise 27B (a q8 head) was not measured and keeps it.
 
 Let predecessor/successor codebooks have shape `[vocab_size,R]` and the hidden projection have
 shape `[R,H]`. The current selector receives its projected hidden g_i as BF16, candidate scores as

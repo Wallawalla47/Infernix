@@ -3,9 +3,18 @@
 #include "launcher/option_support.h"
 
 #include <algorithm>
+#include <cctype>
+#include <string>
 
 namespace infernix::launcher {
 namespace {
+
+// An NVFP4 conversion, by its recipe or its weight formats ("NVFP4 + FP8").
+bool nvfp4_weights(const ScannedModel& model) {
+    std::string text = model.recipe.value_or("") + " " + model.quantization.value_or("");
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return std::tolower(c); });
+    return text.find("nvfp4") != std::string::npos;
+}
 
 std::string stem_of(const ScannedModel& model) {
     std::string stem = path_utf8(model.path.stem());
@@ -23,7 +32,7 @@ const ScannedDrafter* best_drafter(const LibraryScan& scan, const ScannedModel& 
             drafter.compatible_models.end()) {
             continue;
         }
-        // DSpine is an opt-in for long agent and coding sessions (8-10 % slower on short chats): never a default.
+        // DSpine is an opt-in for long agent and coding sessions (4-10 % slower on short chats): never a default.
         if (drafter.kind == "dspine") { continue; }
         // Several copies of compatible drafters: the newest file.
         if (best == nullptr || drafter.modified > best->modified) { best = &drafter; }
@@ -43,6 +52,17 @@ const ScannedNgramVolume* best_ngram_volume(const LibraryScan& scan, const Scann
         }
     }
     return best;
+}
+
+bool defaults_use_proposal_head(const ScannedModel& model) {
+    // The proposal head pays off with DFlash/DFlash2, the small-model MTP drafters and Inkling 2's DSpark (its
+    // shortlist decoded 2.4-5.8 % faster on nine prompts, the output unchanged), not on the 122B whose MTP rounds
+    // measured no gain from it. On Inkling 2 the option needs the artifact's ranking and DSpark drafter. On the
+    // Qwen3.8-27B NVFP4 conversions DFlash2 drafts from the screened full head instead (RV-41): against the proposal
+    // head it decoded 1.7 % faster over code and sampled docs at one to eight requests on NVIDIA's NVFP4 and 1.8 % on
+    // NVFP4-QAD (2026-11-27, README "Recommended settings per model").
+    if (!model.has_proposal || model.family == "qwen3.5-122b-a10b") { return false; }
+    return !(model.family == "qwen3.8-27b" && model.has_dflash2 && nvfp4_weights(model));
 }
 
 Args default_args(const LibraryScan& scan, const ScannedModel& model) {
@@ -79,10 +99,7 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model) {
     if (has_drafter_component || drafter != nullptr || inkling) {
         add("--spec", "auto");
         add("--draft-tokens", "auto");
-        // The proposal head pays off with DFlash/DFlash2, the small-model MTP drafters and Inkling 2's DSpark (its
-        // shortlist decoded 2.4-5.8 % faster on nine prompts, the output unchanged), not on the 122B whose MTP rounds
-        // measured no gain from it. On Inkling 2 the option needs the artifact's ranking and DSpark drafter.
-        if (model.has_proposal && model.family != "qwen3.5-122b-a10b") { add("--lm-head-draft"); }
+        if (defaults_use_proposal_head(model)) { add("--lm-head-draft"); }
     }
     if (drafter != nullptr) { add("--draft-model", path_utf8(drafter->path)); }
     if (model.family == "qwen3.8-27b" && model.has_dflash2) { add("--ngram-draft-tokens", "auto"); }

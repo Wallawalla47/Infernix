@@ -203,6 +203,9 @@ export interface ModelArtifact {
   /** Inkling 2's bundled DSpark drafter. */
   has_dspark: boolean;
   has_proposal: boolean;
+  /** Whether the launcher's defaults name --lm-head-draft when the model drafts (src/launcher/model_defaults.cpp):
+   * not on the Qwen3.8-27B NVFP4s, whose DFlash2 drafts from the screened full head. */
+  proposal_head_default: boolean;
   /** What this model takes (src/launcher/option_support.cpp, the one owner): the form shows nothing else. */
   option_support: {
     /** infernix-serve options this model does not take. */

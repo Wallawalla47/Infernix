@@ -20,6 +20,9 @@ namespace infernix::launcher {
 // Launch parameters, without the artifact path and the managed flags.
 [[nodiscard]] Args default_args(const LibraryScan& scan, const ScannedModel& model);
 
+// Whether those parameters name --lm-head-draft when the model drafts (the configure page restores it after DSpine).
+[[nodiscard]] bool defaults_use_proposal_head(const ScannedModel& model);
+
 // The artifact's file name without its part numbering and extension; unique within the library
 // (a numeric suffix separates two artifacts that would share one).
 [[nodiscard]] std::string default_alias(const LibraryScan& scan, const ScannedModel& model);

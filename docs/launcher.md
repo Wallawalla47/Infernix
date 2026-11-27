@@ -206,7 +206,8 @@ when the artifact holds its `proposal/token_rank` parameter and DSpark drafter. 
 pickers (Qwen3.8-Flash-Next) list the compatible
 files found and write `--draft-model` and `--ngram-volume`. On the Qwen3.8-27B the drafter picker is the **DSpine
 drafter**, an opt-in for long agent and coding sessions (never a default): naming one writes `--spec dspine` and
-drops `--lm-head-draft`, which DSpine refuses, and clearing it returns to `--spec auto` with the proposal head; the
+drops `--lm-head-draft`, which DSpine refuses, and clearing it returns to `--spec auto`, with the proposal head where
+the defaults name it (not on the NVFP4 27Bs, whose DFlash2 drafts from the screened full head); the
 **Speculative decoding** select offers DSpine there too. The **LoRA adapter** picker (the dense
 27Bs and Inkling 2) lists the adapters found, those of the model's base first (another base's is marked, and
 picking it warns), or takes a folder or file elsewhere, and writes `--lora`. The full command line is previewed with
@@ -285,7 +286,7 @@ Defaults per family (README "Recommended settings per model"):
 |---|---|
 | all | `--max-concurrency 2 --kv-dtype int8 --preserve-thinking --tolerant-tool-calls --pending-timeout-ms 900000`, and `--spec auto --draft-tokens auto` when a drafter is available |
 | Qwen3.8-Flash-Next | `--max-context 262144 --lm-head-draft`, the best DFlash2 drafter found (`--draft-model`) and n-gram volume (`--ngram-volume`, unless `<artifact>.ngram` exists) |
-| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --max-context auto` (the context the GPU's memory holds beside the artifact, below) |
+| Qwen3.8-27B | `--ngram-draft-tokens auto --max-context auto` (the context the GPU's memory holds beside the artifact, below); `--lm-head-draft` except on the NVFP4 conversions, whose DFlash2 drafts from the screened full head |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
 | Qwen3.5-122B-A10B | `--max-context 262144` |
 | Inkling 2 Mini | `--max-context auto`; for an artifact without the DSpark drafter, the DFlash2 companion found (`--draft-model`: `--spec auto` then drafts with it; beside DSpark it is left for you to choose, DSpark being faster in the agentic replay); and, with the artifact's token ranking and a drafter (DSpark or the companion), `--lm-head-draft` |

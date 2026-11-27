@@ -402,12 +402,12 @@ function SpecField({ model, form, specArg }: { model: ModelArtifact; form: FormC
 
 /** The Qwen3.8-27B's drafter artifact is a DSpine drafter (option_support's drafter_fits): its rounds draft from the
  * full head, so the server refuses --lm-head-draft beside --spec dspine. Turning DSpine on drops the proposal head;
- * turning it off drops the DSpine drafter and restores the head the artifact has. */
+ * turning it off drops the DSpine drafter and restores the proposal head where the launcher's defaults name it. */
 function withDSpine(args: string[], on: boolean, model: ModelArtifact, form: FormContext): string[] {
   if (on) return setFlag(args, "--lm-head-draft", null, form.takesValue);
   let next = setFlag(args, "--draft-model", null, form.takesValue);
   const spec = getFlagString(next, "--spec", form.takesValue);
-  if (model.has_proposal && spec !== "off" && spec !== "") next = setFlag(next, "--lm-head-draft", true, form.takesValue);
+  if (model.proposal_head_default && spec !== "off" && spec !== "") next = setFlag(next, "--lm-head-draft", true, form.takesValue);
   return next;
 }
 
@@ -433,7 +433,7 @@ function DrafterField({ model, form, library }: { model: ModelArtifact; form: Fo
       flag="--draft-model"
       help={
         dspine
-          ? "Tencent's DSpine drafter: for long agent and coding sessions, 12-24 % faster at one request on code, level on sampled prose, 8-10 % slower on short chats. Naming it selects --spec dspine (Auto never picks it)."
+          ? "Tencent's DSpine drafter: for long agent and coding sessions, 12-17 % faster at one request on code, 0-4 % on sampled prose, 5-6 % slower on short chats. Naming it selects --spec dspine (Auto never picks it)."
           : "Inco AI's DFlash2 drafter is 8-11 % faster than the model's own MTP drafter; with --spec auto, naming it selects it."
       }
     >

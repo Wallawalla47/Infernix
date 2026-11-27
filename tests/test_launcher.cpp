@@ -489,9 +489,17 @@ void test_library() {
     dense.has_mtp      = true;
     dense.has_proposal = true;
     dense.family       = "qwen3.8-27b";
+    dense.quantization = "NVFP4 + FP8";
     dense.bytes        = 23719715844; // neroued/Qwen3.8-27B-nvfp4-NInfer
     const Args dense_args = default_args(scan, dense);
     check(contains(dense_args, {"--ngram-draft-tokens", "auto"}), "Qwen3.8-27B defaults follow the README's recommended settings");
+    // The NVFP4 27B's DFlash2 drafts from its screened full head; a 27B of other weights keeps the proposal head.
+    check(!has_flag(dense_args, "--lm-head-draft") && !defaults_use_proposal_head(dense),
+          "the NVFP4 27B leaves --lm-head-draft off");
+    ScannedModel groupwise = dense;
+    groupwise.quantization = "Q4_G64";
+    check(has_flag(default_args(scan, groupwise), "--lm-head-draft") && defaults_use_proposal_head(groupwise),
+          "a groupwise 27B keeps its proposal head");
     // The default chunk: 4096 slowed decoding beside a long prompt about 3x and continuing turns' TTFT 1.8x (VK-01).
     check(!has_flag(dense_args, "--prefill-chunk"), "the 27B prefills at the server's default chunk");
     check(!has_flag(dense_args, "--host-context-mib"), "the Engine sizes every model's Host tier (auto)");
@@ -537,8 +545,8 @@ void test_library() {
         q27_scan.drafters.push_back(offered);
         const Args q27_args = default_args(q27_scan, q27);
         check(!has_flag(q27_args, "--draft-model") && contains(q27_args, {"--spec", "auto"}) &&
-                  has_flag(q27_args, "--lm-head-draft"),
-              "DSpine is opt-in: the 27B's defaults keep DFlash2 and its proposal head");
+                  !has_flag(q27_args, "--lm-head-draft"),
+              "DSpine is opt-in: the NVFP4 27B's defaults keep DFlash2 on its screened full head");
     }
     const std::vector<std::string> q27_specs = spec_values(q27);
     check(std::find(q27_specs.begin(), q27_specs.end(), "dspine") != q27_specs.end() &&

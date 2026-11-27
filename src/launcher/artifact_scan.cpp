@@ -1,5 +1,6 @@
 #include "launcher/artifact_scan.h"
 
+#include "launcher/model_defaults.h"
 #include "launcher/option_support.h"
 
 #include "launcher/sha256.h"
@@ -786,6 +787,7 @@ Json to_json(const LibraryScan& scan) {
             {"has_dflash2", m.has_dflash2},
             {"has_dspark", m.has_dspark},
             {"has_proposal", m.has_proposal},
+            {"proposal_head_default", defaults_use_proposal_head(m)},
             {"option_support", option_support_json(m)},
             {"offloaded_experts", m.offloaded_experts},
             {"needs_ngram_volume", m.needs_ngram_volume},
