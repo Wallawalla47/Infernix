@@ -113,7 +113,8 @@ The 27B drafter's projections have registered routes, so a round streams each we
 ## Candidates and the refinement
 
 The target's head ranks the 16 best candidates of each mask column's final hidden: the screened head
-where the DFlash2 drafter's screen is fitted (RV-41), else `linear_topk`. Draft row i is block column
+where its 2-bit screen is fitted (RV-41: the FP8 row, q8 and, since 2026-11-27, NVFP4 heads, off the lossless
+route), else `linear_topk`. Draft row i is block column
 `n = i+1`; its sender t is the anchor for row 0 and the previous row's draft otherwise:
 
 ```text
@@ -153,8 +154,13 @@ on Infernix's code and sampled Markdown docs, ABBA), none of its own beat them:
   24-slice runs had suggested +1.4 %, but each setting's text diverges (its widths change the target's routes),
   and that text variance is about ±3 % over 24 slices.
 - **Copy windows:** not swept: one-row copy rounds run no drafter.
-- **Candidates:** the screened head beats exact `linear_topk` for DSpine too (one request: chats +2.4 %,
-  sampled docs +5.1 %).
+- **Candidates:** the screened head beats exact `linear_topk` for DSpine too: on NVIDIA's NVFP4 (its FP8 head)
+  at one request chats +2.4 % and sampled docs +5.1 %; on QAD-Exact's NVFP4 head (2026-11-27), on the reproducible
+  route, where both decode the same text, code +1.7 % and thinking-on chats +1.9 %, and on the default route -2.7 to
+  +4.4 % a cell over code and sampled docs at one, two and four requests and chats at one (geometric mean +1.5 %).
+  There its 357.6 MB costs 3.3 % of the KV cache (313,152 tokens against 323,712 at two lanes). The screen
+  changes only drafts: on the reproducible route a request's tokens stay plain decoding's, greedy and sampled (the
+  speculation invariance test passes with it on QAD-Exact).
 
 ## State
 

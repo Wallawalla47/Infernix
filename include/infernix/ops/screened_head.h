@@ -142,17 +142,19 @@ inline constexpr std::int32_t kScreenedTopkCandidates = 16;
  * Op: Screened head fit (5,120 wide)
  *
  * Math:
- *   For each row r and 64-weight group g of `head` (dequantized: FP8 codes times the row scale, or q8 codes times
- *   their group scale), w the group's values and m = max |w|: the binary16 scale s of least squared error
- *   sum (w - c s)^2, with codes c = clamp(rint(w * fl32(1 / s)), -2, 1), among the binary16 roundings of
- *   +-m (0.300 + 0.025 i), i in [0, 28], and of the least-squares scale of the codes at s = m (the first of equal
- *   errors wins; a zero group keeps s = 0); then the screen holds the codes c and the scale
+ *   For each row r and 64-weight group g of `head` (dequantized: FP8 codes times the row scale, q8 codes times
+ *   their group scale, or NVFP4 E2M1 codes times their block's E4M3 scale, times the matrix coefficient
+ *   nvfp4_a16_alpha in one rounded FP32 product), w the group's values and m = max |w|: the binary16 scale s of
+ *   least squared error sum (w - c s)^2, with codes c = clamp(rint(w * fl32(1 / s)), -2, 1), among the binary16
+ *   roundings of +-m (0.300 + 0.025 i), i in [0, 28], and of the least-squares scale of the codes at s = m (the first
+ *   of equal errors wins; a zero group keeps s = 0); then the screen holds the codes c and the scale
  *   binary16(s sqrt(|w|^2 / <w, c s>)) (s kept where the overlap is not positive or that scale is not finite):
  *   the converter's grouped_mse_norm with fewer candidates.
  *
  * Domain:
- *   head: FP8_E4M3FN_ROW_BF16 / FP8_E4M3FN_ROW_F32 [R, 5120], or row-split Q8_G32_FP16 [R, 5120]; screen:
- *   screened_head_wide_screen over storage of the head's R rows (a multiple of 16).
+ *   head: FP8_E4M3FN_ROW_BF16 / FP8_E4M3FN_ROW_F32 [R, 5120], row-split Q8_G32_FP16 [R, 5120], or NVFP4
+ *   block_scale_k16_m128x4 [R, 5120] (R a multiple of 128); screen: screened_head_wide_screen over storage of the
+ *   head's R rows (a multiple of 16).
  *
  * Effects:
  *   Writes every code and scale of `screen`; preserves the head. One launch; deterministic.
@@ -182,8 +184,8 @@ void screened_head_fit(const Weight& head, const Weight& screen, cudaStream_t st
  *   as ops::linear_topk); 16 <= valid_rows <= R.
  *
  * Supported domain:
- *   head: FP8_E4M3FN_ROW_BF16 / FP8_E4M3FN_ROW_F32, or row-split Q8_G32_FP16, [R, 5120]; screen: its
- *   screened_head_wide_screen. Tensors and planes 16-byte aligned.
+ *   head: FP8_E4M3FN_ROW_BF16 / FP8_E4M3FN_ROW_F32, row-split Q8_G32_FP16, or NVFP4 block_scale_k16_m128x4, [R, 5120];
+ *   screen: its screened_head_wide_screen. Tensors and planes 16-byte aligned.
  *
  * Numeric:
  *   The candidates equal the head's exact top sixteen (linear_topk's, up to its own FP32 summation order) whenever

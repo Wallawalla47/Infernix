@@ -1,6 +1,7 @@
 // ops::screened_head_fit and ops::screened_head_topk (the 5,120-wide screened head, candidates RV-41) against host
-// oracles, on an FP8 row-scaled (BF16 scales) and a row-split q8_g32_fp16 head of 8,192 x 5,120 (512 items over the
-// device's screen CTAs, so each CTA streams several), valid_rows = 8,176.
+// oracles, on an FP8 row-scaled (BF16 scales), a row-split q8_g32_fp16 and two NVFP4 (block_scale_k16_m128x4, multiplier and
+// divisor forms) heads of 8,192 x 5,120 (512 items over the device's screen CTAs, so each CTA streams several), valid_rows =
+// 8,176.
 //
 // Fit: the screen's bytes against a host replay of the documented fit (every step an explicitly rounded FP32
 // operation, binary16 by round to nearest even), for every 13th row and the planted rows, all 80 groups.
@@ -83,6 +84,30 @@ constexpr int kInvalidPlant = kRows - 3; // past valid_rows
 // Rows aligned with even columns' signs, at decreasing code magnitudes; row kInvalidPlant aligned with column 0 at
 // the largest magnitude (and, FP8, a doubled row scale).
 void plant(qw::PackedWeight& head, const std::vector<std::uint16_t>& x) {
+    if (head.weight.qtype == QType::NVFP4) {
+        // E2M1 codes of magnitude 6 (index 7) with the column's signs; every block scale of the row the E4M3 word
+        // 0x38 - j (1.0, 0.9375, ..., 0.28125), the invalid row's 0x40 (2.0).
+        const auto put = [&](int row, int column, std::uint8_t scale_word) {
+            for (int k = 0; k < kK; ++k) {
+                const float v           = x_value(x, column, k);
+                const std::uint8_t code = v == 0.0F ? 0 : static_cast<std::uint8_t>(v < 0.0F ? 0x0F : 0x07);
+                std::uint8_t& byte      = head.payload[static_cast<std::size_t>(row) * (kK / 2) + k / 2];
+                byte = static_cast<std::uint8_t>((k & 1) == 0 ? (byte & 0xF0U) | code : (byte & 0x0FU) | (code << 4));
+            }
+            for (int group = 0; group < kK / 16; ++group) {
+                const std::size_t at = head.scale_plane_offset +
+                                       static_cast<std::size_t>((row / 128) * (kK / 64) + group / 4) * 512U +
+                                       static_cast<std::size_t>(row % 32) * 16U +
+                                       static_cast<std::size_t>((row % 128) / 32) * 4U + static_cast<std::size_t>(group % 4);
+                head.payload[at] = scale_word;
+            }
+        };
+        for (int column = 0; column < kColumns; column += 2) {
+            for (int j = 0; j < kTop; ++j) { put(planted_row(column, j), column, static_cast<std::uint8_t>(0x38 - j)); }
+        }
+        put(kInvalidPlant, 0, 0x40);
+        return;
+    }
     const bool fp8 = head.weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
     const auto put = [&](int row, int column, int j) {
         for (int k = 0; k < kK; ++k) {
@@ -112,6 +137,26 @@ void plant(qw::PackedWeight& head, const std::vector<std::uint16_t>& x) {
 // q8 code times its group's binary16 scale, each one rounded FP32 product).
 std::vector<float> row_values(const qw::PackedWeight& head, int row) {
     std::vector<float> w(kK);
+    if (head.weight.qtype == QType::NVFP4) {
+        // The documented decode: the E2M1 code (low nibble first) times its block's E4M3 scale (the stored
+        // block_scale_k16_m128x4 permutation), exact in FP32, times the matrix coefficient fl32(multiplier) or
+        // fl32(1 / divisor) in one rounded FP32 product.
+        const float alpha = head.weight.weight_multiplier > 0.0F ? head.weight.weight_multiplier
+                                                                 : 1.0F / head.weight.weight_scale_divisor;
+        for (int k = 0; k < kK; ++k) {
+            const std::uint8_t byte = head.payload[static_cast<std::size_t>(row) * (kK / 2) + k / 2];
+            const std::uint8_t code = (k & 1) == 0 ? (byte & 0x0FU) : (byte >> 4);
+            const int group         = k / 16;
+            const std::size_t at    = head.scale_plane_offset +
+                                   static_cast<std::size_t>((row / 128) * (kK / 64) + group / 4) * 512U +
+                                   static_cast<std::size_t>(row % 32) * 16U +
+                                   static_cast<std::size_t>((row % 128) / 32) * 4U + static_cast<std::size_t>(group % 4);
+            const float product =
+                static_cast<float>(qw::detail::decode_e2m1(code) * qw::detail::decode_e4m3fn(head.payload[at]));
+            w[k] = product * alpha;
+        }
+        return w;
+    }
     if (head.weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         const float scale = qw::detail::bf16_to_f32(
             qw::detail::load_u16_le(head.payload, head.scale_plane_offset + static_cast<std::size_t>(row) * 2));
@@ -405,6 +450,16 @@ INFERNIX_OP_TEST(screened_head_topk) {
         qw::PatternedWeightOptions q8;
         q8.row_split_codes = qw::RowSplitCodePattern::Hashed;
         check_head("q8 head", qw::make_patterned_weight(QType::Q8_G32_FP16, kRows, kK, 0x42U, q8), x);
+        // NVIDIA's NVFP4-QAD 27B head form: an nvfp4_mul BlockScale parent run as QType::NVFP4 (a multiplier).
+        qw::PatternedWeightOptions nvfp4;
+        nvfp4.weight_multiplier = 0.0123F;
+        nvfp4.activation_scale  = 1.0F;
+        check_head("nvfp4 head", qw::make_patterned_weight(QType::NVFP4, kRows, kK, 0x43U, nvfp4), x);
+        // An Infernix nvfp4 conversion's head form: an FP32 divisor (its coefficient fl32(1 / divisor)).
+        qw::PatternedWeightOptions nvfp4_divisor;
+        nvfp4_divisor.weight_scale_divisor = 81.0F;
+        nvfp4_divisor.input_scale_divisor  = 1.0F;
+        check_head("nvfp4 divisor head", qw::make_patterned_weight(QType::NVFP4, kRows, kK, 0x44U, nvfp4_divisor), x);
     } catch (const std::exception& error) {
         std::cerr << "screened_head_topk: " << error.what() << '\n';
         return 1;

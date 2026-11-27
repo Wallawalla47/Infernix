@@ -3,8 +3,8 @@
 // rows near each column's best rescored exactly (candidates RV-41: the Qwen3.8-27B DFlash2 drafter's proposal head).
 //
 // Cost model (RTX 5090): the screen streams 1,440 bytes per row (2.25 bits a weight) against the FP8 row head's
-// 5,122 (248,320 rows: 357.6 MB against 1.27 GB) at the DRAM roofline; the rescore reads at most `rescored` rows a
-// column.
+// 5,122 or the NVFP4 head's 2,880 (248,320 rows: 357.6 MB against 1.27 GB or 715 MB) at the DRAM roofline; the
+// rescore reads at most `rescored` rows a column.
 //
 // Kernels, in launch order:
 //   screen    persistent CTAs (one per SM), eight warps splitting K per 16-row item (warp w takes groups
@@ -29,6 +29,8 @@
 #include "ops/common/bytes.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -261,13 +263,14 @@ __global__ void __launch_bounds__(kThreads, 1) wide_screen_kernel(WideScreenPara
 
 // ---- The head's rows, decoded
 
-enum class HeadRows : std::int32_t { Fp8Bf16, Fp8F32, Q8 };
+enum class HeadRows : std::int32_t { Fp8Bf16, Fp8F32, Q8, Nvfp4 };
 
 struct HeadView {
     const std::uint8_t* codes;
     const void* scales;
     HeadRows kind;
-    std::int32_t pitch; // a row's code bytes (q8: its padded K)
+    std::int32_t pitch; // a row's code bytes (q8: its padded K; NVFP4: K / 2)
+    float alpha = 1.0f; // NVFP4: the matrix coefficient (nvfp4_a16_alpha)
 };
 
 __device__ __forceinline__ float fp8_value(std::uint8_t code) {
@@ -279,9 +282,22 @@ __device__ __forceinline__ float row_scale(const HeadView& h, std::int64_t row) 
                                        : static_cast<const float*>(h.scales)[row];
 }
 
-// Eight consecutive weights of `row` from element k (a multiple of 8): FP8 codes times the row scale, or q8 codes
-// times their group scale.
+// Eight consecutive weights of `row` from element k (a multiple of 8): FP8 codes times the row scale, q8 codes
+// times their group scale, or NVFP4 E2M1 codes (low nibble first) times their 16-weight block's E4M3 scale (exact
+// in FP32), then times the matrix coefficient (one rounded product).
 __device__ __forceinline__ void decode8(const HeadView& h, std::int64_t row, int k, float (&w)[8]) {
+    if (h.kind == HeadRows::Nvfp4) {
+        const std::uint32_t packed = __ldg(reinterpret_cast<const std::uint32_t*>(h.codes + row * h.pitch + k / 2));
+        const float scale          = detail::decode_nvfp4_e4m3(static_cast<const std::uint8_t*>(
+            h.scales)[detail::nvfp4_scale_byte_offset(static_cast<int>(row), k / 16, kK)]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 pair = detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(packed >> (8 * j)));
+            w[2 * j]          = __fmul_rn(__fmul_rn(pair.x, scale), h.alpha);
+            w[2 * j + 1]      = __fmul_rn(__fmul_rn(pair.y, scale), h.alpha);
+        }
+        return;
+    }
     const uint2 packed = __ldg(reinterpret_cast<const uint2*>(h.codes + row * h.pitch + k));
     if (h.kind == HeadRows::Q8) {
         const float scale = __half2float(static_cast<const __half*>(h.scales)[row * (h.pitch / 32) + k / 32]);
@@ -508,6 +524,13 @@ bool aligned16(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 HeadView head_view(const Weight& head) {
+    if (head.qtype == QType::NVFP4) {
+        require(head.layout == QuantLayout::BlockScaleK16M128x4 && head.k == kK,
+                "an NVFP4 head must be block_scale_k16_m128x4 [R, 5120]");
+        (void)detail::validate_nvfp4_weight(head, "screened_head (5,120-wide) NVFP4 head");
+        return {static_cast<const std::uint8_t*>(head.qdata), head.scales, HeadRows::Nvfp4, kK / 2,
+                detail::nvfp4_a16_alpha(head)};
+    }
     if ((head.qtype == QType::FP8_E4M3FN_ROW_BF16 || head.qtype == QType::FP8_E4M3FN_ROW_F32) &&
         head.layout == QuantLayout::RowScale && head.k == kK && head.padded_shape[1] == kK && head.qdata != nullptr &&
         head.scales != nullptr && aligned16(head.qdata)) {
@@ -517,7 +540,7 @@ HeadView head_view(const Weight& head) {
     require(head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit && head.k == kK &&
                 head.padded_shape[1] % 32 == 0 && head.padded_shape[1] >= kK && head.qhigh == nullptr &&
                 head.qdata != nullptr && head.scales != nullptr && aligned16(head.qdata),
-            "the head must be an FP8 row-scaled or row-split q8_g32_fp16 [R, 5120]");
+            "the head must be an FP8 row-scaled, row-split q8_g32_fp16 or NVFP4 [R, 5120]");
     return {static_cast<const std::uint8_t*>(head.qdata), head.scales, HeadRows::Q8, head.padded_shape[1]};
 }
 

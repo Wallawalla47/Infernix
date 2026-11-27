@@ -430,7 +430,8 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
         const auto& options = model.options();
         const bool screened_head =
             (head.qtype == QType::FP8_E4M3FN_ROW_BF16 || head.qtype == QType::FP8_E4M3FN_ROW_F32 ||
-             (head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit)) &&
+             (head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit) ||
+             (head.qtype == QType::NVFP4 && head.layout == QuantLayout::BlockScaleK16M128x4)) &&
             head.k == ops::kScreenedTopkHidden && head.n % 16 == 0;
         // A DSpine drafter ranks the same full head's top sixteen.
         if (model.config().draft && (model.config().draft->dflash2 || model.config().draft->dspine) &&
