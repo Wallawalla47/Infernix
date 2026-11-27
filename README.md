@@ -124,6 +124,12 @@ Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer
 - **Faster prefill**: 1.6-1.8× NInfer's on long prompts.
 - **Faster decode**: DFlash2 with n-gram copy drafts, 11-17 % ahead of NInfer's MTP; draft trees
   (`--draft-tree-nodes`) are an option on top.
+- **DSpine drafting** with Tencent's drafter
+  ([in the QAD artifact's repo](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact/tree/main/drafter),
+  1.53 GiB, any 27B NVFP4 artifact) for long agent and coding sessions: at one request it decodes
+  12-24 % faster than DFlash2 on code and 1-10 % on sampled prose; with several decoding together,
+  4-9 % faster on code and level on sampled prose; on short chats 8-10 % slower
+  ([benchmarks](#qwen38-27b-dspine-against-dflash2)).
 - **Smaller KV**: `k4v2` and `vq2` hold 2.7 and 4 times the context of INT8.
 
 ### Inkling 2 Mini on one RTX 5090
@@ -167,8 +173,9 @@ Setup, limits and options: the [Inkling 2 Mini guide](docs/inkling2-mini.md).
 
 ### And also
 
-- **Speculative decoding**: MTP, DFlash, DFlash2, DSpark (Inkling 2 Mini) and n-gram drafting with
-  exact sampling, on by default with the drafter measured fastest for each model (`--spec auto`).
+- **Speculative decoding**: MTP, DFlash, DFlash2, DSpine (Qwen3.8-27B), DSpark (Inkling 2 Mini) and
+  n-gram drafting with exact sampling, on by default with the drafter measured fastest for each model
+  (`--spec auto`; DSpine runs only when named, `--spec dspine --draft-model FILE`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video (Inkling 2 Mini: images only); the vision encoder can stay in system
   RAM.
@@ -388,6 +395,48 @@ prompts), run as its RTX 5090 example: MTP 3 with the optimized proposal head, a
 256 MiB headroom, 1,024-token prefill chunks. Infernix: DFlash2, draft length auto, the proposal
 head and n-gram drafts. Neither caps thinking, so wall times are not comparable with earlier
 versions of this table.
+
+### Qwen3.8-27B: DSpine against DFlash2
+
+Output tok/s over each whole run (wall clock, the prompts' prefill included), Tencent's DSpine drafter
+([`drafter/` of the QAD-Exact repo](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact/tree/main/drafter))
+against each artifact's own DFlash2 drafter (two passes in reverse order, within 4 % of each other):
+
+| Artifact | Prompt | Requests | Code: DFlash2 | **DSpine** | Change | Docs, sampled: DFlash2 | **DSpine** | Change |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| NVIDIA NVFP4 | 1,280 | 1 | 389.5 | **435.4** | +11.8 % | 180.8 | **192.8** | +6.6 % |
+| NVIDIA NVFP4 | 1,280 | 2 | 590.7 | **642.3** | +8.7 % | 328.5 | **338.7** | +3.1 % |
+| NVIDIA NVFP4 | 1,280 | 4 | 831.2 | **887.4** | +6.8 % | **526.6** | 518.6 | −1.5 % |
+| NVIDIA NVFP4-QAD | 1,280 | 1 | 375.3 | **463.5** | +23.5 % | 195.3 | **214.0** | +9.6 % |
+| NVIDIA NVFP4-QAD | 1,280 | 2 | 593.8 | **620.4** | +4.5 % | 333.2 | **334.8** | +0.5 % |
+| NVIDIA NVFP4-QAD | 512 | 1 | 402.9 | **472.7** | +17.3 % | 197.2 | **201.2** | +2.0 % |
+| NVIDIA NVFP4-QAD | 128 | 1 | 386.3 | **459.1** | +18.8 % | 213.8 | **215.4** | +0.7 % |
+
+In the agentic replay (NVIDIA NVFP4, 210K context, four lanes; seed 44 run in both orders) DSpine decoded 12.9 %,
+15.0 % and 14.2 % faster while one request decoded, and 13.1 %, 0.1 % and 7.5 % faster at the run's own batching;
+its rounds took 0-3 % longer, and it accepted 13-18 % more tokens a round. Workload wall time moved −14.0 %, −10.2 %
+and +11.0 %, with how much text each arm happened to sample. On short chats it is slower: 24 chat requests of about
+20 tokens on the QAD artifact (400 tokens each, two passes) decoded 8.3-8.8 % slower, with thinking off or on,
+greedy or sampled, and ten served chat requests 10 % slower; there DSpine accepts about what DFlash2 does at a
+slightly dearer round.
+
+DSpine conditions each draft on the one before it within the block, so more of a long block is accepted: at one
+request 32 % of its accepted code drafts lie past the seventh, against DFlash2's 24 %. Batched rounds verify at most
+seven drafts, where its acceptance on sampled prose matches DFlash2's, while its rounds still cost slightly more
+(its 8,192-position ring, the code bridge, and the full head where DFlash2 uses the proposal head). It keeps the
+target's last 8,192 positions per layer (160 MiB a lane against DFlash2's 40 MiB): on the NVFP4 artifact at
+four lanes the KV cache holds 244,352 tokens against 253,504 (−3.6 %), while on the QAD artifact at two lanes it
+holds 2.8 % more, as `--spec dspine` leaves the artifact's own DFlash2 drafter unloaded. Prefill is 1 % slower.
+Greedy output is the same with either drafter; sampling keeps its distribution.
+
+*Settings*: DFlash2 `--draft-tokens auto --lm-head-draft --ngram-draft-tokens auto`; DSpine `--spec dspine
+--draft-model FILE --draft-tokens auto --ngram-draft-tokens auto` (its NVFP4 conversion: on identical text it is
+0.9-2.2 % faster than the Q8 one, with 0.4-1.0 % fewer accepted drafts). 24 prompts from Infernix's sources and
+Markdown docs at `08dda308`, each continued for 384 tokens, greedy or sampled (temperature 1.0, top-k 20, top-p
+0.95), N requests decoding at a time; INT8 KV; `infernix_decode_quality_gen` (2026-11-26). The two drafters'
+texts diverge (their verify widths change the target's arithmetic), which moves a cell of 24 prompts by about
+±3 %: the sampled-docs differences at two and four requests and on short prompts are within it. DSpine's own
+batch lengths and width costs were measured and none beat DFlash2's ([DSpine](docs/maintainer/dspine.md)).
 
 ### PCIe Gen5 x8 against x16
 
@@ -630,6 +679,20 @@ Qwen3.8-27B on a 32 GB RTX 5090:
 infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --tolerant-tool-calls
 ```
 
+For long agent and coding sessions, Tencent's DSpine drafter (`drafter/Qwen3.8-27B-DSpine-b16-Infernix.infernix` in
+[the artifact's repo](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact/tree/main/drafter))
+decodes faster (one request: 17-24 % on code, 1-10 % on sampled docs; two requests: 4.5 % on code, level on sampled
+docs), and the KV cache holds 2.8 % more, as the artifact's own DFlash2 drafter is then not loaded; on short chats it is
+8-10 % slower ([benchmarks](#qwen38-27b-dspine-against-dflash2)):
+
+```bat
+hf download Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact drafter/Qwen3.8-27B-DSpine-b16-Infernix.infernix --local-dir .
+```
+
+```bat
+infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dspine --draft-model drafter\Qwen3.8-27B-DSpine-b16-Infernix.infernix --draft-tokens auto --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --tolerant-tool-calls
+```
+
 Ornith-1.5-122B (experts in about 70 GiB of RAM; [guide](docs/qwen3_5-122b.md)):
 
 ```bat
@@ -654,7 +717,7 @@ drafter flags are the fastest measured overall, and `auto` picks the draft lengt
 | Model | Drafting | What `--draft-tokens auto` does there |
 |---|---|---|
 | Qwen3.8-Flash-Next, every conversion | `--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft`, plus `--ngram-volume` (the conversion's own, NVIDIA FP4-Local's for Huihui's FP4-Local, or the FP8 volume, [models](#qwen38-flash-next)) and, on Windows, `--vram-past-budget` | verifies the drafts of a 7-token block that their calibrated probabilities make worthwhile; without the drafter, `--spec mtp --draft-tokens auto --lm-head-draft` (0-7 drafts a round, about 10 % slower) |
-| Qwen3.8-27B NVFP4 (NVIDIA, Quasar, Uncensored, Swift, NInfer's nvfp4) | `--spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto` | a 15-draft block verified at the width its probabilities favour (batched rounds: 7), n-gram copies of up to 63 tokens |
+| Qwen3.8-27B NVFP4 (NVIDIA, Quasar, Uncensored, Swift, NInfer's nvfp4) | `--spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto`; for long agent and coding sessions, `--spec dspine --draft-model Qwen3.8-27B-DSpine-b16-Infernix.infernix --draft-tokens auto --ngram-draft-tokens auto` ([drafter](#qwen38-27b)) | a 15-draft block verified at the width its probabilities favour (batched rounds: 7), n-gram copies of up to 63 tokens. DSpine (measured on NVIDIA's NVFP4 and NVFP4-QAD): at one request 12-24 % faster on code and 1-10 % on sampled docs, at two and four 4-9 % on code and level on sampled docs, but 8-10 % slower on short chats |
 | Qwen3.8-27B groupwise (NInfer's `Qwen3.8-27B-NInfer`) | `--spec dflash2 --draft-tokens auto --lm-head-draft` | 7 drafts every round (its per-round policies were no faster); at one request 54 % faster than MTP's 3 on code, 40 % on docs |
 | Qwen3.6-35B-A3B | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length, 1-5 (DFlash `auto` is faster only on code at one request) |
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
@@ -672,7 +735,8 @@ already holds about 850K tokens at four lanes, so there `--embedding-host` only 
 prefill 0.5-0.8 % slower).
 
 Without `--spec`, `infernix-serve` and `infernix` speculate as `--spec auto --draft-tokens auto`: they make the
-table's drafter choice by themselves from the artifact's drafters and report it at startup. On Flash-Next that is
+table's drafter choice by themselves from the artifact's drafters and report it at startup; DSpine runs only with
+`--spec dspine`. On Flash-Next that is
 DFlash2 when `--draft-model` names its drafter or the drafter's companion artifact is the only one in the model's
 folder, else MTP; without a drafter, and on `--lossless`, they decode plain. `--spec off` decodes plain;
 `--lm-head-draft`, `--draft-model` and `--ngram-draft-tokens auto` are still given where the table lists them.
@@ -796,6 +860,16 @@ many blocks per token ([BF16 P12](docs/qwen3_8-flash-next.md#bf16-p12-n-gram-tab
 | [Swift-Qwen3.8-27B-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Swift-Qwen3.8-27B-NVFP4-NInferV3) | [ukisai/Swift-Qwen3.8-27B-NVFP4](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-NVFP4) | UkisAI's token-efficient fine-tune, converted like the NVIDIA artifact. Smoke-tested; quality and speed not measured. |
 | [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | NInfer's official NVFP4 artifact, the one [benchmarked](#qwen38-27b-infernix-vs-ninfer). |
 | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | NInfer's official `groupwise-int` artifact. |
+
+Every 27B NVFP4 artifact can also draft with
+**[`drafter/Qwen3.8-27B-DSpine-b16-Infernix.infernix`](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact/tree/main/drafter)**
+in the QAD-Exact repository (1.53 GiB), Tencent's [DSpine drafter](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16)
+with its MLP, attention output and feature projection in NVFP4 (`--spec dspine --draft-model FILE --draft-tokens auto
+--ngram-draft-tokens auto`; Infernix only, `main` at `e095b683a` or later). At one request it decodes 12-24 % faster
+than the artifact's DFlash2 drafter on code and 1-10 % on sampled docs; with two to four requests decoding together,
+4-9 % on code and level on sampled docs; on short chats 8-10 % slower, so it suits long agent and coding
+sessions ([benchmarks](#qwen38-27b-dspine-against-dflash2)). Measured on NVIDIA's NVFP4 and NVFP4-QAD artifacts; the
+fine-tunes' acceptance is unmeasured.
 
 ### Qwen3.6
 
