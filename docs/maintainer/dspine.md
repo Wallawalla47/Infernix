@@ -141,8 +141,20 @@ recorded q (greedy rows: one-hot), n-gram copy rounds and the `--draft-tokens au
 (adaptive-dflash: the whole block is proposed, the host chooses the verified width). The block is
 causal, so a narrow round's drafts are the leading drafts of a wide one. Tree verification and
 `--lm-head-draft` are refused. Where `--draft-tokens auto` or `--ngram-draft-tokens auto` resolve
-per configuration, DSpine takes DFlash2's measured values (fixed length, copy window); its own have not
-been measured.
+per configuration, DSpine takes DFlash2's measured values (fixed length, width costs, batch length, copy
+window). Measured for DSpine on the NVFP4 27B (2026-11-26, RTX 5090, INT8 KV, `infernix_decode_quality_gen`
+on Infernix's code and sampled Markdown docs, ABBA), none of its own beat them:
+
+- **Batch length:** rounds of two and four rows at 0 (the width policy's split rounds), 5, 9, 11 and 15
+  drafts lost to 7 by 1.9-4.5 % (geometric mean of code and docs at two and four rows); code favours longer
+  batches (15 at two rows +7.9 %), sampled docs 5-7 (9-15 lose 6-16 %).
+- **Width costs:** proposal and per-draft costs of (0.3, 0.02), (0.5, 0.01), (0.18, 0.01) and (0.18, 0.03)
+  against DFlash2's (0.18, 0.02) moved one request by at most +0.3 % over 72 code and docs slices and 24 chats;
+  24-slice runs had suggested +1.4 %, but each setting's text diverges (its widths change the target's routes),
+  and that text variance is about ±3 % over 24 slices.
+- **Copy windows:** not swept: one-row copy rounds run no drafter.
+- **Candidates:** the screened head beats exact `linear_topk` for DSpine too (one request: chats +2.4 %,
+  sampled docs +5.1 %).
 
 ## State
 

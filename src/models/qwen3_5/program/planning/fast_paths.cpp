@@ -791,7 +791,8 @@ std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration
     // one request, the NVFP4 27B 2026-10-21/22 also at two and four): the 27B's DFlash2 7 (15 is
     // 12.4 % faster than 7 on code at one request but 1-19 % slower batched, a geometric mean 6.1 %
     // behind), the 35B-A3B's DFlash 3.
-    // DSpine (unmeasured as a fixed length here) takes DFlash2's: its rounds verify the same chains.
+    // DSpine takes DFlash2's: its rounds verify the same chains. Its own batch lengths and width costs were measured
+    // 2026-11-26 and none beat DFlash2's (docs/maintainer/dspine.md, Verification and rounds).
     if (is_masked_draft_backend(backend)) {
         return configuration.query_heads == 24 ? 7 : 3;
     }
@@ -860,8 +861,8 @@ NgramSettings auto_ngram_settings(const FastPathConfiguration& configuration, Sp
     // -1.6, -1.8 %; a copy rewrite beside a code slice -0.6 %), within the run-to-run spread over the workloads:
     // the owner kept 31 (model-quality.md 6.7, adaptive-dflash).
     // The 4-bit class only: the copy windows were not timed under --a16-activations or --a8-activations.
-    // DSpine takes DFlash2's copies (its rounds verify copies on the same sparse frame); not measured
-    // beside DSpine on its own.
+    // DSpine takes DFlash2's copies (its rounds verify copies on the same sparse frame; a one-row copy round runs
+    // no drafter); not swept beside DSpine on its own.
     if (nvfp4_27b(configuration) && configuration.activations == ActivationClass::A4 &&
         is_sparse_draft_backend(backend) && adaptive_drafts) {
         return {.window = 63, .batch_window = 31, .min_match = 12};
