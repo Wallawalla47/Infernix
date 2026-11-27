@@ -1525,9 +1525,22 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                 options.max_context = *probe.max_context;
                 instance->resize_context(options);
             }
-            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                               "--max-context auto: %u tokens, the largest context the KV cache holds here",
-                               options.max_context);
+            // The model's positions bound it (plan_qwen3_5_context): its native context, more only with YaRN.
+            const double positions =
+                static_cast<double>(instance->parameters.model.config().text.max_position_embeddings) *
+                std::max(1.0, static_cast<double>(options.rope_yarn_factor));
+            if (static_cast<double>(options.max_context) >= positions) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   options.rope_yarn_factor > 1.0F
+                                       ? "--max-context auto: %u tokens, the positions --rope-yarn-factor allows"
+                                       : "--max-context auto: %u tokens, the model's native context (more needs "
+                                         "--rope-yarn-factor)",
+                                   options.max_context);
+            } else {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "--max-context auto: %u tokens, the largest context the KV cache holds here",
+                                   options.max_context);
+            }
         }
         auto planned_sequence = plan_sequence(options);
         if (!planned_sequence) {
