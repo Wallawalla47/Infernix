@@ -28,7 +28,20 @@ bool ProgramImpl::grow_kv(std::uint32_t need) {
     const std::uint32_t backed = pool_->backed_pages();
     std::uint32_t target       = backed + (need - pool_->available_pages());
     target = std::min(pool_->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
-    if (target - backed < need - pool_->available_pages()) { return false; }
+    // A Debug line for a growth that stops (or, with `retry`, goes on from the frames) and the state it met.
+    const auto refused = [&](const char* why, const std::string& detail, bool retry = false) {
+        const VramSnapshot vram = vram_->query();
+        diagnostic(std::string(retry ? "KV pool growth retried from the expert cache (" : "KV pool growth refused (") +
+                       why + "): " + std::to_string(need) + " pages needed, " +
+                       std::to_string(pool_->available_pages()) + " free of " + std::to_string(backed) + " backed (target " +
+                       std::to_string(target) + ", capacity " + std::to_string(pool_->capacity_pages()) + "); expert cache " +
+                       std::to_string(residency_->frames()) + " frames, " +
+                       std::to_string(residency_->stats().lent_frames) + " lent; VRAM free " +
+                       std::to_string(vram.device_free >> 20) + " MiB" + detail,
+                   DiagnosticLevel::Debug);
+        return false;
+    };
+    if (target - backed < need - pool_->available_pages()) { return refused("its capacity", ""); }
     const std::lock_guard<std::mutex> lock(vram_mutex_);
     // The bytes map_kv(target) will map: the chunks the target needs that are not mapped yet. Chunks an earlier
     // failed growth kept (below) can sit in some planes while another plane still lacks one, so the difference of
@@ -46,30 +59,59 @@ bool ProgramImpl::grow_kv(std::uint32_t need) {
     // the frames, one chunk per pool over so the pools unmap at least that much.
     const std::uint32_t spare =
         control_ ? std::max<std::uint32_t>(control_->target(vram_->query(), pool_now_), frames) - frames : 0;
-    const std::uint64_t spare_bytes = static_cast<std::uint64_t>(spare) * stride;
-    std::uint32_t give              = 0;
-    if (added > spare_bytes) {
-        give = static_cast<std::uint32_t>((added - spare_bytes + residency_->pools() * ExpertResidency::kChunkBytes + stride - 1) / stride);
-    }
-    if (give > frames) { return false; }
+    const std::uint64_t phantom     = testing::take_phantom_kv_spare(); // a test's spare the device refuses
+    const std::uint64_t spare_bytes = static_cast<std::uint64_t>(spare) * stride + phantom;
+    const auto give_for = [&](std::uint64_t free_bytes) -> std::uint32_t {
+        if (added <= free_bytes) { return 0; }
+        return static_cast<std::uint32_t>(
+            (added - free_bytes + residency_->pools() * ExpertResidency::kChunkBytes + stride - 1) / stride);
+    };
+    const auto sizing = [&](std::uint32_t give) {
+        return "; growth maps " + std::to_string(added >> 20) + " MiB, " + std::to_string(spare) + " spare frames, " +
+               std::to_string(give) + " frames to give";
+    };
     device_.synchronize();
-    if (give != 0) {
-        const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
-        if (resized.frames > frames - give) { // a lease holds the frames (it may have shrunk part-way)
-            frames_now_ = residency_->frames();
-            pool_now_   = residency_->pool_bytes();
-            return false;
-        }
-    }
     const std::size_t mapped_before = kv_vmm_->mapped_bytes();
-    if (!map_kv(target)) {
+    // That reading is not always memory the device maps: at 85 MiB free it refused even a 2 MiB chunk with nothing
+    // running, while the frames held 24 GiB, and an idle Engine refused a request that fit (HTTP 503 in the
+    // agentic replay, 2026-11-28). A refused chunk sends the growth to the frames for all of it (the second pass);
+    // only a refusal there stands.
+    bool grown = false;
+    for (const std::uint64_t free_bytes : {spare_bytes, std::uint64_t{0}}) {
+        if (free_bytes == 0 && spare_bytes != 0) { testing::count_kv_growth_retry(); }
+        const std::uint32_t give = give_for(free_bytes);
+        if (give > frames) {
+            (void)refused("the expert cache is smaller than the growth", sizing(give));
+            break;
+        }
+        if (frames - give < residency_->frames()) {
+            const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
+            if (resized.frames > frames - give) { // a lease holds the frames
+                (void)refused("the expert cache did not shrink", sizing(give) + "; it kept " +
+                                                                     std::to_string(resized.frames) + " of " +
+                                                                     std::to_string(frames - give) + " frames");
+                break;
+            }
+        }
+        if (!(phantom != 0 && free_bytes != 0) && map_kv(target)) {
+            grown = true;
+            break;
+        }
+        (void)refused(free_bytes != 0 ? "the device refused a KV chunk in the spare memory" : "the device refused a KV chunk",
+                      sizing(give) + "; " + std::to_string((kv_vmm_->mapped_bytes() - mapped_before) >> 20) +
+                          " MiB mapped before the refusal",
+                      free_bytes != 0);
+        if (free_bytes == 0) { break; }
+    }
+    if (!grown) {
         // The chunks mapped before the failure stay with the region (the next growth uses them) and count as
         // fixed bytes; the frames get back only what was not mapped (as Qwen3.5's elastic_kv.cpp), so frames and
         // KV never claim the same memory.
-        const std::size_t kept = kv_vmm_->mapped_bytes() - mapped_before;
+        const std::size_t kept   = kv_vmm_->mapped_bytes() - mapped_before;
+        const std::uint32_t gave = frames - std::min(frames, residency_->frames());
         if (control_ && kept != 0) { control_->account_fixed(static_cast<std::int64_t>(kept)); }
-        const auto held = static_cast<std::uint32_t>(std::min<std::uint64_t>(give, (kept + stride - 1) / stride));
-        if (give > held) { (void)residency_->resize(frames - held, device_.stream, *vram_, growth_limit()); }
+        const auto held = static_cast<std::uint32_t>(std::min<std::uint64_t>(gave, (kept + stride - 1) / stride));
+        if (gave > held) { (void)residency_->resize(frames - held, device_.stream, *vram_, growth_limit()); }
         frames_now_ = residency_->frames();
         pool_now_   = residency_->pool_bytes();
         return false;

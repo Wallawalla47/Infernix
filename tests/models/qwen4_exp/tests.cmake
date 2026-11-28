@@ -120,6 +120,15 @@ infernix_add_test(infernix_qwen4_exp_queued_growth_real_test
 set_tests_properties(infernix_qwen4_exp_queued_growth_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
 
+# An idle Engine's KV pool growth whose chunk the device refuses in the memory the free-memory reading offered (a test
+# seam; under WDDM it refused a request that fit, HTTP 503, 2026-11-28) takes the memory from the expert frames: the
+# request completes and keeps its ids.
+infernix_add_test(infernix_qwen4_exp_kv_growth_refusal_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_growth_refusal_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_kv_growth_refusal_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
 # Non-finite logits after a request published prefix-cache entries (a test hook): its entries are
 # withdrawn, a retry resumes from nothing and equals a cache-off run, and a saved cache file cannot
 # bring them back (hybrid-prefix-cache-spec §7.8, candidates SQ-01).

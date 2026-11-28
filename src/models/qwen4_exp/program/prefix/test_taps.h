@@ -86,4 +86,14 @@ void note_staging(std::int32_t slots, bool full_tier) noexcept;
 [[nodiscard]] std::int32_t staging_slots() noexcept;
 [[nodiscard]] bool staging_full_tier() noexcept;
 
+// The next KV pool growth (grow_kv) reads `bytes` more spare memory than there is, and the device refuses the chunk it
+// maps there, as under WDDM at 85 MiB free with nothing running (2026-11-28: an idle Engine refused a request that fit,
+// HTTP 503 in the agentic replay); 0: off. take_phantom_kv_spare is the growth's (it reads and clears the request). And
+// the growths that went on from the expert frames after a refused chunk since the process started; count_kv_growth_retry
+// is the Program's (infernix_qwen4_exp_kv_growth_refusal_real_test). For tests only.
+void set_phantom_kv_spare(std::uint64_t bytes) noexcept;
+[[nodiscard]] std::uint64_t take_phantom_kv_spare() noexcept;
+void count_kv_growth_retry() noexcept;
+[[nodiscard]] std::uint64_t kv_growth_retries() noexcept;
+
 } // namespace infernix::models::qwen4_exp::testing

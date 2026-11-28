@@ -9389,6 +9389,12 @@ elastic pool does the same job with no kernel change:
     - Growth first uses memory the control law would give the frames anyway. The rest it takes from
       the frames (`ExpertResidency::resize`, one 64 MiB frame chunk over so that much is
       unmapped), as many as the growth needs: a fixed pool at the capacity takes them all.
+    - When the device refuses a chunk in that spare memory, the growth takes all of it from the
+      frames and maps again; only a refusal there stands. Before 2026-11-28 the refusal ended the
+      growth. Under WDDM at 85 MiB free the device refused even a 2 MiB chunk where the control law
+      counted 68-133 frames spare. An idle Engine with 24 GiB of frames then answered a 79K-token turn
+      of the agentic replay with HTTP 503 ("more than an idle Engine has"); the pool stood at 1,216
+      of its 8,194 pages and was 24 pages short.
     - Growth is refused while frames are lent. The quote and the prefix selection count what one
       growth could add.
     - When only a prefill's loans are lent (the stream's ring, wide arena and walk area and the wide

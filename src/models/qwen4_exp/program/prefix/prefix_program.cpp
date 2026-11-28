@@ -32,7 +32,17 @@ std::mutex wide_mutex;
 std::vector<WideScope> recorded_wide_scopes;
 std::atomic<std::int32_t> noted_staging_slots{0};
 std::atomic<bool> noted_full_tier{false};
+std::atomic<std::uint64_t> phantom_kv_spare{0};
+std::atomic<std::uint64_t> kv_growth_retry_count{0};
 } // namespace
+
+void set_phantom_kv_spare(std::uint64_t bytes) noexcept { phantom_kv_spare.store(bytes); }
+
+std::uint64_t take_phantom_kv_spare() noexcept { return phantom_kv_spare.exchange(0); }
+
+void count_kv_growth_retry() noexcept { kv_growth_retry_count.fetch_add(1, std::memory_order_relaxed); }
+
+std::uint64_t kv_growth_retries() noexcept { return kv_growth_retry_count.load(std::memory_order_relaxed); }
 
 void note_staging(std::int32_t slots, bool full_tier) noexcept {
     noted_full_tier.store(full_tier);
