@@ -45,6 +45,18 @@ inline void decode_block(QType q, const std::uint8_t* b, double* y) {
         }
         break;
     }
+    case QType::GGML_Q5_0: { // dequantize_row_q5_0: d, qh[4], qs[16]
+        const double d = f16(u16(b));
+        std::uint32_t qh;
+        std::memcpy(&qh, b + 2, 4);
+        for (int j = 0; j < 16; ++j) {
+            const std::uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
+            const std::uint8_t xh_1 = (qh >> (j + 12)) & 0x10;
+            y[j]      = (((b[6 + j] & 0x0F) | xh_0) - 16) * d;
+            y[j + 16] = (((b[6 + j] >> 4) | xh_1) - 16) * d;
+        }
+        break;
+    }
     case QType::GGML_IQ4_XS: {
         const double d = f16(u16(b));
         const int scales_h = u16(b + 2);
@@ -107,6 +119,38 @@ inline void decode_block(QType q, const std::uint8_t* b, double* y) {
                 const std::uint64_t g = k_iq2s_grid[qs[4 * ib + l] | ((qh[ib] << (8 - 2 * l)) & 0x300)];
                 for (int j = 0; j < 8; ++j) {
                     y[32 * ib + 8 * l + j] = dl * ((g >> 8 * j) & 0xFF) * ((signs[4 * ib + l] & k_kmask_iq2xs[j]) ? -1 : 1);
+                }
+            }
+        }
+        break;
+    }
+    case QType::GGML_IQ2_XXS: { // dequantize_row_iq2_xxs
+        const double d = f16(u16(b));
+        for (int ib = 0; ib < 8; ++ib) {
+            std::uint32_t aux32[2];
+            std::memcpy(aux32, b + 2 + 8 * ib, 8);
+            const double db = d * (0.5 + (aux32[1] >> 28)) * 0.25;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint64_t g     = k_iq2xxs_grid[(aux32[0] >> 8 * l) & 0xFF];
+                const std::uint8_t signs = k_ksigns_iq2xs[(aux32[1] >> 7 * l) & 127];
+                for (int j = 0; j < 8; ++j) {
+                    y[32 * ib + 8 * l + j] = db * ((g >> 8 * j) & 0xFF) * ((signs & k_kmask_iq2xs[j]) ? -1 : 1);
+                }
+            }
+        }
+        break;
+    }
+    case QType::GGML_IQ2_XS: { // dequantize_row_iq2_xs
+        const double d = f16(u16(b));
+        const std::uint8_t* scales = b + 66;
+        for (int ib = 0; ib < 8; ++ib) {
+            const double db[2] = {d * (0.5 + (scales[ib] & 0xF)) * 0.25, d * (0.5 + (scales[ib] >> 4)) * 0.25};
+            for (int l = 0; l < 4; ++l) {
+                const std::uint16_t q     = u16(b + 2 + 2 * (4 * ib + l));
+                const std::uint64_t g     = k_iq2xs_grid[q & 511];
+                const std::uint8_t signs = k_ksigns_iq2xs[q >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    y[32 * ib + 8 * l + j] = db[l / 2] * ((g >> 8 * j) & 0xFF) * ((signs & k_kmask_iq2xs[j]) ? -1 : 1);
                 }
             }
         }

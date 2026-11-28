@@ -156,16 +156,41 @@ __device__ __forceinline__ int2 iq4nl_values(std::uint32_t q4) {
                      static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x7531)));
 }
 
+// Q5_0's codes q - 16 of the eight nibbles of `q4` as signed bytes: .x the low nibbles of its four bytes, their
+// fifth bits in bits 0-3 of `low5`; .y the high nibbles, theirs in bits 0-3 of `high5` (higher bits are ignored).
+// A nibble's four shifted copies 1, 2^7, 2^14, 2^21 do not overlap, as in apply_signs4.
+__device__ __forceinline__ int2 q5_0_values(std::uint32_t q4, std::uint32_t low5, std::uint32_t high5) {
+    const std::uint32_t lo = (q4 & 0x0F0F0F0FU) | ((((low5 & 0xFU) * 0x00204081U) & 0x01010101U) << 4);
+    const std::uint32_t hi = ((q4 >> 4) & 0x0F0F0F0FU) | ((((high5 & 0xFU) * 0x00204081U) & 0x01010101U) << 4);
+    return make_int2(sub_bytes4(lo, 0x10101010U), sub_bytes4(hi, 0x10101010U));
+}
+
 // The codebooks a decode reads (F's grid; IQ3_XXS's sign table too): the device tables by __ldg
 // (DeviceCodebook) or a CTA's copy in shared memory (SharedCodebook), the same values, so a decode
 // gives the same integers from either. Formats without a table read neither.
 template <QType F>
-inline constexpr int kGridWords = F == QType::GGML_IQ3_S     ? 512
-                                  : F == QType::GGML_IQ3_XXS ? 256
-                                  : F == QType::GGML_IQ2_S   ? 2048 // 1,024 eight-byte entries
-                                                             : 0;
+inline constexpr int kGridWords = F == QType::GGML_IQ3_S      ? 512
+                                  : F == QType::GGML_IQ3_XXS  ? 256
+                                  : F == QType::GGML_IQ2_S    ? 2048 // 1,024 eight-byte entries
+                                  : F == QType::GGML_IQ2_XS   ? 1024 // 512 eight-byte entries
+                                  : F == QType::GGML_IQ2_XXS  ? 512  // 256 eight-byte entries
+                                                              : 0;
+// The formats whose 7-bit sign fields index ksigns_iq2xs (IQ2_S stores its sign bytes verbatim).
 template <QType F>
-inline constexpr int kSignBytes = F == QType::GGML_IQ3_XXS ? 128 : 0;
+inline constexpr int kSignBytes =
+    F == QType::GGML_IQ3_XXS || F == QType::GGML_IQ2_XXS || F == QType::GGML_IQ2_XS ? 128 : 0;
+
+// F's device grid of eight-byte entries (the 2-bit formats).
+template <QType F>
+__device__ __forceinline__ const unsigned long long* grid64_table() {
+    if constexpr (F == QType::GGML_IQ2_XXS) {
+        return reinterpret_cast<const unsigned long long*>(d_iq2xxs_grid);
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        return reinterpret_cast<const unsigned long long*>(d_iq2xs_grid);
+    } else {
+        return reinterpret_cast<const unsigned long long*>(d_iq2s_grid);
+    }
+}
 
 template <QType F>
 struct DeviceCodebook {
@@ -176,13 +201,12 @@ struct DeviceCodebook {
             return __ldg(d_iq3s_grid + i);
         }
     }
-    __device__ __forceinline__ std::uint64_t grid64(int i) const {
-        return __ldg(reinterpret_cast<const unsigned long long*>(d_iq2s_grid) + i);
-    }
+    __device__ __forceinline__ std::uint64_t grid64(int i) const { return __ldg(grid64_table<F>() + i); }
     __device__ __forceinline__ unsigned sign(int i) const { return __ldg(d_ksigns_iq2xs + i); }
 };
 
-// F's codebook in shared memory (2 KiB IQ3_S, 1.1 KiB IQ3_XXS, 8 KiB IQ2_S; 16 bytes otherwise).
+// F's codebook in shared memory (2 KiB IQ3_S, 1.1 KiB IQ3_XXS, 8 KiB IQ2_S, 4.1 KiB IQ2_XS, 2.1 KiB IQ2_XXS;
+// 16 bytes otherwise).
 template <QType F>
 struct SharedCodebook {
     alignas(16) std::uint32_t grid[kGridWords<F> > 0 ? kGridWords<F> : 2];
@@ -195,7 +219,7 @@ struct SharedCodebook {
         if constexpr (kGridWords<F> > 0) {
             const std::uint32_t* src = F == QType::GGML_IQ3_S     ? d_iq3s_grid
                                        : F == QType::GGML_IQ3_XXS ? d_iq3xxs_grid
-                                                                  : reinterpret_cast<const std::uint32_t*>(d_iq2s_grid);
+                                                                  : reinterpret_cast<const std::uint32_t*>(grid64_table<F>());
             for (int i = static_cast<int>(threadIdx.x); i < kGridWords<F>; i += Threads) { grid[i] = __ldg(src + i); }
         }
         if constexpr (kSignBytes<F> > 0) {
@@ -247,6 +271,20 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s, const Cod
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
             const int2 v = iq4nl_values(qs[w]);
+            o.q[w]     = v.x;
+            o.q[w + 4] = v.y;
+        }
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        // d, the word of fifth bits (bit e: element e), 16 bytes of low nibbles (byte j: elements j and j + 16).
+        const std::uint8_t* b = row + s * 22;
+        o.d    = static_cast<std::uint16_t>(L::u16(b));
+        o.sub0 = o.sub1 = 1;
+        const std::uint32_t fifth = u32_a2<L>(b + 2);
+        std::uint32_t qs[4];
+        ld_words_a2<4, L>(b + 6, qs);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const int2 v = q5_0_values(qs[w], fifth >> (4 * w), fifth >> (16 + 4 * w));
             o.q[w]     = v.x;
             o.q[w + 4] = v.y;
         }
@@ -313,6 +351,37 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s, const Cod
             const int index = ((qs >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300);
             const std::uint64_t grid = cb.grid64(index);
             const unsigned sign      = (signs >> (8 * l)) & 0xFFU;
+            o.q[2 * l]     = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+            o.q[2 * l + 1] = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+        }
+    } else if constexpr (F == QType::GGML_IQ2_XXS) {
+        const std::uint8_t* b = row + (s / 8) * 66;
+        const int ib = s % 8;
+        o.d = static_cast<std::uint16_t>(L::u16(b));
+        std::uint32_t qw[2];
+        ld_words_a2<2, L>(b + 2 + 8 * ib, qw); // four grid indices, then the sign fields and the sub-scale
+        o.sub0 = o.sub1 = 2 * static_cast<int>(qw[1] >> 28) + 1;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const std::uint64_t grid = cb.grid64(static_cast<int>((qw[0] >> (8 * l)) & 0xFF));
+            const unsigned sign      = cb.sign(static_cast<int>((qw[1] >> (7 * l)) & 127));
+            o.q[2 * l]     = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+            o.q[2 * l + 1] = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+        }
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        const std::uint8_t* b = row + (s / 8) * 74;
+        const int ib = s % 8;
+        o.d = static_cast<std::uint16_t>(L::u16(b));
+        const int sc = b[66 + ib];
+        o.sub0 = 2 * (sc & 0xF) + 1;
+        o.sub1 = 2 * (sc >> 4) + 1;
+        std::uint32_t qw[2];
+        ld_words_a2<2, L>(b + 2 + 8 * ib, qw); // four u16: a 9-bit grid index and a 7-bit sign field each
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const std::uint32_t q    = (qw[l / 2] >> (16 * (l % 2))) & 0xFFFFU;
+            const std::uint64_t grid = cb.grid64(static_cast<int>(q & 511));
+            const unsigned sign      = cb.sign(static_cast<int>(q >> 9));
             o.q[2 * l]     = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
             o.q[2 * l + 1] = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
         }
@@ -402,6 +471,17 @@ __device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p, co
         const int2 v0 = iq4nl_values(ld_u32_a2(qs + 4 * w)), v1 = iq4nl_values(ld_u32_a2(qs + 4 * w + 4));
         o.w0 = p >= 2 ? v0.y : v0.x;
         o.w1 = p >= 2 ? v1.y : v1.x;
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        const std::uint8_t* b = row + s * 22;
+        o.d                   = static_cast<std::uint16_t>(ld_u16(b));
+        // The chunk's elements 8p..8p+7 have their fifth bits at bits 8p.. of the word; their nibbles are the low
+        // (p < 2) or high nibbles of bytes 4w..4w+7.
+        const std::uint32_t fifth = ld_u32_a2(b + 2) >> (8 * p);
+        const int w               = 2 * p % 4;
+        const int2 v0 = q5_0_values(ld_u32_a2(b + 6 + 4 * w), fifth, fifth);
+        const int2 v1 = q5_0_values(ld_u32_a2(b + 6 + 4 * w + 4), fifth >> 4, fifth >> 4);
+        o.w0 = p >= 2 ? v0.y : v0.x;
+        o.w1 = p >= 2 ? v1.y : v1.x;
     } else if constexpr (F == QType::GGML_Q4_K || F == QType::GGML_Q5_K) {
         constexpr int kBytes  = F == QType::GGML_Q4_K ? 144 : 176;
         const std::uint8_t* b = row + (s / 8) * kBytes;
@@ -444,6 +524,27 @@ __device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p, co
         const int index = b[2 + 4 * ib + p] | ((qh << (8 - 2 * p)) & 0x300);
         const std::uint64_t grid = cb.grid64(index);
         const unsigned sign      = b[34 + 4 * ib + p];
+        o.w0 = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+        o.w1 = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+    } else if constexpr (F == QType::GGML_IQ2_XXS) {
+        const std::uint8_t* b = row + (s / 8) * 66;
+        const int ib = s % 8;
+        o.d = static_cast<std::uint16_t>(ld_u16(b));
+        const std::uint32_t aux = ld_u32_a2(b + 6 + 8 * ib);
+        o.sub = 2 * static_cast<int>(aux >> 28) + 1;
+        const std::uint64_t grid = cb.grid64(b[2 + 8 * ib + p]);
+        const unsigned sign      = cb.sign((aux >> (7 * p)) & 127);
+        o.w0 = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
+        o.w1 = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        const std::uint8_t* b = row + (s / 8) * 74;
+        const int ib = s % 8;
+        o.d = static_cast<std::uint16_t>(ld_u16(b));
+        const int sc = b[66 + ib];
+        o.sub = 2 * (p < 2 ? sc & 0xF : sc >> 4) + 1;
+        const std::uint32_t q    = ld_u16(b + 2 + 8 * ib + 2 * p);
+        const std::uint64_t grid = cb.grid64(static_cast<int>(q & 511));
+        const unsigned sign      = cb.sign(static_cast<int>(q >> 9));
         o.w0 = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
         o.w1 = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
     } else if constexpr (F == QType::GGML_IQ3_XXS) {

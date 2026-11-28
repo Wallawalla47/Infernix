@@ -860,7 +860,9 @@ def _fp4_local_vision(model, recipe, base):
 
 def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
     """ISTA-DASLab's GSQ-RCO IQ3_S GGUF of Qwen3.8-Flash-Next, bit-exact
-    (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25). Every GGUF block format is stored verbatim:
+    (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25); the same recipe imports their IQ3_XXS (and
+    ukisai's Swift-1.5 GSQ-RCO IQ3_XXS), whose routed experts add the IQ2_XXS and IQ2_XS gate/up formats
+    (expert banks only: no dense route decodes them). Every GGUF block format is stored verbatim:
     dense matrices of the tiled formats (Q4_K, Q5_K, Q6_K, IQ4_XS) in ``ggml_tiles16_v1`` (the same
     blocks in 16-row tiles, so a tile's block is one contiguous run for the narrow kernels), the
     others and the token embedding (a row gather) in ``ggml_rows_v1``, each in its own per-tensor

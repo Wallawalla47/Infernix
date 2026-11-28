@@ -26,15 +26,29 @@ def ggml_matrix(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalS
     k = shape[1]
 
     if t.ggml_type == GGUF_Q8_0:
-        def encoded(begin: int, end: int) -> EncodedRows:
+        def stored(begin: int, end: int) -> EncodedRows:
             codes, scales = decode_q8_0(np.ascontiguousarray(store.raw(name, begin, end)), end - begin, k)
             if (codes == -128).any():
                 raise ValueError(f"{name}: Q8_0 code -128 has no q8_g32_fp16 encoding")
             return EncodedRows("q8_g32_fp16", torch.from_numpy(codes.copy()).reshape(end - begin, k // 32, 32),
                                torch.from_numpy(scales.copy()).view(torch.float16))
 
+        def encoded(begin: int, end: int) -> EncodedRows:
+            # The row-split layout stores K in whole 128-element units: a K between them (the hyper-connection
+            # up matrices' 320 in Unsloth's GGUFs) gets the layout's zero groups, code 0 at scale 0, as a
+            # quantized matrix's padding does.
+            rows = stored(begin, end)
+            groups = -(-k // 128) * 4
+            if groups == k // 32:
+                return rows
+            codes = torch.zeros((end - begin, groups, 32), dtype=rows.codes.dtype)
+            scales = torch.zeros((end - begin, groups), dtype=torch.float16)
+            codes[:, : k // 32] = rows.codes
+            scales[:, : k // 32] = rows.scales.reshape(end - begin, k // 32)
+            return EncodedRows("q8_g32_fp16", codes, scales)
+
         def values(begin: int, end: int) -> torch.Tensor:
-            rows = encoded(begin // k, -(-end // k))
+            rows = stored(begin // k, -(-end // k))
             v = rows.codes.to(torch.float64) * rows.scales.to(torch.float64)[..., None]
             flat = v.reshape(-1)
             start = begin - begin // k * k
@@ -86,6 +100,41 @@ def plain(store: GgufStore, name: str, shape: tuple[int, ...], *, minus_one: boo
         return cache[0][begin:end]
 
     return LogicalSource(tuple(shape), f"{store.path}:{name}" + (" - 1" if minus_one else ""), read)
+
+
+def plain_as_q8(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalSource:
+    """An F32/F16/BF16 GGUF matrix as ``q8_g32_fp16`` rows, quantized by the engine's own rule
+    (ops::hyper_connection_repack_q8, in binary32: per 32-element group the FP16 scale fl16(max|v| / 127)
+    and the codes rint(v / scale) clamped to +-127), so it can share a parent with a Q8_0 matrix the
+    runtime reads beside it. Lossy, and the one place this importer re-quantizes a GGUF tensor; the
+    source's values are the quantized ones."""
+
+    source = plain(store, name, shape)
+    n, k = shape
+    if k % 128:
+        raise ValueError(f"{name}: q8_g32_fp16 rows need K in whole 128-element units, K is {k}")
+    cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def rows() -> tuple[torch.Tensor, torch.Tensor]:
+        if not cache:
+            v = source.values().to(torch.float32).numpy().reshape(n, k // 32, 32)
+            s16 = (np.abs(v).max(axis=2) / np.float32(127)).astype(np.float16)
+            s = s16.astype(np.float32)[..., None]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                q = np.where(s > 0, np.rint(v / s), np.float32(0))
+            codes = np.clip(q, -127, 127).astype(np.int8)
+            cache.append((torch.from_numpy(codes), torch.from_numpy(s16)))
+        return cache[0]
+
+    def encoded(begin: int, end: int) -> EncodedRows:
+        codes, scales = rows()
+        return EncodedRows("q8_g32_fp16", codes[begin:end].clone(), scales[begin:end].clone())
+
+    def values(begin: int, end: int) -> torch.Tensor:
+        codes, scales = rows()
+        return (codes.to(torch.float64) * scales.to(torch.float64)[..., None]).reshape(-1)[begin:end]
+
+    return LogicalSource(tuple(shape), f"{store.path}:{name} as q8_g32_fp16", values, encoded)
 
 
 def ggml_or_plain(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalSource:

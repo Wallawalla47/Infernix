@@ -97,12 +97,15 @@ template <QType F> ggml::I128 dot(const std::uint8_t* row, const std::int32_t* x
 
 ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int k) {
     switch (q) {
+    case QType::GGML_IQ2_XXS: return dot<QType::GGML_IQ2_XXS>(row, x, k);
+    case QType::GGML_IQ2_XS: return dot<QType::GGML_IQ2_XS>(row, x, k);
     case QType::GGML_IQ2_S: return dot<QType::GGML_IQ2_S>(row, x, k);
     case QType::GGML_IQ3_XXS: return dot<QType::GGML_IQ3_XXS>(row, x, k);
     case QType::GGML_IQ3_S: return dot<QType::GGML_IQ3_S>(row, x, k);
     case QType::GGML_IQ4_XS: return dot<QType::GGML_IQ4_XS>(row, x, k);
     case QType::GGML_IQ4_NL: return dot<QType::GGML_IQ4_NL>(row, x, k);
     case QType::GGML_Q2_0: return dot<QType::GGML_Q2_0>(row, x, k);
+    case QType::GGML_Q5_0: return dot<QType::GGML_Q5_0>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -343,12 +346,15 @@ void decode_row(QType q, const std::uint8_t* row, int k, double* out) {
     for (int i = 0; i < k / 8; ++i) {
         ggml::Chunk c{};
         switch (q) {
+        case QType::GGML_IQ2_XXS: c = ggml::row_chunk<QType::GGML_IQ2_XXS>(row, i); break;
+        case QType::GGML_IQ2_XS: c = ggml::row_chunk<QType::GGML_IQ2_XS>(row, i); break;
         case QType::GGML_IQ2_S: c = ggml::row_chunk<QType::GGML_IQ2_S>(row, i); break;
         case QType::GGML_IQ3_XXS: c = ggml::row_chunk<QType::GGML_IQ3_XXS>(row, i); break;
         case QType::GGML_IQ3_S: c = ggml::row_chunk<QType::GGML_IQ3_S>(row, i); break;
         case QType::GGML_IQ4_XS: c = ggml::row_chunk<QType::GGML_IQ4_XS>(row, i); break;
         case QType::GGML_IQ4_NL: c = ggml::row_chunk<QType::GGML_IQ4_NL>(row, i); break;
         case QType::GGML_Q2_0: c = ggml::row_chunk<QType::GGML_Q2_0>(row, i); break;
+        case QType::GGML_Q5_0: c = ggml::row_chunk<QType::GGML_Q5_0>(row, i); break;
         default: throw std::logic_error("format");
         }
         std::int64_t mant;
@@ -866,11 +872,26 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
         return 0;
     }
     const std::pair<QType, QType> pairs[] = {
+        {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XXS, QType::GGML_Q2_0},
+        {QType::GGML_IQ2_XS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XS, QType::GGML_Q2_0},
         {QType::GGML_IQ2_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_S, QType::GGML_Q2_0},
         {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
         {QType::GGML_IQ3_S, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_S, QType::GGML_Q2_0},
-        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}, {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}, {QType::GGML_IQ4_XS, QType::GGML_Q2_0},
+        {QType::GGML_IQ2_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ2_XS, QType::GGML_Q5_0},
+        {QType::GGML_IQ2_S, QType::GGML_Q5_0}, {QType::GGML_IQ3_XXS, QType::GGML_Q5_0},
+        {QType::GGML_IQ3_S, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
+    // --from N: start at pair N (12: the Q5_0 down pairs alone), with unbuffered output so that an abort shows
+    // the last check that passed.
+    int from = 0;
+    if (argc > 2 && std::strcmp(argv[1], "--from") == 0) {
+        from = std::atoi(argv[2]);
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+    }
+    int index = 0;
     for (const auto& [gu, down] : pairs) {
+        if (index++ < from) { continue; }
+        try {
         // 9, 40 and 300 columns: calls of the wide route (tensor-core tiles for jobs over 8 columns).
         for (const int columns : {1, 3, 9, 40, 300}) { run(gu, down, columns, rng); }
         // The model's scale spread, the per-limb bound's limit, and spreads past it (int128).
@@ -885,6 +906,11 @@ INFERNIX_OP_TEST(offloaded_moe_ggml) {
         run_bf16(gu, down, moe::wide::kGgmlStageDecodeMinColumns + 37, rng);
         // The stage-decode tiles' bits across call widths (4,096 to 16,384 columns) and staged passes.
         run_stage_decode(gu, down, rng);
+        } catch (const std::exception& e) {
+            // A refused launch or a device fault names its pair instead of aborting the suite.
+            std::fprintf(stderr, "error: ggml experts (%d, %d): %s\n", static_cast<int>(gu), static_cast<int>(down), e.what());
+            return 1;
+        }
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d ggml expert checks failed\n", g_failures);

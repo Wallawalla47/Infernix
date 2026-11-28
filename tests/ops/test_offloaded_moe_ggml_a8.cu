@@ -75,12 +75,15 @@ template <QType F> ggml::I128 dot(const std::uint8_t* row, const std::int32_t* x
 
 ggml::I128 row_dot(QType q, const std::uint8_t* row, const std::int32_t* x, int k) {
     switch (q) {
+    case QType::GGML_IQ2_XXS: return dot<QType::GGML_IQ2_XXS>(row, x, k);
+    case QType::GGML_IQ2_XS: return dot<QType::GGML_IQ2_XS>(row, x, k);
     case QType::GGML_IQ2_S: return dot<QType::GGML_IQ2_S>(row, x, k);
     case QType::GGML_IQ3_XXS: return dot<QType::GGML_IQ3_XXS>(row, x, k);
     case QType::GGML_IQ3_S: return dot<QType::GGML_IQ3_S>(row, x, k);
     case QType::GGML_IQ4_XS: return dot<QType::GGML_IQ4_XS>(row, x, k);
     case QType::GGML_IQ4_NL: return dot<QType::GGML_IQ4_NL>(row, x, k);
     case QType::GGML_Q2_0: return dot<QType::GGML_Q2_0>(row, x, k);
+    case QType::GGML_Q5_0: return dot<QType::GGML_Q5_0>(row, x, k);
     default: throw std::logic_error("format");
     }
 }
@@ -419,10 +422,15 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_a8) {
         return 0;
     }
     const std::pair<QType, QType> pairs[] = {
+        {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ2_XXS, QType::GGML_Q2_0},
+        {QType::GGML_IQ2_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ2_XS, QType::GGML_Q2_0},
         {QType::GGML_IQ2_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ2_S, QType::GGML_Q2_0},
         {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL}, {QType::GGML_IQ3_XXS, QType::GGML_Q2_0},
         {QType::GGML_IQ3_S, QType::GGML_IQ4_NL},   {QType::GGML_IQ3_S, QType::GGML_Q2_0},
-        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0}};
+        {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL},  {QType::GGML_IQ4_XS, QType::GGML_Q2_0},
+        {QType::GGML_IQ2_XXS, QType::GGML_Q5_0}, {QType::GGML_IQ2_XS, QType::GGML_Q5_0},
+        {QType::GGML_IQ2_S, QType::GGML_Q5_0}, {QType::GGML_IQ3_XXS, QType::GGML_Q5_0},
+        {QType::GGML_IQ3_S, QType::GGML_Q5_0}, {QType::GGML_IQ4_XS, QType::GGML_Q5_0}};
     for (const auto& [gu, down] : pairs) {
         for (const int columns : {1, 3, 9, 128}) { run(gu, down, columns, rng); }
     }

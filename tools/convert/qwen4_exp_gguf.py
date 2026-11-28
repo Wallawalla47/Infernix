@@ -9,7 +9,9 @@ checked (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25):
 * ``+1`` on the zero-centred RMSNorm gammas: g - 1 must be a BF16 value (checked per tensor);
 * the GDN value heads in ggml's tiled order: rows are permuted back (whole rows, exact); the
   output projection's *columns* cannot be (its K-blocks span two heads), so ``ssm_out`` stays in
-  GGUF order and the text config records ``gdn_output_order: ggml_tiled`` for the runtime;
+  GGUF order and the text config records ``gdn_output_order: ggml_tiled`` for the runtime (a Q8_0
+  ``ssm_out``, whose 32-column blocks are whole within a head, is moved to Hugging Face order
+  instead, and the runtime reads that native projection unpermuted);
 * ``A_log`` stored as ``-exp(A_log)``: kept as ``gdn/a`` (FP32 A), used directly by the runtime;
 * the indexer's fused q/k projection split in two: concatenated again as the index parent.
 
@@ -32,7 +34,8 @@ from typing import Mapping
 import numpy as np
 import torch
 
-from tools.artifact.codecs.ggml import BY_GGML_ID, GGML_TYPES, require_finite_scales
+from tools.artifact.codecs.ggml import (BY_GGML_ID, GGML_TYPES, GGUF_BF16, GGUF_F16, GGUF_F32, GGUF_Q8_0,
+                                        require_finite_scales)
 from tools.artifact.layouts import ggml_expert_geometry
 from tools.flash_next.ngram import head_tables, layer_multipliers
 
@@ -41,7 +44,7 @@ from .methods import PrepareRequest, PreparedMethod
 from .model import Model, Parameter
 from .qwen3_5 import vision_config
 from .resources import load_resources
-from .sources.gguf_logical import ggml_or_plain, head_rows, permute_vector, plain
+from .sources.gguf_logical import ggml_or_plain, head_rows, permute_vector, plain, plain_as_q8, value_head_columns
 from .sources.gguf_raw import GgufStore
 from .sources.logical import select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource
@@ -185,7 +188,16 @@ class _Builder:
         self.matrix(prefix + "down", gguf_prefix + "down.weight", (rank, width), inputs=(prefix + "input",))
         self.matrix(prefix + "up", gguf_prefix + "up.weight", (width, rank), inputs=(prefix + "mix_activation",))
         if combine:
-            self.matrix(prefix + "inject", gguf_prefix + "inject.weight", (c["hc_count"], width), inputs=(prefix + "input",))
+            # The runtime reads down and inject as one matrix, so they share a parent and a format. Where the
+            # GGUF holds down as Q8_0 and inject as plain values (Unsloth's dynamic quants), inject takes down's
+            # format by the rule the engine applies to a BF16 mixer at load (plain_as_q8); down's blocks stay
+            # the GGUF's own.
+            inject, shape = gguf_prefix + "inject.weight", (c["hc_count"], width)
+            if (self.store.tensor(gguf_prefix + "down.weight").ggml_type == GGUF_Q8_0
+                    and self.store.tensor(inject).ggml_type in (GGUF_F32, GGUF_F16, GGUF_BF16)):
+                self.add(prefix + "inject", plain_as_q8(self.store, inject, shape), inputs=(prefix + "input",))
+            else:
+                self.matrix(prefix + "inject", inject, shape, inputs=(prefix + "input",))
             self.model.packing_groups.append((prefix + "down", prefix + "inject"))
 
     def gdn(self, prefix, blk):
@@ -212,8 +224,15 @@ class _Builder:
              2 * kg + ((h_ % (nv // nk)) * nk + h_ // (nv // nk)) * dv + dv) for h_ in range(nv)))
         self.add(p + "convolution", transpose_source(conv, (1, 0), (taps, channels)))
         self.add(p + "norm", plain(self.store, blk + "ssm_norm.weight", (dv,)))
-        # Columns stay in ggml's tiled value-head order (gdn_output_order); see the module docstring.
-        self.matrix(p + "output", blk + "ssm_out.weight", (h, vg), inputs=(p + "gated_output",))
+        # GGUF block rows keep their columns in ggml's tiled value-head order (gdn_output_order; see the module
+        # docstring). A Q8_0 output (Unsloth's dynamic quants) is a native projection the runtime reads without
+        # that permutation: its 32-column blocks are whole within a value head, so they move to Hugging Face
+        # order exactly (value_head_columns).
+        if self.store.tensor(blk + "ssm_out.weight").ggml_type == GGUF_Q8_0:
+            self.add(p + "output", value_head_columns(ggml_or_plain(self.store, blk + "ssm_out.weight", (h, vg)), nv, dv, nk),
+                     inputs=(p + "gated_output",))
+        else:
+            self.matrix(p + "output", blk + "ssm_out.weight", (h, vg), inputs=(p + "gated_output",))
         roles = [p + role for role in ("query", "key", "value", "z")]
         self.model.packing_groups.extend((tuple(roles), tuple(roles[:2]), tuple(roles[2:]),
                                           (p + "a_projection", p + "b_projection")))

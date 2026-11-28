@@ -903,6 +903,8 @@ void launch_decode_pass_ggml(const std::uint16_t* x, const MoeDispatch& dispatch
     if (jobs > kBf16PlanThreads) { throw std::invalid_argument("offloaded_sparse_moe: a BF16 pass plans at most 512 jobs"); }
     constexpr int kGateUpShared = static_cast<int>(sizeof(b::DecodeShared<GU>));
     constexpr int kDownShared   = static_cast<int>(sizeof(b::DecodeShared<D>));
+    static_assert(sizeof(b::DecodeShared<GU>) <= b::kMaxSharedBytes && sizeof(b::DecodeShared<D>) <= b::kMaxSharedBytes,
+                  "the stage-decode tiles' shared memory fits a CTA");
     constexpr int kT = b::kDecodeThreads;
     static const bool configured = [] {
         return cudaFuncSetAttribute(ggml_gate_up_decode<GU, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1030,14 +1032,24 @@ void launch_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const MoeExper
                                        stream, phase, entries, columns, part);                                        \
         return;                                                                                                        \
     }
+    INFERNIX_GGML_PAIR(QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ2_XXS, QType::GGML_Q2_0)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ2_XXS, QType::GGML_Q5_0)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ2_XS, QType::GGML_IQ4_NL)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ2_XS, QType::GGML_Q2_0)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ2_XS, QType::GGML_Q5_0)
     INFERNIX_GGML_PAIR(QType::GGML_IQ2_S, QType::GGML_IQ4_NL)
     INFERNIX_GGML_PAIR(QType::GGML_IQ2_S, QType::GGML_Q2_0)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ2_S, QType::GGML_Q5_0)
     INFERNIX_GGML_PAIR(QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL)
     INFERNIX_GGML_PAIR(QType::GGML_IQ3_XXS, QType::GGML_Q2_0)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ3_XXS, QType::GGML_Q5_0)
     INFERNIX_GGML_PAIR(QType::GGML_IQ3_S, QType::GGML_IQ4_NL)
     INFERNIX_GGML_PAIR(QType::GGML_IQ3_S, QType::GGML_Q2_0)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ3_S, QType::GGML_Q5_0)
     INFERNIX_GGML_PAIR(QType::GGML_IQ4_XS, QType::GGML_IQ4_NL)
     INFERNIX_GGML_PAIR(QType::GGML_IQ4_XS, QType::GGML_Q2_0)
+    INFERNIX_GGML_PAIR(QType::GGML_IQ4_XS, QType::GGML_Q5_0)
 #undef INFERNIX_GGML_PAIR
     throw std::invalid_argument("offloaded_sparse_moe: unsupported ggml expert format pair");
 }

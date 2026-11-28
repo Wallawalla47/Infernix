@@ -51,11 +51,17 @@ The GGUF (ggml) block formats store llama.cpp's blocks verbatim (Section 3.6):
 | `ggml_q4_k` | `Q4_K` (12) | 256 | 144 | 4.50 |
 | `ggml_q5_k` | `Q5_K` (13) | 256 | 176 | 5.50 |
 | `ggml_q6_k` | `Q6_K` (14) | 256 | 210 | 6.5625 |
+| `ggml_iq2_xxs` | `IQ2_XXS` (16) | 256 | 66 | 2.0625 |
+| `ggml_iq2_xs` | `IQ2_XS` (17) | 256 | 74 | 2.3125 |
 | `ggml_iq2_s` | `IQ2_S` (22) | 256 | 82 | 2.5625 |
 | `ggml_iq3_xxs` | `IQ3_XXS` (18) | 256 | 98 | 3.0625 |
 | `ggml_iq3_s` | `IQ3_S` (21) | 256 | 110 | 3.4375 |
 | `ggml_iq4_xs` | `IQ4_XS` (23) | 256 | 136 | 4.25 |
 | `ggml_iq4_nl` | `IQ4_NL` (20) | 32 | 18 | 4.50 |
+
+`ggml_iq2_xxs` and `ggml_iq2_xs` (the GSQ-RCO IQ3_XXS imports' routed gate/up experts) are expert-bank
+formats only: the expert kernels decode them, no dense route does, so `ggml_rows_v1` and `ggml_tiles16_v1`
+refuse them.
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and

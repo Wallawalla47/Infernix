@@ -20,7 +20,7 @@ The storage registry contains exactly these identities:
 | `nvfp4_rg16_v1` | tensor layout | `nvfp4_mul` | rank 2 `[N,K]`, `N % 16 == 0`, `K % 16 == 0` | 256 bytes |
 | `ggml_rows_v1` | tensor layout | every `ggml_*` format | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
 | `ggml_tiles16_v1` | tensor layout | `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq4_xs` | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
-| `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1` | tensor layout | `ggml_iq2_s`, `ggml_iq3_xxs`, `ggml_iq3_s`, `ggml_iq4_xs` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
+| `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1` | tensor layout | `ggml_iq2_xxs`, `ggml_iq2_xs`, `ggml_iq2_s`, `ggml_iq3_xxs`, `ggml_iq3_s`, `ggml_iq4_xs` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
 | `fp8_expert_b128_v1` | tensor layout | `fp8_e4m3fn_b128` | rank 3 `[E,H,I]`, `H % 128 == 0`, `I % 128 == 0` | 4096 bytes |
 | `mxfp8_expert_rg16_v1` | tensor layout | `fp8_e4m3fn_g32_e8m0` | rank 3 `[E,H,I]`, `H % 32 == 0`, `I % 32 == 0` | 4096 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |

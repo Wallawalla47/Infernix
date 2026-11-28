@@ -41,6 +41,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace infernix::ggml::bf16 {
 
@@ -355,9 +356,16 @@ template <QType F>
 inline constexpr int kUnitBytes = tile::kUnitSlices * 32 / static_cast<int>(ggml_block_elems(F)) *
                                   static_cast<int>(ggml_block_bytes(F));
 // A raw row's 16-byte chunks: a unit from its row's 16-byte aligned start (up to 15 bytes before
-// it), rounded to an odd count so that the rows a warp decodes start in distinct bank quads.
+// it), rounded to an odd count so that the rows a warp decodes start in distinct bank quads. Q5_0's
+// 176-byte units take the twelve chunks they need (15 + 176 <= 192) without that rounding, and one-byte
+// offsets: with thirteen chunks DecodeShared<Q5_0> is 103 KiB, past the 99 KiB a CTA can have on sm_120.
 template <QType F>
-inline constexpr int kRawChunks = ((15 + kUnitBytes<F> + 15) / 16) | 1;
+inline constexpr int kRawChunks = F == QType::GGML_Q5_0 ? (15 + kUnitBytes<F> + 15) / 16 : ((15 + kUnitBytes<F> + 15) / 16) | 1;
+template <QType F>
+using RawOffset = std::conditional_t<F == QType::GGML_Q5_0, std::uint8_t, int>;
+
+// The most dynamic shared memory a CTA can have on the target (sm_120a, RTX 5090).
+inline constexpr std::size_t kMaxSharedBytes = 99 * 1024;
 
 template <QType F>
 struct DecodeShared {
@@ -369,7 +377,7 @@ struct DecodeShared {
     // the format has no sub-scales).
     alignas(16) float4 scale[kSlices][kRowGroups][8];
     alignas(16) std::uint8_t raw[2][kRows][kRawChunks<F> * 16];
-    int raw_offset[2][kRows]; // where row r's unit bytes start in raw[.][r]
+    RawOffset<F> raw_offset[2][kRows]; // where row r's unit bytes start in raw[.][r] (below 16)
     fast::SharedCodebook<F> codebook;
 };
 
@@ -452,7 +460,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
             const auto* aligned     = reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{15});
             const int offset        = static_cast<int>(src - aligned);
             const int need          = offset + bytes - 16 * chunk; // bytes of this chunk the unit reads
-            if (chunk == 0) { sm.raw_offset[buf][r] = offset; }
+            if (chunk == 0) { sm.raw_offset[buf][r] = static_cast<RawOffset<F>>(offset); }
             if (need > 0) { tile::cp_async16(&sm.raw[buf][r][16 * chunk], aligned + 16 * chunk, need < 16 ? need : 16); }
         }
     };

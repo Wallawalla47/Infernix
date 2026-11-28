@@ -50,7 +50,9 @@ using exact::to_f32_rn;
 
 // log2 of a format's kappa.
 INFERNIX_GGML_HD int kappa_log2(QType q) {
-    return q == QType::GGML_IQ2_S ? -3 : q == QType::GGML_IQ3_XXS ? -2 : 0;
+    return q == QType::GGML_IQ2_S || q == QType::GGML_IQ2_XXS || q == QType::GGML_IQ2_XS ? -3
+           : q == QType::GGML_IQ3_XXS                                                    ? -2
+                                                                                          : 0;
 }
 
 // The binary32 output of R for a column with A16 exponent emax (canonical NaN for a non-finite one).
@@ -124,6 +126,16 @@ INFERNIX_GGML_HD Chunk chunk(const std::uint8_t* b, int part) {
         const std::uint8_t* qs = b + 2 + 8 * (part & 1);
         const int shift = part >= 2 ? 4 : 0;
         for (int j = 0; j < 8; ++j) { c.code[j] = INFERNIX_GGML_TABLE(kvalues_iq4nl)[(qs[j] >> shift) & 0xF]; }
+    } else if constexpr (F == QType::GGML_Q5_0) {
+        // d, a word of fifth bits (bit e: element e), then 16 bytes of low nibbles (byte j: its low nibble
+        // element j's, its high nibble element j + 16's); codes q - 16.
+        c.d = u16_at(b);
+        const std::uint32_t qh = u32_at(b + 2);
+        const std::uint8_t* qs = b + 6 + 8 * (part & 1);
+        const int shift = part >= 2 ? 4 : 0;
+        for (int j = 0; j < 8; ++j) {
+            c.code[j] = static_cast<std::int32_t>(((qs[j] >> shift) & 0xF) | (((qh >> (8 * part + j)) & 1U) << 4)) - 16;
+        }
     } else if constexpr (F == QType::GGML_IQ4_XS) {
         c.d = u16_at(b);
         const int ib = part / 4, p = part % 4;
@@ -163,6 +175,24 @@ INFERNIX_GGML_HD Chunk chunk(const std::uint8_t* b, int part) {
         for (int j = 0; j < 8; ++j) { c.code[j] = static_cast<std::int32_t>((grid >> (8 * j)) & 0xFF); }
         apply_signs(c.code, b[34 + 4 * ib + l]);
         c.sub = 2 * ((b[74 + ib] >> (4 * (l / 2))) & 0xF) + 1;
+    } else if constexpr (F == QType::GGML_IQ2_XXS) {
+        // Per 32 elements: four grid indices, then the word of four 7-bit sign fields and the sub-scale.
+        c.d = u16_at(b);
+        const int ib = part / 4, l = part % 4;
+        const std::uint32_t aux  = u32_at(b + 6 + 8 * ib);
+        const std::uint64_t grid = INFERNIX_GGML_TABLE(iq2xxs_grid)[b[2 + 8 * ib + l]];
+        for (int j = 0; j < 8; ++j) { c.code[j] = static_cast<std::int32_t>((grid >> (8 * j)) & 0xFF); }
+        apply_signs(c.code, INFERNIX_GGML_TABLE(ksigns_iq2xs)[(aux >> (7 * l)) & 127]);
+        c.sub = 2 * static_cast<std::int32_t>(aux >> 28) + 1;
+    } else if constexpr (F == QType::GGML_IQ2_XS) {
+        // Per 8 elements one u16: a 9-bit grid index and a 7-bit sign field; per 16 a sub-scale nibble.
+        c.d = u16_at(b);
+        const int ib = part / 4, l = part % 4;
+        const std::uint32_t q    = u16_at(b + 2 + 8 * ib + 2 * l);
+        const std::uint64_t grid = INFERNIX_GGML_TABLE(iq2xs_grid)[q & 511];
+        for (int j = 0; j < 8; ++j) { c.code[j] = static_cast<std::int32_t>((grid >> (8 * j)) & 0xFF); }
+        apply_signs(c.code, INFERNIX_GGML_TABLE(ksigns_iq2xs)[q >> 9]);
+        c.sub = 2 * ((b[66 + ib] >> (4 * (l / 2))) & 0xF) + 1;
     } else if constexpr (F == QType::GGML_IQ3_XXS) {
         c.d = u16_at(b);
         const int ib = part / 4, l = part % 4;

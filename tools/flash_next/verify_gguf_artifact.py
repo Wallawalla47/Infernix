@@ -11,7 +11,9 @@ Every logical parameter the recipe imports must equal the GGUF:
 - every ggml_rows_v1 projection's rows, the stored blocks byte for byte (whole-row selections and
   the GDN value-head permutation included); a ggml_tiles16_v1 matrix's rows after untiling, and its
   last tile's padding rows zero blocks;
-- the Q8_0 tensor's codes and scales, as the identical q8_g32_fp16 words;
+- every Q8_0 tensor's codes and scales, as the identical q8_g32_fp16 words; a plain hyper-connection
+  inject stored beside a Q8_0 down (Unsloth's dynamic quants) as the words the importer's rule gives
+  for the GGUF's values (gguf_logical.plain_as_q8: the one tensor not stored as the GGUF holds it);
 - every BF16/FP32 tensor value for value (the converter's checked exact transforms applied);
 - the n-gram volume's header and its IQ4_NL rows (all of them, or a sample);
 - with the vision component (``--mmproj``), every vision tensor value for value against the mmproj,
@@ -104,10 +106,17 @@ def verify_q8(artifact: Artifact, binding: dict, parameter) -> bool:
         obj = artifact.object(part["object"])
         s, c = decode_row_split_codes(artifact.read_object(obj.id), obj.format, obj.shape)
         begin, end = part.get("range", (0, obj.shape[0] * obj.shape[1]))
-        codes.append(c[begin // k : end // k, : k // 32])
-        scales.append(s[begin // k : end // k, : k // 32])
-    return torch.equal(torch.cat(codes).reshape(n, k // 32, 32), expected.codes) and torch.equal(
-        torch.cat(scales).view(torch.int16), expected.scales.view(torch.int16))
+        codes.append(c[begin // k : end // k])
+        scales.append(s[begin // k : end // k])
+    # The GGUF's own blocks are the first K / 32 groups; a K that is not whole 128-element units (the
+    # hyper-connection up matrices' 320 in Unsloth's GGUFs) is followed by the layout's zero groups.
+    groups = k // 32
+    stored_codes = torch.cat(codes).reshape(n, -1, 32)
+    stored_scales = torch.cat(scales).reshape(n, -1).view(torch.int16)
+    want_scales = expected.scales.reshape(n, -1).view(torch.int16)
+    return (torch.equal(stored_codes[:, :groups], expected.codes[:, :groups])
+            and torch.equal(stored_scales[:, :groups], want_scales[:, :groups])
+            and not bool(stored_codes[:, groups:].any()) and not bool(stored_scales[:, groups:].any()))
 
 
 def main() -> int:
